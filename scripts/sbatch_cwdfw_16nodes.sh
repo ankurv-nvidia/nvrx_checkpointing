@@ -165,9 +165,7 @@ OPTIONS=(
 #	--fp4-format e2m1
 #	--fp4-recipe nvfp4
 
-	--mtp-spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
 	--mtp-num-layers 2
-	--mtp-num-layers-per-layer 2
 	--mtp-hybrid-override-pattern "*E"
 	--calculate-per-token-loss
 	--mtp-loss-scaling-factor 0.3

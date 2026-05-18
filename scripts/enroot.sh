@@ -5,7 +5,6 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --nodes=1
-#SBATCH --time=00:20:00
 #SBATCH --mem=0
 #SBATCH --job-name=enroot
 
@@ -33,11 +32,11 @@ else
 fi
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 MEGATRON_ROOT=${SCRIPT_DIR}/../../..
-DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.01-py3"
+DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.04-py3"
 # First 10 hex chars of sha256(prepare.sh) — must match _prepare_sh_hash() in
 # megatron/native/ci/scripts/run_job.py so both paths agree on the filename.
 PREPARE_SH_HASH=$(sha256sum "${SCRIPT_DIR}/prepare.sh" | cut -c1-10)
-ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../base.sqsh}
+ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../pytorch2604.sqsh}
 ENROOT_IMAGE_OUT=${ENROOT_IMAGE_OUT:-${MEGATRON_ROOT}/../native.${PREPARE_SH_HASH}.sqsh}
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}
@@ -47,7 +46,8 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}
 # is run directly (CI, devbox), srun uses the cluster's user defaults, which on lyris
 # requires --account to be specified explicitly.
 SLURM_ACCOUNT=${SLURM_ACCOUNT:-coreai_resiliency_osiris}
-SLURM_TIME=${SLURM_TIME:-00:20:00}
+SLURM_TIME=${SLURM_TIME:-00:60:00}
+SLURM_PARTITION=${SLURM_PARTITION:-interactive}
 slurm_common_args=(
     "--account=${SLURM_ACCOUNT}"
     "--time=${SLURM_TIME}"
@@ -61,9 +61,7 @@ function build_image_base {
 	if [[ -e ${ENROOT_IMAGE_BASE} ]]; then
 		echo "using ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE}"
 	else
-		base_image_file=${MEGATRON_ROOT}/../$(basename ${ENROOT_IMAGE_BASE})
-		srun -l "${slurm_common_args[@]}" enroot import --output ${base_image_file} docker://${DOCKER_IMAGE_BASE}
-		ln -s ${base_image_file} "${ENROOT_IMAGE_BASE}"
+		srun -l "${slurm_common_args[@]}" enroot import --output ${ENROOT_IMAGE_BASE} docker://${DOCKER_IMAGE_BASE}
 	fi
 	$*
 }

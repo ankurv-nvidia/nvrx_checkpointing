@@ -115,7 +115,9 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
     root.register_state_dict(sharded_state_dict)
     root.finalize_registry()
     # TODO_CACHE_STATEDICT
-    # register_state_dict.cache = root
+    # github/main has a bug. It incorrectly caches the data_ptr of pytorch tensors for performance
+    # This is needed until that bug is resolved so we cache the data_ptrs too and match the tensors
+    register_state_dict.cache = root
     return root
 
 

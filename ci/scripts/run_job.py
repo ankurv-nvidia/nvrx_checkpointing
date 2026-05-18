@@ -76,7 +76,7 @@ BASELINES_DIR = (SCRIPT_DIR / "../baselines").resolve()
 sys.path.insert(0, str(MEGATRON_ROOT))
 
 ENROOT_SCRIPTS_DIR = (MEGATRON_ROOT / "megatron/native/scripts").resolve()
-DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.01-py3")
+DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.04-py3")
 
 
 def wait_for_file(path: Path, timeout_seconds: int) -> None:
@@ -152,7 +152,7 @@ def _ensure_enroot_image(image: Path) -> None:
     """Build the enroot .sqsh image if it doesn't exist by delegating to enroot.sh."""
     if image.exists():
         return
-    base_image = image.parent / "base.sqsh"
+    base_image = image.parent / "pytorch2604.sqsh"
     sys.stderr.write(f"[run_job] enroot image not found: {image} — building now (this may take ~30 min)\n")
 
     enroot_sh = ENROOT_SCRIPTS_DIR / "enroot.sh"
@@ -663,12 +663,7 @@ def _pretrain_cli_args(config: PretrainRunConfig) -> list[str]:
 
     return [
         # MTP
-        "--mtp-spec",
-        "megatron.core.models.mamba.mamba_layer_specs",
-        "mamba_stack_spec",
         "--mtp-num-layers",
-        "2",
-        "--mtp-num-layers-per-layer",
         "2",
         "--mtp-hybrid-override-pattern",
         "*E",

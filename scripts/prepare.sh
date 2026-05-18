@@ -75,15 +75,16 @@ function fedora {
     update-alternatives --install /usr/bin/lldb lldb /usr/bin/lldb-${CLANG_VERSION} 100
     update-alternatives --install /usr/bin/lldb-dap lldb-dap /usr/bin/lldb-dap-${CLANG_VERSION} 100
     update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+    update-alternatives --install /usr/bin/python3-config python3-config /usr/bin/python3.12-config 1
 
     # Print out tool version info
     for tool in cmake cc gcc g++ clang-${CLANG_VERSION}; do
-    echo .
-    echo "-- ${tool} version"
-    command -v ${tool}
-    ${tool} --version
+        echo .
+        echo "-- ${tool} version"
+        command -v ${tool}
+        ${tool} --version
     done
-
+    python3-config --extension-suffix
 }
 
 function test {
@@ -131,17 +132,22 @@ function ubuntu2404 {
     )
     # vcpkg
     packages+=(
-        zip xz-utils bzip2 tar unzip cmake python3 git
+        zip xz-utils bzip2 tar unzip cmake python3 git git-lfs openssh-client
         pkg-config patchelf valgrind
     )
-    # openssl
     packages+=(
+        # openssl
         libfindbin-libs-perl
         #perl-File-Compare
         libipc-run-perl
         #libfile-copy-link-perl
         #libfile-copy-recursive-perl
         #libtime-piece-mysql-perl
+
+        # hwloc
+        autoconf
+        automake
+        libtool
     )
 
     apt update
@@ -155,6 +161,7 @@ function ubuntu2404 {
     update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-${CLANG_VERSION} 100
     update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-${CLANG_VERSION} 100
     update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+    update-alternatives --install /usr/bin/python3-config python3-config /usr/bin/python3.12-config 1
 
     # Print out tool version info
     for tool in cmake cc gcc g++ clang-${CLANG_VERSION}; do
@@ -197,19 +204,24 @@ function container {
 }
 
 function megatron {
-    nvcc --version || cuda12
+    nvcc --version || cuda13
     nvcc --version
     export MAX_JOBS=4
     export CC=gcc
     export CXX=g++
     export TORCH_CUDA_ARCH_LIST=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1)
+    export NVTE_CUDA_ARCHS=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | sed 's/\.//')
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    source $HOME/.local/bin/env
+    uv cache clear
+    uv pip install --system --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools 
+    uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
+    uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
+    uv pip install --system --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models
+    unset CC
+    unset CXX
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true
-    pip install --root-user-action=ignore pybind11 --no-build-isolation --break-system-packages # Needed by [dev]
-    pip install --root-user-action=ignore -e "${MEGATRON_ROOT}" --no-cache-dir --no-build-isolation --break-system-packages # Cant install in tandem with [dev] due to dependency resolution issues
-    pip install --root-user-action=ignore -e "${MEGATRON_ROOT}[dev]" --no-cache-dir --no-build-isolation --break-system-packages
-    pip install --root-user-action=ignore tiktoken --no-cache-dir --no-build-isolation --break-system-packages # Needed for running models
-    pip install --root-user-action=ignore flash-attn --no-cache-dir --no-build-isolation --break-system-packages # Needed for running models
     pip list
     #pip install  --no-build-isolation --break-system-packages
     # if nvidia gpus found then run run.sh
@@ -217,15 +229,15 @@ function megatron {
     $*
 }
 
-function cuda12 {
+function cuda13 {
     . /etc/os-release
     # CUDA stuff
     packages=(
         pciutils
-        cuda-toolkit-12-8
-        libcudnn9-cuda-12
+        cuda-toolkit-13-1
+        libcudnn9-cuda-13
         libcutlass-dev
-        cudnn9-cuda-12
+        cudnn9-cuda-13
         libnccl-dev
         libtime-piece-mysql-perl
     )
@@ -237,7 +249,7 @@ function cuda12 {
 
     apt update && apt-get install --yes --no-install-recommends "${packages[@]}"
 
-    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.1}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
 }

@@ -3,5 +3,5 @@ run_cmd: python3 megatron/native/ci/scripts/run_job.py pretrain-native
 update_cmd: python3 megatron/native/ci/scripts/run_job.py pretrain-native --update-baseline
 metrics:
   bw_mbps: 3200.0
-  wr_tnsr_us: 3200000
-  total_written_bytes: 10636354368
+  wr_tnsr_us: 3139199.666667
+  total_written_bytes: 10629014336

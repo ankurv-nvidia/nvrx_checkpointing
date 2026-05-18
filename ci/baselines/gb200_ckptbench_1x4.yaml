@@ -4,4 +4,4 @@ update_cmd: python3 megatron/native/ci/scripts/run_job.py ckptbench --slurm --up
 metrics:
   bw_mbps: 12000.0
   wr_tnsr_us: 850000.0
-  total_written_bytes: 10636354368
+  total_written_bytes: 10629014336

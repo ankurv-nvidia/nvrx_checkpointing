@@ -367,7 +367,7 @@ struct StateTree
             node.data           = StateNode::ShardedTensor(tnsr.dtype, tnsr.fulldim);
             auto& shardedTensor = std::get<StateNode::ShardedTensor>(node.data);
             shardedTensor.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                .rank = _topo.rank, .sharddim = tnsr.sharddim, .device = tnsr.device, .handle = tnsr.handle});
+                .sharddim = tnsr.sharddim, .device = tnsr.device, .handle = tnsr.handle, .rank = _topo.rank});
         }
     }
 

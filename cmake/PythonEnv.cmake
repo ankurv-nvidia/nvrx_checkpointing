@@ -72,7 +72,14 @@ macro(_FindPythonFromVENV)
             ${PYTHON_VIRTUAL_ENV_PATH}/Scripts
             ${PYTHON_VIRTUAL_ENV_PATH}/bin)
 endmacro()
-
+find_program(UV_EXECUTABLE NAMES uv)
+if (NOT EXISTS "${UV_EXECUTABLE}")
+    message(STATUS "uv not found, using pip for python package management")
+    set(PYTHON_USE_UV OFF)
+else()
+    message(STATUS "uv found, using uv for python package management")
+    set(PYTHON_USE_UV ON)
+endif()
 if(NOT "${Python3_EXECUTABLE}" STREQUAL "${Python3_VENV_EXECUTABLE}")
     _PythonGetBasePrefixPath()
     _PythonGetPrefixPath()
@@ -87,7 +94,7 @@ if(NOT "${Python3_EXECUTABLE}" STREQUAL "${Python3_VENV_EXECUTABLE}")
             message(STATUS "${PYTHON_VIRTUAL_ENV_PATH}:: ${venvfile}")
 
             if(PYTHON_USE_UV)
-                set(PYTHON_ENV_SETUP_COMMAND uv venv --python 3.11)
+                set(PYTHON_ENV_SETUP_COMMAND uv venv)
             else()
                 set(PYTHON_ENV_SETUP_COMMAND "${Python3_EXECUTABLE}" -m venv)
             endif()
@@ -114,7 +121,6 @@ if(NOT "${Python3_EXECUTABLE}" STREQUAL "${Python3_VENV_EXECUTABLE}")
             message(FATAL_ERROR "Unable to set up python virtual environment ${PYTHON_VIRTUAL_ENV_PATH} != ${PYTHON_PREFIX_PATH}")
         endif()
     endif()
-    execute_process(COMMAND "${Python3_EXECUTABLE}" -m pip install uv COMMAND_ERROR_IS_FATAL ANY)
 else()
     # Incremental builds will hit this else() block
     _PythonGetPrefixPath()
@@ -137,15 +143,19 @@ function(pip_install_requirements req_file)
 endfunction()
 
 function(pip_install)
-    execute_process(
-        COMMAND "${Python3_EXECUTABLE}" -m pip install ${ARGN}
-        COMMAND_ERROR_IS_FATAL ANY
-    )
+    if (PYTHON_USE_UV)
+        uv_pip_install(${ARGN})
+    else()
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -m pip install ${ARGN}
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif()
 endfunction()
 
 function(uv_pip_install)
     execute_process(
-        COMMAND "${Python3_EXECUTABLE}" -m uv pip install ${ARGN}
+        COMMAND ${UV_EXECUTABLE} pip install --python ${Python3_EXECUTABLE} ${ARGN}
         COMMAND_ERROR_IS_FATAL ANY
     )
 endfunction()

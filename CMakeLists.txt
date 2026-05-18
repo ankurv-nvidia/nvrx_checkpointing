@@ -111,6 +111,7 @@ target_link_libraries(phoenix_checkpoint PUBLIC
 #target_compile_definitions(phoenix_checkpoint PUBLIC $<$<CONFIG:Debug>:SHM_RING_BUFFER_ENABLE_PERF_METRICS>)
 
 if (PHOENIX_BUILD_CUDA)
+    set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "Found CUDAToolkit:
             CUDAToolkit_VERSION=${CUDAToolkit_VERSION}
@@ -206,11 +207,22 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     target_is_python_extension(checkpoint)
 
     if (PHOENIX_BUILD_TORCH_BINDINGS)
-        if (PHOENIX_BUILD_CUDA)
-            pip_install(torch --index-url https://download.pytorch.org/whl)
-            set(TORCH_CUDA_ARCH_LIST "8.0")
-        else()
-            pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import os; import torch; print(os.path.dirname(torch.__file__) + '/share/cmake/Torch')"
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE Torch_DIR
+        )
+        find_package(Torch CONFIG QUIET)
+        if (NOT Torch_FOUND)
+            if (PHOENIX_BUILD_CUDA)
+                set(pytorch_index_url "https://download.pytorch.org/whl/cu${CUDAToolkit_VERSION_MAJOR}${CUDAToolkit_VERSION_MINOR}")
+                message(STATUS "Installing CUDA-enabled PyTorch from ${pytorch_index_url} into venv for Python bindings...")
+                pip_install(torch --index-url ${pytorch_index_url})
+                set(TORCH_CUDA_ARCH_LIST "8.0")
+            else()
+                pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
+            endif()
         endif()
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c
@@ -238,7 +250,11 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     )
 endif()
 
-find_package(OpenSSL REQUIRED)
+if (COMMAND vcpkg_install)
+    vcpkg_install(openssl)
+endif()
+
+find_package(OpenSSL CONFIG REQUIRED)
 
 # Writer library — pure-C++ ZIP+pickle emitter (no Python, no nanobind, no
 # libtorch). Both the production server and the parity-test shim link against
