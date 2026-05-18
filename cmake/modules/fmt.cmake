@@ -1,0 +1,20 @@
+include_guard()
+include(FetchContent)
+
+FetchContent_Declare(
+    fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        12.1.0
+    SOURCE_SUBDIR  .
+    GIT_PROGRESS FALSE GIT_SHALLOW ON SYSTEM
+    FIND_PACKAGE_ARGS 12.0.0 NAMES fmt
+)
+
+if (COMMAND vcpkg_install)
+    vcpkg_install(fmt)
+endif()
+
+FetchContent_MakeAvailable(fmt)
+if (COMMAND SupressWarningForTarget)
+    SupressWarningForTarget(fmt)
+endif()

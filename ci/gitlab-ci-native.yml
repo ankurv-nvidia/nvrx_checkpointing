@@ -1,0 +1,267 @@
+# GitLab CI for performance and correctness testing.
+#
+# Scheduler-agnostic: all cluster-specific details live in
+#   megatron/native/ci/scripts/run_job.py
+#
+# Include from root .gitlab-ci.yml:
+#   include:
+#     - megatron/native/ci/gitlab-ci-native.yml
+#
+# Runners must be registered on each machine's login node.
+# See megatron/native/ci/runner/setup_runner.py and ci/prepare.md.
+
+stages:
+  - test
+  - update
+
+# ---------------------------------------------------------------------------
+# Base template: shared settings for all jobs
+# ---------------------------------------------------------------------------
+.ci_base:
+  interruptible: false
+  retry:
+    max: 1
+    when: runner_system_failure
+  variables:
+    CI_SCRIPTS_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/scripts"
+    BASELINES_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/baselines"
+    RESULTS_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/ci-results"
+    METADATA_DIR: "${CI_PROJECT_DIR}/megatron/native/metadata"
+  before_script:
+    - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
+    - echo "=== Running on $(hostname) ==="
+    # Source the cluster config to pick up CLUSTER (and other env vars like VCPKG_ROOT).
+    - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
+    # MEGATRON_CI_MACHINE is set per-runner in the CI YAML; fall back to $CLUSTER from
+    # ~/data/ci for local runs, then to "devbox" as a last resort.
+    - export MEGATRON_CI_MACHINE="${MEGATRON_CI_MACHINE:-${CLUSTER:-devbox}}"
+    - echo "=== MEGATRON_CI_MACHINE=${MEGATRON_CI_MACHINE} ==="
+
+# ---------------------------------------------------------------------------
+# Per-runner templates: tags + GPU count for each machine
+# ---------------------------------------------------------------------------
+.runner_gb200:
+  tags: [gb200]
+  variables:
+    GPUS_PER_NODE: "4"
+    SLURM_FLAG: "--slurm"
+    MEGATRON_CI_MACHINE: "gb200"
+
+.runner_h200:
+  tags: [h200]
+  variables:
+    GPUS_PER_NODE: "8"
+    SLURM_FLAG: "--slurm"
+    MEGATRON_CI_MACHINE: "h200"
+
+.runner_devbox:
+  tags: [devbox]
+  variables:
+    GPUS_PER_NODE: "2"
+    SLURM_FLAG: ""
+    MEGATRON_CI_MACHINE: "devbox"
+
+# ---------------------------------------------------------------------------
+# Template: run a job via run_job.py (JOB_ARGS set by each concrete job)
+# ---------------------------------------------------------------------------
+.run_job:
+  extends: .ci_base
+  stage: test
+  timeout: 4h
+  # exit 3 = perf regression — pipeline continues so update jobs remain triggerable.
+  # exit 2 = job crashed — treated as a real failure (pipeline goes red).
+  allow_failure:
+    exit_codes: [3]
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/run_job.py" ${JOB_ARGS} || exit $?
+  after_script:
+    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+  artifacts:
+    paths:
+      - megatron/native/ci/ci-results/*.log
+      - megatron/native/ci/ci-results/*_report.json
+      # pretrain-native produces these per-iter; the update stage copies them
+      # into megatron/native/metadata/. Other jobs simply don't match the glob.
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.native.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.txt
+    expire_in: 30 days
+    when: always
+
+# Rules reused by 16-node jobs (schedule/web only)
+.schedule_or_web:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Stage: test
+# ---------------------------------------------------------------------------
+gb200:ckptbench:1x4:
+  extends: [.run_job, .runner_gb200]
+  variables:
+    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:ckptbench:1x8:
+  extends: [.run_job, .runner_h200]
+  variables:
+    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+devbox:ckptbench:1x2:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+gb200:pretrain-all:1x4:
+  extends: [.run_job, .runner_gb200]
+  variables:
+    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:pretrain-all:1x8:
+  extends: [.run_job, .runner_h200]
+  variables:
+    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+devbox:pretrain-all:1x2:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+gb200:pretrain-native:1x4:
+  extends: [.run_job, .runner_gb200]
+  variables:
+    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:pretrain-native:1x8:
+  extends: [.run_job, .runner_h200]
+  variables:
+    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+devbox:pretrain-native:1x2:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+gb200:pretrain-nvrx:1x4:
+  extends: [.run_job, .runner_gb200, .schedule_or_web]
+  variables:
+    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:pretrain-nvrx:1x8:
+  extends: [.run_job, .runner_h200, .schedule_or_web]
+  variables:
+    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+devbox:pretrain-nvrx:1x2:
+  extends: [.run_job, .runner_devbox, .schedule_or_web]
+  variables:
+    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+# 16-node runs: clusters only, schedule/web trigger
+gb200:pretrain:16x4:
+  extends: [.run_job, .runner_gb200, .schedule_or_web]
+  variables:
+    JOB_ARGS: "pretrain-native --nodes 16 --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:pretrain:16x8:
+  extends: [.run_job, .runner_h200, .schedule_or_web]
+  variables:
+    JOB_ARGS: "pretrain-native --nodes 16 --gpus-per-node ${GPUS_PER_NODE}"
+
+# Valgrind runs: pretrain-native with checkpoint_server pre-launched under memcheck.
+# valgrind slows the server ~10-50x; do not gate the pipeline on perf for these jobs
+# (the script reports metrics as informational because there is no valgrind baseline).
+# Devbox runs locally (no srun) — valgrind must be installed on the runner host.
+
+gb200:valgrind:1x4:
+  extends: [.run_job, .runner_gb200]
+  variables:
+    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+h200:valgrind:1x8:
+  extends: [.run_job, .runner_h200]
+  variables:
+    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+devbox:valgrind:1x2:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+
+# ---------------------------------------------------------------------------
+# Stage: update — update baselines from report files produced by test stage.
+#
+# No benchmarks are re-run. Each update job uses `needs:` (DAG mode) so it
+# becomes playable as soon as its single matching test job completes, without
+# waiting for the rest of the test stage. `needs:` also implicitly downloads
+# artifacts from the listed job — so we only see that job's artifacts, which
+# avoids one runner committing metadata files produced by another cluster's
+# test run. Triggerable even when the test job failed with exit 3 (perf
+# regression) because artifacts use `when: always` and the upstream is
+# `allow_failure`.
+# ---------------------------------------------------------------------------
+.update_baseline_base:
+  extends: .ci_base
+  stage: update
+  timeout: 4h
+  when: manual
+  allow_failure: true
+  script:
+    - |
+      git config user.email "ci-bot@noreply"
+      git config user.name  "CI Baseline Bot"
+      git remote set-url origin "ssh://git@${CI_SERVER_HOST}:12051/${CI_PROJECT_PATH}.git"
+      git pull --rebase origin "${CI_COMMIT_BRANCH}"
+    - python3 "${CI_SCRIPTS_DIR}/run_job.py" update_baselines
+    - |
+      mkdir -p "${BASELINES_DIR}"
+      git add "${BASELINES_DIR}/"
+      # pretrain-native update_baselines also refreshes registry.bin / *.native.metadata.info
+      # under megatron/native/metadata/; harmless for ckptbench (no diff there).
+      if [ -d "${METADATA_DIR}" ]; then
+        git add "${METADATA_DIR}/"
+      fi
+      if git diff --cached --quiet; then
+        echo "No baseline changes - nothing to commit."
+      else
+        git commit -m "ci: update performance baselines [skip ci] | Pipeline: ${CI_PIPELINE_ID} | Commit: ${CI_COMMIT_SHORT_SHA} | Branch: ${CI_COMMIT_BRANCH}"
+        git push origin "HEAD:${CI_COMMIT_BRANCH}"
+      fi
+
+gb200:ckptbench:1x4:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: gb200:ckptbench:1x4
+      artifacts: true
+
+h200:ckptbench:1x8:update_baselines:
+  extends: [.update_baseline_base, .runner_h200]
+  needs:
+    - job: h200:ckptbench:1x8
+      artifacts: true
+
+devbox:ckptbench:1x2:update_baselines:
+  extends: [.update_baseline_base, .runner_devbox]
+  needs:
+    - job: devbox:ckptbench:1x2
+      artifacts: true
+
+gb200:pretrain-native:1x4:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: gb200:pretrain-native:1x4
+      artifacts: true
+
+h200:pretrain-native:1x8:update_baselines:
+  extends: [.update_baseline_base, .runner_h200]
+  needs:
+    - job: h200:pretrain-native:1x8
+      artifacts: true
+
+devbox:pretrain-native:1x2:update_baselines:
+  extends: [.update_baseline_base, .runner_devbox]
+  needs:
+    - job: devbox:pretrain-native:1x2
+      artifacts: true

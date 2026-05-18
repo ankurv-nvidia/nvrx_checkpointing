@@ -1,0 +1,29 @@
+interface Server {
+    void ActivateSession(guid);
+    guid GetSessionGuid();
+
+    void AddPeers(list<nodes> )
+
+    list<Peers> GetPeers();
+    void SessionStoragePolicy([ram, localpath, remotepath])
+    void SetRetentionCount(ram, 2)
+    void SetRetentionCount(localpath, 2)
+    void SetRetentionCount(remotepath, 50)
+
+// Metadata once per session
+    void SetLocalRegistry(bytes, overwrite, keeptensorsonoverwrite);
+    bytes GetSessionModelRegistry()
+
+// 
+    int GetLastRndvzCheckpointIteration();
+    int GetAllCheckpointIterations();
+
+// Load Checkpoint
+    void LoadCheckpointIteration(int);
+    void LoadPage(int, tensormeta, offset);
+
+// Save Checkoint
+    void StartCheckpointIteration(int);
+    intptr CommitPage(int, tensormeta, offset);
+    void FinalizeLocalCheckpointForIteration(int);
+}

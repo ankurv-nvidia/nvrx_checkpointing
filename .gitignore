@@ -1,0 +1,15 @@
+.cppforge-sync
+.vs
+.cache
+.vscode
+.clangd
+.config
+build
+dist
+out
+CMakeSettings.json
+CMakeUserPresets.json
+__pycache__
+*.egg-info
+*venv
+checkpoint_server

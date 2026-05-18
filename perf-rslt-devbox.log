@@ -1,0 +1,10 @@
+[native_ckpt:cli][4294967295][INFO][perf][NUMA#0] Using channel=checkpoint_request
+[native_ckpt:cli][4294967295][INFO][perf][NUMA#0] Using channel=checkpoint_request
+[native_ckpt:cli][0][INFO][perf] Finished BW(GB/s)=1.01 | Time(us): DevBufInit=46µs     WrTnsr=7301710µs Total=7301756µs | Count: NumTensor=1063 SmallD2H=81 TotalD2H=308 | Bytes: TotalWritten=7952629776 AvgD2HRq=25820226 AvgTnsr=7481307
+[native_ckpt:cli][perf] save done in 7.756s
+[native_ckpt:cli][1][INFO][perf] Finished BW(GB/s)=1.01 | Time(us): DevBufInit=23µs     WrTnsr=7328847µs Total=7328871µs | Count: NumTensor=1063 SmallD2H=81 TotalD2H=308 | Bytes: TotalWritten=7952629776 AvgD2HRq=25820226 AvgTnsr=7481307
+[native_ckpt:cli][perf] save done in 7.783s
+[native_ckpt:cli][0][INFO][perf] Finished BW(GB/s)=0.98 | Time(us): DevBufInit=33µs     WrTnsr=7593863µs Total=7593896µs | Count: NumTensor=1063 SmallD2H=81 TotalD2H=308 | Bytes: TotalWritten=7952629776 AvgD2HRq=25820226 AvgTnsr=7481307
+[native_ckpt:cli][perf] save done in 7.595s
+[native_ckpt:cli][1][INFO][perf] Finished BW(GB/s)=0.96 | Time(us): DevBufInit=34µs     WrTnsr=7708348µs Total=7708383µs | Count: NumTensor=1063 SmallD2H=81 TotalD2H=308 | Bytes: TotalWritten=7952629776 AvgD2HRq=25820226 AvgTnsr=7481307
+[native_ckpt:cli][perf] save done in 7.709s

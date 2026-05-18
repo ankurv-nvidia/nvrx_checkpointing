@@ -1,0 +1,138 @@
+#pragma once
+#include "tensor.h"
+
+#include <fmt/ranges.h>
+#include <fmt/std.h>
+template <> struct fmt::formatter<Rank> : fmt::formatter<std::string_view>
+{
+    auto format(Rank const& rank, fmt::format_context& ctx) const    // NOLINT
+    {
+        if (rank == Rank::Invalid) { return fmt::format_to(ctx.out(), "?rank?"); }
+        return fmt::format_to(ctx.out(), "{}", static_cast<uint32_t>(rank));
+    }
+};
+template <> struct fmt::formatter<DeviceId> : fmt::formatter<std::string_view>
+{
+    auto format(DeviceId const& device, fmt::format_context& ctx) const    // NOLINT
+    {
+        return fmt::format_to(
+            ctx.out(), "{}:{}", std::string_view(device.type.data(), strnlen(device.type.data(), device.type.size())), device.index);
+    }
+};
+
+template <> struct fmt::formatter<DS4Tensor::DType> : fmt::formatter<std::string_view>
+{
+    auto format(DS4Tensor::DType const& dtype, fmt::format_context& ctx) const    // NOLINT
+    {
+        switch (dtype)
+        {
+        case DS4Tensor::DType::Float16: return fmt::format_to(ctx.out(), "Float16");
+        case DS4Tensor::DType::BFloat16: return fmt::format_to(ctx.out(), "BFloat16");
+        case DS4Tensor::DType::Float32: return fmt::format_to(ctx.out(), "Float32");
+        case DS4Tensor::DType::Float64: return fmt::format_to(ctx.out(), "Float64");
+        case DS4Tensor::DType::Int8: return fmt::format_to(ctx.out(), "Int8");
+        case DS4Tensor::DType::Int16: return fmt::format_to(ctx.out(), "Int16");
+        case DS4Tensor::DType::Int32: return fmt::format_to(ctx.out(), "Int32");
+        case DS4Tensor::DType::Int64: return fmt::format_to(ctx.out(), "Int64");
+        case DS4Tensor::DType::UInt8: return fmt::format_to(ctx.out(), "UInt8");
+        case DS4Tensor::DType::UInt16: return fmt::format_to(ctx.out(), "UInt16");
+        case DS4Tensor::DType::UInt32: return fmt::format_to(ctx.out(), "UInt32");
+        case DS4Tensor::DType::UInt64: return fmt::format_to(ctx.out(), "UInt64");
+        case DS4Tensor::DType::Bool: return fmt::format_to(ctx.out(), "Bool");
+        case DS4Tensor::DType::Invalid: return fmt::format_to(ctx.out(), "Invalid");
+        default: return fmt::format_to(ctx.out(), "Unknown");
+        }
+    }
+};
+
+template <> struct fmt::formatter<DS4Tensor::Range> : fmt::formatter<std::string_view>
+{
+    auto format(DS4Tensor::Range const& obj, fmt::format_context& ctx) const    // NOLINT
+    { return fmt::format_to(ctx.out(), "({}, {})", obj.begin, obj.end); }
+};
+
+template <> struct fmt::formatter<DS4Tensor::DimRange> : fmt::formatter<std::string_view>
+{
+    auto format(DS4Tensor::DimRange const& obj, fmt::format_context& ctx) const    // NOLINT
+    { return fmt::format_to(ctx.out(), "{}", fmt::join(obj, ",")); }
+};
+
+template <> struct fmt::formatter<DS4Tensor> : fmt::formatter<std::string_view>
+{
+    auto format(DS4Tensor const& tensor, fmt::format_context& ctx) const    // NOLINT
+    {
+        fmt::format_to(ctx.out(),
+                       "DS4Tensor(handle={:x} bytes={} dtype={} dev={} fulldim=[",
+                       tensor.handle,
+                       tensor.ShardSizeBytes(),
+                       tensor.dtype,
+                       tensor.device);
+        for (size_t i = 0; i < tensor.fulldim.size(); ++i)
+        {
+            if (i > 0) { fmt::format_to(ctx.out(), ", "); }
+            fmt::format_to(ctx.out(), "{}", tensor.fulldim[i]);    // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+        }
+        fmt::format_to(ctx.out(), "], sharddim=[");
+        for (size_t i = 0; i < tensor.sharddim.size(); ++i)
+        {
+            if (i > 0) { fmt::format_to(ctx.out(), ", "); }
+            fmt::format_to(ctx.out(),
+                           "{{{}-{}}}",
+                           tensor.sharddim[i].begin,    // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+                           tensor.sharddim[i].end);     // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+        }
+        fmt::format_to(ctx.out(), "])");
+        return ctx.out();
+    }
+};
+
+template <ConceptTensorTraits Traits> struct fmt::formatter<RankedTensorShardT<Traits>> : fmt::formatter<std::string_view>
+{
+    auto format(RankedTensorShardT<Traits> const& obj, fmt::format_context& ctx) const    // NOLINT
+    { return fmt::format_to(ctx.out(), "rank={} device={} sharddim=[{}]", obj.rank, obj.device, obj.sharddim); }
+};
+
+template <ConceptTensorTraits Traits> struct fmt::formatter<TensorShardMapT<Traits>> : fmt::formatter<std::string_view>
+{
+    auto format(TensorShardMapT<Traits> const& tensor, fmt::format_context& ctx) const    // NOLINT
+    {
+        return fmt::format_to(ctx.out(),
+                              "ShardedTensor(dtype={} fulldim=[{}], holes={}, nshards={})",
+                              tensor.dtype,
+                              tensor.fulldim,
+                              tensor.holes,
+                              tensor.shards.size());
+    }
+};
+
+#if !defined NDEBUG
+inline void RankTopology::AssertValid() const
+{
+    auto numPeers = (static_cast<uint32_t>(worldSize) + ranksPerPeer - 1) / ranksPerPeer;
+    if (numPeers != peers.size())
+    {
+        throw std::runtime_error(fmt::format(
+            "[native_ckpt][{}] Number of peers {} in root state does not match global world size {}", rank, numPeers, worldSize));
+    }
+    if (rank == Rank::Invalid || worldSize == Rank::Invalid)
+    {
+        throw std::runtime_error(fmt::format("[native_ckpt][{}] Rank and world size must be set", rank));
+    }
+    if (rank >= worldSize)
+    {
+        throw std::runtime_error(fmt::format("[native_ckpt][{}] Rank must be less than world size={}", rank, worldSize));
+    }
+    if (static_cast<uint32_t>(worldSize) % ranksPerPeer != 0)
+    {
+        throw std::runtime_error(
+            fmt::format("[native_ckpt][{}] Worldsize={} must be divisible by ranks-per-peer={}", rank, worldSize, ranksPerPeer));
+    }
+    if ((static_cast<uint32_t>(worldSize) / ranksPerPeer) % peersPerNode != 0)
+    {
+        throw std::runtime_error(fmt::format("[native_ckpt][{}] Number of peers={} must be divisible by peers per node={}",
+                                             rank,
+                                             static_cast<uint32_t>(worldSize) / ranksPerPeer,
+                                             peersPerNode));
+    }
+}
+#endif
