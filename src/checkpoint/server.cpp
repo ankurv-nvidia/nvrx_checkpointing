@@ -1390,6 +1390,18 @@ struct Server
             boost::beast::http::write(stream, res);
             Ping();
         }
+        else if (matches({"api", "stop"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
+        {
+            // Reply OK first, then signal shutdown via the flag that WaitForShutdown polls.
+            // We can't call Stop() inline: it joins _threads and we're running on one of them.
+            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            res.keep_alive(headers.keep_alive());
+            res.body() = "{}";
+            res.prepare_payload();
+            boost::beast::http::write(stream, res);
+            _stopRequested = true;
+        }
         else
         {
             boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::not_found, headers.version()};

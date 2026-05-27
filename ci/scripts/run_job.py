@@ -60,6 +60,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
@@ -262,12 +264,114 @@ def _checkpoint_server_binary() -> Path:
 
 
 _VALGRIND_READY_MARKER = "Checkpoint server started"
+# Server logs this (server.cpp ~L1088) when it begins orderly shutdown. We stop tee'ing
+# new output to the console once we see it — the long auto-shutdown wait would otherwise
+# repeat the same per-channel lines and valgrind's exit diagnostics — but the unified log
+# file still captures everything for post-mortem.
+_VALGRIND_STOP_MARKER = "Shutting down server thread"
+_CHECKPOINT_SERVER_PORT = 41000
 
 
-def _spawn_valgrind_server(cmd: list[str], log_fp: IO[str]) -> tuple[subprocess.Popen, threading.Event]:
-    """Spawn checkpoint_server under valgrind with a pump thread that tees output to
-    both `log_fp` and the parent's stderr (live console), and signals the returned Event
-    once the ready marker appears (or the process exits, so a stuck waiter doesn't deadlock).
+def _is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _stop_stale_checkpoint_server(port: int = _CHECKPOINT_SERVER_PORT, timeout: float = 10.0) -> None:
+    """Best-effort: ensure no checkpoint_server is bound to `port` before we launch our own.
+
+    Tries the server's own HTTP /api/stop endpoint first (graceful, targets only the listener);
+    if the port stays bound, falls back to `pkill -TERM`. The new server's signal handler logs
+    a breadcrumb and exits, so SIGTERM is clean.
+    """
+    if not _is_port_in_use(port):
+        return
+
+    sys.stderr.write(f"[run_job] checkpoint_server port {port} is in use; attempting graceful stop\n")
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stop", timeout=2.0):
+            pass
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        sys.stderr.write(f"[run_job]   /api/stop failed ({exc}); falling back to pkill\n")
+        subprocess.run(["pkill", "-TERM", "-f", "checkpoint_server"], check=False)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_port_in_use(port):
+            sys.stderr.write("[run_job]   stale checkpoint_server gone, port is free\n")
+            return
+        time.sleep(0.25)
+
+    # Last-resort SIGKILL on whatever is still hanging on to the port.
+    sys.stderr.write("[run_job]   port still in use after graceful stop; sending SIGKILL\n")
+    subprocess.run(["pkill", "-KILL", "-f", "checkpoint_server"], check=False)
+    time.sleep(0.5)
+    if _is_port_in_use(port):
+        raise RuntimeError(
+            f"checkpoint_server port {port} is still in use after stop+kill; cannot launch valgrind instance",
+        )
+
+
+def _watch_log_and_tee(
+    server_log: Path,
+    proc: subprocess.Popen,
+    ready: threading.Event,
+) -> None:
+    """Tail the unified server log and tee new content to the parent's stderr so server-side
+    log lines (written to the file via $NATIVE_CKPT_SERVER_LOG, never through the subprocess
+    pipe) also surface in the CI console. Sets `ready` once the readiness marker appears.
+    Stops tee'ing once the orderly-shutdown marker appears — the file still captures
+    everything past that point, but the console doesn't need the auto-shutdown wait's
+    repeated lines and valgrind's exit diagnostics. On process exit, does one final read
+    so log lines written between the previous poll and exit aren't lost. Always sets
+    `ready` so a stuck waiter doesn't deadlock; the caller disambiguates via proc.poll().
+    """
+    pos = 0
+    ready_b = _VALGRIND_READY_MARKER.encode()
+    stop_b = _VALGRIND_STOP_MARKER.encode()
+    teeing = True
+
+    def drain() -> None:
+        nonlocal pos, teeing
+        if not server_log.exists():
+            return
+        with server_log.open("rb") as fp:
+            fp.seek(pos)
+            chunk = fp.read()
+        if not chunk:
+            return
+        pos += len(chunk)
+        if teeing:
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+            if stop_b in chunk:
+                teeing = False
+        if not ready.is_set() and ready_b in chunk:
+            ready.set()
+
+    while True:
+        drain()
+        if proc.poll() is not None:
+            drain()  # Final read in case bytes landed between drain() and poll().
+            ready.set()
+            return
+        time.sleep(0.25)
+
+
+def _spawn_valgrind_server(
+    cmd: list[str],
+    server_log: Path,
+    log_fp: IO[str],
+) -> tuple[subprocess.Popen, threading.Event, threading.Thread]:
+    """Spawn checkpoint_server under valgrind. The pump thread copies the subprocess pipe
+    (valgrind's --log-fd=2 diagnostics plus the server's stdout "READY") into `log_fp`;
+    the watcher thread tails the unified log and is the single source of truth for what
+    reaches the parent's stderr (console). The server itself appends its stderr to the
+    same file via $NATIVE_CKPT_SERVER_LOG, so the watcher surfaces both streams without
+    duplication. The watcher is returned so the caller can join() it after proc.wait()
+    — otherwise log lines written during the final ~0.25s of the server's life can be
+    lost if main exits before the watcher's next poll.
     """
     proc = subprocess.Popen(
         cmd,
@@ -284,14 +388,17 @@ def _spawn_valgrind_server(cmd: list[str], log_fp: IO[str]) -> tuple[subprocess.
         for line in proc.stdout:
             log_fp.write(line)
             log_fp.flush()
-            sys.stderr.write(line)
-            sys.stderr.flush()
-            if not ready.is_set() and _VALGRIND_READY_MARKER in line:
-                ready.set()
+        # Pipe closed (process exited): signal so a stuck waiter doesn't deadlock.
         ready.set()
 
     threading.Thread(target=_pump, daemon=True).start()
-    return proc, ready
+    watcher = threading.Thread(
+        target=_watch_log_and_tee,
+        args=(server_log, proc, ready),
+        daemon=True,
+    )
+    watcher.start()
+    return proc, ready, watcher
 
 
 @contextlib.contextmanager
@@ -317,6 +424,8 @@ def _valgrind_checkpoint_server(machine: str, cfg: str) -> Iterator[None]:
     server = _checkpoint_server_binary()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     server_log = RESULTS_DIR / f"{machine}_valgrind_{cfg}_server.log"
+    # Truncate any prior run's log before we (and the server) start appending to it.
+    server_log.write_bytes(b"")
 
     cmd = [
         valgrind,
@@ -331,9 +440,15 @@ def _valgrind_checkpoint_server(machine: str, cfg: str) -> Iterator[None]:
     sys.stderr.write("[run_job] Launching checkpoint_server under valgrind\n")
     sys.stderr.write(f"[run_job]   server+valgrind log: {server_log}\n")
 
+    _stop_stale_checkpoint_server()
+
     os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
-    log_fp = server_log.open("w")
-    proc, ready = _spawn_valgrind_server(cmd, log_fp)
+    # Server (via RedirectStdio in server_main.cpp) appends its own stderr to this path.
+    # Both Python (pump thread) and the server append; O_APPEND on the server side and
+    # line-flushed writes here keep entries from interleaving mid-line.
+    os.environ["NATIVE_CKPT_SERVER_LOG"] = str(server_log)
+    log_fp = server_log.open("a")
+    proc, ready, watcher = _spawn_valgrind_server(cmd, server_log, log_fp)
 
     try:
         if not ready.wait(timeout=600):
@@ -360,6 +475,9 @@ def _valgrind_checkpoint_server(machine: str, cfg: str) -> Iterator[None]:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 rc = proc.wait()
+        # Wait for the watcher to finish draining the log file before we close it,
+        # otherwise the last ~0.25s of server output never reaches the console.
+        watcher.join(timeout=5)
         log_fp.close()
 
         sys.stderr.write(f"[run_job] valgrind exited with code {rc}\n")
