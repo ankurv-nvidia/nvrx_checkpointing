@@ -54,7 +54,7 @@ struct Session
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
         // Ranks whose __<r>_0.distcp file has been written and writeLog populated.
         // Mirrors `finalizedRanks`: rank-0 polls this set to gate `.metadata` write.
-        std::unordered_set<checkpoint::ipc::Rank> writeCompletedRanks;
+        std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
     };
 
     Server* const                                  server;
