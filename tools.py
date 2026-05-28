@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import torch
+from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 
 from . import checkpoint, mapping
 
@@ -122,8 +123,18 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
 
 
 def save(sharded_state_dict: mapping.ShardedStateDict, iteration: int, checkpoint_dir: Path) -> None:
-    root = register_state_dict(sharded_state_dict)
+    # Mirror nvrx's full save_preprocess pipeline, not just extract_sharded_base:
+    # apply_factories resolves ShardedTensorFactory in place, extract_nonpersistent
+    # drops LocalNonpersistentObject entries (otherwise they leak into common.pt as
+    # extra `optimizer:N:param_state` keys on the native side), and
+    # filter_out_empty_flatten_tensor strips zero-range ShardedTensors.
+    # validate_access_integrity is off here — nvrx will run its own cross-rank
+    # validation when it processes the same state_dict.
+    sharded_part, common_state = save_preprocess(sharded_state_dict, validate_access_integrity=False)
+    root = register_state_dict(sharded_part)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if torch.distributed.get_rank() == 0:
+        torch.save(common_state, checkpoint_dir / "common.pt")
     root.save_async(iteration, Path(checkpoint_dir))
     root.wait_for_deferred_save()
 

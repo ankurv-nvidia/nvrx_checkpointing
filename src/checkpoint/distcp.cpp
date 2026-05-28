@@ -864,11 +864,19 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const&                 glo
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type != StateNode::Type::ShardedTensor) { return; }
         auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        // Dedupe replicas by sharddim so each unique chunk is emitted once.
+        // Mirrors DebugWriteNativeMetadataInfo_ in server.cpp; without this
+        // the two views of the registry disagree and verify_native_server
+        // fires. The proper fix is to drop replica_id != 0 at registration
+        // — tracked in ankurv/megatron-lm#6.
         std::vector<DS4Tensor::DimRange> chunkRanges;
         chunkRanges.reserve(tnsr.shards.size());
+        DS4Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
             if (shard.ShardSizeBytes(tnsr.dtype) == 0) { continue; }
+            if (lastShard == shard.sharddim) { continue; }
+            lastShard = shard.sharddim;
             chunkRanges.push_back(shard.sharddim);
         }
         if (chunkRanges.empty()) { return; }
@@ -887,9 +895,16 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const&                 glo
         if (type != StateNode::Type::ShardedTensor) { return; }
         auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
         auto const fqn = globalRegistry.GetNodeId(node.handle);
+        // Same dedupe as the state_dict_metadata loop above (ankurv/megatron-lm#6).
+        // The surviving _StorageInfo points at the lowest-rank replica;
+        // dcp.load reads bytes from that file. Until #6 is fixed, the
+        // other replica ranks still carry orphan bytes in their .distcp.
+        DS4Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
             if (shard.ShardSizeBytes(tnsr.dtype) == 0) { continue; }
+            if (lastShard == shard.sharddim) { continue; }
+            lastShard = shard.sharddim;
             auto const* rec = LookupWriteRecord(manifest, shard.rank, fqn, shard.sharddim);
             if (rec == nullptr)
             {

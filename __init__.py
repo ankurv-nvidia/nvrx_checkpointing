@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 SHLIB_PATH = SCRIPT_DIR / "checkpoint.abi3.so"
@@ -12,8 +13,8 @@ SERVER_PATH = SCRIPT_DIR / "checkpoint_server"
 CURRENT_HASH = None
 
 
-def try_get_rank() -> int | None:
-    rank: int | None = None
+def try_get_rank() -> Optional[int]:
+    rank: Optional[int] = None
     rank = int(os.environ.get("RANK")) if os.environ.get("RANK") else None
     try:
         import torch  # noqa: F401, PLC0415
@@ -65,7 +66,7 @@ def _compute_source_hash() -> str:
 
 def build_native_extensions() -> None:
     if not hasattr(build_native_extensions, "CURRENT_HASH"):
-        build_native_extensions.CURRENT_HASH: str | None = None  # type: ignore[attr-defined]
+        build_native_extensions.CURRENT_HASH: Optional[str] = None  # type: ignore[attr-defined]
     if build_native_extensions.CURRENT_HASH is not None:
         return
 

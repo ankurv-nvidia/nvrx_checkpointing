@@ -275,7 +275,9 @@ target_link_libraries(phoenix_checkpoint_distcp PUBLIC
     fmt::fmt-header-only
     miniz::miniz)
 
-add_library(phoenix_checkpoint_server OBJECT src/checkpoint/server.cpp)
+add_library(phoenix_checkpoint_server OBJECT
+    src/checkpoint/server.cpp)
+# miniz is pulled in transitively via phoenix_checkpoint_distcp (PUBLIC above).
 target_link_libraries(phoenix_checkpoint_server PUBLIC phoenix_checkpoint phoenix_checkpoint_distcp fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url OpenSSL::Crypto)
 
 add_executable(checkpoint_server src/checkpoint/server_main.cpp)

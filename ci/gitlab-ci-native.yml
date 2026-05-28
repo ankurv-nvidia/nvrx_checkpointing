@@ -75,17 +75,36 @@ stages:
   script:
     - python3 "${CI_SCRIPTS_DIR}/run_job.py" ${JOB_ARGS} || exit $?
   after_script:
-    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+    # Single-provider jobs drop *.distcp directly under iter_*; pretrain-all routes
+    # each writer into iter_*/{native,nvrx}. Glob both layouts so the size report
+    # covers either case.
+    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp megatron/native/ci/ci-runs/*/checkpoints/iter_*/*/*.distcp 2>/dev/null || true
   artifacts:
     paths:
       - megatron/native/ci/ci-results/*.log
       - megatron/native/ci/ci-results/*_report.json
-      # pretrain-native produces these per-iter; the update stage copies them
-      # into megatron/native/metadata/. Other jobs simply don't match the glob.
+      # pretrain-native (and friends) produce these per-iter; the update stage
+      # copies them into megatron/native/metadata/. In dual-provider mode
+      # (pretrain-all) the same files live under iter_*/native instead of
+      # iter_* directly, and iter_*/nvrx/reference.metadata.info also appears
+      # (written by the rewired compare_nvrx_with_native finalize-fn) — list all
+      # three layouts so either job uploads its outputs.
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.native.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/[0-9]*.metadata.info
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.txt
+      # Raw .metadata pickles — what dcp.load and distcp_trace actually read.
+      # On a contiguity-check failure, distcp_trace raises before writing
+      # reference.metadata.info, so this is the only artifact that survives
+      # for offline analysis of the storage_data layout.
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/.metadata
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/registry.bin
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/[0-9]*.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/reference.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/*.txt
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/.metadata
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/nvrx/reference.metadata.info
+      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/nvrx/.metadata
     expire_in: 30 days
     when: always
 
@@ -218,7 +237,7 @@ devbox:valgrind:1x2:
     - |
       mkdir -p "${BASELINES_DIR}"
       git add "${BASELINES_DIR}/"
-      # pretrain-native update_baselines also refreshes registry.bin / *.native.metadata.info
+      # pretrain-native update_baselines also refreshes registry.bin / [0-9]*.metadata.info
       # under megatron/native/metadata/; harmless for ckptbench (no diff there).
       if [ -d "${METADATA_DIR}" ]; then
         git add "${METADATA_DIR}/"

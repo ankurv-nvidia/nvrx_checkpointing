@@ -51,6 +51,11 @@ bool TryRegisterTorchStateDict(StateTree&                     root,
                                nanobind::str const&           key,
                                nanobind::handle               val);
 
+// Detect a list-of-ShardedTensor (what `apply_factories` produces in place of a
+// ShardedTensorFactory) and register every element. Returns false on any other
+// list shape so the generic walker keeps owning the existing list cases.
+bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nanobind::str const& key, nanobind::list const& listObj);
+
 void RegisterStateDictRecr(StateTree&                     root,
                            StateNode::Handle              node,
                            nanobind::dict const&          container,

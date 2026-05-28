@@ -152,6 +152,7 @@ struct StateTreeStringHandler : StateTree::StateHandler<StateTree::StateType::Bl
         //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
         // }
     }
+
     nb::dict container;
     nb::str  key;
 };
@@ -184,6 +185,7 @@ template <typename T, typename TPy> struct StateTreeTrivialTupleHandler : StateT
         //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
         // }
     }
+
     nb::dict container;
     nb::str  key;
 };
@@ -223,6 +225,7 @@ template <typename TPy> struct StateTreeStringTupleHandler : StateTree::StateHan
         //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
         // }
     }
+
     nb::dict container;
     nb::str  key;
 };
@@ -468,6 +471,11 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
     {
         auto listObj = nb::cast<nb::list>(val);
         if (listObj.size() == 0) { return; }
+        // Post-`apply_factories` ShardedTensor lists land here — register each
+        // element under its own FQN before the generic per-element-type checks
+        // below get a chance to mis-classify them (a list of ShardedTensor
+        // instances trips `Unsupported list element type`).
+        if (TryRegisterTorchStateDictList(root, node, key, listObj)) { return; }
         if (IsTuple<nb::str, nb::list>(listObj))
         {
             root.RegisterStateHandler(node, std::make_unique<StateTreeStringTupleHandler<nb::list>>(container, key));
@@ -696,8 +704,8 @@ NB_MODULE(checkpoint, m)    // NOLINT
         .def("register_weight_tensor", &RegisterDeferredSaveTensor)
         .def("register_immediate_tensor", &RegisterImmediateSaveTensor)
         .def("finalize_registry", &FinalizeRegistry)
-        .def("save_async", &SaveAsync)
-        .def("save", &Save)
+        .def("save_async", &SaveAsync, nb::arg("iteration"), nb::arg("dirpath"))
+        .def("save", &Save, nb::arg("iteration"), nb::arg("dirpath"))
         .def("wait_for_deferred_save", &WaitForDeferredSave)
 
         // Save/Load convenience methods that block until complete

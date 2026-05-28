@@ -558,6 +558,48 @@ static bool IsTorchGenerator(nb::handle obj)
     return nb::isinstance(obj, generatorType);
 }
 
+// After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
+// gets replaced with `[ShardedTensor(...weight.z), ShardedTensor(...weight.x),
+// ShardedTensor(...weight.B), ShardedTensor(...weight.C), ShardedTensor(...weight.dt)]`.
+// Register each element using its own `.key` as the FQN — same shape as nvrx's
+// post-`save_preprocess` state_dict, so the cross-provider tensor compare can
+// match tensors per-FQN. Returns false when the list isn't an all-ShardedTensor
+// list so the generic walker can fall through to its existing per-element-type
+// handling.
+bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nb::str const& key, nb::list const& listObj)
+{
+    if (listObj.size() == 0) { return false; }
+    for (auto const& item : listObj)
+    {
+        if (!IsMegatronShardedTensor(item)) { return false; }
+    }
+    auto const nameView = StrView(key);
+    // Megatron's flattened-state-dict convention: when the state-dict key
+    // already has dots (e.g. `decoder.layers.0.mixer.in_proj.weight`) it IS
+    // the FQN — Megatron stashes such pre-flattened keys inside the top-level
+    // `model` / `optimizer` / etc dicts. Treat such names as already-qualified
+    // and skip the parent-node prefix; otherwise compose the FQN from the
+    // parent node id (mirrors `RegisterShardedTorchTensorFactory`).
+    auto const fqn = nameView.contains('.') ? std::string(nameView) : fmt::format("{}.{}", root.GetNodeId(node), nameView);
+    for (auto const& item : listObj)
+    {
+        auto itemContainer = nb::cast<nb::dict>(item.attr("__dict__"));
+        auto shtKey        = nb::cast<nb::str>(itemContainer["key"]);
+        auto shtKeyView    = StrView(shtKey);
+        // Each ShardedTensor's `.key` is the canonical FQN. It must equal
+        // the surrounding state-dict FQN (rare: a single-element list) or be
+        // a dotted child of it. Anything else is a structural surprise we'd
+        // rather raise on.
+        if (shtKeyView != fqn && (!shtKeyView.starts_with(fqn) || shtKeyView.size() <= fqn.size() || shtKeyView[fqn.size()] != '.'))
+        {
+            throw std::runtime_error(
+                fmt::format("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn));
+        }
+        root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(itemContainer, shtKey));
+    }
+    return true;
+}
+
 bool TryRegisterTorchStateDict(StateTree&                     root,
                                StateNode::Handle              node,
                                nb::dict const&                container,

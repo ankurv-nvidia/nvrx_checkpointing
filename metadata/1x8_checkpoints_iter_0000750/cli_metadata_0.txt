@@ -575,9 +575,9 @@ args.use_dist_ckpt: 1
 args.transformer_pipeline_model_parallel_size: 1
 args.data_parallel_size: 1
 args.params_dtype: 15
-args.consumed_train_samples: 6000
+args.consumed_train_samples: 2000
 args.skipped_train_samples: 0
-args.consumed_valid_samples: 112
+args.consumed_valid_samples: 0
 args.variable_seq_lengths: 0
 args.use_layer_wise_distributed_optimizer: 0
 args.model_type: 1
@@ -586,7 +586,7 @@ args.num_floating_point_operations_so_far: 0
 args.do_train: 1
 args.do_valid: 1
 args.do_test: 1
-args.curr_iteration: 749
+args.curr_iteration: 249
 checkpoint_version: 3
 embedding.word_embeddings.weight.sharddim: [(0, 32000),(0, 2048)]
 embedding.word_embeddings.weight.fulldim: [[256000, 2048]]
@@ -773,7 +773,7 @@ decoder.final_norm.weight.fulldim: [[2048]]
 decoder.final_norm.weight.dtype: BFloat16
 decoder.final_norm.weight.device: cuda:0
 decoder.final_norm.weight.handle: 23429087010816
-iteration: 750
+iteration: 250
 mtp.layers.0.enorm.weight.sharddim: [(0, 2048)]
 mtp.layers.0.enorm.weight.fulldim: [[2048]]
 mtp.layers.0.enorm.weight.dtype: BFloat16
@@ -999,7 +999,7 @@ output_layer.weight.fulldim: [[256000, 2048]]
 output_layer.weight.dtype: BFloat16
 output_layer.weight.device: cuda:0
 output_layer.weight.handle: 23428912381952
-num_floating_point_operations_so_far: 6.8341519613952e+16
+num_floating_point_operations_so_far: 2.2780506537984e+16
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(0, 65536000)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[65536000]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1014,7 +1014,7 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[65536000]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420322447360
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420456665088
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(0, 2048)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1024,12 +1024,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425343019520
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425483386880
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(0, 2048)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434547612160
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434547619328
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(2048, 690176)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1114,12 +1114,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434547620352
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434549500416
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(5638144, 5640192)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434549508096
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434549508608
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(5640192, 8785920)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1144,12 +1144,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434549516288
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425483512320
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(8785920, 8787968)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425340882944
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425483520512
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(8787968, 9836544)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1189,12 +1189,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425340891136
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425483528704
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(10885120, 10887168)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425340899328
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425473020928
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(10887168, 10889216)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1204,12 +1204,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434547579392
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425473029120
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(10887168, 10889216)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434547587584
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425473037312
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(10889216, 10891264)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1219,12 +1219,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434547595776
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434547579392
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(10889216, 10891264)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434549467648
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434547587584
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(10891264, 11579392)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1309,12 +1309,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434549475840
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23434547595776
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(16527360, 16529408)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23434549484032
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425483397120
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(16529408, 19675136)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1339,12 +1339,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425342948352
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23425483405312
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(19675136, 19677184)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425342956544
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23425483413504
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(19677184, 20725760)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1354,12 +1354,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23424281870336
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23424416088064
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(19677184, 20725760)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[20725760]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23424286064640
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23424420282368
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(0, 1048576)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1369,12 +1369,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424290258944
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424424476672
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(0, 1048576)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424294453248
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424428670976
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(1048576, 1050624)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1384,12 +1384,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425342964736
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483421696
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(1048576, 1050624)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425342860800
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483324416
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(1050624, 1052672)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1399,12 +1399,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425342868992
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483332608
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(1050624, 1052672)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425342877184
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483340800
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(1052672, 1054720)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1414,12 +1414,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425342885376
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483348992
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(1052672, 1054720)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425342893568
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483280384
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(1054720, 1742848)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1429,12 +1429,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424298647552
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424432865280
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(1054720, 1742848)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424301400064
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424435617792
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(1742848, 2430976)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1444,12 +1444,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424304152576
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424438370304
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(1742848, 2430976)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424306905088
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424441122816
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(2430976, 4528128)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1459,12 +1459,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424309657600
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424443875328
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(2430976, 4528128)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424318046208
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424452263936
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(4528128, 6625280)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1474,12 +1474,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424326434816
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424460652544
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(4528128, 6625280)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424334823424
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424469041152
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(6625280, 6690816)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1489,12 +1489,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425340932096
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 213834006528
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(6625280, 6690816)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425341194240
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 213834268672
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(6690816, 6692864)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1504,12 +1504,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425342901760
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483288576
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(6690816, 6692864)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425342909952
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483296768
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(6692864, 9838592)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1519,12 +1519,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424343212032
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424477429760
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(6692864, 9838592)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424355794944
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424490012672
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(9838592, 9840640)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1534,12 +1534,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425342918144
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483304960
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(9838592, 9840640)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425349245440
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483313152
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(9840640, 10889216)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1549,12 +1549,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424368377856
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424502595584
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(9840640, 10889216)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424372572160
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424506789888
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(10889216, 11937792)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1564,12 +1564,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424376766464
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424510984192
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(10889216, 11937792)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424380960768
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424515178496
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(11937792, 11938304)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1579,12 +1579,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425349191680
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434549488128
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(11937792, 11938304)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425340907520
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547627520
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(11938304, 11939072)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1594,12 +1594,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425340928000
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425473045504
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(11938304, 11939072)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547603968
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547567104
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(11939072, 11942144)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1609,12 +1609,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425349179392
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434549467648
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(11939072, 11942144)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425340915712
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483374592
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(11942144, 14579968)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1624,12 +1624,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424385155072
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23424519372800
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(11942144, 14579968)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424395706368
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23424529924096
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14579968, 14582016)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1639,12 +1639,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425349253632
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425475100672
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14579968, 14582016)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425349261824
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425475108864
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582016, 14582024)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1654,27 +1654,27 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425349195264
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547454976
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582016, 14582024)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547454976
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547477504
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582024, 14582080)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23425343019008
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23434547476480
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.sharddim: [(14582024, 14582080)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547476480
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547570176
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582024, 14582080)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547495936
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547570688
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582080, 14582088)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1684,27 +1684,27 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547477504
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547611136
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582080, 14582088)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434549524480
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547629568
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582088, 14582144)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23434549524992
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23425483536896
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.sharddim: [(14582088, 14582144)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434549526016
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425483537408
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582088, 14582144)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425349319680
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483537920
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582144, 14582152)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1714,27 +1714,27 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23425340931072
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434549525504
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582144, 14582152)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425340931584
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23425483321344
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582152, 14582208)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23425349320192
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.handle: 23434547495424
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.sharddim: [(14582152, 14582208)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547610624
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23434547495936
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582152, 14582208)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547611136
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23434547496448
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.sharddim: [(14582208, 80118208)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.param.dtype: Float32
@@ -1744,12 +1744,12 @@ chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23420584591360
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg.handle: 23420718809088
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.sharddim: [(14582208, 80118208)]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.fulldim: [[80118208]]
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.dtype: Float32
 chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.device: cuda:0
-chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23420054011904
+chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_2.exp_avg_sq.handle: 23420188229632
 optimizer.0.param_state_sharding_type: [blob]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(0, 1376256)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
@@ -1760,12 +1760,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424406257664
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424540475392
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(0, 1376256)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424416088064
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424550305792
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(1376256, 2752512)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1775,12 +1775,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424421593088
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424555810816
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(1376256, 2752512)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424427098112
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424561315840
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(2752512, 4128768)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1790,12 +1790,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424432603136
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424566820864
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(2752512, 4128768)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424438108160
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424572325888
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(4128768, 5505024)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1805,12 +1805,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424443613184
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424577830912
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(4128768, 5505024)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424449118208
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424583335936
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(5505024, 6881280)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1820,12 +1820,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424454623232
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424588840960
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(5505024, 6881280)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424460128256
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424594345984
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(6881280, 8257536)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1835,12 +1835,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424465633280
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424599851008
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(6881280, 8257536)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424471138304
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424605356032
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(8257536, 9633792)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1850,12 +1850,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424476643328
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424610861056
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(8257536, 9633792)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424482148352
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424616366080
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(9633792, 11010048)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1865,12 +1865,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424487653376
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424621871104
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(9633792, 11010048)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424493158400
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424627376128
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(11010048, 12386304)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1880,12 +1880,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424498663424
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424632881152
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(11010048, 12386304)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424504168448
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424638386176
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(12386304, 13762560)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1895,12 +1895,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424509673472
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424643891200
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(12386304, 13762560)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424515178496
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424649396224
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(13762560, 15138816)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1910,12 +1910,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424520683520
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424654901248
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(13762560, 15138816)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424526188544
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424660406272
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(15138816, 16515072)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1925,12 +1925,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424531693568
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424665911296
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(15138816, 16515072)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424537198592
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23424671416320
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(16515072, 17891328)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1940,12 +1940,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424542703616
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23424676921344
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(16515072, 17891328)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420020457472
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420154675200
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(17891328, 19267584)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1955,12 +1955,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23420025962496
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23420160180224
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(17891328, 19267584)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420031467520
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420165685248
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.sharddim: [(19267584, 20643840)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.param.dtype: Float32
@@ -1970,12 +1970,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23419986903040
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg.handle: 23420121120768
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.sharddim: [(19267584, 20643840)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.fulldim: [[20643840]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23419992408064
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_0.exp_avg_sq.handle: 23420126625792
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(0, 1376256)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -1985,12 +1985,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419997913088
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23420132130816
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(0, 1376256)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419953348608
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23420087566336
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(1376256, 2752512)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2000,12 +2000,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419958853632
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23420093071360
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(1376256, 2752512)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419964358656
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23420098576384
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(2752512, 4128768)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2015,12 +2015,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419919794176
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23420054011904
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(2752512, 4128768)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419925299200
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23420059516928
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(4128768, 5505024)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2030,12 +2030,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419930804224
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23420065021952
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(4128768, 5505024)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419886239744
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23420020457472
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(5505024, 6881280)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2045,12 +2045,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419891744768
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23420025962496
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(5505024, 6881280)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419897249792
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23420031467520
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(6881280, 8257536)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2060,12 +2060,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419852685312
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419986903040
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(6881280, 8257536)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419858190336
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419992408064
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(8257536, 9633792)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2075,12 +2075,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419863695360
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419997913088
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(8257536, 9633792)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419819130880
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419953348608
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(9633792, 11010048)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2090,12 +2090,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419824635904
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419958853632
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(9633792, 11010048)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419830140928
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419964358656
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.sharddim: [(11010048, 12386304)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.param.dtype: Float32
@@ -2105,12 +2105,12 @@ chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torc
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419785576448
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg.handle: 23419919794176
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.sharddim: [(11010048, 12386304)]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.fulldim: [[12386304]]
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.dtype: Float32
 chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.device: cuda:0
-chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419791081472
+chained_1.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_dtype_param_torch:bfloat16_grad_torch:float32.bucket_idx_1.exp_avg_sq.handle: 23419925299200
 optimizer.1.param_state_sharding_type: [blob]
 opt_param_scheduler.end_wd: 0.1
 opt_param_scheduler.lr_decay_steps: 6000
@@ -2118,10 +2118,10 @@ opt_param_scheduler.lr_decay_style: [blob]
 opt_param_scheduler.lr_warmup_steps: 0
 opt_param_scheduler.max_lr: 0.00045
 opt_param_scheduler.min_lr: 4.5e-06
-opt_param_scheduler.num_steps: 6000
+opt_param_scheduler.num_steps: 2000
 opt_param_scheduler.start_wd: 0.1
 opt_param_scheduler.wd_incr_steps: 6000
 opt_param_scheduler.wd_incr_style: [blob]
-rerun_state_machine.current_iteration: 750
+rerun_state_machine.current_iteration: 250
 rerun_state_machine.mode: [blob]
 rerun_state_machine.state: 0

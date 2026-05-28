@@ -173,6 +173,36 @@ def in_srun() -> bool:
     return "SLURM_PROCID" in os.environ
 
 
+def _cleanup_stale_checkpoint_server() -> None:
+    """Kill stray checkpoint_server processes and clear named shm segments on this host.
+
+    The daemon (``server_main.cpp``) calls ``setsid()`` and survives parent death, then
+    pins ``messages.h:Message::Port`` (41000). Any prior CI job on this node that
+    crashed before clean shutdown leaves the daemon listening on that port, so when
+    new ``checkpoint_server`` forks try to bind they hit EADDRINUSE and exit with
+    ``ErrorAlreadyRunning`` (``server.cpp:1427``). The clients then see "Failed to
+    start or connect to checkpoint service" — observed on h200 nodes that hosted
+    earlier failed pipelines on this branch.
+
+    Kill any leftover daemon and remove the named shm queues at
+    ``/dev/shm/checkpoint_request_*`` (named after
+    ``Message::RequestChannelName`` in ``messages.h``). Use ``-f`` matching the
+    full cmdline anchored on ``/megatron/native/build/checkpoint_server`` —
+    ``-x`` matches the kernel ``comm`` field which is truncated to 15 chars and
+    silently misses our 17-char binary name; the path anchor keeps us narrow
+    enough to avoid hitting unrelated processes that mention the string.
+    """
+    subprocess.run(
+        ["pkill", "-f", "/megatron/native/build/checkpoint_server"],
+        check=False,
+    )
+    for shm in Path("/dev/shm").glob("checkpoint_request_*"):
+        try:
+            shm.unlink()
+        except OSError as ex:
+            sys.stderr.write(f"[run_job] could not remove stale shm {shm}: {ex}\n")
+
+
 def _slurm_nodes_and_gpus() -> tuple[int, int]:
     nodes = int(os.environ.get("SLURM_NNODES", "1"))
     raw = os.environ.get("SLURM_GPUS_PER_NODE") or os.environ.get("SLURM_NTASKS_PER_NODE") or os.environ.get("SLURM_TASKS_PER_NODE")
@@ -500,7 +530,7 @@ def _maybe_valgrind_ctx(args: argparse.Namespace, cfg: str) -> contextlib.Abstra
     return _valgrind_checkpoint_server(_machine_tag(), cfg)
 
 
-def run_pretrain(args: argparse.Namespace) -> None:
+def run_pretrain(args: argparse.Namespace) -> None:  # noqa: C901
     ckpt_provider = _PRETRAIN_JOBS[args.job]
     cfg = f"{args.nodes}x{args.gpus_per_node}"
     extra_args = getattr(args, "extra_args", None)
@@ -524,6 +554,12 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 _wait_for_native_metadata_files(cfg, timeout_seconds=1800)
             except TimeoutError as ex:
                 sys.stderr.write(f"[run_job] in-srun wait for native artifacts timed out: {ex}\n")
+        # Run the cross-provider compare inside the srun task so it has access
+        # to the container's torch/numpy/megatron.native installation. The
+        # launcher process outside srun runs on bare-metal Python that lacks
+        # these deps and would crash on `import megatron.native.debug`.
+        if args.job == "pretrain-all":
+            _run_equality_compare(cfg)
         return
 
     # Clear stale checkpoints once in the launcher so in-srun tasks don't race on rmtree.
@@ -531,28 +567,47 @@ def run_pretrain(args: argparse.Namespace) -> None:
     if ckpt_dir.exists():
         shutil.rmtree(ckpt_dir)
 
-    if args.nodes > 1 or args.slurm:
-        # Launcher only — orchestration happens inside the srun task (in_srun branch above).
-        cmd = _build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, extra_args=extra_args)
-        _run_and_report_perf(cmd, args.job, cfg, args)
-    elif args.gpus_per_node > 1:
-        # Multi-GPU devbox: use torchrun subprocess so all worker output is captured in the log.
-        # mp.spawn workers don't inherit Python-level sys.stdout/stderr redirections.
-        cmd, env = _pretrain_cmd_and_env(
-            cfg,
-            args.nodes,
-            args.gpus_per_node,
-            use_torchrun=True,
-            ckpt_provider=ckpt_provider,
-            extra_args=extra_args,
-        )
-        with _maybe_valgrind_ctx(args, cfg):
-            _run_and_report_perf(cmd, args.job, cfg, args, env=env)
-    else:
-        # Single-GPU inline: call pretrain() directly in-process — no subprocess or torchrun.
-        # This lets you attach a debugger to run_job.py and hit breakpoints in training code.
-        with _maybe_valgrind_ctx(args, cfg):
-            _launch_pretrain_inline(cfg, args)
+    # pretrain-all is the only dual-provider job; its correctness check must run even
+    # when perf regresses, so capture the SystemExit(3) raised by _run_and_report_perf /
+    # _launch_pretrain_inline, run the equality compare, then re-raise. Other SystemExit
+    # codes (e.g. an unexpected internal exit) propagate immediately.
+    perf_exit: SystemExit | None = None
+    try:
+        if args.nodes > 1 or args.slurm:
+            # Launcher only — orchestration happens inside the srun task (in_srun branch above).
+            cmd = _build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, extra_args=extra_args)
+            _run_and_report_perf(cmd, args.job, cfg, args)
+        elif args.gpus_per_node > 1:
+            # Multi-GPU devbox: use torchrun subprocess so all worker output is captured in the log.
+            # mp.spawn workers don't inherit Python-level sys.stdout/stderr redirections.
+            cmd, env = _pretrain_cmd_and_env(
+                cfg,
+                args.nodes,
+                args.gpus_per_node,
+                use_torchrun=True,
+                ckpt_provider=ckpt_provider,
+                extra_args=extra_args,
+            )
+            with _maybe_valgrind_ctx(args, cfg):
+                _run_and_report_perf(cmd, args.job, cfg, args, env=env)
+        else:
+            # Single-GPU inline: call pretrain() directly in-process — no subprocess or torchrun.
+            # This lets you attach a debugger to run_job.py and hit breakpoints in training code.
+            with _maybe_valgrind_ctx(args, cfg):
+                _launch_pretrain_inline(cfg, args)
+    except SystemExit as exc:
+        if args.job != "pretrain-all" or exc.code != 3:  # noqa: PLR2004 — 3 = perf regression (see _run_and_report_perf / _launch_pretrain_inline)
+            raise
+        perf_exit = exc
+
+    # Reached only in the launcher. pretrain-all is the only dual-provider job
+    # so the check is gated on that. For slurm runs the compare already ran in
+    # the srun task (which has the container's deps); the launcher here is
+    # bare-metal and lacks torch/numpy, so skip.
+    if args.job == "pretrain-all" and not (args.nodes > 1 or args.slurm):
+        _run_equality_compare(cfg)
+    if perf_exit is not None:
+        raise perf_exit
 
 
 def _build_pretrain_srun_cmd(cfg: str, nodes: int, gpus_per_node: int, job: str, extra_args: list[str] | None = None) -> list[str]:
@@ -1496,35 +1551,147 @@ def run_update_baselines(args: argparse.Namespace) -> None:
 
 # Jobs that exercise the native checkpoint provider — these spawn the async
 # checkpoint_server, so we must wait for its background writes (registry.bin,
-# *.native.metadata.info) before the test stage finishes.
+# {peerIndex}.metadata.info) before the test stage finishes.
 _NATIVE_CKPT_JOBS = ("pretrain-native", "pretrain-all", "valgrind")
 
 
+def _native_sidecar_dir(iter_dir: Path) -> Path:
+    """Resolve where the native checkpoint_server's sidecars live for one iter_*.
+
+    In dual-provider mode the native and nvrx writers each get their own
+    sub-directory (iter_*/native, iter_*/nvrx); in single-provider mode the
+    native writer drops its files directly into iter_*. Detect from disk so
+    callers don't have to thread the config through.
+
+    The fallback is intentionally silent: if iter_*/native is missing for any
+    reason other than single-provider mode, callers will report "no files
+    matching <pattern> in <iter_dir>" — pointing at the parent rather than
+    the missing subdir. That trade is acceptable here because the only
+    dual-provider job (pretrain-all) is a CI correctness test where missing
+    files surface as a hard FileNotFoundError anyway."""
+    native_subdir = iter_dir / "native"
+    return native_subdir if native_subdir.is_dir() else iter_dir
+
+
+def _run_equality_compare(cfg: str) -> None:
+    """Compare every iter_*/native against iter_*/nvrx under the run's checkpoint dir.
+
+    Used by the pretrain-all dual-provider correctness test. Runs two passes per iter:
+
+      1. ``checkpoint_equality_compare.py`` — tensor + common.pt semantic equality
+         via ``dcp.load`` and ``torch.load``. Asymmetric on common.pt missing keys
+         (binding-gap policy) per the script's docstring.
+      2. ``distcp_trace`` on each side, then ``compare_reference_metadata`` —
+         byte-level metadata + per-chunk md5 diff. ``distcp_trace`` on the native
+         side also verifies the server's own metadata claims against on-disk
+         truth. The launcher only reaches here once the in-srun branch's
+         ``_wait_for_native_metadata_files`` has drained the server's writes,
+         so the files Pass 2 reads are already on disk.
+
+    Any pass failing on any iter raises a RuntimeError — propagating as exit 1,
+    not exit 3 (gitlab-ci-native.yml treats exit 3 as a perf regression).
+    Both passes run as subprocesses so that ``megatron.native.debug``'s
+    transitive import of ``megatron.core`` → ``torch._inductor`` reads the
+    same ``TORCHINDUCTOR_WORKER_START`` overlay we hand the training
+    subprocess; importing in-process from the in-srun parent (which doesn't
+    have that env) trips an ``Invalid start method`` assertion in newer torch
+    builds.
+    """
+    ckpt_root = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
+    iter_dirs = sorted(ckpt_root.glob("iter_*"))
+    if not iter_dirs:
+        raise RuntimeError(f"no iter_* dirs in {ckpt_root}")
+    # Thread MEGATRON_ROOT onto PYTHONPATH so `-m megatron.native.scripts.*` resolves
+    # regardless of cwd (CI launches from $CI_PROJECT_DIR; manual runs don't).
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{MEGATRON_ROOT}{os.pathsep}{existing_pp}" if existing_pp else str(MEGATRON_ROOT)
+    # Mirror _pretrain_cmd_and_env's torch overlay: the in-srun parent's env
+    # came in via srun --container-env, which has parsed our KEY=VALUE,KEY=...
+    # blob inconsistently in the past and produced a malformed
+    # ``TORCHINDUCTOR_WORKER_START`` value that newer torch._inductor rejects
+    # with "Invalid start method: fork=fork-". The training subprocess avoids
+    # this because _pretrain_cmd_and_env writes the same overrides explicitly
+    # — do the same here for the compare subprocesses.
+    env["TORCHINDUCTOR_WORKER_START"] = "fork"
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    failures: list[str] = []
+    for iter_dir in iter_dirs:
+        native = iter_dir / "native"
+        nvrx = iter_dir / "nvrx"
+        missing = [name for name, d in (("native", native), ("nvrx", nvrx)) if not d.is_dir()]
+        if missing:
+            raise RuntimeError(
+                f"equality-compare expected dual-provider layout under {iter_dir}, "
+                f"but {missing} subdir(s) missing",
+            )
+        sys.stderr.write(f"[run_job] equality-compare {iter_dir.name}\n")
+        rc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "megatron.native.scripts.checkpoint_equality_compare",
+                "--native", str(native),
+                "--nvrx", str(nvrx),
+            ],
+            env=env,
+            check=False,
+        ).returncode
+        if rc != 0:
+            failures.append(f"{iter_dir.name} (checkpoint_equality_compare rc={rc})")
+        rc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "megatron.native.scripts.metadata_compare",
+                "--native", str(native),
+                "--nvrx", str(nvrx),
+            ],
+            env=env,
+            check=False,
+        ).returncode
+        if rc != 0:
+            failures.append(f"{iter_dir.name} (metadata_compare rc={rc})")
+    if failures:
+        raise RuntimeError(
+            f"compare failed for {len(failures)} iter(s): "
+            f"{'; '.join(failures)}; see stderr above for per-finding detail",
+        )
+
+
 def _dump_nvrx_vs_native_diffs(cfg: str, max_lines: int = 200) -> None:
-    """Emit unified diff between reference.metadata.info (nvrx) and
-    0.native.metadata.info (native server) for every iter dir that has both
-    files on disk. Called from the in-srun pretrain failure path so the CI
-    log captures what diverged — distcp_trace itself only prints the diff
-    body when it's under half the file size, which the gb200 5313-diff case
-    blows past."""
+    """Emit cross-provider diff between nvrx and native's independently-derived
+    reference.metadata.info per iter dir, when both writers ran (dual-provider
+    mode). Called from the in-srun pretrain failure path so the CI log captures
+    what diverged — distcp_trace's own diff print is bounded by file size and
+    the gb200 5313-diff case blows past it."""
     checkpoints_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
     if not checkpoints_dir.is_dir():
         return
+    compared_iters = 0
+    diverged_iters = 0
     for iter_dir in sorted(checkpoints_dir.glob("iter_*")):
-        ref = iter_dir / "reference.metadata.info"
-        nat = iter_dir / "0.native.metadata.info"
-        if not (ref.is_file() and nat.is_file()):
+        native_ref = iter_dir / "native" / "reference.metadata.info"
+        nvrx_ref = iter_dir / "nvrx" / "reference.metadata.info"
+        if not (native_ref.is_file() and nvrx_ref.is_file()):
             continue
-        ref_lines = ref.read_text().splitlines()
-        nat_lines = nat.read_text().splitlines()
-        diff = list(difflib.unified_diff(ref_lines, nat_lines, fromfile=str(ref), tofile=str(nat), n=1))
+        compared_iters += 1
+        native_lines = native_ref.read_text().splitlines()
+        nvrx_lines = nvrx_ref.read_text().splitlines()
+        diff = list(difflib.unified_diff(nvrx_lines, native_lines, fromfile=str(nvrx_ref), tofile=str(native_ref), n=1))
         if not diff:
             continue
+        diverged_iters += 1
         sys.stderr.write(f"[run_job] nvrx-vs-native metadata diff for {iter_dir.name} ({len(diff)} lines):\n")
         for line in diff[:max_lines]:
             sys.stderr.write(line + "\n")
         if len(diff) > max_lines:
             sys.stderr.write(f"[run_job] ... ({len(diff) - max_lines} more diff lines suppressed; full files in artifacts)\n")
+        sys.stderr.flush()
+    if compared_iters > 0 and diverged_iters == 0:
+        # Signal that the diagnostic ran cleanly so log readers don't wonder
+        # whether it was silently skipped.
+        sys.stderr.write(f"[run_job] nvrx-vs-native: 0 cross-provider differences across {compared_iters} iter dirs\n")
         sys.stderr.flush()
 
 
@@ -1537,13 +1704,23 @@ def _foreach_native_metadata_files(
 
     If wait_seconds > 0, polls for each pattern's first match (per iter dir) before globbing
     — needed because checkpoint_server writes these files asynchronously in the background.
+    `wait_only_patterns` are polled but not passed to callback — used to block on files the
+    post-pretrain stage consumes downstream but that shouldn't enter the baseline snapshot.
     """
     metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
     ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
     if not ci_runs_root.is_dir():
         raise FileNotFoundError(f"ci-runs root not found: {ci_runs_root}")
 
-    files_to_copy = ("registry.bin", "*.native.metadata.info", "*.txt")
+    # `[0-9]*.metadata.info` keeps the per-rank server dumps separate from
+    # `reference.metadata.info` (the distcp_trace cross-check) so the latter
+    # doesn't bleed into the baseline snapshot.
+    files_to_copy = ("registry.bin", "[0-9]*.metadata.info", "*.txt")
+    # `common.pt` is consumed by the post-pretrain equality-compare but isn't
+    # part of the baseline snapshot — checkpoint_server writes it async, so the
+    # post-pretrain wait must gate on it, but `_update_native_metadata_files`
+    # must not copy multi-MB torch pickles into `megatron/native/metadata/`.
+    wait_only_patterns = ("common.pt",)
     iter_pattern = re.compile(r"^iter_(\d{7})$")
     cfg_pattern = re.compile(r"^\d+x\d+$")
 
@@ -1568,21 +1745,26 @@ def _foreach_native_metadata_files(
             iter_str = iter_pattern.match(src_iter_dir.name).group(1)
             dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
             dst_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_dir = _native_sidecar_dir(src_iter_dir)
             for pattern in files_to_copy:
                 if wait_seconds > 0:
-                    wait_for_file(src_iter_dir / pattern, wait_seconds)
-                matches = sorted(src_iter_dir.glob(pattern))
+                    wait_for_file(sidecar_dir / pattern, wait_seconds)
+                matches = sorted(sidecar_dir.glob(pattern))
                 if not matches:
-                    raise FileNotFoundError(f"no files matching {pattern!r} in {src_iter_dir}")
+                    raise FileNotFoundError(f"no files matching {pattern!r} in {sidecar_dir}")
                 for src in matches:
                     dst = dst_dir / src.name
                     callback(src, dst)
+            if wait_seconds > 0:
+                for pattern in wait_only_patterns:
+                    wait_for_file(sidecar_dir / pattern, wait_seconds)
 
 
 def _wait_for_native_metadata_files(cfg: str, timeout_seconds: int) -> None:
-    """Block until checkpoint_server has flushed registry.bin and *.native.metadata.info
-    under ci-runs/<cfg>/checkpoints/iter_*. Call after pretrain returns but before the
-    test stage finishes, so the downstream update_baselines stage finds the files."""
+    """Block until checkpoint_server has flushed registry.bin and {peerIndex}.metadata.info
+    under ci-runs/<cfg>/checkpoints/iter_* (or iter_*/native in dual-provider mode). Call
+    after pretrain returns but before the test stage finishes, so the downstream
+    update_baselines stage finds the files."""
 
     def _log(src: Path, _dst: Path) -> None:
         sys.stderr.write(f"[run_job] Found native metadata file: {src}\n")
@@ -1591,7 +1773,7 @@ def _wait_for_native_metadata_files(cfg: str, timeout_seconds: int) -> None:
 
 
 def _update_native_metadata_files(filter_config: str | None) -> None:
-    """Refresh registry.bin and native.metadata.info under megatron/native/metadata/.
+    """Refresh registry.bin and {peerIndex}.metadata.info under megatron/native/metadata/.
 
     Driven by ci-runs/<cfg>/checkpoints/iter_NNNNNNN/ — every iter the just-completed
     pretrain-native run produced gets mirrored to metadata/<cfg>_checkpoints_iter_NNNNNNN/
@@ -1666,19 +1848,31 @@ def main() -> None:
         # forwarding.
         os.environ["PHOENIX_BUILD_FOR_VALGRIND"] = "1"
 
-    if args.job == "update_baselines":
-        run_update_baselines(args)
-        return
+    # Clean stale checkpoint_server daemons + named shm before starting any
+    # work, and again on exit, so the next pipeline lands on a node free of
+    # this branch's pollution. Only meaningful on compute nodes: the slurm
+    # launcher (args.slurm and not in_srun()) runs on the head node, where no
+    # checkpoint_server ever runs, so we skip there.
+    is_compute_node = in_srun() or not args.slurm
+    if is_compute_node:
+        _cleanup_stale_checkpoint_server()
+    try:
+        if args.job == "update_baselines":
+            run_update_baselines(args)
+            return
 
-    image = Path(_default_enroot_image())
-    if args.slurm:
-        if args.job == "pretrain-all" and not in_srun():
-            _ensure_enroot_image(image)
-        wait_for_file(image, timeout_seconds=3600)
-    if args.job == "ckptbench":
-        run_ckptbench(args)
-    else:
-        run_pretrain(args)
+        image = Path(_default_enroot_image())
+        if args.slurm:
+            if args.job == "pretrain-all" and not in_srun():
+                _ensure_enroot_image(image)
+            wait_for_file(image, timeout_seconds=3600)
+        if args.job == "ckptbench":
+            run_ckptbench(args)
+        else:
+            run_pretrain(args)
+    finally:
+        if is_compute_node:
+            _cleanup_stale_checkpoint_server()
 
 
 if __name__ == "__main__":

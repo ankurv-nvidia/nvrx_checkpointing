@@ -285,7 +285,7 @@ Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId)
     return *snapshots[snapshotId];
 }
 
-// Write native.metadata.info: flat sorted "key=value" pairs for all tensor nodes.
+// Write {peerIndex}.metadata.info: flat sorted "key=value" pairs for all tensor nodes.
 // Field names and value formats are aligned with reference.metadata.info (produced by
 // distcp_trace.py via recursive dict flattening) so the two files can be diffed line-by-line.
 //
@@ -305,8 +305,8 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 
     auto const ckptDir = snapshot.path.parent_path();
     std::filesystem::create_directories(ckptDir);
-    auto const    infoFile = ckptDir / fmt::format("{}.native.metadata.info", peerIndex);
-    auto const    tmpFile  = ckptDir / fmt::format("{}.native.metadata.info.tmp", peerIndex);
+    auto const    infoFile = ckptDir / fmt::format("{}.metadata.info", peerIndex);
+    auto const    tmpFile  = ckptDir / fmt::format("{}.metadata.info.tmp", peerIndex);
     std::ofstream ofs(tmpFile);
     if (!ofs.good())
     {
@@ -365,8 +365,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                                tnsr.handle);
                 }
 #endif
-                addmd5(fmt::format("{}[{}]", localState->localRegistry->GetNodeId(node.handle), tnsr.sharddim),
-                       ComputeMd5Hex(data, size));
+                addmd5(fmt::format("{}[{}]", localState->localRegistry->GetNodeId(node.handle), tnsr.sharddim), ComputeMd5Hex(data, size));
             }
             else if (type == StateNode::Type::ShardedTensor)
             {
@@ -474,8 +473,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
 #if defined NATIVE_CKPT_TRACE_NODE
         if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))
         {
-            auto const& shTen
-                = std::get<StateNode::ShardedTensor>(sessionState.registry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
+            auto const& shTen = std::get<StateNode::ShardedTensor>(sessionState.registry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
             fmt::print(stderr,
                        "[native_ckpt:svr][{}][{}] Found in tensorMap NATIVE_CKPT_TRACE_NODE = {}  {}\n",
                        sessionId,
@@ -547,11 +545,8 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         WriteGlobalStateTreeToFile_(snapshot, snapshot.path.parent_path() / "registry.bin");
     }
 
-    checkpoint::distcp::WriteRankShard(snapshot.path.parent_path(),
-                                       hdr.globalRank,
-                                       *localState.localRegistry,
-                                       localState.blob,
-                                       localState.writeLog);
+    checkpoint::distcp::WriteRankShard(
+        snapshot.path.parent_path(), hdr.globalRank, *localState.localRegistry, localState.blob, localState.writeLog);
     {
         std::lock_guard<std::mutex> lock(mutex);
         snapshot.writeCompletedRanks.insert(hdr.globalRank);
@@ -566,13 +561,14 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (snapshot.writeCompletedRanks.size() >= static_cast<size_t>(topo.worldSize)) { break; }
-                fmt::print(stderr,
-                           "[native_ckpt:svr][{}][{}] FinalizeSnapshot waiting for snapshot={} write-completed ranks {} of {} remaining...\n",
-                           sessionId,
-                           hdr.globalRank,
-                           hdr.snapshotId,
-                           static_cast<size_t>(topo.worldSize) - snapshot.writeCompletedRanks.size(),
-                           static_cast<size_t>(topo.worldSize));
+                fmt::print(
+                    stderr,
+                    "[native_ckpt:svr][{}][{}] FinalizeSnapshot waiting for snapshot={} write-completed ranks {} of {} remaining...\n",
+                    sessionId,
+                    hdr.globalRank,
+                    hdr.snapshotId,
+                    static_cast<size_t>(topo.worldSize) - snapshot.writeCompletedRanks.size(),
+                    static_cast<size_t>(topo.worldSize));
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
@@ -590,8 +586,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             manifest.reserve(snapshot.localStates.size());
             for (auto const& [r, ls] : snapshot.localStates)
             {
-                manifest.push_back(
-                    checkpoint::distcp::RankManifestRef{.rank = r, .writeLog = &ls->writeLog});
+                manifest.push_back(checkpoint::distcp::RankManifestRef{.rank = r, .writeLog = &ls->writeLog});
             }
         }
         // Log on failure so the operator sees what broke. The async worker's
@@ -600,14 +595,15 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         // would otherwise be the first user-visible signal.
         try
         {
-            checkpoint::distcp::WriteMetadata(
-                snapshot.path.parent_path(), *snapshot.registry, std::span{manifest});
-        }
-        catch (std::exception const& ex)
+            checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry, std::span{manifest});
+        } catch (std::exception const& ex)
         {
             fmt::print(stderr,
                        "[native_ckpt:svr][{}][{}] WriteMetadata failed for snapshot={}: {}\n",
-                       sessionId, hdr.globalRank, hdr.snapshotId, ex.what());
+                       sessionId,
+                       hdr.globalRank,
+                       hdr.snapshotId,
+                       ex.what());
             throw;
         }
     }
@@ -657,11 +653,10 @@ void Session::MergeFragmentToGlobalState_(std::lock_guard<std::mutex> const& /* 
         auto& node       = sessionState.registry->GetNode(nodeHandle);
         if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor))
         {
-            throw std::runtime_error(
-                fmt::format("Received tensor shard for non-sharded tensor '{}' expected-type({}) != actual-type({})",
-                            tensorShard.nodeId,
-                            static_cast<size_t>(StateNode::Type::ShardedTensor),
-                            node.data.index()));
+            throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor '{}' expected-type({}) != actual-type({})",
+                                                 tensorShard.nodeId,
+                                                 static_cast<size_t>(StateNode::Type::ShardedTensor),
+                                                 node.data.index()));
         }
         auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
         if (tnsr.shards.empty())
@@ -831,8 +826,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
         DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata_{}.txt", localStateRank), *localState->localRegistry);
     }
     DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata.txt"), *sessionState.registry);
-    fmt::print(
-        stderr, "[native_ckpt:svr] Accumulated all localState for global State: Dumped states in {}\n", (PerfClock::now() - start1));
+    fmt::print(stderr, "[native_ckpt:svr] Accumulated all localState for global State: Dumped states in {}\n", (PerfClock::now() - start1));
 }
 
 void Session::Activate()
@@ -1045,7 +1039,8 @@ void Session::HandleStateRegistryFragment(Rank recvRank, std::vector<TensorShard
     recievedFrom.insert(recvRank);
 }
 
-void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::array<char, cipc::D2HBufferSize> const& /* buf */) {}
+void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::array<char, cipc::D2HBufferSize> const& /* buf */)
+{}
 
 struct Server
 {
