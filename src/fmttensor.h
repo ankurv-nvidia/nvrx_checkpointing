@@ -105,7 +105,7 @@ template <ConceptTensorTraits Traits> struct fmt::formatter<TensorShardMapT<Trai
     }
 };
 
-#if !defined NDEBUG
+#ifndef NDEBUG
 inline void RankTopology::AssertValid() const
 {
     auto numPeers = (static_cast<uint32_t>(worldSize) + ranksPerPeer - 1) / ranksPerPeer;

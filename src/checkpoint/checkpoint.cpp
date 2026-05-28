@@ -89,9 +89,9 @@ void SvcPing()
     static std::mutex PingMutex;
     SUPPRESS_WARNINGS_END
 
-    std::lock_guard<std::mutex> lock(PingMutex);
-    auto                        selfLoc   = boost::dll::this_line_location();
-    auto                        svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
+    std::scoped_lock lock(PingMutex);
+    auto             selfLoc   = boost::dll::this_line_location();
+    auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
     if (TryConnectToCheckpointService()) { return; }
     if (GetEnv("CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH", "0") == "1") { std::this_thread::sleep_for(1s); }
     else
@@ -125,7 +125,7 @@ void SvcStop()
     static std::mutex PingMutex;
     SUPPRESS_WARNINGS_END
 
-    std::lock_guard<std::mutex> lock(PingMutex);
+    std::scoped_lock lock(PingMutex);
 
     if (!TryConnectToCheckpointService()) { return; }
 
@@ -554,7 +554,7 @@ void FinalizeStateRegistry(StateTree& self)
 [[noreturn]] static void LoadCheckpointforStateTreeFromStream(StateTree& /* tree */, std::istream& /* stream */)
 {
     throw std::logic_error("TODO");
-#if defined TODO_LOAD_CHECKPOINT
+#ifdef TODO_LOAD_CHECKPOINT
     StateSerDes::ReadIntoNode(stream, tree, 0);
     for (auto& node : tree.nodes)
     {
@@ -602,11 +602,11 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
     using namespace std::string_view_literals;
     if (device.IsType("cpu"sv)) { return DeviceContext::CreateDeviceContextCPU(device, streamIdx); }
 
-#if defined(PHOENIX_HAVE_CUDA)
+#ifdef PHOENIX_HAVE_CUDA
     if (device.IsType("cuda"sv)) { return DeviceContext::CreateDeviceContextCUDA(device, streamIdx); }
 
 #endif
-#if defined(PHOENIX_HAVE_METAL)
+#ifdef PHOENIX_HAVE_METAL
     if (device.IsType("mps"sv)) { return DeviceContext::CreateDeviceContextMTL(device, streamIdx); }
 #endif
     return DeviceContext::CreateDeviceContextCPU(device, streamIdx);

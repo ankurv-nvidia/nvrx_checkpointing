@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace checkpoint::ipc
 {
@@ -39,7 +40,7 @@ struct PerfMetrics
     Clock::duration total{};
     Clock::duration min{Clock::duration::max()};
 
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
 
     bool Record(Clock::duration dur)
     {
@@ -169,7 +170,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
 
     void Push(THdr const& hdr, char const* data, size_t size)
     {
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
         auto start = PerfMetrics::Clock::now();
 #endif
         if (size > SlotSize) { throw std::runtime_error("Message exceeds shared buffer slot capacity"); }
@@ -177,7 +178,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
         _hdrs[slot] = hdr;
         std::memcpy(_data[slot].data(), data, size);
         FinishWriting_(slot);
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
         sendPerf.Record(PerfMetrics::Clock::now() - start);
 #endif
     }
@@ -193,7 +194,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
 
     std::tuple<bool, THdr const&, std::array<char, SlotSize> const&> BeginRead()
     {
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
         readstart = PerfMetrics::Clock::now();
 #endif
         auto [stopRequested, slot] = StartReading_();
@@ -235,7 +236,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
         bip::scoped_lock<bip::interprocess_mutex> lock(_ctrl->mutex);
         while (!_stopRequested && AvailableForWrite_() == 0)
         {
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             auto start = PerfMetrics::Clock::now();
 #if SHM_RING_BUFFER_ENABLE_PERF_METRICS == 2
             // Print Write-Head of queue for debugging.
@@ -248,7 +249,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
             // So its important to do so right before we wait
             _ctrl->canRead.notify_all();
             auto valid = _ctrl->canWrite.wait_for(lock, WriteWaitTimeout, [this]() { return AvailableForWrite_() > 0 || _stopRequested; });
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             wlatency.Record(PerfMetrics::Clock::now() - start);
 #endif
             // if heartbeat stopped then raise exception
@@ -300,7 +301,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
             _ctrl->rtimestamp = Control::Clock::now();
             _ctrl->canWrite.notify_all();
             _ctrl->canRead.wait_for(lock, HearBeatInterval, [this]() { return AvailableForRead_() > 0 || _stopRequested; });
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             if (AvailableForRead_() > 0)
             {
                 rlatency.Record(Control::Clock::now() - _ctrl->wtimestamp.load());    //
@@ -381,7 +382,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
                     std::this_thread::sleep_for(HearBeatInterval);
                     continue;
                 }
-                if (static_cast<size_t>(regionSize) < TotalShmSize)
+                if (std::cmp_less(regionSize, TotalShmSize))
                 {
                     throw std::logic_error(
                         fmt::format("Invalid state for shared_memory. expected-size({}) != actual-size({})", TotalShmSize, regionSize));
@@ -414,7 +415,7 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
     std::span<THdr>                       _hdrs;
     bool                                  _stopRequested{false};
     bool                                  _resetShm{false};
-#if defined SHM_RING_BUFFER_ENABLE_PERF_METRICS
+#ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
     PerfMetrics::Clock::time_point readstart;
 #endif
 };

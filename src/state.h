@@ -143,7 +143,7 @@ struct StateTree
     {
         auto& parent = _nodes[static_cast<size_t>(node)].data;
         if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
-#if !defined(NDEBUG)
+#ifndef NDEBUG
         if (!allowDuplicates)
         {
             for (auto childHandle : std::get<StateNode::Dict>(parent))
@@ -167,7 +167,7 @@ struct StateTree
 
     auto FindOrAddNodeByFQN(std::string_view const& fqn)
     {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
         if (fqn == NATIVE_CKPT_TRACE_NODE)
         {
             fmt::print(stderr, "FindOrAddNodeByFQN: Found trace node NATIVE_CKPT_TRACE_NODE: {}\n", NATIVE_CKPT_TRACE_NODE);
@@ -192,7 +192,7 @@ struct StateTree
         auto const& stateName = handler->name;
         if (stateName.contains('.'))
         {
-#if defined(NATIVE_CKPT_WARN_FQN)
+#ifdef NATIVE_CKPT_WARN_FQN
             auto parentFQN = GetNodeId(node);
             fmt::print(stderr,
                        "[native_ckpt:cli][WARN] StateName contains dots. Treating it as a fqn. Will be reparented to root of state-dict"
@@ -254,7 +254,7 @@ struct StateTree
 
     template <typename TLambda> void ChainAsyncCall(TLambda&& lambda)
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         if (_async.valid())
         {
             _async = std::async(std::launch::async | std::launch::deferred,
@@ -312,7 +312,7 @@ struct StateTree
     void AssertShardedTensorHasNoHoles(StateNode::Handle nodeHandle) const
     {
         auto const& tnsr = std::get<StateNode::ShardedTensor>(GetNode(nodeHandle).data);
-        if (tnsr.shards.size() == 0)
+        if (tnsr.shards.empty())
         {
             throw std::runtime_error(fmt::format("[native_ckpt:cli][{}] sharded tensor {}[{}] has no shards in metadata output\n",
                                                  GlobalRank(),
@@ -333,7 +333,7 @@ struct StateTree
     {
         for (auto& node : _nodes)
         {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
             auto fqn = GetNodeId(node.handle);
             if (fqn == NATIVE_CKPT_TRACE_NODE)
             {
@@ -393,7 +393,7 @@ struct StateTree
 
     void WaitForAsyncCalls()
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         if (_async.valid())
         {
             _async.get();
@@ -403,8 +403,8 @@ struct StateTree
 
     void FinalizeRegistry()
     {
-        std::lock_guard<std::mutex> lock(_mutex);
-        auto&                       root = _nodes[0];
+        std::scoped_lock lock(_mutex);
+        auto&            root = _nodes[0];
         try
         {
             SortDictionaryNode_(root);
@@ -479,7 +479,7 @@ struct StateTree
                 for (auto shard : shTen.shards)
                 {
                     shard.handle = node.handler->GetTensorState().handle;
-                    updatedShards.insert(std::move(shard));
+                    updatedShards.insert(shard);
                 }
                 std::swap(shTen.shards, updatedShards);
             }

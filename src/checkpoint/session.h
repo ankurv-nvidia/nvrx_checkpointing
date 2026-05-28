@@ -48,13 +48,13 @@ struct Session
         std::string                 name;
         std::filesystem::path       path;
 
-        std::shared_ptr<StateTree>                                                    registry;
-        std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>>        localStates;
+        std::shared_ptr<StateTree>                                             registry;
+        std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>> localStates;
         // Ranks that have sent FinalizeSnapshot for this snapshot
-        std::unordered_set<checkpoint::ipc::Rank>                                     finalizedRanks;
+        std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
         // Ranks whose __<r>_0.distcp file has been written and writeLog populated.
         // Mirrors `finalizedRanks`: rank-0 polls this set to gate `.metadata` write.
-        std::unordered_set<checkpoint::ipc::Rank>                                     writeCompletedRanks;
+        std::unordered_set<checkpoint::ipc::Rank> writeCompletedRanks;
     };
 
     Server* const                                  server;
@@ -74,30 +74,21 @@ struct Session
 
     std::vector<std::future<void>> asyncTasks;
 
-    Session(Server*                    serverIn,
-            checkpoint::ipc::SessionId sessionIdIn,
-            std::filesystem::path      workDirIn,
-            RankTopology               topoIn);
+    Session(Server* serverIn, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
 
     void Activate();
 
-    void Handle(checkpoint::ipc::Message::LocalStateRegistry const&     hdr,
-                std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
-    void Handle(checkpoint::ipc::Message::LocalStateData const&         hdr1,
-                std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::LocalStateData const& hdr1, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
-    void Handle(checkpoint::ipc::Message::ActivateSnapshot const&       hdr,
-                std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::ActivateSnapshot const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
-    void Handle(checkpoint::ipc::Message::FinalizeSnapshot const&       hdr,
-                std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
-    void Handle(checkpoint::ipc::Message::FinalizeSession const&        hdr,
-                std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
-    void HandleStateRegistryFragment(checkpoint::ipc::Rank               recvRank,
-                                     std::vector<TensorShardInfo> const& tensorShards);
+    void HandleStateRegistryFragment(checkpoint::ipc::Rank recvRank, std::vector<TensorShardInfo> const& tensorShards);
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank);
@@ -109,11 +100,9 @@ struct Session
     void OnRecieveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);
 
-    void MergeFragmentToGlobalState_(std::lock_guard<std::mutex> const&  lock,
-                                     std::vector<TensorShardInfo> const& tensorShards);
+    void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
 
-    void SendPeerFinalizeSnapshotComplete_(std::string const&                                peer,
-                                           checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
+    void SendPeerFinalizeSnapshotComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     void WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const;

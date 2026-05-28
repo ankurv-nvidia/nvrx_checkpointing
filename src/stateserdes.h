@@ -100,7 +100,7 @@ struct StateSerDes
             break;
             case Type::TensorShard:
             {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(nodeHandle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
@@ -115,7 +115,7 @@ struct StateSerDes
             break;
             case Type::ShardedTensor:
             {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(nodeHandle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
@@ -174,7 +174,7 @@ struct StateSerDes
             node.handle   = hdr.handle;
             node.parent   = hdr.parent;
             node.name     = serdes::ReadBlob(istrm, hdr.namelen);
-            if (node.name == "" && node.handle != StateNode::Handle::Root
+            if (node.name.empty() && node.handle != StateNode::Handle::Root
                 && hdr.type != Type::Invalid)    // Only root node can have empty name
             {
                 throw std::runtime_error(fmt::format(
@@ -209,7 +209,7 @@ struct StateSerDes
             break;
             case Type::TensorShard:
             {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
@@ -224,7 +224,7 @@ struct StateSerDes
             break;
             case Type::ShardedTensor:
             {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {

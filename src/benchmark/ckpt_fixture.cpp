@@ -110,12 +110,8 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) { throw std::runtime_error(fmt::format("Failed to open state registry: {}", path.string())); }
-    ctx.globalRegistry = std::make_unique<StateTree>(RankTopology{
-        .rank         = Rank{0},
-        .worldSize    = Rank{1},
-        .ranksPerPeer = 1,
-        .peersPerNode = 1,
-        .peers        = {"localhost"}});
+    ctx.globalRegistry = std::make_unique<StateTree>(
+        RankTopology{.rank = Rank{0}, .worldSize = Rank{1}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost"}});
     auto registry = StateSerDes::Read(ifs);
     registry->CloneInto(*ctx.globalRegistry);
     if (!ifs.eof())
@@ -150,12 +146,11 @@ void ValidateRoundTrip(StateTree const& localState, Blob const& blob)
     localState.WalkNodes([&](auto& node) {
         if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
         {
-            auto& tnsr     = std::get<StateNode::TensorShard>(node.data);
-            auto* data     = &blob.At<char>(tnsr.handle);    // NOLINT
-            auto  size     = tnsr.ShardSizeBytes();
-            auto  shardFqn = localState.GetNodeId(node.handle);
-            auto  actualPattern
-                = std::string_view(static_cast<char const*>(data), std::min(size, static_cast<uint64_t>(shardFqn.size())));
+            auto& tnsr          = std::get<StateNode::TensorShard>(node.data);
+            auto* data          = &blob.At<char>(tnsr.handle);    // NOLINT
+            auto  size          = tnsr.ShardSizeBytes();
+            auto  shardFqn      = localState.GetNodeId(node.handle);
+            auto  actualPattern = std::string_view(static_cast<char const*>(data), std::min(size, static_cast<uint64_t>(shardFqn.size())));
             if (actualPattern != shardFqn)
             {
                 throw std::runtime_error(fmt::format("[ERROR] Validation failed for shard {} at offset {} rank = {}. Got: {}\n",
@@ -206,13 +201,8 @@ void RoundTripCallback(void*                             cbData,
 {
     auto localRank = localState.Topo().rank;
     if (localRank != *static_cast<Rank*>(cbData)) { return; }
-    fmt::print(stderr,
-               "Validating sessionId={} snapshotId={} name={} path={} rank={}\n",
-               sessionId,
-               snapshotId,
-               name,
-               path.string(),
-               localRank);
+    fmt::print(
+        stderr, "Validating sessionId={} snapshotId={} name={} path={} rank={}\n", sessionId, snapshotId, name, path.string(), localRank);
     ValidateRoundTrip(localState, blob);
 }
 }    // namespace
@@ -246,10 +236,7 @@ void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree)
             try
             {
                 func(tree, ckptDir);
-            } catch (...)
-            {
-                workerExc = std::current_exception();
-            }
+            } catch (...) { workerExc = std::current_exception(); }
             {
                 std::unique_lock<std::mutex> lock(ctx.mutex);
                 if (workerExc && !ctx.workerException) { ctx.workerException = workerExc; }

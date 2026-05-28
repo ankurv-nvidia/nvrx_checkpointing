@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#if !defined NDEBUG
+#ifndef NDEBUG
 #define TENSOR_SHARD_ASSERTION_ENABLED
 #endif
 
@@ -22,7 +22,7 @@ namespace std
 {
 template <typename T, std::size_t N> struct inplace_vector : std::array<T, N>    // NOLINT
 {
-    inplace_vector()  = default;
+    inplace_vector()  = default;    // NOLINT(cppcoreguidelines-pro-type-member-init)
     ~inplace_vector() = default;
     CLASS_DEFAULT_COPY_AND_MOVE(inplace_vector);
 
@@ -187,11 +187,11 @@ template <ConceptTensorTraits Traits> struct TensorT
 {
     static constexpr size_t MaxDims = Traits::MaxDims;
 
-    using DimRange = typename Traits::DimRange;
-    using Dim      = typename Traits::Dim;
-    using Range    = typename Traits::Range;
-    using SizeT    = typename Traits::SizeT;
-    using DType    = typename Traits::DType;
+    using DimRange = Traits::DimRange;
+    using Dim      = Traits::Dim;
+    using Range    = Traits::Range;
+    using SizeT    = Traits::SizeT;
+    using DType    = Traits::DType;
 
     DimRange      sharddim{};
     Dim           fulldim{};
@@ -220,7 +220,7 @@ template <ConceptTensorTraits Traits> struct TensorT
 
     void AssertShardIsValid() const
     {
-#if defined TENSOR_SHARD_ASSERTION_ENABLED
+#ifdef TENSOR_SHARD_ASSERTION_ENABLED
         for (size_t dim = 0; dim < sharddim.size(); ++dim)
         {
             auto const& r = sharddim[dim];
@@ -262,11 +262,11 @@ struct RankTopology
 
 template <ConceptTensorTraits Traits> struct RankedTensorShardT
 {
-    typename Traits::DimRange sharddim{};
-    DeviceId                  device{"cpu"};
-    uint64_t                  handle = 0;
-    Rank                      rank{Rank::Invalid};
-    uint32_t                  padding{};
+    Traits::DimRange sharddim{};
+    DeviceId         device{"cpu"};
+    uint64_t         handle = 0;
+    Rank             rank{Rank::Invalid};
+    uint32_t         padding{};
 
     bool operator==(RankedTensorShardT<Traits> const& other) const = default;
 
@@ -285,9 +285,9 @@ template <ConceptTensorTraits Traits> struct RankedTensorShardT
         return size * static_cast<uint64_t>(Traits::GetDTypeSize(dtype));
     }
 
-    void AssertShardIsValid([[maybe_unused]] typename Traits::Dim const& fulldim) const
+    void AssertShardIsValid([[maybe_unused]] Traits::Dim const& fulldim) const
     {
-#if defined TENSOR_SHARD_ASSERTION_ENABLED
+#ifdef TENSOR_SHARD_ASSERTION_ENABLED
         for (size_t dim = 0; dim < sharddim.size(); ++dim)
         {
             auto const& r = sharddim[dim];
@@ -315,11 +315,11 @@ template <ConceptTensorTraits Traits> struct TensorShardMapT
     using Tensor            = TensorT<Traits>;
     using RankedTensorShard = RankedTensorShardT<Traits>;
 
-    using DimRange = typename Traits::DimRange;
-    using Dim      = typename Traits::Dim;
-    using Range    = typename Traits::Range;
-    using SizeT    = typename Traits::SizeT;
-    using DType    = typename Traits::DType;
+    using DimRange = Traits::DimRange;
+    using Dim      = Traits::Dim;
+    using Range    = Traits::Range;
+    using SizeT    = Traits::SizeT;
+    using DType    = Traits::DType;
 
     Traits::DType dtype{};
     Dim           fulldim{};
@@ -416,7 +416,8 @@ template <typename T, size_t N> struct std::hash<std::inplace_vector<T, N>>
 {
     constexpr size_t operator()(std::inplace_vector<T, N> const& obj) const
     {
-        return std::accumulate(obj.begin(), obj.end(), size_t(0), [](size_t acc, T const& value) { return acc ^ std::hash<T>{}(value); });
+        return std::accumulate(
+            obj.begin(), obj.end(), static_cast<size_t>(0), [](size_t acc, T const& value) { return acc ^ std::hash<T>{}(value); });
     }
 };
 

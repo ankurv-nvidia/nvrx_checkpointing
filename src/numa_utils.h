@@ -5,8 +5,8 @@
 
 #include <fmt/format.h>
 
-#include <string>
 #include <array>
+#include <string>
 
 inline uint8_t DetectNumaNodeCount()
 {

@@ -31,7 +31,7 @@ struct CPUContext : public DeviceContext
     {
         std::free(reinterpret_cast<void*>(deviceAddr));    // NOLINT
     }
-    
+
     void FreeHostPinnedBuffer(void* ptr) override
     {
         std::free(ptr);    // NOLINT

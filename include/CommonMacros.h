@@ -1,11 +1,11 @@
 // cppforge-sync
 #pragma once
 #ifndef _PRAGMA_STRINGIFY
-#define _PRAGMA_STRINGIFY2(x) _Pragma(#x)
-#define _PRAGMA_STRINGIFY(x) _PRAGMA_STRINGIFY2(x)
+#define _PRAGMA_STRINGIFY2(x) _Pragma(#x)             // NOLINT
+#define _PRAGMA_STRINGIFY(x) _PRAGMA_STRINGIFY2(x)    // NOLINT
 #endif
 
-#if !(defined SUPPRESS_WARNINGS_START)
+#ifndef SUPPRESS_WARNINGS_START
 #if defined _MSC_VER && !defined __clang__
 #define SUPPRESS_WARNINGS_START _Pragma("warning(push, 3)")
 
@@ -49,7 +49,7 @@
         _Pragma("warning(disable : 5204)") /* class has virtual functions, but its trivial destructor is not virtual;*/      \
         _Pragma("warning(disable : 4668)") /* not defined as a preprocessor macro, replacing with '0' f*/
 
-#elif defined(__clang__)
+#elifdef __clang__
 #define SUPPRESS_WARNINGS_START _Pragma("clang diagnostic push")
 
 #define SUPPRESS_WARNINGS_END _Pragma("clang diagnostic pop")
@@ -63,7 +63,7 @@
 
 #define SUPPRESS_FMT_WARNINGS _Pragma("clang diagnostic ignored \"-Weverything\"")
 
-#elif defined(__GNUC__)
+#elifdef __GNUC__
 
 #define SUPPRESS_WARNINGS_END _Pragma("GCC diagnostic pop")
 
@@ -92,7 +92,8 @@ SUPPRESS_CLANG_WARNING("-Wc++17-extensions")
 SUPPRESS_CLANG_WARNING("-Wunused-macros")
 #endif
 
-#if (!defined CLASS_DEFAULT_COPY_AND_MOVE)
+#ifndef CLASS_DEFAULT_COPY_AND_MOVE
+// NOLINTBEGIN(bugprone-macro-parentheses)
 #define CLASS_DEFAULT_COPY_AND_MOVE(name)       \
     name(name const&)                = default; \
     name(name&&) noexcept            = default; \
@@ -138,8 +139,8 @@ SUPPRESS_CLANG_WARNING("-Wunused-macros")
     constexpr strct& operator=(strct&&)               = default; \
     ~strct()                                          = default; \
     constexpr bool operator==(strct const& rhs) const = default
-
-#if !defined TODO
+// NOLINTEND(bugprone-macro-parentheses)
+#ifndef TODO
 #ifdef __cpp_exceptions
 #define TODO(...) throw "TODO:" __VA_ARGS__
 #endif

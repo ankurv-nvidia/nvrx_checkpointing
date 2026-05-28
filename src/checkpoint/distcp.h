@@ -63,8 +63,6 @@ struct RankManifestRef
 //
 // Caller must guarantee every entry in `manifest` points at a fully-populated
 // writeLog before calling. Single-server v1 only.
-void WriteMetadata(std::filesystem::path const&     ckptDir,
-                   StateTree const&                 globalRegistry,
-                   std::span<RankManifestRef const> manifest);
+void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry, std::span<RankManifestRef const> manifest);
 
 }    // namespace checkpoint::distcp

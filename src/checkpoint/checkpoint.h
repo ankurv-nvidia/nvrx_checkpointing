@@ -41,14 +41,14 @@ struct DeviceContext
 
     static std::unique_ptr<DeviceContext> CreateDeviceContextCPU(DeviceId device, uint8_t streamIdx);
 
-#if defined(PHOENIX_HAVE_CUDA)
+#ifdef PHOENIX_HAVE_CUDA
     static std::unique_ptr<DeviceContext> CreateDeviceContextCUDA(DeviceId device, uint8_t streamIdx);
 
     static void CudaRegisterHostBuffer(void* ptr, size_t size);
     static void CudaUnregisterHostBuffer(void* ptr);
 #endif
 
-#if defined(PHOENIX_HAVE_METAL)
+#ifdef PHOENIX_HAVE_METAL
     static std::unique_ptr<DeviceContext> CreateDeviceContextMTL(DeviceId device, uint8_t streamIdx);
 #endif
 };

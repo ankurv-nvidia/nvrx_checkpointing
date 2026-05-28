@@ -54,9 +54,9 @@ using PerfClock = std::chrono::high_resolution_clock;
 // uint32_t iterations
 using Request = boost::beast::http::request<boost::beast::http::buffer_body>;
 
-using tcp        = boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
-using tcp_stream = typename boost::beast::tcp_stream::rebind_executor<
-    boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
+using tcp = boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
+using tcp_stream
+    = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
 
 template <typename TStream> static void TryCleanShutdown(TStream& stream)
 {
@@ -204,7 +204,7 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
 {
     auto rank = registry.Topo().rank;
     registry.WalkNodes([&](auto& node) {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
         auto fqn = registry.GetNodeId(node.handle);
         if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
         {
@@ -240,7 +240,7 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
 
 namespace
 {
-[[nodiscard]] static auto CreateRequestForPeer(boost::asio::io_context& ioc, boost::beast::tcp_stream& stream, std::string const& peer)
+[[nodiscard]] auto CreateRequestForPeer(boost::asio::io_context& ioc, boost::beast::tcp_stream& stream, std::string const& peer)
 {
     auto peerAddr = boost::urls::url(peer);
     if (!peerAddr.has_port()) { peerAddr.set_port(std::to_string(cipc::Message::Port)); }
@@ -267,21 +267,21 @@ Session::Session(Server* serverIn, cipc::SessionId sessionIdIn, std::filesystem:
 
 Session::LocalState& Session::GetSessionLocalState_(cipc::Rank rank)
 {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::scoped_lock lock(mutex);
     return *sessionState.localStates[rank];
 }
 
 Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank)
 {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto&                       localState = sessionState.localStates[rank];
+    std::scoped_lock lock(mutex);
+    auto&            localState = sessionState.localStates[rank];
     if (localState == nullptr) { localState = std::make_unique<LocalState>(); }
     return *localState;
 }
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId)
 {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::scoped_lock lock(mutex);
     return *snapshots[snapshotId];
 }
 
@@ -354,7 +354,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                 auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
                 auto const  size = tnsr.ShardSizeBytes();
                 auto const* data = static_cast<char const*>(localState->blob.data) + tnsr.handle;    // NOLINT
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = localState->localRegistry->GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
@@ -374,7 +374,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                 {
                     auto const  size = shard.ShardSizeBytes(tnsr.dtype);
                     auto const* data = static_cast<char const*>(localState->blob.data) + shard.handle;    // NOLINT
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
                     auto fqn = localState->localRegistry->GetNodeId(node.handle);
                     if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                     {
@@ -445,8 +445,8 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
 {
     fmt::print(stderr, "[native_ckpt:svr][{}] OnRecieveLocalStateRegistryAsync_\n", rank);
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto&                       localState = *sessionState.localStates[rank];
+        std::scoped_lock lock(mutex);
+        auto&            localState = *sessionState.localStates[rank];
         recievedFrom.insert(rank);
         if (sessionState.registry == nullptr)
         {
@@ -470,7 +470,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
             ForeachTensorShardInfo(*localState.localRegistry, [&](TensorShardInfo const& info) { tensorShards.push_back(info); });
             MergeFragmentToGlobalState_(lock, tensorShards);
         }
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
         if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))
         {
             auto const& shTen = std::get<StateNode::ShardedTensor>(sessionState.registry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
@@ -500,7 +500,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     Snapshot*   snapshotPtr   = nullptr;
     LocalState* localStatePtr = nullptr;
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         snapshotPtr   = snapshots.at(hdr.snapshotId).get();
         localStatePtr = snapshotPtr->localStates.at(hdr.globalRank).get();
     }
@@ -514,7 +514,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         while (true)
         {
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::scoped_lock lock(mutex);
                 if (recievedFrom.size() >= static_cast<size_t>(topo.worldSize)) { break; }
                 fmt::print(
                     stderr,
@@ -530,7 +530,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         while (true)
         {
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::scoped_lock lock(mutex);
                 if (snapshot.finalizedRanks.size() >= static_cast<size_t>(topo.worldSize)) { break; }
                 fmt::print(stderr,
                            "[native_ckpt:svr][{}][{}] FinalizeSnapshot waiting for finalized ranks {} of {} remaining...\n",
@@ -548,7 +548,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     checkpoint::distcp::WriteRankShard(
         snapshot.path.parent_path(), hdr.globalRank, *localState.localRegistry, localState.blob, localState.writeLog);
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
         snapshot.writeCompletedRanks.insert(hdr.globalRank);
     }
 
@@ -559,7 +559,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         while (true)
         {
             {
-                std::lock_guard<std::mutex> lock(mutex);
+                std::scoped_lock lock(mutex);
                 if (snapshot.writeCompletedRanks.size() >= static_cast<size_t>(topo.worldSize)) { break; }
                 fmt::print(
                     stderr,
@@ -582,7 +582,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         // refer to fully-populated vectors that no other thread will touch.
         std::vector<checkpoint::distcp::RankManifestRef> manifest;
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::scoped_lock lock(mutex);
             manifest.reserve(snapshot.localStates.size());
             for (auto const& [r, ls] : snapshot.localStates)
             {
@@ -613,7 +613,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     // SendLocalShardedStateRegistryToPeer(cipc::Rank rank, std::string const& peer)
 }
 
-void Session::MergeFragmentToGlobalState_(std::lock_guard<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
+void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
 {
     if (sessionState.registry == nullptr)
     {
@@ -622,7 +622,7 @@ void Session::MergeFragmentToGlobalState_(std::lock_guard<std::mutex> const& /* 
 
     for (auto const& tensorShard : tensorShards)
     {
-#if defined NATIVE_CKPT_TRACE_NODE
+#ifdef NATIVE_CKPT_TRACE_NODE
         if (tensorShard.nodeId.contains(NATIVE_CKPT_TRACE_NODE))
         {
             fmt::print(stderr,
@@ -752,7 +752,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
         {
             auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
             for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
-            if (tnsr.shards.size() == 0)
+            if (tnsr.shards.empty())
             {
                 fmt::print(stderr,
                            "[native_ckpt:svr][{}][WARN] empty sharded tensor '{}' in metadata output\n",
@@ -884,7 +884,7 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char,
 {
     void* ptr = nullptr;
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
 
         auto& snapshot   = *snapshots[hdr1.snapshotId];
         auto& localState = *snapshot.localStates.at(hdr1.globalRank);
@@ -923,8 +923,8 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
     BufStream bufStream{buf.data(), buf.size()};
     auto      ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto                        snapshotIt = snapshots.find(hdr.snapshotId);
+        std::scoped_lock lock(mutex);
+        auto             snapshotIt = snapshots.find(hdr.snapshotId);
         if (snapshotIt == snapshots.end())
         {
             auto snapshot        = std::make_unique<Snapshot>();
@@ -982,7 +982,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
 void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char, cipc::D2HBufferSize> const& /* buf */)
 {
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::scoped_lock lock(mutex);
 
         auto& snapshot   = *snapshots[hdr.snapshotId];
         auto& localState = *snapshot.localStates[hdr.globalRank];
@@ -1034,7 +1034,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
 
 void Session::HandleStateRegistryFragment(Rank recvRank, std::vector<TensorShardInfo> const& tensorShards)
 {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::scoped_lock lock(mutex);
     MergeFragmentToGlobalState_(lock, tensorShards);
     recievedFrom.insert(recvRank);
 }
@@ -1053,7 +1053,7 @@ struct Server
 
     void Start()
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         _stopRequested = false;
         if (_running) { return; }
         _ioc.restart();
@@ -1069,7 +1069,7 @@ struct Server
                 SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
                 auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(i));
                 {
-                    std::lock_guard<std::mutex> lock1(_mutex);
+                    std::scoped_lock lock1(_mutex);
                     _msgQueue.insert(&msgQueue);
                 }
                 fmt::print(stderr, "[native_ckpt:svr] Checkpoint server started. Waiting for messages...\n");
@@ -1079,7 +1079,7 @@ struct Server
                         auto const [stop, hdr, buf] = msgQueue.BeginRead();
                         if (stop)
                         {
-                            std::lock_guard<std::mutex> lock1(_mutex);
+                            std::scoped_lock lock1(_mutex);
                             fmt::print(stderr, "[native_ckpt:svr] Stop requested. Shutting down server thread.\n");
                             _msgQueue.erase(&msgQueue);
                             return;
@@ -1116,7 +1116,7 @@ struct Server
 
     void Ping()
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         _lastPingTime = PerfClock::now();
     }
 
@@ -1137,7 +1137,7 @@ struct Server
         // break;
         case cipc::Message::Type::ActivateSession:
         {
-            std::lock_guard<std::mutex> lock(_mutex);
+            std::scoped_lock lock(_mutex);
             _lastPingTime = PerfClock::now();
 
             auto      hdr1 = std::get<cipc::Message::ActivateSession>(hdr);
@@ -1202,7 +1202,7 @@ struct Server
     {
         bool wasRunning = false;
         {
-            std::lock_guard<std::mutex> lock(_mutex);
+            std::scoped_lock lock(_mutex);
             wasRunning     = _running;
             _stopRequested = true;
             for (auto const& msgQueue : _msgQueue)
@@ -1220,13 +1220,13 @@ struct Server
             if (t.joinable()) { t.join(); }
         }
 
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         _running = false;
     }
 
     void QuerySessions(ServerSessionCallback callback, void* cbData)
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         for (auto const& [sessionId, session] : _activeSessions)
         {
             for (auto const& [snapshotId, snapshot] : session->snapshots)
@@ -1249,7 +1249,7 @@ struct Server
     private:
     Session& SessionById_(cipc::SessionId sessionId)
     {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::scoped_lock lock(_mutex);
         _lastPingTime = PerfClock::now();
         auto it       = _activeSessions.find(sessionId);
         if (it == _activeSessions.end())

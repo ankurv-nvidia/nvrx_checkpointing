@@ -43,13 +43,11 @@ namespace
 SUPPRESS_WARNINGS_START
 SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
 SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-std::filesystem::path g_registryPath;
+std::filesystem::path GRegistryPath;
 SUPPRESS_WARNINGS_END
 
 std::filesystem::path const& TestRegistryPath()
-{
-    return g_registryPath;
-}
+{ return GRegistryPath; }
 
 // Stem-based subdirectory under the test temp root. Not strictly unique across
 // concurrent ctest workers, but every call site `remove_all`s before use, so
@@ -64,23 +62,16 @@ std::filesystem::path CkptDir(std::string_view stem)
 
 RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
 {
-    return RankTopology{.rank         = Rank{rank},
-                        .worldSize    = Rank{worldSize},
-                        .ranksPerPeer = worldSize,
-                        .peersPerNode = 1,
-                        .peers        = {"localhost"}};
+    return RankTopology{
+        .rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"}};
 }
 
 // Attaches a fully-occupied (sharddim == fulldim) TensorShard leaf at the
 // given FQN. `handle` is the byte offset into the surrounding Blob.
-void AddTensorShardLeaf(StateTree&                 tree,
-                        std::string_view           fqn,
-                        DS4Tensor::DType           dtype,
-                        std::vector<size_t> const& shape,
-                        uint64_t                   handle)
+void AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
 {
     auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-    auto& leaf              = tree.AddChild(parent, leafName);
+    auto&     leaf          = tree.AddChild(parent, leafName);
     DS4Tensor tnsr;
     tnsr.dtype  = dtype;
     tnsr.handle = handle;
@@ -88,16 +79,14 @@ void AddTensorShardLeaf(StateTree&                 tree,
     for (auto d : shape)
     {
         tnsr.fulldim.push_back(d);
-        tnsr.sharddim.push_back({0, d});
+        tnsr.sharddim.push_back({.begin = 0, .end = d});
     }
     leaf.data = StateNode::TensorShard{tnsr};
 }
 }    // namespace
 
 TEST_CASE("scaffolding", "[scaffolding]")
-{
-    REQUIRE(true);
-}
+{ REQUIRE(true); }
 
 // ---------------------------------------------------------------------------
 // Tier 1 — C++ extraction-logic unit tests. Exercises `CollectShards` /
@@ -110,9 +99,9 @@ TEST_CASE("distcp::CollectShards walks TensorShard leaves in insertion order", "
     StateTree tree(SingleRankTopo());
     Blob      blob(64);
 
-    AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);     // 16 B
-    AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, 16);          //  4 B
-    AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, 32);       // 16 B
+    AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);    // 16 B
+    AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, 16);         //  4 B
+    AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, 32);      // 16 B
 
     std::vector<checkpoint::distcp::ShardEntry> entries;
     checkpoint::distcp::CollectShards(tree, blob, entries);
@@ -147,15 +136,15 @@ TEST_CASE("distcp::CollectShards derives shape from sharddim for partial slices"
     // Non-full 2-D slice: fulldim is 8x4 but this shard covers rows [2,6) and cols [1,3).
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN("slice");
-        auto& leaf              = tree.AddChild(parent, leafName);
+        auto&     leaf          = tree.AddChild(parent, leafName);
         DS4Tensor tnsr;
         tnsr.dtype  = DS4Tensor::DType::Int32;
         tnsr.handle = 16;
         tnsr.device = DeviceId{"cpu"};
         tnsr.fulldim.push_back(8);
         tnsr.fulldim.push_back(4);
-        tnsr.sharddim.push_back({2, 6});
-        tnsr.sharddim.push_back({1, 3});
+        tnsr.sharddim.push_back({.begin = 2, .end = 6});
+        tnsr.sharddim.push_back({.begin = 1, .end = 3});
         leaf.data = StateNode::TensorShard{tnsr};
     }
 
@@ -185,9 +174,9 @@ TEST_CASE("distcp::CollectShards expands ShardedTensor into per-shard entries", 
     StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
 
     DS4Tensor::DimRange r0;
-    r0.push_back({0, 4});
+    r0.push_back({.begin = 0, .end = 4});
     DS4Tensor::DimRange r1;
-    r1.push_back({4, 8});
+    r1.push_back({.begin = 4, .end = 8});
     tnsr.AddShard({.sharddim = r0, .device = DeviceId{"cpu"}, .handle = 0, .rank = Rank{0}});
     tnsr.AddShard({.sharddim = r1, .device = DeviceId{"cpu"}, .handle = 16, .rank = Rank{1}});
     leaf.data = std::move(tnsr);
@@ -221,9 +210,9 @@ TEST_CASE("distcp::CollectShards orders same-rank shards by sharddim", "[distcp]
     StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
 
     DS4Tensor::DimRange r0low;
-    r0low.push_back({0, 4});
+    r0low.push_back({.begin = 0, .end = 4});
     DS4Tensor::DimRange r0high;
-    r0high.push_back({4, 8});
+    r0high.push_back({.begin = 4, .end = 8});
     // Insertion order intentionally inverted vs. the std::set order so the
     // test only passes if `tnsr.shards` is iterated in (rank, sharddim) order.
     tnsr.AddShard({.sharddim = r0high, .device = DeviceId{"cpu"}, .handle = 32, .rank = Rank{0}});
@@ -253,7 +242,7 @@ TEST_CASE("distcp::CollectShards walks mixed TensorShard and ShardedTensor nodes
         fulldim.push_back(8);
         StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
         DS4Tensor::DimRange      r;
-        r.push_back({0, 8});
+        r.push_back({.begin = 0, .end = 8});
         tnsr.AddShard({.sharddim = r, .device = DeviceId{"cpu"}, .handle = 16, .rank = Rank{0}});
         leaf.data = std::move(tnsr);
     }
@@ -297,7 +286,7 @@ TEST_CASE("distcp::CollectShards skips zero-length shards", "[distcp][tier1]")
     // Empty sharddim — ShardSizeBytes() returns 0.
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN("empty");
-        auto& leaf              = tree.AddChild(parent, leafName);
+        auto&     leaf          = tree.AddChild(parent, leafName);
         DS4Tensor tnsr;
         tnsr.dtype  = DS4Tensor::DType::Float32;
         tnsr.handle = 8;
@@ -341,7 +330,7 @@ TEST_CASE("distcp::DTypeName maps every supported DType", "[distcp][tier1]")
 
 namespace
 {
-constexpr char kZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};
+constexpr char KZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};
 
 std::vector<char> ReadFile(std::filesystem::path const& path)
 {
@@ -361,9 +350,9 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
     auto* bytes = static_cast<unsigned char*>(blob.data);
     for (size_t i = 0; i < blob.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
 
-    AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);     // 16 B
-    AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8,    {4},    16);   //  4 B
-    AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2},    32);   // 16 B
+    AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);    // 16 B
+    AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, 16);         //  4 B
+    AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, 32);      // 16 B
 
     auto outDir = CkptDir("tier2_layout");
     std::filesystem::remove_all(outDir);
@@ -387,11 +376,8 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
 
     for (auto const& rec : writeLog)
     {
-        REQUIRE(rec.length >= sizeof(kZipLocalFileMagic));
-        for (size_t i = 0; i < sizeof(kZipLocalFileMagic); ++i)
-        {
-            REQUIRE(fileBytes[rec.fileOffset + i] == kZipLocalFileMagic[i]);
-        }
+        REQUIRE(rec.length >= sizeof(KZipLocalFileMagic));
+        for (size_t i = 0; i < sizeof(KZipLocalFileMagic); ++i) { REQUIRE(fileBytes[rec.fileOffset + i] == KZipLocalFileMagic[i]); }
     }
 }
 
@@ -430,14 +416,11 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         // Rank-specific deterministic bytes so a cross-rank write would surface
         // as bogus payload at a recorded (offset, length).
         auto* bytes = static_cast<unsigned char*>(ls.blob->data);
-        for (size_t i = 0; i < ls.blob->size; ++i)
-        {
-            bytes[i] = static_cast<unsigned char>((r * 17u + i) & 0xffu);
-        }
+        for (size_t i = 0; i < ls.blob->size; ++i) { bytes[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
         ls.tree = std::make_unique<StateTree>(SingleRankTopo(r, kWorldSize));
-        AddTensorShardLeaf(*ls.tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);     // 16 B
-        AddTensorShardLeaf(*ls.tree, "b", DS4Tensor::DType::Int8,    {4},    16);   //  4 B
-        AddTensorShardLeaf(*ls.tree, "c", DS4Tensor::DType::Float64, {2},    32);   // 16 B
+        AddTensorShardLeaf(*ls.tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);    // 16 B
+        AddTensorShardLeaf(*ls.tree, "b", DS4Tensor::DType::Int8, {4}, 16);         //  4 B
+        AddTensorShardLeaf(*ls.tree, "c", DS4Tensor::DType::Float64, {2}, 32);      // 16 B
     }
 
     auto outDir = CkptDir("tier6_concurrent");
@@ -450,7 +433,7 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         workers.emplace_back([&snapshot, &outDir, r] {
             auto& ls = snapshot.states[r];
             checkpoint::distcp::WriteRankShard(outDir, Rank{r}, *ls.tree, *ls.blob, ls.writeLog);
-            std::lock_guard<std::mutex> lock(snapshot.mutex);
+            std::scoped_lock lock(snapshot.mutex);
             snapshot.writeCompletedRanks.insert(Rank{r});
         });
     }
@@ -478,11 +461,8 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
 
         for (auto const& rec : ls.writeLog)
         {
-            REQUIRE(rec.length >= sizeof(kZipLocalFileMagic));
-            for (size_t i = 0; i < sizeof(kZipLocalFileMagic); ++i)
-            {
-                REQUIRE(fileBytes[rec.fileOffset + i] == kZipLocalFileMagic[i]);
-            }
+            REQUIRE(rec.length >= sizeof(KZipLocalFileMagic));
+            for (size_t i = 0; i < sizeof(KZipLocalFileMagic); ++i) { REQUIRE(fileBytes[rec.fileOffset + i] == KZipLocalFileMagic[i]); }
         }
 
         // The 16 bytes of leaf "a" embed a rank-specific signature. They are
@@ -491,12 +471,9 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         // the signature instead of slicing at a fixed offset. A cross-rank
         // write would surface here as a missed match.
         std::array<unsigned char, 16> signature{};
-        for (size_t i = 0; i < signature.size(); ++i)
-        {
-            signature[i] = static_cast<unsigned char>((r * 17u + i) & 0xffu);
-        }
-        auto const* needle  = reinterpret_cast<char const*>(signature.data());
-        auto const  found   = std::search(fileBytes.begin(), fileBytes.end(), needle, needle + signature.size());
+        for (size_t i = 0; i < signature.size(); ++i) { signature[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
+        auto const* needle = reinterpret_cast<char const*>(signature.data());
+        auto const  found  = std::search(fileBytes.begin(), fileBytes.end(), needle, needle + signature.size());
         REQUIRE(found != fileBytes.end());
     }
 }
@@ -517,13 +494,13 @@ TEST_CASE("distcp::WriteMetadata throws when a manifest entry is missing", "[dis
     // has rank 0 wired to an EMPTY writeLog, so LookupWriteRecord can't find
     // a matching (fqn, sharddim). The writer must fail loudly, not silently
     // emit a bogus _StorageInfo.
-    StateTree globalTree(SingleRankTopo());
+    StateTree      globalTree(SingleRankTopo());
     DS4Tensor::Dim fulldim;
     fulldim.push_back(2);
     DS4Tensor::DimRange sharddim;
-    sharddim.push_back({0, 2});
-    auto [leafName, parent] = globalTree.FindOrAddNodeByFQN("orphan");
-    auto& leaf              = globalTree.AddChild(parent, leafName);
+    sharddim.push_back({.begin = 0, .end = 2});
+    auto [leafName, parent]       = globalTree.FindOrAddNodeByFQN("orphan");
+    auto&                    leaf = globalTree.AddChild(parent, leafName);
     StateNode::ShardedTensor st(DS4Tensor::DType::Float32, fulldim);
     st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = Rank{0}});
     leaf.data = std::move(st);
@@ -536,9 +513,7 @@ TEST_CASE("distcp::WriteMetadata throws when a manifest entry is missing", "[dis
     auto outDir = CkptDir("metadata_missing_manifest");
     std::filesystem::remove_all(outDir);
 
-    REQUIRE_THROWS_AS(
-        checkpoint::distcp::WriteMetadata(outDir, globalTree, std::span{manifest}),
-        std::runtime_error);
+    REQUIRE_THROWS_AS(checkpoint::distcp::WriteMetadata(outDir, globalTree, std::span{manifest}), std::runtime_error);
 }
 
 #ifdef PHOENIX_VENV_PYTHON
@@ -550,8 +525,8 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     Blob      blob(64);
     auto*     bytes = static_cast<unsigned char*>(blob.data);
     for (size_t i = 0; i < blob.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
-    AddTensorShardLeaf(localTree, "weight",       DS4Tensor::DType::Float32, {2, 2}, 0);
-    AddTensorShardLeaf(localTree, "block.weight", DS4Tensor::DType::Int64,   {3},    16);
+    AddTensorShardLeaf(localTree, "weight", DS4Tensor::DType::Float32, {2, 2}, 0);
+    AddTensorShardLeaf(localTree, "block.weight", DS4Tensor::DType::Int64, {3}, 16);
 
     auto outDir = CkptDir("metadata_unpickle");
     std::filesystem::remove_all(outDir);
@@ -568,15 +543,15 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
         DS4Tensor::Dim fulldim;
         for (auto d : shape) { fulldim.push_back(d); }
         DS4Tensor::DimRange sharddim;
-        for (auto d : shape) { sharddim.push_back({0, d}); }
-        auto [leafName, parent] = globalTree.FindOrAddNodeByFQN(fqn);
-        auto& leaf              = globalTree.AddChild(parent, leafName);
+        for (auto d : shape) { sharddim.push_back({.begin = 0, .end = d}); }
+        auto [leafName, parent]       = globalTree.FindOrAddNodeByFQN(fqn);
+        auto&                    leaf = globalTree.AddChild(parent, leafName);
         StateNode::ShardedTensor st(dtype, fulldim);
         st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = Rank{0}});
         leaf.data = std::move(st);
     };
-    addSharded("weight",       DS4Tensor::DType::Float32, {2, 2});
-    addSharded("block.weight", DS4Tensor::DType::Int64,   {3});
+    addSharded("weight", DS4Tensor::DType::Float32, {2, 2});
+    addSharded("block.weight", DS4Tensor::DType::Int64, {3});
 
     std::array<checkpoint::distcp::RankManifestRef, 1> manifest{{
         {.rank = Rank{0}, .writeLog = &writeLog},
@@ -595,9 +570,8 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     // no shell metacharacters. Stdout is silenced (the script prints nothing
     // on success); stderr is left intact so Catch2 captures the traceback
     // when the load actually breaks.
-    auto const cmd = fmt::format(
-        "{} -c \"import pickle; pickle.load(open(r'{}','rb'))\" >/dev/null",
-        PHOENIX_VENV_PYTHON, metaPath.string());
+    auto const cmd
+        = fmt::format("{} -c \"import pickle; pickle.load(open(r'{}','rb'))\" >/dev/null", PHOENIX_VENV_PYTHON, metaPath.string());
     int const rc = std::system(cmd.c_str());
     REQUIRE(rc == 0);
 }
@@ -617,10 +591,7 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     {
         SKIP("no --registry path provided (pass `--registry <path>` or use ctest, which wires it via EXTRA_ARGS)");
     }
-    if (!std::filesystem::exists(registryPath))
-    {
-        SKIP(fmt::format("registry path does not exist: {}", registryPath.string()));
-    }
+    if (!std::filesystem::exists(registryPath)) { SKIP(fmt::format("registry path does not exist: {}", registryPath.string())); }
 
     // Conservative RAM threshold. The IPC ring buffers consume ~1 GiB per queue
     // (D2HBufferSize × D2HBufferCount = 32 MiB × 32) — empirically 8 of them
@@ -628,12 +599,9 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     // therefore in RAM. Add slack for the test process and the checkpoint
     // working set. Tune up if a larger registry comes along.
     constexpr uint64_t kMinPhysRamBytes = 16ull * 1024 * 1024 * 1024;
-    long const pages    = ::sysconf(_SC_PHYS_PAGES);
-    long const pageSize = ::sysconf(_SC_PAGE_SIZE);
-    if (pages <= 0 || pageSize <= 0)
-    {
-        SKIP("sysconf(_SC_PHYS_PAGES / _SC_PAGE_SIZE) returned <= 0; cannot verify RAM precondition");
-    }
+    long const         pages            = ::sysconf(_SC_PHYS_PAGES);
+    long const         pageSize         = ::sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || pageSize <= 0) { SKIP("sysconf(_SC_PHYS_PAGES / _SC_PAGE_SIZE) returned <= 0; cannot verify RAM precondition"); }
     auto const physRamBytes = static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize);
     if (physRamBytes < kMinPhysRamBytes)
     {
@@ -648,11 +616,8 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     // case) and the *available* size (catches stale `/dev/shm/checkpoint_*`
     // files left behind by a SIGKILLed prior run).
     constexpr uint64_t kMinShmBytes = 10ull * 1024 * 1024 * 1024;
-    struct statvfs vfs{};
-    if (::statvfs("/dev/shm", &vfs) != 0)
-    {
-        SKIP("statvfs(/dev/shm) failed; cannot verify shm precondition");
-    }
+    struct statvfs     vfs{};
+    if (::statvfs("/dev/shm", &vfs) != 0) { SKIP("statvfs(/dev/shm) failed; cannot verify shm precondition"); }
     auto const shmTotalBytes = static_cast<uint64_t>(vfs.f_blocks) * static_cast<uint64_t>(vfs.f_frsize);
     if (shmTotalBytes < kMinShmBytes)
     {
@@ -688,8 +653,7 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
         LoadStateRegistryFromPath(ctx, registryPath);
         tasks = StartClientThreads(ctx);
         REQUIRE_NOTHROW(RunOnAllRanks(ctx, &SaveCheckpointAndValidate, CkptDir("save_then_round_trip_validate")));
-    }
-    catch (...)
+    } catch (...)
     {
         // Real failures (stale shm files, IPC bugs, etc.) propagate — the
         // pre-checks above already SKIP the known "this sandbox can't run
@@ -708,13 +672,12 @@ int main(int argc, char* argv[])
     Catch::Session session;
     std::string    registry;
     using namespace Catch::Clara;
-    auto cli = session.cli()
-             | Opt(registry, "path")["--registry"]("path to a serialized state registry");
+    auto cli = session.cli() | Opt(registry, "path")["--registry"]("path to a serialized state registry");
     session.cli(cli);
 
     int const cliRc = session.applyCommandLine(argc, argv);
     if (cliRc != 0) { return cliRc; }
 
-    g_registryPath = registry;
+    GRegistryPath = registry;
     return session.run();
 }

@@ -44,7 +44,7 @@ struct MetalContext : public DeviceContext {
   uint64_t Allocate(uint64_t size) override {
     // Allocate unified memory buffer that's CPU-accessible.
     void *ptr = std::malloc(size); // NOLINT
-    if (!ptr) {
+    if (ptr == nullptr) {
       throw std::bad_alloc();
     }
     return reinterpret_cast<uint64_t>(ptr); // NOLINT

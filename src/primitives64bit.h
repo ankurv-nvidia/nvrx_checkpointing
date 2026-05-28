@@ -152,7 +152,7 @@ struct Primitives64Bit
     Primitives64Bit() = default;
     Primitives64Bit(std::nullptr_t) {}
 
-    template <typename T> T Cast() const
+    template <typename T> [[nodiscard]] [[nodiscard]] [[nodiscard]] [[nodiscard]] T Cast() const
     {
         if constexpr (Primitives64Bit::Type::IsFloat(Traits<T>::Type()))
         {

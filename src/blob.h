@@ -51,7 +51,7 @@ struct Blob
         if (index >= size) { throw std::out_of_range(fmt::format("Blob access out of range: index {} >= size {}", index, size)); }
         return reinterpret_cast<T*>(data)[index];    // NOLINT
     }
-    template <typename T> T const& At(size_t index) const
+    template <typename T> [[nodiscard]] T const& At(size_t index) const
     {
         if (index >= size) { throw std::out_of_range(fmt::format("Blob access out of range: index {} >= size {}", index, size)); }
         return reinterpret_cast<T const*>(data)[index];    // NOLINT

@@ -32,12 +32,10 @@ inline void SetThreadName(char const* threadName)
     {}
 }
 
-#elif defined(__linux__)
+#elifdef __linux__
 #include <sys/prctl.h>
 inline void SetThreadName(char const* threadName)
-{
-    prctl(PR_SET_NAME, threadName, 0, 0, 0);
-}
+{ prctl(PR_SET_NAME, threadName, 0, 0, 0); }
 
 #else
 #include <pthread.h>

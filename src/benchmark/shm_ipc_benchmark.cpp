@@ -257,7 +257,7 @@ try
                        | std::ranges::to<std::vector>();
         */
         tasks.emplace_back(Server, ranks, iter, size, validate, debug);
-#if defined LAUNCH_FROM_SERVER
+#ifdef LAUNCH_FROM_SERVER
         if (!server && !client) { child.wait(); }
 #endif
     }

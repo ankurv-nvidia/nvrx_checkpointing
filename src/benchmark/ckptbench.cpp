@@ -24,11 +24,11 @@ SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 CheckpointTestContext Ctx;    // NOLINT
 SUPPRESS_WARNINGS_END
 
-constexpr char kDefaultCkptDir[] = "/tmp/checkpoint_bench";
+constexpr char KDefaultCkptDir[] = "/tmp/checkpoint_bench";
 
 void BM_SaveCheckpoint(benchmark::State& benchState)    // NOLINT(readability-identifier-naming)
 {
-    for (auto _ : benchState) { RunOnAllRanks(Ctx, &SaveCheckpointOnly, kDefaultCkptDir); }
+    for (auto _ : benchState) { RunOnAllRanks(Ctx, &SaveCheckpointOnly, KDefaultCkptDir); }
 }
 
 SUPPRESS_WARNINGS_START

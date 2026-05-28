@@ -50,26 +50,22 @@ DS4Tensor::DType ParseDType(std::string const& name)
 // Each entry: (fqn, dtype_name, shape, data_bytes).
 struct InputEntry
 {
-    std::string                 fqn;
-    DS4Tensor::DType            dtype;
-    std::vector<size_t>         shape;
-    std::vector<unsigned char>  bytes;
+    std::string                fqn;
+    DS4Tensor::DType           dtype;
+    std::vector<size_t>        shape;
+    std::vector<unsigned char> bytes;
 };
 
 InputEntry ConvertEntry(nb::tuple const& t)
 {
-    if (t.size() != 4)
-    {
-        throw std::runtime_error("distcp_shim: each entry must be (fqn, dtype, shape, bytes)");
-    }
+    if (t.size() != 4) { throw std::runtime_error("distcp_shim: each entry must be (fqn, dtype, shape, bytes)"); }
     InputEntry e;
     e.fqn   = nb::cast<std::string>(t[0]);
     e.dtype = ParseDType(nb::cast<std::string>(t[1]));
     e.shape = nb::cast<std::vector<size_t>>(t[2]);
     if (e.shape.empty() || e.shape.size() > DS4Tensor::MaxDims)
     {
-        throw std::runtime_error(
-            fmt::format("distcp_shim: shape rank {} out of range [1, {}]", e.shape.size(), DS4Tensor::MaxDims));
+        throw std::runtime_error(fmt::format("distcp_shim: shape rank {} out of range [1, {}]", e.shape.size(), DS4Tensor::MaxDims));
     }
     auto data = nb::cast<nb::bytes>(t[3]);
     e.bytes.resize(data.size());
@@ -82,9 +78,9 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     std::vector<InputEntry> entries;
     entries.reserve(entriesPy.size());
     size_t totalBytes = 0;
-    for (size_t i = 0; i < entriesPy.size(); ++i)
+    for (auto const& i : entriesPy)
     {
-        entries.push_back(ConvertEntry(nb::cast<nb::tuple>(entriesPy[i])));
+        entries.push_back(ConvertEntry(nb::cast<nb::tuple>(i)));
         totalBytes += entries.back().bytes.size();
     }
 
@@ -113,12 +109,12 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
         for (auto d : e.shape)
         {
             tnsr.fulldim.push_back(d);
-            tnsr.sharddim.push_back({0, d});
+            tnsr.sharddim.push_back({.begin = 0, .end = d});
         }
 
         auto [leafName, parent] = tree.FindOrAddNodeByFQN(e.fqn);
-        auto& leaf = tree.AddChild(parent, leafName);
-        leaf.data  = StateNode::TensorShard{tnsr};
+        auto& leaf              = tree.AddChild(parent, leafName);
+        leaf.data               = StateNode::TensorShard{tnsr};
 
         offset += e.bytes.size();
     }
@@ -130,10 +126,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     for (auto const& rec : writeLog)
     {
         nb::list sharddim;
-        for (auto const& r : rec.sharddim)
-        {
-            sharddim.append(nb::make_tuple(r.begin, r.end));
-        }
+        for (auto const& r : rec.sharddim) { sharddim.append(nb::make_tuple(r.begin, r.end)); }
         out.append(nb::make_tuple(rec.fqn, sharddim, rec.fileOffset, rec.length));
     }
     return out;
@@ -142,20 +135,16 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
 DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 {
     DS4Tensor::DimRange out;
-    auto sdList = nb::cast<nb::list>(sd);
-    if (sdList.size() == 0 || sdList.size() > DS4Tensor::MaxDims)
+    auto                sdList = nb::cast<nb::list>(sd);
+    if (sdList.empty() || sdList.size() > DS4Tensor::MaxDims)
     {
-        throw std::runtime_error(
-            fmt::format("distcp_shim: sharddim rank {} out of range [1, {}]", sdList.size(), DS4Tensor::MaxDims));
+        throw std::runtime_error(fmt::format("distcp_shim: sharddim rank {} out of range [1, {}]", sdList.size(), DS4Tensor::MaxDims));
     }
-    for (size_t i = 0; i < sdList.size(); ++i)
+    for (auto&& i : sdList)
     {
-        auto pair = nb::cast<nb::tuple>(sdList[i]);
-        if (pair.size() != 2)
-        {
-            throw std::runtime_error("distcp_shim: sharddim entry must be a (begin, end) tuple");
-        }
-        out.push_back({nb::cast<size_t>(pair[0]), nb::cast<size_t>(pair[1])});
+        auto pair = nb::cast<nb::tuple>(i);
+        if (pair.size() != 2) { throw std::runtime_error("distcp_shim: sharddim entry must be a (begin, end) tuple"); }
+        out.push_back({.begin = nb::cast<size_t>(pair[0]), .end = nb::cast<size_t>(pair[1])});
     }
     return out;
 }
@@ -182,7 +171,7 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
     std::vector<std::vector<checkpoint::distcp::WriteRecord>> writeLogs;
     std::vector<Rank>                                         ranks;
 
-    auto EnsureRankSlot = [&](Rank r) -> std::vector<checkpoint::distcp::WriteRecord>& {
+    auto ensureRankSlot = [&](Rank r) -> std::vector<checkpoint::distcp::WriteRecord>& {
         for (size_t i = 0; i < ranks.size(); ++i)
         {
             if (ranks[i] == r) { return writeLogs[i]; }
@@ -192,13 +181,12 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
         return writeLogs.back();
     };
 
-    for (size_t i = 0; i < tensors.size(); ++i)
+    for (auto const& tensor : tensors)
     {
-        auto t = nb::cast<nb::tuple>(tensors[i]);
+        auto t = nb::cast<nb::tuple>(tensor);
         if (t.size() != 4)
         {
-            throw std::runtime_error(
-                "distcp_shim: each tensor entry must be (fqn, dtype_name, full_shape, shards_list)");
+            throw std::runtime_error("distcp_shim: each tensor entry must be (fqn, dtype_name, full_shape, shards_list)");
         }
         auto fqn       = nb::cast<std::string>(t[0]);
         auto dtype     = ParseDType(nb::cast<std::string>(t[1]));
@@ -207,33 +195,32 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
 
         if (fullShape.empty() || fullShape.size() > DS4Tensor::MaxDims)
         {
-            throw std::runtime_error(fmt::format(
-                "distcp_shim: full_shape rank {} out of range [1, {}]", fullShape.size(), DS4Tensor::MaxDims));
+            throw std::runtime_error(
+                fmt::format("distcp_shim: full_shape rank {} out of range [1, {}]", fullShape.size(), DS4Tensor::MaxDims));
         }
 
         DS4Tensor::Dim fulldim;
         for (auto d : fullShape) { fulldim.push_back(d); }
 
-        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-        auto& leaf              = tree.AddChild(parent, leafName);
+        auto [leafName, parent]       = tree.FindOrAddNodeByFQN(fqn);
+        auto&                    leaf = tree.AddChild(parent, leafName);
         StateNode::ShardedTensor st(dtype, fulldim);
 
-        for (size_t s = 0; s < shards.size(); ++s)
+        for (auto&& shard : shards)
         {
-            auto entry = nb::cast<nb::tuple>(shards[s]);
+            auto entry = nb::cast<nb::tuple>(shard);
             if (entry.size() != 4)
             {
-                throw std::runtime_error(
-                    "distcp_shim: each shard entry must be (rank, sharddim, file_offset, length)");
+                throw std::runtime_error("distcp_shim: each shard entry must be (rank, sharddim, file_offset, length)");
             }
-            auto const     rank       = Rank{nb::cast<uint32_t>(entry[0])};
-            auto const     sharddim   = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
-            auto const     fileOffset = nb::cast<uint64_t>(entry[2]);
-            auto const     length     = nb::cast<uint64_t>(entry[3]);
+            auto const rank       = Rank{nb::cast<uint32_t>(entry[0])};
+            auto const sharddim   = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
+            auto const fileOffset = nb::cast<uint64_t>(entry[2]);
+            auto const length     = nb::cast<uint64_t>(entry[3]);
 
             st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = rank});
 
-            auto& writeLog = EnsureRankSlot(rank);
+            auto& writeLog = ensureRankSlot(rank);
             writeLog.push_back(checkpoint::distcp::WriteRecord{
                 .fqn        = fqn,
                 .sharddim   = sharddim,

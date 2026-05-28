@@ -20,7 +20,7 @@ template <typename T> T ReadTrivial(std::istream& istrm)
 
 template <typename T> std::ostream& WriteBlob(std::ostream& ostrm, std::span<T> const& obj)
 {
-    if (obj.size() == 0) { return ostrm; }
+    if (obj.empty()) { return ostrm; }
     return ostrm.write(obj.data(), static_cast<std::streamsize>(obj.size() * sizeof(T)));
 }
 
