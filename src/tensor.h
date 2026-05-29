@@ -409,7 +409,7 @@ template <ConceptTensorTraits Traits> struct TensorShardMapT
 template <ConceptTensorTraits Traits> struct std::hash<RankedTensorShardT<Traits>>
 {
     constexpr size_t operator()(RankedTensorShardT<Traits> const& shard) const
-    { return std::hash<uint32_t>{}(shard.rank) ^ std::hash<DeviceId>{}(shard.device) ^ std::hash<uint64_t>{}(shard.device); }
+    { return std::hash<uint32_t>{}(shard.rank) ^ std::hash<DeviceId>{}(shard.device) ^ std::hash<uint64_t>{}(shard.handle); }
 };
 
 template <typename T, size_t N> struct std::hash<std::inplace_vector<T, N>>

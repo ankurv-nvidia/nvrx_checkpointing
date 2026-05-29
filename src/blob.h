@@ -57,7 +57,7 @@ struct Blob
         return reinterpret_cast<T const*>(data)[index];    // NOLINT
     }
 
-    template <typename T> std::span<T const> AsSpan(size_t index, size_t count) const
+    template <typename T> [[nodiscard]] std::span<T const> AsSpan(size_t index, size_t count) const
     {
         auto* ptr = &At<T>(index);
         if (index + (count * sizeof(T)) > size)

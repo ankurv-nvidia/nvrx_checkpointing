@@ -5,6 +5,7 @@
 
 #include "blob.h"
 #include "distcp.h"
+#include "distcp_internal.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -84,7 +85,16 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
         totalBytes += entries.back().bytes.size();
     }
 
-    Blob blob(totalBytes == 0 ? 1 : totalBytes);    // aligned_alloc(0) is implementation-defined
+    // `Blob`'s aligned_alloc is POSIX-conformant: `size` must be a multiple of
+    // `alignof(std::max_align_t)` (typically 16). Hypothesis-drawn tensors
+    // smaller than that — e.g. `tensor([0.])` (4 B) — would otherwise fall
+    // through to a null return and a bad_alloc. We only use this buffer as a
+    // source pointer for miniz to copy from; the actual data layout per
+    // shard is driven by `handle`, so a rounded-up buffer is fine.
+    constexpr size_t kAlign     = alignof(std::max_align_t);
+    size_t const     wantedSize = totalBytes == 0 ? kAlign : totalBytes;
+    size_t const     blobSize   = (wantedSize + kAlign - 1) & ~(kAlign - 1);
+    Blob             blob(blobSize);
 
     // Single-rank topology — multi-rank parity is exercised by sequential calls
     // to write_rank_shard from the test, each with its own (rank, world_size).
@@ -97,37 +107,43 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     };
     StateTree tree(std::move(topo));
 
+    // Build the tree in the post-merge global-registry shape — ShardedTensor
+    // leaves keyed by rank — since that's what WriteRankShard's assert
+    // expects. For the parity shim every entry is one shard owned by the
+    // calling rank covering the full shape.
     size_t offset = 0;
     for (auto const& e : entries)
     {
         std::memcpy(blob[offset], e.bytes.data(), e.bytes.size());
 
-        DS4Tensor tnsr;
-        tnsr.dtype  = e.dtype;
-        tnsr.handle = offset;
-        tnsr.device = DeviceId{"cpu"};
-        for (auto d : e.shape)
-        {
-            tnsr.fulldim.push_back(d);
-            tnsr.sharddim.push_back({.begin = 0, .end = d});
-        }
+        DS4Tensor::Dim fulldim;
+        for (auto d : e.shape) { fulldim.push_back(d); }
+        DS4Tensor::DimRange sharddim;
+        for (auto d : e.shape) { sharddim.push_back({.begin = 0, .end = d}); }
 
-        auto [leafName, parent] = tree.FindOrAddNodeByFQN(e.fqn);
-        auto& leaf              = tree.AddChild(parent, leafName);
-        leaf.data               = StateNode::TensorShard{tnsr};
+        auto [leafName, parent]       = tree.FindOrAddNodeByFQN(e.fqn);
+        auto&                    leaf = tree.AddChild(parent, leafName);
+        StateNode::ShardedTensor st(e.dtype, fulldim);
+        st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = offset, .rank = Rank{rank}});
+        leaf.data = std::move(st);
 
         offset += e.bytes.size();
     }
 
-    std::vector<checkpoint::distcp::WriteRecord> writeLog;
-    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, blob, writeLog);
+    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, blob);
 
     nb::list out;
-    for (auto const& rec : writeLog)
+    uint64_t cursor = 0;
+    for (auto const& e : entries)
     {
+        DS4Tensor::Dim shape;
+        for (auto d : e.shape) { shape.push_back(d); }
+        uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(e.dtype, shape, e.bytes.size());
+
         nb::list sharddim;
-        for (auto const& r : rec.sharddim) { sharddim.append(nb::make_tuple(r.begin, r.end)); }
-        out.append(nb::make_tuple(rec.fqn, sharddim, rec.fileOffset, rec.length));
+        for (auto d : e.shape) { sharddim.append(nb::make_tuple(0ULL, static_cast<uint64_t>(d))); }
+        out.append(nb::make_tuple(e.fqn, sharddim, cursor, archiveLen));
+        cursor += archiveLen;
     }
     return out;
 }
@@ -153,6 +169,8 @@ DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 // list of (rank, sharddim, file_offset, length). The shim assembles a global
 // StateTree with one ShardedTensor per fqn, populated with the per-rank chunks,
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
+// The (file_offset, length) values are used as the verification side-channel
+// inside WriteMetadata — they're asserted against the analytical prediction.
 void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
 {
     RankTopology topo{
@@ -164,22 +182,7 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
     };
     StateTree tree(std::move(topo));
 
-    // Per-rank writeLog storage. The manifest is assembled *after* the input
-    // loop completes (see below) — by that point `writeLogs` is no longer
-    // being grown, so the `&writeLogs[i]` pointers stored in the manifest are
-    // stable across the WriteMetadata call.
-    std::vector<std::vector<checkpoint::distcp::WriteRecord>> writeLogs;
-    std::vector<Rank>                                         ranks;
-
-    auto ensureRankSlot = [&](Rank r) -> std::vector<checkpoint::distcp::WriteRecord>& {
-        for (size_t i = 0; i < ranks.size(); ++i)
-        {
-            if (ranks[i] == r) { return writeLogs[i]; }
-        }
-        ranks.push_back(r);
-        writeLogs.emplace_back();
-        return writeLogs.back();
-    };
+    std::vector<Rank> ranks;
 
     for (auto const& tensor : tensors)
     {
@@ -219,29 +222,12 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
             auto const length     = nb::cast<uint64_t>(entry[3]);
 
             st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = rank});
-
-            auto& writeLog = ensureRankSlot(rank);
-            writeLog.push_back(checkpoint::distcp::WriteRecord{
-                .fqn        = fqn,
-                .sharddim   = sharddim,
-                .fileOffset = fileOffset,
-                .length     = length,
-            });
         }
 
         leaf.data = std::move(st);
     }
 
-    // Build the manifest after writeLogs is fully populated — vector pointers
-    // would otherwise dangle if the inner vectors were later relocated.
-    std::vector<checkpoint::distcp::RankManifestRef> manifest;
-    manifest.reserve(ranks.size());
-    for (size_t i = 0; i < ranks.size(); ++i)
-    {
-        manifest.push_back(checkpoint::distcp::RankManifestRef{.rank = ranks[i], .writeLog = &writeLogs[i]});
-    }
-
-    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, std::span{manifest});
+    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
 }    // namespace

@@ -38,8 +38,6 @@ struct Session
         uint64_t writtenTensorRangeBegin{0};
         uint64_t writtenTensorRangeEnd{0};
         uint64_t writtenTensorSize{0};
-
-        std::vector<checkpoint::distcp::WriteRecord> writeLog;
     };
 
     struct Snapshot

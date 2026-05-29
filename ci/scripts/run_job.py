@@ -1154,12 +1154,17 @@ def _pretrain_worker(local_rank: int, gpus_per_node: int, nodes: int, opts: list
 
 
 def _pretrain_main(program_start: float) -> None:
-    """Mirror of pretrain_mamba.py's __main__ block — calls pretrain() directly."""
+    """Mirror of pretrain_hybrid.py's __main__ block — calls pretrain() directly."""
     import time  # noqa: PLC0415
     from functools import partial  # noqa: PLC0415
 
     from megatron.core.enums import ModelType  # noqa: PLC0415
     from megatron.training import inprocess_restart, pretrain, set_startup_timestamps  # noqa: PLC0415
+    from megatron.training.argument_utils import (  # noqa: PLC0415
+        hybrid_config_from_args,
+        pretrain_cfg_container_from_args,
+    )
+    from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415
 
     try:
         from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415
@@ -1168,23 +1173,29 @@ def _pretrain_main(program_start: float) -> None:
     except ImportError:
         has_modelopt = False
 
-    import pretrain_mamba as pm  # noqa: PLC0415
-    from mamba_builders import mamba_builder  # noqa: PLC0415
+    import pretrain_hybrid as ph  # noqa: PLC0415
+    from hybrid_builders import hybrid_builder  # noqa: PLC0415
     from model_provider import model_provider as _mp  # noqa: PLC0415
 
     set_startup_timestamps(program_start=program_start, main_entry=time.time())
 
-    pm.train_valid_test_datasets_provider.is_distributed = True
+    ph.train_valid_test_datasets_provider.is_distributed = True
 
     pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
-    pretrain_fn(
-        pm.train_valid_test_datasets_provider,
-        partial(_mp, mamba_builder),
-        ModelType.encoder_or_decoder,
-        pm.forward_step,
-        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
-        store=store,
+
+    args = parse_and_validate_args(
         extra_args_provider=add_modelopt_args if has_modelopt else None,
+        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
+    )
+    model_cfg = hybrid_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    pretrain_fn(
+        full_config,
+        ph.train_valid_test_datasets_provider,
+        partial(_mp, hybrid_builder),
+        ModelType.encoder_or_decoder,
+        ph.forward_step,
+        store=store,
     )
 
 
@@ -1248,7 +1259,8 @@ def _parse_and_report(  # noqa: PLR0913
         if job == "pretrain-nvrx":
             # nvrx provider doesn't emit parseable metrics; times printed above.
             return True
-        raise RuntimeError(f"no perf metrics found in {log_file}")
+        if in_srun():
+            raise RuntimeError(f"no perf metrics found in {log_file}")
 
     if update_baseline:
         _update_baseline_file(baseline_file, metrics, job, config, gpus_per_node)
@@ -1622,8 +1634,7 @@ def _run_equality_compare(cfg: str) -> None:
         missing = [name for name, d in (("native", native), ("nvrx", nvrx)) if not d.is_dir()]
         if missing:
             raise RuntimeError(
-                f"equality-compare expected dual-provider layout under {iter_dir}, "
-                f"but {missing} subdir(s) missing",
+                f"equality-compare expected dual-provider layout under {iter_dir}, but {missing} subdir(s) missing",
             )
         sys.stderr.write(f"[run_job] equality-compare {iter_dir.name}\n")
         rc = subprocess.run(
@@ -1631,8 +1642,10 @@ def _run_equality_compare(cfg: str) -> None:
                 sys.executable,
                 "-m",
                 "megatron.native.scripts.checkpoint_equality_compare",
-                "--native", str(native),
-                "--nvrx", str(nvrx),
+                "--native",
+                str(native),
+                "--nvrx",
+                str(nvrx),
             ],
             env=env,
             check=False,
@@ -1644,8 +1657,10 @@ def _run_equality_compare(cfg: str) -> None:
                 sys.executable,
                 "-m",
                 "megatron.native.scripts.metadata_compare",
-                "--native", str(native),
-                "--nvrx", str(nvrx),
+                "--native",
+                str(native),
+                "--nvrx",
+                str(nvrx),
             ],
             env=env,
             check=False,
@@ -1654,8 +1669,7 @@ def _run_equality_compare(cfg: str) -> None:
             failures.append(f"{iter_dir.name} (metadata_compare rc={rc})")
     if failures:
         raise RuntimeError(
-            f"compare failed for {len(failures)} iter(s): "
-            f"{'; '.join(failures)}; see stderr above for per-finding detail",
+            f"compare failed for {len(failures)} iter(s): {'; '.join(failures)}; see stderr above for per-finding detail",
         )
 
 

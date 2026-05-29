@@ -52,7 +52,7 @@ from typing import Any
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+from torch.distributed.checkpoint.metadata import Metadata, MetadataIndex, TensorStorageMetadata
 
 
 class _Report:
@@ -71,14 +71,15 @@ class _Report:
         self.failures += 1
 
 
-def _load_tensors(ckpt_dir: Path) -> dict[str, torch.Tensor]:
+def _load_tensors(ckpt_dir: Path) -> tuple[dict[str, torch.Tensor], Metadata]:
     """Load every tensor in `ckpt_dir` into a flat dict via `dcp.load`.
 
     Builds a zero-filled template state_dict from the metadata so that
     `dcp.load` populates every FQN — we have no caller-side state_dict to
     reuse. Single-process invocation is fine: `dcp.load` falls back to local
     I/O when `torch.distributed` is uninitialized and emits one benign
-    warning.
+    warning. The raw `Metadata` is returned alongside so callers can map
+    each FQN back to its on-disk shard locations.
     """
     reader = FileSystemReader(str(ckpt_dir))
     metadata = reader.read_metadata()
@@ -91,7 +92,29 @@ def _load_tensors(ckpt_dir: Path) -> dict[str, torch.Tensor]:
         if isinstance(meta, TensorStorageMetadata):
             template[fqn] = torch.zeros(meta.size, dtype=meta.properties.dtype)
     dcp.load(template, checkpoint_id=str(ckpt_dir))
-    return template
+    return template, metadata
+
+
+def _shard_locations(metadata: Metadata, fqn: str) -> list[str]:
+    """Render one line per shard of `fqn`: seq index, distcp file, file offset."""
+    meta = metadata.state_dict_metadata.get(fqn)
+    if not isinstance(meta, TensorStorageMetadata):
+        return []
+    storage_data = metadata.storage_data or {}
+    lines: list[str] = []
+    for idx, chunk in enumerate(meta.chunks):
+        info = storage_data.get(MetadataIndex(fqn, chunk.offsets, idx))
+        if info is None:
+            lines.append(
+                f"seq={idx} offsets={tuple(chunk.offsets)} sizes={tuple(chunk.sizes)} (no storage info)",
+            )
+        else:
+            lines.append(
+                f"seq={idx} file={info.relative_path} "
+                f"file_offset={info.offset} length={info.length} "
+                f"offsets={tuple(chunk.offsets)} sizes={tuple(chunk.sizes)}",
+            )
+    return lines
 
 
 def _load_common(ckpt_dir: Path) -> dict:
@@ -101,6 +124,8 @@ def _load_common(ckpt_dir: Path) -> dict:
 def _compare_tensors(
     nvrx: dict[str, torch.Tensor],
     native: dict[str, torch.Tensor],
+    nvrx_meta: Metadata,
+    native_meta: Metadata,
     report: _Report,
 ) -> None:
     nvrx_keys = set(nvrx)
@@ -116,12 +141,16 @@ def _compare_tensors(
         a, b = nvrx[fqn], native[fqn]
         if a.dtype != b.dtype or a.shape != b.shape:
             report.fail(
-                f"tensor metadata mismatch: tensor:{fqn} "
-                f"(nvrx={a.dtype}{tuple(a.shape)}, "
-                f"native={b.dtype}{tuple(b.shape)})",
+                f"tensor metadata mismatch: tensor:{fqn} (nvrx={a.dtype}{tuple(a.shape)}, native={b.dtype}{tuple(b.shape)})",
             )
         elif not torch.equal(a, b):
-            report.fail(f"tensor value mismatch: tensor:{fqn}")
+            nvrx_shards = _shard_locations(nvrx_meta, fqn)
+            native_shards = _shard_locations(native_meta, fqn)
+            detail = ["  nvrx shards:"] + [f"    {s}" for s in nvrx_shards]
+            detail += ["  native shards:"] + [f"    {s}" for s in native_shards]
+            report.fail(
+                f"tensor value mismatch: tensor:{fqn}\n" + "\n".join(detail),
+            )
 
 
 def _is_namespace(x: Any) -> bool:
@@ -131,8 +160,7 @@ def _is_namespace(x: Any) -> bool:
 def _compare_namespace(nvrx: Any, native: Any, report: _Report, path: str) -> None:
     if type(nvrx) is not type(native):
         report.fail(
-            f"type mismatch at {path}: "
-            f"nvrx={type(nvrx).__name__}, native={type(native).__name__}",
+            f"type mismatch at {path}: nvrx={type(nvrx).__name__}, native={type(native).__name__}",
         )
         return
     _compare_common(vars(nvrx), vars(native), report, path)
@@ -141,8 +169,7 @@ def _compare_namespace(nvrx: Any, native: Any, report: _Report, path: str) -> No
 def _compare_dict(nvrx: dict, native: Any, report: _Report, path: str) -> None:
     if not isinstance(native, dict):
         report.fail(
-            f"type mismatch at {path}: nvrx=dict, "
-            f"native={type(native).__name__}",
+            f"type mismatch at {path}: nvrx=dict, native={type(native).__name__}",
         )
         return
     nvrx_keys = set(nvrx)
@@ -158,14 +185,12 @@ def _compare_dict(nvrx: dict, native: Any, report: _Report, path: str) -> None:
 def _compare_sequence(nvrx: Any, native: Any, report: _Report, path: str) -> None:
     if type(nvrx) is not type(native):
         report.fail(
-            f"type mismatch at {path}: "
-            f"nvrx={type(nvrx).__name__}, native={type(native).__name__}",
+            f"type mismatch at {path}: nvrx={type(nvrx).__name__}, native={type(native).__name__}",
         )
         return
     if len(nvrx) != len(native):
         report.fail(
-            f"length mismatch at {path}: "
-            f"nvrx={len(nvrx)}, native={len(native)}",
+            f"length mismatch at {path}: nvrx={len(nvrx)}, native={len(native)}",
         )
         return
     for idx, (a, b) in enumerate(zip(nvrx, native, strict=False)):
@@ -175,15 +200,12 @@ def _compare_sequence(nvrx: Any, native: Any, report: _Report, path: str) -> Non
 def _compare_tensor(nvrx: torch.Tensor, native: Any, report: _Report, path: str) -> None:
     if not isinstance(native, torch.Tensor):
         report.fail(
-            f"type mismatch at {path}: "
-            f"nvrx=torch.Tensor, native={type(native).__name__}",
+            f"type mismatch at {path}: nvrx=torch.Tensor, native={type(native).__name__}",
         )
         return
     if nvrx.dtype != native.dtype or nvrx.shape != native.shape:
         report.fail(
-            f"tensor metadata mismatch at {path} "
-            f"(nvrx={nvrx.dtype}{tuple(nvrx.shape)}, "
-            f"native={native.dtype}{tuple(native.shape)})",
+            f"tensor metadata mismatch at {path} (nvrx={nvrx.dtype}{tuple(nvrx.shape)}, native={native.dtype}{tuple(native.shape)})",
         )
     elif not torch.equal(nvrx, native):
         report.fail(f"tensor value mismatch at {path}")
@@ -192,8 +214,7 @@ def _compare_tensor(nvrx: torch.Tensor, native: Any, report: _Report, path: str)
 def _compare_scalar(nvrx: Any, native: Any, report: _Report, path: str) -> None:
     if nvrx != native:
         report.fail(
-            f"value mismatch at {path}: "
-            f"nvrx={nvrx!r}, native={native!r}",
+            f"value mismatch at {path}: nvrx={nvrx!r}, native={native!r}",
         )
 
 
@@ -204,8 +225,7 @@ def _compare_fallback(nvrx: Any, native: Any, report: _Report, path: str) -> Non
     # stderr usable when the tree has many of them.
     if repr(nvrx) != repr(native):
         report.fail(
-            f"complex-type value mismatch at {path} "
-            f"({type(nvrx).__name__}): repr differs",
+            f"complex-type value mismatch at {path} ({type(nvrx).__name__}): repr differs",
         )
 
 
@@ -240,11 +260,11 @@ def main(native_dir: Path, nvrx_dir: Path) -> int:
     """
     report = _Report()
 
-    nvrx_tensors   = _load_tensors(nvrx_dir)
-    native_tensors = _load_tensors(native_dir)
-    _compare_tensors(nvrx_tensors, native_tensors, report)
+    nvrx_tensors, nvrx_meta = _load_tensors(nvrx_dir)
+    native_tensors, native_meta = _load_tensors(native_dir)
+    _compare_tensors(nvrx_tensors, native_tensors, nvrx_meta, native_meta, report)
 
-    nvrx_common   = _load_common(nvrx_dir)
+    nvrx_common = _load_common(nvrx_dir)
     native_common = _load_common(native_dir)
     _compare_common(nvrx_common, native_common, report, "common.pt")
 
@@ -255,8 +275,7 @@ def main(native_dir: Path, nvrx_dir: Path) -> int:
         parts.append(f"{report.failures} failure(s)")
     summary = ", ".join(parts) if parts else "equal"
     print(  # noqa: T201
-        f"checkpoint_equality_compare: {summary} "
-        f"(native={native_dir}, nvrx={nvrx_dir})",
+        f"checkpoint_equality_compare: {summary} (native={native_dir}, nvrx={nvrx_dir})",
         file=sys.stderr,
     )
     return 1 if report.failures else 0
@@ -268,11 +287,15 @@ def _cli() -> int:
     description = (__doc__ or "Compare a native checkpoint against an nvrx one").splitlines()[0]
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
-        "--native", type=Path, required=True,
+        "--native",
+        type=Path,
+        required=True,
         help="path to the native checkpoint sub-directory",
     )
     parser.add_argument(
-        "--nvrx", type=Path, required=True,
+        "--nvrx",
+        type=Path,
+        required=True,
         help="path to the nvrx checkpoint sub-directory",
     )
     args = parser.parse_args()

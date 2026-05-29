@@ -245,8 +245,11 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
             {
                 shard.AssertShardIsValid(tnsr.fulldim);
                 lambda({rank,
-                        StateNode::TensorShard{
-                            .sharddim = shard.sharddim, .fulldim = tnsr.fulldim, .dtype = tnsr.dtype, .device = shard.device},
+                        StateNode::TensorShard{.sharddim = shard.sharddim,
+                                               .fulldim  = tnsr.fulldim,
+                                               .dtype    = tnsr.dtype,
+                                               .handle   = shard.handle,
+                                               .device   = shard.device},
                         registry.GetNodeId(node.handle)});
             }
         }
@@ -383,6 +386,15 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
         }
     };
 
+    // localShardHandleMap[(rank, fqn, sharddim)] = handle from the per-rank local registry.
+    // Used below to assert that the handle recorded in the merged global registry matches
+    // the handle the owning rank actually wrote, catching drift between the two views.
+    std::unordered_map<std::string, uint64_t> localShardHandleMap;
+    auto                                      makeShardHandleKey    //
+        = [](cipc::Rank rank, std::string_view fqn, StateNode::ShardedTensor::DimRange const& sharddim) {
+              return fmt::format("rank{}:{}[{}]", rank, fqn, sharddim);
+          };
+
     for (auto const& [localRank, localState] : snapshot.localStates)
     {
         localState->localRegistry->WalkNodes([&](StateNode const& node) {
@@ -404,7 +416,9 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                                tnsr.handle);
                 }
 #endif
-                addmd5(fmt::format("{}[{}]", localState->localRegistry->GetNodeId(node.handle), tnsr.sharddim), ComputeMd5Hex(data, size));
+                auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
+                localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, tnsr.sharddim), tnsr.handle);
+                addmd5(fmt::format("{}[{}]", localFqn, tnsr.sharddim), ComputeMd5Hex(data, size));
             }
             else if (type == StateNode::Type::ShardedTensor)
             {
@@ -425,8 +439,9 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                                    shard.handle);
                     }
 #endif
-                    addmd5(fmt::format("{}[{}]", localState->localRegistry->GetNodeId(node.handle), shard.sharddim),
-                           ComputeMd5Hex(data.data(), data.size()));
+                    auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
+                    localShardHandleMap.emplace(makeShardHandleKey(shard.rank, localFqn, shard.sharddim), shard.handle);
+                    addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim), ComputeMd5Hex(data.data(), data.size()));
                 }
             }
         });
@@ -458,6 +473,31 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
         size_t                             i = 0;
         for (auto const& rankShard : shardedTnsr.shards)
         {
+            // Verify the per-rank handle recorded in the merged global registry matches
+            // the handle the owning rank's local registry actually wrote. Done for every
+            // rankShard (including replicas) so each rank's view is checked individually,
+            // before the sharddim-dedup skip below collapses replicas for output.
+            auto const shardHandleKey = makeShardHandleKey(rankShard.rank, nodeName, rankShard.sharddim);
+            auto const localHandleIt  = localShardHandleMap.find(shardHandleKey);
+            if (localHandleIt == localShardHandleMap.end())
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}][ERROR] Global shard {} has no matching entry in any local registry\n",
+                           *server,
+                           sessionId,
+                           shardHandleKey);
+            }
+            else if (localHandleIt->second != rankShard.handle)
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}][ERROR] Global shard {} handle {} does not match local handle {}\n",
+                           *server,
+                           sessionId,
+                           shardHandleKey,
+                           rankShard.handle,
+                           localHandleIt->second);
+            }
+
             if (lastShard == rankShard.sharddim) { continue; }
             lastShard         = rankShard.sharddim;
             auto fqnShardName = fmt::format("{}[{}]", globalState.GetNodeId(node.handle), rankShard.sharddim);
@@ -539,8 +579,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         WriteGlobalStateTreeToFile_(snapshot, snapshot.path.parent_path() / "registry.bin");
     }
 
-    checkpoint::distcp::WriteRankShard(
-        snapshot.path.parent_path(), hdr.globalRank, *localState.localRegistry, localState.blob, localState.writeLog);
+    checkpoint::distcp::WriteRankShard(snapshot.path.parent_path(), hdr.globalRank, *snapshot.registry, localState.blob);
     {
         std::scoped_lock lock(mutex);
         snapshot.writeCkptCompletedRanks.insert(hdr.globalRank);
@@ -567,29 +606,13 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         DebugWriteNativeMetadataInfo_(snapshot);
-        // Assemble the per-rank manifest from snapshot.localStates. We take the
-        // mutex briefly to read localStates — same pattern as every other
-        // accessor of that map. The busy-wait above already established
-        // happens-before with every worker's writeLog population (insert into
-        // `writeCompletedRanks` under the mutex on the writer side, read of
-        // its size under the mutex here), so the writeLog pointers we borrow
-        // refer to fully-populated vectors that no other thread will touch.
-        std::vector<checkpoint::distcp::RankManifestRef> manifest;
-        {
-            std::scoped_lock lock(mutex);
-            manifest.reserve(snapshot.localStates.size());
-            for (auto const& [r, ls] : snapshot.localStates)
-            {
-                manifest.push_back(checkpoint::distcp::RankManifestRef{.rank = r, .writeLog = &ls->writeLog});
-            }
-        }
         // Log on failure so the operator sees what broke. The async worker's
         // future is stored in `asyncTasks` but never `.get()`d (pre-existing
         // gap tracked in plan.md), so a silent rethrow at session teardown
         // would otherwise be the first user-visible signal.
         try
         {
-            checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry, std::span{manifest});
+            checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry);
         } catch (std::exception const& ex)
         {
             fmt::print(stderr,
@@ -640,8 +663,10 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             // Add the final node which contains the handler
             auto& child = sessionState.registry->AddChild(parentNode, childName, true);
             auto  shTen = StateNode::ShardedTensor(tensorShard.tensorInfo.dtype, tensorShard.tensorInfo.fulldim);
-            shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                .sharddim = tensorShard.tensorInfo.sharddim, .device = tensorShard.tensorInfo.device, .rank = tensorShard.rank});
+            shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{.sharddim = tensorShard.tensorInfo.sharddim,
+                                                                       .device   = tensorShard.tensorInfo.device,
+                                                                       .handle   = tensorShard.tensorInfo.handle,
+                                                                       .rank     = tensorShard.rank});
             child.data                    = shTen;
             tensorMap[tensorShard.nodeId] = child.handle;
             continue;
@@ -662,7 +687,10 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         }
 
         tensorShard.tensorInfo.AssertShardIsValid();
-        tnsr.AddShard({.sharddim = tensorShard.tensorInfo.sharddim, .device = tensorShard.tensorInfo.device, .rank = tensorShard.rank});
+        tnsr.AddShard({.sharddim = tensorShard.tensorInfo.sharddim,
+                       .device   = tensorShard.tensorInfo.device,
+                       .handle   = tensorShard.tensorInfo.handle,
+                       .rank     = tensorShard.rank});
     }
 }
 

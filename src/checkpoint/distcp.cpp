@@ -1,5 +1,6 @@
 #include "distcp.h"
 #include "distcp_internal.h"
+#include "state.h"
 
 #include <fmt/format.h>
 
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -51,6 +53,8 @@ static_assert(std::endian::native == std::endian::little,
 namespace checkpoint::distcp
 {
 
+namespace
+{
 std::string_view DTypeName(DS4Tensor::DType dtype)
 {
     using DT = DS4Tensor::DType;
@@ -73,53 +77,6 @@ std::string_view DTypeName(DS4Tensor::DType dtype)
     default: throw std::runtime_error(fmt::format("distcp: unsupported dtype {}", static_cast<int>(dtype)));
     }
 }
-
-void CollectShards(StateTree const& tree, Blob const& blob, std::vector<ShardEntry>& out)
-{
-    auto const* base = static_cast<char const*>(blob.data);
-    tree.WalkNodes([&](StateNode const& node) {
-        auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type == StateNode::Type::TensorShard)
-        {
-            auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
-            auto const  size = tnsr.ShardSizeBytes();
-            if (size == 0) { return; }
-            DS4Tensor::Dim shape{};
-            for (auto const& r : tnsr.sharddim) { shape.push_back(r.end - r.begin); }
-            out.push_back(ShardEntry{
-                .srcPtr   = base + tnsr.handle,
-                .length   = size,
-                .fqn      = tree.GetNodeId(node.handle),
-                .dtype    = tnsr.dtype,
-                .sharddim = tnsr.sharddim,
-                .shape    = shape,
-            });
-        }
-        else if (type == StateNode::Type::ShardedTensor)
-        {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            for (auto const& shard : tnsr.shards)
-            {
-                auto const size = shard.ShardSizeBytes(tnsr.dtype);
-                if (size == 0) { continue; }
-                DS4Tensor::Dim shape{};
-                for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
-                out.push_back(ShardEntry{
-                    .srcPtr   = base + shard.handle,
-                    .length   = size,
-                    .fqn      = tree.GetNodeId(node.handle),
-                    .dtype    = tnsr.dtype,
-                    .sharddim = shard.sharddim,
-                    .shape    = shape,
-                });
-            }
-        }
-    });
-}
-
-namespace
-{
-
 // ---- Pickle stream emission ----------------------------------------------
 
 struct DtypePickleInfo
@@ -242,7 +199,7 @@ void PickleTupleClose(std::vector<unsigned char>& b, size_t n)
     }
 }
 
-// Precondition: shape is non-empty. CollectShards builds shapes from
+// Precondition: shape is non-empty. WriteRankShard builds shapes from
 // `sharddim`, which is non-empty for every tensor we write.
 std::vector<unsigned char> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
 {
@@ -326,45 +283,161 @@ std::vector<unsigned char> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim c
 
 // ---- miniz ZIP archive helper --------------------------------------------
 
+// Layout constants shared between the actual writer (WriteShardArchive) and
+// the length predictor (ComputeShardArchiveSize). The predictor is what lets
+// rank 0 emit `.metadata` storage_info entries for OTHER ranks' shards
+// without ever seeing their local registry: archive size is fully determined
+// by (dtype, shape, dataSize), so the layout simulator below produces the
+// same numbers WriteShardArchive would record in a writeLog. See
+// `[distcp][tier1][predict]` for the self-consistency test that gates this.
+//
 // 64-byte alignment of `archive/data/N` mirrors what PyTorchStreamWriter does
 // for zero-copy mmap reads downstream. Without it, torch.load still works but
 // byte-parity with `dcp.save` breaks.
-constexpr uint64_t KFieldAlignment = 64;
+constexpr uint64_t KFieldAlignment      = 64;
+constexpr uint64_t LocalFileHeaderSize  = 30;
+constexpr uint64_t CentralDirHeaderSize = 46;
+constexpr uint64_t FbExtraHeaderBytes   = sizeof(uint16_t) * 2;    // 2-byte ID + 2-byte length
+constexpr uint64_t EocdSize             = 22;
+// Forced by MZ_ZIP_FLAG_WRITE_ZIP64 at writer init — present even when
+// per-entry sizes fit in 32 bits. Sizes from miniz_zip.c.
+constexpr uint64_t Zip64EocdRecordSize  = 56;
+constexpr uint64_t Zip64EocdLocatorSize = 20;
+// `archive/.data/serialization_id` body is always `fmt::format("{:020d}{:020d}", ...)`.
+constexpr uint64_t SerializationIdSize = 40;
+// Every entry with `uncomp_size > 0` gets a post-body data descriptor:
+// 4-byte signature + 4-byte CRC + 4-byte comp_size + 4-byte uncomp_size.
+// Miniz emits the 32-bit variant unless the LFH itself needed a ZIP64 extra
+// (`pExtra_data != NULL`), which only happens when size or offset crosses
+// 4 GiB — gated out by WriteRankShard. See miniz_zip.c:3505-3533.
+constexpr uint64_t DataDescriptorSize = 16;
 
-// Replicates `caffe2::serialize::detail::getOffset` / `getPadding` from
-// pytorch/v2.11.0. Returns the FB-prefixed extra-field bytes to attach to a
-// local file header so the entry's data starts on a 64-byte boundary.
-//
-// `cursor` is the archive offset the next LFH will land at (miniz's
-// `m_archive_size`). The extra field is laid out as:
-//   'F','B', <padding_size LE 2 bytes>, 'Z' * padding_size
-// Total length = padding_size + 4 (the 4-byte FB header itself).
-std::vector<unsigned char> ComputePadding(size_t cursor, size_t filenameSize, size_t dataSize)
+// Per-entry extra-field length needed to push the entry's data body onto a
+// `kFieldAlignment` boundary. Replicates `caffe2::serialize::detail::getOffset`
+// / `getPadding` from pytorch/v2.11.0. `cursor` is the archive offset the next
+// LFH will land at (miniz's `m_archive_size`).
+uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
 {
-    // Mirror the upstream offset computation for ZIP32 entries; ZIP64 entries
-    // need extra header bytes (we throw on those upstream — see WriteRankShard).
-    // 30 = sizeof(LFH); +4 = FB extra-field header bytes (2 id + 2 length).
-    constexpr size_t kLocalFileHeaderSize = 30;
-    constexpr size_t kFbExtraHeaderBytes  = sizeof(uint16_t) * 2;
-    size_t           start                = cursor + kLocalFileHeaderSize + filenameSize + kFbExtraHeaderBytes;
+    uint64_t const start       = cursor + LocalFileHeaderSize + filenameSize + FbExtraHeaderBytes;
+    uint64_t const mod         = start % KFieldAlignment;
+    uint64_t const paddingSize = (mod == 0) ? 0 : (KFieldAlignment - mod);
+    return paddingSize + FbExtraHeaderBytes;
+}
+
+// Materializes the FB extra-field bytes for WriteShardArchive to hand to
+// miniz. Layout: `'F','B', <padding_size LE 2 bytes>, 'Z' * padding_size`.
+// Total length = padding_size + 4.
+std::vector<unsigned char> BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
+{
     if (dataSize >= MZ_UINT32_MAX || cursor >= MZ_UINT32_MAX)
     {
         // The upstream code adds extra bytes here for ZIP64 LFH fields. We
         // gate ZIP64 out at the caller, so this branch shouldn't fire.
         throw std::runtime_error(fmt::format("distcp: ZIP entry too large for ZIP32 (cursor={}, dataSize={})", cursor, dataSize));
     }
-    size_t const mod         = start % KFieldAlignment;
-    size_t const nextOffset  = (mod == 0) ? start : (start + KFieldAlignment - mod);
-    size_t const paddingSize = nextOffset - start;
+    uint64_t const extraSize   = ComputeFbExtraSize(cursor, filenameSize);
+    uint64_t const paddingSize = extraSize - FbExtraHeaderBytes;
 
     std::vector<unsigned char> extra;
-    extra.resize(paddingSize + 4, 'Z');
+    extra.resize(static_cast<size_t>(extraSize), 'Z');
     extra[0] = 'F';
     extra[1] = 'B';
     extra[2] = static_cast<unsigned char>(paddingSize & 0xff);
     extra[3] = static_cast<unsigned char>((paddingSize >> 8) & 0xff);
     return extra;
 }
+
+// Filenames for the 7 archive entries, in write order. Shared between the
+// writer and the size predictor so they can't drift apart.
+constexpr std::array<std::string_view, 7> EntryFullNames{
+    "archive/data.pkl",
+    "archive/.format_version",
+    "archive/.storage_alignment",
+    "archive/byteorder",
+    "archive/data/0",
+    "archive/version",
+    "archive/.data/serialization_id",
+};
+// Bare names that PyTorchStreamWriter::files_written_ stores (no `archive/`
+// prefix), in the same order as EntryFullNames. Used by WriteShardArchive
+// to reproduce the serialization_id name-hash leg. The 7th entry,
+// `.data/serialization_id`, is intentionally excluded from the hash.
+constexpr std::array<std::string_view, 6> EntryBareNames{
+    "data.pkl",
+    ".format_version",
+    ".storage_alignment",
+    "byteorder",
+    "data/0",
+    "version",
+};
+// Constant-body bytes for the fixed entries (indices 1, 2, 3, 5 in
+// EntryFullNames). The two variable entries — `data.pkl` (index 0) and
+// `data/0` (index 4) — are produced per-shard by the caller. Sizes drive
+// the analytical size predictor; bytes also feed the actual writer.
+constexpr std::string_view FormatVersionBytes    = "1";
+constexpr std::string_view StorageAlignmentBytes = "64";
+constexpr std::string_view ByteorderBytes        = "little";
+constexpr std::string_view VersionBytes          = "3\n";
+
+}    // anonymous namespace
+
+uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape, uint64_t shardDataSize)
+{
+    if (shardDataSize >= MZ_UINT32_MAX)
+    {
+        throw std::runtime_error(
+            fmt::format("distcp: ComputeShardArchiveSize: shardDataSize {} >= 4 GiB (ZIP64 LFH not implemented)", shardDataSize));
+    }
+
+    auto const dataPkl = BuildDataPkl(dtype, shape);
+
+    // Per-entry payload size, indexed in lockstep with EntryFullNames.
+    std::array<uint64_t, 7> const dataSizes{
+        dataPkl.size(),
+        FormatVersionBytes.size(),
+        StorageAlignmentBytes.size(),
+        ByteorderBytes.size(),
+        shardDataSize,
+        VersionBytes.size(),
+        SerializationIdSize,
+    };
+
+    // LFH + filename + FB extra + data + data descriptor, per entry. Cursor
+    // advancement mirrors miniz `m_archive_size` so each ComputeFbExtraSize
+    // sees the same alignment input that WriteShardArchive's BuildFbExtra
+    // would — getting the cursor wrong shifts every subsequent entry's FB
+    // padding off the 64-byte grid too, so the descriptor MUST be folded into
+    // cursor advancement, not just added at the end.
+    uint64_t cursor = 0;
+    for (size_t i = 0; i < EntryFullNames.size(); ++i)
+    {
+        uint64_t const fnSize    = EntryFullNames.at(i).size();
+        uint64_t const dataSize  = dataSizes.at(i);
+        uint64_t const extraSize = ComputeFbExtraSize(cursor, fnSize);
+        cursor += LocalFileHeaderSize + fnSize + extraSize + dataSize;
+        // All seven of our entries have non-zero body, so the descriptor
+        // always fires. The `if` keeps the formula honest if a future
+        // change ever introduces a zero-body entry.
+        if (dataSize > 0) { cursor += DataDescriptorSize; }
+    }
+
+    // Central directory: 46-byte fixed header + filename per entry. We pass
+    // null/0 for both `pExtra` and `user_extra_data_central`, and all our
+    // LFH offsets/sizes fit in 32 bits, so miniz adds no zip64 extra to CD
+    // records either (verified against miniz_zip.c:3184-3221).
+    for (auto const& fn : EntryFullNames) { cursor += CentralDirHeaderSize + fn.size(); }
+
+    // MZ_ZIP_FLAG_WRITE_ZIP64 forces m_zip64 at writer init, so finalize
+    // always emits ZIP64 EOCD record + locator before the plain EOCD trailer
+    // — even when nothing in the archive actually needs 64-bit fields
+    // (miniz_zip.c:4442-4470).
+    cursor += Zip64EocdRecordSize + Zip64EocdLocatorSize + EocdSize;
+
+    return cursor;
+}
+
+namespace
+{
 
 // `c10::hash_combine` from c10/util/hash.h: deterministic mixer used in the
 // serialization_id record-name hash.
@@ -388,9 +461,14 @@ uint64_t StdHashString(std::string const& s)
 // in one shot. Memory cost = ZIP container overhead + tensor body (the
 // tensor body is the only large field). For multi-gigabyte tensors this is
 // the same RSS hit `dcp.save` takes; revisit if it shows up in a profile.
-uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view contextName)
+uint64_t WriteShardArchive(int                   fd,
+                           DS4Tensor::DType      dtype,
+                           DS4Tensor::Dim const& shape,
+                           char const*           srcPtr,
+                           uint64_t              length,
+                           std::string_view      contextName)
 {
-    std::vector<unsigned char> dataPkl = BuildDataPkl(s.dtype, s.shape);
+    std::vector<unsigned char> dataPkl = BuildDataPkl(dtype, shape);
 
     // Per-entry plan: filename + content pointer + content size.
     struct EntryPlan
@@ -401,36 +479,39 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
         std::vector<unsigned char> padding;    // 0 for non-data entries
     };
 
-    constexpr char const* kArchivePrefix = "archive/";
-    auto                  joinName       = [](std::string_view sub) {
-        std::string name;
-        name.reserve(8 + sub.size());
-        name.append(kArchivePrefix);
-        name.append(sub);
-        return name;
-    };
-
-    static constexpr std::string_view KByteorderBytes        = "little";
-    static constexpr std::string_view KFormatVersionBytes    = "1";
-    static constexpr std::string_view KStorageAlignmentBytes = "64";
-    static constexpr std::string_view KVersionBytes          = "3\n";
-
     // Record order matches torch.serialization._save / PyTorchStreamWriter::
     // writeEndOfFile exactly:
     //   data.pkl, .format_version, .storage_alignment, byteorder,
     //   data/N..., version, .data/serialization_id
-    // The serialization_id entry is appended after combined-CRC is known.
+    // Filenames live in `EntryFullNames` so the size predictor uses the same
+    // strings. The serialization_id entry is appended after combined-CRC is known.
+    enum Idx : size_t
+    {
+        DataPklIdx    = 0,
+        FormatVerIdx  = 1,
+        StorageAlnIdx = 2,
+        ByteOrderIdx  = 3,
+        DataZeroIdx   = 4,
+        VersionIdx    = 5,
+        SerialIdIdx   = 6,
+    };
     std::array<EntryPlan, 6> entries{
-        EntryPlan{.fullName = joinName("data.pkl"), .data = dataPkl.data(), .size = dataPkl.size(), .padding = {}},
-        EntryPlan{
-            .fullName = joinName(".format_version"), .data = KFormatVersionBytes.data(), .size = KFormatVersionBytes.size(), .padding = {}},
-        EntryPlan{.fullName = joinName(".storage_alignment"),
-                  .data     = KStorageAlignmentBytes.data(),
-                  .size     = KStorageAlignmentBytes.size(),
+        EntryPlan{.fullName = std::string{EntryFullNames[DataPklIdx]}, .data = dataPkl.data(), .size = dataPkl.size(), .padding = {}},
+        EntryPlan{.fullName = std::string{EntryFullNames[FormatVerIdx]},
+                  .data     = FormatVersionBytes.data(),
+                  .size     = FormatVersionBytes.size(),
                   .padding  = {}},
-        EntryPlan{.fullName = joinName("byteorder"), .data = KByteorderBytes.data(), .size = KByteorderBytes.size(), .padding = {}},
-        EntryPlan{.fullName = joinName("data/0"), .data = s.srcPtr, .size = s.length, .padding = {}},
-        EntryPlan{.fullName = joinName("version"), .data = KVersionBytes.data(), .size = KVersionBytes.size(), .padding = {}},
+        EntryPlan{.fullName = std::string{EntryFullNames[StorageAlnIdx]},
+                  .data     = StorageAlignmentBytes.data(),
+                  .size     = StorageAlignmentBytes.size(),
+                  .padding  = {}},
+        EntryPlan{.fullName = std::string{EntryFullNames[ByteOrderIdx]},
+                  .data     = ByteorderBytes.data(),
+                  .size     = ByteorderBytes.size(),
+                  .padding  = {}},
+        EntryPlan{.fullName = std::string{EntryFullNames[DataZeroIdx]}, .data = srcPtr, .size = length, .padding = {}},
+        EntryPlan{
+            .fullName = std::string{EntryFullNames[VersionIdx]}, .data = VersionBytes.data(), .size = VersionBytes.size(), .padding = {}},
     };
 
     // Set up miniz heap writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD
@@ -440,7 +521,7 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
     mz_zip_archive zip{};
     if (mz_zip_writer_init_heap_v2(&zip,
                                    /*size_to_reserve_at_beginning=*/0,
-                                   /*initial_allocation_size=*/std::max<size_t>(1024, s.length),
+                                   /*initial_allocation_size=*/std::max<size_t>(1024, length),
                                    MZ_ZIP_FLAG_WRITE_ZIP64)
         != MZ_TRUE)
     {
@@ -458,7 +539,7 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
     lfhOffsets.reserve(entries.size() + 1);
 
     auto addEntry = [&](EntryPlan& plan, std::string_view bareName) {
-        plan.padding = ComputePadding(zip.m_archive_size, plan.fullName.size(), plan.size);
+        plan.padding = BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
         lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         plan.fullName.c_str(),
@@ -492,21 +573,9 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
         bareNamesWritten.insert(std::string{bareName});
     };
 
-    // Bare record names that PyTorchStreamWriter::files_written_ contains, in
-    // write order — upstream stores names without the `archive/` prefix. Used
-    // to reproduce the serialization_id name-hash leg.
-    static constexpr std::array<std::string_view, 6> KBareNames{
-        "data.pkl",
-        ".format_version",
-        ".storage_alignment",
-        "byteorder",
-        "data/0",
-        "version",
-    };
-
     try
     {
-        for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries[i], KBareNames[i]); }
+        for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries.at(i), EntryBareNames.at(i)); }
 
         // Record-name hash: iterate `bareNamesWritten` (the unordered_set) in
         // its hash-bucket order, like PyTorchStreamWriter::writeSerializationId.
@@ -520,7 +589,7 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
         std::string const serializationId = fmt::format("{:020d}{:020d}", combinedRecordNameHash, combinedCrc);
 
         EntryPlan idPlan{
-            .fullName = joinName(".data/serialization_id"),
+            .fullName = std::string{EntryFullNames[SerialIdIdx]},
             .data     = serializationId.data(),
             .size     = serializationId.size(),
             .padding  = {},
@@ -529,7 +598,7 @@ uint64_t WriteShardArchive(int fd, ShardEntry const& s, std::string_view context
         // upstream excludes it (see PyTorchStreamWriter::writeSerializationId, which
         // checks `files_written_.find(kSerializationIdRecordName) == end()` before
         // computing).
-        idPlan.padding = ComputePadding(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
+        idPlan.padding = BuildFbExtra(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
         lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         idPlan.fullName.c_str(),
@@ -817,25 +886,7 @@ void EmitStorageInfo(std::vector<unsigned char>& b, std::string_view relativePat
     EmitNewObjBuildEnd(b);
 }
 
-// Find the WriteRecord that this rank wrote for (fqn, sharddim). Linear scan
-// per the plan; upgrade to a map if it ever shows up in a profile.
-WriteRecord const*
-LookupWriteRecord(std::span<RankManifestRef const> manifest, Rank rank, std::string const& fqn, DS4Tensor::DimRange const& sharddim)
-{
-    for (auto const& ref : manifest)
-    {
-        if (ref.rank != rank) { continue; }
-        if (ref.writeLog == nullptr) { return nullptr; }
-        for (auto const& wr : *ref.writeLog)
-        {
-            if (wr.fqn == fqn && wr.sharddim == sharddim) { return &wr; }
-        }
-        return nullptr;
-    }
-    return nullptr;
-}
-
-std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, std::span<RankManifestRef const> manifest)
+std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
 {
     std::vector<unsigned char> b;
     b.reserve(2048);
@@ -851,13 +902,9 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, std
     PutU8(b, '(');    // MARK
     globalRegistry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
+        assert(type != StateNode::Type::TensorShard);
         if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-        // Dedupe replicas by sharddim so each unique chunk is emitted once.
-        // Mirrors DebugWriteNativeMetadataInfo_ in server.cpp; without this
-        // the two views of the registry disagree and verify_native_server
-        // fires. The proper fix is to drop replica_id != 0 at registration
-        // — tracked in ankurv/megatron-lm#6.
+        auto const&                      tnsr = std::get<StateNode::ShardedTensor>(node.data);
         std::vector<DS4Tensor::DimRange> chunkRanges;
         chunkRanges.reserve(tnsr.shards.size());
         DS4Tensor::DimRange lastShard{};
@@ -879,31 +926,36 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, std
     PickleBinunicode(b, "storage_data");
     PutU8(b, '}');
     PutU8(b, '(');
+    std::unordered_map<Rank, uint64_t> rankCursors;
     globalRegistry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-        auto const  fqn  = globalRegistry.GetNodeId(node.handle);
-        // Same dedupe as the state_dict_metadata loop above (ankurv/megatron-lm#6).
-        // The surviving _StorageInfo points at the lowest-rank replica;
-        // dcp.load reads bytes from that file. Until #6 is fixed, the
-        // other replica ranks still carry orphan bytes in their .distcp.
+        auto const&         tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        auto const          fqn  = globalRegistry.GetNodeId(node.handle);
         DS4Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
-            if (shard.ShardSizeBytes(tnsr.dtype) == 0) { continue; }
+            auto const shardSize = shard.ShardSizeBytes(tnsr.dtype);
+            if (shardSize == 0) { continue; }
+            DS4Tensor::Dim shardShape;
+            for (auto const& r : shard.sharddim) { shardShape.push_back(r.end - r.begin); }
+            uint64_t const archiveLen = ComputeShardArchiveSize(tnsr.dtype, shardShape, shardSize);
+            uint64_t&      cursor     = rankCursors[shard.rank];
+            uint64_t       curCursor  = cursor;
+            cursor += archiveLen;
+
             if (lastShard == shard.sharddim) { continue; }
-            lastShard       = shard.sharddim;
-            auto const* rec = LookupWriteRecord(manifest, shard.rank, fqn, shard.sharddim);
-            if (rec == nullptr)
-            {
-                throw std::runtime_error(fmt::format("distcp::WriteMetadata: no WriteRecord for rank {} fqn '{}' (writeLog populated?)",
-                                                     static_cast<uint32_t>(shard.rank),
-                                                     fqn));
-            }
+            lastShard = shard.sharddim;
+
+            // Emit only the first replica of each sharddim; later replicas share
+            // the same MetadataIndex key and would just overwrite the prior
+            // entry. The cursor must still advance for every shard — WriteRankShard
+            // wrote each one to that rank's .distcp file, so skipping the
+            // advance would leave subsequent non-replica shards on the same rank
+            // pointing at a wrong offset.
             EmitMetadataIndex(b, fqn, shard.sharddim);
             auto const relPath = fmt::format("__{}_0.distcp", static_cast<uint32_t>(shard.rank));
-            EmitStorageInfo(b, relPath, rec->fileOffset, rec->length);
+            EmitStorageInfo(b, relPath, curCursor, archiveLen);
         }
     });
     PutU8(b, 'u');    // SETITEMS
@@ -918,15 +970,8 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, std
 
 }    // namespace
 
-void WriteRankShard(std::filesystem::path const& ckptDir,
-                    Rank                         rank,
-                    StateTree const&             localRegistry,
-                    Blob const&                  blob,
-                    std::vector<WriteRecord>&    writeLog)
+void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, Blob const& blob)
 {
-    std::vector<ShardEntry> shards;
-    CollectShards(localRegistry, blob, shards);
-
     std::filesystem::create_directories(ckptDir);
 
     auto const filename = fmt::format("__{}_0.distcp", static_cast<uint32_t>(rank));
@@ -938,30 +983,49 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     uint64_t cursor = 0;
     try
     {
-        writeLog.reserve(writeLog.size() + shards.size());
-        for (auto& s : shards)
-        {
-            // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
-            // per-entry call site (the m_zip64 flag) plus the alignment math;
-            // defer until we see a real large-shard case. The archive's EOCD
-            // is already ZIP64 (MZ_ZIP_FLAG_WRITE_ZIP64), but per-entry LFH
-            // sizes are still 32-bit.
-            if (s.length >= MZ_UINT32_MAX)
+        auto const* base = static_cast<char const*>(blob.data);
+        registry.WalkNodes([&](StateNode const& node) {
+            auto const type = static_cast<StateNode::Type>(node.data.index());
+            // The registry handed in is always the post-merge global registry
+            // (ShardedTensor entries keyed by rank). Tests construct it with
+            // the same shape.
+            assert(type != StateNode::Type::TensorShard);
+            if (type != StateNode::Type::ShardedTensor) { return; }
+            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto const  fqn  = registry.GetNodeId(node.handle);
+            for (auto const& shard : tnsr.shards)
             {
-                throw std::runtime_error(
-                    fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", s.fqn, s.length));
+                if (shard.rank != rank) { continue; }
+                auto const size = shard.ShardSizeBytes(tnsr.dtype);
+                if (size == 0) { continue; }
+                DS4Tensor::Dim shape{};
+                for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
+                // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
+                // per-entry call site (the m_zip64 flag) plus the alignment math;
+                // defer until we see a real large-shard case. The archive's EOCD
+                // is already ZIP64 (MZ_ZIP_FLAG_WRITE_ZIP64), but per-entry LFH
+                // sizes are still 32-bit.
+                if (size >= MZ_UINT32_MAX)
+                {
+                    throw std::runtime_error(
+                        fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, size));
+                }
+                uint64_t const predicted = ComputeShardArchiveSize(tnsr.dtype, shape, size);
+                uint64_t const actual    = WriteShardArchive(fd, tnsr.dtype, shape, base + shard.handle, size, fqn);
+                if (predicted != actual)
+                {
+                    throw std::runtime_error(fmt::format("distcp: ComputeShardArchiveSize/WriteShardArchive disagree for '{}' "
+                                                         "(dtype={}, shape=[{}], dataSize={}): predicted={} actual={}",
+                                                         fqn,
+                                                         DTypeName(tnsr.dtype),
+                                                         fmt::join(shape, ","),
+                                                         size,
+                                                         predicted,
+                                                         actual));
+                }
+                cursor += actual;
             }
-
-            uint64_t const archiveLen = WriteShardArchive(fd, s, s.fqn);
-
-            writeLog.push_back(WriteRecord{
-                .fqn        = std::move(s.fqn),
-                .sharddim   = s.sharddim,
-                .fileOffset = cursor,
-                .length     = archiveLen,
-            });
-            cursor += archiveLen;
-        }
+        });
 
         if (::fsync(fd) != 0)
         {
@@ -979,9 +1043,9 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     }
 }
 
-void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry, std::span<RankManifestRef const> manifest)
+void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry)
 {
-    auto const pkl = BuildMetadataPkl(globalRegistry, manifest);
+    auto const pkl = BuildMetadataPkl(globalRegistry);
 
     std::filesystem::create_directories(ckptDir);
     auto const filepath = ckptDir / ".metadata";
