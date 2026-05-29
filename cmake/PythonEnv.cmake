@@ -1,4 +1,3 @@
-# cppforge-sync
 include_guard()
 
 if (DEFINED Python3_EXECUTABLE AND NOT EXISTS "${Python3_EXECUTABLE}")

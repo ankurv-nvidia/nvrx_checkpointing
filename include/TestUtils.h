@@ -1,4 +1,3 @@
-// cppforge-sync
 #pragma once
 #include "CommonMacros.h"
 

@@ -626,17 +626,24 @@ def _build_pretrain_srun_cmd(cfg: str, nodes: int, gpus_per_node: int, job: str,
     )
     if job == "valgrind":
         # Forward the valgrind build flag; CMakeLists.txt translates it into
-        # CPPFORGE_DISABLE_MARCH_NATIVE plus a compile-time macro that shrinks
+        # BUILDENV_DISABLE_MARCH_NATIVE plus a compile-time macro that shrinks
         # D2H buffer sizes so valgrind's shadow memory stays manageable.
         env_exports += ",PHOENIX_BUILD_FOR_VALGRIND"
 
     return [
         "srun",
+        *(
+            [
+                "--comment={'OccupiedIdleGPUsJobReaper':{'exemptIdleTimeMins':'60','reason':'other','description':'Running Memory sanitization tool valgrind'}}"
+            ]
+            if job == "valgrind"
+            else []
+        ),
         f"--account={account}",
         *([f"--partition={partition}"] if partition else []),
         f"--nodes={nodes}",
         f"--ntasks={total_tasks}",
-        f"--time={90 if job == 'valgrind' else 90}",  # 30
+        f"--time={60 if job == 'valgrind' else 40}",
         *([f"--gpus={total_tasks}", f"--gpus-per-node={gpus_per_node}"] if _slurm_gpu_flags_enabled() else []),
         "--mem=0",
         f"--job-name={job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
@@ -1854,7 +1861,7 @@ def main() -> None:
 
     if args.job == "valgrind":
         # Signal CMake that we're building for a valgrind run. CMakeLists.txt
-        # turns this into CPPFORGE_DISABLE_MARCH_NATIVE (so valgrind doesn't trip
+        # turns this into BUILDENV_DISABLE_MARCH_NATIVE (so valgrind doesn't trip
         # on host-specific instructions) and defines PHOENIX_BUILD_FOR_VALGRIND
         # which shrinks D2H ring-buffer sizes in messages.h. Must be set before
         # any `import megatron.native` triggers a CMake build; subprocess and

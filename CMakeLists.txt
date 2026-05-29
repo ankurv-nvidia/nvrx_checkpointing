@@ -10,14 +10,14 @@ include(CMakeDependentOption)
 
 # Valgrind build mode: triggered by env var PHOENIX_BUILD_FOR_VALGRIND=1
 # (set by ci/scripts/run_job.py for the `valgrind` job). Two effects:
-#   1. Force CPPFORGE_DISABLE_MARCH_NATIVE so BuildEnv.cmake omits -march=native
+#   1. Force BUILDENV_DISABLE_MARCH_NATIVE so BuildEnv.cmake omits -march=native
 #      (valgrind doesn't model host-specific instructions and will SIGILL).
 #   2. Define PHOENIX_BUILD_FOR_VALGRIND=1 globally so headers like
 #      src/checkpoint/messages.h can shrink ring-buffer sizes and thread counts
 #      to keep valgrind's address-space and shadow-memory footprint manageable.
 if (DEFINED ENV{PHOENIX_BUILD_FOR_VALGRIND} AND NOT "$ENV{PHOENIX_BUILD_FOR_VALGRIND}" STREQUAL "" AND NOT "$ENV{PHOENIX_BUILD_FOR_VALGRIND}" STREQUAL "0")
     message(STATUS "PHOENIX_BUILD_FOR_VALGRIND is set: disabling -march=native and shrinking D2H buffer sizes")
-    set(CPPFORGE_DISABLE_MARCH_NATIVE ON)
+    set(BUILDENV_DISABLE_MARCH_NATIVE ON)
     add_compile_definitions(PHOENIX_BUILD_FOR_VALGRIND=1)
 endif()
 

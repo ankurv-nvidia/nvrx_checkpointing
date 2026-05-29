@@ -1,4 +1,3 @@
-// cppforge-sync
 #pragma once
 #define HAVE_SET_THREAD_NAME
 #ifdef _MSC_VER

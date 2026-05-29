@@ -1,4 +1,3 @@
-# cppforge-sync
 include(${CMAKE_CURRENT_LIST_DIR}/BuildEnv.cmake)
 
 option(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR "Fallback to binary directory if VCPKG_ROOT is not set" OFF)

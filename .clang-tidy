@@ -1,4 +1,3 @@
-# cppforge-sync
 # This is derived from LLVM's .clang-tidy' with additional checks and some minor config adjustments
 Checks:
   - "-*"

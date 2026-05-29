@@ -1,4 +1,3 @@
-# cppforge-sync
 include_guard(GLOBAL)
 cmake_minimum_required(VERSION 3.31)
 cmake_policy(SET CMP0167 NEW)
@@ -349,15 +348,15 @@ macro(EnableStrictCompilation)
                 list(APPEND extraflags --sysroot="${MACOS_SDK_PATH}")
             endif()
 
-            if (NOT DEFINED CPPFORGE_DISABLE_MARCH_NATIVE)
-                if (DEFINED ENV{CPPFORGE_DISABLE_MARCH_NATIVE})
-                    set(CPPFORGE_DISABLE_MARCH_NATIVE $ENV{CPPFORGE_DISABLE_MARCH_NATIVE})
+            if (NOT DEFINED BUILDENV_DISABLE_MARCH_NATIVE)
+                if (DEFINED ENV{BUILDENV_DISABLE_MARCH_NATIVE})
+                    set(BUILDENV_DISABLE_MARCH_NATIVE $ENV{BUILDENV_DISABLE_MARCH_NATIVE})
                 else()
-                    set(CPPFORGE_DISABLE_MARCH_NATIVE OFF)
+                    set(BUILDENV_DISABLE_MARCH_NATIVE OFF)
                 endif()
             endif()
 
-            if (NOT CMAKE_CROSSCOMPILING AND NOT CPPFORGE_DISABLE_MARCH_NATIVE)
+            if (NOT CMAKE_CROSSCOMPILING AND NOT BUILDENV_DISABLE_MARCH_NATIVE)
                 list(APPEND extraflags -mtune=native -march=native)
             endif()
 

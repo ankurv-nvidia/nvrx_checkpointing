@@ -1,4 +1,3 @@
-// cppforge-sync
 #pragma once
 #ifndef _PRAGMA_STRINGIFY
 #define _PRAGMA_STRINGIFY2(x) _Pragma(#x)             // NOLINT
