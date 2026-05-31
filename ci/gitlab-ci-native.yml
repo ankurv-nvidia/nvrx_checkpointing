@@ -11,6 +11,7 @@
 # See megatron/native/ci/runner/setup_runner.py and ci/prepare.md.
 
 stages:
+  - prepare
   - test
   - update
 
@@ -30,36 +31,31 @@ stages:
   before_script:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
-    # Source the cluster config to pick up CLUSTER (and other env vars like VCPKG_ROOT).
+    # Source the cluster config (CLUSTER + env vars like VCPKG_ROOT). CLUSTER is the
+    # machine tag run_job.py uses to namespace baselines; setup_runner forwards it into
+    # the runner env. Export it here too (with a devbox fallback) so it reaches run_job
+    # on local/unconfigured runs.
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
-    # MEGATRON_CI_MACHINE is set per-runner in the CI YAML; fall back to $CLUSTER from
-    # ~/data/ci for local runs, then to "devbox" as a last resort.
-    - export MEGATRON_CI_MACHINE="${MEGATRON_CI_MACHINE:-${CLUSTER:-devbox}}"
-    - echo "=== MEGATRON_CI_MACHINE=${MEGATRON_CI_MACHINE} ==="
+    - export CLUSTER="${CLUSTER:-devbox}"
+    - echo "=== CLUSTER=${CLUSTER} ==="
 
 # ---------------------------------------------------------------------------
-# Per-runner templates: tags + GPU count for each machine
+# Per-runner templates: just the GitLab tag that routes jobs to each runner.
+#
+# Nothing cluster-specific is set here — GPUs-per-node, SLURM/inline mode and the
+# machine tag are all configured per cluster at runner setup and forwarded into
+# the runner environment (GPUS_PER_NODE, SLURM_PARTITION, CLUSTER; see setup_runner.py).
+# run_job.py honors them, so the same JOB_ARGS run on any cluster — no
+# --gpus-per-node and no --slurm flag in the YAML.
 # ---------------------------------------------------------------------------
 .runner_gb200:
   tags: [gb200]
-  variables:
-    GPUS_PER_NODE: "4"
-    SLURM_FLAG: "--slurm"
-    MEGATRON_CI_MACHINE: "gb200"
 
 .runner_h200:
   tags: [h200]
-  variables:
-    GPUS_PER_NODE: "8"
-    SLURM_FLAG: "--slurm"
-    MEGATRON_CI_MACHINE: "h200"
 
 .runner_devbox:
   tags: [devbox]
-  variables:
-    GPUS_PER_NODE: "2"
-    SLURM_FLAG: ""
-    MEGATRON_CI_MACHINE: "devbox"
 
 # ---------------------------------------------------------------------------
 # Template: run a job via run_job.py (JOB_ARGS set by each concrete job)
@@ -116,78 +112,120 @@ stages:
     - when: never
 
 # ---------------------------------------------------------------------------
+# Stage: prepare — build the enroot squash image once, up front.
+#
+# `run_job.py prepare-image` builds the .sqsh if it is missing and is a fast
+# no-op when it already exists (and a no-op on inline/devbox runners, which use
+# no image). One job per runner; every test job `needs:` its own runner's
+# prepare job (see the .needs_*_image mixins) so jobs no longer build or stall
+# on the image inside the workload itself, and clusters don't wait on each other.
+# ---------------------------------------------------------------------------
+.prepare_image:
+  extends: .ci_base
+  stage: prepare
+  timeout: 2h
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/run_job.py" prepare-image
+
+gb200:prepare-image:
+  extends: [.prepare_image, .runner_gb200]
+
+h200:prepare-image:
+  extends: [.prepare_image, .runner_h200]
+
+devbox:prepare-image:
+  extends: [.prepare_image, .runner_devbox]
+
+# Each test job depends only on its own runner's prepare-image job (DAG via
+# needs), so it starts as soon as that image is ready without waiting on the
+# other clusters' prepare jobs. artifacts:false — the image lives on shared
+# storage, not in CI artifacts.
+.needs_gb200_image:
+  needs:
+    - job: gb200:prepare-image
+      artifacts: false
+.needs_h200_image:
+  needs:
+    - job: h200:prepare-image
+      artifacts: false
+.needs_devbox_image:
+  needs:
+    - job: devbox:prepare-image
+      artifacts: false
+
+# ---------------------------------------------------------------------------
 # Stage: test
 # ---------------------------------------------------------------------------
 gb200:ckptbench:1x4:
-  extends: [.run_job, .runner_gb200]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "ckptbench"
 
 h200:ckptbench:1x8:
-  extends: [.run_job, .runner_h200]
+  extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "ckptbench"
 
 devbox:ckptbench:1x2:
-  extends: [.run_job, .runner_devbox]
+  extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "ckptbench ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "ckptbench"
 
 gb200:pretrain-all:1x4:
-  extends: [.run_job, .runner_gb200]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-all"
 
 h200:pretrain-all:1x8:
-  extends: [.run_job, .runner_h200]
+  extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-all"
 
 devbox:pretrain-all:1x2:
-  extends: [.run_job, .runner_devbox]
+  extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-all ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-all"
 
 gb200:pretrain-native:1x4:
-  extends: [.run_job, .runner_gb200]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-native"
 
 h200:pretrain-native:1x8:
-  extends: [.run_job, .runner_h200]
+  extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-native"
 
 devbox:pretrain-native:1x2:
-  extends: [.run_job, .runner_devbox]
+  extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-native ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-native"
 
 gb200:pretrain-nvrx:1x4:
-  extends: [.run_job, .runner_gb200, .schedule_or_web]
+  extends: [.run_job, .runner_gb200, .schedule_or_web, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-nvrx"
 
 h200:pretrain-nvrx:1x8:
-  extends: [.run_job, .runner_h200, .schedule_or_web]
+  extends: [.run_job, .runner_h200, .schedule_or_web, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-nvrx"
 
 devbox:pretrain-nvrx:1x2:
-  extends: [.run_job, .runner_devbox, .schedule_or_web]
+  extends: [.run_job, .runner_devbox, .schedule_or_web, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-nvrx"
 
 # 16-node runs: clusters only, schedule/web trigger
 gb200:pretrain:16x4:
-  extends: [.run_job, .runner_gb200, .schedule_or_web]
+  extends: [.run_job, .runner_gb200, .schedule_or_web, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-native --nodes 16"
 
 h200:pretrain:16x8:
-  extends: [.run_job, .runner_h200, .schedule_or_web]
+  extends: [.run_job, .runner_h200, .schedule_or_web, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "pretrain-native --nodes 16"
 
 # Valgrind runs: pretrain-native with checkpoint_server pre-launched under memcheck.
 # valgrind slows the server ~10-50x; do not gate the pipeline on perf for these jobs
@@ -195,19 +233,19 @@ h200:pretrain:16x8:
 # Devbox runs locally (no srun) — valgrind must be installed on the runner host.
 
 gb200:valgrind:1x4:
-  extends: [.run_job, .runner_gb200]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "valgrind"
 
 h200:valgrind:1x8:
-  extends: [.run_job, .runner_h200]
+  extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "valgrind"
 
 devbox:valgrind:1x2:
-  extends: [.run_job, .runner_devbox]
+  extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "valgrind ${SLURM_FLAG} --gpus-per-node ${GPUS_PER_NODE}"
+    JOB_ARGS: "valgrind"
 
 # ---------------------------------------------------------------------------
 # Stage: update — update baselines from report files produced by test stage.

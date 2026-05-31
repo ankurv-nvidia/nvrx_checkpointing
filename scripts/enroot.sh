@@ -57,6 +57,13 @@ if [[ -n "${SLURM_PARTITION:-}" ]]; then
     slurm_common_args+=("--partition=${SLURM_PARTITION}")
 fi
 
+# GPU request for the build/run srun. The image build itself doesn't need GPUs,
+# but some schedulers require the request; prepare.sh tolerates their absence.
+gpu_args=""
+if [[ -n "${GPUS_PER_NODE:-}" && "${GPUS_PER_NODE}" -gt 0 ]]; then
+    gpu_args="--gpus-per-node=${GPUS_PER_NODE}"
+fi
+
 function build_image_base {
 	if [[ -e ${ENROOT_IMAGE_BASE} ]]; then
 		echo "using ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE}"
@@ -69,15 +76,6 @@ function build_image_base {
 
 function build {
 	build_image_base
-	# Honor SLURM_GPU_FLAGS_ENABLED=0 the same way run_job.py does — some clusters
-	# (e.g. lyris) reject --gpus-per-node with "Invalid generic resource (gres)".
-	# Image build doesn't actually need GPUs; prepare.sh handles nvcc/nvidia-smi absence.
-	local gpu_args=""
-	local gpu_flags_enabled="${SLURM_GPU_FLAGS_ENABLED:-1}"
-	if [[ "${gpu_flags_enabled}" != "0" && "${gpu_flags_enabled}" != "false" && "${gpu_flags_enabled}" != "False" \
-	      && -n "${GPUS_PER_NODE:-}" && "${GPUS_PER_NODE}" -gt 0 ]]; then
-		gpu_args="--gpus-per-node=${GPUS_PER_NODE}"
-	fi
 	srun -l \
 		"${slurm_common_args[@]}" \
 		${gpu_args} \

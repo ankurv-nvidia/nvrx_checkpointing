@@ -6,14 +6,24 @@ Sensitive config (token, URL) must be written to files there before running setu
 nothing is read from environment variables.
 
 File layout under CI_DIR:
-  token           Registration token (chmod 600). Written by you before running setup.
-  config          Key=value settings: GITLAB_URL, CLUSTER (required), CONCURRENT, SLURM_PARTITION (optional).
-  gitlab-runner   The runner binary (downloaded by setup).
-  config.toml     Runner config (written by setup after registration).
-  runner.pid      PID of the running process.
-  runner.log      Runner log output.
-  builds/         Job build directories.
-  cache/          Job cache.
+  token             Registration token (chmod 600). Written by you before running setup.
+  config            Key=value settings: GITLAB_URL, CLUSTER (required; the machine tag e.g.
+                    gb200/h200/devbox — GitLab runner tag + baseline namespace), CONCURRENT,
+                    GPUS_PER_NODE, SLURM_PARTITION (set => this cluster runs via SLURM; also the
+                    srun --partition). CLUSTER, GPUS_PER_NODE and SLURM_PARTITION are forwarded
+                    into the runner env for run_job.py.
+  srun.tmpl         (optional) per-cluster override of the job-launch srun template.
+  image_build.tmpl  (optional) per-cluster override of the enroot squash-image build.
+                    Drop either template file here to override the repo default for this
+                    cluster; if absent, run_job.py uses the default shipped in
+                    megatron/native/ci/templates/. Write account, partition, mounts and
+                    GPU-request syntax directly into the file.
+  gitlab-runner     The runner binary (downloaded by setup).
+  config.toml       Runner config (written by setup after registration).
+  runner.pid        PID of the running process.
+  runner.log        Runner log output.
+  builds/           Job build directories.
+  cache/            Job cache.
 
 Subcommands:
   setup      Download binary + register + start  (run once per login node)
@@ -23,15 +33,24 @@ Subcommands:
   cleanup    Stop, unregister from GitLab, and delete all state under CI_DIR
 
 Usage:
-  python3 setup_runner.py setup   [--ci-dir DIR] [--cluster NAME] [--slurm-partition PARTITION] [--no-slurm-gpu-flags]
-  python3 setup_runner.py start   [--ci-dir DIR] [--slurm-partition PARTITION] [--no-slurm-gpu-flags]
+  python3 setup_runner.py setup   [--ci-dir DIR] [config flags below]
+  python3 setup_runner.py start   [--ci-dir DIR] [config flags below]
   python3 setup_runner.py stop    [--ci-dir DIR]
   python3 setup_runner.py status  [--ci-dir DIR]
   python3 setup_runner.py cleanup [--ci-dir DIR] [--yes]
 
-  --no-slurm-gpu-flags  Pass this on runners whose SLURM does not support --gpus/--gpus-per-node.
-                        Sets SLURM_GPU_FLAGS_ENABLED=0 in the runner environment so run_job.py
-                        omits those flags and the job runs with all GPUs the scheduler allocates.
+Config flags (setup/start). Each can be set in the config file or here; a value
+passed here overrides the config for this run AND is written back to the config,
+so it becomes the default on the next run (CLI wins, then caches):
+  --cluster NAME        Machine tag, e.g. gb200, h200, devbox              (CLUSTER)
+  --gitlab-url URL      GitLab base URL                                    (GITLAB_URL)
+  --concurrent N        Max concurrent jobs for this runner                (CONCURRENT)
+  --gpus-per-node N     GPUs per node for srun jobs on this cluster        (GPUS_PER_NODE)
+  --slurm-partition NAME    SLURM partition; set => run via SLURM           (SLURM_PARTITION)
+
+  Anything else cluster-specific (account, partition, container mounts, GPU-request syntax,
+  whether GPUs are requested at all) lives in the srun.tmpl / image_build.tmpl override files
+  next to this config — not in environment variables.
 """
 
 import argparse
@@ -79,15 +98,65 @@ def read_token(ci_dir: Path) -> str:
 
 
 def read_config(ci_dir: Path) -> dict:
-    """Read optional key=value config file. Returns dict with defaults filled in."""
-    cfg = {"GITLAB_URL": DEFAULT_GITLAB_URL, "CLUSTER": "", "CONCURRENT": "4", "RUNNER_VERSION": "latest", "SLURM_PARTITION": ""}
+    """Read optional key=value config file. Returns dict with defaults filled in.
+
+    Inline '# comment' suffixes and full-line comments are stripped, matching how
+    bash `source`s this file, so e.g. `GPUS_PER_NODE=4  # note` yields just "4".
+    """
+    cfg = {
+        "GITLAB_URL": DEFAULT_GITLAB_URL,
+        "CLUSTER": "",
+        "CONCURRENT": "4",
+        "RUNNER_VERSION": "latest",
+        "GPUS_PER_NODE": "",
+        "SLURM_PARTITION": "",
+    }
     config_file = ci_dir / "config"
     if config_file.exists():
-        for line in [line.strip() for line in config_file.read_text().splitlines()]:
-            if line and not line.startswith("#") and "=" in line:
+        for raw in config_file.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()  # drop inline/full-line comments
+            if line and "=" in line:
                 k, _, v = line.partition("=")
                 cfg[k.strip()] = v.strip()
     return cfg
+
+
+# Config settings that can also be set on the command line. A CLI value (when
+# given) overrides the config file for this run AND is written back so it becomes
+# the default on the next run. Maps config key -> argparse dest.
+CLI_CONFIG_KEYS = {
+    "GITLAB_URL": "gitlab_url",
+    "CLUSTER": "cluster",
+    "CONCURRENT": "concurrent",
+    "GPUS_PER_NODE": "gpus_per_node",
+    "SLURM_PARTITION": "slurm_partition",
+}
+
+
+def write_config(ci_dir: Path, updates: dict[str, str]) -> None:
+    """Persist key=value `updates` into the config file (creating it if needed).
+
+    Existing keys are updated in place — preserving any inline comment and the
+    rest of the file (other keys, comments, blank lines) — and unknown keys are
+    appended. This is what lets a CLI override become the default next run.
+    """
+    if not updates:
+        return
+    config_file = ci_dir / "config"
+    lines = config_file.read_text().splitlines() if config_file.exists() else []
+    pending = dict(updates)
+    out = []
+    for raw in lines:
+        body = raw.split("#", 1)[0]
+        key = body.split("=", 1)[0].strip() if "=" in body else ""
+        if key in pending:
+            comment = raw[raw.index("#") :] if "#" in raw else ""
+            out.append(f"{key}={pending.pop(key)}" + (f"  {comment}" if comment else ""))
+        else:
+            out.append(raw)
+    out.extend(f"{key}={val}" for key, val in pending.items())
+    config_file.write_text("\n".join(out) + "\n")
+    config_file.chmod(0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +216,8 @@ def install(ci_dir: Path, version: str, force: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register(ci_dir: Path, url: str, token: str, cluster: str, extra_tags: str, concurrent: int) -> str:  # noqa: PLR0913
+def register(ci_dir: Path, url: str, token: str, cluster: str, concurrent: int) -> None:
     p = paths(ci_dir)
-    slurm_tag = f"slurm-{cluster}"
-    ",".join(filter(None, [slurm_tag, "slurm", "shell", extra_tags]))
     name = f"{cluster}-{socket.gethostname().split('.')[0]}-{os.environ.get('USER', 'runner')}"
     p["builds"].mkdir(parents=True, exist_ok=True)
     p["cache"].mkdir(parents=True, exist_ok=True)
@@ -187,7 +254,6 @@ def register(ci_dir: Path, url: str, token: str, cluster: str, extra_tags: str, 
         else f"concurrent = {concurrent}\n\n" + text
     )
     p["config"].write_text(text)
-    return slurm_tag
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +261,7 @@ def register(ci_dir: Path, url: str, token: str, cluster: str, extra_tags: str, 
 # ---------------------------------------------------------------------------
 
 
-def start(ci_dir: Path, slurm_partition: str = "", gpu_flags_enabled: bool = True) -> None:
+def start(ci_dir: Path) -> None:
     p = paths(ci_dir)
     if not p["bin"].is_file():
         die(f"Binary not found at {p['bin']}. Run: python3 setup_runner.py setup")
@@ -204,13 +270,24 @@ def start(ci_dir: Path, slurm_partition: str = "", gpu_flags_enabled: bool = Tru
     pid = read_pid(ci_dir)
     if is_running(pid):
         return
+    # Values come from the config file; main() has already persisted any CLI
+    # overrides into it, so this also honors flags passed to setup/start.
     cfg = read_config(ci_dir)
-    partition = slurm_partition or cfg.get("SLURM_PARTITION", "")
     env = os.environ.copy()
-    if partition:
-        env["SLURM_PARTITION"] = partition
-    if not gpu_flags_enabled:
-        env["SLURM_GPU_FLAGS_ENABLED"] = "0"
+    # Tell run_job.py where this runner's state lives so it finds override
+    # templates (srun.tmpl / image_build.tmpl) placed next to the config.
+    env["CI_DIR"] = ci_dir.as_posix()
+    # Machine identity (e.g. gb200): the GitLab tag + baseline-file namespace that
+    # run_job.py reads via _machine_tag().
+    if cfg.get("CLUSTER", ""):
+        env["CLUSTER"] = cfg["CLUSTER"]
+    # SLURM partition: forwarded so run_job.py uses it as the srun --partition and
+    # treats this cluster as SLURM-based (its presence is the slurm-vs-inline switch).
+    if cfg.get("SLURM_PARTITION", ""):
+        env["SLURM_PARTITION"] = cfg["SLURM_PARTITION"]
+    # GPUs per node for srun jobs.
+    if cfg.get("GPUS_PER_NODE", ""):
+        env["GPUS_PER_NODE"] = cfg["GPUS_PER_NODE"]
     with p["log"].open("a") as lf:
         proc = subprocess.Popen(
             [p["bin"].as_posix(), "run", "--config", p["config"].as_posix(), "--working-directory", ci_dir.as_posix()],
@@ -276,15 +353,19 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["setup", "start", "stop", "status", "cleanup"])
     p.add_argument("--ci-dir", default=DEFAULT_CI_DIR.as_posix(), help=f"Root directory for all CI state (default: {DEFAULT_CI_DIR})")
-    p.add_argument("--cluster", default="", help="Cluster tag suffix, e.g. h200, gb200 (required if not set in config file)")
-    p.add_argument("--slurm-partition", default="", help="SLURM partition for srun jobs (overrides SLURM_PARTITION in config file)")
+    # Settings that can come from the config file or the command line. When passed
+    # here they override the config for this run AND are written back to the config
+    # so they become the defaults next run. Defaults are None = "not provided".
+    p.add_argument("--cluster", default=None, help="Machine tag (GitLab tag + baseline namespace), e.g. gb200/h200/devbox (persisted)")
+    p.add_argument("--gitlab-url", default=None, dest="gitlab_url", help="GitLab base URL (persisted to config)")
+    p.add_argument("--concurrent", default=None, help="Max concurrent jobs for this runner (persisted to config)")
+    p.add_argument("--gpus-per-node", default=None, dest="gpus_per_node", help="GPUs per node for srun jobs (persisted to config)")
     p.add_argument(
-        "--no-slurm-gpu-flags",
-        action="store_true",
-        dest="no_slurm_gpu_flags",
-        help="Omit --gpus/--gpus-per-node from srun commands (for runners where the scheduler allocates all GPUs automatically)",
+        "--slurm-partition",
+        default=None,
+        dest="slurm_partition",
+        help="SLURM partition; set => this cluster runs via SLURM (also used as srun --partition); persisted to config",
     )
-    p.add_argument("--tags", default="", help="Extra comma-separated runner tags")
     p.add_argument("--force-reinstall", action="store_true", help="Re-download binary even if already present")
     p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for cleanup")
     p.add_argument("--log-lines", type=int, default=20)
@@ -293,19 +374,26 @@ def main() -> None:
     ci_dir = Path(args.ci_dir)
     ci_dir.mkdir(parents=True, exist_ok=True)
 
+    # Collect CLI-provided settings (those actually passed) and persist them into
+    # the config file for setup/start, so the merged values are cached for next run.
+    overrides = {key: str(getattr(args, dest)) for key, dest in CLI_CONFIG_KEYS.items() if getattr(args, dest) is not None}
+    if overrides and args.command in ("setup", "start"):
+        write_config(ci_dir, overrides)
+
+    # Read config after persisting, so cfg already reflects any CLI overrides.
     cfg = read_config(ci_dir)
-    cluster = args.cluster or cfg["CLUSTER"]
+    cluster = cfg["CLUSTER"]
     if not cluster:
         die("CLUSTER is not set. Add 'CLUSTER=<name>' to ${env:HOME}/data/ci/config or pass --cluster <name>.")
 
     if args.command == "setup":
         token = read_token(ci_dir)
         install(ci_dir, cfg["RUNNER_VERSION"], args.force_reinstall)
-        register(ci_dir, cfg["GITLAB_URL"], token, cluster, args.tags, int(cfg["CONCURRENT"]))
-        start(ci_dir, args.slurm_partition, gpu_flags_enabled=not args.no_slurm_gpu_flags)
+        register(ci_dir, cfg["GITLAB_URL"], token, cluster, int(cfg["CONCURRENT"]))
+        start(ci_dir)
 
     elif args.command == "start":
-        start(ci_dir, args.slurm_partition, gpu_flags_enabled=not args.no_slurm_gpu_flags)
+        start(ci_dir)
     elif args.command == "stop":
         stop(ci_dir)
     elif args.command == "status":

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Default enroot squash-image build — models cw-dfw (CoreWeave DFW).
+#
+# run_job.py substitutes the ${...} placeholders (lowercase names; shell ${UPPER}
+# vars are left untouched) and runs this with `bash -c` when the project image is
+# missing. It mirrors the build flow in scripts/enroot.sh: import the base
+# PyTorch image if absent, then run prepare.sh inside it and save the result.
+#
+# To customize for another cluster, copy this file next to your runner config
+# (e.g. ~/data/ci/image_build.tmpl) and edit it (account, partition, mounts,
+# GPU flags, ...). When absent there, this repo default is used.
+#
+# Placeholders: ${home} ${image_base} ${image_out} ${docker_image}
+#               ${prepare_sh} ${gpus_per_node}
+set -Eeuox pipefail
+
+# Import the base PyTorch image from the registry if it isn't already present.
+if [[ ! -e "${image_base}" ]]; then
+  srun -l --account=coreai_resiliency_osiris --partition=interactive --time=00:60:00 --mem=0 \
+    enroot import --output "${image_base}" "docker://${docker_image}"
+fi
+
+# Build the project image: run prepare.sh inside the base image and save it.
+# The build itself does not need GPUs, but some schedulers require the request.
+srun -l --account=coreai_resiliency_osiris --partition=interactive --time=00:60:00 --mem=0 \
+  --gpus-per-node=${gpus_per_node} \
+  --container-mounts "${home}:${home},${home}:/root,/lustre:/lustre" \
+  --container-image "${image_base}" \
+  --container-save "${image_out}" \
+  --container-writable \
+  bash -c "bash ${prepare_sh} ubuntu2404 megatron test"

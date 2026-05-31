@@ -5,6 +5,9 @@ Runs a job and automatically parses performance results afterwards.
 By default only perf numbers are printed; use --skip-perf to see full output.
 
 Jobs:
+  prepare-image   Build the enroot .sqsh image if missing (fast no-op if present; no-op on
+                  non-SLURM runners). Its own CI stage — all SLURM jobs `needs:` it instead of
+                  building or stalling on the image inline.
   ckptbench       Build and run the C++ checkpoint benchmark (1 node, 2 GPUs).
   pretrain-all    Run pretrain_mamba.py with both checkpoint providers (correctness).
   pretrain-native Run pretrain_mamba.py with native checkpoint provider (perf benchmark).
@@ -19,17 +22,28 @@ Usage:
   python3 run_job.py pretrain-native --slurm         # 1 node via SLURM
   python3 run_job.py ckptbench                       # run inline (2 GPUs required locally)
   python3 run_job.py ckptbench --slurm               # run via SLURM
+  python3 run_job.py prepare-image --slurm           # build the enroot image if missing
   python3 run_job.py pretrain-native --skip-perf     # tee full output, no perf parsing
   python3 run_job.py pretrain-native --update-baseline  # record current perf as new baseline
 
-Cluster defaults (overridable via environment variables):
-  SLURM_ACCOUNT           coreai_resiliency_osiris
-  SLURM_PARTITION         batch
+SLURM vs inline mode is inferred from SLURM_PARTITION (set per cluster at runner setup):
+set => run via SLURM, unset => inline. The CI YAML carries no --slurm flag; --slurm still
+forces it for manual/local runs.
+
+SLURM commands come from template files (see TEMPLATES_DIR below):
+  srun.tmpl         shared launch command for every job (pretrain/ckptbench/valgrind)
+  image_build.tmpl  build the enroot squash image
+  The repo ships cw-dfw defaults; a runner overrides one by placing a file of the
+  same name next to its config (CI_DIR, e.g. ~/data/ci/srun.tmpl). Account,
+  partition, mounts and GPU-request syntax all live in those files.
+
+Other settings (via environment variables):
   ENROOT_IMAGE            ${HOME}/data/native.<hash>.sqsh
                             (hash = first 10 hex of sha256(megatron/native/scripts/prepare.sh);
                             changing prepare.sh causes a rebuild under a new filename)
-  SLURM_GPU_FLAGS_ENABLED 1 (set to 0 on runners that don't support --gpus/--gpus-per-node;
-                            the job will run with all GPUs allocated by the scheduler)
+  GPUS_PER_NODE           GPUs per node (set at runner setup); default when --gpus-per-node is omitted
+  SLURM_PARTITION         set by runner setup; when set, run via SLURM and use it as the srun --partition
+  CI_DIR                  runner state dir holding config + override templates (default ~/data/ci)
 
 Outputs (auto-derived from job and config):
   Logs:      <megatron_root>/megatron/native/ci/ci-results/<machine>_<job>_<config>.log
@@ -56,6 +70,7 @@ import shlex
 import shutil
 import socket
 import statistics
+import string
 import subprocess
 import sys
 import threading
@@ -114,12 +129,21 @@ def _default_enroot_image() -> str:
     return f"{Path.home()}/data/native.{_prepare_sh_hash()}.sqsh"
 
 
-def _machine_tag() -> str:
-    """Short machine/cluster identifier used to namespace baseline files.
+def _image_path() -> Path:
+    """Enroot image path: the ENROOT_IMAGE override, else the prepare.sh-hashed default.
 
-    Override via MEGATRON_CI_MACHINE; falls back to the hostname stem.
+    Shared by the prepare-image stage (which builds it) and the workload jobs
+    (which use it as --container-image), so both agree on the same file.
     """
-    tag = os.environ.get("MEGATRON_CI_MACHINE", "").strip()
+    return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
+
+
+def _machine_tag() -> str:
+    """Short machine identifier used to namespace baseline files (e.g. gb200).
+
+    Comes from CLUSTER (set per runner at setup); falls back to the hostname stem.
+    """
+    tag = os.environ.get("CLUSTER", "").strip()
     return tag or socket.gethostname().split(".")[0]
 
 
@@ -128,7 +152,6 @@ def _machine_tag() -> str:
 if str(MEGATRON_ROOT) not in sys.path:
     sys.path.insert(0, str(MEGATRON_ROOT))
 RESULTS_DIR = MEGATRON_ROOT / "megatron" / "native" / "ci" / "ci-results"
-GPUS_PER_NODE = 4
 PERF_TOLERANCE = 0.05  # 5% tolerance — both regressions and improvements beyond this fail
 
 # Stable vcpkg root on shared filesystem — persists installed packages across CI runs.
@@ -150,18 +173,51 @@ _PRETRAIN_JOBS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _ensure_enroot_image(image: Path) -> None:
-    """Build the enroot .sqsh image if it doesn't exist by delegating to enroot.sh."""
+def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
+    """Build the enroot .sqsh image if it doesn't exist.
+
+    Renders the image_build.tmpl template (per-cluster override in CI_DIR, else
+    the repo default) and runs it with bash. The default mirrors the build flow
+    in scripts/enroot.sh: import the base PyTorch image if missing, then run
+    prepare.sh inside it and save the result.
+    """
     if image.exists():
         return
     base_image = image.parent / "pytorch2604.sqsh"
     sys.stderr.write(f"[run_job] enroot image not found: {image} — building now (this may take ~30 min)\n")
 
-    enroot_sh = ENROOT_SCRIPTS_DIR / "enroot.sh"
-    env = os.environ.copy()
-    env["ENROOT_IMAGE_BASE"] = base_image.as_posix()
-    env["ENROOT_IMAGE_OUT"] = image.as_posix()
-    subprocess.run([shutil.which("bash"), enroot_sh.as_posix()], env=env, check=True)
+    script = _render_template(
+        "image_build.tmpl",
+        {
+            "home": Path.home().as_posix(),
+            "image_base": base_image.as_posix(),
+            "image_out": image.as_posix(),
+            "docker_image": DOCKER_IMAGE_BASE,
+            "prepare_sh": (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix(),
+            "gpus_per_node": gpus_per_node,
+        },
+    )
+    bash = shutil.which("bash") or "bash"
+    subprocess.run([bash, "-c", script], check=True)
+
+
+def run_prepare_image(args: argparse.Namespace) -> None:
+    """Build the enroot .sqsh image if missing; fast no-op if it already exists.
+
+    This is the dedicated 'prepare-image' CI stage (see gitlab-ci-native.yml):
+    the workload jobs no longer build the image inline or stall on it — they just
+    `needs:` this job. On inline/non-SLURM runners (e.g. devbox) there is no
+    enroot image, so this does nothing.
+    """
+    if not args.slurm:
+        sys.stderr.write("[run_job] prepare-image: non-SLURM runner — no enroot image needed; nothing to do\n")
+        return
+    image = _image_path()
+    if image.exists():
+        sys.stderr.write(f"[run_job] prepare-image: image already present, nothing to build: {image}\n")
+        return
+    _ensure_enroot_image(image, args.gpus_per_node)  # builds synchronously (check=True)
+    sys.stderr.write(f"[run_job] prepare-image: built {image}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -169,33 +225,37 @@ def _ensure_enroot_image(image: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _runner_uses_slurm() -> bool:
+    """True when this runner submits via SLURM, inferred from SLURM_PARTITION being set.
+
+    setup_runner.py forwards SLURM_PARTITION from the cluster config (it also feeds the
+    srun --partition), so a partitioned cluster runs via SLURM and one without runs
+    inline (e.g. devbox) — no separate flag needed. main() folds this into args.slurm.
+    """
+    return bool(os.environ.get("SLURM_PARTITION", "").strip())
+
+
 def in_srun() -> bool:
     return "SLURM_PROCID" in os.environ
 
 
 def _cleanup_stale_checkpoint_server() -> None:
-    """Kill stray checkpoint_server processes and clear named shm segments on this host.
+    """Stop any leftover checkpoint_server on this host and clear its named shm.
 
-    The daemon (``server_main.cpp``) calls ``setsid()`` and survives parent death, then
-    pins ``messages.h:Message::Port`` (41000). Any prior CI job on this node that
-    crashed before clean shutdown leaves the daemon listening on that port, so when
-    new ``checkpoint_server`` forks try to bind they hit EADDRINUSE and exit with
-    ``ErrorAlreadyRunning`` (``server.cpp:1427``). The clients then see "Failed to
-    start or connect to checkpoint service" — observed on h200 nodes that hosted
-    earlier failed pipelines on this branch.
+    The daemon (``server_main.cpp``) calls ``setsid()`` and survives parent death,
+    pinning ``messages.h:Message::Port`` (41000). A prior CI job that crashed
+    before clean shutdown leaves it listening, so a new ``checkpoint_server`` fork
+    hits EADDRINUSE and exits ``ErrorAlreadyRunning`` (``server.cpp:1427``) — the
+    clients then see "Failed to start or connect to checkpoint service".
 
-    Kill any leftover daemon and remove the named shm queues at
-    ``/dev/shm/checkpoint_request_*`` (named after
-    ``Message::RequestChannelName`` in ``messages.h``). Use ``-f`` matching the
-    full cmdline anchored on ``/megatron/native/build/checkpoint_server`` —
-    ``-x`` matches the kernel ``comm`` field which is truncated to 15 chars and
-    silently misses our 17-char binary name; the path anchor keeps us narrow
-    enough to avoid hitting unrelated processes that mention the string.
+    Ask it to stop via its own ``/api/stop`` endpoint and wait for a clean exit
+    (no OS signals), then remove the named shm queues at
+    ``/dev/shm/checkpoint_request_*`` (``Message::RequestChannelName``) once the
+    port is free. If the server doesn't stop, its shm is left untouched rather
+    than yanked out from under a live process.
     """
-    subprocess.run(
-        ["pkill", "-f", "/megatron/native/build/checkpoint_server"],
-        check=False,
-    )
+    if not _stop_checkpoint_server():
+        return
     for shm in Path("/dev/shm").glob("checkpoint_request_*"):
         try:
             shm.unlink()
@@ -203,21 +263,113 @@ def _cleanup_stale_checkpoint_server() -> None:
             sys.stderr.write(f"[run_job] could not remove stale shm {shm}: {ex}\n")
 
 
-def _slurm_nodes_and_gpus() -> tuple[int, int]:
-    nodes = int(os.environ.get("SLURM_NNODES", "1"))
-    raw = os.environ.get("SLURM_GPUS_PER_NODE") or os.environ.get("SLURM_NTASKS_PER_NODE") or os.environ.get("SLURM_TASKS_PER_NODE")
-    if raw is None:
-        slurm_vars = {k: v for k, v in os.environ.items() if k.startswith("SLURM_")}
-        raise RuntimeError(
-            f"cannot infer gpus_per_node — SLURM_GPUS_PER_NODE and SLURM_TASKS_PER_NODE are both unset. SLURM environment: {slurm_vars}",
-        )
-    # SLURM_GPUS_PER_NODE may be "gpu:4" or plain "4"
-    return nodes, int(str(raw).split(":")[-1])
+# ---------------------------------------------------------------------------
+# File-based per-cluster SLURM command templates
+# ---------------------------------------------------------------------------
+#
+# srun invocations differ between clusters in small but real ways: the account
+# and partition names, how GPUs are requested (--gpus-per-node vs --gres), the
+# container mount map, and any site-specific srun flags. Each distinct kind of
+# run is a template file:
+#
+#   srun.tmpl         shared launch command for every job (pretrain/ckptbench/valgrind)
+#   image_build.tmpl  build the enroot squash image
+#
+# The repo ships the defaults (modelling cw-dfw) under TEMPLATES_DIR. A runner
+# overrides one per cluster by dropping a file of the same name next to its
+# config (in CI_DIR, e.g. ~/data/ci/srun.tmpl); when absent, the repo default is
+# used. Per-run values arrive as ${...} placeholders; cluster constants
+# (account, partition, mounts, ...) are written into the file itself.
+
+TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 
 
-def _slurm_gpu_flags_enabled() -> bool:
-    """False on runners that don't support --gpus/--gpus-per-node (set SLURM_GPU_FLAGS_ENABLED=0)."""
-    return os.environ.get("SLURM_GPU_FLAGS_ENABLED", "1").strip() not in ("0", "false", "False")
+def _ci_dir() -> Path:
+    """Runner state dir holding `config` and any override template files.
+
+    setup_runner.py forwards it as CI_DIR; falls back to the ~/data/ci
+    default used by the runner-setup docs.
+    """
+    raw = os.environ.get("CI_DIR", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / "data" / "ci"
+
+
+def _load_template(name: str) -> str:
+    """Return template `name`, searched in priority order:
+
+    1. CI_DIR/<name>                  — per-runner override next to the config
+    2. TEMPLATES_DIR/<cluster>.<name> — repo cluster-specific default (e.g. gb200.srun.tmpl)
+    3. TEMPLATES_DIR/<name>           — repo generic default
+    """
+    cluster = os.environ.get("CLUSTER", "").strip()
+    candidates = [_ci_dir() / name]
+    if cluster:
+        candidates.append(TEMPLATES_DIR / f"{cluster}.{name}")
+    candidates.append(TEMPLATES_DIR / name)
+    for path in candidates[:-1]:
+        if path.is_file():
+            sys.stderr.write(f"[run_job] using template {path}\n")
+            return path.read_text()
+    default = candidates[-1]
+    if not default.is_file():
+        raise FileNotFoundError(f"SLURM template {name!r} not found (looked in {', '.join(str(c) for c in candidates)})")
+    return default.read_text()
+
+
+def _render_template(name: str, values: dict[str, object]) -> str:
+    """Substitute ${lowercase} placeholders in template `name`.
+
+    Uses safe_substitute so shell ${UPPER}/$VAR references in script templates
+    are left untouched — our placeholders are lowercase by convention.
+    """
+    return string.Template(_load_template(name)).safe_substitute(values)
+
+
+def _build_srun_cmd(  # noqa: PLR0913
+    *,
+    nodes: int,
+    ntasks: int,
+    time_minutes: int,
+    job_name: str,
+    image: str,
+    container_env: str,
+    gpus_per_node: int,
+    total_gpus: int,
+    extra_srun_args: list[str] | None = None,
+) -> list[str]:
+    """Render srun.tmpl into the launch-command prefix (before the job payload).
+
+    Shared by every launched job; callers append the payload (e.g.
+    ``python3 -u run_job.py <job>``). Comment lines (first non-space char '#')
+    and blank lines are dropped, the rest is ${...}-substituted and tokenized.
+    ``extra_srun_args`` are appended after the template flags for per-job srun
+    options that don't belong in the cluster template (e.g. valgrind's reaper
+    exemption).
+    """
+    values: dict[str, object] = {
+        "nodes": nodes,
+        "ntasks": ntasks,
+        "time_minutes": time_minutes,
+        "total_gpus": total_gpus,
+        "gpus_per_node": gpus_per_node,
+        "job_name": job_name,
+        "image": image,
+        "container_env": container_env,
+        "home": Path.home().as_posix(),
+        "partition": os.environ.get("SLURM_PARTITION", ""),
+    }
+    body = "\n".join(ln for ln in _load_template("srun.tmpl").splitlines() if not ln.lstrip().startswith("#"))
+    return [*shlex.split(string.Template(body).safe_substitute(values)), *(extra_srun_args or [])]
+
+
+def _runner_gpus_per_node() -> int | None:
+    """GPUs-per-node configured at runner setup (GPUS_PER_NODE env), or None if unset.
+
+    Used as the default when --gpus-per-node isn't passed on the command line, so
+    the count lives with the runner instead of the CI YAML.
+    """
+    raw = os.environ.get("GPUS_PER_NODE", "").strip()
+    return int(raw) if raw else None
 
 
 # ---------------------------------------------------------------------------
@@ -250,22 +402,19 @@ def run_ckptbench(args: argparse.Namespace) -> None:
         return
 
     if args.slurm:
-        account = os.environ.get("SLURM_ACCOUNT", "coreai_resiliency_osiris")
-        partition = os.environ.get("SLURM_PARTITION")
-        image = os.environ.get("ENROOT_IMAGE", _default_enroot_image())
+        image = _image_path().as_posix()
         cmd = [
-            "srun",
-            f"--account={account}",
-            *([f"--partition={partition}"] if partition else []),
-            "--time=5",
-            "--nodes=1",
-            "--ntasks=1",
-            *([f"--gpus-per-node={args.gpus_per_node}"] if _slurm_gpu_flags_enabled() else []),
-            "--mem=0",
-            f"--job-name=ckpt_benchmark_{os.environ.get('CI_PIPELINE_ID', 'local')}",
-            f"--container-image={image}",
-            f"--container-mounts={Path.home()}:{Path.home()},/lustre:/lustre",
-            "--container-env=VCPKG_ROOT",  # forward by name — avoids KEY=VALUE ambiguity in pyxis/enroot
+            *_build_srun_cmd(
+                nodes=1,
+                ntasks=1,
+                time_minutes=5,
+                job_name=f"ckpt_benchmark_{os.environ.get('CI_PIPELINE_ID', 'local')}",
+                image=image,
+                # container-env forwarded by name — avoids KEY=VALUE ambiguity in pyxis/enroot
+                container_env="VCPKG_ROOT",
+                gpus_per_node=args.gpus_per_node,
+                total_gpus=args.gpus_per_node,  # single node
+            ),
             "python3",
             "-u",
             str(Path(__file__).resolve()),
@@ -308,39 +457,33 @@ def _is_port_in_use(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _stop_stale_checkpoint_server(port: int = _CHECKPOINT_SERVER_PORT, timeout: float = 10.0) -> None:
-    """Best-effort: ensure no checkpoint_server is bound to `port` before we launch our own.
+def _stop_checkpoint_server(port: int = _CHECKPOINT_SERVER_PORT, timeout: float = 30.0) -> bool:
+    """Ask the checkpoint_server bound to `port` to shut down and wait for it to
+    exit cleanly. Returns True if the port is free afterwards.
 
-    Tries the server's own HTTP /api/stop endpoint first (graceful, targets only the listener);
-    if the port stays bound, falls back to `pkill -TERM`. The new server's signal handler logs
-    a breadcrumb and exits, so SIGTERM is clean.
+    Uses the server's own HTTP /api/stop endpoint (server.cpp) and polls until the
+    listener is gone. Sends no OS signals, so it can never hit an unrelated
+    process — if the server ignores the request it simply stays up and we report
+    that to the caller rather than force-killing anything.
     """
     if not _is_port_in_use(port):
-        return
+        return True
 
-    sys.stderr.write(f"[run_job] checkpoint_server port {port} is in use; attempting graceful stop\n")
+    sys.stderr.write(f"[run_job] checkpoint_server on port {port} is in use; requesting graceful stop via /api/stop\n")
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stop", timeout=2.0):
             pass
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-        sys.stderr.write(f"[run_job]   /api/stop failed ({exc}); falling back to pkill\n")
-        subprocess.run(["pkill", "-TERM", "-f", "checkpoint_server"], check=False)
+        sys.stderr.write(f"[run_job]   /api/stop request failed: {exc}\n")
 
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _is_port_in_use(port):
-            sys.stderr.write("[run_job]   stale checkpoint_server gone, port is free\n")
-            return
+    while _is_port_in_use(port) and time.monotonic() < deadline:
         time.sleep(0.25)
-
-    # Last-resort SIGKILL on whatever is still hanging on to the port.
-    sys.stderr.write("[run_job]   port still in use after graceful stop; sending SIGKILL\n")
-    subprocess.run(["pkill", "-KILL", "-f", "checkpoint_server"], check=False)
-    time.sleep(0.5)
     if _is_port_in_use(port):
-        raise RuntimeError(
-            f"checkpoint_server port {port} is still in use after stop+kill; cannot launch valgrind instance",
-        )
+        sys.stderr.write(f"[run_job]   checkpoint_server still bound to port {port} after {timeout:.0f}s\n")
+        return False
+    sys.stderr.write("[run_job]   checkpoint_server stopped, port is free\n")
+    return True
 
 
 def _watch_log_and_tee(
@@ -470,7 +613,10 @@ def _valgrind_checkpoint_server(machine: str, cfg: str) -> Iterator[None]:
     sys.stderr.write("[run_job] Launching checkpoint_server under valgrind\n")
     sys.stderr.write(f"[run_job]   server+valgrind log: {server_log}\n")
 
-    _stop_stale_checkpoint_server()
+    if not _stop_checkpoint_server():
+        raise RuntimeError(
+            f"checkpoint_server still bound to port {_CHECKPOINT_SERVER_PORT} after graceful stop; cannot launch valgrind instance",
+        )
 
     os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
     # Server (via RedirectStdio in server_main.cpp) appends its own stderr to this path.
@@ -535,7 +681,11 @@ def run_pretrain(args: argparse.Namespace) -> None:  # noqa: C901
     cfg = f"{args.nodes}x{args.gpus_per_node}"
     extra_args = getattr(args, "extra_args", None)
     if in_srun():
-        nodes, gpus_per_node = _slurm_nodes_and_gpus()
+        # Node count comes from SLURM; GPUs-per-node is passed explicitly on the
+        # command line by the launcher (avoids round-tripping it through the
+        # container env, where a KEY=VALUE collision corrupted the value).
+        nodes = int(os.environ.get("SLURM_NNODES", "1"))
+        gpus_per_node = args.gpus_per_node
         cfg = f"{nodes}x{gpus_per_node}"
         try:
             with _maybe_valgrind_ctx(args, cfg):
@@ -611,9 +761,7 @@ def run_pretrain(args: argparse.Namespace) -> None:  # noqa: C901
 
 
 def _build_pretrain_srun_cmd(cfg: str, nodes: int, gpus_per_node: int, job: str, extra_args: list[str] | None = None) -> list[str]:
-    account = os.environ.get("SLURM_ACCOUNT", "coreai_resiliency_osiris")
-    partition = os.environ.get("SLURM_PARTITION")
-    image = os.environ.get("ENROOT_IMAGE", _default_enroot_image())
+    image = _image_path().as_posix()
     triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
     total_tasks = nodes * gpus_per_node
 
@@ -631,30 +779,31 @@ def _build_pretrain_srun_cmd(cfg: str, nodes: int, gpus_per_node: int, job: str,
         env_exports += ",PHOENIX_BUILD_FOR_VALGRIND"
 
     return [
-        "srun",
-        *(
-            [
-                "--comment={'OccupiedIdleGPUsJobReaper':{'exemptIdleTimeMins':'60','reason':'other','description':'Running Memory sanitization tool valgrind'}}"
-            ]
-            if job == "valgrind"
-            else []
+        *_build_srun_cmd(
+            nodes=nodes,
+            ntasks=total_tasks,
+            time_minutes=60 if job == "valgrind" else 40,
+            job_name=f"{job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
+            image=image,
+            container_env=env_exports,
+            gpus_per_node=gpus_per_node,
+            total_gpus=total_tasks,
+            # valgrind runs ~10-50x slower; exempt it from the idle-GPU reaper.
+            extra_srun_args=(
+                ["--comment={'OccupiedIdleGPUsJobReaper':{'exemptIdleTimeMins':'60','reason':'other','description':'Running Memory sanitization tool valgrind'}}"]
+                if job == "valgrind"
+                else []
+            ),
         ),
-        f"--account={account}",
-        *([f"--partition={partition}"] if partition else []),
-        f"--nodes={nodes}",
-        f"--ntasks={total_tasks}",
-        f"--time={60 if job == 'valgrind' else 40}",
-        *([f"--gpus={total_tasks}", f"--gpus-per-node={gpus_per_node}"] if _slurm_gpu_flags_enabled() else []),
-        "--mem=0",
-        f"--job-name={job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
-        f"--container-image={image}",
-        f"--container-mounts={Path.home()}:{Path.home()},/lustre:/lustre",
-        f"--container-env={env_exports}",
         # SLURM_PROCID will be set on each task, triggering in-srun mode.
         "python3",
         "-u",
         str(Path(__file__).resolve()),
         job,
+        # Pass gpus-per-node on the command line so the in-srun task reads it from
+        # argv, not the container env (a KEY=VALUE collision there corrupted it).
+        "--gpus-per-node",
+        str(gpus_per_node),
         *(extra_args or []),
     ]
 
@@ -1835,10 +1984,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "job",
-        choices=["ckptbench", "pretrain", "pretrain-all", "pretrain-native", "pretrain-nvrx", "valgrind", "update_baselines"],
+        choices=["prepare-image", "ckptbench", "pretrain", "pretrain-all", "pretrain-native", "pretrain-nvrx", "valgrind", "update_baselines"],
     )
     p.add_argument("--nodes", type=int, default=1, help="Number of nodes (default: 1 — runs inline; >1 uses SLURM automatically)")
-    p.add_argument("--gpus-per-node", type=int, default=None, dest="gpus_per_node", help="GPUs per node (default: auto-detect)")
+    p.add_argument(
+        "--gpus-per-node",
+        type=int,
+        default=None,
+        dest="gpus_per_node",
+        help="GPUs per node (default: GPUS_PER_NODE env set at runner setup, else auto-detect)",
+    )
     p.add_argument("--slurm", action="store_true", help="Submit via SLURM even for single-node runs")
     p.add_argument("--skip-perf", action="store_true", dest="skip_perf", help="Skip perf parsing; tee full output to console instead")
     p.add_argument(
@@ -1856,8 +2011,14 @@ def main() -> None:
     )
     args, extra_args = p.parse_known_args()
     args.extra_args = extra_args
+    # Honor the runner's configured scheduler mode (SLURM_PARTITION set => SLURM),
+    # so the CI YAML needn't pass --slurm in JOB_ARGS.
+    if _runner_uses_slurm():
+        args.slurm = True
     if args.gpus_per_node is None:
-        args.gpus_per_node = _detect_local_gpu_count()
+        # Prefer the count configured at runner setup (GPUS_PER_NODE), so the CI
+        # YAML stays cluster-agnostic; fall back to probing the local host.
+        args.gpus_per_node = _runner_gpus_per_node() or _detect_local_gpu_count()
 
     if args.job == "valgrind":
         # Signal CMake that we're building for a valgrind run. CMakeLists.txt
@@ -1869,24 +2030,25 @@ def main() -> None:
         # forwarding.
         os.environ["PHOENIX_BUILD_FOR_VALGRIND"] = "1"
 
-    # Clean stale checkpoint_server daemons + named shm before starting any
-    # work, and again on exit, so the next pipeline lands on a node free of
-    # this branch's pollution. Only meaningful on compute nodes: the slurm
-    # launcher (args.slurm and not in_srun()) runs on the head node, where no
-    # checkpoint_server ever runs, so we skip there.
+    # update_baselines and prepare-image do no GPU work and start no checkpoint
+    # server, so they run without the cleanup bracket below.
+    if args.job == "update_baselines":
+        run_update_baselines(args)
+        return
+    if args.job == "prepare-image":
+        run_prepare_image(args)
+        return
+
+    # Workload jobs: stop any checkpoint_server a prior job left on this node
+    # before starting, and again on exit, so the next pipeline lands on a clean
+    # node. Only meaningful on compute nodes — the slurm launcher (args.slurm and
+    # not in_srun()) runs on the head node, where no checkpoint_server ever runs.
+    # The enroot image is already present (built by the 'prepare-image' stage that
+    # every workload job `needs:`), so there is no wait here.
     is_compute_node = in_srun() or not args.slurm
     if is_compute_node:
         _cleanup_stale_checkpoint_server()
     try:
-        if args.job == "update_baselines":
-            run_update_baselines(args)
-            return
-
-        image = Path(_default_enroot_image())
-        if args.slurm:
-            if args.job == "pretrain-all" and not in_srun():
-                _ensure_enroot_image(image)
-            wait_for_file(image, timeout_seconds=3600)
         if args.job == "ckptbench":
             run_ckptbench(args)
         else:
