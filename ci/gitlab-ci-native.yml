@@ -1,8 +1,5 @@
 # GitLab CI for performance and correctness testing.
 #
-# Scheduler-agnostic: all cluster-specific details live in
-#   megatron/native/ci/scripts/run_job.py
-#
 # Include from root .gitlab-ci.yml:
 #   include:
 #     - megatron/native/ci/gitlab-ci-native.yml
@@ -10,8 +7,12 @@
 # Runners must be registered on each machine's login node.
 # See megatron/native/ci/runner/setup_runner.py and ci/prepare.md.
 
+# `build` and `test` are shared with the root pipeline this file is included
+# into; reusing their names keeps prepare-image ordered before the test jobs
+# after GitLab merges the stage lists (include-only stages get appended last,
+# which would push a dedicated prepare stage after test and break the needs:).
 stages:
-  - prepare
+  - build
   - test
   - update
 
@@ -71,20 +72,15 @@ stages:
   script:
     - python3 "${CI_SCRIPTS_DIR}/run_job.py" ${JOB_ARGS} || exit $?
   after_script:
-    # Single-provider jobs drop *.distcp directly under iter_*; pretrain-all routes
-    # each writer into iter_*/{native,nvrx}. Glob both layouts so the size report
-    # covers either case.
-    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp megatron/native/ci/ci-runs/*/checkpoints/iter_*/*/*.distcp 2>/dev/null || true
+    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
   artifacts:
     paths:
       - megatron/native/ci/ci-results/*.log
       - megatron/native/ci/ci-results/*_report.json
-      # pretrain-native (and friends) produce these per-iter; the update stage
-      # copies them into megatron/native/metadata/. In dual-provider mode
-      # (pretrain-all) the same files live under iter_*/native instead of
-      # iter_* directly, and iter_*/nvrx/reference.metadata.info also appears
-      # (written by the rewired compare_nvrx_with_native finalize-fn) — list all
-      # three layouts so either job uploads its outputs.
+      # Per-iter outputs the update stage mirrors into megatron/native/metadata/:
+      # pretrain-native contributes registry.bin / [0-9]*.metadata.info / *.txt,
+      # both providers contribute reference.metadata.info (re-derived by the
+      # in-job _compare_iters_to_baseline → distcp_trace pass).
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/[0-9]*.metadata.info
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
@@ -94,38 +90,38 @@ stages:
       # reference.metadata.info, so this is the only artifact that survives
       # for offline analysis of the storage_data layout.
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/.metadata
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/registry.bin
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/[0-9]*.metadata.info
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/reference.metadata.info
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/*.txt
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/native/.metadata
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/nvrx/reference.metadata.info
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/nvrx/.metadata
+      # pretrain-nvrx determinism check: run-1's reference.metadata.info is
+      # parked here before run-2 starts. On a cross-run mismatch the diff is
+      # reproducible offline as `diff run1-references/iter_*/reference.metadata.info
+      # checkpoints/iter_*/reference.metadata.info`.
+      - megatron/native/ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
     expire_in: 30 days
     when: always
 
-# Rules reused by 16-node jobs (schedule/web only)
-.schedule_or_web:
+# Optional manual: job is always present in the pipeline but never runs
+# automatically — only when a user clicks "play" in the GitLab UI. Use for
+# jobs that are useful on demand (e.g. cross-provider baseline checks) but
+# too expensive or noisy to run on every commit.
+.manual_optional:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-    - if: $CI_PIPELINE_SOURCE == "web"
-    - when: never
+    - when: manual
+      allow_failure: true
 
 # ---------------------------------------------------------------------------
-# Stage: prepare — build the enroot squash image once, up front.
+# Build the enroot squash image once, up front, in the build stage.
 #
-# `run_job.py prepare-image` builds the .sqsh if it is missing and is a fast
-# no-op when it already exists (and a no-op on inline/devbox runners, which use
-# no image). One job per runner; every test job `needs:` its own runner's
-# prepare job (see the .needs_*_image mixins) so jobs no longer build or stall
-# on the image inside the workload itself, and clusters don't wait on each other.
+# `prepare_image.py` builds the .sqsh if it is missing and is a fast no-op when
+# it already exists (and a no-op on inline/devbox runners, which use no image).
+# One job per runner; every test job `needs:` its own runner's prepare-image job
+# (see the .needs_*_image mixins) so jobs no longer build or stall on the image
+# inside the workload itself, and clusters don't wait on each other.
 # ---------------------------------------------------------------------------
 .prepare_image:
   extends: .ci_base
-  stage: prepare
+  stage: build
   timeout: 2h
   script:
-    - python3 "${CI_SCRIPTS_DIR}/run_job.py" prepare-image
+    - python3 "${CI_SCRIPTS_DIR}/prepare_image.py"
 
 gb200:prepare-image:
   extends: [.prepare_image, .runner_gb200]
@@ -171,81 +167,84 @@ devbox:ckptbench:1x2:
   variables:
     JOB_ARGS: "ckptbench"
 
-gb200:pretrain-all:1x4:
+# pretrain-native: perf measurement (default flavor) and deterministic validation
+# (cross-provider md5 vs the nvrx baseline in metadata/) run as separate jobs so
+# perf isn't skewed by --deterministic-mode and each keeps its own baseline.
+gb200:pretrain-native:1x4:perf:
   extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-all"
+    JOB_ARGS: "pretrain-native --flavor perf"
 
-h200:pretrain-all:1x8:
+h200:pretrain-native:1x8:perf:
   extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-all"
+    JOB_ARGS: "pretrain-native --flavor perf"
 
-devbox:pretrain-all:1x2:
+devbox:pretrain-native:1x2:perf:
   extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-all"
+    JOB_ARGS: "pretrain-native --flavor perf"
 
-gb200:pretrain-native:1x4:
+gb200:pretrain-native:1x4:deterministic:
   extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-native"
+    JOB_ARGS: "pretrain-native --flavor deterministic"
 
-h200:pretrain-native:1x8:
+h200:pretrain-native:1x8:deterministic:
   extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-native"
+    JOB_ARGS: "pretrain-native --flavor deterministic"
 
-devbox:pretrain-native:1x2:
+devbox:pretrain-native:1x2:deterministic:
   extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-native"
+    JOB_ARGS: "pretrain-native --flavor deterministic"
 
-gb200:pretrain-nvrx:1x4:
-  extends: [.run_job, .runner_gb200, .schedule_or_web, .needs_gb200_image]
+# pretrain-nvrx: cross-run determinism gate (requires the deterministic flavor).
+gb200:pretrain-nvrx:1x4:deterministic:
+  extends: [.run_job, .runner_gb200, .manual_optional, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx"
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
-h200:pretrain-nvrx:1x8:
-  extends: [.run_job, .runner_h200, .schedule_or_web, .needs_h200_image]
+h200:pretrain-nvrx:1x8:deterministic:
+  extends: [.run_job, .runner_h200, .manual_optional, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx"
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
-devbox:pretrain-nvrx:1x2:
-  extends: [.run_job, .runner_devbox, .schedule_or_web, .needs_devbox_image]
+devbox:pretrain-nvrx:1x2:deterministic:
+  extends: [.run_job, .runner_devbox, .manual_optional, .needs_devbox_image]
   variables:
-    JOB_ARGS: "pretrain-nvrx"
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
-# 16-node runs: clusters only, schedule/web trigger
-gb200:pretrain:16x4:
-  extends: [.run_job, .runner_gb200, .schedule_or_web, .needs_gb200_image]
+# 16-node perf scale runs: clusters only, manual trigger.
+gb200:pretrain:16x4:perf:
+  extends: [.run_job, .runner_gb200, .manual_optional, .needs_gb200_image]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16"
+    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
 
-h200:pretrain:16x8:
-  extends: [.run_job, .runner_h200, .schedule_or_web, .needs_h200_image]
+h200:pretrain:16x8:perf:
+  extends: [.run_job, .runner_h200, .manual_optional, .needs_h200_image]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16"
+    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
 
-# Valgrind runs: pretrain-native with checkpoint_server pre-launched under memcheck.
-# valgrind slows the server ~10-50x; do not gate the pipeline on perf for these jobs
-# (the script reports metrics as informational because there is no valgrind baseline).
-# Devbox runs locally (no srun) — valgrind must be installed on the runner host.
-
+# Valgrind: memcheck the checkpoint_server under the deterministic flavor (the
+# numerics CI normally validates). valgrind slows the server ~10-50x, so metrics
+# are informational (no valgrind baseline). Devbox runs locally (no srun) —
+# valgrind must be installed on the runner host.
 gb200:valgrind:1x4:
   extends: [.run_job, .runner_gb200, .needs_gb200_image]
   variables:
-    JOB_ARGS: "valgrind"
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 
 h200:valgrind:1x8:
   extends: [.run_job, .runner_h200, .needs_h200_image]
   variables:
-    JOB_ARGS: "valgrind"
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 
 devbox:valgrind:1x2:
   extends: [.run_job, .runner_devbox, .needs_devbox_image]
   variables:
-    JOB_ARGS: "valgrind"
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 
 # ---------------------------------------------------------------------------
 # Stage: update — update baselines from report files produced by test stage.
@@ -275,8 +274,9 @@ devbox:valgrind:1x2:
     - |
       mkdir -p "${BASELINES_DIR}"
       git add "${BASELINES_DIR}/"
-      # pretrain-native update_baselines also refreshes registry.bin / [0-9]*.metadata.info
-      # under megatron/native/metadata/; harmless for ckptbench (no diff there).
+      # pretrain-native update_baselines refreshes registry.bin / [0-9]*.metadata.info
+      # and pretrain-nvrx update_baselines refreshes reference.metadata.info under
+      # megatron/native/metadata/; harmless for ckptbench (no diff there).
       if [ -d "${METADATA_DIR}" ]; then
         git add "${METADATA_DIR}/"
       fi
@@ -305,20 +305,56 @@ devbox:ckptbench:1x2:update_baselines:
     - job: devbox:ckptbench:1x2
       artifacts: true
 
-gb200:pretrain-native:1x4:update_baselines:
+gb200:pretrain-native:1x4:perf:update_baselines:
   extends: [.update_baseline_base, .runner_gb200]
   needs:
-    - job: gb200:pretrain-native:1x4
+    - job: gb200:pretrain-native:1x4:perf
       artifacts: true
 
-h200:pretrain-native:1x8:update_baselines:
+h200:pretrain-native:1x8:perf:update_baselines:
   extends: [.update_baseline_base, .runner_h200]
   needs:
-    - job: h200:pretrain-native:1x8
+    - job: h200:pretrain-native:1x8:perf
       artifacts: true
 
-devbox:pretrain-native:1x2:update_baselines:
+devbox:pretrain-native:1x2:perf:update_baselines:
   extends: [.update_baseline_base, .runner_devbox]
   needs:
-    - job: devbox:pretrain-native:1x2
+    - job: devbox:pretrain-native:1x2:perf
+      artifacts: true
+
+gb200:pretrain-native:1x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: gb200:pretrain-native:1x4:deterministic
+      artifacts: true
+
+h200:pretrain-native:1x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h200]
+  needs:
+    - job: h200:pretrain-native:1x8:deterministic
+      artifacts: true
+
+devbox:pretrain-native:1x2:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_devbox]
+  needs:
+    - job: devbox:pretrain-native:1x2:deterministic
+      artifacts: true
+
+gb200:pretrain-nvrx:1x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: gb200:pretrain-nvrx:1x4:deterministic
+      artifacts: true
+
+h200:pretrain-nvrx:1x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h200]
+  needs:
+    - job: h200:pretrain-nvrx:1x8:deterministic
+      artifacts: true
+
+devbox:pretrain-nvrx:1x2:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_devbox]
+  needs:
+    - job: devbox:pretrain-nvrx:1x2:deterministic
       artifacts: true

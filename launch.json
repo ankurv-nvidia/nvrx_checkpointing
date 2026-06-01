@@ -46,7 +46,7 @@
       "program": "${command:python.interpreterPath}", //Users/ankurv/cmakebuild/python_venv/bin/python3",
       "args": [
         "${workspaceFolder}/ci/scripts/run_job.py",
-        "pretrain-all",
+        "pretrain-native",
         "--gpus-per-node=1",
         "--save-iter-zero"
       ],

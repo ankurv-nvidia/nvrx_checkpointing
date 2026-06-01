@@ -395,65 +395,46 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     try_ping()
 
 
-def compare_reference_metadata(native_dir: Path | str, nvrx_dir: Path | str) -> None:
-    """Cross-provider equality check between two checkpoint dirs.
+def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | str) -> int:
+    """Diff reference.metadata.info between a checkpoint dir and its baseline snapshot.
 
     Each dir must already contain a ``reference.metadata.info`` produced by
-    :func:`distcp_trace` — those files are independent dumps of what's on
-    disk (tensor properties + per-chunk md5sums + flattened common.pt
-    entries) for each writer's output. A diff between them therefore
-    signals that native and nvrx wrote different bytes for at least one
-    tensor or metadata field, independent of either writer's self-reported
-    metadata.
+    :func:`distcp_trace` — independent dumps of what's on disk (tensor
+    properties + per-chunk md5sums) for that writer's output. A non-zero
+    diff therefore signals divergence between the just-derived trace and
+    the baseline (typically the nvrx snapshot in ``megatron/native/metadata/``).
+
+    Returns the unified-diff line count — 0 means equal. Callers decide
+    whether to warn or hard-fail; see ``scripts/metadata_compare.py``.
 
     Raises:
         FileNotFoundError: when either dir is missing reference.metadata.info.
-
-    Note: divergence on the diff is currently logged as a warning rather
-    than raised — see the TODO inline for the upstream writer bugs that
-    will need to land before strict equality can be re-enabled.
     """
-    native_dir = Path(native_dir)
-    nvrx_dir = Path(nvrx_dir)
-    native_ref = native_dir / "reference.metadata.info"
-    nvrx_ref = nvrx_dir / "reference.metadata.info"
-    for label, path in (("native", native_ref), ("nvrx", nvrx_ref)):
+    checkpoint_dir = Path(checkpoint_dir)
+    baseline_dir = Path(baseline_dir)
+    checkpoint_ref = checkpoint_dir / "reference.metadata.info"
+    baseline_ref = baseline_dir / "reference.metadata.info"
+    for label, path in (("checkpoint", checkpoint_ref), ("baseline", baseline_ref)):
         if not path.is_file():
             raise FileNotFoundError(f"[native_ckpt:cli] missing {label} reference.metadata.info at {path}")
-    native_lines = native_ref.read_text().splitlines()
-    nvrx_lines = nvrx_ref.read_text().splitlines()
+    checkpoint_lines = checkpoint_ref.read_text().splitlines()
+    baseline_lines = baseline_ref.read_text().splitlines()
     diff = list(
         difflib.unified_diff(
-            nvrx_lines,
-            native_lines,
-            fromfile=str(nvrx_ref),
-            tofile=str(native_ref),
+            baseline_lines,
+            checkpoint_lines,
+            fromfile=str(baseline_ref),
+            tofile=str(checkpoint_ref),
             n=1,
         ),
     )
     result = "PASS" if len(diff) == 0 else "FAIL"
     sys.stderr.write(
-        f"[native_ckpt:cli] {result}: {len(diff)} cross-provider differences\n\t{nvrx_ref}\n\t{native_ref}\n",
+        f"[native_ckpt:cli] {result}: {len(diff)} differences vs baseline\n\t{baseline_ref}\n\t{checkpoint_ref}\n",
     )
-    if 0 < len(diff) < max(len(native_lines), len(nvrx_lines)) / 2:
+    if 0 < len(diff) < max(len(checkpoint_lines), len(baseline_lines)) / 2:
         sys.stdout.writelines("\n".join(diff))
-    if len(diff) > 0:
-        # TODO(ankurv/megatron-lm#6, #7): re-enable the raise once the two
-        # native-writer bugs are fixed. (#6) replicated tensors collide in
-        # storage_data — only the last-iterated rank's _StorageInfo survives,
-        # so per-chunk md5 lines diverge between native and nvrx for those
-        # FQNs. (#7) RegisterShardedObject is a no-op stub — every
-        # _extra_state / distributed-optimizer-scratch / RNG-state entry is
-        # silently dropped on the native side, so nvrx's reference dump
-        # carries hundreds of lines native's doesn't. Both produce real
-        # diffs against an otherwise-correct tensor compare, so a hard raise
-        # gates CI on known-missing-features. checkpoint_equality_compare
-        # already proves tensor-byte-equality; this diff is advisory until
-        # the writer gaps close.
-        sys.stderr.write(
-            f"WARN: [native_ckpt:cli] {len(diff)} cross-provider differences "
-            f"between {nvrx_ref} and {native_ref} (TODO(ankurv/megatron-lm#6, #7) — see comment)\n",
-        )
+    return len(diff)
 
 
 def main() -> None:
