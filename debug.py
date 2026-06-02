@@ -213,7 +213,12 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     *,
     verify_native_server: bool = True,
 ) -> None:
-    try_ping()
+    # distcp_trace only reads on-disk files (the .distcp chunks for md5s, and the server's
+    # 0.metadata.info for the claim check below) — it never talks to a live server. So only
+    # ensure one is up when we actually verify against it; the md5 / cross-provider path
+    # (verify_native_server=False) must not launch a server it would then strand on the node.
+    if verify_native_server:
+        try_ping()
     if isinstance(checkpoint_dir, str):
         checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
@@ -245,6 +250,13 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
 
     info_entries: dict[str, str] = {}
     tensors = {}
+    # Non-contiguous offsets are expected today: every rank writes the same archive for a
+    # replicated shard, but only one rank's _StorageInfo survives torch's MetadataIndex dict
+    # on pickle.load, leaving orphan bytes between metadata-tracked entries. They flood the log
+    # one-per-shard, so accumulate and emit a single summary after the walk instead.
+    gap_count = 0
+    gap_bytes = 0
+    files_with_gaps: set[str] = set()
     for relative_path, offsets in file_offsets.items():
         sorted_offsets = dict(sorted(offsets.items(), key=lambda item: item[0]))
         start_offset = 0
@@ -254,30 +266,23 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
         for offset, info in sorted_offsets.items():
             tnsr = info["metadata_index"].fqn
             if offset != start_offset:
-                # TODO(ankurv/megatron-lm#6): re-enable the raise once the
-                # native writer dedups replicated tensors at registration time.
-                # Today every rank writes the same archive for a replicated
-                # shard but only one rank's _StorageInfo survives torch's
-                # MetadataIndex dict on pickle.load (identical (fqn,
-                # chunk_offsets, index) across replicas collapses to the last
-                # iterated entry), leaving orphan bytes between metadata-
-                # tracked entries. dcp.load seeks by the recorded offset and
-                # ignores the gap, so tensors still round-trip correctly —
-                # demote to a warning for now.
-                sys.stderr.write(
-                    f"WARN: relative_path={relative_path}: Expected file offset to be {start_offset}, "
-                    f"got {offset} for tensor {tnsr} (delta=+{offset - start_offset} bytes)\n",
-                )
+                gap_count += 1
+                gap_bytes += offset - start_offset
+                files_with_gaps.add(relative_path)
                 start_offset = offset
-            # if tnsr in tensors:
-            #    raise ValueError(
-            #        f"relative_path={relative_path}: Duplicate tensor {tnsr} at offset {offset} in {relative_path}\n"
-            #        f"\tpinfo={tensors[tnsr]!s}\n"
-            #        f"\tninfo={info!s}"
-            #    )
             tensors.setdefault(tnsr, [])
             tensors[tnsr].append(info)
             start_offset += info["storage_info"].length
+
+    if gap_count:
+        # TODO(ankurv/megatron-lm#6): these gaps disappear once the native writer dedups
+        # replicated tensors at registration time. dcp.load seeks by the recorded offset and
+        # ignores the orphan bytes, so tensors still round-trip correctly — warn, don't raise.
+        sys.stderr.write(
+            f"WARN: {gap_count} non-contiguous tensor offset(s) across {len(files_with_gaps)} file(s) "
+            f"(+{gap_bytes} orphan bytes from replicated shards); tensors still round-trip. "
+            f"TODO(ankurv/megatron-lm#6): remove once the native writer dedups replicated tensors.\n",
+        )
 
     tensormeta = {}
     chunkmeta = {}
@@ -328,7 +333,8 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             if extract_tensor_data:
                 extracted_dir.mkdir(exist_ok=True)
             # Build flat key=value metadata entries for all TensorStorageMetadata tensors
-            try_ping()
+            if verify_native_server:
+                try_ping()
             for fqn, meta in tensormeta.items():
                 flatten_to_entries(fqn, meta, info_entries)
                 for i, chunk in enumerate(meta.chunks):
@@ -392,7 +398,7 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             sys.stdout.writelines("\n".join(diff))
         if len(diff) > 0:
             raise ValueError(f"[native_ckpt:cli] FAIL: {len(diff)} Differences found between {ref_info_file} and {native_info_file}")
-    try_ping()
+        try_ping()
 
 
 def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | str) -> int:

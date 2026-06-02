@@ -1,0 +1,111 @@
+# Base pretrain model + training config for the native checkpoint CI.
+#
+# Flattened to CLI args by the pretrain job: `key: value` -> `--key value`,
+# `key: true` -> `--key`, `key: [a, b]` -> `--key a b`, `key: false`/null drops
+# the flag. Per-node-count overrides (pretrain_<N>node.yaml, e.g. pretrain_16node.yaml)
+# deep-merge over this. Runtime values are supplied in code, not here: checkpoint
+# provider/format/save-load, save/log/eval/exit intervals and train-iters, the data
+# cache and tensorboard paths, and the default tensor/expert parallel sizes and global
+# batch size (which scale with the runner's GPU count unless an override pins them).
+#
+# Float and scientific-notation values are quoted so they reach the CLI verbatim.
+
+# MTP
+mtp-num-layers: 2
+mtp-hybrid-override-pattern: "*E"
+calculate-per-token-loss: true
+mtp-loss-scaling-factor: "0.3"
+
+# Architecture
+is-hybrid-model: true
+first-last-layers-bf16: true
+untie-embeddings-and-output-weights: true
+init-method-std: "0.014"
+position-embedding-type: "none"
+bf16: true
+use-mcore-models: true
+spec: [megatron.core.models.mamba.mamba_layer_specs, mamba_stack_spec]
+num-layers: 3
+hidden-size: 2048
+num-attention-heads: 32
+ffn-hidden-size: 1344
+kv-channels: 128
+mamba-num-heads: 64
+hybrid-override-pattern: "M*E"
+num-experts: 32
+moe-router-topk: 11
+moe-shared-expert-intermediate-size: 2688
+moe-latent-size: 1024
+num-layers-at-start-in-bf16: 0
+num-layers-at-end-in-bf16: 2
+
+# Parallelism (tensor/expert model-parallel sizes and global batch size are computed
+# in code so the dev configs track the runner's GPU count; an override pins them).
+expert-tensor-parallel-size: 1
+pipeline-model-parallel-size: 1
+sequence-parallel: true
+no-gradient-accumulation-fusion: true
+use-distributed-optimizer: true
+overlap-grad-reduce: true
+overlap-param-gather: true
+override-opt_param-scheduler: true
+
+# MoE
+moe-token-dispatcher-type: alltoall
+moe-router-score-function: sigmoid
+moe-grouped-gemm: true
+moe-aux-loss-coeff: "1e-4"
+moe-router-topk-scaling-factor: "5.0"
+moe-router-enable-expert-bias: true
+moe-router-dtype: fp32
+moe-router-load-balancing-type: seq_aux_loss
+moe-permute-fusion: true
+
+# Fused ops / attention (fast path; the deterministic flavor swaps these for
+# reproducible kernels).
+attention-backend: flash
+cross-entropy-loss-fusion: true
+cross-entropy-fusion-impl: native
+use-fused-weighted-squared-relu: true
+squared-relu: true
+te-rng-tracker: true
+ddp-num-buckets: 10
+
+# Data
+mock-data: true
+tokenizer-type: NullTokenizer
+vocab-size: 256000
+
+# Schedule / optimizer
+lr-wsd-decay-style: minus_sqrt
+micro-batch-size: 1
+lr: "4.5e-4"
+min-lr: "4.5e-6"
+weight-decay: "0.1"
+clip-grad: "1.0"
+adam-beta1: "0.9"
+adam-beta2: "0.95"
+
+# Regularization
+attention-dropout: "0.0"
+hidden-dropout: "0.0"
+disable-bias-linear: true
+normalization: RMSNorm
+
+# Logging
+log-params-norm: true
+log-num-zeros-in-grad: true
+log-throughput: true
+log-progress: true
+logging-level: 20
+disable-straggler-on-startup: true
+straggler-minmax-count: 16
+timing-log-option: minmax
+
+# Misc
+eval-iters: 14
+no-mmap-bin-files: true
+no-create-attention-mask-in-dataloader: true
+distributed-timeout-minutes: 30
+num-workers: 1
+disable-gloo-process-groups: true

@@ -101,6 +101,13 @@ stages:
     expire_in: 30 days
     when: always
 
+# ckptbench has its own entry script (ckptbench.py); everything else in .run_job
+# (stage, timeout, allow_failure exit 3, artifacts, after_script) is reused.
+.run_ckptbench:
+  extends: .run_job
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/ckptbench.py" || exit $?
+
 # Optional manual: job is always present in the pipeline but never runs
 # automatically — only when a user clicks "play" in the GitLab UI. Use for
 # jobs that are useful on demand (e.g. cross-provider baseline checks) but
@@ -155,19 +162,13 @@ devbox:prepare-image:
 # Stage: test
 # ---------------------------------------------------------------------------
 gb200:ckptbench:1x4:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "ckptbench"
+  extends: [.run_ckptbench, .runner_gb200, .needs_gb200_image]
 
 h200:ckptbench:1x8:
-  extends: [.run_job, .runner_h200, .needs_h200_image]
-  variables:
-    JOB_ARGS: "ckptbench"
+  extends: [.run_ckptbench, .runner_h200, .needs_h200_image]
 
 devbox:ckptbench:1x2:
-  extends: [.run_job, .runner_devbox, .needs_devbox_image]
-  variables:
-    JOB_ARGS: "ckptbench"
+  extends: [.run_ckptbench, .runner_devbox, .needs_devbox_image]
 
 # pretrain-native: perf measurement (default flavor) and deterministic validation
 # (cross-provider md5 vs the nvrx baseline in metadata/) run as separate jobs so

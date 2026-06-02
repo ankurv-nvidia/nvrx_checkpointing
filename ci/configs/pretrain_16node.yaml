@@ -1,0 +1,21 @@
+# 16-node override: a larger Mamba-hybrid MoE model with fixed parallelism.
+# Deep-merged over pretrain_base.yaml when a run uses 16 nodes. Only the keys that
+# differ from the base are listed; everything else (MTP, MoE routing, fused ops,
+# optimizer, logging, ...) is inherited.
+
+# Model
+num-layers: 44
+hidden-size: 4096
+ffn-hidden-size: 2688
+mamba-num-heads: 128
+hybrid-override-pattern: "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEME"
+num-experts: 512
+moe-router-topk: 22
+moe-shared-expert-intermediate-size: 5376
+num-layers-at-end-in-bf16: 14
+
+# Parallelism + batch size (pinned, not scaled to the runner's GPU count)
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 64
+expert-tensor-parallel-size: 1
+global-batch-size: 3072

@@ -5,7 +5,6 @@ Runs a job and automatically parses performance results afterwards.
 By default only perf numbers are printed; use --skip-perf to see full output.
 
 Jobs (the enroot image is built separately by prepare_image.py):
-  ckptbench       Build and run the C++ checkpoint benchmark (1 node, 2 GPUs).
   pretrain-native Run pretrain_mamba.py with the native checkpoint provider. Under the
                   deterministic flavor it also runs the cross-provider md5 compare against
                   the nvrx baseline in metadata/.
@@ -28,7 +27,6 @@ Usage:
   python3 run_job.py pretrain-native --flavor deterministic --flavor valgrind  # memcheck the server
   python3 run_job.py pretrain-nvrx --flavor deterministic --slurm     # cross-run determinism gate
   python3 run_job.py pretrain-native --nodes 16 --flavor deterministic # 16 nodes via SLURM
-  python3 run_job.py ckptbench                                        # run inline (2 GPUs required locally)
   python3 run_job.py pretrain-native --skip-perf                      # tee full output, no perf parsing
   python3 run_job.py pretrain-native --update-baseline                # record current perf as new baseline
 
@@ -37,7 +35,7 @@ set => run via SLURM, unset => inline. The CI YAML carries no --slurm flag; --sl
 forces it for manual/local runs.
 
 SLURM commands come from template files (see TEMPLATES_DIR below), selected by CLUSTER:
-  srun.tmpl         shared launch command for every job (pretrain/ckptbench)
+  srun.tmpl         shared launch command for every pretrain job
   image_build.tmpl  build the enroot squash image
   The repo ships cw-dfw defaults; a runner overrides one either with a repo
   per-cluster file <cluster>.<name> (e.g. cwdfw.srun.tmpl) or by placing a file of
@@ -56,7 +54,7 @@ Other settings (via environment variables):
   CI_DIR                  runner state dir holding config + override templates (default ~/data/ci)
 
 Outputs (auto-derived from platform, job, flavor, and config; the <flavor_tag> segment is
-omitted for jobs without flavors, e.g. ckptbench):
+omitted for jobs run without a flavor):
   Logs:      <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>.log
   Reports:   <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>_report.json
   Baselines: <script_dir>/../baselines/<platform>_<job>_<flavor_tag>_<config>.yaml
@@ -74,6 +72,7 @@ import contextlib
 import difflib
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -101,6 +100,13 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 MEGATRON_ROOT = (SCRIPT_DIR / "../../../..").resolve()
 BASELINES_DIR = (SCRIPT_DIR / "../baselines").resolve()
+CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
+logger = logging.getLogger("native_ci")
+
+# Sentinel first arg that re-enters this script as the in-process training entry: the launcher
+# runs `python3 run_job.py __pretrain_entry__ *opts` (or via torchrun) and __main__ dispatches it
+# to run pretrain in-process, keeping the CI markers in megatron/native and pretrain_hybrid.py unmodified.
+_PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
 
 sys.path.insert(0, str(MEGATRON_ROOT))
 
@@ -126,7 +132,7 @@ def wait_for_file(path: Path, timeout_seconds: int) -> None:
         if time.time() - start_time > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for {path} after {timeout_seconds} seconds")
         prefix = "[in-srun] " if "SLURM_PROCID" in os.environ else ""
-        sys.stderr.write(f"{prefix}Waiting for {path} to be available...\n")
+        logger.info(f"{prefix}Waiting for {path} to be available...")
         time.sleep(10)
 
 
@@ -325,9 +331,19 @@ class PerfFlavor(Flavor):
         recipe.build_env["PHOENIX_BUILD_FOR_PERF"] = "1"
 
     def epilog(self, ctx: RunCtx) -> None:
-        if ctx.log_file is None or ctx.args.skip_perf:
+        self.run_perf_epilog(ctx)
+
+    @staticmethod
+    def run_perf_epilog(ctx: RunCtx) -> None:
+        """Parse perf metrics from the run log, compare to the per-platform baseline, and
+        soft-fail (exit 3 — a non-blocking CI warning) on out-of-tolerance.
+
+        Shared with the deterministic flavor so both warn on perf drift against their own
+        baseline. No-op under --skip-perf, with no log to parse, or under valgrind.
+        """
+        if ctx.log_file is None or ctx.args.skip_perf or ctx.has("valgrind"):
             return
-        passed = _parse_and_report(
+        passed = PerfReport.parse_and_report(
             ctx.job,
             ctx.cfg,
             ctx.flavor_tag,
@@ -342,7 +358,8 @@ class PerfFlavor(Flavor):
 
 
 class DeterministicFlavor(Flavor):
-    """Reproducible numerics for the metadata md5 checks; no perf-baseline gating.
+    """Reproducible numerics for the metadata md5 checks, plus a non-blocking perf-drift
+    warning against this flavor's own baseline.
 
     Swaps fused/atomic-add kernels for deterministic ones and adds --deterministic-mode.
     """
@@ -367,11 +384,13 @@ class DeterministicFlavor(Flavor):
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
-        # Skipped under valgrind: that flavor owns the checkpoint_server and tears it
-        # down before the epilog, leaving distcp_trace with no server (md5 is covered
-        # by the plain deterministic job).
+        # Skipped under valgrind: that flavor owns the server and tears it down before the
+        # epilog, leaving the md5 trace with no server (md5 is covered by the plain run).
         if ctx.is_worker and not ctx.has("valgrind"):
-            _compare_iters_to_baseline(ctx.cfg, ctx.provider)
+            PerfReport._compare_iters_to_baseline(ctx.cfg, ctx.provider)
+        # Warn (non-blocking exit 3) on perf drift against this flavor's own slower baseline;
+        # the md5 mismatch above still hard-fails.
+        PerfFlavor.run_perf_epilog(ctx)
 
 
 class ValgrindFlavor(Flavor):
@@ -384,8 +403,8 @@ class ValgrindFlavor(Flavor):
     name = "valgrind"
 
     _REAPER_COMMENT = (
-        "--comment={'OccupiedIdleGPUsJobReaper':{'exemptIdleTimeMins':'60',"
-        "'reason':'other','description':'Running Memory sanitization tool valgrind'}}"
+        '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60",'
+        '"reason":"other","description":"Running Memory sanitization tool valgrind"}}'
     )
     _READY_MARKER = "Checkpoint server started"
     # server.cpp ~L1088 logs this when it begins orderly shutdown; we stop tee'ing to the
@@ -442,8 +461,8 @@ class ValgrindFlavor(Flavor):
         server_log.write_bytes(b"")  # truncate any prior run's log
 
         cmd = [valgrind, "--tool=memcheck", "--leak-check=full", "--show-leak-kinds=all", "--error-exitcode=42", "--log-fd=2", str(server)]
-        sys.stderr.write(f"[run_job] Launching checkpoint_server under valgrind; log: {server_log}\n")
-        _require_no_checkpoint_server()  # a leftover here means a prior run didn't spin down
+        logger.info(f"[run_job] Launching checkpoint_server under valgrind; log: {server_log}")
+        CheckpointServer.require_no_checkpoint_server()  # a leftover here means a prior run didn't spin down
 
         os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
         # Server (RedirectStdio in server_main.cpp) appends its stderr here too; O_APPEND
@@ -456,28 +475,28 @@ class ValgrindFlavor(Flavor):
                 raise RuntimeError(f"checkpoint_server did not print '{self._READY_MARKER}' within 600s under valgrind; see {server_log}")
             if proc.poll() is not None:
                 raise RuntimeError(f"checkpoint_server exited before becoming ready (rc={proc.returncode}); see {server_log}")
-            sys.stderr.write("[run_job] checkpoint_server is ready — proceeding with pretrain\n")
+            logger.info("[run_job] checkpoint_server is ready — proceeding with pretrain")
             yield
         finally:
             # Ask the server to stop now rather than waiting out its ~600s idle auto-shutdown
             # — under memcheck that wait plus the slow teardown can blow the budget below.
             # /api/stop triggers Server::Stop immediately; valgrind still flushes its leak
             # report when the process exits.
-            sys.stderr.write("[run_job] Pretrain finished — stopping checkpoint_server so valgrind can flush its report\n")
-            _request_server_stop()
+            logger.info("[run_job] Pretrain finished — stopping checkpoint_server so valgrind can flush its report")
+            CheckpointServer._request_server_stop()
             try:
                 rc = proc.wait(timeout=1800)
             except subprocess.TimeoutExpired:
                 # Never force-kill: a SIGKILL would lose valgrind's leak report. Dump the
                 # server's threads and fail loudly so the stuck server is visible.
-                _dump_server_threads()
+                CheckpointServer._dump_server_threads()
                 log_fp.close()
                 raise RuntimeError(
                     "checkpoint_server (under valgrind) did not spin down within 1800s of /api/stop — see the thread dump above",
                 ) from None
             watcher.join(timeout=5)  # drain the final log lines before closing
             log_fp.close()
-            sys.stderr.write(f"[run_job] valgrind exited with code {rc}; server log: {server_log}\n")
+            logger.info(f"[run_job] valgrind exited with code {rc}; server log: {server_log}")
             ctx.valgrind_rc = rc
 
     def _spawn(self, cmd: list[str], server_log: Path, log_fp: IO[str]) -> tuple[subprocess.Popen, threading.Event, threading.Thread]:
@@ -585,36 +604,16 @@ def _flavored_run(ctx: RunCtx) -> Iterator[None]:
         yield
     except BaseException:
         stack.close()  # prologs exit (valgrind waits for its server, records the rc)
-        _ensure_server_down(ctx, wait_flush=False, fail_on_timeout=False)
+        CheckpointServer._ensure_server_down(ctx, wait_flush=False, fail_on_timeout=False)
         raise
     stack.close()
-    _ensure_server_down(ctx)
+    CheckpointServer._ensure_server_down(ctx)
     if not ctx.is_rank0:
         return
     for flavor in ctx.flavors:
         flavor.epilog(ctx)
     if ctx.soft_fail:
         sys.exit(3)
-
-
-def _ensure_server_down(ctx: RunCtx, *, wait_flush: bool = True, fail_on_timeout: bool = True) -> None:
-    """Spin the native checkpoint_server down via its /api/stop endpoint.
-
-    On the success path (wait_flush + fail_on_timeout): wait for the async writes to flush,
-    request the stop, and fail with a thread dump if it doesn't free the port. On a crash
-    path both are False — stop best-effort without masking the original error. No-op
-    off-worker, for nvrx (no server), and for valgrind (its prolog owns the server).
-    """
-    if not ctx.is_worker or ctx.provider != "native" or ctx.has("valgrind"):
-        return
-    if wait_flush:
-        try:
-            _wait_for_native_metadata_files(ctx.cfg, timeout_seconds=1800)
-        except TimeoutError as ex:
-            sys.stderr.write(f"[run_job] wait for native artifacts timed out: {ex}\n")
-    if not _stop_checkpoint_server() and fail_on_timeout:
-        _dump_server_threads()
-        raise RuntimeError("checkpoint_server did not spin down after a clean-stop request — see the thread dump above")
 
 
 def _artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
@@ -642,86 +641,6 @@ def in_srun() -> bool:
     return "SLURM_PROCID" in os.environ
 
 
-def _checkpoint_server_pids() -> list[str]:
-    """PIDs of any running checkpoint_server on this host (incl. a valgrind-wrapped one).
-
-    Single source of truth for "is a server alive". Matches the binary on the full command
-    line (pgrep -f): the daemon's comm is truncated to 15 chars and a valgrind wrapper's comm
-    isn't 'checkpoint_server' at all. The process outlives its listening port — Server::Stop
-    closes the acceptor (freeing the port) well before it joins its threads and exits — so the
-    process, not the port, is the reliable liveness signal.
-
-    The pattern is bracketed (``[c]heckpoint_server``) so it doesn't match other ranks' own
-    concurrent ``pgrep`` commands — every rank runs this at once, and a literal pattern would
-    appear in each pgrep's cmdline and they'd all match each other.
-    """
-    try:
-        out = subprocess.run(["pgrep", "-f", "[c]heckpoint_server"], capture_output=True, text=True, check=False)  # noqa: S607
-    except OSError:
-        return []
-    return out.stdout.split()
-
-
-def _dump_server_threads() -> None:
-    """Best-effort: dump a stack trace of every thread of any running checkpoint_server.
-
-    Used when a server won't start (already running) or won't spin down, to make the stuck
-    process diagnosable rather than force-killing it. A bare `gdb -p` on a valgrind-wrapped
-    process shows valgrind's own frames, not the guest, so for those we attach through vgdb;
-    otherwise plain gdb, else the kernel per-thread stacks under /proc. Never raises —
-    diagnostics must not mask the real error.
-    """
-    pids = _checkpoint_server_pids()
-    if not pids:
-        sys.stderr.write("[run_job] no checkpoint_server process found to dump\n")
-        return
-    gdb = shutil.which("gdb")
-    vgdb = shutil.which("vgdb")
-    for pid in pids:
-        cmdline = Path(f"/proc/{pid}/cmdline")
-        under_valgrind = cmdline.exists() and "valgrind" in cmdline.read_text(errors="replace")
-        sys.stderr.write(f"[run_job] === checkpoint_server pid {pid} thread dump{' (via vgdb)' if under_valgrind else ''} ===\n")
-        try:
-            if gdb and under_valgrind and vgdb:
-                # A bare `gdb -p` on a valgrind process shows valgrind's frames, not the
-                # guest; attach through valgrind's gdbserver to see the real server threads.
-                bt = [gdb, "-batch", "-ex", f"target remote | {vgdb} --pid={pid}", "-ex", "thread apply all bt"]
-                subprocess.run(bt, check=False, timeout=120)
-            elif gdb:
-                subprocess.run([gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"], check=False, timeout=120)
-            else:
-                for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
-                    with contextlib.suppress(OSError):
-                        sys.stderr.write(f"[run_job] thread {task.name}:\n{(task / 'stack').read_text()}")
-        except (OSError, subprocess.TimeoutExpired) as ex:
-            sys.stderr.write(f"[run_job] thread dump for pid {pid} failed: {ex}\n")
-
-
-def _require_no_checkpoint_server() -> None:
-    """Fail if a checkpoint_server process is already running — a prior job's leftover.
-
-    The daemon (``server_main.cpp``) calls ``setsid()`` and survives parent death. We never
-    force-kill it (it may be mid-write or under valgrind, where a SIGKILL loses the leak
-    report); instead we dump its threads and fail loudly so it is visible. Check the process,
-    not the port: the server frees the port well before it exits, so a port check would miss a
-    still-shutting-down process that still holds its shm. With no process running, clear any
-    orphaned shm queues (``/dev/shm/checkpoint_request_*``) so the next server starts clean.
-    """
-    pids = _checkpoint_server_pids()
-    if pids:
-        sys.stderr.write(f"[run_job] checkpoint_server already running (pids {', '.join(pids)})\n")
-        _dump_server_threads()
-        raise RuntimeError(
-            f"checkpoint_server already running (pids {', '.join(pids)}); refusing to start. "
-            f"A previous job did not spin it down — see the thread dump above and stop it before retrying.",
-        )
-    for shm in Path("/dev/shm").glob("checkpoint_request_*"):  # noqa: S108 — named shm, not a temp file
-        try:
-            shm.unlink()
-        except OSError as ex:
-            sys.stderr.write(f"[run_job] could not remove stale shm {shm}: {ex}\n")
-
-
 # ---------------------------------------------------------------------------
 # File-based per-cluster SLURM command templates
 # ---------------------------------------------------------------------------
@@ -731,7 +650,7 @@ def _require_no_checkpoint_server() -> None:
 # container mount map, and any site-specific srun flags. Each distinct kind of
 # run is a template file:
 #
-#   srun.tmpl         shared launch command for every job (pretrain/ckptbench)
+#   srun.tmpl         shared launch command for every pretrain job
 #   image_build.tmpl  build the enroot squash image
 #
 # The repo ships the generic defaults (modelling cw-dfw) under TEMPLATES_DIR.
@@ -768,7 +687,7 @@ def _load_template(name: str) -> str:
     candidates.append(TEMPLATES_DIR / name)
     for path in candidates[:-1]:
         if path.is_file():
-            sys.stderr.write(f"[run_job] using template {path}\n")
+            logger.info(f"[run_job] using template {path}")
             return path.read_text()
     default = candidates[-1]
     if not default.is_file():
@@ -833,61 +752,6 @@ def _runner_gpus_per_node() -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Job: ckptbench
-# ---------------------------------------------------------------------------
-
-
-def _ckptbench_binary() -> Path:
-    import megatron.native as _native  # noqa: F401, PLC0415 — triggers CMake build
-
-    native_dir = MEGATRON_ROOT / "megatron/native"
-    build_dir = (
-        Path(os.environ["MEGATRON_NATIVE_BUILD_DIR"]).resolve() if os.environ.get("MEGATRON_NATIVE_BUILD_DIR") else native_dir / "build"
-    )
-    binary = build_dir / "ckptbench"
-    if not binary.is_file():
-        raise FileNotFoundError(f"ckptbench not found at {binary}")
-    return binary
-
-
-def run_ckptbench(args: argparse.Namespace) -> None:
-    registry = MEGATRON_ROOT / "megatron/native/metadata/1x2_checkpoints_iter_0000250/registry.bin"
-    if not registry.is_file():
-        raise FileNotFoundError(f"stateregistry not found: {registry}")
-
-    if in_srun():
-        binary = _ckptbench_binary()
-        bench_cmd = [str(binary), "--stateregistry", str(registry), "--benchmark_min_iters", "5", "--benchmark_max_iters", "5", "--inproc"]
-        subprocess.run(bench_cmd, check=True)
-        return
-
-    if args.slurm:
-        image = _image_path().as_posix()
-        cmd = [
-            *_build_srun_cmd(
-                nodes=1,
-                ntasks=1,
-                time_minutes=5,
-                job_name=f"ckpt_benchmark_{os.environ.get('CI_PIPELINE_ID', 'local')}",
-                image=image,
-                # container-env forwarded by name — avoids KEY=VALUE ambiguity in pyxis/enroot
-                container_env="VCPKG_ROOT",
-                gpus_per_node=args.gpus_per_node,
-                total_gpus=args.gpus_per_node,  # single node
-            ),
-            "python3",
-            "-u",
-            str(Path(__file__).resolve()),
-            "ckptbench",
-        ]
-    else:
-        binary = _ckptbench_binary()
-        cmd = [str(binary), "--stateregistry", str(registry), "--benchmark_min_iters", "5", "--benchmark_max_iters", "5", "--inproc"]
-
-    _run_and_report_perf(cmd, "ckptbench", f"1x{args.gpus_per_node}", args)
-
-
-# ---------------------------------------------------------------------------
 # Job: pretrain
 # ---------------------------------------------------------------------------
 
@@ -895,477 +759,58 @@ def run_ckptbench(args: argparse.Namespace) -> None:
 _CHECKPOINT_SERVER_PORT = 41000
 
 
-def _is_port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
+# Phase 1 trains from random init to this iteration and saves one checkpoint that
+# phase 2 loads. Phase 2 then trains exactly as a standalone run does today,
+# resuming from this iteration and saving every 250 (iters 250/500/750).
+_PHASE1_TRAIN_ITERS = 100
 
 
-def _request_server_stop() -> None:
-    """Best-effort GET /api/stop — sets the server's shutdown flag (no OS signals)."""
-    if not _is_port_in_use(_CHECKPOINT_SERVER_PORT):
-        return
-    url = f"http://127.0.0.1:{_CHECKPOINT_SERVER_PORT}/api/stop"
-    try:
-        with urllib.request.urlopen(url, timeout=2.0):
-            pass
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-        sys.stderr.write(f"[run_job]   /api/stop request failed: {exc}\n")
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into a copy of base; override wins on conflicts."""
+    out = dict(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
 
 
-def _stop_checkpoint_server(timeout: float = 30.0) -> bool:
-    """Ask the checkpoint_server to stop and wait for the PROCESS to fully exit.
-
-    Sends the server's own HTTP /api/stop (no OS signals, so it can't hit an unrelated
-    process), then polls until no checkpoint_server process remains. Waits on the process,
-    not the port: Server::Stop closes the listener — freeing the port — well before it joins
-    its threads and releases its shm, so a port check reports "stopped" while the process is
-    still alive and would strand its shm for the next job. Returns False if a process is still
-    alive after `timeout`, so the caller can dump threads and fail.
-    """
-    if not _checkpoint_server_pids():
-        return True
-
-    sys.stderr.write("[run_job] checkpoint_server running; requesting graceful stop via /api/stop\n")
-    _request_server_stop()
-
-    deadline = time.monotonic() + timeout
-    while _checkpoint_server_pids() and time.monotonic() < deadline:
-        time.sleep(0.25)
-    if _checkpoint_server_pids():
-        sys.stderr.write(f"[run_job]   checkpoint_server process still alive after {timeout:.0f}s\n")
-        return False
-    sys.stderr.write("[run_job]   checkpoint_server stopped (process exited)\n")
-    return True
-
-
-def run_pretrain(args: argparse.Namespace) -> None:
-    provider = _ckpt_provider(args.job)
-    cfg = f"{args.nodes}x{args.gpus_per_node}"
-    extra_args = getattr(args, "extra_args", None)
-
-    if in_srun():
-        # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
-        nodes = int(os.environ.get("SLURM_NNODES", "1"))
-        cfg = f"{nodes}x{args.gpus_per_node}"
-        ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
-        with _flavored_run(ctx):
-            cmd, env = _pretrain_cmd_and_env(
-                cfg,
-                nodes,
-                args.gpus_per_node,
-                ckpt_provider=provider,
-                flavors=args.flavors,
-                extra_args=extra_args,
-            )
-            subprocess.run(cmd, env=env, check=True)
-        return
-
-    # nvrx via SLURM/multinode runs the two-run cross-run determinism check, which
-    # manages its own ckpt_dir cleanup and run-1 sidecar bookkeeping.
-    if provider == "nvrx" and (args.nodes > 1 or args.slurm):
-        _run_pretrain_determinism_check(args, cfg)
-        return
-
-    # Clear stale checkpoints once in the launcher so in-srun tasks don't race on rmtree.
-    ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
-    if ckpt_dir.exists():
-        shutil.rmtree(ckpt_dir)
-
-    ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
-    ctx.log_file = RESULTS_DIR / f"{ctx.stem}.log"
-    if args.nodes > 1 or args.slurm:
-        # Launcher: training + worker epilogs run in the srun task; _flavored_run here tees
-        # the log and runs the perf epilog from it.
-        cmd = _build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
-        with _flavored_run(ctx):
-            ctx.soft_fail = _tee_run(cmd, ctx.log_file) == _SOFT_FAIL_RC
-    elif args.gpus_per_node > 1:
-        # Multi-GPU devbox: torchrun subprocess so worker output is captured in the log.
-        cmd, env = _pretrain_cmd_and_env(
-            cfg,
-            args.nodes,
-            args.gpus_per_node,
-            use_torchrun=True,
-            ckpt_provider=provider,
-            flavors=args.flavors,
-            extra_args=extra_args,
-        )
-        with _flavored_run(ctx):
-            ctx.soft_fail = _tee_run(cmd, ctx.log_file, env=env) == _SOFT_FAIL_RC
-    else:
-        # Single-GPU inline: call pretrain() in-process (debugger-friendly).
-        with _flavored_run(ctx):
-            _launch_pretrain_inline(ctx)
-
-
-def _build_pretrain_srun_cmd(  # noqa: PLR0913 — distinct srun inputs, not worth a struct
-    cfg: str,
-    nodes: int,
-    gpus_per_node: int,
-    job: str,
-    flavors: list[Flavor],
-    extra_args: list[str] | None = None,
-) -> list[str]:
-    image = _image_path().as_posix()
-    triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
-    total_tasks = nodes * gpus_per_node
-
-    recipe = Recipe(opts=[], env=Flavor.base_env(triton_dir))
-    _apply_flavors(recipe, flavors)
-    # KEY=VALUE for the run env; VCPKG_ROOT and any build_env (already exported in
-    # main()) are forwarded by name — forwarding them by value has hit KEY=VALUE
-    # parsing ambiguity in pyxis/enroot.
-    container_env = ",".join(f"{k}={v}" for k, v in recipe.env.items())
-    container_env += "," + ",".join(["VCPKG_ROOT", *recipe.build_env])
-
-    return [
-        *_build_srun_cmd(
-            nodes=nodes,
-            ntasks=total_tasks,
-            time_minutes=recipe.srun_time_min,
-            job_name=f"{job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
-            image=image,
-            container_env=container_env,
-            gpus_per_node=gpus_per_node,
-            total_gpus=total_tasks,
-            extra_srun_args=recipe.srun_comments,
-        ),
-        # SLURM_PROCID will be set on each task, triggering in-srun mode.
-        "python3",
-        "-u",
-        str(Path(__file__).resolve()),
-        job,
-        # Pass gpus-per-node + flavors on argv so the in-srun task re-derives the
-        # same recipe from argv, not the container env (a KEY=VALUE collision there
-        # corrupted forwarded values).
-        "--gpus-per-node",
-        str(gpus_per_node),
-        *[tok for f in flavors for tok in ("--flavor", f.name)],
-        *(extra_args or []),
-    ]
-
-
-def _pretrain_cmd_and_env(  # noqa: PLR0913
-    cfg: str,
-    nodes: int,
-    gpus_per_node: int,
-    use_torchrun: bool = False,
-    ckpt_provider: str = "nvrx,native",
-    flavors: list[Flavor] | None = None,
-    extra_args: list[str] | None = None,
-) -> tuple[list[str], dict]:
-    """Return (cmd, env) to run pretrain_mamba.py on a compute node.
-
-    use_torchrun=True  — devbox multi-GPU; torchrun spawns one process per GPU.
-    use_torchrun=False — in-srun; srun already placed one process per GPU.
-    """
-    run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
-    ckpt_dir = run_dir / "checkpoints"
-    tb_dir = run_dir / "tensorboard"
-    datacache = run_dir / "data-cache"
-    triton_dir = run_dir / "triton-cache"
-    for d in [ckpt_dir, tb_dir, datacache, triton_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    opts = _pretrain_cli_args(
-        PretrainRunConfig(
-            nodes=nodes,
-            gpus_per_node=gpus_per_node,
-            ckpt_dir=ckpt_dir,
-            tb_dir=tb_dir,
-            datacache_dir=datacache,
-            ckpt_provider=ckpt_provider,
-        ),
-    )
-    recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
-    _apply_flavors(recipe, flavors or [])
-    opts = recipe.opts
-
-    env = os.environ.copy()
-    env.update(recipe.env)
-
-    if use_torchrun:
-        launcher = ["torchrun", "--nproc_per_node", str(gpus_per_node)]
-    else:
-        # In-srun: set PyTorch distributed env vars from SLURM.
-        # Port is derived from SLURM_JOB_ID so concurrent jobs don't collide.
-        slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0"))
-        master_port = 20000 + (slurm_job_id % 40000)
-        try:
-            master_addr = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_NODELIST"]], text=True).split()[0]  # noqa: S607
-        except (subprocess.CalledProcessError, OSError, KeyError, IndexError):
-            master_addr = "localhost"
-        env.update(
-            {
-                "RANK": os.environ.get("SLURM_PROCID", "0"),
-                "LOCAL_RANK": os.environ.get("SLURM_LOCALID", "0"),
-                "WORLD_SIZE": os.environ.get("SLURM_NTASKS", "1"),
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": str(master_port),
-            },
-        )
-        launcher = ["python3", "-u"]
-
-    return [*launcher, str(MEGATRON_ROOT / "pretrain_mamba.py"), *opts, *(extra_args or [])], env
+def _flatten_cli(config: dict) -> list[str]:
+    """Flatten a {flag: value} mapping into CLI tokens: ``True`` -> ``--flag``, a list ->
+    ``--flag v1 v2``, ``False``/``None`` drops the flag, anything else -> ``--flag value``."""
+    out: list[str] = []
+    for key, val in config.items():
+        if val is True:
+            out.append(f"--{key}")
+        elif val is False or val is None:
+            continue
+        elif isinstance(val, list):
+            out.append(f"--{key}")
+            out.extend(str(v) for v in val)
+        else:
+            out.extend([f"--{key}", str(val)])
+    return out
 
 
 @dataclass
 class PretrainRunConfig:
     nodes: int
     gpus_per_node: int
-    ckpt_dir: Path
+    ckpt_dir: Path  # --save target
     tb_dir: Path
     datacache_dir: Path
     save_interval: int = 250
     num_checkpoints: int = 3
+    train_iters: int | None = None  # LR-schedule horizon (lr_decay_iters defaults to it); None -> exit_interval
     ckpt_provider: str = "nvrx,native"
+    phase: int = 2
+    load_dir: Path | None = None  # --load source; None starts from random init
+    synchronous_save: bool = False  # phase 1: stock torch_dist save (no server, durable on exit)
 
     @property
     def scale(self) -> str:
         return f"{self.nodes}x{self.gpus_per_node}"
-
-
-def _pretrain_cli_args(config: PretrainRunConfig) -> list[str]:
-    ckpt_dir, tb_dir, datacache_dir = config.ckpt_dir, config.tb_dir, config.datacache_dir
-    nodes, gpus_per_node = config.nodes, config.gpus_per_node
-    save_interval, num_checkpoints = config.save_interval, config.num_checkpoints
-    scale = config.scale
-    seq_len = 1024
-
-    exit_interval = save_interval * (num_checkpoints)
-
-    if scale == "16node":
-        gbs = 3072
-        model = [
-            "--num-layers",
-            "44",
-            "--hidden-size",
-            "4096",
-            "--num-attention-heads",
-            "32",
-            "--ffn-hidden-size",
-            "2688",
-            "--kv-channels",
-            "128",
-            "--mamba-num-heads",
-            "128",
-            "--hybrid-override-pattern",
-            "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEME",
-            "--num-experts",
-            "512",
-            "--moe-router-topk",
-            "22",
-            "--moe-shared-expert-intermediate-size",
-            "5376",
-            "--moe-latent-size",
-            "1024",
-            "--num-layers-at-start-in-bf16",
-            "0",
-            "--num-layers-at-end-in-bf16",
-            "14",
-        ]
-        parallel = [
-            "--tensor-model-parallel-size",
-            "2",
-            "--expert-model-parallel-size",
-            "64",
-            "--expert-tensor-parallel-size",
-            "1",
-            "--pipeline-model-parallel-size",
-            "1",
-        ]
-    else:
-        gbs = nodes * gpus_per_node
-        tp = ep = gpus_per_node
-        model = [
-            "--num-layers",
-            "3",
-            "--hidden-size",
-            "2048",
-            "--num-attention-heads",
-            "32",
-            "--ffn-hidden-size",
-            "1344",
-            "--kv-channels",
-            "128",
-            "--mamba-num-heads",
-            "64",
-            "--hybrid-override-pattern",
-            "M*E",
-            "--num-experts",
-            "32",
-            "--moe-router-topk",
-            "11",
-            "--moe-shared-expert-intermediate-size",
-            "2688",
-            "--moe-latent-size",
-            "1024",
-            "--num-layers-at-start-in-bf16",
-            "0",
-            "--num-layers-at-end-in-bf16",
-            "2",
-        ]
-        parallel = [
-            "--tensor-model-parallel-size",
-            str(tp),
-            "--expert-model-parallel-size",
-            str(ep),
-            "--expert-tensor-parallel-size",
-            "1",
-            "--pipeline-model-parallel-size",
-            "1",
-        ]
-
-    return [
-        # MTP
-        "--mtp-num-layers",
-        "2",
-        "--mtp-hybrid-override-pattern",
-        "*E",
-        "--calculate-per-token-loss",
-        "--mtp-loss-scaling-factor",
-        "0.3",
-        # Architecture
-        "--is-hybrid-model",
-        "--first-last-layers-bf16",
-        "--untie-embeddings-and-output-weights",
-        "--init-method-std",
-        "0.014",
-        "--position-embedding-type",
-        "none",
-        "--bf16",
-        "--use-mcore-models",
-        "--spec",
-        "megatron.core.models.mamba.mamba_layer_specs",
-        "mamba_stack_spec",
-        *model,
-        # Parallelism
-        *parallel,
-        "--sequence-parallel",
-        "--no-gradient-accumulation-fusion",
-        "--use-distributed-optimizer",
-        "--overlap-grad-reduce",
-        "--overlap-param-gather",
-        "--override-opt_param-scheduler",
-        # MoE
-        "--moe-token-dispatcher-type",
-        "alltoall",
-        "--moe-router-score-function",
-        "sigmoid",
-        "--moe-grouped-gemm",
-        "--moe-aux-loss-coeff",
-        "1e-4",
-        "--moe-router-topk-scaling-factor",
-        "5.0",
-        "--moe-router-enable-expert-bias",
-        "--moe-router-dtype",
-        "fp32",
-        "--moe-router-load-balancing-type",
-        "seq_aux_loss",
-        "--moe-permute-fusion",
-        # Fused ops / attention (fast path). The deterministic flavor swaps these
-        # for reproducible kernels: flash attention and cross-entropy fusion both
-        # do atomic adds with run-to-run float reordering, which megatron refuses
-        # to combine with --deterministic-mode (arguments.py ~L1428).
-        "--attention-backend",
-        "flash",
-        "--cross-entropy-loss-fusion",
-        "--cross-entropy-fusion-impl",
-        "native",
-        "--use-fused-weighted-squared-relu",
-        "--squared-relu",
-        "--te-rng-tracker",
-        "--ddp-num-buckets",
-        "10",
-        # Checkpoint
-        f"--ckpt-provider={config.ckpt_provider}",
-        "--ckpt-format",
-        "torch_dist",
-        "--ckpt-assume-constant-structure",
-        "--async-save",
-        "--use-persistent-ckpt-worker",
-        "--save",
-        str(ckpt_dir),
-        "--load",
-        str(ckpt_dir),
-        "--save-interval",
-        str(save_interval),
-        "--save-retain-interval",
-        str(save_interval),
-        # Data — NullTokenizer requires no vocab file; vocab_size matches the production tokenizer
-        "--mock-data",
-        "--data-cache-path",
-        str(datacache_dir),
-        "--tokenizer-type",
-        "NullTokenizer",
-        "--vocab-size",
-        "256000",
-        # Schedule
-        "--seq-length",
-        str(seq_len),
-        "--max-position-embeddings",
-        str(seq_len),
-        "--lr-wsd-decay-style",
-        "minus_sqrt",
-        # Optimizer
-        "--micro-batch-size",
-        "1",
-        "--global-batch-size",
-        str(gbs),
-        "--lr",
-        "4.5e-4",
-        "--min-lr",
-        "4.5e-6",
-        "--weight-decay",
-        "0.1",
-        "--clip-grad",
-        "1.0",
-        "--adam-beta1",
-        "0.9",
-        "--adam-beta2",
-        "0.95",
-        # Regularization
-        "--attention-dropout",
-        "0.0",
-        "--hidden-dropout",
-        "0.0",
-        "--disable-bias-linear",
-        "--normalization",
-        "RMSNorm",
-        # Logging
-        "--log-interval",
-        str(save_interval),
-        "--log-params-norm",
-        "--log-num-zeros-in-grad",
-        "--log-throughput",
-        "--log-progress",
-        "--logging-level",
-        "20",
-        "--disable-straggler-on-startup",
-        "--straggler-minmax-count",
-        "16",
-        "--timing-log-option",
-        "minmax",
-        # Misc
-        "--eval-interval",
-        str(exit_interval),
-        "--eval-iters",
-        "14",
-        "--no-mmap-bin-files",
-        "--no-create-attention-mask-in-dataloader",
-        "--distributed-timeout-minutes",
-        "30",
-        "--num-workers",
-        "1",
-        "--disable-gloo-process-groups",
-        "--exit-interval",
-        str(exit_interval),
-        "--train-iters",
-        str(exit_interval),
-        "--tensorboard-dir",
-        str(tb_dir),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1373,404 +818,31 @@ def _pretrain_cli_args(config: PretrainRunConfig) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _launch_pretrain_inline(ctx: RunCtx) -> None:
-    """Run pretrain in-process (no subprocess/torchrun) for single-GPU devbox runs.
-
-    Output is tee'd to ctx.log_file so the perf epilog can parse it; run_pretrain
-    runs spin-down + epilogs via _flavored_run afterwards.
-    """
-    args, cfg = ctx.args, ctx.cfg
-    nodes, gpus_per_node = args.nodes, args.gpus_per_node
-    run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
-    ckpt_dir = run_dir / "checkpoints"
-    tb_dir = run_dir / "tensorboard"
-    datacache = run_dir / "data-cache"
-    triton_dir = run_dir / "triton-cache"
-    for d in [ckpt_dir, tb_dir, datacache, triton_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    opts = _pretrain_cli_args(
-        PretrainRunConfig(
-            nodes=nodes,
-            gpus_per_node=gpus_per_node,
-            ckpt_dir=ckpt_dir,
-            tb_dir=tb_dir,
-            datacache_dir=datacache,
-            save_interval=1,
-            num_checkpoints=2,
-            ckpt_provider=ctx.provider,
-        ),
-    )
-    recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
-    _apply_flavors(recipe, args.flavors)
-    opts = [*recipe.opts, *(getattr(args, "extra_args", None) or [])]
-    # Applied before _call_pretrain_inline imports the model: MAMBA_DETERMINISTIC
-    # (under the deterministic flavor) is read at import time.
-    os.environ.update(recipe.env)
-
-    if args.skip_perf:
-        ctx.log_file = None  # nothing for the perf epilog to parse
-        _call_pretrain_inline(opts, nodes, gpus_per_node)
-        return
-
-    class _Tee:
-        def __init__(self, stream: IO[str], logfp: IO[str]) -> None:
-            self._stream, self._logfp = stream, logfp
-
-        def write(self, data: str) -> int:
-            self._stream.write(data)
-            self._logfp.write(data)
-            return len(data)
-
-        def flush(self) -> None:
-            self._stream.flush()
-            self._logfp.flush()
-
-        def fileno(self) -> int:
-            return self._stream.fileno()
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._stream, name)
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with ctx.log_file.open("w") as log_fp:
-        saved_stdout, saved_stderr = sys.stdout, sys.stderr
-        sys.stdout = _Tee(saved_stdout, log_fp)
-        sys.stderr = _Tee(saved_stderr, log_fp)
-        try:
-            _call_pretrain_inline(opts, nodes, gpus_per_node)
-        except SystemExit as e:
-            rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-            if rc != 0:
-                raise RuntimeError(f"pretrain exited with code {rc} — full log: {ctx.log_file}") from None
-        finally:
-            sys.stdout, sys.stderr = saved_stdout, saved_stderr
-
-
-def _call_pretrain_inline(opts: list[str], nodes: int, gpus_per_node: int) -> None:
-    """Set sys.argv and call pretrain() directly.
-
-    gpus_per_node==1: runs in the calling process (debugger-friendly).
-    gpus_per_node>1:  uses torch.multiprocessing.spawn.
-    """
-    import time  # noqa: PLC0415
-
-    if str(MEGATRON_ROOT) not in sys.path:
-        sys.path.insert(0, str(MEGATRON_ROOT))
-
-    program_start = time.time()
-
-    if "MASTER_PORT" not in os.environ:
-        import socket as _socket  # noqa: PLC0415
-
-        with _socket.socket() as _s:
-            _s.bind(("", 0))
-            os.environ["MASTER_PORT"] = str(_s.getsockname()[1])
-
-    if gpus_per_node == 1:
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-        # Force num-workers=0 so DataLoader runs in-process with no subprocess spawning.
-        clean = []
-        skip = False
-        for tok in opts:
-            if skip:
-                skip = False
-                continue
-            if tok == "--num-workers":
-                skip = True
-                continue
-            clean.append(tok)
-        opts = [*clean, "--num-workers", "0"]
-        sys.argv = ["pretrain_mamba.py", *opts]
-        _pretrain_main(program_start)
-    else:
-        import torch.multiprocessing as mp  # noqa: PLC0415
-
-        mp.spawn(
-            _pretrain_worker,
-            args=(gpus_per_node, nodes, opts, program_start),
-            nprocs=gpus_per_node,
-            join=True,
-        )
-
-
-def _pretrain_worker(local_rank: int, gpus_per_node: int, nodes: int, opts: list[str], program_start: float) -> None:
-    """Entry point for each torch.multiprocessing.spawn worker (multi-GPU inline)."""
-    os.environ["RANK"] = str(local_rank)  # single-node: global rank == local rank
-    os.environ["LOCAL_RANK"] = str(local_rank)
-    os.environ["WORLD_SIZE"] = str(nodes * gpus_per_node)
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29500")
-    sys.argv = ["pretrain_mamba.py", *opts]
-    _pretrain_main(program_start)
-
-
-def _pretrain_main(program_start: float) -> None:
-    """Mirror of pretrain_hybrid.py's __main__ block — calls pretrain() directly."""
-    import time  # noqa: PLC0415
-    from functools import partial  # noqa: PLC0415
-
-    from megatron.core.enums import ModelType  # noqa: PLC0415
-    from megatron.training import inprocess_restart, pretrain, set_startup_timestamps  # noqa: PLC0415
-    from megatron.training.argument_utils import (  # noqa: PLC0415
-        hybrid_config_from_args,
-        pretrain_cfg_container_from_args,
-    )
-    from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415
-
-    try:
-        from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415
-
-        has_modelopt = True
-    except ImportError:
-        has_modelopt = False
-
-    import pretrain_hybrid as ph  # noqa: PLC0415
-    from hybrid_builders import hybrid_builder  # noqa: PLC0415
-    from model_provider import model_provider as _mp  # noqa: PLC0415
-
-    set_startup_timestamps(program_start=program_start, main_entry=time.time())
-
-    ph.train_valid_test_datasets_provider.is_distributed = True
-
-    pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
-
-    args = parse_and_validate_args(
-        extra_args_provider=add_modelopt_args if has_modelopt else None,
-        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
-    )
-    model_cfg = hybrid_config_from_args(args)
-    full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    pretrain_fn(
-        full_config,
-        ph.train_valid_test_datasets_provider,
-        partial(_mp, hybrid_builder),
-        ModelType.encoder_or_decoder,
-        ph.forward_step,
-        store=store,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Launch + perf post-processing
 # ---------------------------------------------------------------------------
 
 
-def _tee_run(cmd: list[str], log_file: Path, env: dict | None = None) -> int:
+def _tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: bool = False) -> int:
     """Run cmd, tee combined stdout/stderr to log_file, return the exit code.
 
-    Raises on any code other than 0 or 3 (3 = soft fail bubbled up by an in-srun
-    epilog, e.g. an nvrx baseline mismatch).
+    append=True keeps prior content (tee -a) so a two-phase run's phase-1 and
+    phase-2 output both land in one log. Raises on any code other than 0 or 3
+    (3 = soft fail bubbled up by an in-srun epilog, e.g. an nvrx baseline mismatch).
     """
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    sys.stderr.write(f"[run_job] Running: {' '.join(shlex.quote(c) for c in cmd)}\n")
+    logger.info(f"[run_job] Running: {' '.join(shlex.quote(c) for c in cmd)}")
     # srun+enroot doesn't forward container stdout through a PIPE, so tee via shell.
-    shell_cmd = f"set -o pipefail; {' '.join(shlex.quote(c) for c in cmd)} 2>&1 | tee {shlex.quote(str(log_file))}"
+    tee_flag = "-a " if append else ""
+    shell_cmd = f"set -o pipefail; {' '.join(shlex.quote(c) for c in cmd)} 2>&1 | tee {tee_flag}{shlex.quote(str(log_file))}"
     rc = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", env=env, check=False).returncode  # noqa: S602
     if rc not in (0, 3):
         raise RuntimeError(f"Job failed with exit code {rc} — full log: {log_file}")
     return rc
 
 
-def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.Namespace, env: dict | None = None) -> None:
-    """Tee a non-pretrain job (ckptbench), parse its perf metrics, gate on the baseline."""
-    stem = _artifact_stem(_platform_tag(), job, args.flavor_tag, config)
-    log_file = RESULTS_DIR / f"{stem}.log"
-    if args.skip_perf:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        rc = subprocess.run(cmd, env=env, check=False).returncode
-        if rc != 0:
-            raise RuntimeError(f"Job failed with exit code {rc}")
-        return
-    rc = _tee_run(cmd, log_file, env)
-    passed = _parse_and_report(
-        job,
-        config,
-        args.flavor_tag,
-        log_file,
-        BASELINES_DIR / f"{stem}.yaml",
-        RESULTS_DIR / f"{stem}_report.json",
-        args.update_baseline,
-        args.gpus_per_node,
-    )
-    if not passed or rc == _SOFT_FAIL_RC:
-        sys.exit(_SOFT_FAIL_RC)
-
-
 def _md5(path: Path) -> str:
     return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324 — integrity check, not security
-
-
-def _run_pretrain_determinism_check(args: argparse.Namespace, cfg: str) -> None:  # noqa: C901, PLR0912, PLR0915 — sequential orchestration (run1 → save → wipe → run2 → diff)
-    """Run pretrain twice via srun and verify the two runs produce bit-identical
-    checkpoints — both the per-tensor trace (reference.metadata.info) and the
-    non-tensor state (common.pt).
-
-    This is the primary gate for pretrain-nvrx under --deterministic-mode: if
-    every kernel honours determinism, two back-to-back runs of identical training
-    code on identical hardware must produce identical checkpoint bytes at every
-    save iter. Any cross-run diff means residual non-determinism is leaking
-    through (custom kernels that bypass torch.use_deterministic_algorithms,
-    asynchronous reduction ordering, etc.). The reverse — pass — is a strong
-    foundation for the cross-provider check in pretrain-native.
-
-    Each srun reuses the existing in-srun flow (training + distcp_trace +
-    metadata/ baseline compare). The in-srun's metadata/-baseline compare may
-    soft-fail with exit 3 when the seeded baseline drifts; that's tolerated
-    here because the cross-run check is the real gate.
-
-    Layout (run-1 stashed in the sidecar, run-2 left in place):
-      ci-runs/<cfg>/checkpoints/iter_NNNNNNN/{reference.metadata.info,common.pt}      (run-2)
-      ci-runs/<cfg>/run1-references/iter_NNNNNNN/{reference.metadata.info,common.pt}  (run-1)
-    """
-    extra_args = getattr(args, "extra_args", None)
-    ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
-    sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
-    machine = _platform_tag()
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = _build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
-    stem = _artifact_stem(machine, args.job, args.flavor_tag, cfg)
-
-    for label, path in (("checkpoints", ckpt_dir), ("run-1 sidecar", sidecar_dir)):
-        if path.exists():
-            sys.stderr.write(f"[run_job] determinism: clearing prior {label} at {path}\n")
-            shutil.rmtree(path)
-
-    def _run(log_file: Path, banner: str) -> None:
-        sys.stderr.write(f"[run_job] {banner}: {' '.join(shlex.quote(c) for c in cmd)}\n")
-        shell_cmd = f"set -o pipefail; {' '.join(shlex.quote(c) for c in cmd)} 2>&1 | tee {shlex.quote(str(log_file))}"
-        rc = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", check=False).returncode  # noqa: S602
-        # rc == 3 → in-srun's lenient nvrx metadata-baseline compare flagged a
-        # diff vs metadata/. Tolerated; the cross-run compare below gates the job.
-        if rc not in (0, 3):
-            raise RuntimeError(f"{banner} failed with exit code {rc} — full log: {log_file}")
-        if rc == 3:  # noqa: PLR2004
-            sys.stderr.write(f"[run_job] {banner}: soft-failed vs metadata/ baseline (rc=3); continuing to cross-run compare\n")
-
-    def _collect_iter_refs(root: Path, label: str) -> list[Path]:
-        iter_dirs = sorted(root.glob("iter_*"))
-        if not iter_dirs:
-            raise RuntimeError(f"determinism: {label} produced no iter_* under {root}")
-        return iter_dirs
-
-    # --- Run 1: stash the per-tensor trace and the non-tensor state (common.pt) ---
-    _run(RESULTS_DIR / f"{stem}_run1.log", "determinism: run 1/2")
-    for iter_dir in _collect_iter_refs(ckpt_dir, "run 1/2"):
-        dst_dir = sidecar_dir / iter_dir.name
-        dst_dir.mkdir(parents=True)
-        for name in ("reference.metadata.info", "common.pt"):
-            src = iter_dir / name
-            if not src.is_file():
-                raise RuntimeError(f"determinism: run 1/2 produced no {name} at {src}")
-            shutil.copy2(src, dst_dir / name)
-    sys.stderr.write(f"[run_job] determinism: saved run-1 references under {sidecar_dir}\n")
-
-    # Wipe so run-2 starts from a clean state (otherwise --load picks up run-1's
-    # iter_NNNNNNN and shortcuts the training).
-    shutil.rmtree(ckpt_dir)
-
-    # --- Run 2 ---
-    _run(RESULTS_DIR / f"{stem}_run2.log", "determinism: run 2/2")
-
-    # --- Cross-run diff: per-tensor trace (text) + common.pt (binary md5) ---
-    failures: list[str] = []
-    iter_dirs = _collect_iter_refs(ckpt_dir, "run 2/2")
-    for iter_dir in iter_dirs:
-        ref1, ref2 = sidecar_dir / iter_dir.name / "reference.metadata.info", iter_dir / "reference.metadata.info"
-        if not ref2.is_file():
-            raise RuntimeError(f"determinism: missing run-2 reference at {ref2}")
-        diff = list(
-            difflib.unified_diff(
-                ref1.read_text().splitlines(),
-                ref2.read_text().splitlines(),
-                fromfile=str(ref1),
-                tofile=str(ref2),
-                n=1,
-            ),
-        )
-        if diff:
-            sys.stderr.write(f"[run_job] determinism FAIL on {iter_dir.name}: reference.metadata.info differs ({len(diff)} diff lines)\n")
-            for line in diff[:30]:
-                sys.stderr.write(line.rstrip("\n") + "\n")
-            if len(diff) > 30:  # noqa: PLR2004
-                sys.stderr.write(f"... ({len(diff) - 30} more diff lines suppressed; full files in artifacts)\n")
-            failures.append(f"{iter_dir.name}/reference.metadata.info")
-
-        common2 = iter_dir / "common.pt"
-        if not common2.is_file():
-            raise RuntimeError(f"determinism: missing run-2 common.pt at {common2}")
-        if _md5(sidecar_dir / iter_dir.name / "common.pt") != _md5(common2):
-            sys.stderr.write(f"[run_job] determinism FAIL on {iter_dir.name}: common.pt md5 differs between the two runs\n")
-            failures.append(f"{iter_dir.name}/common.pt")
-
-    if failures:
-        raise RuntimeError(
-            f"determinism check FAILED on {len(failures)} artifact(s): {', '.join(failures)}. "
-            f"Training is not bit-deterministic across runs even under --deterministic-mode — "
-            f"see the diff snippets above and the per-iter artifacts.",
-        )
-    sys.stderr.write(f"[run_job] determinism PASS: {len(iter_dirs)} iter(s) bit-identical (tensors + common.pt) across two nvrx runs\n")
-
-
-def _parse_and_report(  # noqa: PLR0913
-    job: str,
-    config: str,
-    flavor_tag: str,
-    log_file: Path,
-    baseline_file: Path,
-    report_file: Path,
-    update_baseline: bool,
-    gpus_per_node: int,
-) -> bool:
-    """Parse perf metrics from log_file, compare to baseline, write report. Returns True if passed."""
-    log_text = log_file.read_text(errors="replace")
-
-    ckpt_lines = [ln for ln in log_text.splitlines() if "save-checkpoint" in ln]
-    if ckpt_lines:
-        sys.stderr.write("--- save-checkpoint times ---\n")
-        for ln in ckpt_lines:
-            sys.stderr.write(ln + "\n")
-        sys.stderr.write("-----------------------------\n")
-
-    metrics = _parse_metrics(log_text, job)
-
-    if not metrics:
-        if job == "pretrain-nvrx":
-            # nvrx provider doesn't emit parseable metrics; times printed above.
-            return True
-        if in_srun():
-            raise RuntimeError(f"no perf metrics found in {log_file}")
-
-    if update_baseline:
-        _update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
-        return True
-
-    baseline = {}
-    if baseline_file.exists():
-        with baseline_file.open() as f:
-            baseline = yaml.safe_load(f)
-
-    comparison, passed = _compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
-    _print_perf_summary(comparison, passed)
-
-    report = {
-        "job": job,
-        "config": config,
-        "flavor_tag": flavor_tag,
-        "gpus_per_node": gpus_per_node,
-        "log": str(log_file),
-        "baseline": str(baseline_file),
-        "passed": passed,
-        "metrics": {k: {kk: vv for kk, vv in v.items() if kk != "samples"} for k, v in metrics.items()},
-        "comparison": comparison,
-    }
-    with report_file.open("w") as f:
-        json.dump(report, f, indent=2)
-    return passed
 
 
 # ---------------------------------------------------------------------------
@@ -1783,34 +855,12 @@ _RE_NATIVE_BW = re.compile(
     re.DOTALL,
 )
 
+# Rank-0 peak GPU / peak CPU RSS, printed once at process exit by the training entry.
+_RE_NATIVE_MEM = re.compile(r"\[native_ckpt:mem\] gpu_peak_bytes=(\d+) cpu_rss_bytes=(\d+)")
 
-def _make_metric(samples: list, unit: str, higher_is_better: bool | None) -> dict:
-    return {
-        "samples": samples,
-        "mean": statistics.mean(samples),
-        "median": statistics.median(samples),
-        "min": min(samples),
-        "max": max(samples),
-        "unit": unit,
-        "higher_is_better": higher_is_better,
-    }
-
-
-def _parse_metrics(log_text: str, _job: str) -> dict:
-    """Parse all perf metrics for the given job type from log_text."""
-    result = {}
-
-    bw_matches = list(_RE_NATIVE_BW.finditer(log_text))
-    if bw_matches:
-        result.update(
-            {
-                "bw_mbps": _make_metric([float(m.group(1)) for m in bw_matches], "MB/s", higher_is_better=True),
-                "wr_tnsr_us": _make_metric([int(m.group(2)) for m in bw_matches], "us", higher_is_better=False),
-                "total_written_bytes": _make_metric([int(m.group(3)) for m in bw_matches], "B", None),
-            },
-        )
-
-    return result
+# Banner pretrain_hybrid.py prints once per phase; the parser scopes metrics to
+# the phase-2 (load-from-checkpoint) section so phase-1 warmup samples don't count.
+_PHASE2_MARKER = "[native_ckpt:phase] phase=2"
 
 
 # ---------------------------------------------------------------------------
@@ -1818,471 +868,1375 @@ def _parse_metrics(log_text: str, _job: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _compare_to_baseline(metrics: dict, baseline: dict, default_tolerance: float) -> tuple[dict, bool]:
-    baseline_metrics = baseline.get("metrics", {})
-    results = {}
-    all_passed = True
-
-    for metric_name, measured in metrics.items():
-        higher_is_better = measured.get("higher_is_better")
-        measured_val = measured.get("mean")
-        if measured_val is None:
-            continue
-        if metric_name in baseline_metrics:
-            baseline_val = baseline_metrics[metric_name]
-            tolerances = baseline.get("tolerances") or {}
-            # Info-only metrics (no direction) must match exactly; directional perf metrics use default_tolerance.
-            tol = tolerances.get(metric_name, 0.0 if higher_is_better is None else default_tolerance)
-            lo = baseline_val * (1.0 - tol)
-            hi = baseline_val * (1.0 + tol)
-            passed = lo <= measured_val <= hi
-            pct_change = (measured_val - baseline_val) / baseline_val * 100 if baseline_val else 0.0
-            if not passed:
-                all_passed = False
-            results[metric_name] = {
-                "status": "PASS" if passed else "FAIL",
-                "measured": measured_val,
-                "baseline": baseline_val,
-                "lo": lo,
-                "hi": hi,
-                "pct_change": round(pct_change, 2),
-                "tolerance_pct": round(tol * 100, 1),
-                "unit": measured.get("unit", ""),
-                "higher_is_better": higher_is_better,
-                "min": measured.get("min"),
-                "max": measured.get("max"),
-                "median": measured.get("median"),
-                "n_samples": len(measured.get("samples", [])),
-            }
-        elif higher_is_better is None:
-            results[metric_name] = {"status": "info", "measured": measured_val}
-        else:
-            results[metric_name] = {
-                "status": "no_baseline",
-                "measured": measured_val,
-                "unit": measured.get("unit", ""),
-                "higher_is_better": higher_is_better,
-                "min": measured.get("min"),
-                "max": measured.get("max"),
-                "median": measured.get("median"),
-                "n_samples": len(measured.get("samples", [])),
-            }
-    return results, all_passed
-
-
-def _print_perf_summary(comparison: dict, passed: bool) -> None:
-    sys.stderr.write("\n" + "=" * 70 + "\n")
-    sys.stderr.write(" Performance Results\n")
-    sys.stderr.write("=" * 70 + "\n")
-    for name, data in comparison.items():
-        status = data.get("status", "?")
-        measured = data.get("measured")
-        baseline = data.get("baseline")
-        unit = data.get("unit", "")
-        pct = data.get("pct_change")
-        if status == "info":
-            sys.stderr.write(f"  {name}: {measured:.4f} {unit}  [informational]\n")
-        elif status == "no_baseline":
-            sys.stderr.write(f"  {name}: {measured:.4f} {unit}  [no baseline]\n")
-        elif status in ("PASS", "FAIL"):
-            sign = "+" if pct and pct >= 0 else ""
-            pct_str = f"{sign}{pct:.1f}%" if pct is not None else "N/A"
-            tol = data.get("tolerance_pct", "?")
-            samples = data.get("n_samples", "?")
-            sys.stderr.write(
-                f"  [{status}] {name}: {measured:.4f} {unit}  (baseline={baseline:.4f}, Δ={pct_str}, tol=±{tol}%, n={samples})\n",
-            )
-    sys.stderr.write("=" * 70 + "\n")
-    sys.stderr.write(f" Overall: {'PASS' if passed else 'FAIL'}\n")
-    sys.stderr.write("=" * 70 + "\n\n")
-
-
-def _baseline_run_cmds(job: str, config: str, flavor_tag: str, gpus_per_node: int) -> tuple[str, str]:
-    script = "python3 megatron/native/ci/scripts/run_job.py"
-    gflag = f"--gpus-per-node {gpus_per_node}"
-    flavor_flags = "".join(f" --flavor {f}" for f in flavor_tag.split("-") if f)
-    if job == "ckptbench":
-        flags = f"ckptbench --slurm {gflag}"
-    elif config.startswith("16"):
-        flags = f"{job} --nodes 16 {gflag}{flavor_flags}"
-    else:
-        flags = f"{job} --slurm {gflag}{flavor_flags}"
-    return f"{script} {flags}", f"{script} {flags} --update-baseline"
-
-
-def _round_to_sig_figs(value: float, sig_figs: int) -> float:
-    """Round so only the leftmost `sig_figs` digits are non-zero (e.g. 5742.485 -> 5700.0)."""
-    if value == 0 or not math.isfinite(value):
-        return float(value)
-    magnitude = math.floor(math.log10(abs(value)))
-    return round(value, sig_figs - 1 - magnitude)
-
-
-def _round_for_baseline(mean: float, tolerance: float, higher_is_better: bool | None) -> float | int:
-    """Round a measured mean to the precision implied by its tolerance.
-
-    5% (the default for perf metrics) → 2 sig figs so values are easy to read at a glance.
-    Exact match (tolerance==0, e.g. info metrics like total_written_bytes) → preserve as int.
-    Custom tolerances → 6 decimals, since the user picked a non-default precision deliberately.
-    """
-    if tolerance == 0.0:
-        return int(mean) if mean == int(mean) else round(mean, 6)
-    if tolerance == PERF_TOLERANCE:
-        rounded = _round_to_sig_figs(mean, 2)
-        # Info-only metrics that landed in the perf-default branch (no old baseline) still
-        # serialize cleanly as int when the rounded value is integral.
-        if higher_is_better is None and rounded == int(rounded):
-            return int(rounded)
-        return rounded
-    return round(mean, 6)
-
-
-def _update_baseline_file(baseline_file: Path, metrics: dict, job: str, config: str, flavor_tag: str, gpus_per_node: int) -> None:  # noqa: PLR0913
-    if baseline_file.exists():
-        with baseline_file.open() as f:
-            baseline = yaml.safe_load(f)
-    else:
-        run_cmd, update_cmd = _baseline_run_cmds(job, config, flavor_tag, gpus_per_node)
-        baseline = {
-            "description": "auto-generated by CI",
-            "run_cmd": run_cmd,
-            "update_cmd": update_cmd,
-            "metrics": {},
-        }
-
-    existing = baseline.setdefault("metrics", {})
-    tolerances = baseline.get("tolerances") or {}
-    changed: list[str] = []
-    for name, data in metrics.items():
-        mean = data.get("mean")
-        if mean is None:
-            continue
-        old_val = existing.get(name)
-        higher_is_better = data.get("higher_is_better")
-        # Effective tolerance mirrors _compare_to_baseline; for new metrics (no old_val) we
-        # fall back to higher_is_better since type-of-baseline isn't available yet.
-        if name in tolerances:
-            tol = tolerances[name]
-        elif old_val is not None:
-            tol = 0.0 if isinstance(old_val, int) else PERF_TOLERANCE
-        else:
-            tol = 0.0 if higher_is_better is None else PERF_TOLERANCE
-
-        new_val = _round_for_baseline(mean, tol, higher_is_better)
-        if old_val is None or abs(new_val - old_val) / max(abs(old_val), 1e-9) > _BASELINE_CHANGE_THRESHOLD:
-            existing[name] = new_val
-            changed.append(f"  {name}: {old_val} -> {new_val}")
-
-    if not changed:
-        return
-
-    for _line in changed:
-        pass
-    baseline_file.parent.mkdir(parents=True, exist_ok=True)
-    with baseline_file.open("w") as f:
-        yaml.dump(baseline, f, default_flow_style=False, sort_keys=False)
-
-
 # ---------------------------------------------------------------------------
 # Baseline aggregation (update stage — no re-run)
 # ---------------------------------------------------------------------------
 
 
-def _parse_job_filter(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
-    """Return (filter_job, filter_config, filter_flavor) from --filter or CI_JOB_NAME.
+class CheckpointServer:
+    @staticmethod
+    def _ensure_server_down(ctx: RunCtx, *, wait_flush: bool = True, fail_on_timeout: bool = True) -> None:
+        """Spin the native checkpoint_server down via its /api/stop endpoint.
 
-    --filter format:   <job>[:<config>[:<flavor>]]
-    CI_JOB_NAME format: <platform>:<job>[:<config>[:<flavor>]][:update_baselines]
-      gb200:ckptbench:update_baselines                  → (ckptbench, None, None)
-      gb200:pretrain-native:1x4:deterministic:update_baselines → (pretrain-native, 1x4, deterministic)
-    """
-    if args.filter:
-        job_name, *rest = args.filter.split(":")
-        return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+        On the success path (wait_flush + fail_on_timeout): wait for the async writes to flush,
+        request the stop, and fail with a thread dump if it doesn't free the port. On a crash
+        path both are False — stop best-effort without masking the original error. No-op
+        off-worker, for nvrx (no server), and for valgrind (its prolog owns the server).
+        """
+        if not ctx.is_worker or ctx.provider != "native" or ctx.has("valgrind"):
+            return
+        if wait_flush:
+            try:
+                BaselineUpdater._wait_for_native_metadata_files(ctx.cfg, timeout_seconds=1800)
+            except TimeoutError as ex:
+                logger.info(f"[run_job] wait for native artifacts timed out: {ex}")
+        if not CheckpointServer._stop_checkpoint_server() and fail_on_timeout:
+            CheckpointServer._dump_server_threads()
+            raise RuntimeError("checkpoint_server did not spin down after a clean-stop request — see the thread dump above")
 
-    ci_job_name = os.environ.get("CI_JOB_NAME", "")
-    if ci_job_name:
-        _, job_name, *rest = ci_job_name.removesuffix(":update_baselines").split(":")
-        return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+    @staticmethod
+    def _checkpoint_server_pids() -> list[str]:
+        """PIDs of any running checkpoint_server on this host (incl. a valgrind-wrapped one).
 
-    return None, None, None
+        Single source of truth for "is a server alive". Matches the binary on the full command
+        line (pgrep -f): the daemon's comm is truncated to 15 chars and a valgrind wrapper's comm
+        isn't 'checkpoint_server' at all. The process outlives its listening port — Server::Stop
+        closes the acceptor (freeing the port) well before it joins its threads and exits — so the
+        process, not the port, is the reliable liveness signal.
 
+        The pattern is bracketed (``[c]heckpoint_server``) so it doesn't match other ranks' own
+        concurrent ``pgrep`` commands — every rank runs this at once, and a literal pattern would
+        appear in each pgrep's cmdline and they'd all match each other.
+        """
+        try:
+            out = subprocess.run(["pgrep", "-f", "[c]heckpoint_server"], capture_output=True, text=True, check=False)  # noqa: S607
+        except OSError:
+            return []
+        return out.stdout.split()
 
-def run_update_baselines(args: argparse.Namespace) -> None:
-    """Update baseline YAMLs from *_report.json files in RESULTS_DIR without re-running jobs.
+    @staticmethod
+    def _dump_server_threads() -> None:
+        """Best-effort: dump a stack trace of every thread of any running checkpoint_server.
 
-    Job/config are auto-detected from CI_JOB_NAME; override with --filter.
-    """
-    machine = _platform_tag()
-    filter_job, filter_config, filter_flavor = _parse_job_filter(args)
+        Used when a server won't start (already running) or won't spin down, to make the stuck
+        process diagnosable rather than force-killing it. A bare `gdb -p` on a valgrind-wrapped
+        process shows valgrind's own frames, not the guest, so for those we attach through vgdb;
+        otherwise plain gdb, else the kernel per-thread stacks under /proc. Never raises —
+        diagnostics must not mask the real error.
+        """
+        pids = CheckpointServer._checkpoint_server_pids()
+        if not pids:
+            logger.info("[run_job] no checkpoint_server process found to dump")
+            return
+        gdb = shutil.which("gdb")
+        vgdb = shutil.which("vgdb")
+        for pid in pids:
+            cmdline = Path(f"/proc/{pid}/cmdline")
+            under_valgrind = cmdline.exists() and "valgrind" in cmdline.read_text(errors="replace")
+            logger.info(f"[run_job] === checkpoint_server pid {pid} thread dump{' (via vgdb)' if under_valgrind else ''} ===")
+            try:
+                if gdb and under_valgrind and vgdb:
+                    # A bare `gdb -p` on a valgrind process shows valgrind's frames, not the
+                    # guest; attach through valgrind's gdbserver to see the real server threads.
+                    bt = [gdb, "-batch", "-ex", f"target remote | {vgdb} --pid={pid}", "-ex", "thread apply all bt"]
+                    subprocess.run(bt, check=False, timeout=120)
+                elif gdb:
+                    subprocess.run([gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"], check=False, timeout=120)
+                else:
+                    for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
+                        with contextlib.suppress(OSError):
+                            logger.info(f"[run_job] thread {task.name}:\n{(task / 'stack').read_text()}")
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                logger.info(f"[run_job] thread dump for pid {pid} failed: {ex}")
 
-    # Only the perf flavor (and ckptbench) emit *_report.json; deterministic/nvrx
-    # produce no perf metrics, so skip the report-driven loop and go straight to
-    # the metadata snapshot refresh.
-    if filter_flavor != "deterministic" and filter_job != "pretrain-nvrx":
-        job_glob = filter_job or "*"
-        reports = sorted(RESULTS_DIR.glob(f"{machine}_{job_glob}_*_report.json"))
-        if not reports:
-            filter_desc = ":".join(p for p in (filter_job, filter_config, filter_flavor) if p) or "all jobs"
+    @staticmethod
+    def require_no_checkpoint_server() -> None:
+        """Fail if a checkpoint_server process is already running — a prior job's leftover.
+
+        The daemon (``server_main.cpp``) calls ``setsid()`` and survives parent death. We never
+        force-kill it (it may be mid-write or under valgrind, where a SIGKILL loses the leak
+        report); instead we dump its threads and fail loudly so it is visible. Check the process,
+        not the port: the server frees the port well before it exits, so a port check would miss a
+        still-shutting-down process that still holds its shm. With no process running, clear any
+        orphaned shm queues (``/dev/shm/checkpoint_request_*``) so the next server starts clean.
+        """
+        pids = CheckpointServer._checkpoint_server_pids()
+        if pids:
+            logger.info(f"[run_job] checkpoint_server already running (pids {', '.join(pids)})")
+            CheckpointServer._dump_server_threads()
             raise RuntimeError(
-                f"no report files found in {RESULTS_DIR} matching '{machine}_{job_glob}_*_report.json' "
-                f"(filter: {filter_desc}) — did the test stage run first?",
+                f"checkpoint_server already running (pids {', '.join(pids)}); refusing to start. "
+                f"A previous job did not spin it down — see the thread dump above and stop it before retrying.",
+            )
+        for shm in Path("/dev/shm").glob("checkpoint_request_*"):  # noqa: S108 — named shm, not a temp file
+            try:
+                shm.unlink()
+            except OSError as ex:
+                logger.info(f"[run_job] could not remove stale shm {shm}: {ex}")
+
+    @staticmethod
+    def _is_port_in_use(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def _request_server_stop() -> None:
+        """Best-effort GET /api/stop — sets the server's shutdown flag (no OS signals)."""
+        if not CheckpointServer._is_port_in_use(_CHECKPOINT_SERVER_PORT):
+            return
+        url = f"http://127.0.0.1:{_CHECKPOINT_SERVER_PORT}/api/stop"
+        try:
+            with urllib.request.urlopen(url, timeout=2.0):
+                pass
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            logger.info(f"[run_job]   /api/stop request failed: {exc}")
+
+    @staticmethod
+    def _stop_checkpoint_server(timeout: float = 30.0) -> bool:
+        """Ask the checkpoint_server to stop and wait for the PROCESS to fully exit.
+
+        Sends the server's own HTTP /api/stop (no OS signals, so it can't hit an unrelated
+        process), then polls until no checkpoint_server process remains. Waits on the process,
+        not the port: Server::Stop closes the listener — freeing the port — well before it joins
+        its threads and releases its shm, so a port check reports "stopped" while the process is
+        still alive and would strand its shm for the next job. Returns False if a process is still
+        alive after `timeout`, so the caller can dump threads and fail.
+        """
+        if not CheckpointServer._checkpoint_server_pids():
+            return True
+
+        logger.info("[run_job] checkpoint_server running; requesting graceful stop via /api/stop")
+        CheckpointServer._request_server_stop()
+
+        deadline = time.monotonic() + timeout
+        while CheckpointServer._checkpoint_server_pids() and time.monotonic() < deadline:
+            time.sleep(0.25)
+        if CheckpointServer._checkpoint_server_pids():
+            logger.info(f"[run_job]   checkpoint_server process still alive after {timeout:.0f}s")
+            return False
+        logger.info("[run_job]   checkpoint_server stopped (process exited)")
+        return True
+
+
+class PerfReport:
+    @staticmethod
+    def _report_checkpoint_times(log_text: str) -> None:
+        """Print the save-checkpoint times for each phase plus phase 2's load-checkpoint
+        time. The two-phase run concatenates both processes' stdout into one log with a
+        phase banner between them, so we split on it: phase 1 saves once (iter 100), phase
+        2 loads that checkpoint and saves the perf-measured 250/500/750 checkpoints. With
+        no banner (e.g. a single-phase inline run) everything is reported under phase 2.
+        """
+        split = log_text.rfind(_PHASE2_MARKER)
+        phase1_text, phase2_text = (log_text[:split], log_text[split:]) if split != -1 else ("", log_text)
+
+        for header, text, needle in (
+            ("phase-1 save-checkpoint times", phase1_text, "save-checkpoint"),
+            ("phase-2 save-checkpoint times", phase2_text, "save-checkpoint"),
+            ("phase-2 load-checkpoint times", phase2_text, "load-checkpoint"),
+        ):
+            lines = [ln for ln in text.splitlines() if needle in ln]
+            if not lines:
+                continue
+            logger.info(f"--- {header} ---")
+            for ln in lines:
+                logger.info(ln)
+            logger.info("-" * (len(header) + 8))
+
+    @staticmethod
+    def parse_and_report(  # noqa: PLR0913
+        job: str,
+        config: str,
+        flavor_tag: str,
+        log_file: Path,
+        baseline_file: Path,
+        report_file: Path,
+        update_baseline: bool,
+        gpus_per_node: int,
+    ) -> bool:
+        """Parse perf metrics from log_file, compare to baseline, write report. Returns True if passed."""
+        log_text = log_file.read_text(errors="replace")
+
+        PerfReport._report_checkpoint_times(log_text)
+
+        metrics = PerfReport._parse_metrics(log_text, job)
+
+        if not metrics:
+            if job == "pretrain-nvrx":
+                # nvrx provider doesn't emit parseable metrics; times printed above.
+                return True
+            if in_srun():
+                raise RuntimeError(f"no perf metrics found in {log_file}")
+
+        if update_baseline:
+            BaselineUpdater._update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+            return True
+
+        baseline = {}
+        if baseline_file.exists():
+            with baseline_file.open() as f:
+                baseline = yaml.safe_load(f)
+
+        comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
+        PerfReport._print_perf_summary(comparison, passed)
+
+        report = {
+            "job": job,
+            "config": config,
+            "flavor_tag": flavor_tag,
+            "gpus_per_node": gpus_per_node,
+            "log": str(log_file),
+            "baseline": str(baseline_file),
+            "passed": passed,
+            "metrics": {k: {kk: vv for kk, vv in v.items() if kk != "samples"} for k, v in metrics.items()},
+            "comparison": comparison,
+        }
+        with report_file.open("w") as f:
+            json.dump(report, f, indent=2)
+        return passed
+
+    @staticmethod
+    def _make_metric(samples: list, unit: str, higher_is_better: bool | None) -> dict:
+        return {
+            "samples": samples,
+            "mean": statistics.mean(samples),
+            "median": statistics.median(samples),
+            "min": min(samples),
+            "max": max(samples),
+            "unit": unit,
+            "higher_is_better": higher_is_better,
+        }
+
+    @staticmethod
+    def _parse_metrics(log_text: str, _job: str) -> dict:
+        """Parse all perf metrics for the given job type from log_text."""
+        result = {}
+
+        # Scope to phase 2 so phase-1 warmup checkpoint/memory samples never count.
+        marker = log_text.rfind(_PHASE2_MARKER)
+        if marker != -1:
+            log_text = log_text[marker:]
+
+        bw_matches = list(_RE_NATIVE_BW.finditer(log_text))
+        if bw_matches:
+            result.update(
+                {
+                    "bw_mbps": PerfReport._make_metric([float(m.group(1)) for m in bw_matches], "MB/s", higher_is_better=True),
+                    "wr_tnsr_us": PerfReport._make_metric([int(m.group(2)) for m in bw_matches], "us", higher_is_better=False),
+                    "total_written_bytes": PerfReport._make_metric([int(m.group(3)) for m in bw_matches], "B", None),
+                },
             )
 
-        for report_file in reports:
-            with report_file.open() as f:
-                report = json.load(f)
-
-            job = report.get("job")
-            config = report.get("config")
-            flavor_tag = report.get("flavor_tag", "")
-            gpus_per_node = report.get("gpus_per_node", args.gpus_per_node)
-            metrics = report.get("metrics", {})
-
-            if not job or not config or not metrics:
-                continue
-            if filter_config is not None and config != filter_config:
-                continue
-            if filter_flavor is not None and flavor_tag != filter_flavor:
-                continue
-
-            baseline_file = BASELINES_DIR / f"{_artifact_stem(machine, job, flavor_tag, config)}.yaml"
-            _update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
-
-    # The metadata md5 snapshot is only produced by deterministic runs. nvrx
-    # always runs deterministic; native does so only under the deterministic flavor.
-    flavor_is_deterministic = "deterministic" in (filter_flavor or "").split("-")
-    if filter_job == "pretrain-native" and flavor_is_deterministic:
-        _update_native_metadata_files(filter_config)
-    elif filter_job == "pretrain-nvrx":
-        _update_nvrx_baseline_files(filter_config)
-
-
-def _compare_iters_to_baseline(cfg: str, provider: str) -> None:
-    """Re-derive reference.metadata.info per iter and diff against the baseline snapshot.
-
-    For each ``ci-runs/<cfg>/checkpoints/iter_*`` directory:
-      1. Run ``distcp_trace`` (via ``scripts/metadata_compare.py``) to compute
-         per-tensor md5sums and write ``reference.metadata.info`` next to the
-         distcp shards. For provider=native this also verifies the
-         checkpoint_server's ``0.metadata.info`` claims against on-disk truth.
-      2. Diff that file against
-         ``megatron/native/metadata/<cfg>_checkpoints_iter_NNNNNNN/reference.metadata.info``
-         — the nvrx-derived baseline checked into the repo.
-
-    Provider semantics on mismatch:
-      * ``pretrain-nvrx`` (provider=nvrx, self-consistency): warn and
-        ``sys.exit(3)`` so the matching ``update-baselines`` job stays
-        triggerable. The gitlab YAML treats exit 3 as ``allow_failure``.
-      * ``pretrain-native`` (provider=native, cross-provider): hard-fail.
-        The nvrx-derived baseline is the cross-provider equality contract;
-        a divergence is a real bug.
-
-    Structural errors (missing inputs, native-server claims diverging from
-    on-disk truth, distcp_trace crashed, ...) always hard-fail regardless of
-    provider — metadata_compare returns 1 for these.
-
-    Runs each compare as a subprocess so ``megatron.native.debug``'s transitive
-    import of ``megatron.core`` → ``torch._inductor`` reads the same
-    ``TORCHINDUCTOR_WORKER_START`` overlay we hand the training subprocess;
-    importing in-process from the in-srun parent (which doesn't have that env)
-    trips an ``Invalid start method`` assertion in newer torch builds.
-    """
-    strict_on_mismatch = provider == "native"
-
-    ckpt_root = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
-    metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
-    iter_dirs = sorted(ckpt_root.glob("iter_*"))
-    if not iter_dirs:
-        raise RuntimeError(f"no iter_* dirs in {ckpt_root}")
-    # Thread MEGATRON_ROOT onto PYTHONPATH so `-m megatron.native.scripts.*` resolves
-    # regardless of cwd (CI launches from $CI_PROJECT_DIR; manual runs don't).
-    env = os.environ.copy()
-    existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{MEGATRON_ROOT}{os.pathsep}{existing_pp}" if existing_pp else str(MEGATRON_ROOT)
-    # Mirror _pretrain_cmd_and_env's torch overlay: the in-srun parent's env
-    # came in via srun --container-env, which has parsed our KEY=VALUE,KEY=...
-    # blob inconsistently in the past and produced a malformed
-    # ``TORCHINDUCTOR_WORKER_START`` value that newer torch._inductor rejects
-    # with "Invalid start method: fork=fork-". The training subprocess avoids
-    # this because _pretrain_cmd_and_env writes the same overrides explicitly
-    # — do the same here for the compare subprocesses.
-    env["TORCHINDUCTOR_WORKER_START"] = "fork"
-    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-
-    failures: list[str] = []
-    mismatches: list[str] = []
-    for iter_dir in iter_dirs:
-        iter_str = iter_dir.name.removeprefix("iter_")
-        baseline_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
-        sys.stderr.write(f"[run_job] baseline-compare {iter_dir.name} (provider={provider})\n")
-        rc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "megatron.native.scripts.metadata_compare",
-                "--checkpoint-dir",
-                str(iter_dir),
-                "--baseline-dir",
-                str(baseline_dir),
-                "--provider",
-                provider,
-            ],
-            env=env,
-            check=False,
-        ).returncode
-        if rc == 0:
-            continue
-        if rc == 3 and not strict_on_mismatch:  # noqa: PLR2004 — 3 = baseline mismatch (see metadata_compare)
-            mismatches.append(iter_dir.name)
-        else:
-            failures.append(f"{iter_dir.name} (rc={rc})")
-
-    if failures:
-        raise RuntimeError(
-            f"baseline-compare failed for {len(failures)} iter(s): {'; '.join(failures)}; see stderr above for per-finding detail",
-        )
-    if mismatches:
-        sys.stderr.write(
-            f"[run_job] WARN: {provider} baseline mismatch for {len(mismatches)} iter(s): {', '.join(mismatches)} "
-            f"— run the matching update-baselines job to refresh.\n",
-        )
-        sys.exit(3)
-
-
-def _foreach_native_metadata_files(  # noqa: C901
-    filter_config: str | None,
-    callback: Callable[[Path, Path], None],
-    wait_seconds: int = 0,
-) -> None:
-    """Iterate over each (src, dst) native metadata file pair, invoking callback for each.
-
-    If wait_seconds > 0, polls for each pattern's first match (per iter dir) before globbing
-    — needed because checkpoint_server writes these files asynchronously in the background.
-    `wait_only_patterns` are polled but not passed to callback — used to block on files the
-    post-pretrain stage consumes downstream but that shouldn't enter the baseline snapshot.
-    """
-    metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
-    ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
-    if not ci_runs_root.is_dir():
-        raise FileNotFoundError(f"ci-runs root not found: {ci_runs_root}")
-
-    # `[0-9]*.metadata.info` keeps the per-rank server dumps separate from
-    # `reference.metadata.info` (the distcp_trace cross-check) so the latter
-    # doesn't bleed into the baseline snapshot.
-    files_to_copy = ("registry.bin", "[0-9]*.metadata.info", "*.txt")
-    # `common.pt` is consumed by the post-pretrain equality-compare but isn't
-    # part of the baseline snapshot — checkpoint_server writes it async, so the
-    # post-pretrain wait must gate on it, but `_update_native_metadata_files`
-    # must not copy multi-MB torch pickles into `megatron/native/metadata/`.
-    wait_only_patterns = ("common.pt",)
-    iter_pattern = re.compile(r"^iter_(\d{7})$")
-    cfg_pattern = re.compile(r"^\d+x\d+$")
-
-    cfgs = (
-        [filter_config]
-        if filter_config is not None
-        else sorted(d.name for d in ci_runs_root.iterdir() if d.is_dir() and cfg_pattern.match(d.name))
-    )
-
-    for cfg in cfgs:
-        ckpt_root = ci_runs_root / cfg / "checkpoints"
-        if not ckpt_root.is_dir():
-            raise FileNotFoundError(
-                f"checkpoint dir not found for {cfg}: {ckpt_root} — did the pretrain-native test stage run on this runner?",
+        mem_matches = list(_RE_NATIVE_MEM.finditer(log_text))
+        if mem_matches:
+            result.update(
+                {
+                    "gpu_peak_bytes": PerfReport._make_metric([int(m.group(1)) for m in mem_matches], "B", higher_is_better=False),
+                    "cpu_rss_bytes": PerfReport._make_metric([int(m.group(2)) for m in mem_matches], "B", higher_is_better=False),
+                },
             )
 
-        iter_dirs = [d for d in sorted(ckpt_root.iterdir()) if d.is_dir() and iter_pattern.match(d.name)]
-        if not iter_dirs:
-            raise FileNotFoundError(f"no iter_* checkpoints found under {ckpt_root}")
+        return result
 
-        for src_iter_dir in iter_dirs:
-            iter_str = iter_pattern.match(src_iter_dir.name).group(1)
-            dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            for pattern in files_to_copy:
-                if wait_seconds > 0:
-                    wait_for_file(src_iter_dir / pattern, wait_seconds)
-                matches = sorted(src_iter_dir.glob(pattern))
-                if not matches:
-                    raise FileNotFoundError(f"no files matching {pattern!r} in {src_iter_dir}")
-                for src in matches:
-                    dst = dst_dir / src.name
-                    callback(src, dst)
-            if wait_seconds > 0:
-                for pattern in wait_only_patterns:
-                    wait_for_file(src_iter_dir / pattern, wait_seconds)
+    @staticmethod
+    def _compare_to_baseline(metrics: dict, baseline: dict, default_tolerance: float) -> tuple[dict, bool]:
+        baseline_metrics = baseline.get("metrics", {})
+        results = {}
+        all_passed = True
 
+        for metric_name, measured in metrics.items():
+            higher_is_better = measured.get("higher_is_better")
+            measured_val = measured.get("mean")
+            if measured_val is None:
+                continue
+            if metric_name in baseline_metrics:
+                baseline_val = baseline_metrics[metric_name]
+                tolerances = baseline.get("tolerances") or {}
+                # Info-only metrics (no direction) must match exactly; directional perf metrics use default_tolerance.
+                tol = tolerances.get(metric_name, 0.0 if higher_is_better is None else default_tolerance)
+                lo = baseline_val * (1.0 - tol)
+                hi = baseline_val * (1.0 + tol)
+                passed = lo <= measured_val <= hi
+                pct_change = (measured_val - baseline_val) / baseline_val * 100 if baseline_val else 0.0
+                if not passed:
+                    all_passed = False
+                results[metric_name] = {
+                    "status": "PASS" if passed else "FAIL",
+                    "measured": measured_val,
+                    "baseline": baseline_val,
+                    "lo": lo,
+                    "hi": hi,
+                    "pct_change": round(pct_change, 2),
+                    "tolerance_pct": round(tol * 100, 1),
+                    "unit": measured.get("unit", ""),
+                    "higher_is_better": higher_is_better,
+                    "min": measured.get("min"),
+                    "max": measured.get("max"),
+                    "median": measured.get("median"),
+                    "n_samples": len(measured.get("samples", [])),
+                }
+            elif higher_is_better is None:
+                results[metric_name] = {"status": "info", "measured": measured_val}
+            else:
+                results[metric_name] = {
+                    "status": "no_baseline",
+                    "measured": measured_val,
+                    "unit": measured.get("unit", ""),
+                    "higher_is_better": higher_is_better,
+                    "min": measured.get("min"),
+                    "max": measured.get("max"),
+                    "median": measured.get("median"),
+                    "n_samples": len(measured.get("samples", [])),
+                }
+        return results, all_passed
 
-def _wait_for_native_metadata_files(cfg: str, timeout_seconds: int) -> None:
-    """Block until checkpoint_server has flushed registry.bin and {peerIndex}.metadata.info
-    under ci-runs/<cfg>/checkpoints/iter_*. Call after pretrain returns but before the
-    test stage finishes, so the downstream update_baselines stage finds the files."""
-
-    def _log(src: Path, _dst: Path) -> None:
-        sys.stderr.write(f"[run_job] Found native metadata file: {src}\n")
-
-    _foreach_native_metadata_files(cfg, _log, wait_seconds=timeout_seconds)
-
-
-def _update_native_metadata_files(filter_config: str | None) -> None:
-    """Refresh registry.bin and {peerIndex}.metadata.info under megatron/native/metadata/.
-
-    Driven by ci-runs/<cfg>/checkpoints/iter_NNNNNNN/ — every iter the just-completed
-    pretrain-native run produced gets mirrored to metadata/<cfg>_checkpoints_iter_NNNNNNN/
-    (creating the destination folder if needed). When filter_config is set, only that
-    cfg is processed.
-    """
-
-    def log_and_copy(src: Path, dst: Path) -> None:
-        shutil.copy2(src, dst)
-        sys.stderr.write(f"[run_job] updated {dst} from {src}\n")
-
-    _foreach_native_metadata_files(filter_config, log_and_copy)
-
-
-def _update_nvrx_baseline_files(filter_config: str | None) -> None:
-    """Refresh reference.metadata.info under megatron/native/metadata/ from pretrain-nvrx output.
-
-    The nvrx-derived reference.metadata.info is the per-tensor md5 baseline that
-    both pretrain-nvrx (self-consistency check) and pretrain-native (cross-provider
-    check) compare against. Mirrors ci-runs/<cfg>/checkpoints/iter_NNNNNNN/reference.metadata.info
-    to metadata/<cfg>_checkpoints_iter_NNNNNNN/reference.metadata.info, one file per iter.
-    The source file is produced by the in-srun _compare_iters_to_baseline → distcp_trace
-    pass that runs after pretrain.
-    """
-    metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
-    ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
-    iter_pattern = re.compile(r"^iter_(\d{7})$")
-    cfg_pattern = re.compile(r"^\d+x\d+$")
-
-    cfgs = (
-        [filter_config]
-        if filter_config is not None
-        else sorted(d.name for d in ci_runs_root.iterdir() if d.is_dir() and cfg_pattern.match(d.name))
-    )
-
-    for cfg in cfgs:
-        ckpt_root = ci_runs_root / cfg / "checkpoints"
-        if not ckpt_root.is_dir():
-            raise FileNotFoundError(
-                f"checkpoint dir not found for {cfg}: {ckpt_root} — did the pretrain-nvrx test stage run on this runner?",
-            )
-        iter_dirs = [d for d in sorted(ckpt_root.iterdir()) if d.is_dir() and iter_pattern.match(d.name)]
-        if not iter_dirs:
-            raise FileNotFoundError(f"no iter_* checkpoints found under {ckpt_root}")
-        for src_iter_dir in iter_dirs:
-            iter_str = iter_pattern.match(src_iter_dir.name).group(1)
-            dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            src = src_iter_dir / "reference.metadata.info"
-            if not src.is_file():
-                raise FileNotFoundError(
-                    f"missing reference.metadata.info at {src} — did pretrain-nvrx run its baseline-compare step?",
+    @staticmethod
+    def _print_perf_summary(comparison: dict, passed: bool) -> None:
+        bar = "=" * 70
+        logger.info(f"\n{bar}")
+        logger.info(" Performance Results")
+        logger.info(bar)
+        for name, data in comparison.items():
+            status = data.get("status", "?")
+            measured = data.get("measured")
+            baseline = data.get("baseline")
+            unit = data.get("unit", "")
+            pct = data.get("pct_change")
+            if status == "info":
+                logger.info(f"  {name}: {measured:.4f} {unit}  [informational]")
+            elif status == "no_baseline":
+                logger.info(f"  {name}: {measured:.4f} {unit}  [no baseline]")
+            elif status in ("PASS", "FAIL"):
+                sign = "+" if pct and pct >= 0 else ""
+                pct_str = f"{sign}{pct:.1f}%" if pct is not None else "N/A"
+                tol = data.get("tolerance_pct", "?")
+                samples = data.get("n_samples", "?")
+                logger.info(
+                    f"  [{status}] {name}: {measured:.4f} {unit}  (baseline={baseline:.4f}, Δ={pct_str}, tol=±{tol}%, n={samples})",
                 )
-            dst = dst_dir / "reference.metadata.info"
+        logger.info(bar)
+        logger.info(f" Overall: {'PASS' if passed else 'FAIL'}")
+        logger.info(f"{bar}\n")
+
+    @staticmethod
+    def _compare_iters_to_baseline(cfg: str, provider: str) -> None:
+        """Re-derive reference.metadata.info per iter and diff against the baseline snapshot.
+
+        For each ``ci-runs/<cfg>/checkpoints/iter_*`` directory:
+          1. Run ``distcp_trace`` (via ``scripts/metadata_compare.py``) to compute
+             per-tensor md5sums and write ``reference.metadata.info`` next to the
+             distcp shards. For provider=native this also verifies the
+             checkpoint_server's ``0.metadata.info`` claims against on-disk truth.
+          2. Diff that file against
+             ``megatron/native/metadata/<cfg>_checkpoints_iter_NNNNNNN/reference.metadata.info``
+             — the nvrx-derived baseline checked into the repo.
+
+        Provider semantics on mismatch:
+          * ``pretrain-nvrx`` (provider=nvrx, self-consistency): warn and
+            ``sys.exit(3)`` so the matching ``update-baselines`` job stays
+            triggerable. The gitlab YAML treats exit 3 as ``allow_failure``.
+          * ``pretrain-native`` (provider=native, cross-provider): hard-fail.
+            The nvrx-derived baseline is the cross-provider equality contract;
+            a divergence is a real bug.
+
+        Structural errors (missing inputs, native-server claims diverging from
+        on-disk truth, distcp_trace crashed, ...) always hard-fail regardless of
+        provider — metadata_compare returns 1 for these.
+
+        Runs each compare as a subprocess so ``megatron.native.debug``'s transitive
+        import of ``megatron.core`` → ``torch._inductor`` reads the same
+        ``TORCHINDUCTOR_WORKER_START`` overlay we hand the training subprocess;
+        importing in-process from the in-srun parent (which doesn't have that env)
+        trips an ``Invalid start method`` assertion in newer torch builds.
+        """
+        strict_on_mismatch = provider == "native"
+
+        ckpt_root = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
+        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
+        iter_dirs = sorted(ckpt_root.glob("iter_*"))
+        if not iter_dirs:
+            raise RuntimeError(f"no iter_* dirs in {ckpt_root}")
+        # Thread MEGATRON_ROOT onto PYTHONPATH so `-m megatron.native.scripts.*` resolves
+        # regardless of cwd (CI launches from $CI_PROJECT_DIR; manual runs don't).
+        env = os.environ.copy()
+        existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{MEGATRON_ROOT}{os.pathsep}{existing_pp}" if existing_pp else str(MEGATRON_ROOT)
+        # Mirror the training subprocess's torch overlay: the in-srun parent's env
+        # came in via srun --container-env, which has parsed our KEY=VALUE,KEY=...
+        # blob inconsistently in the past and produced a malformed
+        # ``TORCHINDUCTOR_WORKER_START`` value that newer torch._inductor rejects
+        # with "Invalid start method: fork=fork-". The training subprocess avoids
+        # this because the training subprocess writes the same overrides explicitly
+        # — do the same here for the compare subprocesses.
+        env["TORCHINDUCTOR_WORKER_START"] = "fork"
+        env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+
+        failures: list[str] = []
+        mismatches: list[str] = []
+        for iter_dir in iter_dirs:
+            iter_str = iter_dir.name.removeprefix("iter_")
+            baseline_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
+            logger.info(f"[run_job] baseline-compare {iter_dir.name} (provider={provider})")
+            rc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "megatron.native.scripts.metadata_compare",
+                    "--checkpoint-dir",
+                    str(iter_dir),
+                    "--baseline-dir",
+                    str(baseline_dir),
+                    "--provider",
+                    provider,
+                ],
+                env=env,
+                check=False,
+            ).returncode
+            if rc == 0:
+                continue
+            if rc == 3 and not strict_on_mismatch:  # noqa: PLR2004 — 3 = baseline mismatch (see metadata_compare)
+                mismatches.append(iter_dir.name)
+            else:
+                failures.append(f"{iter_dir.name} (rc={rc})")
+
+        if failures:
+            raise RuntimeError(
+                f"baseline-compare failed for {len(failures)} iter(s): {'; '.join(failures)}; see stderr above for per-finding detail",
+            )
+        if mismatches:
+            logger.info(
+                f"[run_job] WARN: {provider} baseline mismatch for {len(mismatches)} iter(s): {', '.join(mismatches)} "
+                f"— run the matching update-baselines job to refresh.",
+            )
+            sys.exit(3)
+
+
+class BaselineUpdater:
+    @staticmethod
+    def _baseline_run_cmds(job: str, config: str, flavor_tag: str, gpus_per_node: int) -> tuple[str, str]:
+        gflag = f"--gpus-per-node {gpus_per_node}"
+        flavor_flags = "".join(f" --flavor {f}" for f in flavor_tag.split("-") if f)
+        if job == "ckptbench":
+            script = "python3 megatron/native/ci/scripts/ckptbench.py"
+            flags = f"--slurm {gflag}"
+        else:
+            script = "python3 megatron/native/ci/scripts/run_job.py"
+            flags = f"{job} --nodes 16 {gflag}{flavor_flags}" if config.startswith("16") else f"{job} --slurm {gflag}{flavor_flags}"
+        return f"{script} {flags}", f"{script} {flags} --update-baseline"
+
+    @staticmethod
+    def _round_to_sig_figs(value: float, sig_figs: int) -> float:
+        """Round so only the leftmost `sig_figs` digits are non-zero (e.g. 5742.485 -> 5700.0)."""
+        if value == 0 or not math.isfinite(value):
+            return float(value)
+        magnitude = math.floor(math.log10(abs(value)))
+        return round(value, sig_figs - 1 - magnitude)
+
+    @staticmethod
+    def _round_for_baseline(mean: float, tolerance: float, higher_is_better: bool | None) -> float | int:
+        """Round a measured mean to the precision implied by its tolerance.
+
+        5% (the default for perf metrics) → 2 sig figs so values are easy to read at a glance.
+        Exact match (tolerance==0, e.g. info metrics like total_written_bytes) → preserve as int.
+        Custom tolerances → 6 decimals, since the user picked a non-default precision deliberately.
+        """
+        if tolerance == 0.0:
+            return int(mean) if mean == int(mean) else round(mean, 6)
+        if tolerance == PERF_TOLERANCE:
+            rounded = BaselineUpdater._round_to_sig_figs(mean, 2)
+            # Info-only metrics that landed in the perf-default branch (no old baseline) still
+            # serialize cleanly as int when the rounded value is integral.
+            if higher_is_better is None and rounded == int(rounded):
+                return int(rounded)
+            return rounded
+        return round(mean, 6)
+
+    @staticmethod
+    def _update_baseline_file(baseline_file: Path, metrics: dict, job: str, config: str, flavor_tag: str, gpus_per_node: int) -> None:  # noqa: PLR0913
+        if baseline_file.exists():
+            with baseline_file.open() as f:
+                baseline = yaml.safe_load(f)
+        else:
+            run_cmd, update_cmd = BaselineUpdater._baseline_run_cmds(job, config, flavor_tag, gpus_per_node)
+            baseline = {
+                "description": "auto-generated by CI",
+                "run_cmd": run_cmd,
+                "update_cmd": update_cmd,
+                "metrics": {},
+            }
+
+        existing = baseline.setdefault("metrics", {})
+        tolerances = baseline.get("tolerances") or {}
+        changed: list[str] = []
+        for name, data in metrics.items():
+            mean = data.get("mean")
+            if mean is None:
+                continue
+            old_val = existing.get(name)
+            higher_is_better = data.get("higher_is_better")
+            # Effective tolerance mirrors _compare_to_baseline; for new metrics (no old_val) we
+            # fall back to higher_is_better since type-of-baseline isn't available yet.
+            if name in tolerances:
+                tol = tolerances[name]
+            elif old_val is not None:
+                tol = 0.0 if isinstance(old_val, int) else PERF_TOLERANCE
+            else:
+                tol = 0.0 if higher_is_better is None else PERF_TOLERANCE
+
+            new_val = BaselineUpdater._round_for_baseline(mean, tol, higher_is_better)
+            if old_val is None or abs(new_val - old_val) / max(abs(old_val), 1e-9) > _BASELINE_CHANGE_THRESHOLD:
+                existing[name] = new_val
+                changed.append(f"  {name}: {old_val} -> {new_val}")
+
+        if not changed:
+            return
+
+        for _line in changed:
+            pass
+        baseline_file.parent.mkdir(parents=True, exist_ok=True)
+        with baseline_file.open("w") as f:
+            yaml.dump(baseline, f, default_flow_style=False, sort_keys=False)
+
+    @staticmethod
+    def _parse_job_filter(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
+        """Return (filter_job, filter_config, filter_flavor) from --filter or CI_JOB_NAME.
+
+        --filter format:   <job>[:<config>[:<flavor>]]
+        CI_JOB_NAME format: <platform>:<job>[:<config>[:<flavor>]][:update_baselines]
+          gb200:ckptbench:update_baselines                  → (ckptbench, None, None)
+          gb200:pretrain-native:1x4:deterministic:update_baselines → (pretrain-native, 1x4, deterministic)
+        """
+        if args.filter:
+            job_name, *rest = args.filter.split(":")
+            return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+
+        ci_job_name = os.environ.get("CI_JOB_NAME", "")
+        if ci_job_name:
+            _, job_name, *rest = ci_job_name.removesuffix(":update_baselines").split(":")
+            return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+
+        return None, None, None
+
+    @staticmethod
+    def run_update_baselines(args: argparse.Namespace) -> None:
+        """Update baseline YAMLs from *_report.json files in RESULTS_DIR without re-running jobs.
+
+        Job/config are auto-detected from CI_JOB_NAME; override with --filter.
+        """
+        machine = _platform_tag()
+        filter_job, filter_config, filter_flavor = BaselineUpdater._parse_job_filter(args)
+
+        # Only the perf flavor (and ckptbench) emit *_report.json; deterministic/nvrx
+        # produce no perf metrics, so skip the report-driven loop and go straight to
+        # the metadata snapshot refresh.
+        if filter_flavor != "deterministic" and filter_job != "pretrain-nvrx":
+            job_glob = filter_job or "*"
+            reports = sorted(RESULTS_DIR.glob(f"{machine}_{job_glob}_*_report.json"))
+            if not reports:
+                filter_desc = ":".join(p for p in (filter_job, filter_config, filter_flavor) if p) or "all jobs"
+                raise RuntimeError(
+                    f"no report files found in {RESULTS_DIR} matching '{machine}_{job_glob}_*_report.json' "
+                    f"(filter: {filter_desc}) — did the test stage run first?",
+                )
+
+            for report_file in reports:
+                with report_file.open() as f:
+                    report = json.load(f)
+
+                job = report.get("job")
+                config = report.get("config")
+                flavor_tag = report.get("flavor_tag", "")
+                gpus_per_node = report.get("gpus_per_node", args.gpus_per_node)
+                metrics = report.get("metrics", {})
+
+                if not job or not config or not metrics:
+                    continue
+                if filter_config is not None and config != filter_config:
+                    continue
+                if filter_flavor is not None and flavor_tag != filter_flavor:
+                    continue
+
+                baseline_file = BASELINES_DIR / f"{_artifact_stem(machine, job, flavor_tag, config)}.yaml"
+                BaselineUpdater._update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+
+        # The metadata md5 snapshot is only produced by deterministic runs. nvrx
+        # always runs deterministic; native does so only under the deterministic flavor.
+        flavor_is_deterministic = "deterministic" in (filter_flavor or "").split("-")
+        if filter_job == "pretrain-native" and flavor_is_deterministic:
+            BaselineUpdater._update_native_metadata_files(filter_config)
+        elif filter_job == "pretrain-nvrx":
+            BaselineUpdater._update_nvrx_baseline_files(filter_config)
+
+    @staticmethod
+    def _foreach_native_metadata_files(  # noqa: C901
+        filter_config: str | None,
+        callback: Callable[[Path, Path], None],
+        wait_seconds: int = 0,
+    ) -> None:
+        """Iterate over each (src, dst) native metadata file pair, invoking callback for each.
+
+        If wait_seconds > 0, polls for each pattern's first match (per iter dir) before globbing
+        — needed because checkpoint_server writes these files asynchronously in the background.
+        `wait_only_patterns` are polled but not passed to callback — used to block on files the
+        post-pretrain stage consumes downstream but that shouldn't enter the baseline snapshot.
+        """
+        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
+        ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
+        if not ci_runs_root.is_dir():
+            raise FileNotFoundError(f"ci-runs root not found: {ci_runs_root}")
+
+        # `[0-9]*.metadata.info` keeps the per-rank server dumps separate from
+        # `reference.metadata.info` (the per-tensor md5 cross-check) so the latter
+        # doesn't bleed into the baseline snapshot.
+        files_to_copy = ("registry.bin", "[0-9]*.metadata.info", "*.txt")
+        # `common.pt` is consumed by the post-pretrain equality-compare but isn't
+        # part of the baseline snapshot — checkpoint_server writes it async, so the
+        # post-pretrain wait must gate on it, but the metadata snapshot
+        # must not copy multi-MB torch pickles into `megatron/native/metadata/`.
+        wait_only_patterns = ("common.pt",)
+        iter_pattern = re.compile(r"^iter_(\d{7})$")
+        cfg_pattern = re.compile(r"^\d+x\d+$")
+
+        cfgs = (
+            [filter_config]
+            if filter_config is not None
+            else sorted(d.name for d in ci_runs_root.iterdir() if d.is_dir() and cfg_pattern.match(d.name))
+        )
+
+        for cfg in cfgs:
+            ckpt_root = ci_runs_root / cfg / "checkpoints"
+            if not ckpt_root.is_dir():
+                raise FileNotFoundError(
+                    f"checkpoint dir not found for {cfg}: {ckpt_root} — did the pretrain-native test stage run on this runner?",
+                )
+
+            iter_dirs = [d for d in sorted(ckpt_root.iterdir()) if d.is_dir() and iter_pattern.match(d.name)]
+            if not iter_dirs:
+                raise FileNotFoundError(f"no iter_* checkpoints found under {ckpt_root}")
+
+            for src_iter_dir in iter_dirs:
+                iter_str = iter_pattern.match(src_iter_dir.name).group(1)
+                dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                for pattern in files_to_copy:
+                    if wait_seconds > 0:
+                        wait_for_file(src_iter_dir / pattern, wait_seconds)
+                    matches = sorted(src_iter_dir.glob(pattern))
+                    if not matches:
+                        raise FileNotFoundError(f"no files matching {pattern!r} in {src_iter_dir}")
+                    for src in matches:
+                        dst = dst_dir / src.name
+                        callback(src, dst)
+                if wait_seconds > 0:
+                    for pattern in wait_only_patterns:
+                        wait_for_file(src_iter_dir / pattern, wait_seconds)
+
+    @staticmethod
+    def _wait_for_native_metadata_files(cfg: str, timeout_seconds: int) -> None:
+        """Block until checkpoint_server has flushed registry.bin and {peerIndex}.metadata.info
+        under ci-runs/<cfg>/checkpoints/iter_*. Call after pretrain returns but before the
+        test stage finishes, so the downstream update_baselines stage finds the files."""
+
+        def _log(src: Path, _dst: Path) -> None:
+            logger.info(f"[run_job] Found native metadata file: {src}")
+
+        BaselineUpdater._foreach_native_metadata_files(cfg, _log, wait_seconds=timeout_seconds)
+
+    @staticmethod
+    def _update_native_metadata_files(filter_config: str | None) -> None:
+        """Refresh registry.bin and {peerIndex}.metadata.info under megatron/native/metadata/.
+
+        Driven by ci-runs/<cfg>/checkpoints/iter_NNNNNNN/ — every iter the just-completed
+        pretrain-native run produced gets mirrored to metadata/<cfg>_checkpoints_iter_NNNNNNN/
+        (creating the destination folder if needed). When filter_config is set, only that
+        cfg is processed.
+        """
+
+        def log_and_copy(src: Path, dst: Path) -> None:
             shutil.copy2(src, dst)
-            sys.stderr.write(f"[run_job] updated {dst} from {src}\n")
+            logger.info(f"[run_job] updated {dst} from {src}")
+
+        BaselineUpdater._foreach_native_metadata_files(filter_config, log_and_copy)
+
+    @staticmethod
+    def _update_nvrx_baseline_files(filter_config: str | None) -> None:
+        """Refresh reference.metadata.info under megatron/native/metadata/ from pretrain-nvrx output.
+
+        The nvrx-derived reference.metadata.info is the per-tensor md5 baseline that
+        both pretrain-nvrx (self-consistency check) and pretrain-native (cross-provider
+        check) compare against. Mirrors ci-runs/<cfg>/checkpoints/iter_NNNNNNN/reference.metadata.info
+        to metadata/<cfg>_checkpoints_iter_NNNNNNN/reference.metadata.info, one file per iter.
+        The source file is produced by the in-srun _compare_iters_to_baseline → distcp_trace
+        pass that runs after pretrain.
+        """
+        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
+        ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
+        iter_pattern = re.compile(r"^iter_(\d{7})$")
+        cfg_pattern = re.compile(r"^\d+x\d+$")
+
+        cfgs = (
+            [filter_config]
+            if filter_config is not None
+            else sorted(d.name for d in ci_runs_root.iterdir() if d.is_dir() and cfg_pattern.match(d.name))
+        )
+
+        for cfg in cfgs:
+            ckpt_root = ci_runs_root / cfg / "checkpoints"
+            if not ckpt_root.is_dir():
+                raise FileNotFoundError(
+                    f"checkpoint dir not found for {cfg}: {ckpt_root} — did the pretrain-nvrx test stage run on this runner?",
+                )
+            iter_dirs = [d for d in sorted(ckpt_root.iterdir()) if d.is_dir() and iter_pattern.match(d.name)]
+            if not iter_dirs:
+                raise FileNotFoundError(f"no iter_* checkpoints found under {ckpt_root}")
+            for src_iter_dir in iter_dirs:
+                iter_str = iter_pattern.match(src_iter_dir.name).group(1)
+                dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                src = src_iter_dir / "reference.metadata.info"
+                if not src.is_file():
+                    raise FileNotFoundError(
+                        f"missing reference.metadata.info at {src} — did pretrain-nvrx run its baseline-compare step?",
+                    )
+                dst = dst_dir / "reference.metadata.info"
+                shutil.copy2(src, dst)
+                logger.info(f"[run_job] updated {dst} from {src}")
+
+
+class PretrainJob:
+    @staticmethod
+    def run_pretrain(args: argparse.Namespace) -> None:
+        provider = _ckpt_provider(args.job)
+        cfg = f"{args.nodes}x{args.gpus_per_node}"
+        extra_args = getattr(args, "extra_args", None)
+
+        if in_srun():
+            # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
+            nodes = int(os.environ.get("SLURM_NNODES", "1"))
+            cfg = f"{nodes}x{args.gpus_per_node}"
+            ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
+            with _flavored_run(ctx):
+                # Two sequential processes in one srun task share a single checkpoint_server
+                # lifecycle and perf epilog: phase 1 trains from random init and saves; phase 2
+                # loads it and saves the perf-measured checkpoints.
+                common = {"ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args}
+                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, args.gpus_per_node, phase=1, **common)
+                subprocess.run(cmd, env=env, check=True)
+                PretrainJob._wait_for_phase1_checkpoint(cfg)
+                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, args.gpus_per_node, phase=2, **common)
+                subprocess.run(cmd, env=env, check=True)
+            return
+
+        # nvrx via SLURM/multinode runs the two-run cross-run determinism check, which
+        # manages its own ckpt_dir cleanup and run-1 sidecar bookkeeping.
+        if provider == "nvrx" and (args.nodes > 1 or args.slurm):
+            PretrainJob._run_pretrain_determinism_check(args, cfg)
+            return
+
+        # Clear stale checkpoints once in the launcher so in-srun tasks don't race on rmtree.
+        # Both phase dirs are cleared so phase 1 always starts from random init.
+        for stale in (
+            MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints",
+            PretrainJob._phase1_ckpt_dir(cfg),
+        ):
+            if stale.exists():
+                shutil.rmtree(stale)
+
+        ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
+        ctx.log_file = RESULTS_DIR / f"{ctx.stem}.log"
+        if args.nodes > 1 or args.slurm:
+            # Launcher: training + worker epilogs run in the srun task; this launcher tees the log
+            # and runs the perf epilog from it.
+            cmd = PretrainJob._build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
+            with _flavored_run(ctx):
+                ctx.soft_fail = _tee_run(cmd, ctx.log_file) == _SOFT_FAIL_RC
+        elif args.gpus_per_node > 1:
+            # Multi-GPU devbox: torchrun subprocess so worker output is captured in the log.
+            # Both phases tee into one log; the perf parser scopes metrics to phase 2.
+            with _flavored_run(ctx):
+                common = {"use_torchrun": True, "ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args}
+                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=1, **common)
+                _tee_run(cmd, ctx.log_file, env=env)
+                PretrainJob._wait_for_phase1_checkpoint(cfg)
+                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=2, **common)
+                ctx.soft_fail = _tee_run(cmd, ctx.log_file, env=env, append=True) == _SOFT_FAIL_RC
+        else:
+            # Single-GPU inline: call pretrain() in-process (debugger-friendly).
+            with _flavored_run(ctx):
+                PretrainJob._launch_pretrain_inline(ctx)
+
+    @staticmethod
+    def _build_pretrain_srun_cmd(  # noqa: PLR0913 — distinct srun inputs, not worth a struct
+        cfg: str,
+        nodes: int,
+        gpus_per_node: int,
+        job: str,
+        flavors: list[Flavor],
+        extra_args: list[str] | None = None,
+    ) -> list[str]:
+        image = _image_path().as_posix()
+        triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
+        total_tasks = nodes * gpus_per_node
+
+        recipe = Recipe(opts=[], env=Flavor.base_env(triton_dir))
+        _apply_flavors(recipe, flavors)
+        # KEY=VALUE for the run env; VCPKG_ROOT and any build_env (already exported in
+        # main()) are forwarded by name — forwarding them by value has hit KEY=VALUE
+        # parsing ambiguity in pyxis/enroot.
+        container_env = ",".join(f"{k}={v}" for k, v in recipe.env.items())
+        container_env += "," + ",".join(["VCPKG_ROOT", *recipe.build_env])
+
+        return [
+            *_build_srun_cmd(
+                nodes=nodes,
+                ntasks=total_tasks,
+                time_minutes=recipe.srun_time_min,
+                job_name=f"{job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
+                image=image,
+                container_env=container_env,
+                gpus_per_node=gpus_per_node,
+                total_gpus=total_tasks,
+                extra_srun_args=recipe.srun_comments,
+            ),
+            # SLURM_PROCID will be set on each task, triggering in-srun mode.
+            "python3",
+            "-u",
+            str(Path(__file__).resolve()),
+            job,
+            # Pass gpus-per-node + flavors on argv so the in-srun task re-derives the
+            # same recipe from argv, not the container env (a KEY=VALUE collision there
+            # corrupted forwarded values).
+            "--gpus-per-node",
+            str(gpus_per_node),
+            *[tok for f in flavors for tok in ("--flavor", f.name)],
+            *(extra_args or []),
+        ]
+
+    @staticmethod
+    def _phase1_ckpt_dir(cfg: str) -> Path:
+        """Phase-1's dedicated checkpoint dir, kept separate from the perf-measured
+        checkpoints/ so the latter holds only the 250/500/750 phase-2 checkpoints."""
+        return MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/phase1-checkpoints"
+
+    @staticmethod
+    def _wait_for_phase1_checkpoint(cfg: str, timeout_seconds: int = 1800) -> None:
+        """Block until phase 1's checkpoint is durable, so the fresh phase-2 process can load it.
+
+        metadata.json is the torch_dist completeness marker that the load-path format
+        detection (check_is_distributed_checkpoint) keys off, and dist_checkpointing.save
+        writes it last; waiting for it guarantees the checkpoint is loadable. A synchronous
+        phase-1 save makes it durable on exit, so this normally returns immediately.
+        """
+        marker = PretrainJob._phase1_ckpt_dir(cfg) / f"iter_{_PHASE1_TRAIN_ITERS:07d}" / "metadata.json"
+        logger.info(f"[run_job] waiting for phase-1 checkpoint to flush: {marker}")
+        wait_for_file(marker, timeout_seconds)
+
+    @staticmethod
+    def _pretrain_cmd_and_env(  # noqa: PLR0913
+        cfg: str,
+        nodes: int,
+        gpus_per_node: int,
+        use_torchrun: bool = False,
+        ckpt_provider: str = "nvrx,native",
+        flavors: list[Flavor] | None = None,
+        extra_args: list[str] | None = None,
+        phase: int = 2,
+    ) -> tuple[list[str], dict]:
+        """Return (cmd, env) to run the in-process pretrain entry (run_job.py __pretrain_entry__) on a compute node.
+
+        use_torchrun=True  — devbox multi-GPU; torchrun spawns one process per GPU.
+        use_torchrun=False — in-srun; srun already placed one process per GPU.
+
+        phase 1 trains from random init to _PHASE1_TRAIN_ITERS, saving into a separate
+        phase1-checkpoints dir; phase 2 loads that checkpoint and saves the perf-measured
+        250/500/750 checkpoints into the main checkpoints dir.
+        """
+        run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
+        ckpt_dir = run_dir / "checkpoints"
+        phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
+        tb_dir = run_dir / "tensorboard"
+        datacache = run_dir / "data-cache"
+        triton_dir = run_dir / "triton-cache"
+        for d in [ckpt_dir, phase1_dir, tb_dir, datacache, triton_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        if phase == 1:
+            config = PretrainJob._phase1_config(
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
+                ckpt_dir=phase1_dir,
+                tb_dir=tb_dir,
+                datacache_dir=datacache,
+                ckpt_provider=ckpt_provider,
+            )
+        else:
+            config = PretrainRunConfig(
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
+                ckpt_dir=ckpt_dir,
+                tb_dir=tb_dir,
+                datacache_dir=datacache,
+                ckpt_provider=ckpt_provider,
+                load_dir=phase1_dir,
+            )
+        opts = PretrainJob._pretrain_cli_args(config)
+        recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
+        _apply_flavors(recipe, flavors or [])
+        opts = recipe.opts
+
+        env = os.environ.copy()
+        env.update(recipe.env)
+
+        if use_torchrun:
+            launcher = ["torchrun", "--nproc_per_node", str(gpus_per_node)]
+        else:
+            # In-srun: set PyTorch distributed env vars from SLURM.
+            # Port is derived from SLURM_JOB_ID so concurrent jobs don't collide.
+            slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0"))
+            master_port = 20000 + (slurm_job_id % 40000)
+            try:
+                master_addr = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_NODELIST"]], text=True).split()[0]  # noqa: S607
+            except (subprocess.CalledProcessError, OSError, KeyError, IndexError):
+                master_addr = "localhost"
+            env.update(
+                {
+                    "RANK": os.environ.get("SLURM_PROCID", "0"),
+                    "LOCAL_RANK": os.environ.get("SLURM_LOCALID", "0"),
+                    "WORLD_SIZE": os.environ.get("SLURM_NTASKS", "1"),
+                    "MASTER_ADDR": master_addr,
+                    "MASTER_PORT": str(master_port),
+                },
+            )
+            launcher = ["python3", "-u"]
+
+        # Re-invoke this script in __pretrain_entry__ mode so the CI markers live under
+        # megatron/native and the repo-root training scripts stay unmodified. The phase follows the
+        # sentinel; the entry forwards the remaining opts to pretrain() in-process.
+        return [*launcher, str(SCRIPT_DIR / "run_job.py"), _PRETRAIN_ENTRY_CMD, str(phase), *opts, *(extra_args or [])], env
+
+    @staticmethod
+    def _phase1_config(**kwargs: object) -> PretrainRunConfig:
+        """A phase-1 config: random init, train to _PHASE1_TRAIN_ITERS, one synchronous save.
+
+        Phase 1 always saves with the nvrx provider — megatron-core dist_checkpointing,
+        which writes a standard torch_dist checkpoint (with metadata.json) that phase 2
+        can load regardless of phase 2's own provider. The native provider, by contrast,
+        writes a DCP-style checkpoint the standard load path can't identify. Saving
+        synchronously (no async checkpoint_server) makes it durable on process exit.
+        """
+        kwargs["ckpt_provider"] = "nvrx"  # override the job's provider for the phase-1 save
+        # lr_decay_iters defaults to --train-iters, so phase 1 must advertise the FULL run's
+        # train_iters — not its own early exit at _PHASE1_TRAIN_ITERS — or it decays the LR
+        # over _PHASE1_TRAIN_ITERS instead of the full horizon. That changes the iter-
+        # _PHASE1_TRAIN_ITERS weights phase 2 resumes from, so the perf-measured checkpoints
+        # would no longer match a single-phase run's.
+        full_train_iters = PretrainRunConfig.save_interval * PretrainRunConfig.num_checkpoints
+        return PretrainRunConfig(
+            save_interval=_PHASE1_TRAIN_ITERS,
+            num_checkpoints=1,
+            train_iters=full_train_iters,
+            phase=1,
+            load_dir=None,
+            synchronous_save=True,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def _pretrain_cli_args(config: PretrainRunConfig) -> list[str]:
+        save_interval, num_checkpoints = config.save_interval, config.num_checkpoints
+        exit_interval = save_interval * num_checkpoints
+        # The LR schedule spans train_iters (lr_decay_iters defaults to it). Phase 1 exits
+        # early (exit_interval) but keeps the full run's horizon so its trajectory matches a
+        # single-phase run; phase 2 / single-phase leave train_iters None -> exit_interval.
+        train_iters = config.train_iters if config.train_iters is not None else exit_interval
+        seq_len = 1024
+
+        # Phase 1 saves synchronously (no --async-save / persistent worker) so the
+        # checkpoint is durable on process exit and phase 2 can --load it.
+        if config.synchronous_save:
+            checkpoint_opts = [
+                f"--ckpt-provider={config.ckpt_provider}",
+                "--ckpt-format",
+                "torch_dist",
+                "--ckpt-assume-constant-structure",
+            ]
+        else:
+            checkpoint_opts = [
+                f"--ckpt-provider={config.ckpt_provider}",
+                "--ckpt-format",
+                "torch_dist",
+                "--ckpt-assume-constant-structure",
+                "--async-save",
+                "--use-persistent-ckpt-worker",
+            ]
+        checkpoint_opts += ["--save", str(config.ckpt_dir)]
+        if config.load_dir is not None:
+            checkpoint_opts += ["--load", str(config.load_dir)]
+        checkpoint_opts += [
+            "--save-interval",
+            str(save_interval),
+            "--save-retain-interval",
+            str(save_interval),
+        ]
+
+        # Runtime defaults; a model config overrides any key it also defines (model wins in
+        # {**dynamic, **model}). The dev configs scale parallelism and global batch size to
+        # the runner's GPU count, while a bigger model's override (pretrain_<nodes>node.yaml)
+        # pins them. eval-interval tracks the full horizon, not the early exit, so phase 1
+        # runs no extra eval that would perturb the state phase 2 resumes from.
+        dynamic = {
+            "tensor-model-parallel-size": config.gpus_per_node,
+            "expert-model-parallel-size": config.gpus_per_node,
+            "global-batch-size": config.nodes * config.gpus_per_node,
+            "seq-length": seq_len,
+            "max-position-embeddings": seq_len,
+            "data-cache-path": str(config.datacache_dir),
+            "tensorboard-dir": str(config.tb_dir),
+            "log-interval": save_interval,
+            "eval-interval": train_iters,
+            "exit-interval": exit_interval,
+            "train-iters": train_iters,
+        }
+        model = PretrainJob._load_model_config(config.nodes)
+        return _flatten_cli({**dynamic, **model}) + checkpoint_opts
+
+    @staticmethod
+    def _load_model_config(nodes: int) -> dict:
+        """Static model + training args from pretrain_base.yaml, deep-merged with the
+        per-node-count override pretrain_<nodes>node.yaml when one exists."""
+        base = yaml.safe_load((CONFIGS_DIR / "pretrain_base.yaml").read_text()) or {}
+        override = CONFIGS_DIR / f"pretrain_{nodes}node.yaml"
+        if override.exists():
+            return _deep_merge(base, yaml.safe_load(override.read_text()) or {})
+        return base
+
+    @staticmethod
+    def _launch_pretrain_inline(ctx: RunCtx) -> None:
+        """Run pretrain in-process (no subprocess/torchrun) for single-GPU devbox runs.
+
+        Output is tee'd to ctx.log_file so the perf epilog can parse it; run_pretrain
+        runs spin-down + epilogs via _flavored_run afterwards.
+        """
+        args, cfg = ctx.args, ctx.cfg
+        nodes, gpus_per_node = args.nodes, args.gpus_per_node
+        run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
+        ckpt_dir = run_dir / "checkpoints"
+        tb_dir = run_dir / "tensorboard"
+        datacache = run_dir / "data-cache"
+        triton_dir = run_dir / "triton-cache"
+        for d in [ckpt_dir, tb_dir, datacache, triton_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        opts = PretrainJob._pretrain_cli_args(
+            PretrainRunConfig(
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
+                ckpt_dir=ckpt_dir,
+                tb_dir=tb_dir,
+                datacache_dir=datacache,
+                save_interval=1,
+                num_checkpoints=2,
+                ckpt_provider=ctx.provider,
+            ),
+        )
+        recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
+        _apply_flavors(recipe, args.flavors)
+        opts = [*recipe.opts, *(getattr(args, "extra_args", None) or [])]
+        # Applied before the in-process pretrain imports the model: MAMBA_DETERMINISTIC
+        # (under the deterministic flavor) is read at import time.
+        os.environ.update(recipe.env)
+        # Single-GPU inline is a debugger smoke test: one short single-phase run with no phase
+        # banner, so the perf parser scopes to the whole log (correct for one phase). The two-phase
+        # resume handoff is exercised by the torchrun and srun paths.
+
+        if args.skip_perf:
+            ctx.log_file = None  # nothing for the perf epilog to parse
+            PretrainJob._call_pretrain_inline(opts, nodes, gpus_per_node)
+            return
+
+        class _Tee:
+            def __init__(self, stream: IO[str], logfp: IO[str]) -> None:
+                self._stream, self._logfp = stream, logfp
+
+            def write(self, data: str) -> int:
+                self._stream.write(data)
+                self._logfp.write(data)
+                return len(data)
+
+            def flush(self) -> None:
+                self._stream.flush()
+                self._logfp.flush()
+
+            def fileno(self) -> int:
+                return self._stream.fileno()
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._stream, name)
+
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        with ctx.log_file.open("w") as log_fp:
+            saved_stdout, saved_stderr = sys.stdout, sys.stderr
+            sys.stdout = _Tee(saved_stdout, log_fp)
+            sys.stderr = _Tee(saved_stderr, log_fp)
+            try:
+                PretrainJob._call_pretrain_inline(opts, nodes, gpus_per_node)
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                if rc != 0:
+                    raise RuntimeError(f"pretrain exited with code {rc} — full log: {ctx.log_file}") from None
+            finally:
+                sys.stdout, sys.stderr = saved_stdout, saved_stderr
+
+    @staticmethod
+    def _call_pretrain_inline(opts: list[str], nodes: int, gpus_per_node: int) -> None:
+        """Set sys.argv and call pretrain() directly.
+
+        gpus_per_node==1: runs in the calling process (debugger-friendly).
+        gpus_per_node>1:  uses torch.multiprocessing.spawn.
+        """
+        import time  # noqa: PLC0415
+
+        if str(MEGATRON_ROOT) not in sys.path:
+            sys.path.insert(0, str(MEGATRON_ROOT))
+
+        program_start = time.time()
+
+        if "MASTER_PORT" not in os.environ:
+            import socket as _socket  # noqa: PLC0415
+
+            with _socket.socket() as _s:
+                _s.bind(("", 0))
+                os.environ["MASTER_PORT"] = str(_s.getsockname()[1])
+
+        if gpus_per_node == 1:
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+            # Force num-workers=0 so DataLoader runs in-process with no subprocess spawning.
+            clean = []
+            skip = False
+            for tok in opts:
+                if skip:
+                    skip = False
+                    continue
+                if tok == "--num-workers":
+                    skip = True
+                    continue
+                clean.append(tok)
+            opts = [*clean, "--num-workers", "0"]
+            sys.argv = ["pretrain_mamba.py", *opts]
+            PretrainJob._pretrain_main(program_start)
+        else:
+            import torch.multiprocessing as mp  # noqa: PLC0415
+
+            mp.spawn(
+                PretrainJob._pretrain_worker,
+                args=(gpus_per_node, nodes, opts, program_start),
+                nprocs=gpus_per_node,
+                join=True,
+            )
+
+    @staticmethod
+    def _pretrain_worker(local_rank: int, gpus_per_node: int, nodes: int, opts: list[str], program_start: float) -> None:
+        """Entry point for each torch.multiprocessing.spawn worker (multi-GPU inline)."""
+        os.environ["RANK"] = str(local_rank)  # single-node: global rank == local rank
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["WORLD_SIZE"] = str(nodes * gpus_per_node)
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        sys.argv = ["pretrain_mamba.py", *opts]
+        PretrainJob._pretrain_main(program_start)
+
+    @staticmethod
+    def _pretrain_main(program_start: float, ci_phase: int | None = None) -> None:
+        """Mirror of pretrain_hybrid.py's __main__ block — calls pretrain() directly.
+
+        Brackets pretrain() with the two CI-only stdout markers the perf parser reads, so every
+        launch path emits them from one place: a phase banner up front (when ci_phase is set, so
+        the parser can split the two-phase log) and, on exit, the rank-0 peak-GPU / peak-CPU-RSS
+        marker. Both fire only on global rank 0; inline debug runs pass ci_phase=None (no banner).
+        """
+        import time  # noqa: PLC0415
+        from functools import partial  # noqa: PLC0415
+
+        from megatron.core.enums import ModelType  # noqa: PLC0415
+        from megatron.training import inprocess_restart, pretrain, set_startup_timestamps  # noqa: PLC0415
+        from megatron.training.argument_utils import (  # noqa: PLC0415
+            hybrid_config_from_args,
+            pretrain_cfg_container_from_args,
+        )
+        from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415
+
+        try:
+            from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415
+
+            has_modelopt = True
+        except ImportError:
+            has_modelopt = False
+
+        import pretrain_hybrid as ph  # noqa: PLC0415
+        from hybrid_builders import hybrid_builder  # noqa: PLC0415
+        from model_provider import model_provider as _mp  # noqa: PLC0415
+
+        rank0 = int(os.environ.get("RANK", "0")) == 0
+        # Parser markers print to stdout: this subprocess has no logging handler and
+        # the perf parser scans the tee'd stdout. Keep them (T201 suppressed).
+        if rank0 and ci_phase is not None:
+            print(f"[native_ckpt:phase] phase={ci_phase}", flush=True)  # noqa: T201
+
+        set_startup_timestamps(program_start=program_start, main_entry=time.time())
+
+        ph.train_valid_test_datasets_provider.is_distributed = True
+
+        pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
+        args = parse_and_validate_args(
+            extra_args_provider=add_modelopt_args if has_modelopt else None,
+            args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
+        )
+        model_cfg = hybrid_config_from_args(args)
+        full_config = pretrain_cfg_container_from_args(args, model_cfg)
+        try:
+            pretrain_fn(
+                full_config,
+                ph.train_valid_test_datasets_provider,
+                partial(_mp, hybrid_builder),
+                ModelType.encoder_or_decoder,
+                ph.forward_step,
+                store=store,
+            )
+        finally:
+            # Peak GPU/CPU are cumulative, so one reading at exit equals the per-iteration max.
+            if rank0:
+                try:
+                    import resource  # noqa: PLC0415
+
+                    import torch  # noqa: PLC0415
+
+                    gpu_peak_bytes = torch.cuda.max_memory_allocated()
+                    cpu_rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # ru_maxrss is KiB on Linux
+                    print(f"[native_ckpt:mem] gpu_peak_bytes={gpu_peak_bytes} cpu_rss_bytes={cpu_rss_bytes}", flush=True)  # noqa: T201
+                except Exception as exc:  # noqa: BLE001 — a metrics hiccup must never mask the training result
+                    print(f"[native_ckpt:mem] unavailable: {exc}", flush=True)  # noqa: T201
+
+    @staticmethod
+    def _run_pretrain_determinism_check(args: argparse.Namespace, cfg: str) -> None:  # noqa: C901, PLR0912, PLR0915 — sequential orchestration (run1 → save → wipe → run2 → diff)
+        """Run pretrain twice via srun and verify the two runs produce bit-identical
+        checkpoints — both the per-tensor trace (reference.metadata.info) and the
+        non-tensor state (common.pt).
+
+        This is the primary gate for pretrain-nvrx under --deterministic-mode: if
+        every kernel honours determinism, two back-to-back runs of identical training
+        code on identical hardware must produce identical checkpoint bytes at every
+        save iter. Any cross-run diff means residual non-determinism is leaking
+        through (custom kernels that bypass torch.use_deterministic_algorithms,
+        asynchronous reduction ordering, etc.). The reverse — pass — is a strong
+        foundation for the cross-provider check in pretrain-native.
+
+        Each srun reuses the existing in-srun flow (training + distcp_trace +
+        metadata/ baseline compare). The in-srun's metadata/-baseline compare may
+        soft-fail with exit 3 when the seeded baseline drifts; that's tolerated
+        here because the cross-run check is the real gate.
+
+        Layout (run-1 stashed in the sidecar, run-2 left in place):
+          ci-runs/<cfg>/checkpoints/iter_NNNNNNN/{reference.metadata.info,common.pt}      (run-2)
+          ci-runs/<cfg>/run1-references/iter_NNNNNNN/{reference.metadata.info,common.pt}  (run-1)
+        """
+        extra_args = getattr(args, "extra_args", None)
+        ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
+        phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
+        sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
+        machine = _platform_tag()
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = PretrainJob._build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
+        stem = _artifact_stem(machine, args.job, args.flavor_tag, cfg)
+
+        # phase1-checkpoints is wiped too so each run's phase 1 starts from random init.
+        for label, path in (("checkpoints", ckpt_dir), ("phase-1 checkpoints", phase1_dir), ("run-1 sidecar", sidecar_dir)):
+            if path.exists():
+                logger.info(f"[run_job] determinism: clearing prior {label} at {path}")
+                shutil.rmtree(path)
+
+        def _run(log_file: Path, banner: str) -> None:
+            logger.info(f"[run_job] {banner}: {' '.join(shlex.quote(c) for c in cmd)}")
+            shell_cmd = f"set -o pipefail; {' '.join(shlex.quote(c) for c in cmd)} 2>&1 | tee {shlex.quote(str(log_file))}"
+            rc = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", check=False).returncode  # noqa: S602
+            # rc == 3 → in-srun's lenient nvrx metadata-baseline compare flagged a
+            # diff vs metadata/. Tolerated; the cross-run compare below gates the job.
+            if rc not in (0, 3):
+                raise RuntimeError(f"{banner} failed with exit code {rc} — full log: {log_file}")
+            if rc == 3:  # noqa: PLR2004
+                logger.info(f"[run_job] {banner}: soft-failed vs metadata/ baseline (rc=3); continuing to cross-run compare")
+
+        def _collect_iter_refs(root: Path, label: str) -> list[Path]:
+            iter_dirs = sorted(root.glob("iter_*"))
+            if not iter_dirs:
+                raise RuntimeError(f"determinism: {label} produced no iter_* under {root}")
+            return iter_dirs
+
+        # --- Run 1: stash the per-tensor trace and the non-tensor state (common.pt) ---
+        _run(RESULTS_DIR / f"{stem}_run1.log", "determinism: run 1/2")
+        for iter_dir in _collect_iter_refs(ckpt_dir, "run 1/2"):
+            dst_dir = sidecar_dir / iter_dir.name
+            dst_dir.mkdir(parents=True)
+            for name in ("reference.metadata.info", "common.pt"):
+                src = iter_dir / name
+                if not src.is_file():
+                    raise RuntimeError(f"determinism: run 1/2 produced no {name} at {src}")
+                shutil.copy2(src, dst_dir / name)
+        logger.info(f"[run_job] determinism: saved run-1 references under {sidecar_dir}")
+
+        # Wipe so run-2 starts from a clean state (otherwise --load picks up run-1's
+        # iter_NNNNNNN and shortcuts the training). phase1-checkpoints is wiped too so
+        # run-2's phase 1 retrains from random init.
+        shutil.rmtree(ckpt_dir)
+        if phase1_dir.exists():
+            shutil.rmtree(phase1_dir)
+
+        # --- Run 2 ---
+        _run(RESULTS_DIR / f"{stem}_run2.log", "determinism: run 2/2")
+
+        # --- Cross-run diff: per-tensor trace (text) + common.pt (binary md5) ---
+        failures: list[str] = []
+        iter_dirs = _collect_iter_refs(ckpt_dir, "run 2/2")
+        for iter_dir in iter_dirs:
+            ref1, ref2 = sidecar_dir / iter_dir.name / "reference.metadata.info", iter_dir / "reference.metadata.info"
+            if not ref2.is_file():
+                raise RuntimeError(f"determinism: missing run-2 reference at {ref2}")
+            diff = list(
+                difflib.unified_diff(
+                    ref1.read_text().splitlines(),
+                    ref2.read_text().splitlines(),
+                    fromfile=str(ref1),
+                    tofile=str(ref2),
+                    n=1,
+                ),
+            )
+            if diff:
+                logger.info(f"[run_job] determinism FAIL on {iter_dir.name}: reference.metadata.info differs ({len(diff)} diff lines)")
+                for line in diff[:30]:
+                    logger.info(line.rstrip("\n"))
+                if len(diff) > 30:  # noqa: PLR2004
+                    logger.info(f"... ({len(diff) - 30} more diff lines suppressed; full files in artifacts)")
+                failures.append(f"{iter_dir.name}/reference.metadata.info")
+
+            common2 = iter_dir / "common.pt"
+            if not common2.is_file():
+                raise RuntimeError(f"determinism: missing run-2 common.pt at {common2}")
+            if _md5(sidecar_dir / iter_dir.name / "common.pt") != _md5(common2):
+                logger.info(f"[run_job] determinism FAIL on {iter_dir.name}: common.pt md5 differs between the two runs")
+                failures.append(f"{iter_dir.name}/common.pt")
+
+        if failures:
+            raise RuntimeError(
+                f"determinism check FAILED on {len(failures)} artifact(s): {', '.join(failures)}. "
+                f"Training is not bit-deterministic across runs even under --deterministic-mode — "
+                f"see the diff snippets above and the per-iter artifacts.",
+            )
+        logger.info(f"[run_job] determinism PASS: {len(iter_dirs)} iter(s) bit-identical (tensors + common.pt) across two nvrx runs")
 
 
 # ---------------------------------------------------------------------------
@@ -2307,11 +2261,12 @@ def _detect_local_gpu_count() -> int:
 
 
 def main() -> None:
-    sys.stdout.write(shlex.join(sys.argv) + "\n")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger.info(shlex.join(sys.argv))
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "job",
-        choices=["ckptbench", "pretrain-native", "pretrain-nvrx", "update_baselines"],
+        choices=["pretrain-native", "pretrain-nvrx", "update_baselines"],
     )
     p.add_argument("--nodes", type=int, default=1, help="Number of nodes (default: 1 — runs inline; >1 uses SLURM automatically)")
     p.add_argument(
@@ -2368,21 +2323,25 @@ def main() -> None:
     os.environ.update(build_env.build_env)
 
     if args.job == "update_baselines":
-        run_update_baselines(args)
+        BaselineUpdater.run_update_baselines(args)
         return
 
     # Workload jobs fail fast if a prior job left a checkpoint_server bound to the port
-    # (we don't force-kill it; see _require_no_checkpoint_server). Only meaningful on
+    # (we don't force-kill it; the guard refuses to start instead). Only meaningful on
     # compute nodes — the slurm launcher runs on the head node, where no server runs. The
-    # run's own server is spun down by its epilog (_ensure_server_down) or exits with the
+    # run's own server is spun down by its epilog or exits with the
     # process (ckptbench --inproc).
     if in_srun() or not args.slurm:
-        _require_no_checkpoint_server()
-    if args.job == "ckptbench":
-        run_ckptbench(args)
-    else:
-        run_pretrain(args)
+        CheckpointServer.require_no_checkpoint_server()
+    PretrainJob.run_pretrain(args)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == _PRETRAIN_ENTRY_CMD:
+        # Subprocess entry for the srun/torchrun paths: drop the sentinel and the phase that
+        # follows it, then run pretrain in-process. argv[0] is cosmetic; Megatron parses argv[1:].
+        ci_phase = int(sys.argv[2])
+        sys.argv = ["pretrain_hybrid.py", *sys.argv[3:]]
+        PretrainJob._pretrain_main(time.time(), ci_phase=ci_phase)
+    else:
+        main()
