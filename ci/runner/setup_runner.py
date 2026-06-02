@@ -7,11 +7,12 @@ nothing is read from environment variables.
 
 File layout under CI_DIR:
   token             Registration token (chmod 600). Written by you before running setup.
-  config            Key=value settings: GITLAB_URL, CLUSTER (required; the machine tag e.g.
-                    gb200/h200/devbox — GitLab runner tag + baseline namespace), CONCURRENT,
-                    GPUS_PER_NODE, SLURM_PARTITION (set => this cluster runs via SLURM; also the
-                    srun --partition). CLUSTER, GPUS_PER_NODE and SLURM_PARTITION are forwarded
-                    into the runner env for run_job.py.
+  config            Key=value settings: GITLAB_URL, PLATFORM (required; hardware platform e.g.
+                    gb200/h200/h100/devbox — the GitLab runner tag that routes jobs + baseline
+                    namespace), CLUSTER (required; datacenter e.g. cwdfw/ocihsg — selects the srun
+                    templates), CONCURRENT, GPUS_PER_NODE, SLURM_PARTITION (set => this cluster runs
+                    via SLURM; also the srun --partition). PLATFORM, CLUSTER, GPUS_PER_NODE and
+                    SLURM_PARTITION are forwarded into the runner env for run_job.py.
   srun.tmpl         (optional) per-cluster override of the job-launch srun template.
   image_build.tmpl  (optional) per-cluster override of the enroot squash-image build.
                     Drop either template file here to override the repo default for this
@@ -42,7 +43,9 @@ Usage:
 Config flags (setup/start). Each can be set in the config file or here; a value
 passed here overrides the config for this run AND is written back to the config,
 so it becomes the default on the next run (CLI wins, then caches):
-  --cluster NAME        Machine tag, e.g. gb200, h200, devbox              (CLUSTER)
+  --platform NAME       Hardware platform: GitLab runner tag + baseline namespace,
+                        e.g. gb200, h200, h100, devbox                     (PLATFORM)
+  --cluster NAME        Datacenter that selects the srun templates, e.g. cwdfw, ocihsg  (CLUSTER)
   --gitlab-url URL      GitLab base URL                                    (GITLAB_URL)
   --concurrent N        Max concurrent jobs for this runner                (CONCURRENT)
   --gpus-per-node N     GPUs per node for srun jobs on this cluster        (GPUS_PER_NODE)
@@ -105,6 +108,7 @@ def read_config(ci_dir: Path) -> dict:
     """
     cfg = {
         "GITLAB_URL": DEFAULT_GITLAB_URL,
+        "PLATFORM": "",
         "CLUSTER": "",
         "CONCURRENT": "4",
         "RUNNER_VERSION": "latest",
@@ -126,6 +130,7 @@ def read_config(ci_dir: Path) -> dict:
 # the default on the next run. Maps config key -> argparse dest.
 CLI_CONFIG_KEYS = {
     "GITLAB_URL": "gitlab_url",
+    "PLATFORM": "platform",
     "CLUSTER": "cluster",
     "CONCURRENT": "concurrent",
     "GPUS_PER_NODE": "gpus_per_node",
@@ -216,9 +221,9 @@ def install(ci_dir: Path, version: str, force: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register(ci_dir: Path, url: str, token: str, cluster: str, concurrent: int) -> None:
+def register(ci_dir: Path, url: str, token: str, platform_tag: str, cluster: str, concurrent: int) -> None:
     p = paths(ci_dir)
-    name = f"{cluster}-{socket.gethostname().split('.')[0]}-{os.environ.get('USER', 'runner')}"
+    name = f"{platform_tag}-{cluster}-{socket.gethostname().split('.')[0]}-{os.environ.get('USER', 'runner')}"
     p["builds"].mkdir(parents=True, exist_ok=True)
     p["cache"].mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -277,10 +282,12 @@ def start(ci_dir: Path) -> None:
     # Tell run_job.py where this runner's state lives so it finds override
     # templates (srun.tmpl / image_build.tmpl) placed next to the config.
     env["CI_DIR"] = ci_dir.as_posix()
-    # Machine identity (e.g. gb200): the GitLab tag + baseline-file namespace that
-    # run_job.py reads via _machine_tag().
-    if cfg.get("CLUSTER", ""):
-        env["CLUSTER"] = cfg["CLUSTER"]
+    # Hardware platform (e.g. gb200): the GitLab runner tag + baseline-file namespace
+    # that run_job.py reads via _platform_tag(). Fall back to CLUSTER for configs that
+    # predate the PLATFORM/CLUSTER split.
+    env["PLATFORM"] = cfg["PLATFORM"]
+    # Datacenter (e.g. cwdfw): selects the per-cluster srun/image_build templates.
+    env["CLUSTER"] = cfg["CLUSTER"]
     # SLURM partition: forwarded so run_job.py uses it as the srun --partition and
     # treats this cluster as SLURM-based (its presence is the slurm-vs-inline switch).
     if cfg.get("SLURM_PARTITION", ""):
@@ -356,7 +363,12 @@ def main() -> None:
     # Settings that can come from the config file or the command line. When passed
     # here they override the config for this run AND are written back to the config
     # so they become the defaults next run. Defaults are None = "not provided".
-    p.add_argument("--cluster", default=None, help="Machine tag (GitLab tag + baseline namespace), e.g. gb200/h200/devbox (persisted)")
+    p.add_argument(
+        "--platform",
+        default=None,
+        help="Hardware platform: GitLab runner tag + baseline namespace, e.g. gb200/h200/h100/devbox (persisted)",
+    )
+    p.add_argument("--cluster", default=None, help="Datacenter that selects the srun templates, e.g. cwdfw/ocihsg (persisted)")
     p.add_argument("--gitlab-url", default=None, dest="gitlab_url", help="GitLab base URL (persisted to config)")
     p.add_argument("--concurrent", default=None, help="Max concurrent jobs for this runner (persisted to config)")
     p.add_argument("--gpus-per-node", default=None, dest="gpus_per_node", help="GPUs per node for srun jobs (persisted to config)")
@@ -385,11 +397,13 @@ def main() -> None:
     cluster = cfg["CLUSTER"]
     if not cluster:
         die("CLUSTER is not set. Add 'CLUSTER=<name>' to ${env:HOME}/data/ci/config or pass --cluster <name>.")
+    if not cfg["PLATFORM"]:
+        die("PLATFORM is not set. Add 'PLATFORM=<name>' to ${env:HOME}/data/ci/config or pass --platform <name>.")
 
     if args.command == "setup":
         token = read_token(ci_dir)
         install(ci_dir, cfg["RUNNER_VERSION"], args.force_reinstall)
-        register(ci_dir, cfg["GITLAB_URL"], token, cluster, int(cfg["CONCURRENT"]))
+        register(ci_dir, cfg["GITLAB_URL"], token, cfg["PLATFORM"], cluster, int(cfg["CONCURRENT"]))
         start(ci_dir)
 
     elif args.command == "start":

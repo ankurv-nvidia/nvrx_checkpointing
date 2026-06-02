@@ -436,3 +436,12 @@ function(init_submodule path)
         COMMAND_ERROR_IS_FATAL ANY
     )
 endfunction()
+
+macro(DetectVar varName defaultValue)
+    if (DEFINED ENV{${varName}})
+        set(${varName} $ENV{${varName}})
+    endif()
+    if (NOT DEFINED ${varName})
+        set(${varName} ${defaultValue})
+    endif()
+endmacro()

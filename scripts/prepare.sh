@@ -209,8 +209,21 @@ function megatron {
     export MAX_JOBS=4
     export CC=gcc
     export CXX=g++
-    export TORCH_CUDA_ARCH_LIST=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1)
-    export NVTE_CUDA_ARCHS=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | sed 's/\.//')
+    # TransformerEngine's CMake recognizes only Blackwell family heads (100/120) and
+    # expands them into the CUDA-13 feature-suffixed gencode targets its kernels require
+    # (input 100 -> generic sm_100 plus arch-specific sm_100a and sm_103a). Map the live
+    # compute capability to the family head TE can expand; torch's arch list takes the raw cc.
+    # nvidia-smi prints one line per GPU; capture the full output and slice the first
+    # line in-shell. A truncating reader (head) closes the pipe early and SIGPIPEs
+    # nvidia-smi, which pipefail would turn into a fatal exit on multi-GPU nodes.
+    _COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)
+    _COMPUTE_CAP=${_COMPUTE_CAP%%$'\n'*}
+    export TORCH_CUDA_ARCH_LIST=${_COMPUTE_CAP}
+    case "${_COMPUTE_CAP}" in
+        10.*) export NVTE_CUDA_ARCHS=100 ;;   # Blackwell datacenter (sm_100/sm_103)
+        12.*) export NVTE_CUDA_ARCHS=120 ;;   # Blackwell consumer (sm_120)
+        *)    export NVTE_CUDA_ARCHS=$(echo "${_COMPUTE_CAP}" | sed 's/\.//') ;;  # pre-Blackwell: bare arch (9.0 -> 90)
+    esac
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
     curl -LsSf https://astral.sh/uv/install.sh | sh
     source $HOME/.local/bin/env

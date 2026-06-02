@@ -68,7 +68,9 @@ function build_image_base {
 	if [[ -e ${ENROOT_IMAGE_BASE} ]]; then
 		echo "using ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE}"
 	else
-		srun -l "${slurm_common_args[@]}" enroot import --output ${ENROOT_IMAGE_BASE} docker://${DOCKER_IMAGE_BASE}
+		rm -f "${ENROOT_IMAGE_BASE}.tmp"
+		srun -l "${slurm_common_args[@]}" enroot import --output ${ENROOT_IMAGE_BASE}.tmp docker://${DOCKER_IMAGE_BASE}
+		mv -f "${ENROOT_IMAGE_BASE}.tmp" "${ENROOT_IMAGE_BASE}"
 	fi
 	$*
 }
@@ -76,14 +78,16 @@ function build_image_base {
 
 function build {
 	build_image_base
+	rm -f "${ENROOT_IMAGE_OUT}.tmp"
 	srun -l \
 		"${slurm_common_args[@]}" \
 		${gpu_args} \
 		--container-mounts "${HOME}:${HOME},${HOME}:/root,/lustre:/lustre" \
 		--container-image "${ENROOT_IMAGE_BASE}" \
-		--container-save "${ENROOT_IMAGE_OUT}" \
+		--container-save "${ENROOT_IMAGE_OUT}.tmp" \
 		--container-writable \
 		bash -c "bash ${SCRIPT_DIR}/prepare.sh ubuntu2404 megatron test"
+	mv -f "${ENROOT_IMAGE_OUT}.tmp" "${ENROOT_IMAGE_OUT}"
 	$*
 }
 

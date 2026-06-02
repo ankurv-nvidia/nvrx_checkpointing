@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.31)
 project(phoenix)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -7,19 +7,6 @@ set(VCPKG_AUTOCLONE_COMMIT "2026.02.27" CACHE STRING "The commit to clone vcpkg 
 set(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR ON CACHE BOOL "Allow vcpkg to be found in the binary directory if not found in the source directory")
 
 include(CMakeDependentOption)
-
-# Valgrind build mode: triggered by env var PHOENIX_BUILD_FOR_VALGRIND=1
-# (set by ci/scripts/run_job.py for the `valgrind` job). Two effects:
-#   1. Force BUILDENV_DISABLE_MARCH_NATIVE so BuildEnv.cmake omits -march=native
-#      (valgrind doesn't model host-specific instructions and will SIGILL).
-#   2. Define PHOENIX_BUILD_FOR_VALGRIND=1 globally so headers like
-#      src/checkpoint/messages.h can shrink ring-buffer sizes and thread counts
-#      to keep valgrind's address-space and shadow-memory footprint manageable.
-if (DEFINED ENV{PHOENIX_BUILD_FOR_VALGRIND} AND NOT "$ENV{PHOENIX_BUILD_FOR_VALGRIND}" STREQUAL "" AND NOT "$ENV{PHOENIX_BUILD_FOR_VALGRIND}" STREQUAL "0")
-    message(STATUS "PHOENIX_BUILD_FOR_VALGRIND is set: disabling -march=native and shrinking D2H buffer sizes")
-    set(BUILDENV_DISABLE_MARCH_NATIVE ON)
-    add_compile_definitions(PHOENIX_BUILD_FOR_VALGRIND=1)
-endif()
 
 include(BuildEnv)
 include(vcpkg)
@@ -44,6 +31,26 @@ option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"         ON)
 option(PHOENIX_BUILD_TORCH_BINDINGS     "Build PyTorch Bindings"        ON)
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"         ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"  OFF)
+option(PHOENIX_BUILD_FOR_PERF "Build with full perf at the cost of increased resource usage" OFF)
+option(PHOENIX_BUILD_FOR_VALGRIND "Build with reduced memory usage" OFF)
+
+DetectVar(PHOENIX_BUILD_FOR_PERF OFF)
+DetectVar(PHOENIX_BUILD_FOR_VALGRIND OFF)
+
+if (PHOENIX_BUILD_FOR_PERF AND PHOENIX_BUILD_FOR_VALGRIND)
+    message(FATAL_ERROR "PHOENIX_BUILD_FOR_PERF and PHOENIX_BUILD_FOR_VALGRIND are mutually exclusive")
+endif()
+
+if (PHOENIX_BUILD_FOR_VALGRIND)
+    message(STATUS "PHOENIX_BUILD_FOR_VALGRIND is set: disabling -march=native and shrinking D2H buffer sizes")
+    set(BUILDENV_DISABLE_MARCH_NATIVE ON)
+    add_compile_definitions(PHOENIX_BUILD_FOR_VALGRIND=1)
+endif()
+
+if (PHOENIX_BUILD_FOR_PERF)
+    message(STATUS "PHOENIX_BUILD_FOR_PERF is set:  maxing out D2H buffer sizes")
+    add_compile_definitions(PHOENIX_BUILD_FOR_PERF=1)
+endif()
 
 # The pure-C++ distcp writer no longer requires Python; the Python bindings
 # block stays optional. Disabling it skips `_distcp_shim` and the pytest-driven

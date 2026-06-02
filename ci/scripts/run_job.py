@@ -36,26 +36,30 @@ SLURM vs inline mode is inferred from SLURM_PARTITION (set per cluster at runner
 set => run via SLURM, unset => inline. The CI YAML carries no --slurm flag; --slurm still
 forces it for manual/local runs.
 
-SLURM commands come from template files (see TEMPLATES_DIR below):
+SLURM commands come from template files (see TEMPLATES_DIR below), selected by CLUSTER:
   srun.tmpl         shared launch command for every job (pretrain/ckptbench)
   image_build.tmpl  build the enroot squash image
-  The repo ships cw-dfw defaults; a runner overrides one by placing a file of the
-  same name next to its config (CI_DIR, e.g. ~/data/ci/srun.tmpl). Account,
+  The repo ships cw-dfw defaults; a runner overrides one either with a repo
+  per-cluster file <cluster>.<name> (e.g. cwdfw.srun.tmpl) or by placing a file of
+  the same name next to its config (CI_DIR, e.g. ~/data/ci/srun.tmpl). Account,
   partition, mounts and GPU-request syntax all live in those files.
 
 Other settings (via environment variables):
   ENROOT_IMAGE            ${HOME}/data/native.<hash>.sqsh
                             (hash = first 10 hex of sha256(megatron/native/scripts/prepare.sh);
                             changing prepare.sh causes a rebuild under a new filename)
+  PLATFORM                hardware platform (gb200/h200/h100/devbox): the GitLab runner tag that
+                            routes jobs, and the baseline-file namespace
+  CLUSTER                 datacenter/cluster (cwdfw/ocihsg/...): selects the per-cluster srun templates
   GPUS_PER_NODE           GPUs per node (set at runner setup); default when --gpus-per-node is omitted
   SLURM_PARTITION         set by runner setup; when set, run via SLURM and use it as the srun --partition
   CI_DIR                  runner state dir holding config + override templates (default ~/data/ci)
 
-Outputs (auto-derived from job, flavor, and config; the <flavor_tag> segment is
+Outputs (auto-derived from platform, job, flavor, and config; the <flavor_tag> segment is
 omitted for jobs without flavors, e.g. ckptbench):
-  Logs:      <megatron_root>/megatron/native/ci/ci-results/<machine>_<job>_<flavor_tag>_<config>.log
-  Reports:   <megatron_root>/megatron/native/ci/ci-results/<machine>_<job>_<flavor_tag>_<config>_report.json
-  Baselines: <script_dir>/../baselines/<machine>_<job>_<flavor_tag>_<config>.yaml
+  Logs:      <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>.log
+  Reports:   <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>_report.json
+  Baselines: <script_dir>/../baselines/<platform>_<job>_<flavor_tag>_<config>.yaml
 
 Exit codes:
   0  Job succeeded and all perf metrics within tolerance (or --skip-perf)
@@ -146,12 +150,16 @@ def _image_path() -> Path:
     return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
 
 
-def _machine_tag() -> str:
-    """Short machine identifier used to namespace baseline files (e.g. gb200).
+def _platform_tag() -> str:
+    """Hardware platform identifier used to namespace baseline files (e.g. gb200, h200, h100).
 
-    Comes from CLUSTER (set per runner at setup); falls back to the hostname stem.
+    Comes from PLATFORM (set per runner at setup), which is also the GitLab runner
+    tag that routes jobs. Falls back to CLUSTER for runners predating the
+    PLATFORM/CLUSTER split, then to the hostname stem. Perf baselines key on this,
+    so one GPU platform shares baselines across clusters; CLUSTER (which selects the
+    srun templates) does not enter the baseline name.
     """
-    tag = os.environ.get("CLUSTER", "").strip()
+    tag = os.environ.get("PLATFORM", "").strip()
     return tag or socket.gethostname().split(".")[0]
 
 
@@ -312,6 +320,9 @@ class PerfFlavor(Flavor):
     """
 
     name = "perf"
+
+    def transform(self, recipe: Recipe) -> None:
+        recipe.build_env["PHOENIX_BUILD_FOR_PERF"] = "1"
 
     def epilog(self, ctx: RunCtx) -> None:
         if ctx.log_file is None or ctx.args.skip_perf:
@@ -723,11 +734,12 @@ def _require_no_checkpoint_server() -> None:
 #   srun.tmpl         shared launch command for every job (pretrain/ckptbench)
 #   image_build.tmpl  build the enroot squash image
 #
-# The repo ships the defaults (modelling cw-dfw) under TEMPLATES_DIR. A runner
-# overrides one per cluster by dropping a file of the same name next to its
-# config (in CI_DIR, e.g. ~/data/ci/srun.tmpl); when absent, the repo default is
-# used. Per-run values arrive as ${...} placeholders; cluster constants
-# (account, partition, mounts, ...) are written into the file itself.
+# The repo ships the generic defaults (modelling cw-dfw) under TEMPLATES_DIR.
+# Templates are selected by CLUSTER (the datacenter, e.g. cwdfw/ocihsg): a runner
+# overrides one either with a repo per-cluster file <cluster>.<name> or by dropping
+# a file of the same name next to its config (in CI_DIR, e.g. ~/data/ci/srun.tmpl);
+# when absent, the generic default is used. Per-run values arrive as ${...}
+# placeholders; cluster constants (account, partition, mounts, ...) live in the file.
 
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 
@@ -746,7 +758,7 @@ def _load_template(name: str) -> str:
     """Return template `name`, searched in priority order:
 
     1. CI_DIR/<name>                  — per-runner override next to the config
-    2. TEMPLATES_DIR/<cluster>.<name> — repo cluster-specific default (e.g. gb200.srun.tmpl)
+    2. TEMPLATES_DIR/<cluster>.<name> — repo cluster-specific default (e.g. cwdfw.srun.tmpl)
     3. TEMPLATES_DIR/<name>           — repo generic default
     """
     cluster = os.environ.get("CLUSTER", "").strip()
@@ -936,10 +948,15 @@ def run_pretrain(args: argparse.Namespace) -> None:
         # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
         nodes = int(os.environ.get("SLURM_NNODES", "1"))
         cfg = f"{nodes}x{args.gpus_per_node}"
-        ctx = RunCtx(args, args.job, cfg, provider, _machine_tag(), args.flavors)
+        ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
         with _flavored_run(ctx):
             cmd, env = _pretrain_cmd_and_env(
-                cfg, nodes, args.gpus_per_node, ckpt_provider=provider, flavors=args.flavors, extra_args=extra_args,
+                cfg,
+                nodes,
+                args.gpus_per_node,
+                ckpt_provider=provider,
+                flavors=args.flavors,
+                extra_args=extra_args,
             )
             subprocess.run(cmd, env=env, check=True)
         return
@@ -955,7 +972,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
     if ckpt_dir.exists():
         shutil.rmtree(ckpt_dir)
 
-    ctx = RunCtx(args, args.job, cfg, provider, _machine_tag(), args.flavors)
+    ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
     ctx.log_file = RESULTS_DIR / f"{ctx.stem}.log"
     if args.nodes > 1 or args.slurm:
         # Launcher: training + worker epilogs run in the srun task; _flavored_run here tees
@@ -966,7 +983,13 @@ def run_pretrain(args: argparse.Namespace) -> None:
     elif args.gpus_per_node > 1:
         # Multi-GPU devbox: torchrun subprocess so worker output is captured in the log.
         cmd, env = _pretrain_cmd_and_env(
-            cfg, args.nodes, args.gpus_per_node, use_torchrun=True, ckpt_provider=provider, flavors=args.flavors, extra_args=extra_args,
+            cfg,
+            args.nodes,
+            args.gpus_per_node,
+            use_torchrun=True,
+            ckpt_provider=provider,
+            flavors=args.flavors,
+            extra_args=extra_args,
         )
         with _flavored_run(ctx):
             ctx.soft_fail = _tee_run(cmd, ctx.log_file, env=env) == _SOFT_FAIL_RC
@@ -1555,7 +1578,7 @@ def _tee_run(cmd: list[str], log_file: Path, env: dict | None = None) -> int:
 
 def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.Namespace, env: dict | None = None) -> None:
     """Tee a non-pretrain job (ckptbench), parse its perf metrics, gate on the baseline."""
-    stem = _artifact_stem(_machine_tag(), job, args.flavor_tag, config)
+    stem = _artifact_stem(_platform_tag(), job, args.flavor_tag, config)
     log_file = RESULTS_DIR / f"{stem}.log"
     if args.skip_perf:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1565,9 +1588,14 @@ def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.N
         return
     rc = _tee_run(cmd, log_file, env)
     passed = _parse_and_report(
-        job, config, args.flavor_tag, log_file,
-        BASELINES_DIR / f"{stem}.yaml", RESULTS_DIR / f"{stem}_report.json",
-        args.update_baseline, args.gpus_per_node,
+        job,
+        config,
+        args.flavor_tag,
+        log_file,
+        BASELINES_DIR / f"{stem}.yaml",
+        RESULTS_DIR / f"{stem}_report.json",
+        args.update_baseline,
+        args.gpus_per_node,
     )
     if not passed or rc == _SOFT_FAIL_RC:
         sys.exit(_SOFT_FAIL_RC)
@@ -1602,7 +1630,7 @@ def _run_pretrain_determinism_check(args: argparse.Namespace, cfg: str) -> None:
     extra_args = getattr(args, "extra_args", None)
     ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
     sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
-    machine = _machine_tag()
+    machine = _platform_tag()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     cmd = _build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
     stem = _artifact_stem(machine, args.job, args.flavor_tag, cfg)
@@ -1985,7 +2013,7 @@ def run_update_baselines(args: argparse.Namespace) -> None:
 
     Job/config are auto-detected from CI_JOB_NAME; override with --filter.
     """
-    machine = _machine_tag()
+    machine = _platform_tag()
     filter_job, filter_config, filter_flavor = _parse_job_filter(args)
 
     # Only the perf flavor (and ckptbench) emit *_report.json; deterministic/nvrx

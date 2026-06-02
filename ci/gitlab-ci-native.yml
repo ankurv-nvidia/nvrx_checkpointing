@@ -32,22 +32,25 @@ stages:
   before_script:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
-    # Source the cluster config (CLUSTER + env vars like VCPKG_ROOT). CLUSTER is the
-    # machine tag run_job.py uses to namespace baselines; setup_runner forwards it into
-    # the runner env. Export it here too (with a devbox fallback) so it reaches run_job
-    # on local/unconfigured runs.
+    # Source the runner config (PLATFORM/CLUSTER + env vars like VCPKG_ROOT) and export
+    # both for run_job.py. PLATFORM (gb200/h200/...) is the GitLab tag + baseline namespace;
+    # CLUSTER (cwdfw/ocihsg/...) selects the srun templates. setup_runner forwards both into
+    # the runner env; re-export here (with fallbacks) so they reach run_job on local runs.
+    # PLATFORM falls back to CLUSTER for configs predating the split, CLUSTER to devbox.
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
     - export CLUSTER="${CLUSTER:-devbox}"
-    - echo "=== CLUSTER=${CLUSTER} ==="
+    - export PLATFORM="${PLATFORM:-${CLUSTER}}"
+    - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
 
 # ---------------------------------------------------------------------------
-# Per-runner templates: just the GitLab tag that routes jobs to each runner.
+# Per-runner templates: just the GitLab tag (the PLATFORM) that routes jobs.
 #
-# Nothing cluster-specific is set here — GPUs-per-node, SLURM/inline mode and the
-# machine tag are all configured per cluster at runner setup and forwarded into
-# the runner environment (GPUS_PER_NODE, SLURM_PARTITION, CLUSTER; see setup_runner.py).
-# run_job.py honors them, so the same JOB_ARGS run on any cluster — no
-# --gpus-per-node and no --slurm flag in the YAML.
+# Nothing cluster-specific is set here — GPUs-per-node, SLURM/inline mode, PLATFORM and
+# CLUSTER are all configured per runner at setup and forwarded into the runner
+# environment (GPUS_PER_NODE, SLURM_PARTITION, PLATFORM, CLUSTER; see setup_runner.py).
+# PLATFORM (gb200/h200/...) is the runner tag + baseline namespace; CLUSTER (cwdfw/...)
+# selects the srun templates. run_job.py honors them, so the same JOB_ARGS run on any
+# cluster — no --gpus-per-node and no --slurm flag in the YAML.
 # ---------------------------------------------------------------------------
 .runner_gb200:
   tags: [gb200]
@@ -103,9 +106,8 @@ stages:
 # jobs that are useful on demand (e.g. cross-provider baseline checks) but
 # too expensive or noisy to run on every commit.
 .manual_optional:
-  rules:
-    - when: manual
-      allow_failure: true
+  when: manual
+  allow_failure: true
 
 # ---------------------------------------------------------------------------
 # Build the enroot squash image once, up front, in the build stage.
@@ -202,28 +204,28 @@ devbox:pretrain-native:1x2:deterministic:
 
 # pretrain-nvrx: cross-run determinism gate (requires the deterministic flavor).
 gb200:pretrain-nvrx:1x4:deterministic:
-  extends: [.run_job, .runner_gb200, .manual_optional, .needs_gb200_image]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
   variables:
     JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
 h200:pretrain-nvrx:1x8:deterministic:
-  extends: [.run_job, .runner_h200, .manual_optional, .needs_h200_image]
+  extends: [.run_job, .runner_h200, .needs_h200_image, .manual_optional]
   variables:
     JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
 devbox:pretrain-nvrx:1x2:deterministic:
-  extends: [.run_job, .runner_devbox, .manual_optional, .needs_devbox_image]
+  extends: [.run_job, .runner_devbox, .needs_devbox_image, .manual_optional]
   variables:
     JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
 # 16-node perf scale runs: clusters only, manual trigger.
 gb200:pretrain:16x4:perf:
-  extends: [.run_job, .runner_gb200, .manual_optional, .needs_gb200_image]
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
   variables:
     JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
 
 h200:pretrain:16x8:perf:
-  extends: [.run_job, .runner_h200, .manual_optional, .needs_h200_image]
+  extends: [.run_job, .runner_h200, .needs_h200_image, .manual_optional]
   variables:
     JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
 
