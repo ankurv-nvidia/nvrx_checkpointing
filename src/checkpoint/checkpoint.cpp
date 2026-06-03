@@ -508,7 +508,6 @@ void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, s
 {
     StateSerDes::DebugDumpLocalStateTreeKVP(ckptPath / fmt::format("cli_metadata_{}.txt", root.GlobalRank()), root);
     fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Saving Checkpoint to dir {}\n", root.GlobalRank(), ckptPath.string());
-    SvcPing();
     CheckpointWriter writer{root};
     writer.SendToServer(snapshotId, ckptPath);
 }
@@ -522,7 +521,7 @@ void WaitForCheckpointSave(RankTopology const& topo)
 void FinalizeStateRegistry(StateTree& self)
 {
     fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Finalizing State Registry\n", self.Topo().rank);
-    SvcPing();
+    SvcPing();    // TODO: Get rid of this
     SetThreadName("ncc:finst");
     auto const& topo     = self.Topo();
     auto&       msgQueue = CheckpointWriter::GetMsgQueue(topo);

@@ -27,15 +27,24 @@ using Rank = ::Rank;
 // rank plus many 8 MiB writer-thread stacks, which exhausts valgrind's
 // shadow memory / segment table on multi-rank runs. Shrink aggressively when
 // building specifically for a valgrind run.
-static constexpr size_t D2HNumConcurrency = 2;
-static constexpr size_t D2HBufferCount    = 4;
-static constexpr size_t D2HBufferSize     = size_t{4u} * 1024u * 1024u;
+static constexpr size_t  TotalShmSize      = 128ull * 1024ull * 1024ull;
+static constexpr size_t  D2HNumConcurrency = 2;
+static constexpr size_t  D2HBufferCount    = 4;
+static constexpr uint8_t MaxRanksPerNode   = 2;
+#elif (defined PHOENIX_BUILD_FOR_PERF)
+static constexpr size_t  TotalShmSize      = 24ull * 1024ull * 1024ull * 1024ull;
+static constexpr size_t  D2HNumConcurrency = 4;
+static constexpr size_t  D2HBufferCount    = 32;
+static constexpr uint8_t MaxRanksPerNode   = 4;
 #else
-static constexpr size_t D2HNumConcurrency = 4;
-static constexpr size_t D2HBufferCount    = 32;
-static constexpr size_t D2HBufferSize     = size_t{32u} * 1024u * 1024u;
+static constexpr size_t  TotalShmSize      = 8ull * 1024ull * 1024ull * 1024ull;    // 8GB
+static constexpr size_t  D2HNumConcurrency = 4;
+static constexpr size_t  D2HBufferCount    = 32;
+static constexpr uint8_t MaxRanksPerNode   = 8;
 #endif
-static constexpr uint8_t MaxRanksPerNode = 8;
+
+static constexpr size_t D2HBufferSize = TotalShmSize / D2HBufferCount / MaxRanksPerNode;    // 512MB
+
 /*
 A server can contain multiple sessions
 A session consist of multiple peers(ranks) participating in a distributed job
