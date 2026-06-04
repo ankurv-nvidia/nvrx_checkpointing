@@ -33,7 +33,7 @@ stages:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
     # Source the runner config (PLATFORM/CLUSTER + env vars like VCPKG_ROOT) and export
-    # both for run_job.py. PLATFORM (gb200/h200/...) is the GitLab tag + baseline namespace;
+    # both for run_job.py. PLATFORM (gb200/h100/...) is the GitLab tag + baseline namespace;
     # CLUSTER (cwdfw/ocihsg/...) selects the srun templates. setup_runner forwards both into
     # the runner env; re-export here (with fallbacks) so they reach run_job on local runs.
     # PLATFORM falls back to CLUSTER for configs predating the split, CLUSTER to devbox.
@@ -48,15 +48,15 @@ stages:
 # Nothing cluster-specific is set here — GPUs-per-node, SLURM/inline mode, PLATFORM and
 # CLUSTER are all configured per runner at setup and forwarded into the runner
 # environment (GPUS_PER_NODE, SLURM_PARTITION, PLATFORM, CLUSTER; see setup_runner.py).
-# PLATFORM (gb200/h200/...) is the runner tag + baseline namespace; CLUSTER (cwdfw/...)
+# PLATFORM (gb200/h100/...) is the runner tag + baseline namespace; CLUSTER (cwdfw/...)
 # selects the srun templates. run_job.py honors them, so the same JOB_ARGS run on any
 # cluster — no --gpus-per-node and no --slurm flag in the YAML.
 # ---------------------------------------------------------------------------
 .runner_gb200:
   tags: [gb200]
 
-.runner_h200:
-  tags: [h200]
+.runner_h100:
+  tags: [h100]
 
 .runner_devbox:
   tags: [devbox]
@@ -135,11 +135,8 @@ stages:
 gb200:prepare-image:
   extends: [.prepare_image, .runner_gb200]
 
-h200:prepare-image:
-  extends: [.prepare_image, .runner_h200]
-
-devbox:prepare-image:
-  extends: [.prepare_image, .runner_devbox]
+h100:prepare-image:
+  extends: [.prepare_image, .runner_h100]
 
 # Each test job depends only on its own runner's prepare-image job (DAG via
 # needs), so it starts as soon as that image is ready without waiting on the
@@ -149,118 +146,11 @@ devbox:prepare-image:
   needs:
     - job: gb200:prepare-image
       artifacts: false
-.needs_h200_image:
+.needs_h100_image:
   needs:
-    - job: h200:prepare-image
-      artifacts: false
-.needs_devbox_image:
-  needs:
-    - job: devbox:prepare-image
+    - job: h100:prepare-image
       artifacts: false
 
-# ---------------------------------------------------------------------------
-# Stage: test
-# ---------------------------------------------------------------------------
-gb200:ckptbench:1x4:
-  extends: [.run_ckptbench, .runner_gb200, .needs_gb200_image]
-
-h200:ckptbench:1x8:
-  extends: [.run_ckptbench, .runner_h200, .needs_h200_image]
-
-devbox:ckptbench:1x2:
-  extends: [.run_ckptbench, .runner_devbox, .needs_devbox_image]
-
-# pretrain-native: perf measurement (default flavor) and deterministic validation
-# (cross-provider md5 vs the nvrx baseline in metadata/) run as separate jobs so
-# perf isn't skewed by --deterministic-mode and each keeps its own baseline.
-gb200:pretrain-native:1x4:perf:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
-
-h200:pretrain-native:1x8:perf:
-  extends: [.run_job, .runner_h200, .needs_h200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
-
-devbox:pretrain-native:1x2:perf:
-  extends: [.run_job, .runner_devbox, .needs_devbox_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
-
-gb200:pretrain-native:1x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
-
-h200:pretrain-native:1x8:deterministic:
-  extends: [.run_job, .runner_h200, .needs_h200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
-
-devbox:pretrain-native:1x2:deterministic:
-  extends: [.run_job, .runner_devbox, .needs_devbox_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
-
-# pretrain-nvrx: cross-run determinism gate (requires the deterministic flavor).
-gb200:pretrain-nvrx:1x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
-
-h200:pretrain-nvrx:1x8:deterministic:
-  extends: [.run_job, .runner_h200, .needs_h200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
-
-devbox:pretrain-nvrx:1x2:deterministic:
-  extends: [.run_job, .runner_devbox, .needs_devbox_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
-
-# 16-node perf scale runs: clusters only, manual trigger.
-gb200:pretrain:16x4:perf:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
-
-h200:pretrain:16x8:perf:
-  extends: [.run_job, .runner_h200, .needs_h200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
-
-# Valgrind: memcheck the checkpoint_server under the deterministic flavor (the
-# numerics CI normally validates). valgrind slows the server ~10-50x, so metrics
-# are informational (no valgrind baseline). Devbox runs locally (no srun) —
-# valgrind must be installed on the runner host.
-gb200:valgrind:1x4:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
-
-h200:valgrind:1x8:
-  extends: [.run_job, .runner_h200, .needs_h200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
-
-devbox:valgrind:1x2:
-  extends: [.run_job, .runner_devbox, .needs_devbox_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
-
-# ---------------------------------------------------------------------------
-# Stage: update — update baselines from report files produced by test stage.
-#
-# No benchmarks are re-run. Each update job uses `needs:` (DAG mode) so it
-# becomes playable as soon as its single matching test job completes, without
-# waiting for the rest of the test stage. `needs:` also implicitly downloads
-# artifacts from the listed job — so we only see that job's artifacts, which
-# avoids one runner committing metadata files produced by another cluster's
-# test run. Triggerable even when the test job failed with exit 3 (perf
-# regression) because artifacts use `when: always` and the upstream is
-# `allow_failure`.
-# ---------------------------------------------------------------------------
 .update_baseline_base:
   extends: .ci_base
   stage: update
@@ -290,74 +180,153 @@ devbox:valgrind:1x2:
         git push origin "HEAD:${CI_COMMIT_BRANCH}"
       fi
 
-gb200:ckptbench:1x4:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: gb200:ckptbench:1x4
-      artifacts: true
+00.devbox:ckptbench:1x2:
+  extends: [.run_ckptbench, .runner_devbox]
 
-h200:ckptbench:1x8:update_baselines:
-  extends: [.update_baseline_base, .runner_h200]
-  needs:
-    - job: h200:ckptbench:1x8
-      artifacts: true
-
-devbox:ckptbench:1x2:update_baselines:
+00.devbox:ckptbench:1x2:update_baselines:
   extends: [.update_baseline_base, .runner_devbox]
   needs:
-    - job: devbox:ckptbench:1x2
+    - job: 00.devbox:ckptbench:1x2
       artifacts: true
 
-gb200:pretrain-native:1x4:perf:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: gb200:pretrain-native:1x4:perf
-      artifacts: true
+01.devbox:pretrain-native:1x2:deterministic:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic"
 
-h200:pretrain-native:1x8:perf:update_baselines:
-  extends: [.update_baseline_base, .runner_h200]
-  needs:
-    - job: h200:pretrain-native:1x8:perf
-      artifacts: true
-
-devbox:pretrain-native:1x2:perf:update_baselines:
+01.devbox:pretrain-native:1x2:deterministic:update_baselines:
   extends: [.update_baseline_base, .runner_devbox]
   needs:
-    - job: devbox:pretrain-native:1x2:perf
+    - job: 01.devbox:pretrain-native:1x2:deterministic
       artifacts: true
 
-gb200:pretrain-native:1x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: gb200:pretrain-native:1x4:deterministic
-      artifacts: true
+02.devbox:pretrain-native:1x2:perf:
+  extends: [.run_job, .runner_devbox]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor perf"
 
-h200:pretrain-native:1x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h200]
-  needs:
-    - job: h200:pretrain-native:1x8:deterministic
-      artifacts: true
-
-devbox:pretrain-native:1x2:deterministic:update_baselines:
+02.devbox:pretrain-native:1x2:perf:update_baselines:
   extends: [.update_baseline_base, .runner_devbox]
   needs:
-    - job: devbox:pretrain-native:1x2:deterministic
+    - job: 02.devbox:pretrain-native:1x2:perf
       artifacts: true
 
-gb200:pretrain-nvrx:1x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: gb200:pretrain-nvrx:1x4:deterministic
-      artifacts: true
+03.devbox:pretrain-nvrx:1x2:deterministic:
+  extends: [.run_job, .runner_devbox, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
 
-h200:pretrain-nvrx:1x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h200]
-  needs:
-    - job: h200:pretrain-nvrx:1x8:deterministic
-      artifacts: true
-
-devbox:pretrain-nvrx:1x2:deterministic:update_baselines:
+03.devbox:pretrain-nvrx:1x2:deterministic:update_baselines:
   extends: [.update_baseline_base, .runner_devbox]
   needs:
-    - job: devbox:pretrain-nvrx:1x2:deterministic
+    - job: 03.devbox:pretrain-nvrx:1x2:deterministic
       artifacts: true
+
+zy.devbox:valgrind:1x2:
+  extends: [.run_job, .runner_devbox, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
+
+10.gb200:ckptbench:1x4:
+  extends: [.run_ckptbench, .runner_gb200, .needs_gb200_image]
+
+10.gb200:ckptbench:1x4:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 10.gb200:ckptbench:1x4
+      artifacts: true
+
+11.gb200:pretrain-native:1x4:deterministic:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic"
+
+11.gb200:pretrain-native:1x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 11.gb200:pretrain-native:1x4:deterministic
+      artifacts: true
+
+12.gb200:pretrain-native:1x4:perf:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor perf"
+
+12.gb200:pretrain-native:1x4:perf:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 12.gb200:pretrain-native:1x4:perf
+      artifacts: true
+
+13.gb200:pretrain-nvrx:1x4:deterministic:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
+
+13.gb200:pretrain-nvrx:1x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 13.gb200:pretrain-nvrx:1x4:deterministic
+      artifacts: true
+
+zy.gb200:valgrind:1x4:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
+
+zz.gb200:pretrain:16x4:perf:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
+
+20.h100:ckptbench:1x8:
+  extends: [.run_ckptbench, .runner_h100, .needs_h100_image]
+
+20.h100:ckptbench:1x8:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 20.h100:ckptbench:1x8
+      artifacts: true
+
+21.h100:pretrain-native:1x8:deterministic:
+  extends: [.run_job, .runner_h100, .needs_h100_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic"
+
+21.h100:pretrain-native:1x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 21.h100:pretrain-native:1x8:deterministic
+      artifacts: true
+
+22.h100:pretrain-native:1x8:perf:
+  extends: [.run_job, .runner_h100, .needs_h100_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor perf"
+
+22.h100:pretrain-native:1x8:perf:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 22.h100:pretrain-native:1x8:perf
+      artifacts: true
+
+23.h100:pretrain-nvrx:1x8:deterministic:
+  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
+
+23.h100:pretrain-nvrx:1x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 23.h100:pretrain-nvrx:1x8:deterministic
+      artifacts: true
+
+zy.h100:valgrind:1x8:
+  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
+
+zz.h100:pretrain:16x8:perf:
+  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"

@@ -29,7 +29,7 @@ does th ├── token             ← registration token (you write this, chmo
 
 1. Go to **https://gitlab-master.nvidia.com/ankurv/\<project\>/-/settings/ci_cd**
 2. Expand **Runners → New project runner**
-3. Set a description (e.g. `gb200 on cwdfw`) and the tag that routes jobs to this runner — the **PLATFORM**, e.g. `gb200` / `h200` / `h100` / `devbox` — then click **Create runner**
+3. Set a description (e.g. `gb200 on cwdfw`) and the tag that routes jobs to this runner — the **PLATFORM**, e.g. `gb200` / `h100` / `h100` / `devbox` — then click **Create runner**
 4. Copy the token — it starts with `glrt-`
 
 > The token is **single-use**. After `setup` succeeds, it is exchanged for a persistent auth token stored in `config.toml`. If a previous `setup` attempt failed (e.g. due to wrong URL), the token may already be consumed — go back to GitLab and create a fresh one.
@@ -52,10 +52,10 @@ chmod 600 $CI_DIR/token
 # Write settings
 cat > $CI_DIR/config <<EOF
 GITLAB_URL=https://gitlab-master.nvidia.com
-PLATFORM=gb200       # required — hardware platform: GitLab runner tag + baseline namespace (gb200/h200/h100/devbox)
+PLATFORM=gb200       # required — hardware platform: GitLab runner tag + baseline namespace (gb200/h100/h100/devbox)
 CLUSTER=cwdfw        # required — datacenter that selects the srun templates (cwdfw/ocihsg/...)
 CONCURRENT=4
-GPUS_PER_NODE=4      # GPUs per node for srun jobs on this cluster (gb200=4, h200=8, devbox=2)
+GPUS_PER_NODE=4      # GPUs per node for srun jobs on this cluster (gb200=4, h100=8, devbox=2)
 SLURM_PARTITION=batch # set => this cluster runs via SLURM (and the srun --partition); omit => inline (e.g. devbox)
 EOF
 chmod 600 $CI_DIR/config
@@ -64,7 +64,7 @@ chmod 600 $CI_DIR/config
 `PLATFORM`, `CLUSTER`, `GPUS_PER_NODE` and `SLURM_PARTITION` live here (per runner)
 rather than in the CI YAML, so the pipeline stays cluster-agnostic — no `--gpus-per-node`
 and no `--slurm` flag in `JOB_ARGS`. `setup_runner.py` forwards them (and `CI_DIR`) into
-the runner environment, which `run_job.py` honors. `PLATFORM` (gb200/h200/h100/devbox)
+the runner environment, which `run_job.py` honors. `PLATFORM` (gb200/h100/h100/devbox)
 is the hardware identity: it matches the GitLab runner tag that routes jobs here and
 namespaces the baseline files (`<PLATFORM>_<job>_<config>.yaml`). `CLUSTER`
 (cwdfw/ocihsg/...) is the datacenter: it selects the per-cluster srun/image_build

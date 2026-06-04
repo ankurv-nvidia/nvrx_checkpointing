@@ -8,7 +8,7 @@ nothing is read from environment variables.
 File layout under CI_DIR:
   token             Registration token (chmod 600). Written by you before running setup.
   config            Key=value settings: GITLAB_URL, PLATFORM (required; hardware platform e.g.
-                    gb200/h200/h100/devbox — the GitLab runner tag that routes jobs + baseline
+                    gb200/h100/h100/devbox — the GitLab runner tag that routes jobs + baseline
                     namespace), CLUSTER (required; datacenter e.g. cwdfw/ocihsg — selects the srun
                     templates), CONCURRENT, GPUS_PER_NODE, SLURM_PARTITION (set => this cluster runs
                     via SLURM; also the srun --partition). PLATFORM, CLUSTER, GPUS_PER_NODE and
@@ -44,7 +44,7 @@ Config flags (setup/start). Each can be set in the config file or here; a value
 passed here overrides the config for this run AND is written back to the config,
 so it becomes the default on the next run (CLI wins, then caches):
   --platform NAME       Hardware platform: GitLab runner tag + baseline namespace,
-                        e.g. gb200, h200, h100, devbox                     (PLATFORM)
+                        e.g. gb200, h100, h100, devbox                     (PLATFORM)
   --cluster NAME        Datacenter that selects the srun templates, e.g. cwdfw, ocihsg  (CLUSTER)
   --gitlab-url URL      GitLab base URL                                    (GITLAB_URL)
   --concurrent N        Max concurrent jobs for this runner                (CONCURRENT)
@@ -366,7 +366,7 @@ def main() -> None:
     p.add_argument(
         "--platform",
         default=None,
-        help="Hardware platform: GitLab runner tag + baseline namespace, e.g. gb200/h200/h100/devbox (persisted)",
+        help="Hardware platform: GitLab runner tag + baseline namespace, e.g. gb200/h100/h100/devbox (persisted)",
     )
     p.add_argument("--cluster", default=None, help="Datacenter that selects the srun templates, e.g. cwdfw/ocihsg (persisted)")
     p.add_argument("--gitlab-url", default=None, dest="gitlab_url", help="GitLab base URL (persisted to config)")

@@ -46,7 +46,7 @@ Other settings (via environment variables):
   ENROOT_IMAGE            ${HOME}/data/native.<hash>.sqsh
                             (hash = first 10 hex of sha256(megatron/native/scripts/prepare.sh);
                             changing prepare.sh causes a rebuild under a new filename)
-  PLATFORM                hardware platform (gb200/h200/h100/devbox): the GitLab runner tag that
+  PLATFORM                hardware platform (gb200/h100/h100/devbox): the GitLab runner tag that
                             routes jobs, and the baseline-file namespace
   CLUSTER                 datacenter/cluster (cwdfw/ocihsg/...): selects the per-cluster srun templates
   GPUS_PER_NODE           GPUs per node (set at runner setup); default when --gpus-per-node is omitted
@@ -157,7 +157,7 @@ def _image_path() -> Path:
 
 
 def _platform_tag() -> str:
-    """Hardware platform identifier used to namespace baseline files (e.g. gb200, h200, h100).
+    """Hardware platform identifier used to namespace baseline files (e.g. gb200, h100, h100).
 
     Comes from PLATFORM (set per runner at setup), which is also the GitLab runner
     tag that routes jobs. Falls back to CLUSTER for runners predating the
@@ -1133,7 +1133,7 @@ class PerfReport:
             result.update(
                 {
                     "gpu_peak_bytes": PerfReport._make_metric([int(m.group(1)) for m in mem_matches], "B", higher_is_better=False),
-                    "cpu_rss_bytes": PerfReport._make_metric([int(m.group(2)) for m in mem_matches], "B", higher_is_better=False),
+                    # "cpu_rss_bytes": PerfReport._make_metric([int(m.group(2)) for m in mem_matches], "B", higher_is_better=False),
                 },
             )
 
