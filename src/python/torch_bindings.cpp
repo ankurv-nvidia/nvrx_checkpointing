@@ -543,12 +543,29 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
     }
 }
 
-static void RegisterShardedObject(StateTree& self, StateNode::Handle node, std::string_view const& name, nb::dict const& container)
+static void RegisterShardedObject(StateTree& root, nb::handle val)
 {
-    [[maybe_unused]] auto tensordata   = container.attr("data");
-    [[maybe_unused]] auto key          = container.attr("key");
-    [[maybe_unused]] auto globalshape  = container.attr("global_shape");
-    [[maybe_unused]] auto globalOffset = container.attr("global_offset");
+    // Persist a Megatron ShardedObject (e.g. TransformerEngine `_extra_state`, the
+    // distributed-optimizer object state, rng/rerun state) as a torch-DCP bytes
+    // entry so the standard torch_dist load path can read it back. Serialize it
+    // exactly as the nvrx/dcp writer does — `torch.save([data])`, a one-element
+    // list — so the bytes are identical to the nvrx checkpoint (the cross-provider
+    // md5 baseline) and the loader reconstructs `[data]`. The bytes are held inline
+    // as a Blob node keyed by the object's unique_key (its DCP fqn); rank 0 later
+    // writes them into its `.distcp` shard and emits the BytesStorageMetadata entry.
+    auto const unique_key = nb::cast<std::string>(val.attr("unique_key"));
+    nb::object io         = nb::module_::import_("io");
+    nb::object torch      = nb::module_::import_("torch");
+    nb::object buf        = io.attr("BytesIO")();
+    nb::list   one;
+    one.append(val.attr("data"));
+    torch.attr("save")(one, buf);
+    auto const  raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
+    char const* p   = raw.c_str();
+
+    auto [childName, parentNode] = root.FindOrAddNodeByFQN(unique_key);
+    auto& child                  = root.AddChild(parentNode, childName);
+    child.data                   = StateNode::Blob(p, p + raw.size());
 }
 
 static bool IsTorchGenerator(nb::handle obj)
@@ -633,18 +650,9 @@ bool TryRegisterTorchStateDict(StateTree&                     root,
     }
     if (IsMegatronShardedObject(val))
     {
-#if defined TODO_SHRDOBJ
-        fmt::print(stderr,
-                   "[native_ckpt:cli][{}][TODO] RegisterShardedObject for parent = {} key = {}, obj = {}\n",
-                   root.GlobalRank(),
-                   root.GetNodeId(node),
-                   key,
-                   nb::str(val));
-#endif
-        // TODO_SHRDOBJ
-        // auto& child = root.AddChild(node, fmt::format("{}.#sharded_object#", key));
-        // child.data  = StateNode::Dict{};
-        // RegisterStateDictRecr(root, child.handle, nb::cast<nb::dict>(val.attr("__dict__")), recursive, visited);
+        // The object's unique_key is a full FQN, so it reparents to the state-dict
+        // root (like dotted ShardedTensor names) — `node`/`key` are not used.
+        RegisterShardedObject(root, val);
         return true;
     }
     if (IsTorchGenerator(val))

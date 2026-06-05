@@ -367,6 +367,30 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
                         with datafile.open("ab") as fd:
                             fd.write(raw_data)
 
+            # ShardedObject (BytesStorageMetadata) entries: raw torch.save bytes,
+            # not a ZIP archive. md5 the content (content-based, so it matches across
+            # providers/runs regardless of which file/offset the bytes live at).
+            #
+            # Restricted to TransformerEngine `_extra_state`: it is computed from the
+            # model and is byte-identical across providers. The other objects — the
+            # distributed-optimizer state dict and rng_state — are not byte-identical
+            # across checkpoint backends (the native server and dist_checkpointing
+            # consume rng and serialize the optimizer dict differently), so tracing
+            # them would spuriously fail the cross-provider compare.
+            for fqn in bytemeta:
+                if "_extra_state" not in fqn:
+                    continue
+                si = chunk_storage.get((fqn, ()))
+                if si is None or si.relative_path != relative_path:
+                    continue
+                dcp_fd.seek(si.offset)
+                raw = dcp_fd.read(si.length)
+                if len(raw) != si.length:
+                    raise ValueError(
+                        f"[native_ckpt:cli] {relative_path}:{fqn} offset={si.offset}: Got {len(raw)} of {si.length} bytes\n",
+                    )
+                info_entries[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+
     ref_info_file = checkpoint_dir / "reference.metadata.info"
     rflines = [f"{k}={info_entries[k]}" for k in sorted(info_entries.keys())]
     ref_info_file.write_text("\n".join(rflines))

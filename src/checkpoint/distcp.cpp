@@ -886,6 +886,26 @@ void EmitStorageInfo(std::vector<unsigned char>& b, std::string_view relativePat
     EmitNewObjBuildEnd(b);
 }
 
+// torch.distributed.checkpoint.metadata.BytesStorageMetadata() — an empty
+// dataclass (no fields). Marks `fqn` in state_dict_metadata as a non-tensor
+// (ShardedObject) entry; the DCP load planner reads its bytes via storage_data.
+void EmitBytesStorageMetadata(std::vector<unsigned char>& b)
+{
+    EmitNewObjBuildBegin(b, KMetadataModule, "BytesStorageMetadata");
+    EmitNewObjBuildEnd(b);
+}
+
+// MetadataIndex for a bytes (ShardedObject) entry. Unlike the tensor index, a
+// bytes index carries no offset/index — both default to None, which torch's
+// writer omits — so the restored key equals MetadataIndex(fqn).
+void EmitMetadataIndexBytes(std::vector<unsigned char>& b, std::string_view fqn)
+{
+    EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
+    PickleBinunicode(b, "fqn");
+    PickleBinunicode(b, fqn);
+    EmitNewObjBuildEnd(b);
+}
+
 std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
 {
     std::vector<unsigned char> b;
@@ -919,6 +939,12 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
         auto const fqn = globalRegistry.GetNodeId(node.handle);
         PickleBinunicode(b, fqn);
         EmitTensorStorageMetadata(b, tnsr.dtype, tnsr.fulldim, chunkRanges);
+    });
+    // ShardedObjects (Blob nodes) — torch.save'd bytes the load path reads back.
+    globalRegistry.WalkNodes([&](StateNode const& node) {
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
+        PickleBinunicode(b, globalRegistry.GetNodeId(node.handle));
+        EmitBytesStorageMetadata(b);
     });
     PutU8(b, 'u');    // SETITEMS
 
@@ -957,6 +983,17 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
             auto const relPath = fmt::format("__{}_0.distcp", static_cast<uint32_t>(shard.rank));
             EmitStorageInfo(b, relPath, curCursor, archiveLen);
         }
+    });
+    // ShardedObject bytes are all appended to rank 0's shard file, after rank 0's
+    // tensors (rankCursors[0] now holds rank 0's tensor total). WriteRankShard for
+    // rank 0 writes them in the same WalkNodes order, so these offsets line up.
+    uint64_t& objCursor = rankCursors[static_cast<Rank>(0)];
+    globalRegistry.WalkNodes([&](StateNode const& node) {
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
+        auto const& blob = std::get<StateNode::Blob>(node.data);
+        EmitMetadataIndexBytes(b, globalRegistry.GetNodeId(node.handle));
+        EmitStorageInfo(b, "__0_0.distcp", objCursor, blob.size());
+        objCursor += blob.size();
     });
     PutU8(b, 'u');    // SETITEMS
 
@@ -1026,6 +1063,31 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
                 cursor += actual;
             }
         });
+
+        // ShardedObject bytes live only in rank 0's shard file (the metadata points
+        // every BytesStorageMetadata entry at __0_0.distcp). Append them after the
+        // tensors, in the same WalkNodes order BuildMetadataPkl used for the offsets.
+        if (static_cast<uint32_t>(rank) == 0)
+        {
+            registry.WalkNodes([&](StateNode const& node) {
+                if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
+                auto const& objBytes = std::get<StateNode::Blob>(node.data);
+                char const* p        = objBytes.data();
+                size_t      rem      = objBytes.size();
+                while (rem > 0)
+                {
+                    ssize_t const n = ::write(fd, p, rem);
+                    if (n < 0)
+                    {
+                        if (errno == EINTR) { continue; }
+                        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: write({}) failed", filepath.string()));
+                    }
+                    p += n;
+                    rem -= static_cast<size_t>(n);
+                }
+                cursor += objBytes.size();
+            });
+        }
 
         if (::fsync(fd) != 0)
         {

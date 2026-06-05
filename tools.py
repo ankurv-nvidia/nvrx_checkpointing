@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 
 import torch
+from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+from megatron.core.dist_checkpointing.serialization import _CONTENT_METADATA_KEY
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 
 from . import checkpoint, mapping
@@ -122,7 +124,12 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
     return root
 
 
-def save(sharded_state_dict: mapping.ShardedStateDict, iteration: int, checkpoint_dir: Path) -> None:
+def save(
+    sharded_state_dict: mapping.ShardedStateDict,
+    iteration: int,
+    checkpoint_dir: Path,
+    content_metadata: dict | None = None,
+) -> None:
     # Mirror nvrx's full save_preprocess pipeline, not just extract_sharded_base:
     # apply_factories resolves ShardedTensorFactory in place, extract_nonpersistent
     # drops LocalNonpersistentObject entries (otherwise they leak into common.pt as
@@ -134,7 +141,19 @@ def save(sharded_state_dict: mapping.ShardedStateDict, iteration: int, checkpoin
     root = register_state_dict(sharded_part)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if torch.distributed.get_rank() == 0:
+        # Record content_metadata in common.pt — dist_checkpointing.load_content_metadata
+        # reads it from the common state on load. nvrx stores it the same way (via
+        # save_preprocess); doing it here keeps the native common.pt byte-compatible.
+        if content_metadata is not None:
+            common_state[_CONTENT_METADATA_KEY] = content_metadata
         torch.save(common_state, checkpoint_dir / "common.pt")
+        # Advertise the checkpoint as torch_dist so megatron's standard load path can
+        # read it back. The native writer emits torch DCP shards (.metadata + __R_O.distcp)
+        # that the torch_dist loader understands; the only missing piece for format
+        # detection (check_is_distributed_checkpoint) is this metadata.json marker. A
+        # dedicated native load path is future work — until then checkpoints written here
+        # are loaded via the regular torch_dist code.
+        save_config(CheckpointingConfig(sharded_backend="torch_dist"), str(checkpoint_dir))
     root.save_async(iteration, Path(checkpoint_dir))
     root.wait_for_deferred_save()
 

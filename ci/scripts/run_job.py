@@ -1929,12 +1929,12 @@ class PretrainJob:
     def _wait_for_phase1_checkpoint(cfg: str, timeout_seconds: int = 1800) -> None:
         """Block until phase 1's checkpoint is durable, so the fresh phase-2 process can load it.
 
-        metadata.json is the torch_dist completeness marker that the load-path format
-        detection (check_is_distributed_checkpoint) keys off, and dist_checkpointing.save
-        writes it last; waiting for it guarantees the checkpoint is loadable. A synchronous
-        phase-1 save makes it durable on exit, so this normally returns immediately.
+        The checkpoint_server flushes the DCP ``.metadata`` commit marker last (after the
+        shards), so its presence means the checkpoint is complete on disk; metadata.json
+        (the torch_dist format marker) is written synchronously by the phase-1 process
+        before it exits, hence present by the time .metadata lands.
         """
-        marker = PretrainJob._phase1_ckpt_dir(cfg) / f"iter_{_PHASE1_TRAIN_ITERS:07d}" / "metadata.json"
+        marker = PretrainJob._phase1_ckpt_dir(cfg) / f"iter_{_PHASE1_TRAIN_ITERS:07d}" / ".metadata"
         logger.info(f"[run_job] waiting for phase-1 checkpoint to flush: {marker}")
         wait_for_file(marker, timeout_seconds)
 
@@ -2025,13 +2025,12 @@ class PretrainJob:
     def _phase1_config(**kwargs: object) -> PretrainRunConfig:
         """A phase-1 config: random init, train to _PHASE1_TRAIN_ITERS, one synchronous save.
 
-        Phase 1 always saves with the nvrx provider — megatron-core dist_checkpointing,
-        which writes a standard torch_dist checkpoint (with metadata.json) that phase 2
-        can load regardless of phase 2's own provider. The native provider, by contrast,
-        writes a DCP-style checkpoint the standard load path can't identify. Saving
-        synchronously (no async checkpoint_server) makes it durable on process exit.
+        Phase 1 saves with the job's own provider (so the native job's phase 1 is a native
+        save). megatron.native.tools.save writes a metadata.json marker and persists the
+        ShardedObjects, so the native checkpoint is read back by the regular torch_dist
+        load path in phase 2. Saving synchronously (no async persistent worker) makes it
+        durable on process exit.
         """
-        kwargs["ckpt_provider"] = "nvrx"  # override the job's provider for the phase-1 save
         # lr_decay_iters defaults to --train-iters, so phase 1 must advertise the FULL run's
         # train_iters — not its own early exit at _PHASE1_TRAIN_ITERS — or it decays the LR
         # over _PHASE1_TRAIN_ITERS instead of the full horizon. That changes the iter-

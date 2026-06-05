@@ -318,7 +318,21 @@ Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank)
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId)
 {
     std::scoped_lock lock(mutex);
-    return *snapshots[snapshotId];
+    return GetSnapshot_(lock, snapshotId);
+}
+
+Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* lock */, cipc::SnapshotId snapshotId)
+{
+    auto it = snapshots.find(snapshotId);
+    if (it == snapshots.end())
+    {
+        throw std::runtime_error(
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] GetSnapshot_: no snapshot with id {} (evicted or never activated)",
+                        *server,
+                        sessionId,
+                        snapshotId));
+    }
+    return *it->second;
 }
 
 // Write {peerIndex}.metadata.info: flat sorted "key=value" pairs for all tensor nodes.
@@ -453,6 +467,21 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                snapshot.name);
     globalState.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::Blob)
+        {
+            // ShardedObject bytes. Emit the same {fqn}.bytes.md5sum that distcp_trace
+            // derives from the on-disk shard so the server-claim cross-check stays
+            // balanced. Restricted to _extra_state, matching distcp_trace: the
+            // distributed-optimizer dict and rng_state objects are not byte-identical
+            // across checkpoint backends, so they are excluded from the compare.
+            auto const nodeId = globalState.GetNodeId(node.handle);
+            if (nodeId.contains("_extra_state"))
+            {
+                auto const& objBytes = std::get<StateNode::Blob>(node.data);
+                emit(nodeId + ".bytes.md5sum", ComputeMd5Hex(objBytes.data(), objBytes.size()));
+            }
+            return;
+        }
         if (type != StateNode::Type::ShardedTensor) { return; }
         auto const  nodeName = globalState.GetNodeId(node.handle);
         std::string name     = nodeName.starts_with("model.") ? nodeName.substr(std::string_view("model.").size()) : nodeName;
@@ -961,10 +990,9 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char,
     void* ptr = nullptr;
     {
         std::scoped_lock lock(mutex);
-
-        auto& snapshot   = *snapshots[hdr1.snapshotId];
-        auto& localState = *snapshot.localStates.at(hdr1.globalRank);
-        auto  endOffset  = hdr1.offset + hdr1.messageSize;
+        auto&            snapshot   = GetSnapshot_(lock, hdr1.snapshotId);
+        auto&            localState = *snapshot.localStates.at(hdr1.globalRank);
+        auto             endOffset  = hdr1.offset + hdr1.messageSize;
         if (endOffset > localState.blob.size)
         {
             throw std::runtime_error(fmt::format(
@@ -1068,7 +1096,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
     {
         std::scoped_lock lock(mutex);
 
-        auto& snapshot   = *snapshots[hdr.snapshotId];
+        auto& snapshot   = GetSnapshot_(lock, hdr.snapshotId);
         auto& localState = *snapshot.localStates[hdr.globalRank];
 
         if (localState.writtenTensorSize != localState.blob.size)
@@ -1094,15 +1122,6 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
                                                  localState.writtenTensorRangeBegin,
                                                  localState.writtenTensorRangeEnd,
                                                  localState.blob.size));
-        }
-        auto it = snapshots.find(hdr.snapshotId);
-        if (it == snapshots.end())
-        {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot with id {} does not exist for session id {}",
-                                                 *server,
-                                                 sessionId,
-                                                 hdr.snapshotId,
-                                                 hdr.sessionId));
         }
         if (sessionState.registry == nullptr)
         {
@@ -1640,6 +1659,28 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
             std::vector<TensorShardInfo> tensorShards;
             ForeachTensorShardInfo(*localState.localRegistry, [&](TensorShardInfo const& info) { tensorShards.push_back(info); });
             MergeFragmentToGlobalState_(lock, tensorShards);
+
+            // Merge this fragment's ShardedObjects (Blob nodes) into the global
+            // registry, deduping by fqn: replicated objects share a unique_key
+            // across ranks (keep one copy), while EP/TP-sharded objects have
+            // distinct unique_keys (keep each). The first received rank's objects
+            // already arrived via Clone(); this folds in every other rank's.
+            std::unordered_set<std::string> existingObjects;
+            sessionState.registry->WalkNodes([&](StateNode const& gnode) {
+                if (static_cast<StateNode::Type>(gnode.data.index()) == StateNode::Type::Blob)
+                {
+                    existingObjects.insert(sessionState.registry->GetNodeId(gnode.handle));
+                }
+            });
+            localState.localRegistry->WalkNodes([&](StateNode const& fnode) {
+                if (static_cast<StateNode::Type>(fnode.data.index()) != StateNode::Type::Blob) { return; }
+                auto fqn = localState.localRegistry->GetNodeId(fnode.handle);
+                if (existingObjects.contains(fqn)) { return; }
+                auto [childName, parentNode] = sessionState.registry->FindOrAddNodeByFQN(fqn);
+                auto& child                  = sessionState.registry->AddChild(parentNode, childName);
+                child.data                   = fnode.data;    // copy the torch.save'd object bytes
+                existingObjects.insert(std::move(fqn));
+            });
         }
 #ifdef NATIVE_CKPT_TRACE_NODE
         if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))

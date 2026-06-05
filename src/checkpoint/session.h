@@ -110,6 +110,7 @@ struct Session
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank);
     LocalState& FindOrCreateLocalState_(checkpoint::ipc::Rank rank);
     Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId);
+    Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId);
 
     void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;
 
