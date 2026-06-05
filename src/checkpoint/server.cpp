@@ -532,11 +532,35 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     LocalState* localStatePtr = nullptr;
     {
         std::scoped_lock lock(mutex);
-        snapshotPtr   = snapshots.at(hdr.snapshotId).get();
-        localStatePtr = snapshotPtr->localStates.at(hdr.globalRank).get();
+        snapshotPtr           = snapshots.at(hdr.snapshotId).get();
+        localStatePtr         = snapshotPtr->localStates.at(hdr.globalRank).get();
+        snapshotPtr->registry = sessionState.registry;
     }
     auto& snapshot   = *snapshotPtr;
     auto& localState = *localStatePtr;
+
+    if (snapshotPtr->registry == nullptr)
+    {
+        while (true)
+        {
+            std::scoped_lock lock(mutex);
+            if (sessionState.registry != nullptr)
+            {
+                snapshotPtr->registry = sessionState.registry;
+                break;
+            }
+            fmt::print(
+                stderr,
+                "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for global registry to be populated for rank={} snapshot={}\n",
+                *server,
+                sessionId,
+                hdr.globalRank,
+                hdr.snapshotId);
+            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
     // Rank 0 writes registry.bin before any per-rank distcp file lands. Wait
     // order matches origin/ankurv/phoenix: recievedFrom, then finalizedRanks.
     // TODO_MULTILOCAL_CKPT : For multinode local checkpointing this needs to happen once on each node so designate one rank
@@ -557,6 +581,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                            static_cast<size_t>(topo.worldSize),
                            fmt::join(recievedFrom, ","));
             }
+            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         while (true)
@@ -574,6 +599,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                            static_cast<size_t>(topo.worldSize),
                            fmt::join(snapshot.finalizedRanks, ","));
             }
+            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to finalize snapshot"); }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         WriteGlobalStateTreeToFile_(snapshot, snapshot.path.parent_path() / "registry.bin");
@@ -603,6 +629,8 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                            static_cast<size_t>(topo.worldSize) - snapshot.writeCkptCompletedRanks.size(),
                            static_cast<size_t>(topo.worldSize));
             }
+            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to write checkpoint"); }
+
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         DebugWriteNativeMetadataInfo_(snapshot);
@@ -624,9 +652,39 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                        ex.what());
             throw;
         }
+        {
+            // free Snapshot blobs (multi-GB) OUTSIDE the session mutex to avoid mutex blocking
+            std::vector<std::unique_ptr<Snapshot>> evicted;
+            size_t                                 remainingSnapshots = 0;
+            {
+                std::scoped_lock lock(mutex);
+                while (!snapshots.empty() && snapshots.size() >= numActiveSnapshots)
+                {
+                    auto it = snapshots.begin();
+                    if (it->second->writeCkptCompletedRanks.size() < static_cast<size_t>(topo.worldSize)) { break; }
+                    evicted.push_back(std::move(it->second));
+                    snapshots.erase(it);
+                }
+                remainingSnapshots = snapshots.size();
+            }
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after finalizing snapshot={} rank={}. Remaining snapshots "
+                       "in memory: {}\n",
+                       *server,
+                       sessionId,
+                       evicted.size(),
+                       hdr.snapshotId,
+                       hdr.globalRank,
+                       remainingSnapshots);
+        }
     }
 
-    fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] OnFinalizeSnapshotAsync_ for snapshotId : {}\n", *server, sessionId, hdr.snapshotId);
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}][INFO] OnFinalizeSnapshotAsync_ for rank = {}, snapshotId : {} \n",
+               *server,
+               sessionId,
+               hdr.globalRank,
+               hdr.snapshotId);
     // SendLocalShardedStateRegistryToPeer(cipc::Rank rank, std::string const& peer)
 }
 
@@ -1071,14 +1129,13 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
         }
         if (sessionState.registry == nullptr)
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Global state registry is not initialized when "
-                                                 "finalizing snapshot {} for session id {}",
-                                                 *server,
-                                                 sessionId,
-                                                 hdr.snapshotId,
-                                                 hdr.sessionId));
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][WARN] Global state registry is not initialized when finalizing rank={} snapshot={}\n",
+                       *server,
+                       sessionId,
+                       hdr.globalRank,
+                       hdr.snapshotId);
         }
-        if (it->second->registry == nullptr) { it->second->registry = sessionState.registry; }
         snapshot.finalizedRanks.insert(hdr.globalRank);
     }
     // TODO_SAVETENSORS : Write out the rank specific checkpoint file
@@ -1161,16 +1218,22 @@ struct Server
         }
     }
 
+    bool AllSessionsComplete()
+    {
+        std::scoped_lock<std::mutex> lock(_mutex);
+        return std::ranges::all_of(_activeSessions, [](auto const& pair) { return pair.second->AllSnapshotsComplete(); });
+    }
+
     void WaitForShutdown()
     {
 #ifdef PHOENIX_BUILD_FOR_VALGRIND
-        static constexpr auto AutoShutdownTimeout = 600s;
+        static constexpr auto AutoShutdownTimeout = 900s;
 #else
         static constexpr auto AutoShutdownTimeout = 150s;
 #endif
         while (true)
         {
-            if (_stopRequested || (_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) { break; }
+            if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && AllSessionsComplete())) { break; }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         Stop();
@@ -1207,8 +1270,9 @@ struct Server
             auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
             auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
             auto      createSession = [&]() {
-                auto topo    = StateSerDes::ReadTopology(bufStream);
-                auto session = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
+                auto topo                   = StateSerDes::ReadTopology(bufStream);
+                auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
+                session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, Session::MaxActiveSnapshots);
                 session->Activate();
                 return session;
             };
@@ -1472,6 +1536,13 @@ struct Server
             res.prepare_payload();
             boost::beast::http::write(stream, res);
             _stopRequested = true;
+            {
+                for (auto& session : _activeSessions)
+                {
+                    std::scoped_lock lock(session.second->mutex);
+                    session.second->stopRequested = true;
+                }
+            }
         }
         else
         {

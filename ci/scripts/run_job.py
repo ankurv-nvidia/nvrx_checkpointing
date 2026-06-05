@@ -78,6 +78,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import statistics
 import string
@@ -487,12 +488,15 @@ class ValgrindFlavor(Flavor):
             try:
                 rc = proc.wait(timeout=1800)
             except subprocess.TimeoutExpired:
-                # Never force-kill: a SIGKILL would lose valgrind's leak report. Dump the
-                # server's threads and fail loudly so the stuck server is visible.
+                # Dump threads and snapshot a core, then force-kill so the next job isn't
+                # blocked by the stuck server. SIGKILL forfeits valgrind's leak report —
+                # the thread dump and core file are what's left to debug from.
                 CheckpointServer._dump_server_threads()
+                CheckpointServer._gcore_and_kill_server()
                 log_fp.close()
                 raise RuntimeError(
-                    "checkpoint_server (under valgrind) did not spin down within 1800s of /api/stop — see the thread dump above",
+                    "checkpoint_server (under valgrind) did not spin down within 1800s of /api/stop — "
+                    "see the thread dump above and the core file in ci-results",
                 ) from None
             watcher.join(timeout=5)  # drain the final log lines before closing
             log_fp.close()
@@ -892,7 +896,11 @@ class CheckpointServer:
                 logger.info(f"[run_job] wait for native artifacts timed out: {ex}")
         if not CheckpointServer._stop_checkpoint_server() and fail_on_timeout:
             CheckpointServer._dump_server_threads()
-            raise RuntimeError("checkpoint_server did not spin down after a clean-stop request — see the thread dump above")
+            CheckpointServer._gcore_and_kill_server()
+            raise RuntimeError(
+                "checkpoint_server did not spin down after a clean-stop request — "
+                "see the thread dump above and the core file in ci-results",
+            )
 
     @staticmethod
     def _checkpoint_server_pids() -> list[str]:
@@ -948,6 +956,51 @@ class CheckpointServer:
                             logger.info(f"[run_job] thread {task.name}:\n{(task / 'stack').read_text()}")
             except (OSError, subprocess.TimeoutExpired) as ex:
                 logger.info(f"[run_job] thread dump for pid {pid} failed: {ex}")
+
+    @staticmethod
+    def _gcore_and_kill_server() -> None:
+        """Snapshot a core file for any running checkpoint_server, then SIGKILL it.
+
+        Called after a thread dump when the server won't spin down: the core file lets a
+        post-mortem inspect live state (queue depths, in-flight RPCs) that a stack trace
+        alone can't show, and the SIGKILL frees the port and shm so the next job isn't
+        blocked by the leftover. Under valgrind the SIGKILL costs the leak report —
+        accepted as the price of unblocking CI; the thread dump and core file remain.
+        Mirrors `_dump_server_threads`' valgrind handling: a bare `gcore` against a
+        valgrind-wrapped process captures valgrind's frames, so for those we drive
+        gdb through vgdb. Core files land in RESULTS_DIR as
+        `checkpoint_server.<pid>.core`. Never raises — diagnostics must not mask the
+        original error.
+        """
+        pids = CheckpointServer._checkpoint_server_pids()
+        if not pids:
+            return
+        gcore = shutil.which("gcore")
+        gdb = shutil.which("gdb")
+        vgdb = shutil.which("vgdb")
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        for pid in pids:
+            cmdline = Path(f"/proc/{pid}/cmdline")
+            under_valgrind = cmdline.exists() and "valgrind" in cmdline.read_text(errors="replace")
+            core_path = RESULTS_DIR / f"checkpoint_server.{pid}.core"
+            logger.info(f"[run_job] writing core file for pid {pid} -> {core_path}{' (via vgdb)' if under_valgrind else ''}")
+            try:
+                if gdb and under_valgrind and vgdb:
+                    cmd = [gdb, "-batch", "-ex", f"target remote | {vgdb} --pid={pid}", "-ex", f"generate-core-file {core_path}"]
+                    subprocess.run(cmd, check=False, timeout=300)
+                elif gcore:
+                    subprocess.run([gcore, "-o", str(core_path), pid], check=False, timeout=300)
+                elif gdb:
+                    subprocess.run([gdb, "-batch", "-p", pid, "-ex", f"generate-core-file {core_path}"], check=False, timeout=300)
+                else:
+                    logger.info(f"[run_job] no gcore/gdb available; skipping core dump for pid {pid}")
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                logger.info(f"[run_job] core dump for pid {pid} failed: {ex}")
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+                logger.info(f"[run_job] sent SIGKILL to pid {pid}")
+            except (OSError, ValueError) as ex:
+                logger.info(f"[run_job] kill pid {pid} failed: {ex}")
 
     @staticmethod
     def require_no_checkpoint_server() -> None:

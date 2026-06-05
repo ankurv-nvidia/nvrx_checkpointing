@@ -223,7 +223,23 @@ template <typename THdr, size_t SlotSize, size_t NSlots> struct ShmRingBuffer
 
     void Flush()
     {
-        while (AvailableForWrite_() < NSlots) { std::this_thread::sleep_for(HearBeatInterval); }
+        auto start      = PerfMetrics::Clock::now();
+        auto rtimestamp = _ctrl->rtimestamp.load();
+        while (AvailableForWrite_() < NSlots)
+        {
+            std::this_thread::sleep_for(HearBeatInterval);
+            if (_ctrl->rtimestamp.load() != rtimestamp)
+            {
+                rtimestamp = _ctrl->rtimestamp.load();
+                start      = PerfMetrics::Clock::now();
+            }
+            else if (PerfMetrics::Clock::now() - start > WriteWaitTimeout)
+            {
+                throw std::runtime_error(fmt::format("Flush: No heartbeat from reader, possible deadlock Queue: {} Queue-Head-Hdr: {}\n",
+                                                     *this,
+                                                     _hdrs[_ctrl->wbeg % NSlots]));
+            }
+        }
     }
 
     private:

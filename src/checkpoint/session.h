@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +30,12 @@ struct TensorShardInfo
 
 struct Session
 {
+#ifdef PHOENIX_BUILD_FOR_VALGRIND
+    static constexpr uint32_t MaxActiveSnapshots = 1;
+#else
+    static constexpr uint32_t MaxActiveSnapshots = 4;
+#endif
+
     // State for Devices directly connected to this peer
     struct LocalState
     {
@@ -61,18 +68,20 @@ struct Session
     std::filesystem::path const                    workDir;
     std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
 
-    std::mutex mutex;
+    uint32_t           numActiveSnapshots{0};
+    mutable std::mutex mutex;
 
     // Session State variables
     Snapshot                                                 sessionState;    // The blob on this is empty
     std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
     std::unordered_set<checkpoint::ipc::Rank>                recievedFrom;    // Ranks from which data has been recieved.
 
-    std::unordered_map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
+    std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
     std::vector<std::future<void>> asyncTasks;
 
     Session(Server* serverIn, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
+    std::atomic<bool> stopRequested{false};
 
     void Activate();
 
@@ -87,6 +96,15 @@ struct Session
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
 
     void HandleStateRegistryFragment(checkpoint::ipc::Rank recvRank, std::vector<TensorShardInfo> const& tensorShards);
+    bool AllSnapshotsComplete() const
+    {
+        std::scoped_lock lock(mutex);
+        for (auto const& [snapshotId, snapshot] : snapshots)
+        {
+            if (snapshot->writeCkptCompletedRanks.size() < static_cast<size_t>(topo.worldSize)) { return false; }
+        }
+        return true;
+    }
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank);
