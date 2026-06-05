@@ -224,6 +224,11 @@ h100:prepare-image:
 
 zy.devbox:valgrind:1x2:
   extends: [.run_job, .runner_devbox, .manual_optional]
+  # Override .manual_optional's allow_failure:true: a memcheck error or a stall
+  # (exit != 3) must fail the pipeline, not show as an allowed warning. Only the
+  # perf soft-fail (exit 3) stays tolerated, matching .run_job.
+  allow_failure:
+    exit_codes: [3]
   variables:
     JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 
@@ -271,6 +276,9 @@ zy.devbox:valgrind:1x2:
 
 zy.gb200:valgrind:1x4:
   extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
+  # See zy.devbox:valgrind:1x2 — fail the pipeline on memcheck errors/stalls (exit != 3).
+  allow_failure:
+    exit_codes: [3]
   variables:
     JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 
@@ -323,6 +331,9 @@ zz.gb200:pretrain:16x4:perf:
 
 zy.h100:valgrind:1x8:
   extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
+  # See zy.devbox:valgrind:1x2 — fail the pipeline on memcheck errors/stalls (exit != 3).
+  allow_failure:
+    exit_codes: [3]
   variables:
     JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
 

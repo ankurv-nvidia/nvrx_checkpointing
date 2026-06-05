@@ -413,11 +413,145 @@ class ValgrindFlavor(Flavor):
     # per-channel lines and valgrind's exit diagnostics.
     _STOP_MARKER = "Shutting down server thread"
 
+    # Stall guard. The checkpoint server makes progress by writing checkpoint files;
+    # a stuck server (deadlocked finalize, or spinning after a use-after-free) stops
+    # touching those files even while it keeps logging, so checkpoint-file activity —
+    # not log activity — is the progress signal. No file written/modified for
+    # _STALL_SILENCE_S means it is stalled.
+    _STALL_SILENCE_S = 300       # 5 min of no checkpoint-file activity = stalled
+    _STALL_POLL_S = 10           # how often to poll for progress / exit
+    _STALL_STOP_GRACE_S = 120    # grace for a stalled server to honor a re-issued stop
+    _STALL_LOG_EVERY_S = 60      # heartbeat cadence while waiting, so the wait is visible
+
+    # memcheck *error* headers (NOT leak kinds — leaks stay gated by --error-exitcode).
+    # valgrind prints each as the error happens, prefixed ==<pid>==, so they remain in
+    # the log even when valgrind is later SIGKILLed before it can emit ERROR SUMMARY.
+    _MEMCHECK_ERROR_RE = re.compile(
+        r"==\d+==\s+("
+        r"Invalid read of size \d+|"
+        r"Invalid write of size \d+|"
+        r"Use of uninitialised value|"
+        r"Conditional jump or move depends on uninitialised value|"
+        r"Mismatched free\(\)|"
+        r"Invalid free\(\)|"
+        r"Source and destination overlap|"
+        r"Jump to the invalid address|"
+        r"Process terminating with default action of signal|"
+        r"Syscall param "
+        r")",
+    )
+
+    @classmethod
+    def _scan_valgrind_errors(cls, server_log: Path) -> list[str]:
+        """Distinct memcheck error headers in the server log.
+
+        Kept as a robust SUMMARY and backstop — not the primary gate. A real memory
+        error normally trips a regular guard first (a crash → non-zero exit, or a
+        hang → the stall guard). This scan prints exactly what valgrind flagged, and
+        lets us detect the case where an error slips past the regular guards.
+        """
+        found: list[str] = []
+        seen: set[str] = set()
+        try:
+            with server_log.open(errors="replace") as fp:
+                for line in fp:
+                    m = cls._MEMCHECK_ERROR_RE.search(line)
+                    if m is not None and m.group(1) not in seen:
+                        seen.add(m.group(1))
+                        found.append(m.group(1))
+        except OSError as ex:
+            logger.info(f"[run_job] could not scan valgrind log {server_log}: {ex}")
+        return found
+
+    @staticmethod
+    def _ckpt_mtimes(ckpt_root: Path) -> dict[str, float]:
+        """{relative path: mtime} for every file under ckpt_root (recursive).
+
+        The max value is the progress signal for the stall guard; the per-file map
+        lets the wait loop report which files changed since the last heartbeat.
+        """
+        out: dict[str, float] = {}
+        try:
+            for p in ckpt_root.rglob("*"):
+                try:
+                    if p.is_file():
+                        out[str(p.relative_to(ckpt_root))] = p.stat().st_mtime
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return out
+
+    def _await_server_exit(self, proc: subprocess.Popen, ckpt_root: Path) -> tuple[int | None, bool]:
+        """Wait for the valgrind'd server to exit, bounding the wait by checkpoint-file
+        activity instead of a flat timeout. Returns (rc, stalled).
+
+        While the server keeps writing checkpoint files it is making progress, so keep
+        waiting (a healthy 1x8 finalize under memcheck is slow but never silent for
+        long, and the final leak check is seconds). _STALL_SILENCE_S with no
+        checkpoint-file activity means it is stuck: re-request a stop, then SIGKILL if
+        it still will not exit. Either way the caller fails the job. rc is the process
+        exit code, or None if it had to be SIGKILLed.
+        """
+        mtimes = self._ckpt_mtimes(ckpt_root)
+        last_max = max(mtimes.values(), default=0.0)
+        logged_mtimes = dict(mtimes)
+        start = last_progress = last_log = time.monotonic()
+        while True:
+            try:
+                return proc.wait(timeout=self._STALL_POLL_S), False
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            mtimes = self._ckpt_mtimes(ckpt_root)
+            cur_max = max(mtimes.values(), default=0.0)
+            if cur_max > last_max:
+                last_max = cur_max
+                last_progress = now
+            # Per-minute heartbeat so a slow-but-progressing finalize under valgrind is
+            # visible in the CI log instead of looking like a hang. Report the checkpoint
+            # files written/modified since the last heartbeat; if none, show how long it
+            # has been silent and when the stall guard will trip.
+            if now - last_log >= self._STALL_LOG_EVERY_S:
+                changed = sorted(p for p, m in mtimes.items() if logged_mtimes.get(p) != m)
+                logged_mtimes = dict(mtimes)
+                last_log = now
+                waited = round(now - start)
+                if changed:
+                    shown = ", ".join(changed[:6]) + (f" (+{len(changed) - 6} more)" if len(changed) > 6 else "")
+                    logger.info(
+                        f"[run_job] waiting for checkpoint_server to exit ({waited}s elapsed); "
+                        f"{len(changed)} checkpoint file(s) modified in the last {self._STALL_LOG_EVERY_S}s: {shown}",
+                    )
+                else:
+                    silent = round(now - last_progress)
+                    logger.info(
+                        f"[run_job] waiting for checkpoint_server to exit ({waited}s elapsed); "
+                        f"no checkpoint-file activity for {silent}s (stall guard trips at {self._STALL_SILENCE_S}s)",
+                    )
+            if now - last_progress >= self._STALL_SILENCE_S:
+                logger.error(
+                    f"[run_job] checkpoint_server made no checkpoint-file progress for "
+                    f"{self._STALL_SILENCE_S}s under {ckpt_root} — treating as stalled",
+                )
+                CheckpointServer._dump_server_threads()
+                CheckpointServer._request_server_stop()
+                try:
+                    rc = proc.wait(timeout=self._STALL_STOP_GRACE_S)
+                    logger.error(f"[run_job] stalled checkpoint_server exited after re-issued stop (rc={rc})")
+                    return rc, True
+                except subprocess.TimeoutExpired:
+                    logger.error("[run_job] stalled checkpoint_server ignored stop — SIGKILL")
+                    CheckpointServer._gcore_and_kill_server()
+                    return None, True
+
     def transform(self, recipe: Recipe) -> None:
         # PHOENIX_BUILD_FOR_VALGRIND → CMakeLists.txt sets BUILDENV_DISABLE_MARCH_NATIVE
         # and shrinks D2H buffers so valgrind's shadow memory stays manageable.
         recipe.build_env["PHOENIX_BUILD_FOR_VALGRIND"] = "1"
-        recipe.srun_time_min = max(recipe.srun_time_min, 60)  # valgrind runs ~10-50x slower
+        # valgrind runs ~10-50x slower; give the step enough room that the stall
+        # guard (below) — not the SLURM time limit — is what ends a hung run.
+        recipe.srun_time_min = max(recipe.srun_time_min, 120)
         recipe.srun_comments.append(self._REAPER_COMMENT)
 
     @contextlib.contextmanager
@@ -479,29 +613,48 @@ class ValgrindFlavor(Flavor):
             logger.info("[run_job] checkpoint_server is ready — proceeding with pretrain")
             yield
         finally:
-            # Ask the server to stop now rather than waiting out its ~600s idle auto-shutdown
-            # — under memcheck that wait plus the slow teardown can blow the budget below.
-            # /api/stop triggers Server::Stop immediately; valgrind still flushes its leak
-            # report when the process exits.
+            # Ask the server to stop now rather than waiting out its idle auto-shutdown
+            # — under memcheck that wait plus the slow teardown can blow the budget.
+            # /api/stop triggers Server::Stop immediately; valgrind still flushes its
+            # leak report when the process exits.
             logger.info("[run_job] Pretrain finished — stopping checkpoint_server so valgrind can flush its report")
             CheckpointServer._request_server_stop()
-            try:
-                rc = proc.wait(timeout=1800)
-            except subprocess.TimeoutExpired:
-                # Dump threads and snapshot a core, then force-kill so the next job isn't
-                # blocked by the stuck server. SIGKILL forfeits valgrind's leak report —
-                # the thread dump and core file are what's left to debug from.
-                CheckpointServer._dump_server_threads()
-                CheckpointServer._gcore_and_kill_server()
-                log_fp.close()
-                raise RuntimeError(
-                    "checkpoint_server (under valgrind) did not spin down within 1800s of /api/stop — "
-                    "see the thread dump above and the core file in ci-results",
-                ) from None
+            # PRIMARY GATE (regular guards): wait for exit, bounded by checkpoint-file
+            # activity. A stall (no file progress for _STALL_SILENCE_S) re-stops then
+            # SIGKILLs the server and is a hard failure; a clean exit with a non-zero
+            # rc (valgrind --error-exitcode=42) is failed by epilog.
+            ckpt_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs" / ctx.cfg
+            rc, stalled = self._await_server_exit(proc, ckpt_root)
+            ctx.valgrind_rc = rc  # record before cleanup so epilog sees it even if cleanup raises
             watcher.join(timeout=5)  # drain the final log lines before closing
             log_fp.close()
-            logger.info(f"[run_job] valgrind exited with code {rc}; server log: {server_log}")
-            ctx.valgrind_rc = rc
+            if rc is not None:
+                logger.info(f"[run_job] valgrind exited with code {rc}; server log: {server_log}")
+
+            # ROBUST CROSS-CHECK (kept; a summary + backstop, NOT the primary gate):
+            # list the memcheck errors valgrind flagged, however it exited.
+            errors = self._scan_valgrind_errors(server_log)
+            summary = "; ".join(errors[:5]) + (" ..." if len(errors) > 5 else "")
+            if errors:
+                logger.error(f"[run_job] valgrind memcheck summary: {len(errors)} error type(s): {summary}; see {server_log}")
+            else:
+                logger.info(f"[run_job] valgrind memcheck summary: no errors found in {server_log}")
+
+            # Regular guard: a stalled server is a hard failure.
+            if stalled:
+                raise RuntimeError(
+                    f"checkpoint_server stalled (no checkpoint-file activity for {self._STALL_SILENCE_S}s) "
+                    f"and had to be stopped/killed — see the thread dump above and {server_log}",
+                ) from None
+            # Backstop: if the regular guards say PASS (clean exit, rc 0) yet the scan
+            # still found memcheck errors, one slipped past them — fail loudly and say
+            # so, so the regular guards get strengthened rather than leaning on the scan.
+            if rc == 0 and errors:
+                raise RuntimeError(
+                    "valgrind reported memcheck errors that the exit-code/stall guards did NOT catch — "
+                    f"the regular guards need strengthening: {summary}; see {server_log}",
+                ) from None
+            # rc != 0 (e.g. 42) is handled by epilog's exit-code guard.
 
     def _spawn(self, cmd: list[str], server_log: Path, log_fp: IO[str]) -> tuple[subprocess.Popen, threading.Event, threading.Thread]:
         """Spawn the server; a pump thread copies its pipe into log_fp and a watcher tees the

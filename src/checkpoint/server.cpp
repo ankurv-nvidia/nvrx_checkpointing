@@ -523,67 +523,44 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 
 void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr)
 {
-    // WriteRankShard reads this rank's blob + localRegistry without holding the
-    // session mutex. Safe today because Handle(FinalizeSnapshot) validates
-    // writtenTensorSize==blob.size under the mutex before dispatching us and
-    // each rank's messages run on a dedicated queue thread (server.cpp:986).
-    // If the dispatcher ever shares threads across ranks, this collapses.
     Snapshot*   snapshotPtr   = nullptr;
     LocalState* localStatePtr = nullptr;
     {
         std::scoped_lock lock(mutex);
-        snapshotPtr           = snapshots.at(hdr.snapshotId).get();
-        localStatePtr         = snapshotPtr->localStates.at(hdr.globalRank).get();
-        snapshotPtr->registry = sessionState.registry;
+        snapshotPtr   = snapshots.at(hdr.snapshotId).get();
+        localStatePtr = snapshotPtr->localStates.at(hdr.globalRank).get();
     }
     auto& snapshot   = *snapshotPtr;
     auto& localState = *localStatePtr;
 
-    if (snapshotPtr->registry == nullptr)
+    // Wait for all ranks to merge before capturing the shared registry (it keeps mutating until then).
+    while (true)
     {
-        while (true)
         {
             std::scoped_lock lock(mutex);
-            if (sessionState.registry != nullptr)
+            if (recievedFrom.size() >= static_cast<size_t>(topo.worldSize))
             {
                 snapshotPtr->registry = sessionState.registry;
                 break;
             }
-            fmt::print(
-                stderr,
-                "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for global registry to be populated for rank={} snapshot={}\n",
-                *server,
-                sessionId,
-                hdr.globalRank,
-                hdr.snapshotId);
-            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for snapshot={} local-state-registry {} of {} "
+                       "remaining... recievedFrom=[{}]\n",
+                       *server,
+                       sessionId,
+                       hdr.snapshotId,
+                       static_cast<size_t>(topo.worldSize) - recievedFrom.size(),
+                       static_cast<size_t>(topo.worldSize),
+                       fmt::join(recievedFrom, ","));
         }
+        if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    // Rank 0 writes registry.bin before any per-rank distcp file lands. Wait
-    // order matches origin/ankurv/phoenix: recievedFrom, then finalizedRanks.
+    // Rank 0 writes registry.bin once every rank has finalized.
     // TODO_MULTILOCAL_CKPT : For multinode local checkpointing this needs to happen once on each node so designate one rank
     if (hdr.globalRank == Rank{0})
     {
-        while (true)
-        {
-            {
-                std::scoped_lock lock(mutex);
-                if (recievedFrom.size() >= static_cast<size_t>(topo.worldSize)) { break; }
-                fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for snapshot={} local-state-registry {} of {} "
-                           "remaining... recievedFrom=[{}]\n",
-                           *server,
-                           sessionId,
-                           hdr.snapshotId,
-                           static_cast<size_t>(topo.worldSize) - recievedFrom.size(),
-                           static_cast<size_t>(topo.worldSize),
-                           fmt::join(recievedFrom, ","));
-            }
-            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
         while (true)
         {
             {
