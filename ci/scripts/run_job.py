@@ -1007,7 +1007,7 @@ def _md5(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 _RE_NATIVE_BW = re.compile(
-    r"\[native_ckpt:cli\]\[\d+\]\[INFO\]\[perf\] Finished "
+    r"\[native_ckpt:cli\]\[(\d+)\]\[INFO\]\[perf\] Finished "
     r"bw_mbps=([0-9.]+).*?wr_tnsr_us=([0-9]+).*?total_written_bytes=([0-9]+)",
     re.DOTALL,
 )
@@ -1285,7 +1285,7 @@ class PerfReport:
                 baseline = yaml.safe_load(f)
 
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
-        PerfReport._print_perf_summary(comparison, passed)
+        PerfReport._print_perf_summary(comparison, passed, metrics)
 
         report = {
             "job": job,
@@ -1295,7 +1295,7 @@ class PerfReport:
             "log": str(log_file),
             "baseline": str(baseline_file),
             "passed": passed,
-            "metrics": {k: {kk: vv for kk, vv in v.items() if kk != "samples"} for k, v in metrics.items()},
+            "metrics": {k: {kk: vv for kk, vv in v.items() if kk not in ("samples", "ranks")} for k, v in metrics.items()},
             "comparison": comparison,
         }
         with report_file.open("w") as f:
@@ -1303,9 +1303,12 @@ class PerfReport:
         return passed
 
     @staticmethod
-    def _make_metric(samples: list, unit: str, higher_is_better: bool | None) -> dict:
+    def _make_metric(samples: list, unit: str, higher_is_better: bool | None, ranks: list | None = None) -> dict:
         return {
             "samples": samples,
+            # Per-sample originating rank (aligned with samples), so the summary can
+            # surface per-rank / per-socket structure (e.g. NUMA-driven bimodality).
+            "ranks": ranks,
             "mean": statistics.mean(samples),
             "median": statistics.median(samples),
             "min": min(samples),
@@ -1326,11 +1329,12 @@ class PerfReport:
 
         bw_matches = list(_RE_NATIVE_BW.finditer(log_text))
         if bw_matches:
+            ranks = [int(m.group(1)) for m in bw_matches]
             result.update(
                 {
-                    "bw_mbps": PerfReport._make_metric([float(m.group(1)) for m in bw_matches], "MB/s", higher_is_better=True),
-                    "wr_tnsr_us": PerfReport._make_metric([int(m.group(2)) for m in bw_matches], "us", higher_is_better=False),
-                    "total_written_bytes": PerfReport._make_metric([int(m.group(3)) for m in bw_matches], "B", None),
+                    "bw_mbps": PerfReport._make_metric([float(m.group(2)) for m in bw_matches], "MB/s", higher_is_better=True, ranks=ranks),
+                    "wr_tnsr_us": PerfReport._make_metric([int(m.group(3)) for m in bw_matches], "us", higher_is_better=False, ranks=ranks),
+                    "total_written_bytes": PerfReport._make_metric([int(m.group(4)) for m in bw_matches], "B", None, ranks=ranks),
                 },
             )
 
@@ -1398,7 +1402,7 @@ class PerfReport:
         return results, all_passed
 
     @staticmethod
-    def _print_perf_summary(comparison: dict, passed: bool) -> None:
+    def _print_perf_summary(comparison: dict, passed: bool, metrics: dict | None = None) -> None:
         bar = "=" * 70
         logger.info(f"\n{bar}")
         logger.info(" Performance Results")
@@ -1421,9 +1425,38 @@ class PerfReport:
                 logger.info(
                     f"  [{status}] {name}: {measured:.4f} {unit}  (baseline={baseline:.4f}, Δ={pct_str}, tol=±{tol}%, n={samples})",
                 )
+                # The PASS/FAIL above is on the mean; print the underlying samples so
+                # multi-modal behaviour (e.g. a per-socket NUMA split between ranks)
+                # is visible rather than averaged away.
+                PerfReport._print_sample_detail(metrics, name)
         logger.info(bar)
         logger.info(f" Overall: {'PASS' if passed else 'FAIL'}")
         logger.info(f"{bar}\n")
+
+    @staticmethod
+    def _print_sample_detail(metrics: dict | None, name: str) -> None:
+        """Show the individual samples behind a metric: spread, per-rank means, and
+        the full sorted list. Reveals run-to-run / per-rank modality the mean hides."""
+        metric = (metrics or {}).get(name)
+        if not metric:
+            return
+        # Only directional perf metrics vary meaningfully; exact info metrics
+        # (e.g. total_written_bytes, higher_is_better=None) are constant per rank.
+        if metric.get("higher_is_better") is None:
+            return
+        samples = metric.get("samples") or []
+        if len(samples) < 2:
+            return
+        ranks = metric.get("ranks")
+        f = lambda v: f"{v:.0f}"  # noqa: E731 — these are MB/s or microseconds; integer precision is plenty
+        logger.info(f"         spread: min={f(min(samples))} median={f(statistics.median(samples))} max={f(max(samples))}")
+        if ranks and len(ranks) == len(samples):
+            by_rank: dict[int, list] = {}
+            for r, s in zip(ranks, samples):
+                by_rank.setdefault(r, []).append(s)
+            per_rank = "  ".join(f"r{r}={f(statistics.mean(by_rank[r]))}" for r in sorted(by_rank))
+            logger.info(f"         per-rank mean: {per_rank}")
+        logger.info(f"         all values: {' '.join(f(s) for s in sorted(samples))}")
 
     @staticmethod
     def _compare_iters_to_baseline(cfg: str, provider: str) -> None:
