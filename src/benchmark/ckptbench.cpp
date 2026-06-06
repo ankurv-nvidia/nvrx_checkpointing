@@ -44,8 +44,10 @@ try
     bpo::options_description desc("Allowed options");
     bool                     outofproc = false;
     std::filesystem::path    stateRegistry;
+    uint16_t                 nodes = 2;
 
     desc.add_options()("help", "produce help message")                                                         //
+        ("nodes", bpo::value<uint16_t>(&nodes), "number of nodes")                                             //
         ("outproc", bpo::bool_switch(&outofproc), "run the checkpoint server out-of-process")                  //
         ("stateregistry", bpo::value<std::filesystem::path>(&stateRegistry), "path to the state registry");    //
 
@@ -70,9 +72,10 @@ try
         return 1;
     }
 
-    if (!outofproc) { RunInprocServer(); }
-
     if (!vm.contains("stateregistry")) { throw std::runtime_error("State registry path must be provided with --stateregistry"); }
+    Ctx.nodes     = nodes;
+    Ctx.outofproc = outofproc;
+
     LoadStateRegistryFromPath(Ctx, stateRegistry);
 
     auto tasks = StartClientThreads(Ctx);

@@ -182,8 +182,6 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
     };
     StateTree tree(std::move(topo));
 
-    std::vector<Rank> ranks;
-
     for (auto const& tensor : tensors)
     {
         auto t = nb::cast<nb::tuple>(tensor);
@@ -212,21 +210,15 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
         for (auto&& shard : shards)
         {
             auto entry = nb::cast<nb::tuple>(shard);
-            if (entry.size() != 4)
-            {
-                throw std::runtime_error("distcp_shim: each shard entry must be (rank, sharddim, file_offset, length)");
-            }
-            auto const rank       = Rank{nb::cast<uint32_t>(entry[0])};
-            auto const sharddim   = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
-            auto const fileOffset = nb::cast<uint64_t>(entry[2]);
-            auto const length     = nb::cast<uint64_t>(entry[3]);
+            if (entry.size() != 2) { throw std::runtime_error("distcp_shim: each shard entry must be (rank, sharddim)"); }
+            auto const rank     = Rank{nb::cast<uint32_t>(entry[0])};
+            auto const sharddim = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
 
             st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = rank});
         }
 
         leaf.data = std::move(st);
     }
-
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
@@ -250,6 +242,7 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("out_dir"),
           nb::arg("tensors"),
           "Write `<out_dir>/.metadata` from a list of (fqn, dtype_name, full_shape, "
-          "shards) tuples, where each shards entry is "
-          "(rank, sharddim, file_offset, length).");
+          "shards) tuples, where each shards entry is (rank, sharddim). The "
+          "per-shard (file_offset, length) is inferred analytically from the "
+          "shape/dtype — no need to pass it in.");
 }

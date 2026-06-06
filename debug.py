@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import pickle
+import re
 import sys
 import time
 import types
@@ -252,17 +253,19 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     tensors = {}
     # Non-contiguous offsets are expected today: every rank writes the same archive for a
     # replicated shard, but only one rank's _StorageInfo survives torch's MetadataIndex dict
-    # on pickle.load, leaving orphan bytes between metadata-tracked entries. They flood the log
-    # one-per-shard, so accumulate and emit a single summary after the walk instead.
+    # on pickle.load, leaving orphan bytes between metadata-tracked entries. With multiple
+    # nodes the canonical _StorageInfo for a replicated shard can land in another rank's file,
+    # so a file's own first metadata-tracked entry may start past offset 0 — the bytes before
+    # it are that same kind of orphan. Both cases flood the log one-per-shard, so accumulate
+    # the leading and interior gaps together and emit a single summary after the walk. dcp.load
+    # seeks by the recorded offset and never reads the orphan bytes, so tensors round-trip; the
+    # md5 / cross-provider check is the gate that fails on real offset-vs-data divergence.
     gap_count = 0
     gap_bytes = 0
     files_with_gaps: set[str] = set()
     for relative_path, offsets in file_offsets.items():
         sorted_offsets = dict(sorted(offsets.items(), key=lambda item: item[0]))
         start_offset = 0
-        first_item = next(iter(sorted_offsets))
-        if first_item != 0:
-            raise ValueError(f"relative_path={relative_path}: Expected first file offset to be 0, got {first_item}")
         for offset, info in sorted_offsets.items():
             tnsr = info["metadata_index"].fqn
             if offset != start_offset:
@@ -425,16 +428,57 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
         try_ping()
 
 
+_CHUNK_KEY_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<idx>\d+)\.(?P<field>\w+)$")
+
+
+def _parse_reference_metadata(path: Path) -> tuple[dict[str, str], dict[tuple[str, str], tuple[tuple[str, str], ...]]]:
+    """Split a ``reference.metadata.info`` dump into scalar entries and per-chunk fields.
+
+    Chunk lines have the form ``<fqn>.chunks.<n>.<field>`` where ``<n>`` is the
+    chunk's position in the writer's chunk list. That position reflects how a
+    given writer happens to enumerate a tensor's chunks — and a multinode native
+    dump lists a chunk once per rank that holds it, so a replicated chunk appears
+    several times — so it is not a stable identity. Re-key each chunk by
+    ``(fqn, offsets)`` (its location in the full tensor) and carry the remaining
+    fields (sizes, md5sum) as the value; replicas of one chunk collapse to a
+    single entry. Every other ``key=value`` line is returned verbatim.
+    """
+    scalars: dict[str, str] = {}
+    chunk_fields: dict[tuple[str, str], dict[str, str]] = {}
+    for line in path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        m = _CHUNK_KEY_RE.match(key)
+        if m is None:
+            scalars[key] = value
+        else:
+            chunk_fields.setdefault((m["fqn"], m["idx"]), {})[m["field"]] = value
+    chunks: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {}
+    for (fqn, _idx), fields in chunk_fields.items():
+        offsets = fields.get("offsets", "")
+        rest = tuple(sorted((f, v) for f, v in fields.items() if f != "offsets"))
+        chunks[(fqn, offsets)] = rest
+    return scalars, chunks
+
+
 def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | str) -> int:
     """Diff reference.metadata.info between a checkpoint dir and its baseline snapshot.
 
     Each dir must already contain a ``reference.metadata.info`` produced by
     :func:`distcp_trace` — independent dumps of what's on disk (tensor
-    properties + per-chunk md5sums) for that writer's output. A non-zero
-    diff therefore signals divergence between the just-derived trace and
-    the baseline (typically the nvrx snapshot in ``megatron/native/metadata/``).
+    properties + per-chunk md5sums) for that writer's output.
 
-    Returns the unified-diff line count — 0 means equal. Callers decide
+    Tensor properties are compared by key; per-chunk entries are compared by
+    chunk identity ``(fqn, offsets)`` rather than by list position. A divergence
+    is reported only when a chunk's recorded data (md5sum/sizes) differs, or when
+    one side is missing a chunk the other has — not when two writers merely
+    enumerate or replicate the same chunks in a different order. This keeps the
+    cross-provider equality contract meaningful across the native and nvrx
+    writers, which list chunks in their own orders, and across single- vs
+    multinode native runs, where replicated chunks are written once per node.
+
+    Returns the number of differing entries — 0 means equal. Callers decide
     whether to warn or hard-fail; see ``scripts/metadata_compare.py``.
 
     Raises:
@@ -447,24 +491,25 @@ def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | 
     for label, path in (("checkpoint", checkpoint_ref), ("baseline", baseline_ref)):
         if not path.is_file():
             raise FileNotFoundError(f"[native_ckpt:cli] missing {label} reference.metadata.info at {path}")
-    checkpoint_lines = checkpoint_ref.read_text().splitlines()
-    baseline_lines = baseline_ref.read_text().splitlines()
-    diff = list(
-        difflib.unified_diff(
-            baseline_lines,
-            checkpoint_lines,
-            fromfile=str(baseline_ref),
-            tofile=str(checkpoint_ref),
-            n=1,
-        ),
-    )
-    result = "PASS" if len(diff) == 0 else "FAIL"
+    base_scalars, base_chunks = _parse_reference_metadata(baseline_ref)
+    ckpt_scalars, ckpt_chunks = _parse_reference_metadata(checkpoint_ref)
+
+    findings: list[str] = []
+    for key in sorted(set(base_scalars) | set(ckpt_scalars)):
+        if base_scalars.get(key) != ckpt_scalars.get(key):
+            findings.append(f"  {key}: baseline={base_scalars.get(key)!r} checkpoint={ckpt_scalars.get(key)!r}")
+    for ident in sorted(set(base_chunks) | set(ckpt_chunks)):
+        if base_chunks.get(ident) != ckpt_chunks.get(ident):
+            fqn, offsets = ident
+            findings.append(f"  {fqn} chunk offsets={offsets}: baseline={base_chunks.get(ident)} checkpoint={ckpt_chunks.get(ident)}")
+
+    result = "PASS" if not findings else "FAIL"
     sys.stderr.write(
-        f"[native_ckpt:cli] {result}: {len(diff)} differences vs baseline\n\t{baseline_ref}\n\t{checkpoint_ref}\n",
+        f"[native_ckpt:cli] {result}: {len(findings)} differences vs baseline\n\t{baseline_ref}\n\t{checkpoint_ref}\n",
     )
-    if 0 < len(diff) < max(len(checkpoint_lines), len(baseline_lines)) / 2:
-        sys.stdout.writelines("\n".join(diff))
-    return len(diff)
+    if findings:
+        sys.stderr.write("\n".join(findings[:50]) + "\n")
+    return len(findings)
 
 
 def main() -> None:

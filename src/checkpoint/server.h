@@ -10,7 +10,7 @@
 // then blocks until a shutdown is triggered (either by message or inactivity timeout).
 void RunServer();
 
-void RunInprocServer();
+void RunInprocServer(uint16_t nodes);
 
 void StopInprocServer();
 

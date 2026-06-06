@@ -757,7 +757,7 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 
     try
     {
-        RunInprocServer();
+        RunInprocServer(1);
         serverRunning = true;
 
         LoadStateRegistryFromPath(ctx, registryPath);

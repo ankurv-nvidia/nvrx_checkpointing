@@ -18,6 +18,8 @@ using FixtureFunc = void (*)(StateTree& tree, std::filesystem::path const& ckptD
 
 struct CheckpointTestContext
 {
+    bool                                           outofproc{false};
+    uint16_t                                       nodes{};
     std::unique_ptr<StateTree>                     globalRegistry;
     std::unordered_set<std::unique_ptr<StateTree>> localRegistries;
 

@@ -62,7 +62,7 @@ struct Message
 {
     static constexpr uint16_t Port = 41000;
 
-    static std::string RequestChannelName(uint8_t rank) { return fmt::format("checkpoint_request_{}", rank); }
+    static std::string RequestChannelName(uint16_t index, uint8_t rank) { return fmt::format("checkpoint_request_{}_{}", index, rank); }
 
     enum class Type : uint8_t
     {

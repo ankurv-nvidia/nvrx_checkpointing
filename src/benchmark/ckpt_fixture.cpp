@@ -124,17 +124,21 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
             throw std::runtime_error(fmt::format("Failed to read entire state registry file (extra data at end: {} bytes)", extraBytes));
         }
     }
-
     ctx.worldSize = InferWorldSize(*ctx.globalRegistry);
-    fmt::print(stderr, "[fixture] Inferred worldSize = {}\n", ctx.worldSize);
 
-    std::vector<std::string> peers(1, "localhost");
+    ctx.nodes = std::min(ctx.nodes, static_cast<uint16_t>(ctx.worldSize));
+
+    if (!ctx.outofproc) { RunInprocServer(ctx.nodes); }
+    std::vector<std::string> peers;
+    peers.reserve(ctx.nodes);
+    for (uint16_t i = 0; i < ctx.nodes; ++i) { peers.emplace_back(fmt::format("localhost:{}", cipc::Message::Port + i)); }
+
     for (uint32_t r = 0; r < static_cast<uint32_t>(ctx.worldSize); ++r)
     {
         RankTopology topo{.rank         = Rank{r},
                           .worldSize    = ctx.worldSize,
-                          .ranksPerPeer = static_cast<uint32_t>(ctx.worldSize),
-                          .peersPerNode = 1,
+                          .ranksPerPeer = static_cast<uint32_t>(ctx.worldSize) / ctx.nodes,
+                          .peersPerNode = ctx.nodes,
                           .peers        = peers};
         ctx.localRegistries.insert(BuildPerRankStateTree(ctx, std::move(topo)));
     }
@@ -184,7 +188,7 @@ void ValidateRoundTrip(StateTree const& localState, Blob const& blob)
 
 void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
 {
-    SaveCheckpoint(tree, {}, ckptDir);
+    SaveCheckpoint(tree, cipc::SnapshotId{1}, ckptDir);
     WaitForCheckpointSave(tree.Topo());
 }
 

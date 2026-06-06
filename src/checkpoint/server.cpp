@@ -274,17 +274,14 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
         peerAddr.set_port(std::to_string(cipc::Message::Port));
     }
 
-    // Connect to peer
+    // Connect to peer, trying every resolved endpoint until one accepts. A host
+    // like `localhost` resolves to both ::1 and 127.0.0.1 and the server binds
+    // IPv4, so connect() must fall through the address list to the reachable one.
     boost::asio::ip::tcp::resolver resolver(ioc);
     auto                           results = resolver.resolve(peerAddr.host(), peerAddr.port());
     if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve peer address: {}", peer)); }
-    for (auto const& rslt : results)
-    {    //
-        fmt::print(stderr, "[native_ckpt:svr] Resolved peer {} to endpoint {}\n", peer, rslt.endpoint());
-    }
-    auto endpoint = results.begin()->endpoint();
-    fmt::print(stderr, "[native_ckpt:svr] Connecting to endpoint {} resolved from peer {}\n", endpoint, peer);
-    stream.connect(endpoint);
+    auto const endpoint = stream.connect(results);
+    fmt::print(stderr, "[native_ckpt:svr] Connected to endpoint {} resolved from peer {}\n", endpoint, peer);
 
     Request req;
     // Write HTTP/1.1 request headers with Transfer-Encoding: chunked (no Content-Length)
@@ -349,7 +346,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
 // Fields present only in native (no distcp equivalent):
 //   {fqn}.device           -- cuda:0 etc.
 
-void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
+[[maybe_unused]] void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 {
     auto peerIndex = static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer;
 
@@ -552,6 +549,11 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 
 void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr)
 {
+    // Ranks on the coordinator peer (peers[0]) record their finalize/write-complete
+    // locally; only ranks on other peers forward those notifications to the coordinator.
+    bool const notifyCoordinator = static_cast<uint32_t>(hdr.globalRank) / topo.ranksPerPeer != 0;
+    if (notifyCoordinator) { SendPeerFinalizeSnapshotComplete_(topo.peers[0], hdr); }
+
     Snapshot*   snapshotPtr   = nullptr;
     LocalState* localStatePtr = nullptr;
     {
@@ -562,12 +564,15 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     auto& snapshot   = *snapshotPtr;
     auto& localState = *localStatePtr;
 
+    // TODO_GLOBAL_REGISTRY_BCASE
+    auto localNodeWorldSize = hdr.globalRank == Rank{0} ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
+
     // Wait for all ranks to merge before capturing the shared registry (it keeps mutating until then).
     while (true)
     {
         {
             std::scoped_lock lock(mutex);
-            if (recievedFrom.size() >= static_cast<size_t>(topo.worldSize))
+            if (recievedFrom.size() >= localNodeWorldSize)
             {
                 snapshotPtr->registry = sessionState.registry;
                 break;
@@ -578,8 +583,8 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                        *server,
                        sessionId,
                        hdr.snapshotId,
-                       static_cast<size_t>(topo.worldSize) - recievedFrom.size(),
-                       static_cast<size_t>(topo.worldSize),
+                       localNodeWorldSize - recievedFrom.size(),
+                       localNodeWorldSize,
                        fmt::join(recievedFrom, ","));
         }
         if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
@@ -616,9 +621,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         std::scoped_lock lock(mutex);
         snapshot.writeCkptCompletedRanks.insert(hdr.globalRank);
     }
+    if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr); }
 
-    // Rank 0 emits metadata (DebugWriteNativeMetadataInfo_ and the distcp
-    // .metadata pickle) once every rank has finished its WriteRankShard.
+    // Rank 0 emits metadata and the distcp.metadata once every rank has finished its WriteRankShard.
     if (hdr.globalRank == Rank{0})
     {
         while (true)
@@ -640,10 +645,6 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         DebugWriteNativeMetadataInfo_(snapshot);
-        // Log on failure so the operator sees what broke. The async worker's
-        // future is stored in `asyncTasks` but never `.get()`d (pre-existing
-        // gap tracked in plan.md), so a silent rethrow at session teardown
-        // would otherwise be the first user-visible signal.
         try
         {
             checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry);
@@ -760,6 +761,30 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 
 // TODO_MULTILOCAL_CKPT
 void Session::SendPeerFinalizeSnapshotComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
+{
+    boost::asio::io_context  ioc;
+    boost::beast::tcp_stream stream(ioc);
+    {
+        auto req = CreateRequestForPeer(
+            ioc, stream, peer, fmt::format("/api/peer/finalizecomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId));
+        // req.set(boost::beast::http::field::expect, "100-continue");
+        boost::beast::http::request_serializer<boost::beast::http::buffer_body, boost::beast::http::fields> sr{req};
+        boost::beast::http::write_header(stream, sr);
+    }
+    // Read the response
+    boost::beast::flat_buffer                                     buffer;
+    boost::beast::http::response<boost::beast::http::string_body> res;
+    boost::beast::http::read(stream, buffer, res);
+
+    if (res.result() != boost::beast::http::status::ok)
+    {
+        throw std::runtime_error(
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} returned error: {}", *server, sessionId, peer, res.result_int()));
+    }
+    TryCleanShutdown(stream);
+}
+
+void Session::SendPeerWriteCkptComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
 {
     boost::asio::io_context  ioc;
     boost::beast::tcp_stream stream(ioc);
@@ -978,7 +1003,9 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<ch
     asyncTasks.emplace_back(
         std::async(std::launch::async | std::launch::deferred, &Session::OnRecieveLocalStateRegistryAsync_, this, rank));
 
-    if (rank != Rank{0})    // TODO_MULTILOCAL_CKPT
+    // Coordinator-peer ranks merge into the global registry locally (OnRecieve); only
+    // ranks on other peers forward their fragment to the coordinator (peers[0]).
+    if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
     {
         asyncTasks.push_back(std::async(
             std::launch::async | std::launch::deferred, &Session::SendLocalShardedStateRegistryToPeer_, this, rank, topo.peers[0]));
@@ -1162,7 +1189,7 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    Server() = default;
+    Server(uint16_t index = 0) : _index(index) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
@@ -1182,7 +1209,7 @@ struct Server
         {
             _threads.emplace_back([this, i]() {
                 SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
-                auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(i));
+                auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i));
                 {
                     std::scoped_lock lock1(_mutex);
                     _msgQueue.insert(&msgQueue);
@@ -1394,13 +1421,67 @@ struct Server
         return *it->second;
     }
 
-    void RecieveStateRegistryFragments_(Session&                                                             session,
+    void NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
+    {
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}] Finalize complete notification received for snapshot {} from rank {}\n",
+                   *this,
+                   sessionId,
+                   snapshotId,
+                   fromRank);
+        auto lock = std::scoped_lock<std::mutex>(_mutex);
+        auto it   = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end())
+        {
+            throw std::runtime_error(fmt::format(
+                "Received finalize complete notification for non-existent session {} from rank {}. Ignoring.\n", sessionId, fromRank));
+        }
+        auto it2 = it->second->snapshots.find(snapshotId);
+        if (it2 == it->second->snapshots.end())
+        {
+            throw std::runtime_error(fmt::format(
+                "Received finalize complete notification for non-existent snapshot {} from rank {}. Ignoring.\n", snapshotId, fromRank));
+        }
+        auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
+        it2->second->finalizedRanks.insert(fromRank);
+    }
+
+    void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
+    {
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}] Write checkpoint complete notification received for snapshot {} from rank {}\n",
+                   *this,
+                   sessionId,
+                   snapshotId,
+                   fromRank);
+        auto lock = std::scoped_lock<std::mutex>(_mutex);
+        auto it   = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end())
+        {
+            throw std::runtime_error(
+                fmt::format("Received write checkpoint complete notification for non-existent session {} from rank {}. Ignoring.\n",
+                            sessionId,
+                            fromRank));
+        }
+        auto it2 = it->second->snapshots.find(snapshotId);
+        if (it2 == it->second->snapshots.end())
+        {
+            throw std::runtime_error(
+                fmt::format("Received write checkpoint complete notification for non-existent snapshot {} from rank {}. Ignoring.\n",
+                            snapshotId,
+                            fromRank));
+        }
+        auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
+        it2->second->writeCkptCompletedRanks.insert(fromRank);
+    }
+
+    void RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
                                         cipc::Rank                                                           fromRank,
                                         tcp_stream&                                                          stream,
                                         boost::beast::flat_buffer&                                           buffer,
                                         boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser)
     {
-        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Receiving state registry chunks for rank={}\n", *this, session.sessionId, fromRank);
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Receiving state registry chunks for rank={}\n", *this, sessionId, fromRank);
 
         // Reads exactly dest.size() bytes, looping over partial reads until complete.
         // Returns bytes read; caller checks for 0+is_done() at record boundaries.
@@ -1461,13 +1542,35 @@ struct Server
             tensorShards.push_back(std::move(info));
         }
 
-        session.HandleStateRegistryFragment(fromRank, tensorShards);
-        fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
-                   *this,
-                   session.sessionId,
-                   tensorShards.size(),
-                   fromRank);
+        {
+            auto lock = std::scoped_lock<std::mutex>(_mutex);
+            auto it   = _activeSessions.find(sessionId);
+            // This is a bit ugly
+            if (it == _activeSessions.end() || it->second->sessionState.registry == nullptr)
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}][INFO] Received state registry fragment for non-existent session. Adding to "
+                           "pending data\n",
+                           *this,
+                           sessionId,
+                           fromRank);
+                auto pendingData          = std::make_unique<PendingSessionData>();
+                pendingData->tensorShards = std::move(tensorShards);
+                pendingData->recvFrom     = fromRank;
+                pendingData->recievedAt   = PerfClock::now();
+                _pendingSessionData[sessionId].push_back(std::move(pendingData));
+            }
+            else
+            {
+                it->second->HandleStateRegistryFragment(fromRank, tensorShards);
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
+                           *this,
+                           sessionId,
+                           tensorShards.size(),
+                           fromRank);
+            }
+        }
     }
 
     void HandleRequest_(tcp_stream& stream)
@@ -1503,7 +1606,41 @@ struct Server
             if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
 
             boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
-            RecieveStateRegistryFragments_(SessionById_(sessionId), rank, stream, buffer, bufferParser);
+            RecieveStateRegistryFragments_(sessionId, rank, stream, buffer, bufferParser);
+            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            res.keep_alive(headers.keep_alive());
+            res.body() = "{}";
+            res.prepare_payload();
+            boost::beast::http::write(stream, res);
+        }
+        // Check if this is the state upload endpoint: POST /api/peer/finalizecomplete/{sessionId}/{rank}/{snapshotId}
+
+        else if (matches({"api", "peer", "finalizecomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+        {
+            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
+
+            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+            NotifyFinalizeComplete_(sessionId, rank, snapshotId);
+            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            res.keep_alive(headers.keep_alive());
+            res.body() = "{}";
+            res.prepare_payload();
+            boost::beast::http::write(stream, res);
+        }
+        else if (matches({"api", "peer", "writeckptcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+        {
+            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
+
+            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+            NotifyWriteCkptComplete_(sessionId, rank, snapshotId);
             boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
             res.set(boost::beast::http::field::server, "NativeCheckpointServer");
             res.keep_alive(headers.keep_alive());
@@ -1557,7 +1694,7 @@ struct Server
     {
         using boost::asio::ip::tcp;
         auto const    address = boost::asio::ip::make_address("0.0.0.0");
-        tcp::endpoint endpoint(address, Port);
+        tcp::endpoint endpoint(address, Port + _index);
         // use synchronous acceptor to simplify shutdown logic (no need to cancel async accept)
         _tcpAcceptor.open(endpoint.protocol());
         _tcpAcceptor.set_option(boost::asio::socket_base::reuse_address(true));
@@ -1609,6 +1746,7 @@ struct Server
     }
 
     private:
+    uint16_t   _index{};
     std::mutex _mutex;
 
     PerfClock::time_point               _lastPingTime{PerfClock::now()};
@@ -1619,6 +1757,16 @@ struct Server
 
     boost::asio::io_context        _ioc;
     boost::asio::ip::tcp::acceptor _tcpAcceptor{_ioc};
+
+    // TODO_NOPENDING_STRUCT
+    struct PendingSessionData
+    {
+        PerfClock::time_point        recievedAt;
+        Rank                         recvFrom{Rank::Invalid};
+        std::vector<TensorShardInfo> tensorShards;
+    };
+
+    std::unordered_map<cipc::SessionId, std::vector<std::unique_ptr<PendingSessionData>>> _pendingSessionData;
 
     std::unordered_map<cipc::SessionId, std::unique_ptr<Session>> _activeSessions;
     friend struct Session;
@@ -1696,24 +1844,39 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
         }
 #endif
     }
-
-    // if (recievedFrom.size() == rankPeerMap.size())
-    //{    // This will only be invoked for 1 Node runs
-    //     WriteGlobalStateTreeToFile(*sessionState.registry, workDir / "registry.bin");
-    // }
+    {
+        // TODO_NOPENDING_STRUCT
+        auto lock = std::scoped_lock<std::mutex>(server->_mutex);
+        auto itp  = server->_pendingSessionData.find(sessionId);
+        if (itp != server->_pendingSessionData.end())
+        {
+            for (auto const& p : itp->second)
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}][WARN] Found pending session data. activating session with pending data\n",
+                           *server,
+                           sessionId);
+                HandleStateRegistryFragment(p->recvFrom, p->tensorShards);
+            }
+            server->_pendingSessionData.erase(itp);
+        }
+    }
 }
 
 SUPPRESS_WARNINGS_START
 SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
 SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-static std::unique_ptr<Server> ServerSingleton;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static std::vector<std::unique_ptr<Server>> ServerSingletons;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
 
-void RunInprocServer()
+void RunInprocServer(uint16_t nodes)
 {
-    ServerSingleton = std::make_unique<Server>();
-    SetThreadName("ncs:main");
-    ServerSingleton->Start();
+    for (uint16_t i = 0; i < nodes; i++)
+    {
+        fmt::print(stderr, "[native_ckpt:svr] Starting inproc server instance for node {}\n", i);
+        ServerSingletons.push_back(std::make_unique<Server>(i));
+        ServerSingletons.back()->Start();
+    }
     fmt::print(stderr, "[native_ckpt:svr] Inproc server started.\n");
     std::fflush(stderr);
 }
@@ -1733,15 +1896,20 @@ void RunServer()    // NOLINT(misc-use-internal-linkage)
 
 void StopInprocServer()
 {
-    if (ServerSingleton)
+    for (auto& server : ServerSingletons)
     {
-        ServerSingleton->Stop();
-        ServerSingleton.reset();
+        if (server)
+        {
+            server->Stop();
+            server.reset();
+        }
     }
 }
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData)
 {
-    if (!ServerSingleton) { return; }
-    ServerSingleton->QuerySessions(callback, cbData);
+    for (auto& server : ServerSingletons)
+    {
+        if (server) { server->QuerySessions(callback, cbData); }
+    }
 }

@@ -927,12 +927,23 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
         auto const&                      tnsr = std::get<StateNode::ShardedTensor>(node.data);
         std::vector<DS4Tensor::DimRange> chunkRanges;
         chunkRanges.reserve(tnsr.shards.size());
-        DS4Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
             if (shard.ShardSizeBytes(tnsr.dtype) == 0) { continue; }
-            if (lastShard == shard.sharddim) { continue; }
-            lastShard = shard.sharddim;
+            // tnsr.shards is ordered by (rank, sharddim), so replicas of one chunk held on
+            // different ranks are not adjacent. Dedup against every chunk collected so far,
+            // not just the previous shard, so each chunk is listed once: a consecutive-only
+            // check leaves duplicate ChunkStorageMetadata entries for cross-node replicas.
+            bool alreadyEmitted = false;
+            for (auto const& emitted : chunkRanges)
+            {
+                if (emitted == shard.sharddim)
+                {
+                    alreadyEmitted = true;
+                    break;
+                }
+            }
+            if (alreadyEmitted) { continue; }
             chunkRanges.push_back(shard.sharddim);
         }
         if (chunkRanges.empty()) { return; }

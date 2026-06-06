@@ -171,11 +171,11 @@ struct CheckpointWriter
     StateTree const&      root;    // NOLINT
     static cipc::MsgQueue InitMsgQueue(RankTopology const& topo)
     {
-        auto numa = GetCurrentNumaNode();
-        auto channelName
-            = cipc::Message::RequestChannelName(static_cast<uint8_t>(static_cast<uint32_t>(topo.rank) % cipc::MaxRanksPerNode));
-        fmt::print(
-            stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", static_cast<size_t>(topo.rank), numa, channelName);
+        auto numa        = GetCurrentNumaNode();
+        auto index       = (static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer) % cipc::MaxRanksPerNode;
+        auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+        auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
+        fmt::print(stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", topo.rank, numa, channelName);
         auto msgQueue = cipc::MsgQueue::Open(channelName);
 #ifdef PHOENIX_HAVE_CUDA
         auto region = msgQueue.GetShmDataRegion();

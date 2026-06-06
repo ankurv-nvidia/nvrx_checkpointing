@@ -418,10 +418,10 @@ class ValgrindFlavor(Flavor):
     # touching those files even while it keeps logging, so checkpoint-file activity —
     # not log activity — is the progress signal. No file written/modified for
     # _STALL_SILENCE_S means it is stalled.
-    _STALL_SILENCE_S = 300       # 5 min of no checkpoint-file activity = stalled
-    _STALL_POLL_S = 10           # how often to poll for progress / exit
-    _STALL_STOP_GRACE_S = 120    # grace for a stalled server to honor a re-issued stop
-    _STALL_LOG_EVERY_S = 60      # heartbeat cadence while waiting, so the wait is visible
+    _STALL_SILENCE_S = 300  # 5 min of no checkpoint-file activity = stalled
+    _STALL_POLL_S = 10  # how often to poll for progress / exit
+    _STALL_STOP_GRACE_S = 120  # grace for a stalled server to honor a re-issued stop
+    _STALL_LOG_EVERY_S = 60  # heartbeat cadence while waiting, so the wait is visible
 
     # memcheck *error* headers (NOT leak kinds — leaks stay gated by --error-exitcode).
     # valgrind prints each as the error happens, prefixed ==<pid>==, so they remain in
@@ -541,7 +541,7 @@ class ValgrindFlavor(Flavor):
                     logger.error(f"[run_job] stalled checkpoint_server exited after re-issued stop (rc={rc})")
                     return rc, True
                 except subprocess.TimeoutExpired:
-                    logger.error("[run_job] stalled checkpoint_server ignored stop — SIGKILL")
+                    logger.exception("[run_job] stalled checkpoint_server ignored stop — SIGKILL")
                     CheckpointServer._gcore_and_kill_server()
                     return None, True
 
@@ -549,9 +549,9 @@ class ValgrindFlavor(Flavor):
         # PHOENIX_BUILD_FOR_VALGRIND → CMakeLists.txt sets BUILDENV_DISABLE_MARCH_NATIVE
         # and shrinks D2H buffers so valgrind's shadow memory stays manageable.
         recipe.build_env["PHOENIX_BUILD_FOR_VALGRIND"] = "1"
-        # valgrind runs ~10-50x slower; give the step enough room that the stall
-        # guard (below) — not the SLURM time limit — is what ends a hung run.
-        recipe.srun_time_min = max(recipe.srun_time_min, 120)
+        # valgrind runs ~10-50x slower; give it double the regular budget so the
+        # stall guard (above) — not the SLURM time limit — is what ends a hung run.
+        recipe.srun_time_min = recipe.srun_time_min * 2
         recipe.srun_comments.append(self._REAPER_COMMENT)
 
     @contextlib.contextmanager
@@ -1997,22 +1997,9 @@ class PretrainJob:
         if use_torchrun:
             launcher = ["torchrun", "--nproc_per_node", str(gpus_per_node)]
         else:
-            # In-srun: set PyTorch distributed env vars from SLURM.
-            # Port is derived from SLURM_JOB_ID so concurrent jobs don't collide.
-            slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0"))
-            master_port = 20000 + (slurm_job_id % 40000)
-            try:
-                master_addr = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_NODELIST"]], text=True).split()[0]  # noqa: S607
-            except (subprocess.CalledProcessError, OSError, KeyError, IndexError):
-                master_addr = "localhost"
-            env.update(
-                {
-                    "RANK": os.environ.get("SLURM_PROCID", "0"),
-                    "LOCAL_RANK": os.environ.get("SLURM_LOCALID", "0"),
-                    "WORLD_SIZE": os.environ.get("SLURM_NTASKS", "1"),
-                    "MASTER_ADDR": master_addr,
-                    "MASTER_PORT": str(master_port),
-                },
+            logger.info(
+                f"[run_job] in-srun mode: RANK={env['RANK']} LOCAL_RANK={env['LOCAL_RANK']} WORLD_SIZE={env['WORLD_SIZE']}"
+                f"MASTER_ADDR={env['MASTER_ADDR']} MASTER_PORT={env['MASTER_PORT']}",
             )
             launcher = ["python3", "-u"]
 

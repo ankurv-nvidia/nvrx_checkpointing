@@ -274,6 +274,31 @@ zy.devbox:valgrind:1x2:
     - job: 13.gb200:pretrain-nvrx:1x4:deterministic
       artifacts: true
 
+14.gb200:pretrain-native:2x4:deterministic:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic --nodes 2"
+
+14.gb200:pretrain-native:2x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 14.gb200:pretrain-native:2x4:deterministic
+      artifacts: true
+
+# Multinode nvrx: generates the cross-provider baseline (metadata/2x4_*) the 2x4
+# native deterministic job compares against. Baselines are namespaced by config,
+# so these do not collide with the 1x4 set.
+15.gb200:pretrain-nvrx:2x4:deterministic:
+  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic --nodes 2"
+
+15.gb200:pretrain-nvrx:2x4:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_gb200]
+  needs:
+    - job: 15.gb200:pretrain-nvrx:2x4:deterministic
+      artifacts: true
+
 zy.gb200:valgrind:1x4:
   extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
   # See zy.devbox:valgrind:1x2 — fail the pipeline on memcheck errors/stalls (exit != 3).
@@ -327,6 +352,31 @@ zz.gb200:pretrain:16x4:perf:
   extends: [.update_baseline_base, .runner_h100]
   needs:
     - job: 23.h100:pretrain-nvrx:1x8:deterministic
+      artifacts: true
+
+24.h100:pretrain-native:2x8:deterministic:
+  extends: [.run_job, .runner_h100, .needs_h100_image]
+  variables:
+    JOB_ARGS: "pretrain-native --flavor deterministic --nodes 2"
+
+24.h100:pretrain-native:2x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 24.h100:pretrain-native:2x8:deterministic
+      artifacts: true
+
+# Multinode nvrx: generates the cross-provider baseline (metadata/2x8_*) the 2x8
+# native deterministic job compares against. Baselines are namespaced by config,
+# so these do not collide with the 1x8 set.
+25.h100:pretrain-nvrx:2x8:deterministic:
+  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
+  variables:
+    JOB_ARGS: "pretrain-nvrx --flavor deterministic --nodes 2"
+
+25.h100:pretrain-nvrx:2x8:deterministic:update_baselines:
+  extends: [.update_baseline_base, .runner_h100]
+  needs:
+    - job: 25.h100:pretrain-nvrx:2x8:deterministic
       artifacts: true
 
 zy.h100:valgrind:1x8:
