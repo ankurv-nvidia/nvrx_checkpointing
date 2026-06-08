@@ -1330,13 +1330,24 @@ class PerfReport:
         bw_matches = list(_RE_NATIVE_BW.finditer(log_text))
         if bw_matches:
             ranks = [int(m.group(1)) for m in bw_matches]
+            bw_samples = [float(m.group(2)) for m in bw_matches]
             result.update(
                 {
-                    "bw_mbps": PerfReport._make_metric([float(m.group(2)) for m in bw_matches], "MB/s", higher_is_better=True, ranks=ranks),
+                    "bw_mbps": PerfReport._make_metric(bw_samples, "MB/s", higher_is_better=True, ranks=ranks),
                     "wr_tnsr_us": PerfReport._make_metric([int(m.group(3)) for m in bw_matches], "us", higher_is_better=False, ranks=ranks),
                     "total_written_bytes": PerfReport._make_metric([int(m.group(4)) for m in bw_matches], "B", None, ranks=ranks),
                 },
             )
+            # Per-rank bandwidth imbalance (informational): fastest/slowest rank
+            # mean. ~1.0 is balanced; larger flags a per-socket NUMA split. Not
+            # gated — which socket is slow varies run-to-run, so a hard threshold
+            # would be flaky.
+            per_rank: dict[int, list[float]] = {}
+            for r, v in zip(ranks, bw_samples):
+                per_rank.setdefault(r, []).append(v)
+            rank_means = [statistics.mean(v) for v in per_rank.values()]
+            if len(rank_means) > 1 and min(rank_means) > 0:
+                result["bw_rank_imbalance"] = PerfReport._make_metric([max(rank_means) / min(rank_means)], "ratio", higher_is_better=None)
 
         mem_matches = list(_RE_NATIVE_MEM.finditer(log_text))
         if mem_matches:
@@ -1456,7 +1467,7 @@ class PerfReport:
                 by_rank.setdefault(r, []).append(s)
             per_rank = "  ".join(f"r{r}={f(statistics.mean(by_rank[r]))}" for r in sorted(by_rank))
             logger.info(f"         per-rank mean: {per_rank}")
-        logger.info(f"         all values: {' '.join(f(s) for s in sorted(samples))}")
+        logger.info(f"         all values: {' '.join(f(s) for s in samples)}")
 
     @staticmethod
     def _compare_iters_to_baseline(cfg: str, provider: str) -> None:

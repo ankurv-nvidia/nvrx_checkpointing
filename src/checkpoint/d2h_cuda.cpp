@@ -4,6 +4,9 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
+#include <cctype>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -134,6 +137,20 @@ void DeviceContext::CudaRegisterHostBuffer(void* ptr, size_t size)
 void DeviceContext::CudaUnregisterHostBuffer(void* ptr)
 {
     CUDA_CHECK(cudaHostUnregister(ptr), "Failed to unregister host buffer at {:p}", ptr);    //
+}
+
+int DeviceContext::CudaGetCurrentDeviceNumaNode()
+{
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) { return -1; }
+    std::array<char, 32> busId{};
+    if (cudaDeviceGetPCIBusId(busId.data(), static_cast<int>(busId.size()), device) != cudaSuccess) { return -1; }
+    // sysfs PCI paths are lowercase; cudaDeviceGetPCIBusId yields uppercase hex.
+    for (auto& ch : busId) { ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); }
+    std::ifstream f(std::string("/sys/bus/pci/devices/") + busId.data() + "/numa_node");
+    int node = -1;
+    if (f >> node) { return node; }    // a value of -1 here means "no NUMA affinity"
+    return -1;
 }
 
 std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContextCUDA(DeviceId device, uint8_t streamIdx)

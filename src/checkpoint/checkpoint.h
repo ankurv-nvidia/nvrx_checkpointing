@@ -46,6 +46,9 @@ struct DeviceContext
 
     static void CudaRegisterHostBuffer(void* ptr, size_t size);
     static void CudaUnregisterHostBuffer(void* ptr);
+
+    // NUMA node of the current CUDA device (from its PCI bus), or -1 if unknown.
+    static int CudaGetCurrentDeviceNumaNode();
 #endif
 
 #ifdef PHOENIX_HAVE_METAL

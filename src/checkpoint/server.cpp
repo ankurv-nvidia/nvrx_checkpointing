@@ -1104,7 +1104,22 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
                                                  hdr.globalRank,
                                                  hdr.snapshotId));
         }
-        localState->blob                                = Blob(hdr.snapshotSize);
+        localState->blob = Blob(hdr.snapshotSize);
+        // Keep the dequeue memcpy on-socket: bind the blob to the rank's NUMA domain
+        // using the same rank->queue->domain mapping as the client. Single node only
+        // and assumes socket-ordered GPUs (ranks 0..N/2-1 on NUMA 0, etc.), as the client.
+        if (auto numDomains = DetectNumaNodeCount();
+            topo.peersPerNode == 1 && numDomains > 1 && localState->blob.data != nullptr)
+        {
+            uint32_t ranksPerQueue = topo.ranksPerPeer / cipc::MaxRanksPerNode;
+            if (ranksPerQueue == 0) { ranksPerQueue = 1; }
+            uint32_t queuesPerDomain = cipc::MaxRanksPerNode / numDomains;
+            if (queuesPerDomain == 0) { queuesPerDomain = 1; }
+            uint32_t localRank = static_cast<uint32_t>(hdr.globalRank) % topo.ranksPerPeer;
+            uint32_t qidx      = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
+            int      domain    = std::min<int>(numDomains - 1, static_cast<int>(qidx / queuesPerDomain));
+            BindRegionToNumaNode(domain, localState->blob.data, localState->blob.size);
+        }
         snapshotIt->second->localStates[hdr.globalRank] = std::move(localState);
     }
 

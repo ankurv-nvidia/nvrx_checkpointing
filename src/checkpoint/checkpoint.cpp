@@ -171,14 +171,27 @@ struct CheckpointWriter
     StateTree const&      root;    // NOLINT
     static cipc::MsgQueue InitMsgQueue(RankTopology const& topo)
     {
-        auto numa        = GetCurrentNumaNode();
-        auto index       = (static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer) % cipc::MaxRanksPerNode;
-        auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+        int numa = GetCurrentNumaNode();
+#ifdef PHOENIX_HAVE_CUDA
+        // The GPU, fixed by the rank, decides where the D2H copy lands fastest.
+        if (int gpuNuma = DeviceContext::CudaGetCurrentDeviceNumaNode(); gpuNuma >= 0) { numa = gpuNuma; }
+#endif
+        auto localRank = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
+        // Map consecutive same-socket ranks to one queue so each shm buffer stays
+        // within a single NUMA domain.
+        auto ranksPerQueue = topo.ranksPerPeer / cipc::MaxRanksPerNode;
+        if (ranksPerQueue == 0) { ranksPerQueue = 1; }
+        auto index     = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
+        auto peerIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
         auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
         fmt::print(stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", topo.rank, numa, channelName);
         auto msgQueue = cipc::MsgQueue::Open(channelName);
 #ifdef PHOENIX_HAVE_CUDA
         auto region = msgQueue.GetShmDataRegion();
+        // Bind the data pages to the rank-local node before cudaHostRegister faults
+        // them in; the queue's Create initializes only the control header. Single
+        // node only — the rank->domain mapping isn't correct for multi-peer layouts.
+        if (topo.peersPerNode == 1) { BindRegionToNumaNode(numa, region.data(), region.size()); }
         DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
 #endif
         return msgQueue;
