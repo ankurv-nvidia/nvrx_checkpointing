@@ -112,7 +112,9 @@ struct Session
     Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId);
     Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId);
 
+#ifdef DEBUG_MD5SUM
     void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;
+#endif
 
     void OnRecieveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);

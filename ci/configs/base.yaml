@@ -1,12 +1,14 @@
-# Base pretrain model + training config for the native checkpoint CI.
+# Common model + training config shared by every native-checkpoint CI profile.
 #
 # Flattened to CLI args by the pretrain job: `key: value` -> `--key value`,
 # `key: true` -> `--key`, `key: [a, b]` -> `--key a b`, `key: false`/null drops
-# the flag. Per-node-count overrides (pretrain_<N>node.yaml, e.g. pretrain_16node.yaml)
-# deep-merge over this. Runtime values are supplied in code, not here: checkpoint
-# provider/format/save-load, save/log/eval/exit intervals and train-iters, the data
-# cache and tensorboard paths, and the default tensor/expert parallel sizes and global
-# batch size (which scale with the runner's GPU count unless an override pins them).
+# the flag. A profile (pico.yaml / nano.yaml / ultra.yaml, selected by
+# `--config <profile>`) deep-merges over this; the profile pins model size,
+# routing top-k, and parallelism. Runtime values are supplied in code, not here:
+# checkpoint provider/format/save-load, save/log/eval/exit intervals and
+# train-iters, the data cache and tensorboard paths, and the default
+# tensor/expert parallel sizes and global batch size (which scale with the
+# runner's GPU count unless a profile pins them).
 #
 # Float and scientific-notation values are quoted so they reach the CLI verbatim.
 
@@ -16,7 +18,9 @@ mtp-hybrid-override-pattern: "*E"
 calculate-per-token-loss: true
 mtp-loss-scaling-factor: "0.3"
 
-# Architecture
+# Architecture (model size — num-layers, hidden-size, ffn-hidden-size,
+# mamba-num-heads, hybrid-override-pattern, num-experts, the MoE shared-expert
+# size, and the bf16-tail depth — is pinned per profile).
 is-hybrid-model: true
 first-last-layers-bf16: true
 untie-embeddings-and-output-weights: true
@@ -25,22 +29,13 @@ position-embedding-type: "none"
 bf16: true
 use-mcore-models: true
 spec: [megatron.core.models.mamba.mamba_layer_specs, mamba_stack_spec]
-num-layers: 3
-hidden-size: 2048
 num-attention-heads: 32
-ffn-hidden-size: 1344
 kv-channels: 128
-mamba-num-heads: 64
-hybrid-override-pattern: "M*E"
-num-experts: 32
-moe-router-topk: 11
-moe-shared-expert-intermediate-size: 2688
 moe-latent-size: 1024
 num-layers-at-start-in-bf16: 0
-num-layers-at-end-in-bf16: 2
 
 # Parallelism (tensor/expert model-parallel sizes and global batch size are computed
-# in code so the dev configs track the runner's GPU count; an override pins them).
+# in code so the pico profile tracks the runner's GPU count; nano/ultra pin them).
 expert-tensor-parallel-size: 1
 pipeline-model-parallel-size: 1
 sequence-parallel: true
@@ -50,12 +45,11 @@ overlap-grad-reduce: true
 overlap-param-gather: true
 override-opt_param-scheduler: true
 
-# MoE
+# MoE (routing top-k and its scaling factor are pinned per profile)
 moe-token-dispatcher-type: alltoall
 moe-router-score-function: sigmoid
 moe-grouped-gemm: true
 moe-aux-loss-coeff: "1e-4"
-moe-router-topk-scaling-factor: "5.0"
 moe-router-enable-expert-bias: true
 moe-router-dtype: fp32
 moe-router-load-balancing-type: seq_aux_loss

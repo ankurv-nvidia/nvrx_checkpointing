@@ -1,0 +1,25 @@
+# nano profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes.
+# Deep-merged over base.yaml. Model dimensions and routing come from the
+# nemotron3 nano preset; the training recipe (optimizer, fused ops, data,
+# logging, MTP) is inherited from base. Parallelism pins TP=2 / EP=32 (EP=32
+# needs >= 32 GPUs, i.e. 8 nodes at 4 GPUs/node); global batch size is left
+# unpinned so it tracks the runner's GPU count.
+
+# Model size
+num-layers: 52
+hidden-size: 2688
+ffn-hidden-size: 1856
+mamba-num-heads: 64
+hybrid-override-pattern: "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+num-experts: 128
+moe-shared-expert-intermediate-size: 3712
+num-layers-at-end-in-bf16: 2
+moe-latent-size: null  # N/A on nano — drops the --moe-latent-size flag
+
+# Routing
+moe-router-topk: 6
+moe-router-topk-scaling-factor: "2.5"
+
+# Parallelism (pinned; global batch size scales with the runner's GPU count)
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 32

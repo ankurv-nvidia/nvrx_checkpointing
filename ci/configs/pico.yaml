@@ -1,0 +1,18 @@
+# pico profile: the smallest Mamba-hybrid MoE recipe — a fast single-node smoke
+# of the native checkpoint path. Deep-merged over base.yaml. Parallelism and
+# global batch size are left unpinned so they scale with the runner's GPU count
+# (the dynamic defaults supplied in code).
+
+# Model size
+num-layers: 3
+hidden-size: 2048
+ffn-hidden-size: 1344
+mamba-num-heads: 64
+hybrid-override-pattern: "M*E"
+num-experts: 32
+moe-shared-expert-intermediate-size: 2688
+num-layers-at-end-in-bf16: 2
+
+# Routing
+moe-router-topk: 11
+moe-router-topk-scaling-factor: "5.0"

@@ -227,8 +227,8 @@ function megatron {
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
     curl -LsSf https://astral.sh/uv/install.sh | sh
     source $HOME/.local/bin/env
-    uv cache clear
-    uv pip install --system --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools 
+    export UV_CACHE_DIR="$(mktemp -d)"
+    uv pip install --system --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools
     uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
     uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
     uv pip install --system --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models

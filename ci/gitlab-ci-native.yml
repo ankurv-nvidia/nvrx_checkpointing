@@ -1,24 +1,12 @@
-# GitLab CI for performance and correctness testing.
-#
-# Include from root .gitlab-ci.yml:
-#   include:
-#     - megatron/native/ci/gitlab-ci-native.yml
-#
-# Runners must be registered on each machine's login node.
-# See megatron/native/ci/runner/setup_runner.py and ci/prepare.md.
+# Bootstrap CI: shared templates + a generate job that renders the per-platform jobs (from
+# generate-ci.py) into child pipelines. Everything above the marker is copied into each
+# child; add a platform in generate-ci.py, not here. See runner/setup_runner.py, ci/prepare.md.
 
-# `build` and `test` are shared with the root pipeline this file is included
-# into; reusing their names keeps prepare-image ordered before the test jobs
-# after GitLab merges the stage lists (include-only stages get appended last,
-# which would push a dedicated prepare stage after test and break the needs:).
 stages:
   - build
   - test
   - update
 
-# ---------------------------------------------------------------------------
-# Base template: shared settings for all jobs
-# ---------------------------------------------------------------------------
 .ci_base:
   interruptible: false
   retry:
@@ -32,26 +20,15 @@ stages:
   before_script:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
-    # Source the runner config (PLATFORM/CLUSTER + env vars like VCPKG_ROOT) and export
-    # both for run_job.py. PLATFORM (gb200/h100/...) is the GitLab tag + baseline namespace;
-    # CLUSTER (cwdfw/ocihsg/...) selects the srun templates. setup_runner forwards both into
-    # the runner env; re-export here (with fallbacks) so they reach run_job on local runs.
-    # PLATFORM falls back to CLUSTER for configs predating the split, CLUSTER to devbox.
+    # Load runner config; export the platform tag (baseline namespace) and cluster (selects
+    # srun templates), with fallbacks for local runs.
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
     - export CLUSTER="${CLUSTER:-devbox}"
     - export PLATFORM="${PLATFORM:-${CLUSTER}}"
     - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
 
-# ---------------------------------------------------------------------------
-# Per-runner templates: just the GitLab tag (the PLATFORM) that routes jobs.
-#
-# Nothing cluster-specific is set here — GPUs-per-node, SLURM/inline mode, PLATFORM and
-# CLUSTER are all configured per runner at setup and forwarded into the runner
-# environment (GPUS_PER_NODE, SLURM_PARTITION, PLATFORM, CLUSTER; see setup_runner.py).
-# PLATFORM (gb200/h100/...) is the runner tag + baseline namespace; CLUSTER (cwdfw/...)
-# selects the srun templates. run_job.py honors them, so the same JOB_ARGS run on any
-# cluster — no --gpus-per-node and no --slurm flag in the YAML.
-# ---------------------------------------------------------------------------
+# Per-runner tag only. GPUs-per-node, SLURM mode, platform, and cluster are configured per
+# runner at setup, so the same JOB_ARGS run anywhere — no scale or --slurm flag in the YAML.
 .runner_gb200:
   tags: [gb200]
 
@@ -61,15 +38,16 @@ stages:
 .runner_devbox:
   tags: [devbox]
 
-# ---------------------------------------------------------------------------
-# Template: run a job via run_job.py (JOB_ARGS set by each concrete job)
-# ---------------------------------------------------------------------------
+# Run a job via run_job.py. The image build runs in before_script (not a separate job) so
+# it lands on the same machine as the workload; it's a fast no-op when already present.
 .run_job:
   extends: .ci_base
+  before_script:
+    - !reference [.ci_base, before_script]
+    - python3 "${CI_SCRIPTS_DIR}/prepare_image.py"
   stage: test
   timeout: 4h
-  # exit 3 = perf regression — pipeline continues so update jobs remain triggerable.
-  # exit 2 = job crashed — treated as a real failure (pipeline goes red).
+  # exit 3 = perf drift, tolerated so update jobs stay triggerable; any other failure reds.
   allow_failure:
     exit_codes: [3]
   script:
@@ -80,76 +58,27 @@ stages:
     paths:
       - megatron/native/ci/ci-results/*.log
       - megatron/native/ci/ci-results/*_report.json
-      # Per-iter outputs the update stage mirrors into megatron/native/metadata/:
-      # pretrain-native contributes registry.bin / [0-9]*.metadata.info / *.txt,
-      # both providers contribute reference.metadata.info (re-derived by the
-      # in-job _compare_iters_to_baseline → distcp_trace pass).
+      # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/[0-9]*.metadata.info
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.txt
-      # Raw .metadata pickles — what dcp.load and distcp_trace actually read.
-      # On a contiguity-check failure, distcp_trace raises before writing
-      # reference.metadata.info, so this is the only artifact that survives
-      # for offline analysis of the storage_data layout.
+      # Raw .metadata pickles — the only survivor if the trace raises before writing.
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/.metadata
-      # pretrain-nvrx determinism check: run-1's reference.metadata.info is
-      # parked here before run-2 starts. On a cross-run mismatch the diff is
-      # reproducible offline as `diff run1-references/iter_*/reference.metadata.info
-      # checkpoints/iter_*/reference.metadata.info`.
+      # nvrx run-1 reference, parked for an offline cross-run diff on mismatch.
       - megatron/native/ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
     expire_in: 30 days
     when: always
 
-# ckptbench has its own entry script (ckptbench.py); everything else in .run_job
-# (stage, timeout, allow_failure exit 3, artifacts, after_script) is reused.
 .run_ckptbench:
   extends: .run_job
   script:
     - python3 "${CI_SCRIPTS_DIR}/ckptbench.py" || exit $?
 
-# Optional manual: job is always present in the pipeline but never runs
-# automatically — only when a user clicks "play" in the GitLab UI. Use for
-# jobs that are useful on demand (e.g. cross-provider baseline checks) but
-# too expensive or noisy to run on every commit.
+# Optional manual trigger bridge: allow_failure:true keeps an unplayed group from blocking
+# or reddening the parent. Opt-in lives here; the jobs inside each group run automatically.
 .manual_optional:
   when: manual
   allow_failure: true
-
-# ---------------------------------------------------------------------------
-# Build the enroot squash image once, up front, in the build stage.
-#
-# `prepare_image.py` builds the .sqsh if it is missing and is a fast no-op when
-# it already exists (and a no-op on inline/devbox runners, which use no image).
-# One job per runner; every test job `needs:` its own runner's prepare-image job
-# (see the .needs_*_image mixins) so jobs no longer build or stall on the image
-# inside the workload itself, and clusters don't wait on each other.
-# ---------------------------------------------------------------------------
-.prepare_image:
-  extends: .ci_base
-  stage: build
-  timeout: 2h
-  script:
-    - python3 "${CI_SCRIPTS_DIR}/prepare_image.py"
-
-gb200:prepare-image:
-  extends: [.prepare_image, .runner_gb200]
-
-h100:prepare-image:
-  extends: [.prepare_image, .runner_h100]
-
-# Each test job depends only on its own runner's prepare-image job (DAG via
-# needs), so it starts as soon as that image is ready without waiting on the
-# other clusters' prepare jobs. artifacts:false — the image lives on shared
-# storage, not in CI artifacts.
-.needs_gb200_image:
-  needs:
-    - job: gb200:prepare-image
-      artifacts: false
-.needs_h100_image:
-  needs:
-    - job: h100:prepare-image
-      artifacts: false
 
 .update_baseline_base:
   extends: .ci_base
@@ -167,9 +96,7 @@ h100:prepare-image:
     - |
       mkdir -p "${BASELINES_DIR}"
       git add "${BASELINES_DIR}/"
-      # pretrain-native update_baselines refreshes registry.bin / [0-9]*.metadata.info
-      # and pretrain-nvrx update_baselines refreshes reference.metadata.info under
-      # megatron/native/metadata/; harmless for ckptbench (no diff there).
+      # native and nvrx update jobs also refresh their snapshots under metadata/.
       if [ -d "${METADATA_DIR}" ]; then
         git add "${METADATA_DIR}/"
       fi
@@ -180,214 +107,88 @@ h100:prepare-image:
         git push origin "HEAD:${CI_COMMIT_BRANCH}"
       fi
 
-00.devbox:ckptbench:1x2:
-  extends: [.run_ckptbench, .runner_devbox]
+# >>> generate-ci.py: concrete jobs are generated below this line <<<
 
-00.devbox:ckptbench:1x2:update_baselines:
-  extends: [.update_baseline_base, .runner_devbox]
-  needs:
-    - job: 00.devbox:ckptbench:1x2
-      artifacts: true
+# Bootstrap (parent-only): render the per-platform jobs and trigger one child pipeline per
+# group. Keep these triggers in sync with GROUPS in generate-ci.py.
+generate-native-pipeline:
+  extends: .ci_base
+  stage: build
+  # Lightweight generation — runs on shared perflab machines, not a GPU runner.
+  tags: [perflab, os/linux]
+  # perflab's default image lacks python3; the slim image has the stdlib this needs.
+  image: python:3.12-slim
+  script:
+    - python3 "${CI_PROJECT_DIR}/megatron/native/ci/generate-ci.py"
+  artifacts:
+    paths: [generated-*.yml]
 
-01.devbox:pretrain-native:1x2:deterministic:
-  extends: [.run_job, .runner_devbox]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
+.native_trigger:
+  stage: test
+  needs: [generate-native-pipeline]
 
-01.devbox:pretrain-native:1x2:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_devbox]
-  needs:
-    - job: 01.devbox:pretrain-native:1x2:deterministic
-      artifacts: true
+ckptbench:
+  extends: .native_trigger
+  trigger:
+    include:
+      - artifact: generated-ckptbench.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-02.devbox:pretrain-native:1x2:perf:
-  extends: [.run_job, .runner_devbox]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
+"[DETR].native":
+  extends: .native_trigger
+  trigger:
+    include:
+      - artifact: generated-native-deterministic.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-02.devbox:pretrain-native:1x2:perf:update_baselines:
-  extends: [.update_baseline_base, .runner_devbox]
-  needs:
-    - job: 02.devbox:pretrain-native:1x2:perf
-      artifacts: true
+"[PERF].native":
+  extends: .native_trigger
+  trigger:
+    include:
+      - artifact: generated-native-perf.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-03.devbox:pretrain-nvrx:1x2:deterministic:
-  extends: [.run_job, .runner_devbox, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
+# The remaining groups are opt-in (nvrx smokes, memcheck, 16-node and 8-node sets): manual
+# play-button bridges. Playing one spawns its child, whose jobs then run automatically.
+"[DETR].nvrx":
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-nvrx-deterministic.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-03.devbox:pretrain-nvrx:1x2:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_devbox]
-  needs:
-    - job: 03.devbox:pretrain-nvrx:1x2:deterministic
-      artifacts: true
+"[PERF].nvrx":
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-nvrx-perf.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-zy.devbox:valgrind:1x2:
-  extends: [.run_job, .runner_devbox, .manual_optional]
-  # Override .manual_optional's allow_failure:true: a memcheck error or a stall
-  # (exit != 3) must fail the pipeline, not show as an allowed warning. Only the
-  # perf soft-fail (exit 3) stays tolerated, matching .run_job.
-  allow_failure:
-    exit_codes: [3]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
+valgrind:
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-valgrind.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-10.gb200:ckptbench:1x4:
-  extends: [.run_ckptbench, .runner_gb200, .needs_gb200_image]
+16node-ultra:
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-16node-ultra.yml
+        job: generate-native-pipeline
+    strategy: depend
 
-10.gb200:ckptbench:1x4:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 10.gb200:ckptbench:1x4
-      artifacts: true
-
-11.gb200:pretrain-native:1x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
-
-11.gb200:pretrain-native:1x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 11.gb200:pretrain-native:1x4:deterministic
-      artifacts: true
-
-12.gb200:pretrain-native:1x4:perf:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
-
-12.gb200:pretrain-native:1x4:perf:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 12.gb200:pretrain-native:1x4:perf
-      artifacts: true
-
-13.gb200:pretrain-nvrx:1x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
-
-13.gb200:pretrain-nvrx:1x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 13.gb200:pretrain-nvrx:1x4:deterministic
-      artifacts: true
-
-14.gb200:pretrain-native:2x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --nodes 2"
-
-14.gb200:pretrain-native:2x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 14.gb200:pretrain-native:2x4:deterministic
-      artifacts: true
-
-# Multinode nvrx: generates the cross-provider baseline (metadata/2x4_*) the 2x4
-# native deterministic job compares against. Baselines are namespaced by config,
-# so these do not collide with the 1x4 set.
-15.gb200:pretrain-nvrx:2x4:deterministic:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic --nodes 2"
-
-15.gb200:pretrain-nvrx:2x4:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_gb200]
-  needs:
-    - job: 15.gb200:pretrain-nvrx:2x4:deterministic
-      artifacts: true
-
-zy.gb200:valgrind:1x4:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  # See zy.devbox:valgrind:1x2 — fail the pipeline on memcheck errors/stalls (exit != 3).
-  allow_failure:
-    exit_codes: [3]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
-
-zz.gb200:pretrain:16x4:perf:
-  extends: [.run_job, .runner_gb200, .needs_gb200_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
-
-20.h100:ckptbench:1x8:
-  extends: [.run_ckptbench, .runner_h100, .needs_h100_image]
-
-20.h100:ckptbench:1x8:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 20.h100:ckptbench:1x8
-      artifacts: true
-
-21.h100:pretrain-native:1x8:deterministic:
-  extends: [.run_job, .runner_h100, .needs_h100_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic"
-
-21.h100:pretrain-native:1x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 21.h100:pretrain-native:1x8:deterministic
-      artifacts: true
-
-22.h100:pretrain-native:1x8:perf:
-  extends: [.run_job, .runner_h100, .needs_h100_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor perf"
-
-22.h100:pretrain-native:1x8:perf:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 22.h100:pretrain-native:1x8:perf
-      artifacts: true
-
-23.h100:pretrain-nvrx:1x8:deterministic:
-  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic"
-
-23.h100:pretrain-nvrx:1x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 23.h100:pretrain-nvrx:1x8:deterministic
-      artifacts: true
-
-24.h100:pretrain-native:2x8:deterministic:
-  extends: [.run_job, .runner_h100, .needs_h100_image]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --nodes 2"
-
-24.h100:pretrain-native:2x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 24.h100:pretrain-native:2x8:deterministic
-      artifacts: true
-
-# Multinode nvrx: generates the cross-provider baseline (metadata/2x8_*) the 2x8
-# native deterministic job compares against. Baselines are namespaced by config,
-# so these do not collide with the 1x8 set.
-25.h100:pretrain-nvrx:2x8:deterministic:
-  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-nvrx --flavor deterministic --nodes 2"
-
-25.h100:pretrain-nvrx:2x8:deterministic:update_baselines:
-  extends: [.update_baseline_base, .runner_h100]
-  needs:
-    - job: 25.h100:pretrain-nvrx:2x8:deterministic
-      artifacts: true
-
-zy.h100:valgrind:1x8:
-  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
-  # See zy.devbox:valgrind:1x2 — fail the pipeline on memcheck errors/stalls (exit != 3).
-  allow_failure:
-    exit_codes: [3]
-  variables:
-    JOB_ARGS: "pretrain-native --flavor deterministic --flavor valgrind"
-
-zz.h100:pretrain:16x8:perf:
-  extends: [.run_job, .runner_h100, .needs_h100_image, .manual_optional]
-  variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --flavor perf"
+8node-nano:
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-8node-nano.yml
+        job: generate-native-pipeline
+    strategy: depend

@@ -1,68 +1,20 @@
 #!/usr/bin/env python3
 """CI job runner for megatron/native benchmarks and e2e tests.
 
-Runs a job and automatically parses performance results afterwards.
-By default only perf numbers are printed; use --skip-perf to see full output.
+Jobs:
+  pretrain-native  native provider; deterministic adds the cross-provider md5 compare.
+  pretrain-nvrx    nvrx provider; deterministic runs twice (cross-run determinism gate),
+                   perf is a fast-path smoke.
 
-Jobs (the enroot image is built separately by prepare_image.py):
-  pretrain-native Run pretrain_mamba.py with the native checkpoint provider. Under the
-                  deterministic flavor it also runs the cross-provider md5 compare against
-                  the nvrx baseline in metadata/.
-  pretrain-nvrx   Run pretrain_mamba.py with the nvrx checkpoint provider (requires the
-                  deterministic flavor). Via SLURM it runs twice and verifies the two runs
-                  produce bit-identical iter_*/reference.metadata.info files (the cross-run
-                  determinism gate that the pretrain-native cross-provider check builds on).
+Flavors (--flavor, repeatable, default perf): perf (flash + fusion, perf-gated),
+deterministic (reproducible kernels + md5 checks, excludes perf), valgrind (memcheck the
+server, single-node).
 
-Flavors (--flavor, pretrain jobs only; repeatable, default 'perf'):
-  perf            Fast path (flash attention + cross-entropy fusion). Gated on perf metrics.
-  deterministic   Reproducible kernels + --deterministic-mode; enables the metadata md5
-                  checks (cross-provider for native, cross-run for nvrx). Mutually exclusive
-                  with perf. Slower — kept for validation, not perf measurement.
-  valgrind        Pre-launch checkpoint_server under valgrind (memcheck). Composes with a
-                  numerics flavor; single-node only (only rank 0's server is memchecked).
+SLURM vs inline is inferred from SLURM_PARTITION; --slurm forces SLURM for local runs.
+Per-cluster srun/image-build templates live in templates/ (selected by CLUSTER); env knobs:
+PLATFORM (tag + baseline namespace), CLUSTER, GPUS_PER_NODE, SLURM_PARTITION, CI_DIR.
 
-Usage:
-  python3 run_job.py pretrain-native                                  # perf (default), 1 node inline
-  python3 run_job.py pretrain-native --flavor deterministic --slurm   # determinism validation via SLURM
-  python3 run_job.py pretrain-native --flavor deterministic --flavor valgrind  # memcheck the server
-  python3 run_job.py pretrain-nvrx --flavor deterministic --slurm     # cross-run determinism gate
-  python3 run_job.py pretrain-native --nodes 16 --flavor deterministic # 16 nodes via SLURM
-  python3 run_job.py pretrain-native --skip-perf                      # tee full output, no perf parsing
-  python3 run_job.py pretrain-native --update-baseline                # record current perf as new baseline
-
-SLURM vs inline mode is inferred from SLURM_PARTITION (set per cluster at runner setup):
-set => run via SLURM, unset => inline. The CI YAML carries no --slurm flag; --slurm still
-forces it for manual/local runs.
-
-SLURM commands come from template files (see TEMPLATES_DIR below), selected by CLUSTER:
-  srun.tmpl         shared launch command for every pretrain job
-  image_build.tmpl  build the enroot squash image
-  The repo ships cw-dfw defaults; a runner overrides one either with a repo
-  per-cluster file <cluster>.<name> (e.g. cwdfw.srun.tmpl) or by placing a file of
-  the same name next to its config (CI_DIR, e.g. ~/data/ci/srun.tmpl). Account,
-  partition, mounts and GPU-request syntax all live in those files.
-
-Other settings (via environment variables):
-  ENROOT_IMAGE            ${HOME}/data/native.<hash>.sqsh
-                            (hash = first 10 hex of sha256(megatron/native/scripts/prepare.sh);
-                            changing prepare.sh causes a rebuild under a new filename)
-  PLATFORM                hardware platform (gb200/h100/h100/devbox): the GitLab runner tag that
-                            routes jobs, and the baseline-file namespace
-  CLUSTER                 datacenter/cluster (cwdfw/ocihsg/...): selects the per-cluster srun templates
-  GPUS_PER_NODE           GPUs per node (set at runner setup); default when --gpus-per-node is omitted
-  SLURM_PARTITION         set by runner setup; when set, run via SLURM and use it as the srun --partition
-  CI_DIR                  runner state dir holding config + override templates (default ~/data/ci)
-
-Outputs (auto-derived from platform, job, flavor, and config; the <flavor_tag> segment is
-omitted for jobs run without a flavor):
-  Logs:      <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>.log
-  Reports:   <megatron_root>/megatron/native/ci/ci-results/<platform>_<job>_<flavor_tag>_<config>_report.json
-  Baselines: <script_dir>/../baselines/<platform>_<job>_<flavor_tag>_<config>.yaml
-
-Exit codes:
-  0  Job succeeded and all perf metrics within tolerance (or --skip-perf)
-  3  Job succeeded but one or more perf metrics regressed beyond tolerance
-  1  Job or setup failed (raised as an exception)
+Exit codes: 0 = pass (or --skip-perf), 3 = perf regression (soft), 1 = job/setup failure.
 """
 
 from __future__ import annotations
@@ -151,8 +103,9 @@ def _default_enroot_image() -> str:
 def _image_path() -> Path:
     """Enroot image path: the ENROOT_IMAGE override, else the prepare.sh-hashed default.
 
-    Shared by the prepare-image stage (which builds it) and the workload jobs
-    (which use it as --container-image), so both agree on the same file.
+    Shared by prepare_image.py (which builds it in each workload job's before_script)
+    and the workload itself (which uses it as --container-image), so both agree on the
+    same file.
     """
     return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
 
@@ -202,15 +155,8 @@ def _ckpt_provider(job: str) -> str:
     return job.split("-", 1)[1]
 
 
-# ---------------------------------------------------------------------------
-# Flavors — composable transforms over the core pretrain recipe
-# ---------------------------------------------------------------------------
-# Every pretrain run starts from one core recipe (fast path: flash attention +
-# cross-entropy fusion). Each selected flavor edits that recipe in place: `perf`
-# (the default) leaves it untouched; `deterministic` swaps fused/atomic-add
-# kernels for reproducible ones and adds --deterministic-mode so the cross-run
-# and cross-provider metadata checks are meaningful; `valgrind` memchecks the
-# checkpoint_server. Flavors compose — `deterministic` + `valgrind` is valid.
+# Flavors compose over the core fast-path recipe: perf leaves it as-is; deterministic swaps in
+# reproducible kernels + --deterministic-mode; valgrind memchecks the server.
 
 
 @dataclass
@@ -220,7 +166,7 @@ class Recipe:
     opts: list[str]
     env: dict[str, str]
     build_env: dict[str, str] = field(default_factory=dict)
-    srun_time_min: int = 40
+    srun_time_min: int = 60  # SLURM --time in minutes; 1h default, raised per flavor (e.g. valgrind)
     srun_comments: list[str] = field(default_factory=list)
 
 
@@ -403,21 +349,14 @@ class ValgrindFlavor(Flavor):
 
     name = "valgrind"
 
-    _REAPER_COMMENT = (
-        '--comment={"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60",'
-        '"reason":"other","description":"Running Memory sanitization tool valgrind"}}'
-    )
     _READY_MARKER = "Checkpoint server started"
     # server.cpp ~L1088 logs this when it begins orderly shutdown; we stop tee'ing to the
     # console once seen (the file keeps the rest) to drop the auto-shutdown wait's repeated
     # per-channel lines and valgrind's exit diagnostics.
     _STOP_MARKER = "Shutting down server thread"
 
-    # Stall guard. The checkpoint server makes progress by writing checkpoint files;
-    # a stuck server (deadlocked finalize, or spinning after a use-after-free) stops
-    # touching those files even while it keeps logging, so checkpoint-file activity —
-    # not log activity — is the progress signal. No file written/modified for
-    # _STALL_SILENCE_S means it is stalled.
+    # Stall guard: a stuck server keeps logging but stops writing checkpoint files, so
+    # checkpoint-file activity (not log activity) is the progress signal.
     _STALL_SILENCE_S = 300  # 5 min of no checkpoint-file activity = stalled
     _STALL_POLL_S = 10  # how often to poll for progress / exit
     _STALL_STOP_GRACE_S = 120  # grace for a stalled server to honor a re-issued stop
@@ -552,7 +491,6 @@ class ValgrindFlavor(Flavor):
         # valgrind runs ~10-50x slower; give it double the regular budget so the
         # stall guard (above) — not the SLURM time limit — is what ends a hung run.
         recipe.srun_time_min = recipe.srun_time_min * 2
-        recipe.srun_comments.append(self._REAPER_COMMENT)
 
     @contextlib.contextmanager
     def prolog(self, ctx: RunCtx) -> Iterator[None]:
@@ -714,12 +652,13 @@ _FLAVOR_ORDER = ("perf", "deterministic", "valgrind")
 _FLAVORS: dict[str, type[Flavor]] = {cls.name: cls for cls in (PerfFlavor, DeterministicFlavor, ValgrindFlavor)}
 
 
-def _resolve_flavors(job: str, requested: list[str] | None, nodes: int) -> list[Flavor]:
+def _resolve_flavors(requested: list[str] | None, nodes: int) -> list[Flavor]:
     """Validate the --flavor selection and instantiate it in canonical order.
 
-    Defaults to ['perf']. perf and deterministic are mutually exclusive; nvrx exists
-    only to validate determinism so it requires deterministic; valgrind memchecks rank
-    0's server only, so it is single-node.
+    Defaults to ['perf']. perf and deterministic are mutually exclusive. pretrain-nvrx
+    runs under either: deterministic gates the cross-run determinism check, while perf
+    is a fast-path smoke (no parseable bw metrics — its run prints checkpoint times).
+    valgrind memchecks rank 0's server only, so it is single-node.
     """
     names = list(dict.fromkeys(requested or ["perf"]))
     unknown = [n for n in names if n not in _FLAVORS]
@@ -727,8 +666,6 @@ def _resolve_flavors(job: str, requested: list[str] | None, nodes: int) -> list[
         raise SystemExit(f"--flavor: unknown flavor(s) {unknown}; choose from {sorted(_FLAVORS)}")
     if "perf" in names and "deterministic" in names:
         raise SystemExit("--flavor: 'perf' and 'deterministic' are mutually exclusive")
-    if _is_pretrain_job(job) and _ckpt_provider(job) == "nvrx" and "deterministic" not in names:
-        raise SystemExit("pretrain-nvrx requires --flavor deterministic (it only validates determinism)")
     if "valgrind" in names and nodes > 1:
         raise SystemExit("--flavor valgrind is single-node only (only rank 0's checkpoint_server is memchecked)")
     return [_FLAVORS[n]() for n in _FLAVOR_ORDER if n in names]
@@ -779,9 +716,7 @@ def _artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
     return "_".join(parts)
 
 
-# ---------------------------------------------------------------------------
 # SLURM context detection
-# ---------------------------------------------------------------------------
 
 
 def _runner_uses_slurm() -> bool:
@@ -798,24 +733,8 @@ def in_srun() -> bool:
     return "SLURM_PROCID" in os.environ
 
 
-# ---------------------------------------------------------------------------
-# File-based per-cluster SLURM command templates
-# ---------------------------------------------------------------------------
-#
-# srun invocations differ between clusters in small but real ways: the account
-# and partition names, how GPUs are requested (--gpus-per-node vs --gres), the
-# container mount map, and any site-specific srun flags. Each distinct kind of
-# run is a template file:
-#
-#   srun.tmpl         shared launch command for every pretrain job
-#   image_build.tmpl  build the enroot squash image
-#
-# The repo ships the generic defaults (modelling cw-dfw) under TEMPLATES_DIR.
-# Templates are selected by CLUSTER (the datacenter, e.g. cwdfw/ocihsg): a runner
-# overrides one either with a repo per-cluster file <cluster>.<name> or by dropping
-# a file of the same name next to its config (in CI_DIR, e.g. ~/data/ci/srun.tmpl);
-# when absent, the generic default is used. Per-run values arrive as ${...}
-# placeholders; cluster constants (account, partition, mounts, ...) live in the file.
+# Per-cluster SLURM/image-build templates: per-run values fill ${...} placeholders, cluster
+# constants live in the file. Repo ships defaults; a runner can override per cluster.
 
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 
@@ -878,9 +797,10 @@ def _build_srun_cmd(  # noqa: PLR0913
     Shared by every launched job; callers append the payload (e.g.
     ``python3 -u run_job.py <job>``). Comment lines (first non-space char '#')
     and blank lines are dropped, the rest is ${...}-substituted and tokenized.
-    ``extra_srun_args`` are appended after the template flags for per-job srun
-    options that don't belong in the cluster template (e.g. valgrind's reaper
-    exemption).
+    Every job is exempted from the idle-GPU reaper for its full --time budget, so a job
+    whose GPUs go transiently idle (image build/compile, checkpoint flush, multinode
+    coordination) is not reaped before its time limit. ``extra_srun_args`` are appended
+    after the template flags for any per-job srun options not in the cluster template.
     """
     values: dict[str, object] = {
         "nodes": nodes,
@@ -895,7 +815,14 @@ def _build_srun_cmd(  # noqa: PLR0913
         "partition": os.environ.get("SLURM_PARTITION", ""),
     }
     body = "\n".join(ln for ln in _load_template("srun.tmpl").splitlines() if not ln.lstrip().startswith("#"))
-    return [*shlex.split(string.Template(body).safe_substitute(values)), *(extra_srun_args or [])]
+    # Exempt the job from the OccupiedIdleGPUsJobReaper for its full time budget so a job whose
+    # GPUs go transiently idle (build/compile, checkpoint flush, multinode coordination) is not
+    # reaped before its --time limit; exemptIdleTimeMins tracks the job's own time_minutes.
+    reaper = "--comment=" + json.dumps(
+        {"OccupiedIdleGPUsJobReaper": {"exemptIdleTimeMins": str(time_minutes), "reason": "other", "description": "native checkpoint CI job"}},
+        separators=(",", ":"),
+    )
+    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, *(extra_srun_args or [])]
 
 
 def _runner_gpus_per_node() -> int | None:
@@ -908,9 +835,7 @@ def _runner_gpus_per_node() -> int | None:
     return int(raw) if raw else None
 
 
-# ---------------------------------------------------------------------------
 # Job: pretrain
-# ---------------------------------------------------------------------------
 
 
 _CHECKPOINT_SERVER_PORT = 41000
@@ -964,20 +889,17 @@ class PretrainRunConfig:
     phase: int = 2
     load_dir: Path | None = None  # --load source; None starts from random init
     synchronous_save: bool = False  # phase 1: stock torch_dist save (no server, durable on exit)
+    config_profile: str = "pico"  # model profile (pico/nano/ultra): base.yaml + <profile>.yaml
 
     @property
     def scale(self) -> str:
         return f"{self.nodes}x{self.gpus_per_node}"
 
 
-# ---------------------------------------------------------------------------
 # Inline pretrain (in-process, no torchrun subprocess)
-# ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
 # Launch + perf post-processing
-# ---------------------------------------------------------------------------
 
 
 def _tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: bool = False) -> int:
@@ -1002,9 +924,7 @@ def _md5(path: Path) -> str:
     return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324 — integrity check, not security
 
 
-# ---------------------------------------------------------------------------
 # Perf log parsers
-# ---------------------------------------------------------------------------
 
 _RE_NATIVE_BW = re.compile(
     r"\[native_ckpt:cli\]\[(\d+)\]\[INFO\]\[perf\] Finished "
@@ -1020,14 +940,10 @@ _RE_NATIVE_MEM = re.compile(r"\[native_ckpt:mem\] gpu_peak_bytes=(\d+) cpu_rss_b
 _PHASE2_MARKER = "[native_ckpt:phase] phase=2"
 
 
-# ---------------------------------------------------------------------------
 # Baseline comparison + reporting
-# ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
 # Baseline aggregation (update stage — no re-run)
-# ---------------------------------------------------------------------------
 
 
 class CheckpointServer:
@@ -1512,13 +1428,8 @@ class PerfReport:
         env = os.environ.copy()
         existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{MEGATRON_ROOT}{os.pathsep}{existing_pp}" if existing_pp else str(MEGATRON_ROOT)
-        # Mirror the training subprocess's torch overlay: the in-srun parent's env
-        # came in via srun --container-env, which has parsed our KEY=VALUE,KEY=...
-        # blob inconsistently in the past and produced a malformed
-        # ``TORCHINDUCTOR_WORKER_START`` value that newer torch._inductor rejects
-        # with "Invalid start method: fork=fork-". The training subprocess avoids
-        # this because the training subprocess writes the same overrides explicitly
-        # — do the same here for the compare subprocesses.
+        # srun --container-env can mangle TORCHINDUCTOR_WORKER_START into a value newer
+        # torch._inductor rejects; set it explicitly for the compare subprocesses.
         env["TORCHINDUCTOR_WORKER_START"] = "fork"
         env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
@@ -1572,7 +1483,13 @@ class BaselineUpdater:
             flags = f"--slurm {gflag}"
         else:
             script = "python3 megatron/native/ci/scripts/run_job.py"
-            flags = f"{job} --nodes 16 {gflag}{flavor_flags}" if config.startswith("16") else f"{job} --slurm {gflag}{flavor_flags}"
+            # config is "NxG"; map the node count to the profile that runs at it in CI
+            # (pico single-node, nano at 8, ultra at 16) so the reproducer is runnable.
+            nodes = int(config.split("x", 1)[0]) if "x" in config else 1
+            profile = {8: "nano", 16: "ultra"}.get(nodes, "pico")
+            cflag = f" --config {profile}" if profile != "pico" else ""
+            scale = f"--nodes {nodes}" if nodes > 1 else "--slurm"
+            flags = f"{job} {scale}{cflag} {gflag}{flavor_flags}"
         return f"{script} {flags}", f"{script} {flags} --update-baseline"
 
     @staticmethod
@@ -1654,17 +1571,31 @@ class BaselineUpdater:
 
         --filter format:   <job>[:<config>[:<flavor>]]
         CI_JOB_NAME format: <platform>:<job>[:<config>[:<flavor>]][:update_baselines]
-          gb200:ckptbench:update_baselines                  → (ckptbench, None, None)
-          gb200:pretrain-native:1x4:deterministic:update_baselines → (pretrain-native, 1x4, deterministic)
+          gb200:ckptbench:update_baselines              → (ckptbench, None, None)
+          gb200:native:1x4:[DETR]:update_baselines      → (pretrain-native, 1x4, deterministic)
+
+        Generated job names abbreviate two segments: the provider (native/nvrx, dropping
+        the "pretrain-" prefix) and the flavor ([PERF]/[DETR]). Map both back to the real
+        values (pretrain-native/pretrain-nvrx, perf/deterministic) so the report-file globs
+        and baseline matching below — which key on the real job/flavor — still work.
         """
+        labels = {"[PERF]": "perf", "[DETR]": "deterministic"}
+        providers = {"native": "pretrain-native", "nvrx": "pretrain-nvrx"}
+
+        def flavor(seg: str | None) -> str | None:
+            return labels.get(seg, seg)
+
+        def job_of(seg: str) -> str:
+            return providers.get(seg, seg)
+
         if args.filter:
             job_name, *rest = args.filter.split(":")
-            return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+            return job_of(job_name), (rest[0] if rest else None), flavor(rest[1] if len(rest) > 1 else None)
 
         ci_job_name = os.environ.get("CI_JOB_NAME", "")
         if ci_job_name:
             _, job_name, *rest = ci_job_name.removesuffix(":update_baselines").split(":")
-            return job_name, (rest[0] if rest else None), (rest[1] if len(rest) > 1 else None)
+            return job_of(job_name), (rest[0] if rest else None), flavor(rest[1] if len(rest) > 1 else None)
 
         return None, None, None
 
@@ -1677,10 +1608,9 @@ class BaselineUpdater:
         machine = _platform_tag()
         filter_job, filter_config, filter_flavor = BaselineUpdater._parse_job_filter(args)
 
-        # Only the perf flavor (and ckptbench) emit *_report.json; deterministic/nvrx
-        # produce no perf metrics, so skip the report-driven loop and go straight to
-        # the metadata snapshot refresh.
-        if filter_flavor != "deterministic" and filter_job != "pretrain-nvrx":
+        # Seed/update perf baselines from *_report.json (perf, deterministic, ckptbench all
+        # emit one). nvrx emits none: skip to the md5 snapshot refresh below.
+        if filter_job != "pretrain-nvrx":
             job_glob = filter_job or "*"
             reports = sorted(RESULTS_DIR.glob(f"{machine}_{job_glob}_*_report.json"))
             if not reports:
@@ -1724,27 +1654,17 @@ class BaselineUpdater:
         callback: Callable[[Path, Path], None],
         wait_seconds: int = 0,
     ) -> None:
-        """Iterate over each (src, dst) native metadata file pair, invoking callback for each.
-
-        If wait_seconds > 0, polls for each pattern's first match (per iter dir) before globbing
-        — needed because checkpoint_server writes these files asynchronously in the background.
-        `wait_only_patterns` are polled but not passed to callback — used to block on files the
-        post-pretrain stage consumes downstream but that shouldn't enter the baseline snapshot.
-        """
+        """Run callback over each native metadata file to snapshot; with wait_seconds, poll
+        for each first (written asynchronously). Some files are waited on but not copied."""
         metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
         ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
         if not ci_runs_root.is_dir():
             raise FileNotFoundError(f"ci-runs root not found: {ci_runs_root}")
 
-        # `[0-9]*.metadata.info` keeps the per-rank server dumps separate from
-        # `reference.metadata.info` (the per-tensor md5 cross-check) so the latter
-        # doesn't bleed into the baseline snapshot.
-        files_to_copy = ("registry.bin", "[0-9]*.metadata.info", "*.txt")
-        # `common.pt` is consumed by the post-pretrain equality-compare but isn't
-        # part of the baseline snapshot — checkpoint_server writes it async, so the
-        # post-pretrain wait must gate on it, but the metadata snapshot
-        # must not copy multi-MB torch pickles into `megatron/native/metadata/`.
-        wait_only_patterns = ("common.pt",)
+        files_to_copy = ("registry.bin", "*.txt")
+        # Gate on .metadata, the last file a finalizing checkpoint writes, so the server is
+        # not stopped mid-write; common.pt feeds the equality-compare. Neither is copied.
+        wait_only_patterns = (".metadata", "common.pt")
         iter_pattern = re.compile(r"^iter_(\d{7})$")
         cfg_pattern = re.compile(r"^\d+x\d+$")
 
@@ -1784,9 +1704,8 @@ class BaselineUpdater:
 
     @staticmethod
     def _wait_for_native_metadata_files(cfg: str, timeout_seconds: int) -> None:
-        """Block until checkpoint_server has flushed registry.bin and {peerIndex}.metadata.info
-        under ci-runs/<cfg>/checkpoints/iter_*. Call after pretrain returns but before the
-        test stage finishes, so the downstream update_baselines stage finds the files."""
+        """Block until each checkpoint's final artifacts are flushed, so the later update
+        stage finds them."""
 
         def _log(src: Path, _dst: Path) -> None:
             logger.info(f"[run_job] Found native metadata file: {src}")
@@ -1795,13 +1714,8 @@ class BaselineUpdater:
 
     @staticmethod
     def _update_native_metadata_files(filter_config: str | None) -> None:
-        """Refresh registry.bin and {peerIndex}.metadata.info under megatron/native/metadata/.
-
-        Driven by ci-runs/<cfg>/checkpoints/iter_NNNNNNN/ — every iter the just-completed
-        pretrain-native run produced gets mirrored to metadata/<cfg>_checkpoints_iter_NNNNNNN/
-        (creating the destination folder if needed). When filter_config is set, only that
-        cfg is processed.
-        """
+        """Mirror each iter's snapshot files into the metadata/ baseline dirs; with a
+        filter, only that scale."""
 
         def log_and_copy(src: Path, dst: Path) -> None:
             shutil.copy2(src, dst)
@@ -1870,7 +1784,7 @@ class PretrainJob:
                 # Two sequential processes in one srun task share a single checkpoint_server
                 # lifecycle and perf epilog: phase 1 trains from random init and saves; phase 2
                 # loads it and saves the perf-measured checkpoints.
-                common = {"ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args}
+                common = {"ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args, "config_profile": args.config}
                 cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, args.gpus_per_node, phase=1, **common)
                 subprocess.run(cmd, env=env, check=True)
                 PretrainJob._wait_for_phase1_checkpoint(cfg)
@@ -1878,9 +1792,10 @@ class PretrainJob:
                 subprocess.run(cmd, env=env, check=True)
             return
 
-        # nvrx via SLURM/multinode runs the two-run cross-run determinism check, which
-        # manages its own ckpt_dir cleanup and run-1 sidecar bookkeeping.
-        if provider == "nvrx" and (args.nodes > 1 or args.slurm):
+        # nvrx deterministic via SLURM/multinode runs the two-run cross-run determinism check;
+        # perf falls through to a single measured run (the check needs deterministic references).
+        is_deterministic = any(f.name == "deterministic" for f in args.flavors)
+        if provider == "nvrx" and is_deterministic and (args.nodes > 1 or args.slurm):
             PretrainJob._run_pretrain_determinism_check(args, cfg)
             return
 
@@ -1898,14 +1813,22 @@ class PretrainJob:
         if args.nodes > 1 or args.slurm:
             # Launcher: training + worker epilogs run in the srun task; this launcher tees the log
             # and runs the perf epilog from it.
-            cmd = PretrainJob._build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
+            cmd = PretrainJob._build_pretrain_srun_cmd(
+                cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args, config_profile=args.config,
+            )
             with _flavored_run(ctx):
                 ctx.soft_fail = _tee_run(cmd, ctx.log_file) == _SOFT_FAIL_RC
         elif args.gpus_per_node > 1:
             # Multi-GPU devbox: torchrun subprocess so worker output is captured in the log.
             # Both phases tee into one log; the perf parser scopes metrics to phase 2.
             with _flavored_run(ctx):
-                common = {"use_torchrun": True, "ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args}
+                common = {
+                    "use_torchrun": True,
+                    "ckpt_provider": provider,
+                    "flavors": args.flavors,
+                    "extra_args": extra_args,
+                    "config_profile": args.config,
+                }
                 cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=1, **common)
                 _tee_run(cmd, ctx.log_file, env=env)
                 PretrainJob._wait_for_phase1_checkpoint(cfg)
@@ -1924,6 +1847,7 @@ class PretrainJob:
         job: str,
         flavors: list[Flavor],
         extra_args: list[str] | None = None,
+        config_profile: str = "pico",
     ) -> list[str]:
         image = _image_path().as_posix()
         triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
@@ -1954,11 +1878,14 @@ class PretrainJob:
             "-u",
             str(Path(__file__).resolve()),
             job,
-            # Pass gpus-per-node + flavors on argv so the in-srun task re-derives the
-            # same recipe from argv, not the container env (a KEY=VALUE collision there
-            # corrupted forwarded values).
+            # Pass gpus-per-node + config profile + flavors on argv so the in-srun task
+            # re-derives the same recipe from argv, not the container env (a KEY=VALUE
+            # collision there corrupted forwarded values). --nodes is re-derived from
+            # SLURM_NNODES in-srun, so it is not forwarded here.
             "--gpus-per-node",
             str(gpus_per_node),
+            "--config",
+            config_profile,
             *[tok for f in flavors for tok in ("--flavor", f.name)],
             *(extra_args or []),
         ]
@@ -1992,6 +1919,7 @@ class PretrainJob:
         flavors: list[Flavor] | None = None,
         extra_args: list[str] | None = None,
         phase: int = 2,
+        config_profile: str = "pico",
     ) -> tuple[list[str], dict]:
         """Return (cmd, env) to run the in-process pretrain entry (run_job.py __pretrain_entry__) on a compute node.
 
@@ -2019,6 +1947,7 @@ class PretrainJob:
                 tb_dir=tb_dir,
                 datacache_dir=datacache,
                 ckpt_provider=ckpt_provider,
+                config_profile=config_profile,
             )
         else:
             config = PretrainRunConfig(
@@ -2029,6 +1958,7 @@ class PretrainJob:
                 datacache_dir=datacache,
                 ckpt_provider=ckpt_provider,
                 load_dir=phase1_dir,
+                config_profile=config_profile,
             )
         opts = PretrainJob._pretrain_cli_args(config)
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
@@ -2062,11 +1992,8 @@ class PretrainJob:
         load path in phase 2. Saving synchronously (no async persistent worker) makes it
         durable on process exit.
         """
-        # lr_decay_iters defaults to --train-iters, so phase 1 must advertise the FULL run's
-        # train_iters — not its own early exit at _PHASE1_TRAIN_ITERS — or it decays the LR
-        # over _PHASE1_TRAIN_ITERS instead of the full horizon. That changes the iter-
-        # _PHASE1_TRAIN_ITERS weights phase 2 resumes from, so the perf-measured checkpoints
-        # would no longer match a single-phase run's.
+        # lr_decay_iters defaults to --train-iters, so phase 1 must advertise the full run's
+        # train_iters, else the LR schedule and the weights phase 2 resumes from diverge.
         full_train_iters = PretrainRunConfig.save_interval * PretrainRunConfig.num_checkpoints
         return PretrainRunConfig(
             save_interval=_PHASE1_TRAIN_ITERS,
@@ -2116,11 +2043,8 @@ class PretrainJob:
             str(save_interval),
         ]
 
-        # Runtime defaults; a model config overrides any key it also defines (model wins in
-        # {**dynamic, **model}). The dev configs scale parallelism and global batch size to
-        # the runner's GPU count, while a bigger model's override (pretrain_<nodes>node.yaml)
-        # pins them. eval-interval tracks the full horizon, not the early exit, so phase 1
-        # runs no extra eval that would perturb the state phase 2 resumes from.
+        # Runtime defaults; a model config overrides shared keys. pico scales parallelism +
+        # batch to GPU count, nano/ultra pin them; eval-interval tracks the full horizon.
         dynamic = {
             "tensor-model-parallel-size": config.gpus_per_node,
             "expert-model-parallel-size": config.gpus_per_node,
@@ -2134,18 +2058,21 @@ class PretrainJob:
             "exit-interval": exit_interval,
             "train-iters": train_iters,
         }
-        model = PretrainJob._load_model_config(config.nodes)
+        model = PretrainJob._load_model_config(config.config_profile)
         return _flatten_cli({**dynamic, **model}) + checkpoint_opts
 
     @staticmethod
-    def _load_model_config(nodes: int) -> dict:
-        """Static model + training args from pretrain_base.yaml, deep-merged with the
-        per-node-count override pretrain_<nodes>node.yaml when one exists."""
-        base = yaml.safe_load((CONFIGS_DIR / "pretrain_base.yaml").read_text()) or {}
-        override = CONFIGS_DIR / f"pretrain_{nodes}node.yaml"
-        if override.exists():
-            return _deep_merge(base, yaml.safe_load(override.read_text()) or {})
-        return base
+    def _load_model_config(profile: str) -> dict:
+        """Static model + training args from base.yaml, deep-merged with the named
+        profile override <profile>.yaml (pico/nano/ultra)."""
+        base = yaml.safe_load((CONFIGS_DIR / "base.yaml").read_text()) or {}
+        override = CONFIGS_DIR / f"{profile}.yaml"
+        if not override.exists():
+            raise FileNotFoundError(
+                f"unknown config profile {profile!r}: {override} not found "
+                f"(available: {', '.join(_available_profiles())})",
+            )
+        return _deep_merge(base, yaml.safe_load(override.read_text()) or {})
 
     @staticmethod
     def _launch_pretrain_inline(ctx: RunCtx) -> None:
@@ -2174,6 +2101,7 @@ class PretrainJob:
                 save_interval=1,
                 num_checkpoints=2,
                 ckpt_provider=ctx.provider,
+                config_profile=args.config,
             ),
         )
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
@@ -2387,7 +2315,9 @@ class PretrainJob:
         sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
         machine = _platform_tag()
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        cmd = PretrainJob._build_pretrain_srun_cmd(cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args)
+        cmd = PretrainJob._build_pretrain_srun_cmd(
+            cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args, config_profile=args.config,
+        )
         stem = _artifact_stem(machine, args.job, args.flavor_tag, cfg)
 
         # phase1-checkpoints is wiped too so each run's phase 1 starts from random init.
@@ -2475,9 +2405,13 @@ class PretrainJob:
         logger.info(f"[run_job] determinism PASS: {len(iter_dirs)} iter(s) bit-identical (tensors + common.pt) across two nvrx runs")
 
 
-# ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
+
+
+def _available_profiles() -> list[str]:
+    """Config-profile names selectable via --config: every configs/*.yaml except base.yaml
+    (the shared base each profile deep-merges over)."""
+    return sorted(p.stem for p in CONFIGS_DIR.glob("*.yaml") if p.stem != "base")
 
 
 def _detect_local_gpu_count() -> int:
@@ -2505,6 +2439,14 @@ def main() -> None:
         choices=["pretrain-native", "pretrain-nvrx", "update_baselines"],
     )
     p.add_argument("--nodes", type=int, default=1, help="Number of nodes (default: 1 — runs inline; >1 uses SLURM automatically)")
+    p.add_argument(
+        "--config",
+        default="pico",
+        choices=_available_profiles(),
+        help="Model config profile (default: pico). Selects configs/<profile>.yaml, deep-merged "
+        "over configs/base.yaml. pico scales parallelism to the runner's GPUs; nano (8 nodes) and "
+        "ultra (16 nodes) pin it.",
+    )
     p.add_argument(
         "--gpus-per-node",
         type=int,
@@ -2548,7 +2490,7 @@ def main() -> None:
 
     # Flavors apply only to pretrain jobs; other jobs keep an empty tag (e.g.
     # ckptbench baselines stay {machine}_ckptbench_{cfg}).
-    args.flavors = _resolve_flavors(args.job, args.flavor, args.nodes) if _is_pretrain_job(args.job) else []
+    args.flavors = _resolve_flavors(args.flavor, args.nodes) if _is_pretrain_job(args.job) else []
     args.flavor_tag = "-".join(f.name for f in args.flavors)
 
     # build_env (e.g. valgrind's PHOENIX_BUILD_FOR_VALGRIND) is read when
@@ -2562,11 +2504,8 @@ def main() -> None:
         BaselineUpdater.run_update_baselines(args)
         return
 
-    # Workload jobs fail fast if a prior job left a checkpoint_server bound to the port
-    # (we don't force-kill it; the guard refuses to start instead). Only meaningful on
-    # compute nodes — the slurm launcher runs on the head node, where no server runs. The
-    # run's own server is spun down by its epilog or exits with the
-    # process (ckptbench --inproc).
+    # Fail fast if a prior job left a server bound to the port (refuse to start, don't kill it).
+    # Only on compute nodes — the slurm launcher runs on the head node, where no server runs.
     if in_srun() or not args.slurm:
         CheckpointServer.require_no_checkpoint_server()
     PretrainJob.run_pretrain(args)

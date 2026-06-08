@@ -136,6 +136,7 @@ static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, State
     });
 }
 
+#ifdef DEBUG_MD5SUM
 // Compute a lowercase hex MD5 digest matching Python's hashlib.md5().hexdigest().
 static std::string ComputeMd5Hex(char const* data, size_t size)
 {
@@ -206,6 +207,7 @@ static std::string_view DTypeToTorchStr(DS4Tensor::DType dtype)
     default: throw std::runtime_error(fmt::format("Invalid DType: {}", static_cast<int>(dtype)));
     }
 }
+#endif
 
 static void WriteTensorShardInfo(std::ostream& ostrm, TensorShardInfo const& info)
 {
@@ -332,21 +334,10 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
     return *it->second;
 }
 
-// Write {peerIndex}.metadata.info: flat sorted "key=value" pairs for all tensor nodes.
-// Field names and value formats are aligned with reference.metadata.info (produced by
-// distcp_trace.py via recursive dict flattening) so the two files can be diffed line-by-line.
-//
-// Fields present in both files (comparable):
-//   {fqn}.properties.dtype -- torch.bfloat16 etc.
-//   {fqn}.size             -- [d0, d1, ...]
-//   {fqn}.chunks.N.offsets -- [o0, o1, ...]
-//   {fqn}.chunks.N.sizes   -- [s0, s1, ...]
-//   {fqn}.md5sum  (single-chunk) or {fqn}.chunks.N.md5sum (multi-chunk)
-//
-// Fields present only in native (no distcp equivalent):
-//   {fqn}.device           -- cuda:0 etc.
-
-[[maybe_unused]] void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
+#ifdef DEBUG_MD5SUM
+// Write {peerIndex}.metadata.info: sorted "key=value" pairs per tensor node, aligned with
+// reference.metadata.info (from distcp_trace.py) for line-by-line diffing.
+void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 {
     auto peerIndex = static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer;
 
@@ -546,6 +537,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
     ofs.close();
     std::filesystem::rename(tmpFile, infoFile);
 }
+#endif
 
 void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr)
 {
@@ -644,7 +636,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
+#ifdef DEBUG_MD5SUM
         DebugWriteNativeMetadataInfo_(snapshot);
+#endif
         try
         {
             checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry);

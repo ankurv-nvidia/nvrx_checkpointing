@@ -83,11 +83,17 @@ python3 setup_runner.py setup --platform gb200 --cluster cwdfw --gpus-per-node 4
 python3 setup_runner.py start
 ```
 
-The pipeline builds the enroot image in a dedicated **`prepare` stage**
-(`run_job.py prepare-image`): one job per runner that creates the `.sqsh` if
-missing and is a fast no-op otherwise (and a no-op on inline/devbox runners).
-Every workload job `needs:` its own runner's prepare job, so jobs no longer
-build or stall on the image themselves.
+Each workload job builds the enroot image in its **`before_script`**
+(`prepare_image.py`): it creates the `.sqsh` if missing and is a fast no-op
+otherwise (and a no-op on inline/devbox runners). Building it in the workload
+job — rather than a separate prepare stage other jobs `needs:` — keeps the build
+on the same machine that runs the job, so a runner tag spanning multiple machines
+can't route the build and the workload to different hosts and leave the image
+missing. Each job builds into its own per-job path (under `$CI_PROJECT_DIR`) and
+moves the result to the shared image path only if that path is still absent — so
+concurrent jobs on a cold machine never trample a shared scratch file, and the
+first to finish populates the shared image the rest reuse. Duplicate builds are
+possible but rare, since the shared image is normally already present.
 
 ### Customizing SLURM commands per cluster (template files)
 
