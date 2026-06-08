@@ -6,7 +6,7 @@ update_cmd:
   python3 megatron/native/ci/scripts/run_job.py pretrain-native --slurm
   --gpus-per-node 8 --flavor perf --update-baseline
 metrics:
-  bw_mbps: 22500.0
-  wr_tnsr_us: 147000.0
+  bw_mbps: 37000.0
+  wr_tnsr_us: 72000.0
   total_written_bytes: 2791741616
   gpu_peak_bytes: 5194880000

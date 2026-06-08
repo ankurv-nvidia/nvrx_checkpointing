@@ -117,6 +117,7 @@ struct Message
         Rank       globalRank;
         uint64_t   snapshotSize;
         uint32_t   messageSize;
+        int32_t    numaNode = -1;    // this rank's GPU-local NUMA node, or -1 if unknown
         /*Message Format
         std::string ckptPath;
         std::string snapshotName;

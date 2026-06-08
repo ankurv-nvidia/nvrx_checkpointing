@@ -177,8 +177,8 @@ struct CheckpointWriter
         if (int gpuNuma = DeviceContext::CudaGetCurrentDeviceNumaNode(); gpuNuma >= 0) { numa = gpuNuma; }
 #endif
         auto localRank = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
-        // Map consecutive same-socket ranks to one queue so each shm buffer stays
-        // within a single NUMA domain.
+        // One queue per rank when MaxRanksPerNode covers the node's ranks; if a node
+        // has more ranks than queues, consecutive (same-socket) ranks share one.
         auto ranksPerQueue = topo.ranksPerPeer / cipc::MaxRanksPerNode;
         if (ranksPerQueue == 0) { ranksPerQueue = 1; }
         auto index     = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
@@ -188,10 +188,10 @@ struct CheckpointWriter
         auto msgQueue = cipc::MsgQueue::Open(channelName);
 #ifdef PHOENIX_HAVE_CUDA
         auto region = msgQueue.GetShmDataRegion();
-        // Bind the data pages to the rank-local node before cudaHostRegister faults
-        // them in; the queue's Create initializes only the control header. Single
-        // node only — the rank->domain mapping isn't correct for multi-peer layouts.
-        if (topo.peersPerNode == 1) { BindRegionToNumaNode(numa, region.data(), region.size()); }
+        // Bind the data pages to this rank's GPU-local node before cudaHostRegister
+        // faults them in (the queue's Create touches only the control header). The
+        // node is the GPU's own, so this is correct for multi-peer layouts too.
+        BindRegionToNumaNode(numa, region.data(), region.size());
         DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
 #endif
         return msgQueue;
@@ -473,6 +473,12 @@ struct CheckpointWriter
         auto stop1                       = Clock::now();
 
         {
+            int numaNode = -1;
+#ifdef PHOENIX_HAVE_CUDA
+            // Tell the server this rank's GPU-local NUMA node so it can place the
+            // accumulation blob there, keeping its dequeue copy on-socket.
+            numaNode = DeviceContext::CudaGetCurrentDeviceNumaNode();
+#endif
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
             auto msg = sstrm.str();
@@ -480,7 +486,8 @@ struct CheckpointWriter
                                                            .snapshotId   = snapshotId,
                                                            .globalRank   = root.GlobalRank(),
                                                            .snapshotSize = totalTensorStateSizeInBytes,
-                                                           .messageSize  = static_cast<uint32_t>(msg.size())}},
+                                                           .messageSize  = static_cast<uint32_t>(msg.size()),
+                                                           .numaNode     = numaNode}},
                           msg.data(),
                           msg.size());
         }

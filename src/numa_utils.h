@@ -28,22 +28,70 @@ inline hwloc_topology_t HwlocTopology()
     return topo;
 }
 
+// Resolve a NUMA node by its OS index. `node` is an OS index (e.g. the GPU's
+// /sys numa_node), which differs from hwloc's logical index when GPU-memory NUMA
+// nodes are present (GB200), so hwloc_get_obj_by_type (logical) must not be used.
+inline hwloc_obj_t NumaNodeByOsIndex(hwloc_topology_t topo, int node)
+{
+    hwloc_obj_t obj = nullptr;
+    while ((obj = hwloc_get_next_obj_by_type(topo, HWLOC_OBJ_NUMANODE, obj)) != nullptr)
+    {
+        if (obj->os_index == static_cast<unsigned>(node)) { return obj; }
+    }
+    return nullptr;
+}
+
+// Pin the calling thread's CPU to NUMA node `node` (OS index, best-effort). The
+// checkpoint server pins each queue's dequeue thread to the domain of the ranks
+// it serves so the shm->blob memcpy runs on-socket.
+inline void BindThreadCpuToNumaNode(int node)
+{
+    if (node < 0) { return; }
+    hwloc_topology_t topo = HwlocTopology();
+    if (hwloc_obj_t obj = NumaNodeByOsIndex(topo, node); obj != nullptr && obj->cpuset != nullptr)
+    {
+        (void)hwloc_set_cpubind(topo, obj->cpuset, HWLOC_CPUBIND_THREAD);
+    }
+}
+
+// Restore the calling thread to run on all cores (undo a prior cpu pin).
+inline void UnbindThreadCpu()
+{
+    hwloc_topology_t topo = HwlocTopology();
+    if (hwloc_obj_t root = hwloc_get_root_obj(topo); root != nullptr && root->cpuset != nullptr)
+    {
+        (void)hwloc_set_cpubind(topo, root->cpuset, HWLOC_CPUBIND_THREAD);
+    }
+}
+
+// Count NUMA nodes that have CPUs. GB200 exposes GPU-memory NUMA nodes (cpuset
+// empty); those must not inflate the socket count used for queue placement.
 inline uint8_t DetectNumaNodeCount()
 {
-    int count = hwloc_get_nbobjs_by_type(HwlocTopology(), HWLOC_OBJ_NUMANODE);
+    hwloc_topology_t topo  = HwlocTopology();
+    int              count = 0;
+    hwloc_obj_t      obj   = nullptr;
+    while ((obj = hwloc_get_next_obj_by_type(topo, HWLOC_OBJ_NUMANODE, obj)) != nullptr)
+    {
+        if (obj->cpuset != nullptr && hwloc_bitmap_iszero(obj->cpuset) == 0) { ++count; }
+    }
     return count > 0 ? static_cast<uint8_t>(count) : 1;
 }
 
-// Bind a mapped range to `node` so its pages land there regardless of which
-// thread/process first touches them (per-VMA; best-effort).
+// Migrate a mapped range to `node` (OS index) so its pages are local to the GPU
+// that copies into it, regardless of which thread/process first touched them.
+// MIGRATE moves already-resident pages (the shm region is server-created), which
+// a bind-only policy would leave in place.
 inline void BindRegionToNumaNode(int node, void* addr, size_t size)
 {
     if (node < 0 || addr == nullptr || size == 0) { return; }
+    // Single NUMA domain: pages are already local, so the migrate is pure cost.
+    if (DetectNumaNodeCount() <= 1) { return; }
     hwloc_topology_t topo = HwlocTopology();
-    if (hwloc_obj_t obj = hwloc_get_obj_by_type(topo, HWLOC_OBJ_NUMANODE, static_cast<unsigned>(node));
-        obj != nullptr && obj->nodeset != nullptr)
+    if (hwloc_obj_t obj = NumaNodeByOsIndex(topo, node); obj != nullptr && obj->nodeset != nullptr)
     {
-        (void)hwloc_set_area_membind(topo, addr, size, obj->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
+        (void)hwloc_set_area_membind(
+            topo, addr, size, obj->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET | HWLOC_MEMBIND_MIGRATE);
     }
 }
 

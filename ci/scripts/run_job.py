@@ -129,6 +129,11 @@ if str(MEGATRON_ROOT) not in sys.path:
     sys.path.insert(0, str(MEGATRON_ROOT))
 RESULTS_DIR = MEGATRON_ROOT / "megatron" / "native" / "ci" / "ci-results"
 PERF_TOLERANCE = 0.05  # 5% tolerance — both regressions and improvements beyond this fail
+# Max tolerated slower/faster socket-half mean ratio. Post NUMA-locality fix the two
+# rank halves (= the two NUMA sockets) sit at ~1.0-1.13 on every platform; a breach
+# means a per-socket bimodality has returned (the bug had a ~2x split). Gated on the
+# socket halves, not individual ranks: per-rank D2H noise alone reaches ~1.48 on h100.
+MAX_BW_SOCKET_IMBALANCE = 1.30
 
 _BASELINE_CHANGE_THRESHOLD = 1e-6  # minimum relative change to count as a meaningful baseline update
 _SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx baseline drift)
@@ -1254,16 +1259,24 @@ class PerfReport:
                     "total_written_bytes": PerfReport._make_metric([int(m.group(4)) for m in bw_matches], "B", None, ranks=ranks),
                 },
             )
-            # Per-rank bandwidth imbalance (informational): fastest/slowest rank
-            # mean. ~1.0 is balanced; larger flags a per-socket NUMA split. Not
-            # gated — which socket is slow varies run-to-run, so a hard threshold
-            # would be flaky.
+            # Per-rank bandwidth imbalance (informational): fastest/slowest rank mean.
+            # Reaches ~1.48 on h100 from per-rank D2H noise alone, so it is NOT gated.
             per_rank: dict[int, list[float]] = {}
             for r, v in zip(ranks, bw_samples):
                 per_rank.setdefault(r, []).append(v)
-            rank_means = [statistics.mean(v) for v in per_rank.values()]
+            ordered_ranks = sorted(per_rank)
+            rank_means = [statistics.mean(per_rank[r]) for r in ordered_ranks]
             if len(rank_means) > 1 and min(rank_means) > 0:
                 result["bw_rank_imbalance"] = PerfReport._make_metric([max(rank_means) / min(rank_means)], "ratio", higher_is_better=None)
+                # Socket imbalance (gated): ratio of the two rank-halves' means. Ranks
+                # are GPU-socket-ordered (0..N/2-1 on NUMA 0, rest on NUMA 1), so the
+                # halves are the two sockets; averaging over a socket cancels per-rank
+                # noise, leaving the per-socket split the bimodality bug produced.
+                half = len(rank_means) // 2
+                h0 = statistics.mean(rank_means[:half])
+                h1 = statistics.mean(rank_means[half:])
+                if min(h0, h1) > 0:
+                    result["bw_socket_imbalance"] = PerfReport._make_metric([max(h0, h1) / min(h0, h1)], "ratio", higher_is_better=None)
 
         mem_matches = list(_RE_NATIVE_MEM.finditer(log_text))
         if mem_matches:
@@ -1286,6 +1299,20 @@ class PerfReport:
             higher_is_better = measured.get("higher_is_better")
             measured_val = measured.get("mean")
             if measured_val is None:
+                continue
+            if metric_name == "bw_socket_imbalance":
+                # One-sided gate: the two sockets must stay balanced. A breach means a
+                # NUMA mis-placement has reintroduced the per-socket bimodality. Only an
+                # upper bound is meaningful (1.0 is perfect), so no symmetric tolerance.
+                passed = measured_val <= MAX_BW_SOCKET_IMBALANCE
+                if not passed:
+                    all_passed = False
+                results[metric_name] = {
+                    "status": "PASS" if passed else "FAIL",
+                    "measured": measured_val,
+                    "threshold": MAX_BW_SOCKET_IMBALANCE,
+                    "unit": measured.get("unit", ""),
+                }
                 continue
             if metric_name in baseline_metrics:
                 baseline_val = baseline_metrics[metric_name]
@@ -1340,7 +1367,11 @@ class PerfReport:
             baseline = data.get("baseline")
             unit = data.get("unit", "")
             pct = data.get("pct_change")
-            if status == "info":
+            if name == "bw_socket_imbalance" and status in ("PASS", "FAIL"):
+                thr = data.get("threshold")
+                note = "" if status == "PASS" else "  <-- per-socket bimodality regression"
+                logger.info(f"  [{status}] {name}: {measured:.3f} (max allowed {thr}; ratio of the two NUMA sockets' mean BW){note}")
+            elif status == "info":
                 logger.info(f"  {name}: {measured:.4f} {unit}  [informational]")
             elif status == "no_baseline":
                 logger.info(f"  {name}: {measured:.4f} {unit}  [no baseline]")
