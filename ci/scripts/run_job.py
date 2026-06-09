@@ -140,11 +140,15 @@ _SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx
 
 
 def _ensure_vcpkg_root() -> None:
-    """Pin VCPKG_ROOT (vcpkg packages persisted on the shared FS) so the CMake build —
-    triggered by `import megatron.native`, forwarded into the container — finds it. Call
-    before any such import; subprocesses inherit it. Override via the VCPKG_ROOT env var.
+    """Pin VCPKG_ROOT to a per-checkout location so the CMake build — triggered by
+    `import megatron.native`, forwarded into the container — finds it. Call before any
+    such import; subprocesses inherit it. Override via the VCPKG_ROOT env var.
+
+    The root sits beside the source checkout (MEGATRON_ROOT/../vcpkg). GitLab clones each
+    concurrent build into its own numbered checkout dir, so concurrent pipelines on one
+    runner land on distinct roots and never contend on a shared vcpkg installed-tree lock.
     """
-    os.environ.setdefault("VCPKG_ROOT", str(Path.home() / "data/vcpkg"))
+    os.environ.setdefault("VCPKG_ROOT", str(MEGATRON_ROOT.parent / "vcpkg"))
 
 
 def _is_pretrain_job(job: str) -> bool:
