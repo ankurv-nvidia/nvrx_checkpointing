@@ -92,7 +92,6 @@ log-num-zeros-in-grad: true
 log-throughput: true
 log-progress: true
 logging-level: 20
-disable-straggler-on-startup: true
 straggler-minmax-count: 16
 timing-log-option: minmax
 
@@ -103,3 +102,15 @@ no-create-attention-mask-in-dataloader: true
 distributed-timeout-minutes: 30
 num-workers: 1
 disable-gloo-process-groups: true
+async-save: true
+async-strategy: nvrx
+
+# The production recipe is sample-based (lr-decay-samples / lr-warmup-samples /
+# lr-wsd-decay-samples + lr-decay-style WSD), but the CI run is iter-based
+# (--train-iters), and megatron requires iters xor samples — so the sample-based
+# decay horizon is omitted here. Only the LR magnitude (above) is matched.
+lr-decay-samples: 38000
+lr-decay-style: WSD
+lr-warmup-samples: 2000
+lr-wsd-decay-samples: 40000
+train-samples: 51200

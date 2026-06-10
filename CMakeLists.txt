@@ -259,9 +259,12 @@ endif()
 
 if (COMMAND vcpkg_install)
     vcpkg_install(openssl)
+    vcpkg_install(cpptrace)
 endif()
 
 find_package(OpenSSL CONFIG REQUIRED)
+# cpptrace symbolizes the checkpoint_server crash backtrace (demangled, file:line).
+find_package(cpptrace CONFIG REQUIRED)
 
 # Writer library — pure-C++ ZIP+pickle emitter (no Python, no nanobind, no
 # libtorch). Both the production server and the parity-test shim link against
@@ -291,7 +294,7 @@ add_executable(checkpoint_server src/checkpoint/server_main.cpp)
 # phoenix_checkpoint_distcp is listed directly because CMake only propagates
 # OBJECT-lib object files one consumer hop — without this, distcp.cpp.o is
 # missing from the executable even though server.cpp references it.
-target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint_server phoenix_checkpoint_distcp)
+target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint_server phoenix_checkpoint_distcp cpptrace::cpptrace)
 
 add_custom_command(TARGET checkpoint_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>

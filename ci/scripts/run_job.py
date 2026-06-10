@@ -110,6 +110,29 @@ def image_path() -> Path:
     return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
 
 
+def _triton_cache_dir() -> Path:
+    """Node-local Triton kernel cache, under /tmp.
+
+    /tmp is local to each node and NOT a cross-node shared filesystem. A cache on
+    a shared HOME/scratch FS races across the multinode allocation: one rank writes
+    a compiled kernel while another node's NFS view has not yet seen the backing
+    cubin, so inductor's static launcher load_kernel hits "CUDA driver error: file
+    not found" (and, with a stale shared index, "unknown key" cubin failures). A
+    node-local dir gives every node its own cache, so each rank only loads cubins
+    its own node wrote. /tmp also sits outside the GitLab build dir, so get_sources
+    never wipes it.
+
+    The outer launcher sets the path and forwards it via --container-env; in-srun
+    re-invocations inherit TRITON_CACHE_DIR and reuse it. The path string is the
+    same everywhere, but each node's container resolves /tmp to its own local
+    storage — exactly the per-node isolation we want.
+    """
+    env = os.environ.get("TRITON_CACHE_DIR")
+    d = Path(env) if env else Path("/tmp/triton-cache")  # noqa: S108 — node-local cache, isolation is the point
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def platform_tag() -> str:
     """Hardware platform identifier used to namespace baseline files (e.g. gb200, h100, h100).
 
@@ -252,6 +275,12 @@ class Flavor(ABC):
             "QUANTIZATION_TYPE_DEBUG": "1",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "TRITON_CACHE_DIR": str(triton_dir),
+            "TRITON_CACHE_PATH": str(triton_dir),
+            # Route the auto-launched checkpoint_server's log into the artifact dir
+            # (ci-results/*.log is uploaded) instead of node-local /tmp, which is lost
+            # when the job ends. The server expands %h to the node hostname so every
+            # node's per-node singleton writes a distinct file on a multinode run.
+            "NATIVE_CKPT_SERVER_LOG": str(RESULTS_DIR / "checkpoint_server.%h.log"),
         }
 
     @staticmethod
@@ -1914,7 +1943,7 @@ class PretrainJob:
         config_profile: str = "pico",
     ) -> list[str]:
         image = image_path().as_posix()
-        triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
+        triton_dir = _triton_cache_dir()
         total_tasks = nodes * gpus_per_node
 
         recipe = Recipe(opts=[], env=Flavor.base_env(triton_dir))
@@ -1999,8 +2028,8 @@ class PretrainJob:
         phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
         tb_dir = run_dir / "tensorboard"
         datacache = run_dir / "data-cache"
-        triton_dir = run_dir / "triton-cache"
-        for d in [ckpt_dir, phase1_dir, tb_dir, datacache, triton_dir]:
+        triton_dir = _triton_cache_dir()
+        for d in [ckpt_dir, phase1_dir, tb_dir, datacache]:
             d.mkdir(parents=True, exist_ok=True)
 
         if phase == 1:
@@ -2118,11 +2147,19 @@ class PretrainJob:
             "data-cache-path": str(config.datacache_dir),
             "tensorboard-dir": str(config.tb_dir),
             "log-interval": save_interval,
-            "eval-interval": train_iters,
+            "eval-interval": train_iters * 2,
             "exit-interval": exit_interval,
-            "train-iters": train_iters,
+            #            "train-iters": train_iters,
         }
         model = PretrainJob._load_model_config(config.config_profile)
+        if config.synchronous_save:
+            # Phase 1 must persist synchronously so its checkpoint is durable when the phase-1
+            # process exits and phase 2 can --load it. The config may turn on async save globally
+            # (base.yaml async-save / async-strategy), so strip those for the synchronous path —
+            # otherwise phase 1 saves async and _wait_for_phase1_checkpoint times out on the
+            # never-flushed marker.
+            for async_flag in ("async-save", "async-strategy", "use-persistent-ckpt-worker"):
+                model.pop(async_flag, None)
         return _flatten_cli({**dynamic, **model}) + checkpoint_opts
 
     @staticmethod
@@ -2150,8 +2187,8 @@ class PretrainJob:
         ckpt_dir = run_dir / "checkpoints"
         tb_dir = run_dir / "tensorboard"
         datacache = run_dir / "data-cache"
-        triton_dir = run_dir / "triton-cache"
-        for d in [ckpt_dir, tb_dir, datacache, triton_dir]:
+        triton_dir = _triton_cache_dir()
+        for d in [ckpt_dir, tb_dir, datacache]:
             d.mkdir(parents=True, exist_ok=True)
 
         opts = PretrainJob._pretrain_cli_args(
@@ -2335,6 +2372,9 @@ class PretrainJob:
                 ph.forward_step,
                 store=store,
             )
+        except Exception as exc:
+            PretrainJob._diagnose_checkpoint_failure(exc)
+            raise
         finally:
             # Peak GPU/CPU are cumulative, so one reading at exit equals the per-iteration max.
             if rank0:
@@ -2348,6 +2388,134 @@ class PretrainJob:
                     print(f"[native_ckpt:mem] gpu_peak_bytes={gpu_peak_bytes} cpu_rss_bytes={cpu_rss_bytes}", flush=True)  # noqa: T201
                 except Exception as exc:  # noqa: BLE001 — a metrics hiccup must never mask the training result
                     print(f"[native_ckpt:mem] unavailable: {exc}", flush=True)  # noqa: T201
+
+    # Substrings that mark a checkpoint-server failure worth probing. Cheap detection:
+    # the in-srun pretrain wraps pretrain() in try/except and matches these on the caught
+    # exception — no polling, the probe only runs when training has already failed.
+    _CKPT_FAILURE_MARKERS = (
+        "Failed to start or connect to checkpoint service",  # startup / connect
+        "No heartbeat from reader",  # server reader stalled mid-save
+    )
+
+    @staticmethod
+    def _diagnose_checkpoint_failure(exc: BaseException) -> None:
+        """Probe the per-node checkpoint_server when a pretrain rank fails.
+
+        Called on every caught pretrain exception. Socket-pings the server's fixed TCP port
+        (127.0.0.1:41000, checkpoint::ipc::Message::Port) and acts only when the failure
+        implicates the server:
+
+          * DEAD (connect refused/timed out — socket released): the server process is gone,
+            i.e. it crashed or exited. Dump its log so the crash reason (the FatalSignalHandler
+            backtrace server_main.cpp writes) is visible in the job output, whatever exception
+            the client itself saw. Node-local /tmp logs are copied into ci-results so they
+            upload as artifacts too.
+          * ALIVE but a ``_CKPT_FAILURE_MARKERS`` signature was hit: the server is up but not
+            draining, so dump its stack trace (gdb) to show where it is stuck.
+          * ALIVE and no marker: training failed for an unrelated reason and the server is
+            healthy — stay quiet (the caller re-raises the original error).
+
+        The server is a per-node singleton, so the server-side dump is gated to LOCAL_RANK 0
+        (one probe per node). Best-effort: never raises, so it cannot mask the original failure.
+        """
+        import glob  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import socket  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import traceback  # noqa: PLC0415
+
+        rank = os.environ.get("RANK", "?")
+        local_rank = os.environ.get("LOCAL_RANK", "0")
+        host, port = "127.0.0.1", 41000  # checkpoint::ipc::Message::Port — per-node singleton
+        marker_hit = any(marker in str(exc) for marker in PretrainJob._CKPT_FAILURE_MARKERS)
+
+        alive = False
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                alive = True
+        except OSError:
+            alive = False
+
+        # A healthy server on an unrelated training failure is not worth a diagnostic.
+        if alive and not marker_hit:
+            return
+
+        print(
+            f"[native_ckpt:diag][rank{rank}] pretrain failed; checkpoint_server on "
+            f"{host}:{port} is {'ALIVE' if alive else 'DEAD (socket released — crashed/exited)'}.",
+            flush=True,
+        )  # noqa: T201
+
+        # Only one rank per node probes that node's singleton server.
+        if local_rank == "0":
+            if not alive:
+                hostname = socket.gethostname()
+                # The server writes into ci-results (NATIVE_CKPT_SERVER_LOG, %h -> hostname).
+                logs = sorted(glob.glob(str(RESULTS_DIR / "checkpoint_server.*.log")))
+                # Fallback: a server that ignored the env path (e.g. a stale singleton from a
+                # prior job) logs to node-local /tmp; copy those into ci-results so they upload.
+                tmp_logs = sorted(glob.glob("/tmp/native_ckpt_server.*.log"))
+                for tmp_log in tmp_logs:
+                    try:
+                        dest = RESULTS_DIR / f"checkpoint_server.{hostname}.{os.path.basename(tmp_log)}"
+                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(tmp_log, dest)
+                        logs.append(str(dest))
+                    except OSError as copy_err:
+                        print(f"[native_ckpt:diag][rank{rank}] could not copy {tmp_log}: {copy_err}", flush=True)  # noqa: T201
+                        logs.append(tmp_log)
+                logs = list(dict.fromkeys(logs))  # dedupe, preserve order
+                if not logs:
+                    print(
+                        f"[native_ckpt:diag][rank{rank}] no server log in {RESULTS_DIR} or /tmp/native_ckpt_server.*.log",
+                        flush=True,
+                    )  # noqa: T201
+                for log_path in logs[-2:]:
+                    print(f"[native_ckpt:diag][rank{rank}] ==== server log {log_path} (tail) ====", flush=True)  # noqa: T201
+                    try:
+                        with open(log_path) as log_file:
+                            print("".join(log_file.readlines()[-300:]), flush=True)  # noqa: T201
+                    except OSError as read_err:
+                        print(f"[native_ckpt:diag][rank{rank}] could not read {log_path}: {read_err}", flush=True)  # noqa: T201
+            else:
+                pid = None
+                if shutil.which("pgrep"):
+                    try:
+                        found = subprocess.run(
+                            ["pgrep", "-f", "checkpoint_server"],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            check=False,
+                        )
+                        pids = [p for p in found.stdout.split() if p.isdigit()]
+                        pid = pids[0] if pids else None
+                    except (OSError, subprocess.SubprocessError):
+                        pid = None
+                if pid and shutil.which("gdb"):
+                    print(f"[native_ckpt:diag][rank{rank}] ==== server (pid {pid}) stack via gdb ====", flush=True)  # noqa: T201
+                    try:
+                        bt = subprocess.run(
+                            ["gdb", "-p", pid, "-batch", "-ex", "thread apply all bt"],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            check=False,
+                        )
+                        print(bt.stdout, flush=True)  # noqa: T201
+                        if bt.stderr.strip():
+                            print(f"[native_ckpt:diag][rank{rank}] gdb stderr: {bt.stderr}", flush=True)  # noqa: T201
+                    except (OSError, subprocess.SubprocessError) as gdb_err:
+                        print(f"[native_ckpt:diag][rank{rank}] gdb on server pid {pid} failed: {gdb_err}", flush=True)  # noqa: T201
+                else:
+                    print(
+                        f"[native_ckpt:diag][rank{rank}] cannot dump server stack "
+                        f"(checkpoint_server pid={pid}, gdb={'present' if shutil.which('gdb') else 'absent'}).",
+                        flush=True,
+                    )  # noqa: T201
+
+        print(f"[native_ckpt:diag][rank{rank}] client-side stack trace:", flush=True)  # noqa: T201
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     @staticmethod
     def _run_pretrain_determinism_check(args: argparse.Namespace, cfg: str) -> None:  # noqa: C901, PLR0912, PLR0915 — sequential orchestration (run1 → save → wipe → run2 → diff)
