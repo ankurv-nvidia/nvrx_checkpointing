@@ -10,15 +10,17 @@ File layout under CI_DIR:
   config            Key=value settings: GITLAB_URL, PLATFORM (required; hardware platform e.g.
                     gb200/h100/h100/devbox — the GitLab runner tag that routes jobs + baseline
                     namespace), CLUSTER (required; datacenter e.g. cwdfw/ocihsg — selects the srun
-                    templates), CONCURRENT, GPUS_PER_NODE, SLURM_PARTITION (set => this cluster runs
-                    via SLURM; also the srun --partition). PLATFORM, CLUSTER, GPUS_PER_NODE and
+                    templates), CONCURRENT, GPUS_PER_NODE, SLURM_ACCOUNT (set => this cluster runs
+                    via SLURM; also the srun --account), SLURM_PARTITION (srun --partition; defaults
+                    to "batch" when unset). PLATFORM, CLUSTER, GPUS_PER_NODE, SLURM_ACCOUNT and
                     SLURM_PARTITION are forwarded into the runner env for run_job.py.
-  srun.tmpl         (optional) per-cluster override of the job-launch srun template.
-  image_build.tmpl  (optional) per-cluster override of the enroot squash-image build.
-                    Drop either template file here to override the repo default for this
-                    cluster; if absent, run_job.py uses the default shipped in
-                    megatron/native/ci/templates/. Write account, partition, mounts and
-                    GPU-request syntax directly into the file.
+  srun.tmpl            (optional) per-cluster override of the job-launch srun template.
+  enroot_import.tmpl   (optional) per-cluster override of the base-image import srun command.
+  image_prep.tmpl      (optional) per-cluster override of the project-image build srun command.
+                       Drop any of these template files here to override the repo default for
+                       this cluster; if absent, run_job.py uses the default shipped in
+                       megatron/native/ci/templates/. Write account, partition, mounts and
+                       GPU-request syntax directly into the file.
   gitlab-runner     The runner binary (downloaded by setup).
   config.toml       Runner config (written by setup after registration).
   runner.pid        PID of the running process.
@@ -49,11 +51,12 @@ so it becomes the default on the next run (CLI wins, then caches):
   --gitlab-url URL      GitLab base URL                                    (GITLAB_URL)
   --concurrent N        Max concurrent jobs for this runner                (CONCURRENT)
   --gpus-per-node N     GPUs per node for srun jobs on this cluster        (GPUS_PER_NODE)
-  --slurm-partition NAME    SLURM partition; set => run via SLURM           (SLURM_PARTITION)
+  --slurm-account NAME      SLURM account; set => run via SLURM (srun --account)  (SLURM_ACCOUNT)
+  --slurm-partition NAME    SLURM partition (srun --partition; defaults to "batch")  (SLURM_PARTITION)
 
-  Anything else cluster-specific (account, partition, container mounts, GPU-request syntax,
-  whether GPUs are requested at all) lives in the srun.tmpl / image_build.tmpl override files
-  next to this config — not in environment variables.
+  Anything else cluster-specific (partition, container mounts, GPU-request syntax,
+  whether GPUs are requested at all) lives in the srun.tmpl / enroot_import.tmpl /
+  image_prep.tmpl override files next to this config — not in environment variables.
 """
 
 import argparse
@@ -113,6 +116,7 @@ def read_config(ci_dir: Path) -> dict:
         "CONCURRENT": "4",
         "RUNNER_VERSION": "latest",
         "GPUS_PER_NODE": "",
+        "SLURM_ACCOUNT": "",
         "SLURM_PARTITION": "",
     }
     config_file = ci_dir / "config"
@@ -134,6 +138,7 @@ CLI_CONFIG_KEYS = {
     "CLUSTER": "cluster",
     "CONCURRENT": "concurrent",
     "GPUS_PER_NODE": "gpus_per_node",
+    "SLURM_ACCOUNT": "slurm_account",
     "SLURM_PARTITION": "slurm_partition",
 }
 
@@ -280,18 +285,20 @@ def start(ci_dir: Path) -> None:
     cfg = read_config(ci_dir)
     env = os.environ.copy()
     # Tell run_job.py where this runner's state lives so it finds override
-    # templates (srun.tmpl / image_build.tmpl) placed next to the config.
+    # templates (srun.tmpl / enroot_import.tmpl / image_prep.tmpl) placed next to the config.
     env["CI_DIR"] = ci_dir.as_posix()
     # Hardware platform (e.g. gb200): the GitLab runner tag + baseline-file namespace
     # that run_job.py reads via _platform_tag(). Fall back to CLUSTER for configs that
     # predate the PLATFORM/CLUSTER split.
     env["PLATFORM"] = cfg["PLATFORM"]
-    # Datacenter (e.g. cwdfw): selects the per-cluster srun/image_build templates.
+    # Datacenter (e.g. cwdfw): selects the per-cluster srun/enroot_import/image_prep templates.
     env["CLUSTER"] = cfg["CLUSTER"]
-    # SLURM partition: forwarded so run_job.py uses it as the srun --partition and
+    # SLURM account: forwarded so run_job.py uses it as the srun --account and
     # treats this cluster as SLURM-based (its presence is the slurm-vs-inline switch).
-    if cfg.get("SLURM_PARTITION", ""):
-        env["SLURM_PARTITION"] = cfg["SLURM_PARTITION"]
+    if cfg.get("SLURM_ACCOUNT", ""):
+        env["SLURM_ACCOUNT"] = cfg["SLURM_ACCOUNT"]
+        # SLURM partition: forwarded as the srun --partition; defaults to "batch".
+        env["SLURM_PARTITION"] = cfg.get("SLURM_PARTITION", "") or "batch"
     # GPUs per node for srun jobs.
     if cfg.get("GPUS_PER_NODE", ""):
         env["GPUS_PER_NODE"] = cfg["GPUS_PER_NODE"]
@@ -373,10 +380,16 @@ def main() -> None:
     p.add_argument("--concurrent", default=None, help="Max concurrent jobs for this runner (persisted to config)")
     p.add_argument("--gpus-per-node", default=None, dest="gpus_per_node", help="GPUs per node for srun jobs (persisted to config)")
     p.add_argument(
+        "--slurm-account",
+        default=None,
+        dest="slurm_account",
+        help="SLURM account for srun --account; set => this cluster runs via SLURM (persisted to config)",
+    )
+    p.add_argument(
         "--slurm-partition",
         default=None,
         dest="slurm_partition",
-        help="SLURM partition; set => this cluster runs via SLURM (also used as srun --partition); persisted to config",
+        help="SLURM partition for srun --partition; defaults to 'batch' when unset (persisted to config)",
     )
     p.add_argument("--force-reinstall", action="store_true", help="Re-download binary even if already present")
     p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for cleanup")

@@ -1,0 +1,7 @@
+srun
+  -l
+  --account=${account}
+  --partition=${partition}
+  --time=00:${time_minutes}:00
+  --mem=0
+  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"native checkpoint CI image import"}}'

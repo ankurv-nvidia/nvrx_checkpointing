@@ -1,25 +1,9 @@
-# Default SLURM job-launch template — models cw-dfw (CoreWeave DFW).
-#
-# run_job.py substitutes the ${...} placeholders, drops comment lines (first
-# non-space char '#') and blank lines, shell-tokenizes the result, then appends
-# the job payload (python3 -u run_job.py <job> ...). This one template is shared
-# by every launched job (pretrain, ckptbench, valgrind); per-job values arrive
-# through the placeholders below.
-#
-# To customize for another cluster, copy this file next to your runner config
-# (e.g. ~/data/ci/srun.tmpl) and edit it — swap --gpus-per-node for --gres,
-# change --container-mounts, append site-specific flags, etc. When the file is
-# absent there, this repo default is used. ${partition} comes from the runner's
-# SLURM_PARTITION config (its being set is also what marks the cluster SLURM-based).
-#
-# Placeholders: ${nodes} ${ntasks} ${time_minutes} ${total_gpus} ${gpus_per_node}
-#               ${partition} ${job_name} ${image} ${container_env} ${home}
 srun
-  --account=coreai_resiliency_osiris
+  --account=${account}
   --partition=${partition}
   --nodes=${nodes}
   --ntasks=${ntasks}
-  --time=${time_minutes}
+  --time=00:${time_minutes}:00
   --gpus=${total_gpus}
   --gpus-per-node=${gpus_per_node}
   --mem=0

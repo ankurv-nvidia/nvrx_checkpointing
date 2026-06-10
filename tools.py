@@ -75,7 +75,7 @@ def get_slurm_nodelist(rank: int, world_size: int) -> list[str]:
             f"specifies {len(ntasks_per_node)} entries.",
         )
 
-    rank_expanded_nodelist = [node for node, ntasks in zip(expanded_nodelist, ntasks_per_node, strict=False) for _ in range(ntasks)]
+    rank_expanded_nodelist = [node for node, ntasks in zip(expanded_nodelist, ntasks_per_node) for _ in range(ntasks)]  # noqa: B905
     sys.stdout.write(
         f"SLURM_JOB_NODELIST: {nodelistspec}\n"
         f"SLURM_TASKS_PER_NODE: {ntasks_per_node_spec}\n"

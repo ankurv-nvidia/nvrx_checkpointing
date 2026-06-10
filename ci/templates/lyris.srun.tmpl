@@ -1,0 +1,11 @@
+srun
+  --account=coreai_resiliency_osiris
+  --partition=gb200
+  --nodes=${nodes}
+  --ntasks=${ntasks}
+  --time=00:${time_minutes}:00
+  --mem=0
+  --job-name=${job_name}
+  --container-image=${image}
+  --container-mounts=${home}:${home},/lustre:/lustre
+  --container-env=${container_env}

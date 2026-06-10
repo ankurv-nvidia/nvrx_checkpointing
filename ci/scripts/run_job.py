@@ -10,9 +10,9 @@ Flavors (--flavor, repeatable, default perf): perf (flash + fusion, perf-gated),
 deterministic (reproducible kernels + md5 checks, excludes perf), valgrind (memcheck the
 server, single-node).
 
-SLURM vs inline is inferred from SLURM_PARTITION; --slurm forces SLURM for local runs.
+SLURM vs inline is inferred from SLURM_ACCOUNT being set; --slurm forces SLURM for local runs.
 Per-cluster srun/image-build templates live in templates/ (selected by CLUSTER); env knobs:
-PLATFORM (tag + baseline namespace), CLUSTER, GPUS_PER_NODE, SLURM_PARTITION, CI_DIR.
+PLATFORM (tag + baseline namespace), CLUSTER, GPUS_PER_NODE, SLURM_ACCOUNT, SLURM_PARTITION, CI_DIR.
 
 Exit codes: 0 = pass (or --skip-perf), 3 = perf regression (soft), 1 = job/setup failure.
 """
@@ -100,7 +100,7 @@ def _default_enroot_image() -> str:
     return f"{Path.home()}/data/native.{_prepare_sh_hash()}.sqsh"
 
 
-def _image_path() -> Path:
+def image_path() -> Path:
     """Enroot image path: the ENROOT_IMAGE override, else the prepare.sh-hashed default.
 
     Shared by prepare_image.py (which builds it in each workload job's before_script)
@@ -110,7 +110,7 @@ def _image_path() -> Path:
     return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
 
 
-def _platform_tag() -> str:
+def platform_tag() -> str:
     """Hardware platform identifier used to namespace baseline files (e.g. gb200, h100, h100).
 
     Comes from PLATFORM (set per runner at setup), which is also the GitLab runner
@@ -136,10 +136,10 @@ PERF_TOLERANCE = 0.05  # 5% tolerance — both regressions and improvements beyo
 MAX_BW_SOCKET_IMBALANCE = 1.30
 
 _BASELINE_CHANGE_THRESHOLD = 1e-6  # minimum relative change to count as a meaningful baseline update
-_SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx baseline drift)
+SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx baseline drift)
 
 
-def _ensure_vcpkg_root() -> None:
+def ensure_vcpkg_root() -> None:
     """Pin VCPKG_ROOT to a per-checkout location so the CMake build — triggered by
     `import megatron.native`, forwarded into the container — finds it. Call before any
     such import; subprocesses inherit it. Override via the VCPKG_ROOT env var.
@@ -199,7 +199,7 @@ class RunCtx:
 
     @property
     def stem(self) -> str:
-        return _artifact_stem(self.machine, self.job, self.flavor_tag, self.cfg)
+        return artifact_stem(self.machine, self.job, self.flavor_tag, self.cfg)
 
     @property
     def is_worker(self) -> bool:
@@ -719,7 +719,7 @@ def _flavored_run(ctx: RunCtx) -> Iterator[None]:
         sys.exit(3)
 
 
-def _artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
+def artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
     """`{machine}_{job}_{flavor_tag}_{cfg}`, dropping the tag when empty (e.g. ckptbench)."""
     parts = [machine, job, flavor_tag, cfg] if flavor_tag else [machine, job, cfg]
     return "_".join(parts)
@@ -728,14 +728,14 @@ def _artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
 # SLURM context detection
 
 
-def _runner_uses_slurm() -> bool:
-    """True when this runner submits via SLURM, inferred from SLURM_PARTITION being set.
+def runner_uses_slurm() -> bool:
+    """True when this runner submits via SLURM, inferred from SLURM_ACCOUNT being set.
 
-    setup_runner.py forwards SLURM_PARTITION from the cluster config (it also feeds the
-    srun --partition), so a partitioned cluster runs via SLURM and one without runs
+    setup_runner.py forwards SLURM_ACCOUNT from the cluster config (it also feeds the
+    srun --account), so a cluster with an account runs via SLURM and one without runs
     inline (e.g. devbox) — no separate flag needed. main() folds this into args.slurm.
     """
-    return bool(os.environ.get("SLURM_PARTITION", "").strip())
+    return bool(os.environ.get("SLURM_ACCOUNT", "").strip())
 
 
 def in_srun() -> bool:
@@ -789,7 +789,20 @@ def _render_template(name: str, values: dict[str, object]) -> str:
     return string.Template(_load_template(name)).safe_substitute(values)
 
 
-def _build_srun_cmd(  # noqa: PLR0913
+def build_cmd_from_template(name: str, values: dict[str, object], payload: list[str]) -> list[str]:
+    """Render template `name` into a command list, appending payload.
+
+    Comment lines (first non-space char '#') and blank lines are stripped;
+    ${...} placeholders are substituted; the rest is shell-tokenized with shlex.
+    payload tokens are appended after the template flags. Mirrors the inner logic
+    of build_srun_cmd but without the reaper comment injection, for callers that
+    assemble the full srun command from a single template.
+    """
+    body = "\n".join(ln for ln in _load_template(name).splitlines() if not ln.lstrip().startswith("#"))
+    return [*shlex.split(string.Template(body).safe_substitute(values)), *payload]
+
+
+def build_srun_cmd(  # noqa: PLR0913
     *,
     nodes: int,
     ntasks: int,
@@ -811,6 +824,9 @@ def _build_srun_cmd(  # noqa: PLR0913
     coordination) is not reaped before its time limit. ``extra_srun_args`` are appended
     after the template flags for any per-job srun options not in the cluster template.
     """
+    account = os.environ.get("SLURM_ACCOUNT", "").strip()
+    if not account:
+        raise RuntimeError("SLURM_ACCOUNT is not set — required for SLURM job submission")
     values: dict[str, object] = {
         "nodes": nodes,
         "ntasks": ntasks,
@@ -821,20 +837,27 @@ def _build_srun_cmd(  # noqa: PLR0913
         "image": image,
         "container_env": container_env,
         "home": Path.home().as_posix(),
-        "partition": os.environ.get("SLURM_PARTITION", ""),
+        "account": account,
+        "partition": os.environ.get("SLURM_PARTITION", "batch"),
     }
     body = "\n".join(ln for ln in _load_template("srun.tmpl").splitlines() if not ln.lstrip().startswith("#"))
     # Exempt the job from the OccupiedIdleGPUsJobReaper for its full time budget so a job whose
     # GPUs go transiently idle (build/compile, checkpoint flush, multinode coordination) is not
     # reaped before its --time limit; exemptIdleTimeMins tracks the job's own time_minutes.
     reaper = "--comment=" + json.dumps(
-        {"OccupiedIdleGPUsJobReaper": {"exemptIdleTimeMins": str(time_minutes), "reason": "other", "description": "native checkpoint CI job"}},
+        {
+            "OccupiedIdleGPUsJobReaper": {
+                "exemptIdleTimeMins": str(time_minutes),
+                "reason": "other",
+                "description": "native checkpoint CI job",
+            }
+        },
         separators=(",", ":"),
     )
     return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, *(extra_srun_args or [])]
 
 
-def _runner_gpus_per_node() -> int | None:
+def runner_gpus_per_node() -> int | None:
     """GPUs-per-node configured at runner setup (GPUS_PER_NODE env), or None if unset.
 
     Used as the default when --gpus-per-node isn't passed on the command line, so
@@ -911,7 +934,7 @@ class PretrainRunConfig:
 # Launch + perf post-processing
 
 
-def _tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: bool = False) -> int:
+def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: bool = False) -> int:
     """Run cmd, tee combined stdout/stderr to log_file, return the exit code.
 
     append=True keeps prior content (tee -a) so a two-phase run's phase-1 and
@@ -1266,7 +1289,7 @@ class PerfReport:
             # Per-rank bandwidth imbalance (informational): fastest/slowest rank mean.
             # Reaches ~1.48 on h100 from per-rank D2H noise alone, so it is NOT gated.
             per_rank: dict[int, list[float]] = {}
-            for r, v in zip(ranks, bw_samples):
+            for r, v in zip(ranks, bw_samples):  # noqa: B905
                 per_rank.setdefault(r, []).append(v)
             ordered_ranks = sorted(per_rank)
             rank_means = [statistics.mean(per_rank[r]) for r in ordered_ranks]
@@ -1414,7 +1437,7 @@ class PerfReport:
         logger.info(f"         spread: min={f(min(samples))} median={f(statistics.median(samples))} max={f(max(samples))}")
         if ranks and len(ranks) == len(samples):
             by_rank: dict[int, list] = {}
-            for r, s in zip(ranks, samples):
+            for r, s in zip(ranks, samples):  # noqa: B905
                 by_rank.setdefault(r, []).append(s)
             per_rank = "  ".join(f"r{r}={f(statistics.mean(by_rank[r]))}" for r in sorted(by_rank))
             logger.info(f"         per-rank mean: {per_rank}")
@@ -1640,7 +1663,7 @@ class BaselineUpdater:
 
         Job/config are auto-detected from CI_JOB_NAME; override with --filter.
         """
-        machine = _platform_tag()
+        machine = platform_tag()
         filter_job, filter_config, filter_flavor = BaselineUpdater._parse_job_filter(args)
 
         # Seed/update perf baselines from *_report.json (perf, deterministic, ckptbench all
@@ -1672,7 +1695,7 @@ class BaselineUpdater:
                 if filter_flavor is not None and flavor_tag != filter_flavor:
                     continue
 
-                baseline_file = BASELINES_DIR / f"{_artifact_stem(machine, job, flavor_tag, config)}.yaml"
+                baseline_file = BASELINES_DIR / f"{artifact_stem(machine, job, flavor_tag, config)}.yaml"
                 BaselineUpdater._update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
 
         # The metadata md5 snapshot is only produced by deterministic runs. nvrx
@@ -1814,7 +1837,7 @@ class PretrainJob:
             # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
             nodes = int(os.environ.get("SLURM_NNODES", "1"))
             cfg = f"{nodes}x{args.gpus_per_node}"
-            ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
+            ctx = RunCtx(args, args.job, cfg, provider, platform_tag(), args.flavors)
             with _flavored_run(ctx):
                 # Two sequential processes in one srun task share a single checkpoint_server
                 # lifecycle and perf epilog: phase 1 trains from random init and saves; phase 2
@@ -1843,16 +1866,22 @@ class PretrainJob:
             if stale.exists():
                 shutil.rmtree(stale)
 
-        ctx = RunCtx(args, args.job, cfg, provider, _platform_tag(), args.flavors)
+        ctx = RunCtx(args, args.job, cfg, provider, platform_tag(), args.flavors)
         ctx.log_file = RESULTS_DIR / f"{ctx.stem}.log"
         if args.nodes > 1 or args.slurm:
             # Launcher: training + worker epilogs run in the srun task; this launcher tees the log
             # and runs the perf epilog from it.
             cmd = PretrainJob._build_pretrain_srun_cmd(
-                cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args, config_profile=args.config,
+                cfg,
+                args.nodes,
+                args.gpus_per_node,
+                args.job,
+                args.flavors,
+                extra_args=extra_args,
+                config_profile=args.config,
             )
             with _flavored_run(ctx):
-                ctx.soft_fail = _tee_run(cmd, ctx.log_file) == _SOFT_FAIL_RC
+                ctx.soft_fail = tee_run(cmd, ctx.log_file) == SOFT_FAIL_RC
         elif args.gpus_per_node > 1:
             # Multi-GPU devbox: torchrun subprocess so worker output is captured in the log.
             # Both phases tee into one log; the perf parser scopes metrics to phase 2.
@@ -1865,10 +1894,10 @@ class PretrainJob:
                     "config_profile": args.config,
                 }
                 cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=1, **common)
-                _tee_run(cmd, ctx.log_file, env=env)
+                tee_run(cmd, ctx.log_file, env=env)
                 PretrainJob._wait_for_phase1_checkpoint(cfg)
                 cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=2, **common)
-                ctx.soft_fail = _tee_run(cmd, ctx.log_file, env=env, append=True) == _SOFT_FAIL_RC
+                ctx.soft_fail = tee_run(cmd, ctx.log_file, env=env, append=True) == SOFT_FAIL_RC
         else:
             # Single-GPU inline: call pretrain() in-process (debugger-friendly).
             with _flavored_run(ctx):
@@ -1884,7 +1913,7 @@ class PretrainJob:
         extra_args: list[str] | None = None,
         config_profile: str = "pico",
     ) -> list[str]:
-        image = _image_path().as_posix()
+        image = image_path().as_posix()
         triton_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/triton-cache"
         total_tasks = nodes * gpus_per_node
 
@@ -1897,7 +1926,7 @@ class PretrainJob:
         container_env += "," + ",".join(["VCPKG_ROOT", *recipe.build_env])
 
         return [
-            *_build_srun_cmd(
+            *build_srun_cmd(
                 nodes=nodes,
                 ntasks=total_tasks,
                 time_minutes=recipe.srun_time_min,
@@ -2104,8 +2133,7 @@ class PretrainJob:
         override = CONFIGS_DIR / f"{profile}.yaml"
         if not override.exists():
             raise FileNotFoundError(
-                f"unknown config profile {profile!r}: {override} not found "
-                f"(available: {', '.join(_available_profiles())})",
+                f"unknown config profile {profile!r}: {override} not found (available: {', '.join(_available_profiles())})",
             )
         return _deep_merge(base, yaml.safe_load(override.read_text()) or {})
 
@@ -2348,12 +2376,18 @@ class PretrainJob:
         ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
         phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
         sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
-        machine = _platform_tag()
+        machine = platform_tag()
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         cmd = PretrainJob._build_pretrain_srun_cmd(
-            cfg, args.nodes, args.gpus_per_node, args.job, args.flavors, extra_args=extra_args, config_profile=args.config,
+            cfg,
+            args.nodes,
+            args.gpus_per_node,
+            args.job,
+            args.flavors,
+            extra_args=extra_args,
+            config_profile=args.config,
         )
-        stem = _artifact_stem(machine, args.job, args.flavor_tag, cfg)
+        stem = artifact_stem(machine, args.job, args.flavor_tag, cfg)
 
         # phase1-checkpoints is wiped too so each run's phase 1 starts from random init.
         for label, path in (("checkpoints", ckpt_dir), ("phase-1 checkpoints", phase1_dir), ("run-1 sidecar", sidecar_dir)):
@@ -2449,7 +2483,7 @@ def _available_profiles() -> list[str]:
     return sorted(p.stem for p in CONFIGS_DIR.glob("*.yaml") if p.stem != "base")
 
 
-def _detect_local_gpu_count() -> int:
+def detect_local_gpu_count() -> int:
     """Return the number of visible GPUs on this host, falling back to 4."""
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if cuda_visible and cuda_visible not in ("NoDevFiles", "none", ""):
@@ -2513,15 +2547,15 @@ def main() -> None:
     )
     args, extra_args = p.parse_known_args()
     args.extra_args = extra_args
-    _ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
-    # Honor the runner's configured scheduler mode (SLURM_PARTITION set => SLURM),
+    ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
+    # Honor the runner's configured scheduler mode (SLURM_ACCOUNT set => SLURM),
     # so the CI YAML needn't pass --slurm in JOB_ARGS.
-    if _runner_uses_slurm():
+    if runner_uses_slurm():
         args.slurm = True
     if args.gpus_per_node is None:
         # Prefer the count configured at runner setup (GPUS_PER_NODE), so the CI
         # YAML stays cluster-agnostic; fall back to probing the local host.
-        args.gpus_per_node = _runner_gpus_per_node() or _detect_local_gpu_count()
+        args.gpus_per_node = runner_gpus_per_node() or detect_local_gpu_count()
 
     # Flavors apply only to pretrain jobs; other jobs keep an empty tag (e.g.
     # ckptbench baselines stay {machine}_ckptbench_{cfg}).

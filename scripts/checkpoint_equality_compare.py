@@ -193,7 +193,7 @@ def _compare_sequence(nvrx: Any, native: Any, report: _Report, path: str) -> Non
             f"length mismatch at {path}: nvrx={len(nvrx)}, native={len(native)}",
         )
         return
-    for idx, (a, b) in enumerate(zip(nvrx, native, strict=False)):
+    for idx, (a, b) in enumerate(zip(nvrx, native)):  # noqa: B905
         _compare_common(a, b, report, f"{path}[{idx}]")
 
 

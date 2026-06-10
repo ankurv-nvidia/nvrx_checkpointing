@@ -26,12 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_job import (  # companion script, shares run_job's build helpers
     DOCKER_IMAGE_BASE,
     ENROOT_SCRIPTS_DIR,
-    _detect_local_gpu_count,
-    _ensure_vcpkg_root,
-    _image_path,
-    _render_template,
-    _runner_gpus_per_node,
-    _runner_uses_slurm,
+    build_cmd_from_template,
+    detect_local_gpu_count,
+    ensure_vcpkg_root,
+    image_path,
+    runner_gpus_per_node,
+    runner_uses_slurm,
 )
 
 
@@ -70,35 +70,48 @@ def _publish_to_shared(local: Path, image: Path) -> bool:
 
 
 def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
-    """Render image_build.tmpl (per-cluster override in CI_DIR, else repo default) and run it.
+    """Run enroot_import.tmpl then image_prep.tmpl to build the project enroot image.
 
-    The default imports the base PyTorch image if missing, runs prepare.sh inside it, then
-    saves the result to image_out — mirroring scripts/enroot.sh. The build targets a per-job
-    path (see _ci_build_path) instead of a shared scratch file, so concurrent jobs on one
-    machine never clobber each other's in-progress image; the finished image is then moved to
-    the shared path only if still missing (_publish_to_shared). enroot saves the container at
-    srun teardown even when prepare.sh fails inside it, so the build writes to the per-job
-    path and is promoted to the shared path only after a clean exit — a failed build never
-    leaves a partial sqsh that later jobs would reuse as if prebuilt.
+    The base PyTorch image is imported (via enroot_import.tmpl) only when absent.
+    The project image is built (via image_prep.tmpl) into a per-job path, then
+    promoted to the shared path only after a clean exit — a failed build never
+    leaves a partial sqsh for later jobs to reuse.
     """
     base_image = image.parent / "pytorch2604.sqsh"
     local = _ci_build_path(image)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.unlink(missing_ok=True)  # clear any leftover from a previously failed build
     sys.stderr.write(f"[prepare-image] image not found: {image} — building into per-job path {local} (this may take ~30 min)\n")
-    script = _render_template(
-        "image_build.tmpl",
-        {
-            "home": Path.home().as_posix(),
-            "image_base": base_image.as_posix(),
-            "image_out": local.as_posix(),
-            "docker_image": DOCKER_IMAGE_BASE,
-            "prepare_sh": (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix(),
-            "gpus_per_node": gpus_per_node,
-        },
+
+    account = os.environ.get("SLURM_ACCOUNT", "").strip()
+    if not account:
+        raise RuntimeError("SLURM_ACCOUNT is not set — required for SLURM image build")
+    srun_values: dict[str, object] = {
+        "account": account,
+        "partition": os.environ.get("SLURM_PARTITION", "batch"),
+        "home": Path.home().as_posix(),
+        "image_base": base_image.as_posix(),
+        "image_out": local.as_posix(),
+        "gpus_per_node": gpus_per_node,
+    }
+
+    if not base_image.exists():
+        sys.stderr.write(f"[prepare-image] base image not found: {base_image} — importing from registry\n")
+        import_cmd = build_cmd_from_template(
+            "enroot_import.tmpl",
+            {**srun_values, "time_minutes": 20},
+            ["enroot", "import", "--output", base_image.as_posix(), f"docker://{DOCKER_IMAGE_BASE}"],
+        )
+        subprocess.run(import_cmd, check=True)
+
+    prepare_sh = (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix()
+    prep_cmd = build_cmd_from_template(
+        "image_prep.tmpl",
+        {**srun_values, "time_minutes": 60},
+        ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
-    bash = shutil.which("bash") or "bash"
-    subprocess.run([bash, "-c", script], check=True)  # raises on failure, before the publish below
+    subprocess.run(prep_cmd, check=True)  # raises on failure, before the publish below
+
     if _publish_to_shared(local, image):
         sys.stderr.write(f"[prepare-image] published built image to shared path: {image}\n")
     else:
@@ -106,15 +119,15 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
 
 
 def main() -> None:
-    _ensure_vcpkg_root()
-    if not _runner_uses_slurm():
+    ensure_vcpkg_root()
+    if not runner_uses_slurm():
         sys.stderr.write("[prepare-image] non-SLURM runner — no enroot image needed; nothing to do\n")
         return
-    image = _image_path()
+    image = image_path()
     if image.exists():
         sys.stderr.write(f"[prepare-image] image already present, nothing to build: {image}\n")
         return
-    _ensure_enroot_image(image, _runner_gpus_per_node() or _detect_local_gpu_count())
+    _ensure_enroot_image(image, runner_gpus_per_node() or detect_local_gpu_count())
 
 
 if __name__ == "__main__":

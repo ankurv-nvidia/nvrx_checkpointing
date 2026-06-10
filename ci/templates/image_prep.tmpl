@@ -1,0 +1,12 @@
+srun
+  -l
+  --account=${account}
+  --partition=${partition}
+  --time=00:${time_minutes}:00
+  --mem=0
+  --gpus-per-node=${gpus_per_node}
+  --container-mounts=${home}:${home},/lustre:/lustre
+  --container-image=${image_base}
+  --container-save=${image_out}
+  --container-writable
+  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"other","description":"native checkpoint CI image prep"}}'

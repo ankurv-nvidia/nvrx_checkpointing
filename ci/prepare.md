@@ -13,8 +13,9 @@ Script: `megatron/native/ci/runner/setup_runner.py`
 /home/ankurv/data/ci/
 does th ├── token             ← registration token (you write this, chmod 600)
 ├── config            ← settings: GITLAB_URL, PLATFORM, CLUSTER, CONCURRENT, GPUS_PER_NODE
-├── srun.tmpl         ← (optional) per-cluster override of the job-launch srun template
-├── image_build.tmpl  ← (optional) per-cluster override of the squash-image build
+├── srun.tmpl            ← (optional) per-cluster override of the job-launch srun template
+├── enroot_import.tmpl   ← (optional) per-cluster override of the base-image import srun command
+├── image_prep.tmpl      ← (optional) per-cluster override of the project-image build srun command
 ├── gitlab-runner     ← binary (downloaded by setup)
 ├── config.toml       ← runner config (written by setup after registration)
 ├── runner.pid        ← PID of running process
@@ -67,8 +68,8 @@ and no `--slurm` flag in `JOB_ARGS`. `setup_runner.py` forwards them (and `CI_DI
 the runner environment, which `run_job.py` honors. `PLATFORM` (gb200/h100/h100/devbox)
 is the hardware identity: it matches the GitLab runner tag that routes jobs here and
 namespaces the baseline files (`<PLATFORM>_<job>_<config>.yaml`). `CLUSTER`
-(cwdfw/ocihsg/...) is the datacenter: it selects the per-cluster srun/image_build
-templates. `SLURM_PARTITION` being set is what marks a cluster SLURM-based — a runner
+(cwdfw/ocihsg/...) is the datacenter: it selects the per-cluster srun/enroot_import/image_prep
+templates. `SLURM_ACCOUNT` being set is what marks a cluster SLURM-based — a runner
 without it (e.g. devbox) runs jobs inline.
 
 Each of these settings can equivalently be passed on the command line to
@@ -78,7 +79,7 @@ is **written back** to it, so it becomes the default on the next run (CLI wins,
 then caches). For example:
 
 ```bash
-python3 setup_runner.py setup --platform gb200 --cluster cwdfw --gpus-per-node 4 --slurm-partition batch
+python3 setup_runner.py setup --platform gb200 --cluster cwdfw --gpus-per-node 4 --slurm-account my_account --slurm-partition batch
 # later, no flags needed — the cached config is reused:
 python3 setup_runner.py start
 ```
@@ -103,7 +104,8 @@ defaults that model **cw-dfw** under `megatron/native/ci/templates/`:
 | Template | What it builds |
 |---|---|
 | `srun.tmpl` | the launch `srun` shared by every job (pretrain, ckptbench, valgrind) |
-| `image_build.tmpl` | the enroot squash-image build (import base + run `prepare.sh`) |
+| `enroot_import.tmpl` | the `srun` that imports the base PyTorch image from the registry |
+| `image_prep.tmpl` | the `srun` that runs `prepare.sh` inside the base image and saves the result |
 
 To adapt a cluster that differs in account, partition, GPU-request syntax,
 mounts, or extra srun flags, **copy the template next to this config and edit

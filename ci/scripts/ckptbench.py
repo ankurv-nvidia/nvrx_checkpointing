@@ -17,22 +17,22 @@ import sys
 from pathlib import Path
 
 from run_job import (  # companion script, shares run_job's build helpers
-    _SOFT_FAIL_RC,
     BASELINES_DIR,
     MEGATRON_ROOT,
     RESULTS_DIR,
+    SOFT_FAIL_RC,
     CheckpointServer,
     PerfReport,
-    _artifact_stem,
-    _build_srun_cmd,
-    _detect_local_gpu_count,
-    _ensure_vcpkg_root,
-    _image_path,
-    _platform_tag,
-    _runner_gpus_per_node,
-    _runner_uses_slurm,
-    _tee_run,
+    artifact_stem,
+    build_srun_cmd,
+    detect_local_gpu_count,
+    ensure_vcpkg_root,
+    image_path,
     in_srun,
+    platform_tag,
+    runner_gpus_per_node,
+    runner_uses_slurm,
+    tee_run,
 )
 
 logger = logging.getLogger("native_ci")
@@ -63,12 +63,12 @@ def run_ckptbench(args: argparse.Namespace) -> None:
         return
 
     if args.slurm:
-        image = _image_path().as_posix()
+        image = image_path().as_posix()
         cmd = [
-            *_build_srun_cmd(
+            *build_srun_cmd(
                 nodes=1,
                 ntasks=1,
-                time_minutes=5,
+                time_minutes=10,
                 job_name=f"ckpt_benchmark_{os.environ.get('CI_PIPELINE_ID', 'local')}",
                 image=image,
                 # container-env forwarded by name — avoids KEY=VALUE ambiguity in pyxis/enroot
@@ -89,7 +89,7 @@ def run_ckptbench(args: argparse.Namespace) -> None:
 
 def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.Namespace, env: dict | None = None) -> None:
     """Tee a non-pretrain job (ckptbench), parse its perf metrics, gate on the baseline."""
-    stem = _artifact_stem(_platform_tag(), job, args.flavor_tag, config)
+    stem = artifact_stem(platform_tag(), job, args.flavor_tag, config)
     log_file = RESULTS_DIR / f"{stem}.log"
     if args.skip_perf:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,7 +97,7 @@ def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.N
         if rc != 0:
             raise RuntimeError(f"Job failed with exit code {rc}")
         return
-    rc = _tee_run(cmd, log_file, env)
+    rc = tee_run(cmd, log_file, env)
     passed = PerfReport.parse_and_report(
         job,
         config,
@@ -108,8 +108,8 @@ def _run_and_report_perf(cmd: list[str], job: str, config: str, args: argparse.N
         args.update_baseline,
         args.gpus_per_node,
     )
-    if not passed or rc == _SOFT_FAIL_RC:
-        sys.exit(_SOFT_FAIL_RC)
+    if not passed or rc == SOFT_FAIL_RC:
+        sys.exit(SOFT_FAIL_RC)
 
 
 def main() -> None:
@@ -134,14 +134,14 @@ def main() -> None:
     args, extra_args = p.parse_known_args()
     args.extra_args = extra_args
     args.flavor_tag = ""
-    _ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
+    ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
     # Honor the runner's configured scheduler mode (SLURM_PARTITION set => SLURM).
-    if _runner_uses_slurm():
+    if runner_uses_slurm():
         args.slurm = True
     if args.gpus_per_node is None:
         # Prefer the count configured at runner setup (GPUS_PER_NODE), so the CI
         # YAML stays cluster-agnostic; fall back to probing the local host.
-        args.gpus_per_node = _runner_gpus_per_node() or _detect_local_gpu_count()
+        args.gpus_per_node = runner_gpus_per_node() or detect_local_gpu_count()
 
     # Fail fast if a prior job left a checkpoint_server bound to the port. Only
     # meaningful on compute nodes — the slurm launcher runs on the head node,
