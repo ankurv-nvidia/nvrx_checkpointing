@@ -126,5 +126,10 @@ struct Session
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
 
+    // Coordinator-only: once the merged registry is final / the whole snapshot is write-complete,
+    // push that out to the other nodes so they can finish and mark the snapshot complete locally.
+    void BroadcastGlobalRegistryToPeers_(checkpoint::ipc::SnapshotId snapshotId, StateTree const& registry) const;
+    void BroadcastSnapshotCompleteToPeers_(checkpoint::ipc::SnapshotId snapshotId) const;
+
     void WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const;
 };

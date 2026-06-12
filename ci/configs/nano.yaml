@@ -1,25 +1,113 @@
-# nano profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes.
-# Deep-merged over base.yaml. Model dimensions and routing come from the
-# nemotron3 nano preset; the training recipe (optimizer, fused ops, data,
-# logging, MTP) is inherited from base. Parallelism pins TP=2 / EP=32 (EP=32
-# needs >= 32 GPUs, i.e. 8 nodes at 4 GPUs/node); global batch size is left
-# unpinned so it tracks the runner's GPU count.
+# nano profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes,
+# mirroring a real nemotron-MoE "nano" training run as closely as the CI harness
+# allows. Deep-merged over base.yaml. Model dimensions, routing, attention
+# grouping, the bf16 layer head/tail, MTP, the precision-aware (bf16) optimizer,
+# and the MoE routing/streaming knobs are pinned here to match the production
+# recipe. Parallelism pins TP=2 / EP=32 (EP=32 needs >= 32 GPUs, i.e. 8 nodes at
+# 4 GPUs/node); global batch size tracks the runner's GPU count.
+#
+# Intentionally NOT pinned here (left to the harness/flavor): the checkpoint
+# strategy (sync vs async/nvrx, ckpt-provider, fully-parallel groups) and
+# deterministic-mode / attention backend are set per flavor; the run length
+# (train-iters, save/eval/exit intervals), data-cache and tensorboard paths are
+# supplied in code. The production run is sample-based (train-samples +
+# lr-*-samples); the CI run is iter-based, so the LR magnitude is matched but the
+# sample-based decay horizon is not (it would conflict with --train-iters).
 
 # Model size
 num-layers: 52
 hidden-size: 2688
 ffn-hidden-size: 1856
 mamba-num-heads: 64
-hybrid-override-pattern: "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+hybrid-layer-pattern: "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+hybrid-override-pattern: null
 num-experts: 128
 moe-shared-expert-intermediate-size: 3712
-num-layers-at-end-in-bf16: 2
-moe-latent-size: null  # N/A on nano — drops the --moe-latent-size flag
+moe-latent-size: null # N/A on nano — drops the --moe-latent-size flag
 
-# Routing
+ckpt-fully-parallel-load: true
+ckpt-fully-parallel-load-process-group: ep_dp
+# The CLI flag is --ckpt-fully-parallel-save (dest ckpt_fully_parallel_save_deprecated);
+# there is no --ckpt-fully-parallel-save-deprecated. Parallel save is on by default.
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-save-process-group: ep_dp
+eval-global-batch-size: 256
+# Sequence length (production nano trains at 8192, not the base 1024)
+seq-length: 8192
+max-position-embeddings: 8192
+
+# Vocabulary (production nano tokenizer size). pad_vocab_size is derived (not a
+# CLI flag here), so it is left to its default.
+vocab-size: 131072
+
+# Attention: grouped-query with 8 KV groups (num-attention-heads=32 from base).
+# group-query-attention must be set explicitly — num-query-groups alone does not
+# enable GQA in this build.
+group-query-attention: true
+num-query-groups: 8
+
+# Init
+init-method-std: "0.0099"
+
+# bf16 precision boundary: one layer at each end in bf16; no first/last-layer bf16
+num-layers-at-start-in-bf16: 1
+num-layers-at-end-in-bf16: 1
+first-last-layers-bf16: false
+
+# MTP is disabled in the production nano recipe
+mtp-num-layers: null
+mtp-hybrid-override-pattern: null
+mtp-loss-scaling-factor: "0.1"
+calculate-per-token-loss: false
+
+# Precision-aware optimizer: bf16 moments + bf16 main grads, grads reduced in
+# bf16 (which also clears accumulate-allreduce-grads-in-fp32 in code).
+use-precision-aware-optimizer: true
+main-grads-dtype: bf16
+exp-avg-dtype: bf16
+exp-avg-sq-dtype: bf16
+grad-reduce-in-bf16: true
+
+# Routing (top-k and scaling pinned for nano)
 moe-router-topk: 6
 moe-router-topk-scaling-factor: "2.5"
+moe-router-force-load-balancing: true
+moe-router-fusion: true
+high-priority-stream-groups: [ep]
+moe-single-grouped-bias: false
+moe-single-grouped-weight: false
+
+# DDP / runtime
+ddp-num-buckets: 24
+manual-gc: true
+manual-gc-interval: 100
+num-workers: 2
+distributed-timeout-minutes: 120
+eval-iters: 7
+
+# LR magnitude (the sample-based WSD horizon is omitted; see header)
+lr: "8e-4"
+min-lr: "8e-6"
 
 # Parallelism (pinned; global batch size scales with the runner's GPU count)
 tensor-model-parallel-size: 2
 expert-model-parallel-size: 32
+override-opt_param-scheduler: False
+megatron-fsdp-main-grads-dtype: bf16
+
+# Logging
+straggler-minmax-count: 1
+log-num-zeros-in-grad: false
+
+# The production recipe is sample-based (lr-decay-samples / lr-warmup-samples /
+# lr-wsd-decay-samples + lr-decay-style WSD), but the CI run is iter-based
+# (--train-iters), and megatron requires iters xor samples — so the sample-based
+# decay horizon is omitted here. Only the LR magnitude (above) is matched.
+lr-decay-samples: 38000
+lr-decay-style: WSD
+lr-warmup-samples: 2000
+lr-wsd-decay-samples: 40000
+train-samples: 51200
+
+high-priority-stream-groups: ep
+moe-grouped-gemm: true

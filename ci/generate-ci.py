@@ -44,7 +44,9 @@ HEADER_MARKER = "# >>> generate-ci.py: concrete jobs are generated below this li
 #                gates job generation.
 #   multinode    optional list of scaled profile job-sets (see _emit_multinode). A
 #                multinode entry may pin all its jobs to one group via "group"
-#                (e.g. the expensive nano/16-node sets live in their own manual group).
+#                (e.g. the expensive nano/16-node sets live in their own manual group)
+#                and override the default 4h job timeout via "timeout" (the 8-/16-node
+#                sets can sit in the SLURM queue for hours before a large allocation frees).
 #
 # Manual-vs-auto is NOT a per-job property here: it is decided by the GROUP a job lands
 # in — each group has one trigger job in gitlab-ci-native.yml that is either automatic
@@ -78,7 +80,8 @@ PLATFORMS = [
                 "jobs": [("pretrain-native", "deterministic"), ("pretrain-nvrx", "deterministic")],
             },
             # nano: 8 nodes (EP=32). Expensive, so all its jobs go in the dedicated manual
-            # "8node-nano" group (not the automatic native-* groups). update_baselines siblings.
+            # "8node-nano" group (not the automatic native-* groups). native + nvrx, each in
+            # deterministic and perf; update_baselines siblings on all but nvrx:perf.
             {
                 "key": "nano",
                 "config": "nano",
@@ -86,10 +89,13 @@ PLATFORMS = [
                 "scale": "8x4",
                 "with_update": True,
                 "group": "8node-nano",
+                # 8-node allocations can sit in the SLURM queue for hours; outlast it.
+                "timeout": "1d",
                 "jobs": [
                     ("pretrain-native", "deterministic"),
                     ("pretrain-native", "perf"),
                     ("pretrain-nvrx", "deterministic"),
+                    ("pretrain-nvrx", "perf"),
                 ],
             },
             # multinode-perf: ultra at 16 nodes, a single perf smoke, no update. Manual
@@ -101,6 +107,8 @@ PLATFORMS = [
                 "scale": "16x4",
                 "with_update": False,
                 "group": "16node-ultra",
+                # 16-node allocations can sit in the SLURM queue for hours; outlast it.
+                "timeout": "1d",
                 "jobs": [("pretrain-native", "perf")],
             },
         ],
@@ -127,6 +135,8 @@ PLATFORMS = [
                 "scale": "16x8",
                 "with_update": False,
                 "group": "16node-ultra",
+                # 16-node allocations can sit in the SLURM queue for hours; outlast it.
+                "timeout": "1d",
                 "jobs": [("pretrain-native", "perf")],
             },
         ],
@@ -145,27 +155,37 @@ def _read_header() -> str:
     return head.rstrip() + "\n"
 
 
-def _job(name: str, extends: list[str], *, job_args: str | None = None) -> str:
+def _job(name: str, extends: list[str], *, job_args: str | None = None, timeout: str | None = None) -> str:
     """Render one concrete job. Every job runs automatically within its group and keeps
     .run_job's allow_failure: exit_codes:[3] gating (a crash, exit != 3, fails the pipeline);
-    opt-in is controlled by the group's trigger, not the job. So no job is when: manual."""
+    opt-in is controlled by the group's trigger, not the job. So no job is when: manual.
+
+    ``timeout`` overrides .run_job's default 4h job timeout — the multinode sets can sit in
+    the SLURM queue for many hours waiting for a large node allocation, which the GitLab job
+    timeout must outlast or the job reds before the workload ever starts."""
     lines = [f"{name}:", f"  extends: [{', '.join(extends)}]"]
+    if timeout is not None:
+        lines.append(f"  timeout: {timeout}")
     if job_args is not None:
         lines += ["  variables:", f'    JOB_ARGS: "{job_args}"']
     return "\n".join(lines)
 
 
-def _update(test_name: str, runner: str) -> str:
-    """Render the update_baselines sibling for a test job."""
-    return "\n".join(
-        [
-            f"{test_name}:update_baselines:",
-            f"  extends: [.update_baseline_base, {runner}]",
-            "  needs:",
-            f"    - job: {test_name}",
-            "      artifacts: true",
-        ],
-    )
+def _update(test_name: str, runner: str, *, timeout: str | None = None) -> str:
+    """Render the update_baselines sibling for a test job. ``timeout`` overrides the default
+    job timeout (the multinode update jobs re-run the same large-allocation workload)."""
+    lines = [
+        f"{test_name}:update_baselines:",
+        f"  extends: [.update_baseline_base, {runner}]",
+    ]
+    if timeout is not None:
+        lines.append(f"  timeout: {timeout}")
+    lines += [
+        "  needs:",
+        f"    - job: {test_name}",
+        "      artifacts: true",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +238,16 @@ def _emit_multinode(p: dict, runner: str, groups: dict[str, list[str]]) -> None:
     ``with_update`` adds an update_baselines sibling alongside the job.
     """
     for entry in p.get("multinode", []):
+        timeout = entry.get("timeout")
         for job, flavor in entry["jobs"]:
             name = f"{p['name']}:{_provider(job)}:{entry['scale']}:{FLAVOR_LABEL.get(flavor, flavor)}"
             args = f"{job} --nodes {entry['nodes']} --config {entry['config']} --flavor {flavor}"
             g = entry.get("group") or _pretrain_group(job, flavor)
-            groups[g].append(_job(name, [".run_job", runner], job_args=args))
-            if entry["with_update"]:
-                groups[g].append(_update(name, runner))
+            groups[g].append(_job(name, [".run_job", runner], job_args=args, timeout=timeout))
+            # nvrx perf emits checkpoint times, not parseable bw metrics, so it has no
+            # baseline to refresh — skip its update sibling (matches the single-node nvrx-perf).
+            if entry["with_update"] and not (job == "pretrain-nvrx" and flavor == "perf"):
+                groups[g].append(_update(name, runner, timeout=timeout))
 
 
 def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:

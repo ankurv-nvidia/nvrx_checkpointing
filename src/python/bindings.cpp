@@ -8,6 +8,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
@@ -647,6 +648,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
 {
     m.def("ping", &SvcPing);
     m.def("svc_stop", &SvcStop);
+    m.def("svc_spindown", &SvcSpinDown/* , nanobind::arg("timeout") = nanobind::none() */);
     auto cls = nb::class_<StateTree>(std::move(m), "model_state");
 
     cls.def_static(

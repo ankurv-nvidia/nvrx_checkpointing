@@ -57,7 +57,6 @@ PLATFORM=gb200       # required — hardware platform: GitLab runner tag + basel
 CLUSTER=cwdfw        # required — datacenter that selects the srun templates (cwdfw/ocihsg/...)
 CONCURRENT=4
 GPUS_PER_NODE=4      # GPUs per node for srun jobs on this cluster (gb200=4, h100=8, devbox=2)
-SLURM_PARTITION=batch # set => this cluster runs via SLURM (and the srun --partition); omit => inline (e.g. devbox)
 EOF
 chmod 600 $CI_DIR/config
 ```

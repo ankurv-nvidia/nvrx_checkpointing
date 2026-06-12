@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -160,6 +162,52 @@ void SvcStop()
     TryCleanShutdown(stream);
 }
 
+void SvcSpinDown()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::mutex SpinDownMutex;
+    SUPPRESS_WARNINGS_END
+
+    std::scoped_lock lock(SpinDownMutex);
+
+    if (!TryConnectToCheckpointService()) { return; }
+
+    boost::system::error_code ec;
+
+    boost::asio::io_context        ioc;
+    boost::beast::tcp_stream       stream(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+
+    auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port));
+    // Fail fast if the service is already gone.
+    [[maybe_unused]] auto endpoint = stream.connect(results, ec);
+    if (ec) { return; }
+
+    auto target = std::string("/api/spindown");
+
+    static constexpr int                                         HttpVersion11 = 11;
+    boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, target, HttpVersion11};
+    req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
+    req.body().data = nullptr;
+    req.body().size = 0;
+    req.body().more = false;
+    req.prepare_payload();
+
+    boost::beast::http::write(stream, req);
+
+    // The server holds this connection open with chunked heartbeats and only completes the
+    // response once spin-down finishes. No stream timeout is set, so the read blocks across
+    // the heartbeats for the full (possibly long) spin-down rather than timing out.
+    boost::beast::flat_buffer                                            buffer;
+    boost::beast::http::response_parser<boost::beast::http::string_body> parser;
+    parser.body_limit(std::numeric_limits<std::uint64_t>::max());
+    boost::beast::http::read(stream, buffer, parser, ec);
+    if (ec && ec != boost::beast::http::error::end_of_stream) { return; }
+
+    TryCleanShutdown(stream);
+}
+
 namespace
 {
 struct CheckpointWriter
@@ -181,8 +229,8 @@ struct CheckpointWriter
         // has more ranks than queues, consecutive (same-socket) ranks share one.
         auto ranksPerQueue = topo.ranksPerPeer / cipc::MaxRanksPerNode;
         if (ranksPerQueue == 0) { ranksPerQueue = 1; }
-        auto index     = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
-        auto peerIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+        auto index       = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
+        auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
         auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
         fmt::print(stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", topo.rank, numa, channelName);
         auto msgQueue = cipc::MsgQueue::Open(channelName);
@@ -228,7 +276,7 @@ struct CheckpointWriter
 
     struct PartitionContext
     {
-        static constexpr size_t ExpectedPendingD2HRequestsPerBuffer = 256;
+        static constexpr size_t ExpectedPendingD2HRequestsPerBuffer = 1024;
 
         struct D2HRequest
         {
@@ -526,7 +574,6 @@ struct CheckpointWriter
 
 void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
 {
-    StateSerDes::DebugDumpLocalStateTreeKVP(ckptPath / fmt::format("cli_metadata_{}.txt", root.GlobalRank()), root);
     fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Saving Checkpoint to dir {}\n", root.GlobalRank(), ckptPath.string());
     CheckpointWriter writer{root};
     writer.SendToServer(snapshotId, ckptPath);

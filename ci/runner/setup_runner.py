@@ -298,7 +298,6 @@ def start(ci_dir: Path) -> None:
     if cfg.get("SLURM_ACCOUNT", ""):
         env["SLURM_ACCOUNT"] = cfg["SLURM_ACCOUNT"]
         # SLURM partition: forwarded as the srun --partition; defaults to "batch".
-        env["SLURM_PARTITION"] = cfg.get("SLURM_PARTITION", "") or "batch"
     # GPUs per node for srun jobs.
     if cfg.get("GPUS_PER_NODE", ""):
         env["GPUS_PER_NODE"] = cfg["GPUS_PER_NODE"]

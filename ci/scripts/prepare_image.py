@@ -88,7 +88,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         raise RuntimeError("SLURM_ACCOUNT is not set — required for SLURM image build")
     srun_values: dict[str, object] = {
         "account": account,
-        "partition": os.environ.get("SLURM_PARTITION", "batch"),
+        "partition": os.environ.get("SLURM_PARTITION", "interactive"),
         "home": Path.home().as_posix(),
         "image_base": base_image.as_posix(),
         "image_out": local.as_posix(),

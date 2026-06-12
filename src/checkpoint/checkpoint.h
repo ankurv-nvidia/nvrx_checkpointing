@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 
 void SvcIncrRef();
 void SvcDecrRef();
@@ -18,6 +19,10 @@ void FinalizeStateRegistry(StateTree& self);
 void WaitForCheckpointSave(RankTopology const& topo);
 void SvcPing();
 void SvcStop();
+
+// Graceful shutdown: ask the server to stop once every session is idle, blocking until the
+// spin-down completes.
+void SvcSpinDown();
 struct DeviceContext
 {
     DeviceContext(DeviceId deviceIn, uint8_t streamIdxIn) : device(deviceIn), streamIdx(streamIdxIn) {}

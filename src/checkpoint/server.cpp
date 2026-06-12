@@ -39,16 +39,25 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 using namespace std::chrono_literals;
 namespace cipc  = checkpoint::ipc;
 using PerfClock = std::chrono::high_resolution_clock;
+
+#ifdef PHOENIX_BUILD_FOR_VALGRIND
+static constexpr auto AutoShutdownTimeout = 900s;
+#else
+static constexpr auto AutoShutdownTimeout = 150s;
+#endif
 
 // uint32_t ranks
 // uint32_t iterations
@@ -94,7 +103,7 @@ static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, State
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::Invalid || type >= StateNode::Type::Unknown)
         {
-            throw std::runtime_error(fmt::format("Invalid node type: {}", static_cast<uint8_t>(type)));
+            throw std::runtime_error(fmt::format("Invalid node type={}", static_cast<uint8_t>(type)));
         }
         if (type == StateNode::Type::Dict) { return; }
         auto const name = state.GetNodeId(node.handle);
@@ -123,7 +132,7 @@ static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, State
         else if (type == StateNode::Type::ShardedTensor)
         {
             auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor : {}", name));
+            if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor={}", name));
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
             fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
 
@@ -204,7 +213,7 @@ static std::string_view DTypeToTorchStr(DS4Tensor::DType dtype)
     case DS4Tensor::DType::UInt64: return "torch.uint64";
     case DS4Tensor::DType::Bool: return "torch.bool";
     case DS4Tensor::DType::Invalid: return "torch.unknown";
-    default: throw std::runtime_error(fmt::format("Invalid DType: {}", static_cast<int>(dtype)));
+    default: throw std::runtime_error(fmt::format("Invalid DType={}", static_cast<int>(dtype)));
     }
 }
 #endif
@@ -225,8 +234,8 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
         if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
         {
             fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}] ForeachTensorShardInfo NATIVE_CKPT_TRACE_NODE = {}. Node data rank = {} "
-                       "index = {}\n",
+                       "[native_ckpt:svr][{}#{}] ForeachTensorShardInfo NATIVE_CKPT_TRACE_NODE={}. Node data rank={} "
+                       "index={}\n",
                        *server,
                        sessionId,
                        fqn,
@@ -281,9 +290,9 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
     // IPv4, so connect() must fall through the address list to the reachable one.
     boost::asio::ip::tcp::resolver resolver(ioc);
     auto                           results = resolver.resolve(peerAddr.host(), peerAddr.port());
-    if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve peer address: {}", peer)); }
+    if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve peer address={}", peer)); }
     auto const endpoint = stream.connect(results);
-    fmt::print(stderr, "[native_ckpt:svr] Connected to endpoint {} resolved from peer {}\n", endpoint, peer);
+    fmt::print(stderr, "[native_ckpt:svr] Connected to endpoint={} resolved from peer={}\n", endpoint, peer);
 
     Request req;
     // Write HTTP/1.1 request headers with Transfer-Encoding: chunked (no Content-Length)
@@ -326,7 +335,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
     if (it == snapshots.end())
     {
         throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] GetSnapshot_: no snapshot with id {} (evicted or never activated)",
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] GetSnapshot_: no snapshot with id={} (evicted or never activated)",
                         *server,
                         sessionId,
                         snapshotId));
@@ -355,7 +364,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
     if (snapshot.registry == nullptr)
     {
         throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Active global state is null when finalizing snapshot {} for session id {}",
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Active global state is null when finalizing snapshot={} for session id={}",
                         *server,
                         sessionId,
                         snapshot.name,
@@ -378,7 +387,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             {
                 // throw std::runtime_error(
                 fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][ERROR] Replicate shard {} md5sums dont match {} != {}\n",
+                           "[native_ckpt:svr][{}#{}][ERROR] Replicate shard={} md5sums dont match {} != {}\n",
                            *server,
                            sessionId,
                            fqnShardName,
@@ -411,7 +420,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
                     fmt::print(stderr,
-                               "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE = {}. Blob Offset = {}\n",
+                               "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. Blob Offset={}\n",
                                *server,
                                sessionId,
                                fqn,
@@ -434,7 +443,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                     if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                     {
                         fmt::print(stderr,
-                                   "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE = {}. Blob Offset = {}\n",
+                                   "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. Blob Offset={}\n",
                                    *server,
                                    sessionId,
                                    fqn,
@@ -449,7 +458,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
         });
     }
     fmt::print(stderr,
-               "[native_ckpt:svr][{}#{}] DebugWriteNativeMetadataInfo_ for snapshot {}. Writing global metadata\n",
+               "[native_ckpt:svr][{}#{}] DebugWriteNativeMetadataInfo_ for snapshot={}. Writing global metadata\n",
                *server,
                sessionId,
                snapshot.name);
@@ -477,7 +486,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
         auto const& shardedTnsr = std::get<StateNode::ShardedTensor>(node.data);
         if (shardedTnsr.shards.empty())
         {
-            throw std::runtime_error(fmt::format("Sharded tensor {} has no shards in metadata output\n", name));
+            throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", name));
         }
         emit(name + ".size", FormatDim(shardedTnsr.fulldim));
         emit(name + ".properties.dtype", std::string(DTypeToTorchStr(shardedTnsr.dtype)));
@@ -499,7 +508,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             if (localHandleIt == localShardHandleMap.end())
             {
                 fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][ERROR] Global shard {} has no matching entry in any local registry\n",
+                           "[native_ckpt:svr][{}#{}][ERROR] Global shard={} has no matching entry in any local registry\n",
                            *server,
                            sessionId,
                            shardHandleKey);
@@ -507,7 +516,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             else if (localHandleIt->second != rankShard.handle)
             {
                 fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][ERROR] Global shard {} handle {} does not match local handle {}\n",
+                           "[native_ckpt:svr][{}#{}][ERROR] Global shard={} handle={} does not match local handle={}\n",
                            *server,
                            sessionId,
                            shardHandleKey,
@@ -594,7 +603,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                 if (snapshot.finalizedRanks.size() >= static_cast<size_t>(topo.worldSize)) { break; }
                 fmt::print(stderr,
                            "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for snapshot={} finalized ranks {} of {} remaining... "
-                           "Finalized ranks : [{}]\n",
+                           "Finalized ranks=[{}]\n",
                            *server,
                            sessionId,
                            hdr.snapshotId,
@@ -606,6 +615,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         WriteGlobalStateTreeToFile_(snapshot, snapshot.path.parent_path() / "registry.bin");
+        // The merged registry is final now; push it to the other nodes so they hold the global
+        // view instead of only their own fragment.
+        BroadcastGlobalRegistryToPeers_(hdr.snapshotId, *snapshot.registry);
     }
 
     checkpoint::distcp::WriteRankShard(snapshot.path.parent_path(), hdr.globalRank, *snapshot.registry, localState.blob);
@@ -653,16 +665,36 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                        ex.what());
             throw;
         }
+        // The whole snapshot is durable now; tell the other nodes so they can mark it complete
+        // and spin down — they only ever counted their own ranks' write-completes locally.
+        BroadcastSnapshotCompleteToPeers_(hdr.snapshotId);
         {
             // free Snapshot blobs (multi-GB) OUTSIDE the session mutex to avoid mutex blocking
             std::vector<std::unique_ptr<Snapshot>> evicted;
             size_t                                 remainingSnapshots = 0;
             {
                 std::scoped_lock lock(mutex);
-                while (!snapshots.empty() && snapshots.size() >= numActiveSnapshots)
+                while (!snapshots.empty() && snapshots.size() > numActiveSnapshots)
                 {
-                    auto it = snapshots.begin();
-                    if (it->second->writeCkptCompletedRanks.size() < static_cast<size_t>(topo.worldSize)) { break; }
+                    auto       it        = snapshots.begin();
+                    auto const worldSize = static_cast<size_t>(topo.worldSize);
+                    if (it->second->writeCkptCompletedRanks.size() < worldSize) { break; }
+                    // Eviction gates on write-complete only; warn if we drop a snapshot whose
+                    // finalize hasn't landed from every rank yet (e.g. a peer node's finalize
+                    // still in flight) — that snapshot is then gone for any late peer forward.
+                    if (it->second->finalizedRanks.size() < worldSize)
+                    {
+                        fmt::print(stderr,
+                                   "[native_ckpt:svr][{}#{}][WARN] evicting snapshot {} with finalize INCOMPLETE: "
+                                   "finalized {}/{}, write-completed {}/{}\n",
+                                   *server,
+                                   sessionId,
+                                   it->first,
+                                   it->second->finalizedRanks.size(),
+                                   worldSize,
+                                   it->second->writeCkptCompletedRanks.size(),
+                                   worldSize);
+                    }
                     evicted.push_back(std::move(it->second));
                     snapshots.erase(it);
                 }
@@ -670,18 +702,19 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             }
             fmt::print(stderr,
                        "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after finalizing snapshot={} rank={}. Remaining snapshots "
-                       "in memory: {}\n",
+                       "in memory={} numActiveSnapshots={}\n",
                        *server,
                        sessionId,
                        evicted.size(),
                        hdr.snapshotId,
                        hdr.globalRank,
-                       remainingSnapshots);
+                       remainingSnapshots,
+                       numActiveSnapshots);
         }
     }
 
     fmt::print(stderr,
-               "[native_ckpt:svr][{}#{}][INFO] OnFinalizeSnapshotAsync_ for rank = {}, snapshotId : {} \n",
+               "[native_ckpt:svr][{}#{}][INFO] OnFinalizeSnapshotAsync_ for rank={}, snapshotId={} \n",
                *server,
                sessionId,
                hdr.globalRank,
@@ -691,7 +724,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 
 void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
 {
-    fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] MergeFragmentToGlobalState_: {}\n", *server, sessionId, tensorShards.size());
+    fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] MergeFragmentToGlobalState_ shards={}\n", *server, sessionId, tensorShards.size());
 
     if (sessionState.registry == nullptr)
     {
@@ -705,7 +738,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         {
             fmt::print(stderr,
                        "[native_ckpt:svr][{}#{}][INFO] MergeFragmentToGlobalState_ Found tensor shard with nodeId containing "
-                       "NATIVE_CKPT_TRACE_NODE = {} rank = {}\n",
+                       "NATIVE_CKPT_TRACE_NODE={} rank={}\n",
                        *server,
                        sessionId,
                        NATIVE_CKPT_TRACE_NODE,
@@ -734,7 +767,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         auto& node       = sessionState.registry->GetNode(nodeHandle);
         if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor))
         {
-            throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor '{}' expected-type({}) != actual-type({})",
+            throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor='{}' expected-type={} != actual-type={}",
                                                  tensorShard.nodeId,
                                                  static_cast<size_t>(StateNode::Type::ShardedTensor),
                                                  node.data.index()));
@@ -742,7 +775,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
         if (tnsr.shards.empty())
         {
-            throw std::runtime_error(fmt::format("Sharded tensor {} has no shards in metadata output\n", tensorShard.nodeId));
+            throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", tensorShard.nodeId));
         }
 
         tensorShard.tensorInfo.AssertShardIsValid();
@@ -773,7 +806,7 @@ void Session::SendPeerFinalizeSnapshotComplete_(std::string const& peer, cipc::M
     if (res.result() != boost::beast::http::status::ok)
     {
         throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} returned error: {}", *server, sessionId, peer, res.result_int()));
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
     }
     TryCleanShutdown(stream);
 }
@@ -797,7 +830,7 @@ void Session::SendPeerWriteCkptComplete_(std::string const& peer, cipc::Message:
     if (res.result() != boost::beast::http::status::ok)
     {
         throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} returned error: {}", *server, sessionId, peer, res.result_int()));
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
     }
     TryCleanShutdown(stream);
 }
@@ -845,9 +878,82 @@ void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string 
     if (res.result() != boost::beast::http::status::ok)
     {
         throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} returned error: {}", *server, sessionId, peer, res.result_int()));
+            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
     }
     TryCleanShutdown(stream);
+}
+
+void Session::BroadcastGlobalRegistryToPeers_(cipc::SnapshotId snapshotId, StateTree const& registry) const
+{
+    if (topo.peers.size() <= 1) { return; }
+    // Serialize the merged registry once (topology + every node), then ship the same bytes to
+    // each non-coordinator peer so they hold the global registry rather than just their fragment.
+    std::ostringstream oss;
+    StateSerDes::Write(oss, registry, StateNode::Handle::Root);
+    std::string const body = oss.str();
+
+    for (size_t p = 1; p < topo.peers.size(); ++p)
+    {
+        boost::asio::io_context  ioc;
+        boost::beast::tcp_stream stream(ioc);
+        auto req = CreateRequestForPeer(ioc, stream, topo.peers[p], fmt::format("/api/peer/globalregistry/{}/{}", sessionId, snapshotId));
+        req.body().data = const_cast<char*>(body.data());    // NOLINT — beast buffer_body is non-owning; body outlives the write
+        req.body().size = body.size();
+        req.body().more = false;
+        req.prepare_payload();
+        boost::beast::http::write(stream, req);
+
+        boost::beast::flat_buffer                                     buffer;
+        boost::beast::http::response<boost::beast::http::string_body> res;
+        boost::beast::http::read(stream, buffer, res);
+        if (res.result() != boost::beast::http::status::ok)
+        {
+            throw std::runtime_error(fmt::format(
+                "[native_ckpt:svr][{}#{}][ERROR] Peer {} globalregistry returned {}", *server, sessionId, topo.peers[p], res.result_int()));
+        }
+        TryCleanShutdown(stream);
+    }
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}][INFO] Broadcast global registry for snapshot {} to {} peer(s)\n",
+               *server,
+               sessionId,
+               snapshotId,
+               topo.peers.size() - 1);
+}
+
+void Session::BroadcastSnapshotCompleteToPeers_(cipc::SnapshotId snapshotId) const
+{
+    if (topo.peers.size() <= 1) { return; }
+    for (size_t p = 1; p < topo.peers.size(); ++p)
+    {
+        boost::asio::io_context  ioc;
+        boost::beast::tcp_stream stream(ioc);
+        auto req = CreateRequestForPeer(ioc, stream, topo.peers[p], fmt::format("/api/peer/snapshotcomplete/{}/{}", sessionId, snapshotId));
+        req.body().data = nullptr;
+        req.body().size = 0;
+        req.body().more = false;
+        req.prepare_payload();
+        boost::beast::http::write(stream, req);
+
+        boost::beast::flat_buffer                                     buffer;
+        boost::beast::http::response<boost::beast::http::string_body> res;
+        boost::beast::http::read(stream, buffer, res);
+        if (res.result() != boost::beast::http::status::ok)
+        {
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} snapshotcomplete returned {}",
+                                                 *server,
+                                                 sessionId,
+                                                 topo.peers[p],
+                                                 res.result_int()));
+        }
+        TryCleanShutdown(stream);
+    }
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}][INFO] Broadcast snapshot {} complete to {} peer(s)\n",
+               *server,
+               sessionId,
+               snapshotId,
+               topo.peers.size() - 1);
 }
 
 void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const
@@ -871,7 +977,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
             if (tnsr.shards.empty())
             {
                 fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][WARN] empty sharded tensor '{}' in metadata output\n",
+                           "[native_ckpt:svr][{}#{}][WARN] empty sharded tensor='{}' in metadata output\n",
                            *server,
                            sessionId,
                            snapshot.registry->GetNodeId(node.handle));
@@ -888,8 +994,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
                 "[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for writing: {}", *server, sessionId, ckptPath.string()));
         }
         StateSerDes::Write(sstrm, *snapshot.registry, StateNode::Handle::Root);
-        fmt::print(
-            stderr, "[native_ckpt:svr][{}#{}][INFO] Finished writing metadata to file: {} \n", *server, sessionId, ckptPath.string());
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Finished writing metadata to file={} \n", *server, sessionId, ckptPath.string());
     }
     // Verify if this was written correctly
     // Note because of empty nodes not being serialized this might not be a perfect match
@@ -915,7 +1020,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
             if (origNode.data != readBackNode.data)
             {
                 fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][ERROR] Node '{}' mismatch after roundtrip\n\tOriginal: {}\n\tReadBack: {}\n",
+                           "[native_ckpt:svr][{}#{}][ERROR] Node='{}' mismatch after roundtrip\n\tOriginal={}\n\tReadBack={}\n",
                            *server,
                            sessionId,
                            snapshot.registry->GetNodeId(origNode.handle),
@@ -988,7 +1093,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<ch
         }
     });
     fmt::print(stderr,
-               "[native_ckpt:svr][{}#{}][INFO] Received sharded state registry from rank = {} data of size {}, Total Tensor Size: {}\n",
+               "[native_ckpt:svr][{}#{}][INFO] Received sharded state registry from rank={} data of size={}, Total Tensor Size={}\n",
                *server,
                sessionId,
                rank,
@@ -1017,7 +1122,7 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char,
         if (endOffset > localState.blob.size)
         {
             throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Received tensor data exceeds allocated size({}) for session id {} offset = {} size = {}",
+                "[native_ckpt:svr][{}#{}][ERROR] Received tensor data exceeds allocated size={} for session id={} offset={} size={}",
                 *server,
                 sessionId,
                 localState.blob.size,
@@ -1031,8 +1136,8 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char,
         localState.writtenTensorRangeEnd   = std::max(localState.writtenTensorRangeEnd, endOffset);
         if (localState.writtenTensorSize > localState.blob.size)
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Received tensor data size {} (range {}-{}) exceeds "
-                                                 "total tensor size({}) for session id {}",
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Received tensor data size={} (range {}-{}) exceeds "
+                                                 "total tensor size={} for session id={}",
                                                  *server,
                                                  sessionId,
                                                  localState.writtenTensorSize,
@@ -1066,7 +1171,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
         if (snapshotIt->second->localStates.contains(hdr.globalRank))
         {
             throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Snapshot {} for global rank {} already has local state when activating snapshot {}",
+                "[native_ckpt:svr][{}#{}][ERROR] Snapshot={} for global rank={} already has local state when activating snapshot={}",
                 *server,
                 sessionId,
                 hdr.snapshotId,
@@ -1078,7 +1183,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
         if (it == sessionState.localStates.end())
         {
             throw std::runtime_error(
-                fmt::format("[native_ckpt:svr][{}#{}][ERROR] No local state found for global rank {} when activating snapshot {}",
+                fmt::format("[native_ckpt:svr][{}#{}][ERROR] No local state found for global rank={} when activating snapshot={}",
                             *server,
                             sessionId,
                             hdr.globalRank,
@@ -1089,8 +1194,8 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
 
         if (hdr.snapshotSize != it->second->localRegistry->GetTotalTensorStateSizeInBytes())
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot size {} does not match expected total tensor "
-                                                 "state size {} from local registry for global rank {} when activating snapshot {}",
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot size={} does not match expected total tensor "
+                                                 "state size={} from local registry for global rank={} when activating snapshot={}",
                                                  *server,
                                                  sessionId,
                                                  hdr.snapshotSize,
@@ -1109,7 +1214,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
     }
 
     fmt::print(stderr,
-               "[native_ckpt:svr][{}#{}] Activated snapshot {} for global rank {} with expected tensor data size {} path = {}\n",
+               "[native_ckpt:svr][{}#{}] Activated snapshot={} for global rank={} with expected tensor data size={} path={}\n",
                *server,
                sessionId,
                hdr.snapshotId,
@@ -1252,22 +1357,29 @@ struct Server
         }
     }
 
+    bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
+    {
+        return std::ranges::all_of(_activeSessions, [](auto const& pair) { return pair.second->AllSnapshotsComplete(); });
+    }
+
     bool AllSessionsComplete()
     {
         std::scoped_lock<std::mutex> lock(_mutex);
-        return std::ranges::all_of(_activeSessions, [](auto const& pair) { return pair.second->AllSnapshotsComplete(); });
+        return AllSessionsComplete(lock);
     }
 
     void WaitForShutdown()
     {
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-        static constexpr auto AutoShutdownTimeout = 900s;
-#else
-        static constexpr auto AutoShutdownTimeout = 150s;
-#endif
+        auto hasSessionsAndAllSessionsComplete = [&]() {
+            std::scoped_lock<std::mutex> lock(_mutex);
+            return !_activeSessions.empty() && AllSessionsComplete(lock);
+        };
         while (true)
         {
-            if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && AllSessionsComplete())) { break; }
+            if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && hasSessionsAndAllSessionsComplete()))
+            {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         Stop();
@@ -1311,7 +1423,7 @@ struct Server
                 return session;
             };
 
-            fmt::print(stderr, "[native_ckpt:svr][{}#{}] ActivateSession {}\n", *this, hdr1.sessionId, workDir);
+            fmt::print(stderr, "[native_ckpt:svr][{}#{}] ActivateSession workDir={}\n", *this, hdr1.sessionId, workDir);
             auto it = _activeSessions.find(hdr1.sessionId);
             it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
         }
@@ -1365,9 +1477,51 @@ struct Server
             std::scoped_lock lock(_mutex);
             wasRunning     = _running;
             _stopRequested = true;
+            // Diagnostic: a graceful stop should only happen once every snapshot is both finalized
+            // and write-completed across all ranks. Warn (loudly) if we are stopping while any is
+            // still incomplete — that flags a premature "idle" decision (e.g. counting only
+            // write-complete and missing a peer node's still-in-flight finalize).
+            if (wasRunning)
+            {
+                for (auto const& [sessionId, session] : _activeSessions)
+                {
+                    auto const       worldSize = static_cast<size_t>(session->topo.worldSize);
+                    std::scoped_lock slock(session->mutex);
+                    for (auto const& [snapshotId, snapshot] : session->snapshots)
+                    {
+                        auto const fin = snapshot->finalizedRanks.size();
+                        auto const wr  = snapshot->writeCkptCompletedRanks.size();
+                        if (fin < worldSize || wr < worldSize)
+                        {
+                            fmt::print(stderr,
+                                       "[native_ckpt:svr][{}#{}][WARN] stopping with snapshot {} INCOMPLETE: "
+                                       "finalized {}/{}, write-completed {}/{}\n",
+                                       *this,
+                                       sessionId,
+                                       snapshotId,
+                                       fin,
+                                       worldSize,
+                                       wr,
+                                       worldSize);
+                        }
+                    }
+                }
+                std::fflush(stderr);
+            }
             for (auto const& msgQueue : _msgQueue)
             {
                 if (msgQueue != nullptr) { msgQueue->Stop(); }
+            }
+        }
+        {
+            std::vector<std::thread> spinThreads;
+            {
+                std::scoped_lock lock(_mutex);
+                spinThreads.swap(_spinDownThreads);
+            }
+            for (auto& t : spinThreads)
+            {
+                if (t.joinable()) { t.join(); }
             }
         }
         {
@@ -1427,7 +1581,7 @@ struct Server
         auto it       = _activeSessions.find(sessionId);
         if (it == _activeSessions.end())
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id {} not found", *this, sessionId));
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id={} not found", *this, sessionId));
         }
         return *it->second;
     }
@@ -1435,32 +1589,72 @@ struct Server
     void NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
     {
         fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Finalize complete notification received for snapshot {} from rank {}\n",
+                   "[native_ckpt:svr][{}#{}] Finalize complete notification received for snapshot={} from rank={}\n",
                    *this,
                    sessionId,
                    snapshotId,
                    fromRank);
-        auto lock = std::scoped_lock<std::mutex>(_mutex);
-        auto it   = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end())
+        bool emitOnce = false;
+        auto start    = PerfClock::now();
+        while (true)
         {
-            throw std::runtime_error(fmt::format(
-                "Received finalize complete notification for non-existent session {} from rank {}. Ignoring.\n", sessionId, fromRank));
+            // Release _mutex before the wait below: ActivateSession also needs it to create the
+            // session, so holding it across the sleep would block the very creation we wait for
+            // (and stall every other handler, including spin-down's idle check).
+            {
+                std::scoped_lock<std::mutex> lock(_mutex);
+                auto                         it = _activeSessions.find(sessionId);
+                if (it != _activeSessions.end())
+                {
+                    auto it2 = it->second->snapshots.find(snapshotId);
+                    if (it2 == it->second->snapshots.end())
+                    {
+                        throw std::runtime_error(
+                            fmt::format("Received finalize complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
+                                        snapshotId,
+                                        fromRank));
+                    }
+                    std::scoped_lock<std::mutex> lock2(it->second->mutex);
+                    it2->second->finalizedRanks.insert(fromRank);
+                    if (emitOnce)
+                    {
+                        fmt::print(stderr,
+                                   "[native_ckpt:svr][{}#{}] Marked snapshot={} finalized for rank={}. Finalized ranks={}/{}\n",
+                                   *this,
+                                   sessionId,
+                                   snapshotId,
+                                   fromRank,
+                                   it2->second->finalizedRanks.size(),
+                                   it->second->topo.worldSize);
+                    }
+                    return;
+                }
+            }
+
+            if (PerfClock::now() - start > 30s)
+            {
+                throw std::runtime_error(fmt::format(
+                    "Received finalize complete notification for non-existent session={} from rank={}.\n", sessionId, fromRank));
+            }
+            if (!emitOnce)
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:svr][{}#{}] Finalize complete notification received for non-existent session={} from rank={}. "
+                           "Waiting...\n",
+                           *this,
+                           sessionId,
+                           sessionId,
+                           fromRank);
+                emitOnce = true;
+            }
+            std::this_thread::sleep_for(100ms);
         }
-        auto it2 = it->second->snapshots.find(snapshotId);
-        if (it2 == it->second->snapshots.end())
-        {
-            throw std::runtime_error(fmt::format(
-                "Received finalize complete notification for non-existent snapshot {} from rank {}. Ignoring.\n", snapshotId, fromRank));
-        }
-        auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
-        it2->second->finalizedRanks.insert(fromRank);
     }
 
     void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
     {
         fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Write checkpoint complete notification received for snapshot {} from rank {}\n",
+                   "[native_ckpt:svr][{}#{}] Write checkpoint complete notification received for snapshot={} from rank={}\n",
                    *this,
                    sessionId,
                    snapshotId,
@@ -1470,7 +1664,7 @@ struct Server
         if (it == _activeSessions.end())
         {
             throw std::runtime_error(
-                fmt::format("Received write checkpoint complete notification for non-existent session {} from rank {}. Ignoring.\n",
+                fmt::format("Received write checkpoint complete notification for non-existent session={} from rank={}. Ignoring.\n",
                             sessionId,
                             fromRank));
         }
@@ -1478,12 +1672,59 @@ struct Server
         if (it2 == it->second->snapshots.end())
         {
             throw std::runtime_error(
-                fmt::format("Received write checkpoint complete notification for non-existent snapshot {} from rank {}. Ignoring.\n",
+                fmt::format("Received write checkpoint complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
                             snapshotId,
                             fromRank));
         }
         auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
         it2->second->writeCkptCompletedRanks.insert(fromRank);
+    }
+
+    // Coordinator -> peer: store the broadcast global registry as this snapshot's registry, so the
+    // peer holds the merged view instead of only its own fragment. The arrival also means finalize
+    // is globally done, so mark every rank finalized (symmetric with the snapshot-complete signal).
+    void ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, std::string_view body)
+    {
+        BufStream                  bufStream{body.data(), body.size()};
+        std::shared_ptr<StateTree> registry = StateSerDes::Read(bufStream);
+        std::scoped_lock           lock(_mutex);
+        auto                       it = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end())
+        {
+            throw std::runtime_error(fmt::format("Received global registry for non-existent session {}\n", sessionId));
+        }
+        std::scoped_lock lock2(it->second->mutex);
+        auto             it2 = it->second->snapshots.find(snapshotId);
+        if (it2 == it->second->snapshots.end())
+        {
+            throw std::runtime_error(fmt::format("Received global registry for non-existent snapshot {}\n", snapshotId));
+        }
+        it2->second->registry = std::move(registry);
+        auto const worldSize  = static_cast<uint32_t>(it->second->topo.worldSize);
+        for (uint32_t r = 0; r < worldSize; ++r) { it2->second->finalizedRanks.insert(cipc::Rank{r}); }
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Received global registry for snapshot {}\n", *this, sessionId, snapshotId);
+    }
+
+    // Coordinator -> peer: the whole snapshot is globally write-complete. A non-coordinator only
+    // ever counts its own node's ranks locally, so mark every rank write-complete; that lets its
+    // AllSnapshotsComplete pass and the daemon spin down.
+    void NotifySnapshotComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId)
+    {
+        std::scoped_lock lock(_mutex);
+        auto             it = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end())
+        {
+            throw std::runtime_error(fmt::format("Received snapshot-complete for non-existent session {}\n", sessionId));
+        }
+        std::scoped_lock lock2(it->second->mutex);
+        auto             it2 = it->second->snapshots.find(snapshotId);
+        if (it2 == it->second->snapshots.end())
+        {
+            throw std::runtime_error(fmt::format("Received snapshot-complete for non-existent snapshot {}\n", snapshotId));
+        }
+        auto const worldSize = static_cast<uint32_t>(it->second->topo.worldSize);
+        for (uint32_t r = 0; r < worldSize; ++r) { it2->second->writeCkptCompletedRanks.insert(cipc::Rank{r}); }
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Snapshot {} marked globally complete by coordinator\n", *this, sessionId, snapshotId);
     }
 
     void RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
@@ -1584,6 +1825,69 @@ struct Server
         }
     }
 
+    void SpinDownWaitLoop_(tcp_stream stream)
+    {
+        SetThreadName("ncs:spindown");
+        static constexpr auto HeartbeatInterval = 2s;
+        // No explicit timeout falls back to a generous default so a wedged server can't hang
+        // a caller forever — matched to WaitForShutdown's idle auto-shutdown window.
+
+        auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
+
+        // No deadline on the synchronous writes; the heartbeat cadence, not a socket timeout,
+        // bounds how long we hold the connection.
+        stream.expires_never();
+
+        boost::system::error_code                                    ec;
+        boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, 11};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.chunked(true);
+        boost::beast::http::response_serializer<boost::beast::http::empty_body> sr{res};
+        boost::beast::http::write_header(stream, sr, ec);
+
+        bool hardStop = false;
+        while (!ec)
+        {
+            if (AllSessionsComplete()) { break; }
+            if (_stopRequested) { break; }    // another path already began shutdown
+            if (PerfClock::now() >= deadline)
+            {
+                hardStop = true;
+                break;
+            }
+            // A non-empty chunk keeps the client read alive while we wait for idle. The body
+            // is opaque to the caller, which only inspects the status line.
+            static constexpr std::string_view Heartbeat = " ";
+            boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Heartbeat)), ec);
+            if (ec) { break; }    // client hung up — stop heartbeating, still spin down below
+            std::this_thread::sleep_for(HeartbeatInterval);
+        }
+
+        if (hardStop)
+        {
+            fmt::print(
+                stderr, "[native_ckpt:svr][{}][ERROR] spindown timed out before idle; hard-stopping (aborting in-flight work)\n", *this);
+            std::scoped_lock lock(_mutex);
+            for (auto& session : _activeSessions)
+            {
+                std::scoped_lock slock(session.second->mutex);
+                session.second->stopRequested = true;
+            }
+        }
+        else
+        {
+            fmt::print(stderr, "[native_ckpt:svr][{}][INFO] spindown: all sessions idle; spinning down\n", *this);
+        }
+
+        // Final empty "{}" payload, matching the hard-stop reply, then the terminating chunk.
+        static constexpr std::string_view Final = "{}";
+        boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Final)), ec);
+        boost::asio::write(stream.socket(), boost::beast::http::make_chunk_last(), ec);
+        TryCleanShutdown(stream);
+
+        _stopRequested = true;    // WaitForShutdown observes this and calls Stop()
+    }
+
     void HandleRequest_(tcp_stream& stream)
     {
         boost::beast::flat_buffer buffer;
@@ -1659,6 +1963,40 @@ struct Server
             res.prepare_payload();
             boost::beast::http::write(stream, res);
         }
+        // Coordinator broadcast: the merged global registry for a snapshot (body = serialized tree).
+        else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+        {
+            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint"); }
+
+            boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+            bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+            boost::beast::http::read(stream, buffer, bodyParser);
+            ReceiveGlobalRegistry_(sessionId, snapshotId, bodyParser.get().body());
+            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            res.keep_alive(headers.keep_alive());
+            res.body() = "{}";
+            res.prepare_payload();
+            boost::beast::http::write(stream, res);
+        }
+        // Coordinator broadcast: this snapshot is globally write-complete.
+        else if (matches({"api", "peer", "snapshotcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+        {
+            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in snapshotcomplete endpoint"); }
+
+            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+            NotifySnapshotComplete_(sessionId, snapshotId);
+            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            res.keep_alive(headers.keep_alive());
+            res.body() = "{}";
+            res.prepare_payload();
+            boost::beast::http::write(stream, res);
+        }
         else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
         {
             boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
@@ -1687,6 +2025,15 @@ struct Server
                     session.second->stopRequested = true;
                 }
             }
+        }
+        else if (matches({"api", "spindown"}) && headers.method() == boost::beast::http::verb::get)
+        {
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in spindown endpoint"); }
+            // Hand the connection off to a dedicated waiter thread and return at once: the
+            // accept loop must stay free to service the peer writeckptcomplete/finalizecomplete
+            // notifications that idle-ness depends on, otherwise the wait would deadlock.
+            std::scoped_lock lock(_mutex);
+            _spinDownThreads.emplace_back([this, s = std::move(stream)]() mutable { SpinDownWaitLoop_(std::move(s)); });
         }
         else
         {
@@ -1765,6 +2112,8 @@ struct Server
     std::unordered_set<cipc::MsgQueue*> _msgQueue{nullptr};
     bool                                _running{false};
     std::vector<std::thread>            _threads;
+    // Live spin-down waiter threads, each holding one client connection open until idle.
+    std::vector<std::thread> _spinDownThreads;
 
     boost::asio::io_context        _ioc;
     boost::asio::ip::tcp::acceptor _tcpAcceptor{_ioc};
@@ -1846,7 +2195,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
         {
             auto const& shTen = std::get<StateNode::ShardedTensor>(sessionState.registry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
             fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}][VERBOSE] Rank = {} Found in tensorMap NATIVE_CKPT_TRACE_NODE = {}  {}\n",
+                       "[native_ckpt:svr][{}#{}][VERBOSE] Rank={} Found in tensorMap NATIVE_CKPT_TRACE_NODE={}  {}\n",
                        *server,
                        sessionId,
                        rank,
@@ -1884,7 +2233,7 @@ void RunInprocServer(uint16_t nodes)
 {
     for (uint16_t i = 0; i < nodes; i++)
     {
-        fmt::print(stderr, "[native_ckpt:svr] Starting inproc server instance for node {}\n", i);
+        fmt::print(stderr, "[native_ckpt:svr] Starting inproc server instance for node={}\n", i);
         ServerSingletons.push_back(std::make_unique<Server>(i));
         ServerSingletons.back()->Start();
     }

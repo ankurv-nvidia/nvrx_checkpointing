@@ -208,6 +208,21 @@ def svc_stop() -> None:
         pass
 
 
+def svc_spindown() -> None:
+    """Gracefully spin the checkpoint server down, blocking until it is idle.
+
+    Unlike svc_stop this does not abort in-flight saves on other ranks; the server stops
+    only once every session is idle. `timeout` bounds the wait before falling back to a
+    hard stop; None lets the server apply its own default bound.
+    """
+    try:
+        import megatron.native.checkpoint  # noqa: PLC0415
+
+        megatron.native.checkpoint.svc_spindown()
+    except ImportError:
+        pass
+
+
 def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     checkpoint_dir: Path | str,
     extract_tensor_data: bool,
