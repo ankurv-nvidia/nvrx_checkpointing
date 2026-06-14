@@ -15,6 +15,7 @@
 *.tar binary
 *.tgz binary
 *.gz binary
+*.xz binary
 *.zip binary
 *.exe binary
 *.snappy binary
@@ -24,3 +25,8 @@
 *.jpg diff=image
 *.jpeg diff=image
 *.png diff=image
+
+# The CI checkpoint baselines are xz-compressed text. Decompress them for
+# `git diff`/`git show` so baseline updates stay reviewable. One-time opt-in:
+#   git config diff.xztext.textconv 'xz -dcq'
+metadata/**/reference.metadata.info.xz diff=xztext

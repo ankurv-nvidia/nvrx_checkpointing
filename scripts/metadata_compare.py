@@ -8,13 +8,15 @@ For one iter directory of a single-provider pretrain run, this script:
    path here; ``distcp_trace``'s optional native-server claim check (diffing
    against the server-written ``0.metadata.info``) is disabled — this script
    only cares about the trace-vs-baseline diff.
-2. If ``<baseline-dir>/reference.metadata.info`` exists, diffs the
-   just-derived file against it via ``compare_reference_metadata``.
+2. If the baseline holds a ``reference.metadata.info`` (or its xz-compressed
+   ``reference.metadata.info.xz`` form), diffs the just-derived file against it
+   via ``compare_reference_metadata``.
 
-The baseline is the nvrx-derived ``reference.metadata.info`` checked into
-``megatron/native/metadata/<cfg>_checkpoints_iter_NNNNNNN/`` — it is the
-cross-provider equality contract that both pretrain-nvrx (self-consistency)
-and pretrain-native (cross-provider) compare against.
+The baseline is the nvrx-derived reference metadata checked into
+``megatron/native/metadata/<cfg>_checkpoints_iter_NNNNNNN/`` as an xz-compressed
+``reference.metadata.info.xz`` — it is the cross-provider equality contract
+that both pretrain-nvrx (self-consistency) and pretrain-native (cross-provider)
+compare against. ``compare_reference_metadata`` decompresses it in memory.
 
 Exit codes (callers decide whether to warn or hard-fail on each):
 
@@ -66,7 +68,7 @@ def main(checkpoint_dir: Path, baseline_dir: Path, provider: str) -> int:
         return 1
 
     baseline_ref = baseline_dir / "reference.metadata.info"
-    if not baseline_ref.is_file():
+    if not baseline_ref.is_file() and not (baseline_dir / "reference.metadata.info.xz").is_file():
         # Provider-asymmetric bootstrap policy: nvrx is the source of truth
         # that seeds the baseline (via pretrain-nvrx → update-baselines), so
         # let it pass without a baseline. Native compares against that already-

@@ -5,6 +5,7 @@ import enum
 import hashlib
 import io
 import json
+import lzma
 import pickle
 import re
 import sys
@@ -446,6 +447,30 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
 _CHUNK_KEY_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<idx>\d+)\.(?P<field>\w+)$")
 
 
+def _reference_metadata_file(dir_path: Path, label: str) -> Path:
+    """Locate a dir's reference.metadata.info, accepting the xz-compressed baseline form.
+
+    Run-output dirs hold the plaintext ``reference.metadata.info`` that
+    :func:`distcp_trace` writes; the checked-in ``metadata/`` baseline holds the
+    compressed ``reference.metadata.info.xz`` to keep the tree small enough to
+    merge without LFS.
+    """
+    plain = dir_path / "reference.metadata.info"
+    xz = dir_path / "reference.metadata.info.xz"
+    if plain.is_file():
+        return plain
+    if xz.is_file():
+        return xz
+    raise FileNotFoundError(f"[native_ckpt:cli] missing {label} reference.metadata.info at {plain}")
+
+
+def _read_reference_metadata_text(path: Path) -> str:
+    """Read a reference.metadata.info[.xz] file into a text string, decompressing in memory."""
+    if path.suffix == ".xz":
+        return lzma.decompress(path.read_bytes()).decode()
+    return path.read_text()
+
+
 def _parse_reference_metadata(path: Path) -> tuple[dict[str, str], dict[tuple[str, str], tuple[tuple[str, str], ...]]]:
     """Split a ``reference.metadata.info`` dump into scalar entries and per-chunk fields.
 
@@ -460,7 +485,7 @@ def _parse_reference_metadata(path: Path) -> tuple[dict[str, str], dict[tuple[st
     """
     scalars: dict[str, str] = {}
     chunk_fields: dict[tuple[str, str], dict[str, str]] = {}
-    for line in path.read_text().splitlines():
+    for line in _read_reference_metadata_text(path).splitlines():
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -501,11 +526,8 @@ def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | 
     """
     checkpoint_dir = Path(checkpoint_dir)
     baseline_dir = Path(baseline_dir)
-    checkpoint_ref = checkpoint_dir / "reference.metadata.info"
-    baseline_ref = baseline_dir / "reference.metadata.info"
-    for label, path in (("checkpoint", checkpoint_ref), ("baseline", baseline_ref)):
-        if not path.is_file():
-            raise FileNotFoundError(f"[native_ckpt:cli] missing {label} reference.metadata.info at {path}")
+    checkpoint_ref = _reference_metadata_file(checkpoint_dir, "checkpoint")
+    baseline_ref = _reference_metadata_file(baseline_dir, "baseline")
     base_scalars, base_chunks = _parse_reference_metadata(baseline_ref)
     ckpt_scalars, ckpt_chunks = _parse_reference_metadata(checkpoint_ref)
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from run_job import (  # companion script, shares run_job's build helpers
     BASELINES_DIR,
+    CKPTBENCH_REGISTRY,
     MEGATRON_ROOT,
     RESULTS_DIR,
     SOFT_FAIL_RC,
@@ -52,7 +53,7 @@ def _ckptbench_binary() -> Path:
 
 
 def run_ckptbench(args: argparse.Namespace) -> None:
-    registry = MEGATRON_ROOT / "megatron/native/metadata/1x2_checkpoints_iter_0000250/registry.bin"
+    registry = CKPTBENCH_REGISTRY
     if not registry.is_file():
         raise FileNotFoundError(f"stateregistry not found: {registry}")
 

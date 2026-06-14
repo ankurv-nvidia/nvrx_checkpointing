@@ -25,6 +25,7 @@ import difflib
 import hashlib
 import json
 import logging
+import lzma
 import math
 import os
 import re
@@ -55,6 +56,16 @@ MEGATRON_ROOT = (SCRIPT_DIR / "../../../..").resolve()
 BASELINES_DIR = (SCRIPT_DIR / "../baselines").resolve()
 CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
 logger = logging.getLogger("native_ci")
+
+# The single state registry checked into metadata/: the fixed input that the
+# ckptbench benchmark (ckptbench.py) and the ckpttest round-trip test
+# (CMakeLists.txt) replay. Every other config's registry.bin is a runtime-only
+# artifact and is not mirrored into the baseline tree.
+_CKPTBENCH_REGISTRY_CFG = "1x2"
+_CKPTBENCH_REGISTRY_ITER = "0000250"
+CKPTBENCH_REGISTRY = (
+    MEGATRON_ROOT / "megatron/native/metadata" / f"{_CKPTBENCH_REGISTRY_CFG}_checkpoints_iter_{_CKPTBENCH_REGISTRY_ITER}" / "registry.bin"
+)
 
 # Sentinel first arg that re-enters this script as the in-process training entry, so the
 # launched and in-process paths share one code path.
@@ -1368,6 +1379,15 @@ class PerfReport:
             sys.exit(3)
 
 
+def _write_compressed_baseline(src: Path, dst_xz: Path) -> None:
+    """Write ``src`` into the metadata/ baseline as an xz-compressed file,
+    replacing any stale plaintext form. The xz stream carries no timestamp, so
+    identical input yields byte-identical output and an unchanged baseline
+    produces no git churn."""
+    dst_xz.write_bytes(lzma.compress(src.read_bytes(), preset=9 | lzma.PRESET_EXTREME))
+    dst_xz.with_suffix("").unlink(missing_ok=True)
+
+
 class BaselineUpdater:
     @staticmethod
     def _baseline_run_cmds(job: str, config: str, flavor_tag: str, gpus_per_node: int) -> tuple[str, str]:
@@ -1529,33 +1549,31 @@ class BaselineUpdater:
 
     @staticmethod
     def _update_native_metadata_files(filter_config: str | None) -> None:
-        """Mirror each iteration's registry file into the baseline dirs (optionally one scale)."""
-        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
-        ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
-        iter_pattern = re.compile(r"^iter_(\d{7})$")
-        cfg_pattern = re.compile(r"^\d+x\d+$")
-
-        cfgs = (
-            [filter_config]
-            if filter_config is not None
-            else sorted(d.name for d in ci_runs_root.iterdir() if d.is_dir() and cfg_pattern.match(d.name))
+        """Refresh the single checked-in state registry (``CKPTBENCH_REGISTRY``) from the
+        matching deterministic native run. Only the ckptbench/ckpttest input is mirrored;
+        other configs' registry.bin files stay runtime-only."""
+        if filter_config not in (None, _CKPTBENCH_REGISTRY_CFG):
+            return
+        src = (
+            MEGATRON_ROOT
+            / "megatron/native/ci/ci-runs"
+            / _CKPTBENCH_REGISTRY_CFG
+            / "checkpoints"
+            / f"iter_{_CKPTBENCH_REGISTRY_ITER}"
+            / "registry.bin"
         )
-        for cfg in cfgs:
-            ckpt_root = ci_runs_root / cfg / "checkpoints"
-            if not ckpt_root.is_dir():
-                raise FileNotFoundError(f"checkpoint dir not found for {cfg}: {ckpt_root}")
-            iter_dirs = [d for d in sorted(ckpt_root.iterdir()) if d.is_dir() and iter_pattern.match(d.name)]
-            if not iter_dirs:
-                raise FileNotFoundError(f"no iter_* checkpoints found under {ckpt_root}")
-            for src_iter_dir in iter_dirs:
-                iter_str = iter_pattern.match(src_iter_dir.name).group(1)
-                dst_dir = metadata_root / f"{cfg}_checkpoints_iter_{iter_str}"
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                src = src_iter_dir / "registry.bin"
-                if not src.is_file():
-                    raise FileNotFoundError(f"no registry.bin in {src_iter_dir}")
-                shutil.copy2(src, dst_dir / src.name)
-                logger.info(f"[run_job] updated {dst_dir / src.name} from {src}")
+        if not src.is_file():
+            # filter_config=None means "update whatever ran"; the registry's config may
+            # not have run in this batch, so skip silently. An explicit request for it must
+            # find the file.
+            if filter_config == _CKPTBENCH_REGISTRY_CFG:
+                raise FileNotFoundError(
+                    f"no registry.bin at {src} — did the {_CKPTBENCH_REGISTRY_CFG} deterministic native run produce iter_{_CKPTBENCH_REGISTRY_ITER}?",
+                )
+            return
+        CKPTBENCH_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, CKPTBENCH_REGISTRY)
+        logger.info(f"[run_job] updated {CKPTBENCH_REGISTRY} from {src}")
 
     @staticmethod
     def _update_nvrx_baseline_files(filter_config: str | None) -> None:
@@ -1590,8 +1608,8 @@ class BaselineUpdater:
                     raise FileNotFoundError(
                         f"missing reference.metadata.info at {src} — did pretrain-nvrx run its baseline-compare step?",
                     )
-                dst = dst_dir / "reference.metadata.info"
-                shutil.copy2(src, dst)
+                dst = dst_dir / "reference.metadata.info.xz"
+                _write_compressed_baseline(src, dst)
                 logger.info(f"[run_job] updated {dst} from {src}")
 
 
