@@ -6,12 +6,15 @@ import hashlib
 import io
 import json
 import lzma
+import os
 import pickle
 import re
 import sys
+import threading
 import time
 import types
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import IO
 
@@ -224,6 +227,13 @@ def svc_spindown() -> None:
         pass
 
 
+# A .distcp file lives on lustre (a network filesystem) where read latency, not
+# bandwidth, dominates: many small seek-then-read calls thrash the file. A large
+# read buffer lets the client coalesce and read ahead once the reads are issued
+# in ascending-offset order.
+_DCP_READ_BUFFER_BYTES = 16 * 1024 * 1024
+
+
 def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     checkpoint_dir: Path | str,
     extract_tensor_data: bool,
@@ -336,79 +346,117 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             if tnsr not in tensors:
                 sys.stderr.write(f"\tMetadata byte {tnsr} : {obj} not found in storage offsets\n")
 
-    for relative_path in file_offsets:
-        tnsr_data_dcp_file = checkpoint_dir / relative_path
+    # chunk_storage: (fqn, chunk_offsets_tuple) -> storage_info, used to locate each
+    # chunk's raw bytes within its distcp file. It is derived from metadata.storage_data
+    # alone, so it is the same for every file — build it once, not once per file.
+    chunk_storage: dict[tuple, object] = {}
+    for midx, si in metadata.storage_data.items():
+        if isinstance(midx, MetadataIndex):
+            offset_key = tuple(midx.offset) if midx.offset is not None else ()
+            chunk_storage[(midx.fqn, offset_key)] = si
 
-        # Build chunk_storage: (fqn, chunk_offsets_tuple) -> storage_info
-        # Used to locate each chunk's raw bytes within the distcp file.
-        chunk_storage: dict[tuple, object] = {}
-        for midx, si in metadata.storage_data.items():
-            if isinstance(midx, MetadataIndex):
-                offset_key = tuple(midx.offset) if midx.offset is not None else ()
-                chunk_storage[(midx.fqn, offset_key)] = si
-        with tnsr_data_dcp_file.open("rb") as dcp_fd:
-            # Write per-tensor raw bytes (unchanged behaviour)
-            extracted_dir = checkpoint_dir / "reference"
-            if extract_tensor_data:
-                extracted_dir.mkdir(exist_ok=True)
-            # Build flat key=value metadata entries for all TensorStorageMetadata tensors
-            if verify_native_server:
-                try_ping()
-            for fqn, meta in tensormeta.items():
-                flatten_to_entries(fqn, meta, info_entries)
-                for i, chunk in enumerate(meta.chunks):
-                    si = chunk_storage[(fqn, tuple(chunk.offsets))]
-                    if si.relative_path != relative_path:
-                        continue
-                    dcp_fd.seek(si.offset)
-                    raw = dcp_fd.read(si.length)
-                    if len(raw) != si.length:
-                        raise ValueError(
-                            f"[native_ckpt:cli] {relative_path}:{fqn}.chunk.{i} offset={si.offset}: Got {len(raw)} of {si.length} bytes\n",
-                        )
-                    data_size = chunk.sizes.numel() * torch.tensor([], dtype=meta.properties.dtype).element_size()
-                    # Each si.length chunk is a complete torch.save() ZIP64 archive.
-                    # Raw tensor bytes live in the 'archive/data/0' member; the ZIP
-                    # local-file-header + data.pkl + ZIP footer surround them.
-                    with zipfile.ZipFile(io.BytesIO(raw)) as _zip, _zip.open("archive/data/0") as _f:
-                        raw_data = _f.read()
-                    if len(raw_data) != data_size:
-                        raise ValueError(
-                            f"[native_ckpt:cli] WARNING: Expected {data_size} raw bytes, got {len(raw_data)} bytes for {fqn}[chunk#{i}]\n"
-                            f"\tchunk_size={si.length} bytes\n",
-                        )
-                    md5hex = hashlib.md5(raw_data).hexdigest()  # noqa: S324
-                    info_entries[f"{fqn}.chunks.{i}.md5sum"] = md5hex
-                    datafile = extracted_dir / f"{fqn}.chunks.{i}.dat"
-                    # info_entries[f"{fqn}.chunks.{i}.size"] = str(si.length)
-                    if extract_tensor_data:
-                        datafile.unlink() if datafile.exists() else None
-                        with datafile.open("ab") as fd:
-                            fd.write(raw_data)
+    # Tensor properties are flat metadata, independent of on-disk layout — emit them
+    # once rather than re-deriving the same entries for every file below.
+    for fqn, meta in tensormeta.items():
+        flatten_to_entries(fqn, meta, info_entries)
 
-            # ShardedObject (BytesStorageMetadata) entries: raw torch.save bytes,
-            # not a ZIP archive. md5 the content (content-based, so it matches across
-            # providers/runs regardless of which file/offset the bytes live at).
-            #
-            # Restricted to TransformerEngine `_extra_state`: it is computed from the
-            # model and is byte-identical across providers. The other objects — the
-            # distributed-optimizer state dict and rng_state — are not byte-identical
-            # across checkpoint backends (the native server and dist_checkpointing
-            # consume rng and serialize the optimizer dict differently), so tracing
-            # them would spuriously fail the cross-provider compare.
-            for fqn in bytemeta:
-                if "_extra_state" not in fqn:
+    extracted_dir = checkpoint_dir / "reference"
+    if extract_tensor_data:
+        extracted_dir.mkdir(exist_ok=True)
+
+    # Group every read by the file holding it, so each file is opened once and its
+    # chunks are read in ascending-offset order. The original tensor-dict-order
+    # traversal seeks back and forth across the file; on lustre that random pattern
+    # defeats client readahead and dominates the runtime. "tensor" reads are ZIP64
+    # archives (the raw tensor lives in archive/data/0); "bytes" reads are raw
+    # torch.save bytes for TransformerEngine `_extra_state` ShardedObjects — the only
+    # bytes objects compared, since they are byte-identical across providers, unlike
+    # the optimizer/rng state which the two backends serialize differently.
+    reads_by_file: dict[str, list[tuple]] = {}
+    for fqn, meta in tensormeta.items():
+        for i, chunk in enumerate(meta.chunks):
+            si = chunk_storage[(fqn, tuple(chunk.offsets))]
+            data_size = chunk.sizes.numel() * torch.tensor([], dtype=meta.properties.dtype).element_size()
+            reads_by_file.setdefault(si.relative_path, []).append(("tensor", si.offset, si.length, fqn, i, data_size))
+    for fqn in bytemeta:
+        if "_extra_state" not in fqn:
+            continue
+        si = chunk_storage.get((fqn, ()))
+        if si is None:
+            continue
+        reads_by_file.setdefault(si.relative_path, []).append(("bytes", si.offset, si.length, fqn, 0, None))
+
+    if verify_native_server:
+        try_ping()
+
+    # Each .distcp file is independent — its chunks read, ZIP-extract, and md5 with no
+    # cross-file state — so process the files concurrently. hashlib and file reads drop
+    # the GIL, so worker threads overlap the lustre reads and the md5 hashing that
+    # otherwise serialize into the multi-minute single-threaded walk that blows the
+    # deterministic job's time budget. Each worker returns its own entries; the parent
+    # merges them, so no shared-dict locking on the hot path.
+    stats = {"bytes": 0, "chunks": 0, "read_s": 0.0, "md5_s": 0.0}
+    stats_lock = threading.Lock()
+
+    def _trace_file(item: tuple[str, list[tuple]]) -> dict[str, str]:
+        relative_path, reads = item
+        reads.sort(key=lambda r: r[1])  # ascending offset → sequential, readahead-friendly
+        local: dict[str, str] = {}
+        b = c = 0
+        read_s = md5_s = 0.0
+        with (checkpoint_dir / relative_path).open("rb", buffering=_DCP_READ_BUFFER_BYTES) as dcp_fd:
+            for kind, offset, length, fqn, i, data_size in reads:
+                t0 = time.monotonic()
+                dcp_fd.seek(offset)
+                raw = dcp_fd.read(length)
+                read_s += time.monotonic() - t0
+                b += length
+                c += 1
+                if len(raw) != length:
+                    raise ValueError(f"[native_ckpt:cli] {relative_path}:{fqn}.chunk.{i} offset={offset}: Got {len(raw)} of {length} bytes\n")
+                if kind == "bytes":
+                    t1 = time.monotonic()
+                    local[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+                    md5_s += time.monotonic() - t1
                     continue
-                si = chunk_storage.get((fqn, ()))
-                if si is None or si.relative_path != relative_path:
-                    continue
-                dcp_fd.seek(si.offset)
-                raw = dcp_fd.read(si.length)
-                if len(raw) != si.length:
+                # Each chunk is a complete torch.save() ZIP64 archive; the raw tensor
+                # bytes live in the 'archive/data/0' member.
+                with zipfile.ZipFile(io.BytesIO(raw)) as _zip, _zip.open("archive/data/0") as _f:
+                    raw_data = _f.read()
+                if len(raw_data) != data_size:
                     raise ValueError(
-                        f"[native_ckpt:cli] {relative_path}:{fqn} offset={si.offset}: Got {len(raw)} of {si.length} bytes\n",
+                        f"[native_ckpt:cli] WARNING: Expected {data_size} raw bytes, got {len(raw_data)} bytes for {fqn}[chunk#{i}]\n"
+                        f"\tchunk_size={length} bytes\n",
                     )
-                info_entries[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+                t1 = time.monotonic()
+                local[f"{fqn}.chunks.{i}.md5sum"] = hashlib.md5(raw_data).hexdigest()  # noqa: S324
+                md5_s += time.monotonic() - t1
+                if extract_tensor_data:
+                    datafile = extracted_dir / f"{fqn}.chunks.{i}.dat"
+                    datafile.unlink() if datafile.exists() else None
+                    with datafile.open("ab") as fd:
+                        fd.write(raw_data)
+        with stats_lock:
+            stats["bytes"] += b
+            stats["chunks"] += c
+            stats["read_s"] += read_s
+            stats["md5_s"] += md5_s
+        return local
+
+    n_workers = max(1, min(len(reads_by_file), (os.cpu_count() or 8)))
+    wall0 = time.monotonic()
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for d in ex.map(_trace_file, list(reads_by_file.items())):
+                info_entries.update(d)
+    else:
+        for item in reads_by_file.items():
+            info_entries.update(_trace_file(item))
+    wall = time.monotonic() - wall0
+    sys.stderr.write(
+        f"[native_ckpt:trace_prof] files={len(reads_by_file)} chunks={stats['chunks']} bytes={stats['bytes']} "
+        f"workers={n_workers} wall={wall:.1f}s sum_read={stats['read_s']:.1f}s sum_md5={stats['md5_s']:.1f}s\n",
+    )
 
     ref_info_file = checkpoint_dir / "reference.metadata.info"
     rflines = [f"{k}={info_entries[k]}" for k in sorted(info_entries.keys())]
