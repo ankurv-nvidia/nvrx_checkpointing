@@ -1858,6 +1858,11 @@ class PretrainJob:
                 "--async-save",
                 "--use-persistent-ckpt-worker",
             ]
+            # nvrx async worker stages D2H copies through CPU shared memory instead
+            # of pinned host buffers; pairs with dropping the pre-save GPU-headroom
+            # release (empty_cache / free_overlap_buffers) in training.py.
+            if "nvrx" in config.ckpt_provider:
+                checkpoint_opts.append("--async-ckpt-use-cpu-shm")
         checkpoint_opts += ["--save", str(config.ckpt_dir)]
         if config.load_dir is not None:
             checkpoint_opts += ["--load", str(config.load_dir)]

@@ -4,9 +4,22 @@ import sys
 from pathlib import Path
 
 import torch
+from megatron.core import mpu
 from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
 from megatron.core.dist_checkpointing.serialization import _CONTENT_METADATA_KEY
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
+from megatron.core.dist_checkpointing.utils import extract_nonpersistent, extract_sharded_base
+from megatron.core.msc_utils import open_file
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.training.checkpointing import (
+    _build_sharded_state_dict_metadata,
+    generate_state_dict,
+    get_checkpoint_name,
+    get_checkpoint_tracker_filename,
+    get_rng_state,
+)
+from megatron.training.global_vars import get_args
+from megatron.training.utils import print_rank_0, unwrap_model
 
 from . import checkpoint, mapping
 
@@ -102,60 +115,107 @@ def detect_peers(rank: int, world_size: int) -> dict[str, list[str] | int]:
 
 
 def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpoint.model_state:
-    # TODO_CACHE_STATEDICT
-    if not hasattr(register_state_dict, "cache"):
-        register_state_dict.cache: checkpoint.model_state | None = None  # type: ignore[attr-defined]
-    if register_state_dict.cache is not None:
-        return register_state_dict.cache
-    # Re-register every save: handlers cache `tnsr.data_ptr()` at registration time
-    # (torch_bindings.cpp:Convert) and never refresh it. If any tensor's storage has
-    # been reallocated since the previous save, the cached pointer is stale and the
-    # D2H copy reads freed memory. Most visible on small `bucket_idx_2` tail shards
-    # whose backing buffers Megatron may rebuild between optimizer steps.
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    root = checkpoint.model_state.create_root(rank, world_size, **detect_peers(rank, world_size))
-    root.register_state_dict(sharded_state_dict)
-    root.finalize_registry()
-    # TODO_CACHE_STATEDICT
-    # github/main has a bug. It incorrectly caches the data_ptr of pytorch tensors for performance
-    # This is needed until that bug is resolved so we cache the data_ptrs too and match the tensors
-    register_state_dict.cache = root
-    return root
+    """Register the preprocessed sharded state dict with a native root, once.
+
+    The root is cached and reused for every save: its handlers read each tensor's storage
+    live, so only the sharded structure has to stay constant. Registration is collective,
+    so all ranks must reach the first (registering) save together — the training loop
+    drives saves in lockstep, so they do.
+    """
+    if register_state_dict.root is None:
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        root = checkpoint.model_state.create_root(rank, world_size, **detect_peers(rank, world_size))
+        root.register_state_dict(sharded_state_dict)
+        root.finalize_registry()
+        register_state_dict.root = root
+    return register_state_dict.root
 
 
-def save(
-    sharded_state_dict: mapping.ShardedStateDict,
-    iteration: int,
-    checkpoint_dir: Path,
-    content_metadata: dict | None = None,
-) -> None:
-    # Mirror nvrx's full save_preprocess pipeline, not just extract_sharded_base:
-    # apply_factories resolves ShardedTensorFactory in place, extract_nonpersistent
-    # drops LocalNonpersistentObject entries (otherwise they leak into common.pt as
-    # extra `optimizer:N:param_state` keys on the native side), and
-    # filter_out_empty_flatten_tensor strips zero-range ShardedTensors.
-    # validate_access_integrity is off here — nvrx will run its own cross-rank
-    # validation when it processes the same state_dict.
-    sharded_part, common_state = save_preprocess(sharded_state_dict, validate_access_integrity=False)
-    root = register_state_dict(sharded_part)
+register_state_dict.root = None
+
+
+def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
+    """Write common.pt and the registered sharded shards for one checkpoint."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if torch.distributed.get_rank() == 0:
-        # Record content_metadata in common.pt — dist_checkpointing.load_content_metadata
-        # reads it from the common state on load. nvrx stores it the same way (via
-        # save_preprocess); doing it here keeps the native common.pt byte-compatible.
-        if content_metadata is not None:
-            common_state[_CONTENT_METADATA_KEY] = content_metadata
         torch.save(common_state, checkpoint_dir / "common.pt")
-        # Advertise the checkpoint as torch_dist so megatron's standard load path can
-        # read it back. The native writer emits torch DCP shards (.metadata + __R_O.distcp)
-        # that the torch_dist loader understands; the only missing piece for format
-        # detection (check_is_distributed_checkpoint) is this metadata.json marker. A
-        # dedicated native load path is future work — until then checkpoints written here
-        # are loaded via the regular torch_dist code.
+        # metadata.json marker so the standard torch_dist loader recognizes these shards.
         save_config(CheckpointingConfig(sharded_backend="torch_dist"), str(checkpoint_dir))
-    root.save_async(iteration, Path(checkpoint_dir))
-    root.wait_for_deferred_save()
+    register_state_dict.root.save_async(iteration, checkpoint_dir)
+    register_state_dict.root.wait_for_deferred_save()
 
 
-__all__ = ["register_state_dict", "save"]
+def save_checkpoint(
+    iteration: int,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    num_floating_point_operations_so_far: int,
+    train_data_iterator=None,
+) -> None:
+    """Save a synchronous torch_dist checkpoint through the native writer.
+
+    The first save builds the full sharded state dict and registers it; later saves reuse
+    that registration — model/optimizer tensors are read live, the frozen sharded objects
+    (RNG, distributed-optimizer state) are re-emitted from their registration-time bytes,
+    and only the plain common scalars are refreshed — so generate_state_dict and
+    re-registration are skipped entirely.
+
+    TODO: omits work the generic save_checkpoint does, to add back as needed: dataloader /
+    Energon resume, one_logger/wandb hooks, fault tolerance, save_retain cleanup, ModelOpt.
+    """
+    args = get_args()
+    common = save_checkpoint.common
+    if common is None:
+        model = unwrap_model(model)
+        metadata = _build_sharded_state_dict_metadata(args)
+        rng_state = get_rng_state(
+            "torch_dist", mpu.get_tensor_model_parallel_group(), mpu.get_pipeline_model_parallel_group()
+        )
+        rerun_state = get_rerun_state_machine().state_dict(
+            data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
+        )
+        state_dict = generate_state_dict(
+            args, model, optimizer, opt_param_scheduler, rng_state, iteration=iteration,
+            optim_sd_kwargs=dict(metadata=metadata), model_sd_kwargs=dict(metadata=metadata),
+            rerun_state=rerun_state,
+        )
+        state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
+        # validate_access_integrity off: nvrx runs its own cross-rank validation on the same dict.
+        sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
+        register_state_dict(sharded_part)
+        if torch.distributed.get_rank() == 0:
+            # content_metadata lets load pick the matching optimizer sharding type; only rank 0
+            # writes common.pt. dp_cp_group is dropped because it is not serializable.
+            common[_CONTENT_METADATA_KEY] = {k: v for k, v in metadata.items() if k != "dp_cp_group"}
+        save_checkpoint.common = common
+    else:
+        common["iteration"] = iteration
+        common["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
+        if "opt_param_scheduler" in common:
+            common["opt_param_scheduler"] = opt_param_scheduler.state_dict()
+        if "rerun_state_machine" in common:
+            # The rerun ShardedObject is frozen in the root, but its plain fields (e.g.
+            # current_iteration) advance; re-extract the common portion to keep them current.
+            rerun_state = get_rerun_state_machine().state_dict(
+                data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
+            )
+            _, persistent = extract_nonpersistent(rerun_state)
+            _, common["rerun_state_machine"] = extract_sharded_base(persistent)
+
+    print_rank_0(f"saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format")
+    save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        with open_file(get_checkpoint_tracker_filename(args.save), "w") as f:
+            f.write(str(iteration))
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    print_rank_0(f"  successfully saved checkpoint from iteration {iteration:7d} to {args.save}")
+
+
+save_checkpoint.common = None
+
+
+__all__ = ["register_state_dict", "save", "save_checkpoint"]
