@@ -28,7 +28,6 @@ if (APPLE)
 endif()
 
 option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"         ON)
-option(PHOENIX_BUILD_TORCH_BINDINGS     "Build PyTorch Bindings"        ON)
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"         ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"  OFF)
 option(PHOENIX_BUILD_FOR_PERF "Build with full perf at the cost of increased resource usage" OFF)
@@ -63,7 +62,7 @@ cmake_dependent_option(PHOENIX_BUILD_METAL  "Build Metal Support"   ON METAL_FOU
 set(PYTHON_VENV_USE_SYSTEM_PACKAGES ON)
 
 set(CMAKE_CXX_STANDARD 26)
-EnableStrictCompilation()
+    EnableStrictCompilation()
 InitClangDIntellisense()
 
 include_directories(include)
@@ -78,30 +77,6 @@ include(miniz)
 #find_package(Boost CONFIG REQUIRED OPTIONAL_COMPONENTS interprocess)
 
 add_library(phoenix_checkpoint OBJECT src/checkpoint/checkpoint.cpp)
-
-function(target_is_python_extension target)
-    if (APPLE)
-        find_package(Python3 COMPONENTS Development.Embed Development.SABIModule REQUIRED QUIET)
-        message(VERBOSE "Linking with Python Libraries to ensure no undefined symbols remain ...
-            Python3_LIBRARIES=${Python3_LIBRARIES}
-            Python3_INCLUDE_DIRS=${Python3_INCLUDE_DIRS}
-            Python3_SABI_LIBRARIES=${Python3_SABI_LIBRARIES}
-            Python3_SABI_LIBRARY_DIRS=${Python3_SABI_LIBRARY_DIRS}
-            Python3_SABI_INCLUDE_DIRS=${Python3_SABI_INCLUDE_DIRS}
-            Python3_SABI_LIBRARY=${Python3_SABI_LIBRARY}")
-        target_link_libraries(${target} PRIVATE Python3::Python Python3::SABIModule)
-    elseif (UNIX)
-        find_program(PATCHELF patchelf REQUIRED)
-        find_package(Python3 COMPONENTS Development.Embed Development.SABIModule REQUIRED QUIET)
-        target_link_libraries(${target} PRIVATE Python3::Python Python3::SABIModule)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${PATCHELF} --remove-needed libpython${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}.so.1.0 $<TARGET_FILE:${target}>
-            COMMENT "Removing libpython dependency with patchelf..."
-        )
-    else()
-        message(FATAL_ERROR "Unsupported platform ${CMAKE_SYSTEM_NAME} for target_is_python_extension")
-    endif()
-endfunction()
 
 target_include_directories(phoenix_checkpoint PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -193,6 +168,8 @@ if (PHOENIX_BUILD_BENCHMARK)
 endif()
 
 if (PHOENIX_BUILD_PYTHON_BINDINGS)
+    include(DLPack)
+
     find_package(Python3 COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
     include(PythonEnv)
     pip_install(nanobind)
@@ -206,48 +183,23 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     find_package(nanobind CONFIG REQUIRED)
     nanobind_add_module(checkpoint
         FREE_THREADED STABLE_ABI NB_DOMAIN checkpoint
-        src/python/bindings.cpp)
+        src/python/bindings.cpp
+        src/python/torch_bindings.cpp)
     SupressWarningForTarget(checkpoint)
     SupressWarningForTarget(nanobind-static)
     SupressWarningForTarget(nanobind-static-abi3)
-    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only)
+    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
-
-    if (PHOENIX_BUILD_TORCH_BINDINGS)
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c
-                "import os; import torch; print(os.path.dirname(torch.__file__) + '/share/cmake/Torch')"
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            OUTPUT_VARIABLE Torch_DIR
-        )
-        find_package(Torch CONFIG QUIET)
-        if (NOT Torch_FOUND)
-            if (PHOENIX_BUILD_CUDA)
-                set(pytorch_index_url "https://download.pytorch.org/whl/cu${CUDAToolkit_VERSION_MAJOR}${CUDAToolkit_VERSION_MINOR}")
-                message(STATUS "Installing CUDA-enabled PyTorch from ${pytorch_index_url} into venv for Python bindings...")
-                pip_install(torch --index-url ${pytorch_index_url})
-                set(TORCH_CUDA_ARCH_LIST "8.0")
-            else()
-                pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
-            endif()
-        endif()
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c
-                "import os; import torch; print(os.path.dirname(torch.__file__) + '/share/cmake/Torch')"
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            OUTPUT_VARIABLE Torch_DIR
-        )
-        find_package(Torch CONFIG REQUIRED)
-        if (Torch_FOUND)
-            find_library(torch_python_LIB NAMES torch_python REQUIRED PATHS ${Torch_DIR}/../../../lib)
-            target_sources(checkpoint PRIVATE src/python/torch_bindings.cpp)
-            target_compile_definitions(checkpoint PRIVATE HAVE_TORCH=1)
-            target_include_directories(checkpoint PRIVATE ${TORCH_INCLUDE_DIRS})
-            target_link_libraries(checkpoint PRIVATE ${TORCH_LIBRARIES} ${torch_python_LIB})
-            target_compile_definitions(checkpoint PRIVATE ${TORCH_CXX_FLAGS})
+    if (PHOENIX_BUILD_TESTS)
+        if (PHOENIX_BUILD_CUDA)
+            set(pytorch_index_url "https://download.pytorch.org/whl/cu${CUDAToolkit_VERSION_MAJOR}${CUDAToolkit_VERSION_MINOR}")
+            message(STATUS "Installing CUDA-enabled PyTorch from ${pytorch_index_url} into venv for Python bindings...")
+            pip_install(torch --index-url ${pytorch_index_url})
+            set(TORCH_CUDA_ARCH_LIST "8.0")
+        else()
+            pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
         endif()
     endif()
-
     add_custom_command(TARGET checkpoint POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint>>
         COMMAND ${CMAKE_COMMAND} -E create_symlink

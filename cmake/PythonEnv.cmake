@@ -158,3 +158,27 @@ function(uv_pip_install)
         COMMAND_ERROR_IS_FATAL ANY
     )
 endfunction()
+
+function(target_is_python_extension target)
+    if (APPLE)
+        find_package(Python3 COMPONENTS Development.Embed Development.SABIModule REQUIRED QUIET)
+        message(VERBOSE "Linking with Python Libraries to ensure no undefined symbols remain ...
+            Python3_LIBRARIES=${Python3_LIBRARIES}
+            Python3_INCLUDE_DIRS=${Python3_INCLUDE_DIRS}
+            Python3_SABI_LIBRARIES=${Python3_SABI_LIBRARIES}
+            Python3_SABI_LIBRARY_DIRS=${Python3_SABI_LIBRARY_DIRS}
+            Python3_SABI_INCLUDE_DIRS=${Python3_SABI_INCLUDE_DIRS}
+            Python3_SABI_LIBRARY=${Python3_SABI_LIBRARY}")
+        target_link_libraries(${target} PRIVATE Python3::Python Python3::SABIModule)
+    elseif (UNIX)
+        find_program(PATCHELF patchelf REQUIRED)
+        find_package(Python3 COMPONENTS Development.Embed Development.SABIModule REQUIRED QUIET)
+        target_link_libraries(${target} PRIVATE Python3::Python Python3::SABIModule)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${PATCHELF} --remove-needed libpython${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}.so.1.0 $<TARGET_FILE:${target}>
+            COMMENT "Removing libpython dependency with patchelf..."
+        )
+    else()
+        message(FATAL_ERROR "Unsupported platform ${CMAKE_SYSTEM_NAME} for target_is_python_extension")
+    endif()
+endfunction()

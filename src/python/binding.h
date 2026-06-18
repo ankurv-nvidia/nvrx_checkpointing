@@ -2,8 +2,6 @@
 #include "checkpoint.h"
 #include "fmttensor.h"
 
-#include <torch/torch.h>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/filesystem.h>
@@ -40,8 +38,6 @@ template <> struct fmt::formatter<nanobind::str> : fmt::formatter<std::string_vi
     auto format(nanobind::str const& obj, fmt::format_context& ctx) const    // NOLINT
     { return fmt::format_to(ctx.out(), "{}", StrView(obj, "<null>")); }
 };
-
-void AddTorchBindings(nanobind::class_<StateTree>& cls);
 
 bool TryRegisterTorchStateDict(StateTree&                     root,
                                StateNode::Handle              node,

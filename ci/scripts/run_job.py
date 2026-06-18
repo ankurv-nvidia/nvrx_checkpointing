@@ -878,11 +878,12 @@ class CheckpointServer:
         if not ctx.is_worker or ctx.provider != "native" or ctx.has("valgrind"):
             return
         if not CheckpointServer._stop_checkpoint_server(graceful=graceful) and fail_on_timeout:
+            CheckpointServer._dump_server_log()
             CheckpointServer._dump_server_threads()
             CheckpointServer._gcore_and_kill_server()
             raise RuntimeError(
                 "checkpoint_server did not spin down after a clean-stop request — "
-                "see the thread dump above and the core file in ci-results",
+                "see the checkpoint_server log dumped above (and the core file in ci-results)",
             )
         if verify_files and ctx.is_rank0:
             CheckpointServer._report_native_checkpoint_files(ctx.cfg)
@@ -913,34 +914,127 @@ class CheckpointServer:
             return []
         return out.stdout.split()
 
+    # Cap the per-log console dump so a runaway log can't flood the job output; the crash
+    # diagnostics (asan/heap-corruption report, fatal stderr) sit at the tail.
+    _SERVER_LOG_TAIL_BYTES = 256 * 1024
+
+    @staticmethod
+    def _dump_server_log() -> None:
+        """Echo this node's checkpoint_server stderr log to the console.
+
+        On a teardown hang the gdb/gcore dumps routinely can't attach (restricted
+        ptrace_scope, a concurrent attach racing the same pid, core-file writes failing on
+        the scratch mount), so the server's own log is the only reliable diagnostic — yet it
+        only lands in the uploaded artifact dir, never on the console. Surface it. The server
+        expands %h->hostname and %p->pid when it opens the file (server_main.cpp); resolve %h
+        to this node's hostname and glob %p so the match is pid-independent. Never raises."""
+        template = os.environ.get("NATIVE_CKPT_SERVER_LOG")
+        if not template:
+            logger.info("[run_job] NATIVE_CKPT_SERVER_LOG unset; no server log to dump")
+            return
+        resolved = template.replace("%h", socket.gethostname()).replace("%p", "*")
+        resolved_path = Path(resolved)
+        matches = sorted(resolved_path.parent.glob(resolved_path.name))
+        if not matches:
+            logger.info(f"[run_job] no checkpoint_server log found matching {resolved}")
+            return
+        for log_path in matches:
+            try:
+                size = log_path.stat().st_size
+                with log_path.open("rb") as fp:
+                    if size > CheckpointServer._SERVER_LOG_TAIL_BYTES:
+                        fp.seek(size - CheckpointServer._SERVER_LOG_TAIL_BYTES)
+                        raw = fp.read()
+                        raw = raw[raw.find(b"\n") + 1 :]  # drop the partial leading line
+                        span = f"last {CheckpointServer._SERVER_LOG_TAIL_BYTES // 1024} KiB of {size} bytes"
+                    else:
+                        raw = fp.read()
+                        span = f"{size} bytes"
+            except OSError as ex:
+                logger.info(f"[run_job] could not read checkpoint_server log {log_path}: {ex}")
+                continue
+            logger.info(f"[run_job] === checkpoint_server log {log_path.name} ({span}) ===")
+            for line in raw.decode(errors="replace").splitlines():
+                logger.info(f"[ncs:{log_path.name}] {line}")
+            logger.info(f"[run_job] === end checkpoint_server log {log_path.name} ===")
+
+    @staticmethod
+    def _local_server_log_path() -> Path | None:
+        """Resolve this node's checkpoint_server log path from the template the server opened
+        (server_main.cpp expands %h->hostname and %p->pid). Returns None if unset or, for a
+        %p template, if no server process is running to supply the pid."""
+        template = os.environ.get("NATIVE_CKPT_SERVER_LOG")
+        if not template:
+            return None
+        resolved = template.replace("%h", socket.gethostname())
+        if "%p" in resolved:
+            pids = CheckpointServer._checkpoint_server_pids()
+            if not pids:
+                return None
+            resolved = resolved.replace("%p", pids[0])
+        return Path(resolved)
+
+    @staticmethod
+    def _append_to_server_log(text: str) -> None:
+        """Append run_job-side teardown diagnostics (the thread dump) to this node's
+        checkpoint_server log, so the backtrace lands in the uploaded artifact alongside the
+        server's own crash output — not just inline in the live job trace. Never raises."""
+        path = CheckpointServer._local_server_log_path()
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as fp:
+                fp.write(f"\n[run_job] ==== run_job teardown thread dump @ {time.strftime('%Y-%m-%dT%H:%M:%S')} ====\n")
+                fp.write(text)
+                fp.write("\n")
+
     @staticmethod
     def _dump_server_threads() -> None:
         """Best-effort thread dump of any running checkpoint server, to make a stuck process
-        diagnosable instead of just killing it. Never raises."""
+        diagnosable instead of just killing it. The dump is emitted to the console and appended
+        to the node's checkpoint_server log so the backtrace survives in the uploaded artifact
+        too. Always captures /proc kernel stacks (which need no ptrace, so they work even when
+        gdb can't attach — restricted ptrace_scope, or a sibling rank already attached on a
+        multi-rank node) in addition to the symbolized gdb backtrace. Never raises."""
         pids = CheckpointServer._checkpoint_server_pids()
         if not pids:
             logger.info("[run_job] no checkpoint_server process found to dump")
             return
         gdb = shutil.which("gdb")
         vgdb = shutil.which("vgdb")
+        chunks: list[str] = []
         for pid in pids:
             cmdline = Path(f"/proc/{pid}/cmdline")
             under_valgrind = cmdline.exists() and "valgrind" in cmdline.read_text(errors="replace")
-            logger.info(f"[run_job] === checkpoint_server pid {pid} thread dump{' (via vgdb)' if under_valgrind else ''} ===")
+            header = f"=== checkpoint_server pid {pid} thread dump{' (via vgdb)' if under_valgrind else ''} ==="
+            gdb_out = ""
             try:
                 if gdb and under_valgrind and vgdb:
                     # A bare `gdb -p` on a valgrind process shows valgrind's frames, not the
                     # guest; attach through valgrind's gdbserver to see the real server threads.
-                    bt = [gdb, "-batch", "-ex", f"target remote | {vgdb} --pid={pid}", "-ex", "thread apply all bt"]
-                    subprocess.run(bt, check=False, timeout=120)
+                    cmd = [gdb, "-batch", "-ex", f"target remote | {vgdb} --pid={pid}", "-ex", "thread apply all bt"]
+                    res = subprocess.run(cmd, check=False, timeout=120, capture_output=True, text=True)
+                    gdb_out = res.stdout + res.stderr
                 elif gdb:
-                    subprocess.run([gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"], check=False, timeout=120)
-                else:
-                    for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
-                        with contextlib.suppress(OSError):
-                            logger.info(f"[run_job] thread {task.name}:\n{(task / 'stack').read_text()}")
+                    res = subprocess.run(
+                        [gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"], check=False, timeout=120, capture_output=True, text=True
+                    )
+                    gdb_out = res.stdout + res.stderr
             except (OSError, subprocess.TimeoutExpired) as ex:
-                logger.info(f"[run_job] thread dump for pid {pid} failed: {ex}")
+                gdb_out = f"gdb backtrace for pid {pid} failed: {ex}"
+            # Kernel per-thread stacks — no ptrace, so they survive when the gdb attach can't.
+            kstacks = []
+            for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
+                with contextlib.suppress(OSError):
+                    kstacks.append(f"thread {task.name}:\n{(task / 'stack').read_text().rstrip()}")
+            body = "\n".join(filter(None, [gdb_out.strip(), "\n".join(kstacks)]))
+            chunk = f"{header}\n{body}"
+            chunks.append(chunk)
+            logger.info(f"[run_job] {header}")
+            for line in body.splitlines():
+                logger.info(f"[run_job] {line}")
+        CheckpointServer._append_to_server_log("\n\n".join(chunks))
 
     @staticmethod
     def _gcore_and_kill_server() -> None:

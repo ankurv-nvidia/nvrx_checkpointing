@@ -357,7 +357,7 @@ macro(EnableStrictCompilation)
             endif()
 
             if (NOT CMAKE_CROSSCOMPILING AND NOT BUILDENV_DISABLE_MARCH_NATIVE)
-                list(APPEND extraflags -mtune=native -march=native)
+                list(APPEND extraflags -march=native)
             endif()
 
             set(exclusions "[-/]W[a-zA-Z1-9]+")

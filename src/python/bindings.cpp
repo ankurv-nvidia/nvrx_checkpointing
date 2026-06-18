@@ -720,7 +720,4 @@ NB_MODULE(checkpoint, m)    // NOLINT
 
         // Return list of named states' names (as Python list of strings)
         ;
-#if (defined HAVE_TORCH) && (HAVE_TORCH)
-    AddTorchBindings(cls);
-#endif
 }

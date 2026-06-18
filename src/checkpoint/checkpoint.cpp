@@ -2,6 +2,7 @@
 #include "SetThreadName.h"
 
 #include "checkpoint.h"
+#include "fmttensor.h"
 #include "messages.h"
 #include "numa_utils.h"
 #include "state.h"
@@ -670,13 +671,20 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
 
 #ifdef PHOENIX_HAVE_CUDA
     if (device.IsType("cuda"sv)) { return DeviceContext::CreateDeviceContextCUDA(device, streamIdx); }
-
 #endif
 #ifdef PHOENIX_HAVE_METAL
     if (device.IsType("mps"sv)) { return DeviceContext::CreateDeviceContextMTL(device, streamIdx); }
 #endif
-    return DeviceContext::CreateDeviceContextCPU(device, streamIdx);
-    // throw std::runtime_error(fmt::format("Unsupported device type : {} for DeviceContext creation", deviceStr));
+    // Falling through to CPU on an unmatched device type silently maps a
+    // CUDA / MPS device address to CPUContext::AddD2H, which does
+    // `memcpy(host, (void*)deviceAddr, size)` and segfaults the moment a
+    // real device pointer arrives. Better to fail loudly: misconfigurations
+    // (e.g. the wheel built without PHOENIX_BUILD_CUDA but loaded into a
+    // CUDA training run) now surface as a clear runtime error at the
+    // factory call instead of an opaque SIGSEGV deep inside the writer.
+    throw std::runtime_error(fmt::format("Unsupported device type for DeviceContext creation: {} — "
+                                         "is this build missing PHOENIX_BUILD_CUDA / PHOENIX_BUILD_METAL?",
+                                         device));
 }
 
 void SvcDecrRef()
