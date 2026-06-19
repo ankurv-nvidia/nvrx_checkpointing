@@ -17,6 +17,9 @@ void SvcDecrRef();
 void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
 void FinalizeStateRegistry(StateTree& self);
 void WaitForCheckpointSave(RankTopology const& topo);
+
+// Warm up the MsgQueue pinned buffers for CUDA D2H
+void WarmUpCheckpoint(RankTopology const& topo);
 void SvcPing();
 void SvcStop();
 

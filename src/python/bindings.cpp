@@ -648,7 +648,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
 {
     m.def("ping", &SvcPing);
     m.def("svc_stop", &SvcStop);
-    m.def("svc_spindown", &SvcSpinDown/* , nanobind::arg("timeout") = nanobind::none() */);
+    m.def("svc_spindown", &SvcSpinDown /* , nanobind::arg("timeout") = nanobind::none() */);
     auto cls = nb::class_<StateTree>(std::move(m), "model_state");
 
     cls.def_static(
@@ -696,6 +696,26 @@ NB_MODULE(checkpoint, m)    // NOLINT
            nb::arg("peers"),
            nb::arg("ranks_per_peer") = 0,
            nb::arg("peers_per_node") = 1)
+        .def_static(
+            "warmup",
+            [](uint32_t                 globalRank,
+               uint32_t                 globalWorldSize,
+               std::vector<std::string> peers,
+               uint32_t                 ranksPerPeer,
+               uint32_t                 peersPerNode) {
+                WarmUpCheckpoint(RankTopology{
+                    .rank         = Rank{globalRank},
+                    .worldSize    = Rank{globalWorldSize},
+                    .ranksPerPeer = ranksPerPeer,
+                    .peersPerNode = peersPerNode,
+                    .peers        = std::move(peers),
+                });
+            },
+            nb::arg("global_rank"),
+            nb::arg("global_world_size"),
+            nb::arg("peers"),
+            nb::arg("ranks_per_peer"),
+            nb::arg("peers_per_node") = 1)
         .def("add_child", &StateTree::AddChild, nb::rv_policy::reference)
         .def_prop_ro("globalRank", &StateTree::GlobalRank)
         .def_prop_ro("globalWorldSize", &StateTree::GlobalWorldSize)

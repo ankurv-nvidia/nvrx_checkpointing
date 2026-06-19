@@ -135,6 +135,13 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
 register_state_dict.root = None
 
 
+def warmup() -> None:
+    """Warm up the pinned buffers used for D2H transfers in checkpointing to avoid first save penalty"""
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    checkpoint.model_state.warmup(rank, world_size, **detect_peers(rank, world_size))
+
+
 def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
     """Write common.pt and the registered sharded shards for one checkpoint."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -170,15 +177,17 @@ def save_checkpoint(
     if common is None:
         model = unwrap_model(model)
         metadata = _build_sharded_state_dict_metadata(args)
-        rng_state = get_rng_state(
-            "torch_dist", mpu.get_tensor_model_parallel_group(), mpu.get_pipeline_model_parallel_group()
-        )
-        rerun_state = get_rerun_state_machine().state_dict(
-            data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
-        )
+        rng_state = get_rng_state("torch_dist", mpu.get_tensor_model_parallel_group(), mpu.get_pipeline_model_parallel_group())
+        rerun_state = get_rerun_state_machine().state_dict(data_iterator=train_data_iterator, ckpt_format=args.ckpt_format)
         state_dict = generate_state_dict(
-            args, model, optimizer, opt_param_scheduler, rng_state, iteration=iteration,
-            optim_sd_kwargs=dict(metadata=metadata), model_sd_kwargs=dict(metadata=metadata),
+            args,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            rng_state,
+            iteration=iteration,
+            optim_sd_kwargs=dict(metadata=metadata),
+            model_sd_kwargs=dict(metadata=metadata),
             rerun_state=rerun_state,
         )
         state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
@@ -198,9 +207,7 @@ def save_checkpoint(
         if "rerun_state_machine" in common:
             # The rerun ShardedObject is frozen in the root, but its plain fields (e.g.
             # current_iteration) advance; re-extract the common portion to keep them current.
-            rerun_state = get_rerun_state_machine().state_dict(
-                data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
-            )
+            rerun_state = get_rerun_state_machine().state_dict(data_iterator=train_data_iterator, ckpt_format=args.ckpt_format)
             _, persistent = extract_nonpersistent(rerun_state)
             _, common["rerun_state_machine"] = extract_sharded_base(persistent)
 
@@ -218,4 +225,4 @@ def save_checkpoint(
 save_checkpoint.common = None
 
 
-__all__ = ["register_state_dict", "save", "save_checkpoint"]
+__all__ = ["register_state_dict", "save", "save_checkpoint", "warmup"]

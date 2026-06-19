@@ -26,11 +26,13 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <future>
 #include <limits>
-#include <optional>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 using namespace std::chrono_literals;
 namespace cipc = checkpoint::ipc;
@@ -217,8 +219,10 @@ struct CheckpointWriter
     using TimePoint = Clock::time_point;
     using Duration  = Clock::duration;
 
-    StateTree const&      root;    // NOLINT
-    static cipc::MsgQueue InitMsgQueue(RankTopology const& topo)
+    StateTree const& root;    // NOLINT
+
+    // Resolve this rank's channel and mmap its shm queue (cheap; logs the open time).
+    static cipc::MsgQueue OpenMsgQueue(RankTopology const& topo)
     {
         int numa = GetCurrentNumaNode();
 #ifdef PHOENIX_HAVE_CUDA
@@ -234,34 +238,78 @@ struct CheckpointWriter
         auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
         auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
         fmt::print(stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", topo.rank, numa, channelName);
-        auto msgQueue = cipc::MsgQueue::Open(channelName);
+        return cipc::MsgQueue::Open(channelName);
+    }
+
+    // Note: a queue can be shared by multiple ranks
+    struct QueueState
+    {
+        std::unique_ptr<cipc::MsgQueue> queue;
+        std::shared_future<void>        ready;
+    };
+
+    struct QueueRegistry
+    {
+        std::mutex                                            mu;
+        std::unordered_map<Rank, std::shared_ptr<QueueState>> states;
+    };
+    static QueueRegistry& Registry()
+    {
+        SUPPRESS_WARNINGS_START
+        SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+        static QueueRegistry Registry;
+        SUPPRESS_WARNINGS_END
+        return Registry;
+    }
+
+    static void WarmUpCheckpoint(RankTopology const& topo)
+    {
+        auto&            reg = Registry();
+        std::scoped_lock lock(reg.mu);
+        if (reg.states.contains(topo.rank)) { return; }
+        SvcPing();
+        auto state   = std::make_shared<QueueState>();
+        auto readyP  = std::make_shared<std::promise<void>>();
+        state->ready = readyP->get_future().share();
+        reg.states.emplace(topo.rank, state);
+        int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
-        auto region = msgQueue.GetShmDataRegion();
-        // Bind the data pages to this rank's GPU-local node before cudaHostRegister
-        // faults them in (the queue's Create touches only the control header). The
-        // node is the GPU's own, so this is correct for multi-peer layouts too.
-        BindRegionToNumaNode(numa, region.data(), region.size());
-        DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+        // Need to determine numa for current device since once cudaHostRegister has faulted+pinned the pages, a later mbind is a no-op
+        // pinned pages won't migrate.
+        numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
-        return msgQueue;
+        std::thread([topo, numa, state, readyP]() {
+            SetThreadName("ncc:bufwarm");
+            try
+            {
+                state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(topo));
+#ifdef PHOENIX_HAVE_CUDA
+                auto region = state->queue->GetShmDataRegion();
+                BindRegionToNumaNode(numa, region.data(), region.size());
+                DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+#else
+                (void)numa;
+#endif
+            } catch (...)
+            {
+                readyP->set_exception(std::current_exception());
+                return;
+            }
+            readyP->set_value();
+        }).detach();
     }
 
     static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo)
     {
-        SUPPRESS_WARNINGS_START
-        SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-        // TODO_PINNED_BUFFERS
-        // This cannot be thread_local because it uses pinned buffers which are registered once per process
-        static /* thread_local */ std::unordered_map<Rank, std::unique_ptr<cipc::MsgQueue>> MsgQueueMap;
-        SUPPRESS_WARNINGS_END
-
-        auto it = MsgQueueMap.find(topo.rank);
-        if (it == MsgQueueMap.end())
+        WarmUpCheckpoint(topo);
+        std::shared_ptr<QueueState> state;
         {
-            auto msgQueue = InitMsgQueue(topo);
-            it            = MsgQueueMap.emplace(topo.rank, std::make_unique<cipc::MsgQueue>(std::move(msgQueue))).first;
+            auto&            reg = Registry();
+            std::scoped_lock lock(reg.mu);
+            state = reg.states.at(topo.rank);
         }
-        return *(it->second);
+        state->ready.get();    // rethrows if the warmup failed to open/pin
+        return *state->queue;
     }
 
     cipc::MsgQueue&     msgQueue = GetMsgQueue(root.Topo());
@@ -585,6 +633,9 @@ void WaitForCheckpointSave(RankTopology const& topo)
     auto& msgQueue = CheckpointWriter::GetMsgQueue(topo);
     for (size_t i = 0; i < cipc::D2HBufferCount; ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
+
+void WarmUpCheckpoint(RankTopology const& topo)
+{ CheckpointWriter::WarmUpCheckpoint(topo); }
 
 void FinalizeStateRegistry(StateTree& self)
 {
