@@ -43,42 +43,57 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
     if (ec && ec != boost::system::errc::not_connected)
     {    //
-        fmt::print(stderr, "Shutdown Error: {}\n", ec.what());
+        fmt::print(stderr, "[native_ckpt:cli][ERROR] Shutdown Error: {}\n", ec.what());
     }
 }
 
 static bool TryConnectToCheckpointService()
 {
-    boost::system::error_code ec;
+    // EINTR is transient, A signal can interrupt the blocking socket syscalls (e.g. SIGCHLD torch's fork etc)
+    static constexpr int MaxRetries = 5;
+    // Seed with interrupted so the loop runs the first attempt; afterwards it only re-enters on EINTR.
+    boost::system::error_code ec = boost::asio::error::interrupted;
 
-    boost::asio::io_context        ioc;
-    boost::beast::tcp_stream       stream(ioc);
-    boost::asio::ip::tcp::resolver resolver(ioc);
+    for (int attempt = 0; attempt < MaxRetries && ec == boost::asio::error::interrupted; ++attempt)
+    {
+        boost::asio::io_context        ioc;
+        boost::beast::tcp_stream       stream(ioc);
+        boost::asio::ip::tcp::resolver resolver(ioc);
 
-    auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port));
-    // Try connecting to localhost before we send a request to check and fail-fast
-    [[maybe_unused]] auto endpoint = stream.connect(results, ec);
-    if (ec) { return false; }
+        auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port), ec);
+        if (ec) { continue; }
 
-    // Create HTTP GET request with buffer_body (avoids copying state data)
-    static constexpr int                                         HttpVersion11 = 11;
-    boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
-    req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
-    req.body().data = nullptr;
-    req.body().size = 0;
-    req.body().more = false;
-    req.prepare_payload();
+        // Try connecting to localhost before we send a request to check and fail-fast
+        [[maybe_unused]] auto endpoint = stream.connect(results, ec);
+        if (ec) { continue; }
 
-    // Send the request (Beast sends directly from buffer with Content-Length)
-    boost::beast::http::write(stream, req);
-    // Read the response
-    boost::beast::flat_buffer                                     buffer;
-    boost::beast::http::response<boost::beast::http::string_body> res;
-    boost::beast::http::read(stream, buffer, res);
+        // Create HTTP GET request with buffer_body (avoids copying state data)
+        static constexpr int                                         HttpVersion11 = 11;
+        boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
+        req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
+        req.body().data = nullptr;
+        req.body().size = 0;
+        req.body().more = false;
+        req.prepare_payload();
 
-    if (res.result() != boost::beast::http::status::ok) { return false; }
-    TryCleanShutdown(stream);
-    return true;
+        // Send the request (Beast sends directly from buffer with Content-Length)
+        boost::beast::http::write(stream, req, ec);
+        if (ec) { continue; }
+
+        // Read the response
+        boost::beast::flat_buffer                                     buffer;
+        boost::beast::http::response<boost::beast::http::string_body> res;
+        boost::beast::http::read(stream, buffer, res, ec);
+        if (ec) { continue; }
+
+        if (res.result() != boost::beast::http::status::ok) { return false; }
+        TryCleanShutdown(stream);
+        return true;
+    }
+
+    fmt::print(stderr, "[native_ckpt:cli][ERROR] Attempting to connect with checkpoint service failed with: {}\n", ec.what());
+
+    return false;
 }
 
 static auto GetEnv(char const* envVar, std::string_view defaultVal) -> std::string_view
@@ -267,7 +282,6 @@ struct CheckpointWriter
         auto&            reg = Registry();
         std::scoped_lock lock(reg.mu);
         if (reg.states.contains(topo.rank)) { return; }
-        SvcPing();
         auto state   = std::make_shared<QueueState>();
         auto readyP  = std::make_shared<std::promise<void>>();
         state->ready = readyP->get_future().share();
@@ -279,6 +293,7 @@ struct CheckpointWriter
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
         std::thread([topo, numa, state, readyP]() {
+            SvcPing();
             SetThreadName("ncc:bufwarm");
             try
             {

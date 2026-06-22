@@ -503,7 +503,7 @@ class ValgrindFlavor(Flavor):
         # writes keep entries from interleaving mid-line.
         os.environ["NATIVE_CKPT_SERVER_LOG"] = str(server_log)
         log_fp = server_log.open("a")
-        proc, ready, watcher = self._spawn(cmd, server_log, log_fp)
+        proc, ready, watcher, pump = self._spawn(cmd, server_log, log_fp)
         try:
             if not ready.wait(timeout=600):
                 raise RuntimeError(f"checkpoint_server did not print '{self._READY_MARKER}' within 600s under valgrind; see {server_log}")
@@ -521,7 +521,8 @@ class ValgrindFlavor(Flavor):
             ckpt_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs" / ctx.cfg
             rc, stalled = self._await_server_exit(proc, ckpt_root)
             ctx.valgrind_rc = rc  # record before cleanup so epilog sees it even if cleanup raises
-            watcher.join(timeout=5)  # drain the final log lines before closing
+            watcher.join(timeout=5)
+            pump.join(timeout=60)  # let the pump drain valgrind's full exit report before the file is closed
             log_fp.close()
             if rc is not None:
                 logger.info(f"[run_job] valgrind exited with code {rc}; server log: {server_log}")
@@ -550,9 +551,11 @@ class ValgrindFlavor(Flavor):
                 ) from None
             # rc != 0 (e.g. 42) is handled by epilog's exit-code guard.
 
-    def _spawn(self, cmd: list[str], server_log: Path, log_fp: IO[str]) -> tuple[subprocess.Popen, threading.Event, threading.Thread]:
+    def _spawn(
+        self, cmd: list[str], server_log: Path, log_fp: IO[str]
+    ) -> tuple[subprocess.Popen, threading.Event, threading.Thread, threading.Thread]:
         """Spawn the server with threads that capture its output and tee the log to the console.
-        Returns the watcher so the caller can join it after the process exits."""
+        Returns the watcher and the pump so the caller can join them after the process exits."""
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, bufsize=1, text=True)
         ready = threading.Event()
 
@@ -563,10 +566,11 @@ class ValgrindFlavor(Flavor):
                 log_fp.flush()
             ready.set()  # pipe closed (process exited): unblock a stuck waiter
 
-        threading.Thread(target=_pump, daemon=True).start()
+        pump = threading.Thread(target=_pump, daemon=True)
+        pump.start()
         watcher = threading.Thread(target=self._watch_log, args=(server_log, proc, ready), daemon=True)
         watcher.start()
-        return proc, ready, watcher
+        return proc, ready, watcher, pump
 
     def _watch_log(self, server_log: Path, proc: subprocess.Popen, ready: threading.Event) -> None:
         """Tail the server log to the console, signalling readiness at its marker and muting at
@@ -637,6 +641,10 @@ def _flavored_run(ctx: RunCtx) -> Iterator[None]:
         yield
     except BaseException:
         stack.close()  # prologs exit (valgrind waits for its server, records the rc)
+        # On a failure the daemon may have crashed; echo its log (one rank per node) so its
+        # [CRASH]/SIGABRT backtrace reaches the console, not just the uploaded artifact.
+        if ctx.is_worker and ctx.provider == "native" and not ctx.has("valgrind") and os.environ.get("SLURM_LOCALID", "0") == "0":
+            CheckpointServer._dump_server_log()
         CheckpointServer.ensure_server_down(ctx, graceful=False, verify_files=False, fail_on_timeout=False)
         raise
     stack.close()
@@ -753,7 +761,11 @@ def build_srun_cmd(  # noqa: PLR0913
         },
         separators=(",", ":"),
     )
-    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, *(extra_srun_args or [])]
+    # Demand whole nodes for the allocation so no two CI jobs share a host. The checkpoint
+    # server is a per-node singleton on a fixed port and fixed shm names; co-scheduling two
+    # jobs on one node makes their daemons collide ("Failed to start or connect to checkpoint
+    # service"). Appended here, not in the templates, so every cluster's render carries it.
+    return [*shlex.split(string.Template(body).safe_substitute(values)), "--exclusive", reaper, *(extra_srun_args or [])]
 
 
 def runner_gpus_per_node() -> int | None:

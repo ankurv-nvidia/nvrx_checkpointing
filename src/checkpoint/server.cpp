@@ -56,7 +56,7 @@ using PerfClock = std::chrono::high_resolution_clock;
 #ifdef PHOENIX_BUILD_FOR_VALGRIND
 static constexpr auto AutoShutdownTimeout = 900s;
 #else
-static constexpr auto AutoShutdownTimeout = 150s;
+static constexpr auto AutoShutdownTimeout = 450s;
 #endif
 
 // uint32_t ranks
