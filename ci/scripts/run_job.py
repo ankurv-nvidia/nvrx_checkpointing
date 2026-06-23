@@ -765,7 +765,7 @@ def build_srun_cmd(  # noqa: PLR0913
     # server is a per-node singleton on a fixed port and fixed shm names; co-scheduling two
     # jobs on one node makes their daemons collide ("Failed to start or connect to checkpoint
     # service"). Appended here, not in the templates, so every cluster's render carries it.
-    return [*shlex.split(string.Template(body).safe_substitute(values)), "--exclusive", reaper, *(extra_srun_args or [])]
+    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, *(extra_srun_args or [])]
 
 
 def runner_gpus_per_node() -> int | None:
