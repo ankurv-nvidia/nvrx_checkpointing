@@ -280,6 +280,19 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
     groups["valgrind"].append(
         _job(vg, [".run_job", runner], job_args="pretrain-native --config pico --flavor deterministic --flavor valgrind"),
     )
+    # 2-node valgrind: memchecks every node's server (each node's local rank 0 runs its own
+    # valgrind server), exercising the cross-node ShardedObject merge under memcheck. Multinode
+    # platforms only (the single-node devbox has an empty multinode list).
+    if p.get("multinode"):
+        per_node = gpus.split("x")[1]
+        groups["valgrind"].append(
+            _job(
+                f"{name}:valgrind:2x{per_node}",
+                [".run_job", runner],
+                job_args="pretrain-native --nodes 2 --config pico --flavor deterministic --flavor valgrind",
+                timeout="1d",
+            ),
+        )
 
     # nvrx perf — a fast-path (flash + fusion) smoke of the nvrx provider, in the manual
     # nvrx-perf group. No update sibling: the nvrx provider emits checkpoint times, not

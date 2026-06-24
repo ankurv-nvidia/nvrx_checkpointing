@@ -199,6 +199,10 @@ class RunCtx:
     def is_rank0(self) -> bool:
         return os.environ.get("SLURM_PROCID", "0") == "0"
 
+    @property
+    def is_local_rank0(self) -> bool:
+        return os.environ.get("SLURM_LOCALID", "0") == "0"
+
     def has(self, name: str) -> bool:
         return any(f.name == name for f in self.flavors)
 
@@ -461,13 +465,15 @@ class ValgrindFlavor(Flavor):
 
     @contextlib.contextmanager
     def prolog(self, ctx: RunCtx) -> Iterator[None]:
-        # Only global rank 0 hosts the server; other ranks skip their own auto-fork.
-        if not ctx.is_rank0:
-            os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
-            yield
+        # Each node's local rank 0 hosts that node's memchecked (valgrind) server; the node's
+        # other ranks connect to it (suppress their auto-fork). So every node's server runs under
+        # memcheck, not just the coordinator's.
+        if ctx.is_local_rank0:
+            with self._server(ctx):
+                yield
             return
-        with self._server(ctx):
-            yield
+        os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
+        yield
 
     def epilog(self, ctx: RunCtx) -> None:
         if ctx.is_worker and ctx.valgrind_rc not in (None, 0):
@@ -491,7 +497,9 @@ class ValgrindFlavor(Flavor):
             raise RuntimeError("valgrind not found in PATH — required for the valgrind flavor")
         server = self._binary()
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        server_log = RESULTS_DIR / f"{ctx.stem}_server.log"
+        # Per-node filename: on multinode each node's local rank 0 runs its own valgrind server,
+        # and RESULTS_DIR is shared, so a single name would clobber across nodes.
+        server_log = RESULTS_DIR / f"{ctx.stem}_server.{socket.gethostname().split('.')[0]}.log"
         server_log.write_bytes(b"")  # truncate any prior run's log
 
         cmd = [valgrind, "--tool=memcheck", "--leak-check=full", "--show-leak-kinds=all", "--error-exitcode=42", "--log-fd=2", str(server)]
@@ -549,7 +557,10 @@ class ValgrindFlavor(Flavor):
                     "valgrind reported memcheck errors that the exit-code/stall guards did NOT catch — "
                     f"the regular guards need strengthening: {summary}; see {server_log}",
                 ) from None
-            # rc != 0 (e.g. 42) is handled by epilog's exit-code guard.
+            # Fail here (not just in the global-rank-0 epilog) so every node's local rank 0 reports
+            # its own server's valgrind errors — required for per-node multinode memcheck.
+            if rc not in (None, 0):
+                raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {server_log}") from None
 
     def _spawn(
         self, cmd: list[str], server_log: Path, log_fp: IO[str]
@@ -612,15 +623,14 @@ _FLAVORS: dict[str, type[Flavor]] = {cls.name: cls for cls in (PerfFlavor, Deter
 
 def _resolve_flavors(requested: list[str] | None, nodes: int) -> list[Flavor]:
     """Validate the requested flavors and instantiate them in canonical order (default perf).
-    perf and deterministic are mutually exclusive; valgrind is single-node."""
+    perf and deterministic are mutually exclusive."""
     names = list(dict.fromkeys(requested or ["perf"]))
     unknown = [n for n in names if n not in _FLAVORS]
     if unknown:
         raise SystemExit(f"--flavor: unknown flavor(s) {unknown}; choose from {sorted(_FLAVORS)}")
     if "perf" in names and "deterministic" in names:
         raise SystemExit("--flavor: 'perf' and 'deterministic' are mutually exclusive")
-    if "valgrind" in names and nodes > 1:
-        raise SystemExit("--flavor valgrind is single-node only (only rank 0's checkpoint_server is memchecked)")
+    # valgrind runs at any node count: each node's local rank 0 memchecks its own server.
     return [_FLAVORS[n]() for n in _FLAVOR_ORDER if n in names]
 
 
