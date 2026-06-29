@@ -679,8 +679,14 @@ bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nb::
         // rather raise on.
         if (shtKeyView != fqn && (!shtKeyView.starts_with(fqn) || shtKeyView.size() <= fqn.size() || shtKeyView[fqn.size()] != '.'))
         {
-            throw std::runtime_error(
-                fmt::format("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn));
+            // TODO_BREAK_BACK_COMPAT The following changes in megatron/core/ssm/mamba_mixer.py:1348 
+            // for back-compat are forcing a weakening of the strong change 
+            //  conv_checkpoint_key_map = {"conv1d_weight": "conv1d.weight", "conv1d_bias": "conv1d.bias"}
+            //  for param_name, checkpoint_name in conv_checkpoint_key_map.items():
+            //      sharded_state_dict[f"{prefix}{param_name}"].key = f"{prefix}{checkpoint_name}"
+
+            //throw std::runtime_error(
+            fmt::print(stderr, "ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
         root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(itemContainer, shtKey));
     }

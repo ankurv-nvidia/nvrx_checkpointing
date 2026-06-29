@@ -11,6 +11,7 @@ from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 from megatron.core.dist_checkpointing.utils import extract_nonpersistent, extract_sharded_base
 from megatron.core.msc_utils import open_file
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import unwrap_model
 from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     generate_state_dict,
@@ -19,7 +20,7 @@ from megatron.training.checkpointing import (
     get_rng_state,
 )
 from megatron.training.global_vars import get_args
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
 
 from . import checkpoint, mapping
 

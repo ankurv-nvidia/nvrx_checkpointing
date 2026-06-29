@@ -272,3 +272,5 @@ if [ "$#" -eq 0 ]; then
 else
     $*
 fi
+
+# git-merge-base a58373f332496f08c6584b3196233275ff69f175
