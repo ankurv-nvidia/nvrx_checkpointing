@@ -153,13 +153,13 @@ def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
     register_state_dict.root.wait_for_deferred_save()
 
 
-def save_checkpoint(
+def save_checkpoint(  # noqa: PLR0913
     iteration: int,
-    model,
-    optimizer,
-    opt_param_scheduler,
+    model,  # noqa: ANN001
+    optimizer,  # noqa: ANN001
+    opt_param_scheduler,  # noqa: ANN001
     num_floating_point_operations_so_far: int,
-    train_data_iterator=None,
+    train_data_iterator=None,  # noqa: ANN001
 ) -> None:
     """Save a synchronous torch_dist checkpoint through the native writer.
 
@@ -186,8 +186,8 @@ def save_checkpoint(
             opt_param_scheduler,
             rng_state,
             iteration=iteration,
-            optim_sd_kwargs=dict(metadata=metadata),
-            model_sd_kwargs=dict(metadata=metadata),
+            optim_sd_kwargs={"metadata": metadata},
+            model_sd_kwargs={"metadata": metadata},
             rerun_state=rerun_state,
         )
         state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far

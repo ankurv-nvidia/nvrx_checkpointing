@@ -413,7 +413,9 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
                 b += length
                 c += 1
                 if len(raw) != length:
-                    raise ValueError(f"[native_ckpt:cli] {relative_path}:{fqn}.chunk.{i} offset={offset}: Got {len(raw)} of {length} bytes\n")
+                    raise ValueError(
+                        f"[native_ckpt:cli] {relative_path}:{fqn}.chunk.{i} offset={offset}: Got {len(raw)} of {length} bytes\n",
+                    )
                 if kind == "bytes":
                     t1 = time.monotonic()
                     local[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
@@ -579,10 +581,12 @@ def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | 
     base_scalars, base_chunks = _parse_reference_metadata(baseline_ref)
     ckpt_scalars, ckpt_chunks = _parse_reference_metadata(checkpoint_ref)
 
-    findings: list[str] = []
-    for key in sorted(set(base_scalars) | set(ckpt_scalars)):
-        if base_scalars.get(key) != ckpt_scalars.get(key):
-            findings.append(f"  {key}: baseline={base_scalars.get(key)!r} checkpoint={ckpt_scalars.get(key)!r}")
+    findings: list[str] = [
+        f"  {key}: baseline={base_scalars.get(key)!r} checkpoint={ckpt_scalars.get(key)!r}"
+        for key in sorted(set(base_scalars) | set(ckpt_scalars))
+        if base_scalars.get(key) != ckpt_scalars.get(key)
+    ]
+
     for ident in sorted(set(base_chunks) | set(ckpt_chunks)):
         if base_chunks.get(ident) != ckpt_chunks.get(ident):
             fqn, offsets = ident
