@@ -1,0 +1,89 @@
+# nano4 profile: a latent-MoE Mamba-hybrid recipe run at 8 nodes, mirroring the
+# production a8b_120b_latentmoe_1t run (scripts/a8b_120b_latentmoe_1t.sh) as
+# closely as the CI harness allows. Deep-merged over base.yaml. Model dimensions,
+# the hybrid layer/MTP pattern, routing, attention grouping, and the latent-MoE
+# knobs are pinned here to match the production recipe; parallelism pins TP=2 /
+# EP=16 (32 GPUs = 8 nodes at 4 GPUs/node). Global batch size is left unpinned so
+# it tracks the runner's GPU count (8*4 = 32, matching the production --global-batch-size).
+#
+# Intentionally NOT pinned here (left to the harness/flavor): the checkpoint
+# strategy (sync vs async/nvrx, ckpt-provider), the run length (train-iters,
+# save/eval/exit intervals), data-cache/tensorboard paths, and the
+# deterministic-mode / attention backend, all set per flavor or in code. The
+# production run is sample-based (train-samples + lr-*-samples); the CI run is
+# iter-based, so the LR magnitude is matched but the sample-based decay horizon
+# is inherited from base.yaml (it would conflict with --train-iters).
+
+# Architecture: the production a8b stack uses the hybrid layer specs (not the
+# mamba alias) and a unified hybrid pattern. num-layers and mtp-num-layers are
+# DERIVED from the pattern: the part before the first '/' sets the layer count,
+# and the two trailing '/*E' MTP segments enable MTP with depth 2 (so base's
+# mtp-num-layers=2 / mtp-loss-scaling-factor / calculate-per-token-loss carry over).
+spec: [megatron.core.models.hybrid.hybrid_layer_specs, hybrid_stack_spec]
+hybrid-layer-pattern: "MEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEME/*E/*E"
+hybrid-override-pattern: null
+# The unified pattern carries MTP; drop base's legacy MTP override so only the
+# pattern drives it.
+mtp-hybrid-override-pattern: null
+
+# Model size
+hidden-size: 4608
+ffn-hidden-size: 3072
+mamba-num-heads: 128
+num-experts: 512
+moe-shared-expert-intermediate-size: 6144
+moe-latent-size: 1152
+
+# Attention: 40 heads, grouped-query with 8 KV groups (head dim pinned by base's
+# kv-channels=128). group-query-attention must be set explicitly.
+num-attention-heads: 40
+group-query-attention: true
+num-query-groups: 8
+
+# Init
+init-method-std: "0.0132"
+
+# Pure bf16: the production recipe keeps no bf16 first/last-layer boundary, so
+# clear base's flag (the start/end bf16 layer counts then do not apply).
+first-last-layers-bf16: false
+
+# Routing (top-k and scaling pinned for nano4)
+moe-router-topk: 6
+moe-router-topk-scaling-factor: "2.5"
+
+# Sequence length (production trains at 8192, not the base 1024)
+seq-length: 8192
+max-position-embeddings: 8192
+
+# Vocabulary (production 128k tokenizer; CI uses mock data + NullTokenizer, so the
+# padded vocab is set here). base's 256000 is overridden.
+vocab-size: 131072
+
+# Parallelism (pinned; ETP=1 / PP=1 / sequence-parallel inherited from base).
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 16
+
+# LR magnitude (the sample-based WSD horizon is inherited from base.yaml; see header)
+lr: "8e-4"
+min-lr: "8e-6"
+
+# DDP / runtime
+ddp-num-buckets: 8
+high-priority-stream-groups: ep
+distributed-timeout-minutes: 120
+manual-gc: true
+manual-gc-interval: 10
+
+# Checkpoint sharding for the multinode distcp save/load (parallel save is on by
+# default; load is pinned to match the production recipe).
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+
+# Perf-only acceleration: CUDA graphs and selective MoE activation recompute.
+# These are active only under the perf flavor; the deterministic and valgrind
+# flavors strip them (see run_job.py DeterministicFlavor/ValgrindFlavor) because
+# graph capture fights --deterministic-mode and valgrind memcheck.
+recompute-granularity: selective
+recompute-modules: moe
+cuda-graph-impl: local
+cuda-graph-modules: [mamba, attn, moe_router]

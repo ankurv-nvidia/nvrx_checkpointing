@@ -23,6 +23,7 @@ import argparse
 import contextlib
 import difflib
 import hashlib
+import http.client
 import json
 import logging
 import lzma
@@ -61,7 +62,7 @@ logger = logging.getLogger("native_ci")
 # ckptbench benchmark (ckptbench.py) and the ckpttest round-trip test
 # (CMakeLists.txt) replay. Every other config's registry.bin is a runtime-only
 # artifact and is not mirrored into the baseline tree.
-_CKPTBENCH_REGISTRY_CFG = "1x2"
+_CKPTBENCH_REGISTRY_CFG = "pico_1x2"
 _CKPTBENCH_REGISTRY_ITER = "0000250"
 CKPTBENCH_REGISTRY = (
     MEGATRON_ROOT / "megatron/native/metadata" / f"{_CKPTBENCH_REGISTRY_CFG}_checkpoints_iter_{_CKPTBENCH_REGISTRY_ITER}" / "registry.bin"
@@ -266,6 +267,30 @@ class Flavor(ABC):
         if flag not in opts:
             opts.append(flag)
 
+    @staticmethod
+    def _drop_opt_multi(opts: list[str], flag: str) -> None:
+        """Remove flag and all of its value tokens (up to the next --flag or end). Handles both
+        single-value (--recompute-modules moe) and multi-value (--cuda-graph-modules a b c) options."""
+        if flag not in opts:
+            return
+        i = opts.index(flag)
+        j = i + 1
+        while j < len(opts) and not opts[j].startswith("--"):
+            j += 1
+        del opts[i:j]
+
+    # Acceleration flags some profiles pin for the perf flavor (CUDA graphs, selective
+    # activation recompute). Names match configs/*.yaml. The deterministic flavor keeps CUDA
+    # graphs (they cut the run time and the cross-run check validates they stay reproducible)
+    # but drops recompute; valgrind drops both (graph capture is infeasible under memcheck).
+    _CUDA_GRAPH_FLAGS: ClassVar[tuple[str, ...]] = ("--cuda-graph-impl", "--cuda-graph-modules")
+    _RECOMPUTE_FLAGS: ClassVar[tuple[str, ...]] = ("--recompute-granularity", "--recompute-modules")
+
+    @classmethod
+    def _drop_opts(cls, opts: list[str], flags: tuple[str, ...]) -> None:
+        for flag in flags:
+            cls._drop_opt_multi(opts, flag)
+
 
 class PerfFlavor(Flavor):
     """Fast path (flash attention + cross-entropy fusion, already in the core recipe).
@@ -320,6 +345,9 @@ class DeterministicFlavor(Flavor):
         self._set_opt(recipe.opts, "--attention-backend", "unfused")
         self._drop_opt(recipe.opts, "--cross-entropy-loss-fusion")
         self._drop_opt(recipe.opts, "--cross-entropy-fusion-impl", has_value=True)
+        # Keep CUDA graphs (they cut the run time; the cross-run determinism check guards
+        # reproducibility); drop only the activation recompute, which adds compute.
+        self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
         # int(): the SLURM --time template wants integer minutes (a float renders as "45.0").
         recipe.srun_time_min = int(recipe.srun_time_min * 1.5)
@@ -329,7 +357,7 @@ class DeterministicFlavor(Flavor):
         # Skipped under valgrind: that flavor owns the server and tears it down before the
         # epilog, leaving the md5 trace with no server (md5 is covered by the plain run).
         if ctx.is_worker and not ctx.has("valgrind"):
-            PerfReport._compare_iters_to_baseline(ctx.cfg, ctx.provider)
+            PerfReport.compare_iters_to_baseline(ctx.cfg, ctx.provider)
         # Warn (non-blocking exit 3) on perf drift against this flavor's own slower baseline;
         # the md5 mismatch above still hard-fails.
         PerfFlavor.run_perf_epilog(ctx)
@@ -352,6 +380,7 @@ class ValgrindFlavor(Flavor):
     _STALL_POLL_S = 10  # how often to poll for progress / exit
     _STALL_STOP_GRACE_S = 120  # grace for a stalled server to honor a re-issued stop
     _STALL_LOG_EVERY_S = 60  # heartbeat cadence while waiting, so the wait is visible
+    _MAX_FILES_SHOWN = 6  # max changed files to list in the heartbeat log line
 
     # Memcheck error headers (not leak kinds). Each is printed as it happens, so they
     # survive in the log even if the process is later killed before the summary.
@@ -369,6 +398,7 @@ class ValgrindFlavor(Flavor):
         r"Syscall param "
         r")",
     )
+    _MAX_ERRORS_SUMMARY = 5
 
     @classmethod
     def _scan_valgrind_errors(cls, server_log: Path) -> list[str]:
@@ -429,7 +459,8 @@ class ValgrindFlavor(Flavor):
                 last_log = now
                 waited = round(now - start)
                 if changed:
-                    shown = ", ".join(changed[:6]) + (f" (+{len(changed) - 6} more)" if len(changed) > 6 else "")
+                    n = self._MAX_FILES_SHOWN
+                    shown = ", ".join(changed[:n]) + (f" (+{len(changed) - n} more)" if len(changed) > n else "")
                     logger.info(
                         f"[run_job] waiting for checkpoint_server to exit ({waited}s elapsed); "
                         f"{len(changed)} checkpoint file(s) modified in the last {self._STALL_LOG_EVERY_S}s: {shown}",
@@ -445,20 +476,24 @@ class ValgrindFlavor(Flavor):
                     f"[run_job] checkpoint_server made no checkpoint-file progress for "
                     f"{self._STALL_SILENCE_S}s under {ckpt_root} — treating as stalled",
                 )
-                CheckpointServer._dump_server_threads()
-                CheckpointServer._request_server_stop()
+                CheckpointServer.dump_server_threads()
+                CheckpointServer.request_server_stop()
                 try:
                     rc = proc.wait(timeout=self._STALL_STOP_GRACE_S)
-                    logger.error(f"[run_job] stalled checkpoint_server exited after re-issued stop (rc={rc})")
-                    return rc, True
                 except subprocess.TimeoutExpired:
                     logger.exception("[run_job] stalled checkpoint_server ignored stop — SIGKILL")
-                    CheckpointServer._gcore_and_kill_server()
+                    CheckpointServer.gcore_and_kill_server()
                     return None, True
+                else:
+                    logger.error(f"[run_job] stalled checkpoint_server exited after re-issued stop (rc={rc})")
+                    return rc, True
 
     def transform(self, recipe: Recipe) -> None:
         # Build flag that shrinks the staging buffers so valgrind's shadow memory stays manageable.
         recipe.build_env["PHOENIX_BUILD_FOR_VALGRIND"] = "1"
+        # Strip CUDA graphs AND recompute: graph capture is infeasible under memcheck. valgrind
+        # composes with deterministic (which keeps CUDA graphs), so drop them explicitly here.
+        self._drop_opts(recipe.opts, self._CUDA_GRAPH_FLAGS + self._RECOMPUTE_FLAGS)
         # valgrind runs far slower; double the time budget so the stall guard, not the
         # scheduler's time limit, ends a hung run.
         recipe.srun_time_min = recipe.srun_time_min * 2
@@ -523,7 +558,7 @@ class ValgrindFlavor(Flavor):
             # Ask the server to stop now rather than waiting out its idle auto-shutdown — under
             # memcheck that wait plus the slow teardown can blow the time budget.
             logger.info("[run_job] Pretrain finished — stopping checkpoint_server so valgrind can flush its report")
-            CheckpointServer._request_server_stop()
+            CheckpointServer.request_server_stop()
             # Primary gate: wait for exit, bounded by checkpoint-file activity. A stall re-stops
             # then kills the server (hard failure); a non-zero clean exit is failed by the check below.
             ckpt_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs" / ctx.cfg
@@ -538,7 +573,7 @@ class ValgrindFlavor(Flavor):
             # ROBUST CROSS-CHECK (kept; a summary + backstop, NOT the primary gate):
             # list the memcheck errors valgrind flagged, however it exited.
             errors = self._scan_valgrind_errors(server_log)
-            summary = "; ".join(errors[:5]) + (" ..." if len(errors) > 5 else "")
+            summary = "; ".join(errors[: self._MAX_ERRORS_SUMMARY]) + (" ..." if len(errors) > self._MAX_ERRORS_SUMMARY else "")
             if errors:
                 logger.error(f"[run_job] valgrind memcheck summary: {len(errors)} error type(s): {summary}; see {server_log}")
             else:
@@ -563,7 +598,10 @@ class ValgrindFlavor(Flavor):
                 raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {server_log}") from None
 
     def _spawn(
-        self, cmd: list[str], server_log: Path, log_fp: IO[str]
+        self,
+        cmd: list[str],
+        server_log: Path,
+        log_fp: IO[str],
     ) -> tuple[subprocess.Popen, threading.Event, threading.Thread, threading.Thread]:
         """Spawn the server with threads that capture its output and tee the log to the console.
         Returns the watcher and the pump so the caller can join them after the process exits."""
@@ -621,7 +659,7 @@ _FLAVOR_ORDER = ("perf", "deterministic", "valgrind")
 _FLAVORS: dict[str, type[Flavor]] = {cls.name: cls for cls in (PerfFlavor, DeterministicFlavor, ValgrindFlavor)}
 
 
-def _resolve_flavors(requested: list[str] | None, nodes: int) -> list[Flavor]:
+def _resolve_flavors(requested: list[str] | None, _nodes: int) -> list[Flavor]:
     """Validate the requested flavors and instantiate them in canonical order (default perf).
     perf and deterministic are mutually exclusive."""
     names = list(dict.fromkeys(requested or ["perf"]))
@@ -648,29 +686,167 @@ def _flavored_run(ctx: RunCtx) -> Iterator[None]:
         for flavor in ctx.flavors:
             stack.enter_context(flavor.prolog(ctx))
     try:
-        yield
-    except BaseException:
-        stack.close()  # prologs exit (valgrind waits for its server, records the rc)
-        # On a failure the daemon may have crashed; echo its log (one rank per node) so its
-        # [CRASH]/SIGABRT backtrace reaches the console, not just the uploaded artifact.
-        if ctx.is_worker and ctx.provider == "native" and not ctx.has("valgrind") and os.environ.get("SLURM_LOCALID", "0") == "0":
-            CheckpointServer._dump_server_log()
-        CheckpointServer.ensure_server_down(ctx, graceful=False, verify_files=False, fail_on_timeout=False)
-        raise
-    stack.close()
-    CheckpointServer.ensure_server_down(ctx)
-    if not ctx.is_rank0:
-        return
-    for flavor in ctx.flavors:
-        flavor.epilog(ctx)
-    if ctx.soft_fail:
-        sys.exit(3)
+        try:
+            yield
+        except BaseException:
+            stack.close()  # prologs exit (valgrind waits for its server, records the rc)
+            # On a failure the daemon may have crashed; echo its log (one rank per node) so its
+            # [CRASH]/SIGABRT backtrace reaches the console, not just the uploaded artifact.
+            if ctx.is_worker and ctx.provider == "native" and not ctx.has("valgrind") and os.environ.get("SLURM_LOCALID", "0") == "0":
+                CheckpointServer.dump_server_log()
+            CheckpointServer.ensure_server_down(ctx, graceful=False, verify_files=False, fail_on_timeout=False)
+            raise
+        stack.close()
+        CheckpointServer.ensure_server_down(ctx)
+        if not ctx.is_rank0:
+            return
+        for flavor in ctx.flavors:
+            flavor.epilog(ctx)
+        # Args baseline gate (launcher owns the tee'd log): warn (non-blocking) if the resolved
+        # arguments drifted from the committed baseline. update_baselines accepts the new block.
+        if ctx.log_file is not None and not ctx.args.update_baseline and not _arguments_match_baseline(ctx.stem):
+            ctx.soft_fail = True
+        if ctx.soft_fail:
+            sys.exit(3)
+    finally:
+        # Capture the resolved arguments block from the run log (artifact + baseline), on success
+        # and failure alike — args are printed at model init, before a later crash. Only the
+        # launcher/torchrun/inline path owns ctx.log_file; in-srun tasks (log_file=None) skip it,
+        # so the capture runs once per job from the process that holds the tee'd log.
+        if ctx.log_file is not None:
+            capture_arguments(ctx.stem)
 
 
 def artifact_stem(machine: str, job: str, flavor_tag: str, cfg: str) -> str:
     """`{machine}_{job}_{flavor_tag}_{cfg}`, dropping the tag when empty (e.g. ckptbench)."""
     parts = [machine, job, flavor_tag, cfg] if flavor_tag else [machine, job, cfg]
     return "_".join(parts)
+
+
+# Markers Megatron prints around the fully-resolved argument dump at model init.
+_ARGS_BLOCK_START = "------------------------ arguments ------------------------"
+_ARGS_BLOCK_END = "-------------------- end of arguments ---------------------"
+# Strip a leading per-task/per-rank log prefix (srun --label "N: ", torchrun "[rankN]: ") so the
+# captured block matches Megatron's raw output; the value lines themselves start with spaces. srun
+# right-justifies the task number to the max-rank width (" 0: " at >= 10 tasks), hence the \s*.
+_ARGS_LINE_PREFIX_RE = re.compile(r"^(?:\[rank\d+\]:\s?|\s*\d+:\s)")
+# Collapse the per-runner build-dir prefix of ci-runs/ paths (save/load/data_cache_path/
+# tensorboard_dir) so the args compare ignores where the job happened to check out.
+_ARGS_VOLATILE_PATH_RE = re.compile(r"/\S*/ci-runs/")
+# Megatron prints one "  name ....... value" line per argument. A clean line starts with two
+# spaces, the name, then the dotted leader (or padding spaces for a long name).
+_ARGS_LINE_RE = re.compile(r"^  [A-Za-z_]\w* [.\s]")
+# The same shape with a dotted leader, embedded mid-line: a stderr log line flushed without a
+# trailing newline prepends junk to the next argument line, which we recover from here.
+_ARGS_EMBEDDED_RE = re.compile(r"  [A-Za-z_]\w* \.{3,} ")
+# A stderr log line can also merge onto the END of an argument's value (no separator), e.g.
+# "logging_level ... 20WARNING: TensorBoard ..."; drop the appended message from the level marker on.
+_ARGS_APPENDED_RE = re.compile(r"(?:WARNING|INFO|ERROR|DEBUG|CRITICAL): .*$")
+
+
+def _clean_arguments_line(line: str) -> str | None:
+    """The argument portion of ``line`` — kept when clean, recovered when a stderr log line without a
+    trailing newline merged onto the front of (or landed inside) it, with any log message merged onto
+    the end stripped — or None if the line carries no argument (blank line, standalone log message,
+    progress output that interleaved into the dump)."""
+    if _ARGS_LINE_RE.match(line):
+        arg = line
+    else:
+        m = _ARGS_EMBEDDED_RE.search(line)
+        if not m:
+            return None
+        arg = line[m.start() :]
+    return _ARGS_APPENDED_RE.sub("", arg)
+
+
+def _extract_arguments_block(log_text: str) -> str | None:
+    """Return the last complete Megatron arguments block (markers inclusive) in ``log_text``, per-line
+    log prefixes stripped and non-argument lines that interleaved into the dump dropped, or None if no
+    complete block is present. The last block is the measured (phase-2 / run-2) one; earlier blocks are
+    the warm-up phase-1 / run-1 runs."""
+    end = log_text.rfind(_ARGS_BLOCK_END)
+    if end == -1:
+        return None
+    start = log_text.rfind(_ARGS_BLOCK_START, 0, end)
+    if start == -1:
+        return None
+    block = log_text[start : end + len(_ARGS_BLOCK_END)]
+    out = [_ARGS_BLOCK_START]
+    for raw in block.splitlines():
+        ln = _ARGS_LINE_PREFIX_RE.sub("", raw)
+        if ln in (_ARGS_BLOCK_START, _ARGS_BLOCK_END):
+            continue
+        cleaned = _clean_arguments_line(ln)
+        if cleaned is not None:
+            out.append(cleaned)
+    out.append(_ARGS_BLOCK_END)
+    return "\n".join(out) + "\n"
+
+
+def _read_arguments_block(stem: str) -> str | None:
+    """The resolved arguments block from this run's log(s), or None if none was printed. For the
+    two-run nvrx determinism check the run-2 log wins (its block is the last one read)."""
+    candidates = [RESULTS_DIR / f"{stem}.log", *sorted(RESULTS_DIR.glob(f"{stem}_run*.log"))]
+    block: str | None = None
+    for log in candidates:
+        try:
+            text = log.read_text(errors="replace")
+        except OSError:
+            continue
+        found = _extract_arguments_block(text)
+        if found is not None:
+            block = found
+    return block
+
+
+def _normalize_arguments(block: str) -> str:
+    """Canonicalize an arguments block for comparison: collapse volatile ci-runs/ path prefixes."""
+    return _ARGS_VOLATILE_PATH_RE.sub("/.../ci-runs/", block)
+
+
+def capture_arguments(stem: str) -> None:
+    """Write this run's resolved arguments block to ``RESULTS_DIR/{stem}_arguments.txt`` — uploaded
+    as an artifact and committed (plaintext) to the baselines by update_baselines, one per
+    config+flavor. Best-effort: a job that prints no block (e.g. ckptbench) writes nothing. Never
+    raises — capture must not turn a passing run red."""
+    block = _read_arguments_block(stem)
+    out = RESULTS_DIR / f"{stem}_arguments.txt"
+    if block is None:
+        logger.info(f"[run_job] no arguments block in {stem} log(s); not writing {out.name}")
+        return
+    try:
+        out.write_text(block)
+        logger.info(f"[run_job] captured resolved arguments -> {out}")
+    except OSError as ex:
+        logger.info(f"[run_job] could not write {out}: {ex}")
+
+
+def _arguments_match_baseline(stem: str) -> bool:
+    """Compare this run's resolved arguments against the committed baseline (volatile ci-runs/ paths
+    ignored). True on match, when no baseline is committed yet (bootstrap), or when the run printed
+    no block; False (and logs a unified diff) on drift. update_baselines refreshes the baseline."""
+    current = _read_arguments_block(stem)
+    if current is None:
+        return True
+    baseline_file = BASELINES_DIR / f"{stem}_arguments.txt"
+    if not baseline_file.exists():
+        logger.info(f"[run_job] no arguments baseline {baseline_file.name}; run update_baselines to seed it")
+        return True
+    base_lines = _normalize_arguments(baseline_file.read_text()).splitlines()
+    cur_lines = _normalize_arguments(current).splitlines()
+    if base_lines == cur_lines:
+        logger.info(f"[run_job] resolved arguments match baseline {baseline_file.name}")
+        return True
+    diff = difflib.unified_diff(
+        base_lines,
+        cur_lines,
+        fromfile=f"{baseline_file.name} (baseline)",
+        tofile=f"{stem} (this run)",
+        lineterm="",
+    )
+    diff_text = "\n".join(diff)
+    logger.warning(f"[run_job] resolved arguments differ from baseline:\n{diff_text}")
+    return False
 
 
 # SLURM context detection
@@ -767,15 +943,14 @@ def build_srun_cmd(  # noqa: PLR0913
                 "exemptIdleTimeMins": str(time_minutes),
                 "reason": "other",
                 "description": "native checkpoint CI job",
-            }
+            },
         },
         separators=(",", ":"),
     )
-    # Demand whole nodes for the allocation so no two CI jobs share a host. The checkpoint
-    # server is a per-node singleton on a fixed port and fixed shm names; co-scheduling two
-    # jobs on one node makes their daemons collide ("Failed to start or connect to checkpoint
-    # service"). Appended here, not in the templates, so every cluster's render carries it.
-    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, *(extra_srun_args or [])]
+    # --label makes srun buffer each task's stdout on line boundaries before merging, so one
+    # rank's partial write can't splice mid-line into another's (which clobbers rank 0's argument
+    # dump). Appended here, not in the templates, so every cluster's render carries it.
+    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, "--label", *(extra_srun_args or [])]
 
 
 def runner_gpus_per_node() -> int | None:
@@ -838,7 +1013,7 @@ class PretrainRunConfig:
     phase: int = 2
     load_dir: Path | None = None  # --load source; None starts from random init
     synchronous_save: bool = False  # phase 1: stock torch_dist save (no server, durable on exit)
-    config_profile: str = "pico"  # model profile (pico/nano/ultra): base.yaml + <profile>.yaml
+    config_profile: str = "pico"  # model profile (pico/nano3/nano4/ultra): base.yaml + <profile>.yaml
 
     @property
     def scale(self) -> str:
@@ -900,9 +1075,9 @@ class CheckpointServer:
         if not ctx.is_worker or ctx.provider != "native" or ctx.has("valgrind"):
             return
         if not CheckpointServer._stop_checkpoint_server(graceful=graceful) and fail_on_timeout:
-            CheckpointServer._dump_server_log()
-            CheckpointServer._dump_server_threads()
-            CheckpointServer._gcore_and_kill_server()
+            CheckpointServer.dump_server_log()
+            CheckpointServer.dump_server_threads()
+            CheckpointServer.gcore_and_kill_server()
             raise RuntimeError(
                 "checkpoint_server did not spin down after a clean-stop request — "
                 "see the checkpoint_server log dumped above (and the core file in ci-results)",
@@ -941,7 +1116,7 @@ class CheckpointServer:
     _SERVER_LOG_TAIL_BYTES = 256 * 1024
 
     @staticmethod
-    def _dump_server_log() -> None:
+    def dump_server_log() -> None:
         """Echo this node's checkpoint_server stderr log to the console.
 
         On a teardown hang the gdb/gcore dumps routinely can't attach (restricted
@@ -1012,7 +1187,7 @@ class CheckpointServer:
                 fp.write("\n")
 
     @staticmethod
-    def _dump_server_threads() -> None:
+    def dump_server_threads() -> None:
         """Best-effort thread dump of any running checkpoint server, to make a stuck process
         diagnosable instead of just killing it. The dump is emitted to the console and appended
         to the node's checkpoint_server log so the backtrace survives in the uploaded artifact
@@ -1040,7 +1215,11 @@ class CheckpointServer:
                     gdb_out = res.stdout + res.stderr
                 elif gdb:
                     res = subprocess.run(
-                        [gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"], check=False, timeout=120, capture_output=True, text=True
+                        [gdb, "-p", pid, "-batch", "-ex", "thread apply all bt"],
+                        check=False,
+                        timeout=120,
+                        capture_output=True,
+                        text=True,
                     )
                     gdb_out = res.stdout + res.stderr
             except (OSError, subprocess.TimeoutExpired) as ex:
@@ -1059,7 +1238,7 @@ class CheckpointServer:
         CheckpointServer._append_to_server_log("\n\n".join(chunks))
 
     @staticmethod
-    def _gcore_and_kill_server() -> None:
+    def gcore_and_kill_server() -> None:
         """Snapshot a core file for any running checkpoint server, then kill it — the core aids
         post-mortem and the kill frees the port and shm for the next job. Never raises."""
         pids = CheckpointServer._checkpoint_server_pids()
@@ -1099,7 +1278,7 @@ class CheckpointServer:
         pids = CheckpointServer._checkpoint_server_pids()
         if pids:
             logger.info(f"[run_job] checkpoint_server already running (pids {', '.join(pids)})")
-            CheckpointServer._dump_server_threads()
+            CheckpointServer.dump_server_threads()
             raise RuntimeError(
                 f"checkpoint_server already running (pids {', '.join(pids)}); refusing to start. "
                 f"A previous job did not spin it down — see the thread dump above and stop it before retrying.",
@@ -1117,7 +1296,7 @@ class CheckpointServer:
             return sock.connect_ex(("127.0.0.1", port)) == 0
 
     @staticmethod
-    def _request_server_stop() -> None:
+    def request_server_stop() -> None:
         """Best-effort immediate hard stop for the non-graceful paths (stall, crash, teardown);
         the normal completion path spins down gracefully instead."""
         if not CheckpointServer._is_port_in_use(_CHECKPOINT_SERVER_PORT):
@@ -1126,7 +1305,7 @@ class CheckpointServer:
         try:
             with urllib.request.urlopen(url, timeout=2.0):
                 pass
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError, http.client.HTTPException) as exc:
             logger.info(f"[run_job]   stop request failed: {exc}")
 
     # Socket read timeout for the spin-down request. The server sends frequent heartbeats while
@@ -1143,7 +1322,7 @@ class CheckpointServer:
         try:
             with urllib.request.urlopen(url, timeout=CheckpointServer._SPINDOWN_READ_TIMEOUT_S) as resp:
                 resp.read()  # blocks until the server finishes spinning down
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError, http.client.HTTPException) as exc:
             logger.info(f"[run_job]  spindown request failed: {exc}")
 
     @staticmethod
@@ -1160,7 +1339,7 @@ class CheckpointServer:
             CheckpointServer._request_server_spindown()
         else:
             logger.info("[run_job] checkpoint_server running; requesting immediate stop")
-            CheckpointServer._request_server_stop()
+            CheckpointServer.request_server_stop()
 
         deadline = time.monotonic() + timeout
         while CheckpointServer._checkpoint_server_pids() and time.monotonic() < deadline:
@@ -1219,7 +1398,7 @@ class PerfReport:
                 raise RuntimeError(f"no perf metrics found in {log_file}")
 
         if update_baseline:
-            BaselineUpdater._update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+            BaselineUpdater.update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
             return True
 
         baseline = {}
@@ -1421,7 +1600,7 @@ class PerfReport:
         if metric.get("higher_is_better") is None:
             return
         samples = metric.get("samples") or []
-        if len(samples) < 2:
+        if len(samples) < 2:  # noqa: PLR2004 — need at least two samples to compute spread
             return
         ranks = metric.get("ranks")
         f = lambda v: f"{v:.0f}"  # noqa: E731 — these are MB/s or microseconds; integer precision is plenty
@@ -1435,7 +1614,7 @@ class PerfReport:
         logger.info(f"         all values: {' '.join(f(s) for s in samples)}")
 
     @staticmethod
-    def _compare_iters_to_baseline(cfg: str, provider: str) -> None:
+    def compare_iters_to_baseline(cfg: str, provider: str) -> None:
         """Re-derive each iteration's metadata and diff it against the checked-in baseline: native
         hard-fails on mismatch, nvrx soft-fails. Each compare runs as a subprocess for env parity."""
         strict_on_mismatch = provider == "native"
@@ -1514,13 +1693,13 @@ class BaselineUpdater:
             flags = f"--slurm {gflag}"
         else:
             script = "python3 megatron/native/ci/scripts/run_job.py"
-            # config is "NxG"; map the node count to the profile that runs at it in CI
-            # (pico single-node, nano at 8, ultra at 16) so the reproducer is runnable.
-            nodes = int(config.split("x", 1)[0]) if "x" in config else 1
-            profile = {8: "nano", 16: "ultra"}.get(nodes, "pico")
-            cflag = f" --config {profile}" if profile != "pico" else ""
+            # config is the run key "{profile}_NxG" (e.g. pico_1x2, nano3_8x4); recover the
+            # profile and node count for a runnable reproducer command.
+            m = re.match(r"^(?P<profile>.+)_(?P<nodes>\d+)x(?P<gpus>\d+)$", config)
+            profile = m.group("profile") if m else "pico"
+            nodes = int(m.group("nodes")) if m else 1
             scale = f"--nodes {nodes}" if nodes > 1 else "--slurm"
-            flags = f"{job} {scale}{cflag} {gflag}{flavor_flags}"
+            flags = f"{job} {scale} --config {profile} {gflag}{flavor_flags}"
         return f"{script} {flags}", f"{script} {flags} --update-baseline"
 
     @staticmethod
@@ -1547,7 +1726,7 @@ class BaselineUpdater:
         return round(mean, 6)
 
     @staticmethod
-    def _update_baseline_file(baseline_file: Path, metrics: dict, job: str, config: str, flavor_tag: str, gpus_per_node: int) -> None:  # noqa: PLR0913
+    def update_baseline_file(baseline_file: Path, metrics: dict, job: str, config: str, flavor_tag: str, gpus_per_node: int) -> None:  # noqa: PLR0913
         if baseline_file.exists():
             with baseline_file.open() as f:
                 baseline = yaml.safe_load(f)
@@ -1653,7 +1832,7 @@ class BaselineUpdater:
                     continue
 
                 baseline_file = BASELINES_DIR / f"{artifact_stem(machine, job, flavor_tag, config)}.yaml"
-                BaselineUpdater._update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+                BaselineUpdater.update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
 
         # The metadata md5 snapshot is only produced by deterministic runs. nvrx
         # always runs deterministic; native does so only under the deterministic flavor.
@@ -1662,6 +1841,26 @@ class BaselineUpdater:
             BaselineUpdater._update_native_metadata_files(filter_config)
         elif filter_job == "pretrain-nvrx":
             BaselineUpdater._update_nvrx_baseline_files(filter_config)
+
+        # Mirror the captured resolved-arguments block into the baselines (plaintext, not
+        # compressed) so the committed baseline records exactly which args each config+flavor ran
+        # with. Runs for every job type (native, nvrx, ckptbench); a job that produced no
+        # arguments file is simply skipped.
+        BaselineUpdater._update_arguments_baselines(machine, filter_job, filter_config, filter_flavor)
+
+    @staticmethod
+    def _update_arguments_baselines(machine: str, filter_job: str | None, filter_config: str | None, filter_flavor: str | None) -> None:
+        """Copy each ``{stem}_arguments.txt`` produced by the test run into BASELINES_DIR verbatim
+        (plaintext), honoring the same job/config/flavor filter as the perf baselines."""
+        BASELINES_DIR.mkdir(parents=True, exist_ok=True)
+        for src in sorted(RESULTS_DIR.glob(f"{machine}_{filter_job or '*'}_*_arguments.txt")):
+            stem = src.name[: -len("_arguments.txt")]
+            if filter_config is not None and not stem.endswith(f"_{filter_config}"):
+                continue
+            if filter_flavor is not None and f"_{filter_flavor}_" not in stem:
+                continue
+            shutil.copy2(src, BASELINES_DIR / src.name)
+            logger.info(f"[run_job] updated arguments baseline {BASELINES_DIR / src.name}")
 
     @staticmethod
     def _update_native_metadata_files(filter_config: str | None) -> None:
@@ -1684,7 +1883,8 @@ class BaselineUpdater:
             # find the file.
             if filter_config == _CKPTBENCH_REGISTRY_CFG:
                 raise FileNotFoundError(
-                    f"no registry.bin at {src} — did the {_CKPTBENCH_REGISTRY_CFG} deterministic native run produce iter_{_CKPTBENCH_REGISTRY_ITER}?",
+                    f"no registry.bin at {src} — did the {_CKPTBENCH_REGISTRY_CFG} deterministic"
+                    f" native run produce iter_{_CKPTBENCH_REGISTRY_ITER}?",
                 )
             return
         CKPTBENCH_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
@@ -1698,7 +1898,8 @@ class BaselineUpdater:
         metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
         ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
         iter_pattern = re.compile(r"^iter_(\d{7})$")
-        cfg_pattern = re.compile(r"^\d+x\d+$")
+        # Matches the "{profile}_NxG" ci-runs dirs (e.g. pico_1x4, nano4_8x4).
+        cfg_pattern = re.compile(r"^.+_\d+x\d+$")
 
         cfgs = (
             [filter_config]
@@ -1729,17 +1930,24 @@ class BaselineUpdater:
                 logger.info(f"[run_job] updated {dst} from {src}")
 
 
+def _run_cfg(args: argparse.Namespace, nodes: int, gpus_per_node: int) -> str:
+    """Run-namespace key for baselines, metadata, and the ci-runs dir: ``{config}_{scale}``, so
+    two profiles pinned to the same node scale (e.g. nano3 and nano4 at 8x4) keep separate
+    baseline/metadata trees."""
+    return f"{args.config}_{nodes}x{gpus_per_node}"
+
+
 class PretrainJob:
     @staticmethod
     def run_pretrain(args: argparse.Namespace) -> None:
         provider = _ckpt_provider(args.job)
-        cfg = f"{args.nodes}x{args.gpus_per_node}"
+        cfg = _run_cfg(args, args.nodes, args.gpus_per_node)
         extra_args = getattr(args, "extra_args", None)
 
         if in_srun():
             # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
             nodes = int(os.environ.get("SLURM_NNODES", "1"))
-            cfg = f"{nodes}x{args.gpus_per_node}"
+            cfg = _run_cfg(args, nodes, args.gpus_per_node)
             ctx = RunCtx(args, args.job, cfg, provider, platform_tag(), args.flavors)
             with _flavored_run(ctx):
                 # Two sequential processes in one task share one server lifecycle: the first
@@ -2131,7 +2339,7 @@ class PretrainJob:
                 clean.append(tok)
             opts = [*clean, "--num-workers", "0"]
             sys.argv = ["pretrain_mamba.py", *opts]
-            PretrainJob._pretrain_main(program_start)
+            PretrainJob.pretrain_main(program_start)
         else:
             import torch.multiprocessing as mp  # noqa: PLC0415
 
@@ -2151,10 +2359,10 @@ class PretrainJob:
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
         sys.argv = ["pretrain_mamba.py", *opts]
-        PretrainJob._pretrain_main(program_start)
+        PretrainJob.pretrain_main(program_start)
 
     @staticmethod
-    def _pretrain_main(program_start: float, ci_phase: int | None = None) -> None:
+    def pretrain_main(program_start: float, ci_phase: int | None = None) -> None:
         """Call pretrain directly, bracketed by the CI-only stdout markers the perf parser reads
         (a phase banner up front and peak-memory on exit), emitted on rank 0 only."""
         import time  # noqa: PLC0415
@@ -2264,6 +2472,9 @@ class PretrainJob:
             logger.info(f"[run_job] {banner}: {' '.join(shlex.quote(c) for c in cmd)}")
             shell_cmd = f"set -o pipefail; {' '.join(shlex.quote(c) for c in cmd)} 2>&1 | tee {shlex.quote(str(log_file))}"
             rc = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", check=False).returncode  # noqa: S602
+            # Capture the resolved arguments before any failure check — model init (and the args
+            # dump) precedes training, so even a timed-out or crashed run still yields the block.
+            capture_arguments(stem)
             # rc == 3 → in-srun's lenient nvrx metadata-baseline compare flagged a
             # diff vs metadata/. Tolerated; the cross-run compare below gates the job.
             if rc not in (0, 3):
@@ -2376,8 +2587,8 @@ def main() -> None:
         default="pico",
         choices=_available_profiles(),
         help="Model config profile (default: pico). Selects configs/<profile>.yaml, deep-merged "
-        "over configs/base.yaml. pico scales parallelism to the runner's GPUs; nano (8 nodes) and "
-        "ultra (16 nodes) pin it.",
+        "over configs/base.yaml. pico scales parallelism to the runner's GPUs; nano3/nano4 "
+        "(8 nodes) and ultra (16 nodes) pin it.",
     )
     p.add_argument(
         "--gpus-per-node",
@@ -2446,6 +2657,6 @@ if __name__ == "__main__":
         # Subprocess entry for the launched paths: drop the sentinel and phase, then run in-process.
         ci_phase = int(sys.argv[2])
         sys.argv = ["pretrain_hybrid.py", *sys.argv[3:]]
-        PretrainJob._pretrain_main(time.time(), ci_phase=ci_phase)
+        PretrainJob.pretrain_main(time.time(), ci_phase=ci_phase)
     else:
         main()

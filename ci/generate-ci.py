@@ -1,59 +1,25 @@
 #!/usr/bin/env python3
-"""Generate the native CI child pipelines from a PLATFORMS table.
+"""Generate the native CI child pipelines from the PLATFORMS table.
 
-The hand-written ``gitlab-ci-native.yml`` carries only the shared templates
-(``.ci_base``, ``.run_job``, ``.run_ckptbench``, ``.manual_optional``,
-``.update_baseline_base``, ``.runner_*``) plus the bootstrap jobs that run this
-script and trigger its output as child pipelines. Everything above the
-``HEADER_MARKER`` line in that file is the shared header; this script copies it
-verbatim and appends the concrete jobs from ``PLATFORMS``, bucketed by category
-(see ``GROUPS``). It writes one ``generated-<group>.yml`` per non-empty group —
-each a complete standalone pipeline — into the cwd, which the
-``generate-native-pipeline`` job collects as artifacts and the per-group
-trigger jobs (one per ``GROUPS`` entry) fire as child pipelines.
-
-Adding a hardware platform = appending one dict to ``PLATFORMS``. No other YAML
-edit is required: the standard per-platform jobs (ckptbench, pretrain-native
-deterministic/perf, pretrain-nvrx deterministic, valgrind) and any multinode
-profile job-sets are all emitted from the table.
-
-Run standalone to preview:  cd "$(mktemp -d)" && python3 .../generate-ci.py
+Copies the shared header (everything above HEADER_MARKER) from
+gitlab-ci-native.yml and appends one standalone generated-<group>.yml per GROUPS
+entry, which the parent's per-group trigger jobs fire as child pipelines.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 HERE = Path(__file__).resolve().parent
 PARENT_CI = HERE / "gitlab-ci-native.yml"
 
-# Everything in PARENT_CI above this line is the shared header (templates) copied
-# verbatim into the child pipeline; the bootstrap jobs that follow it stay in the
-# parent only (the child must not re-trigger itself).
 HEADER_MARKER = "# >>> generate-ci.py: concrete jobs are generated below this line <<<"
 
 
-# ---------------------------------------------------------------------------
-# Platform table — one dict per hardware platform.
-#
-#   name         runner tag (.runner_<name>) and job-name segment, e.g. "gb200"
-#   gpus         node x gpu scale segment for the single-node jobs, e.g. "1x4"
-#   has_image    whether this platform builds an enroot image. Retained for
-#                documentation: prepare_image.py now runs in .run_job.before_script
-#                for every platform (a no-op on non-SLURM runners), so it no longer
-#                gates job generation.
-#   multinode    optional list of scaled profile job-sets (see _emit_multinode). A
-#                multinode entry may pin all its jobs to one group via "group"
-#                (e.g. the expensive nano/16-node sets live in their own manual group)
-#                and override the default 4h job timeout via "timeout" (the 8-/16-node
-#                sets can sit in the SLURM queue for hours before a large allocation frees).
-#
-# Manual-vs-auto is NOT a per-job property here: it is decided by the GROUP a job lands
-# in — each group has one trigger job in gitlab-ci-native.yml that is either automatic
-# or optional-manual (.manual_optional). Every concrete job runs automatically within
-# its group and keeps .run_job's exit-code gating; an opt-in group simply isn't spawned
-# until its trigger is played. See the GROUPS comment.
-# ---------------------------------------------------------------------------
+# One dict per hardware platform; keys are consumed in _emit_platform / _emit_multinode.
 PLATFORMS = [
     {
         "name": "devbox",
@@ -66,11 +32,6 @@ PLATFORMS = [
         "gpus": "1x4",
         "has_image": True,
         "multinode": [
-            # 2-node deterministic smoke (pico model at 2 nodes). No "group", so each job
-            # lands in its provider+flavor group: native:deterministic in the automatic
-            # native-deterministic group, nvrx:deterministic in the manual nvrx-deterministic
-            # group (it seeds the cross-provider metadata/2x4_* baseline the native job
-            # compares against). Both have update_baselines siblings.
             {
                 "key": "2node",
                 "config": "pico",
@@ -79,27 +40,38 @@ PLATFORMS = [
                 "with_update": True,
                 "jobs": [("pretrain-native", "deterministic"), ("pretrain-nvrx", "deterministic")],
             },
-            # nano: 8 nodes (EP=32). Expensive, so all its jobs go in the dedicated manual
-            # "8node-nano" group (not the automatic native-* groups). native + nvrx, each in
-            # deterministic and perf; update_baselines siblings on all but nvrx:perf.
             {
-                "key": "nano",
-                "config": "nano",
+                "key": "nano3",
+                "config": "nano3",
                 "nodes": 8,
                 "scale": "8x4",
                 "with_update": True,
-                "group": "8node-nano",
-                # 8-node allocations can sit in the SLURM queue for hours; outlast it.
+                "group": "8node-nano3",
                 "timeout": "1d",
                 "jobs": [
                     ("pretrain-native", "deterministic"),
                     ("pretrain-native", "perf"),
                     ("pretrain-nvrx", "deterministic"),
                     ("pretrain-nvrx", "perf"),
+                    ("pretrain-native", ["deterministic", "valgrind"]),
                 ],
             },
-            # multinode-perf: ultra at 16 nodes, a single perf smoke, no update. Manual
-            # "16node-ultra" group.
+            {
+                "key": "nano4",
+                "config": "nano4",
+                "nodes": 8,
+                "scale": "8x4",
+                "with_update": True,
+                "group": "8node-nano4",
+                "timeout": "1d",
+                "jobs": [
+                    ("pretrain-native", "deterministic"),
+                    ("pretrain-native", "perf"),
+                    ("pretrain-nvrx", "deterministic"),
+                    ("pretrain-nvrx", "perf"),
+                    ("pretrain-native", ["deterministic", "valgrind"]),
+                ],
+            },
             {
                 "key": "multinode-perf",
                 "config": "ultra",
@@ -107,7 +79,6 @@ PLATFORMS = [
                 "scale": "16x4",
                 "with_update": False,
                 "group": "16node-ultra",
-                # 16-node allocations can sit in the SLURM queue for hours; outlast it.
                 "timeout": "1d",
                 "jobs": [("pretrain-native", "perf")],
             },
@@ -118,8 +89,6 @@ PLATFORMS = [
         "gpus": "1x8",
         "has_image": True,
         "multinode": [
-            # 2-node deterministic smoke (pico at 2 nodes); native in native-deterministic
-            # (auto), nvrx in nvrx-deterministic (manual, seeds metadata/2x8_*). See gb200 2node.
             {
                 "key": "2node",
                 "config": "pico",
@@ -135,7 +104,6 @@ PLATFORMS = [
                 "scale": "16x8",
                 "with_update": False,
                 "group": "16node-ultra",
-                # 16-node allocations can sit in the SLURM queue for hours; outlast it.
                 "timeout": "1d",
                 "jobs": [("pretrain-native", "perf")],
             },
@@ -156,13 +124,7 @@ def _read_header() -> str:
 
 
 def _job(name: str, extends: list[str], *, job_args: str | None = None, timeout: str | None = None) -> str:
-    """Render one concrete job. Every job runs automatically within its group and keeps
-    .run_job's allow_failure: exit_codes:[3] gating (a crash, exit != 3, fails the pipeline);
-    opt-in is controlled by the group's trigger, not the job. So no job is when: manual.
-
-    ``timeout`` overrides .run_job's default 4h job timeout — the multinode sets can sit in
-    the SLURM queue for many hours waiting for a large node allocation, which the GitLab job
-    timeout must outlast or the job reds before the workload ever starts."""
+    """Render one concrete job block; ``timeout`` overrides .run_job's default 4h job timeout."""
     lines = [f"{name}:", f"  extends: [{', '.join(extends)}]"]
     if timeout is not None:
         lines.append(f"  timeout: {timeout}")
@@ -172,8 +134,7 @@ def _job(name: str, extends: list[str], *, job_args: str | None = None, timeout:
 
 
 def _update(test_name: str, runner: str, *, timeout: str | None = None) -> str:
-    """Render the update_baselines sibling for a test job. ``timeout`` overrides the default
-    job timeout (the multinode update jobs re-run the same large-allocation workload)."""
+    """Render the update_baselines sibling for a test job."""
     lines = [
         f"{test_name}:update_baselines:",
         f"  extends: [.update_baseline_base, {runner}]",
@@ -188,32 +149,20 @@ def _update(test_name: str, runner: str, *, timeout: str | None = None) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Job grouping. native-tests is split into one child pipeline per category so the
-# parent pipeline shows separate, independently-retriggerable groups. A single-node or
-# 2-node pretrain job's group is "<provider>-<flavor>"; ckptbench is its own group; the
-# expensive multinode sets pin themselves to a manual group via the entry "group" key
-# (nano -> "8node-nano", the 16-node perf smoke -> "16node-ultra").
-#
-# Whether a group runs automatically or on demand is decided ENTIRELY by its trigger job
-# in gitlab-ci-native.yml — automatic for ckptbench / native-deterministic / native-perf,
-# optional-manual (.manual_optional) for nvrx-deterministic / nvrx-perf / valgrind /
-# 16node-ultra / 8node-nano. Concrete jobs are never when: manual (that would block an automatic group's child
-# on an unplayed job and, with exit-code gating, mask nothing while stalling everything);
-# they run automatically inside whichever group is spawned and keep .run_job's exit-code
-# gating, so a real failure fails that child rather than hiding as an allowed warning.
-#
-# Each non-empty group is written as generated-<group>.yml — a complete standalone pipeline
-# (shared header + that group's jobs). The trigger's display name uses the flavor-tag form
-# ([DETR].native, [PERF].native, [DETR].nvrx, [PERF].nvrx) while still referencing
-# generated-<group>.yml. Keep this list in sync with those trigger jobs.
-# ---------------------------------------------------------------------------
-GROUPS = ("ckptbench", "native-deterministic", "native-perf", "nvrx-deterministic", "nvrx-perf", "valgrind", "16node-ultra", "8node-nano")
+# One child pipeline per group; auto-vs-manual is set by each group's trigger in gitlab-ci-native.yml.
+GROUPS = (
+    "ckptbench",
+    "native-deterministic",
+    "native-perf",
+    "nvrx-deterministic",
+    "nvrx-perf",
+    "valgrind",
+    "16node-ultra",
+    "8node-nano3",
+    "8node-nano4",
+)
 
-# Short display tags for the flavor segment of job names (…:perf -> …:[PERF],
-# …:deterministic -> …:[DETR]). The real flavor still drives JOB_ARGS (--flavor …) and
-# the group; only the visible job name is abbreviated. run_job.py's _parse_job_filter
-# maps these back so baseline auto-detection still works.
+# Display tags for the flavor name segment; run_job.py's _parse_job_filter maps them back.
 FLAVOR_LABEL = {"deterministic": "[DETR]", "perf": "[PERF]"}
 
 
@@ -228,76 +177,63 @@ def _pretrain_group(job: str, flavor: str) -> str:
 
 
 def _emit_multinode(p: dict, runner: str, groups: dict[str, list[str]]) -> None:
-    """Bucket each multinode profile entry's jobs into their groups.
-
-    Each entry runs a fixed --config profile at --nodes N. An entry with a "group" pins all
-    its jobs to that one (manual) group — used for the expensive opt-in sets (nano, the
-    16-node perf smoke). Otherwise each job lands in its provider+flavor group via
-    _pretrain_group (e.g. the 2-node pair: native:deterministic in the automatic
-    native-deterministic group, nvrx:deterministic in the manual nvrx-deterministic group).
-    ``with_update`` adds an update_baselines sibling alongside the job.
-    """
+    """Emit each multinode entry's jobs into their group (pinned "group" or provider+flavor)."""
     for entry in p.get("multinode", []):
         timeout = entry.get("timeout")
+        run_seg = f"{entry['config']}_{entry['scale']}"
         for job, flavor in entry["jobs"]:
-            name = f"{p['name']}:{_provider(job)}:{entry['scale']}:{FLAVOR_LABEL.get(flavor, flavor)}"
-            args = f"{job} --nodes {entry['nodes']} --config {entry['config']} --flavor {flavor}"
-            g = entry.get("group") or _pretrain_group(job, flavor)
+            flavors = [flavor] if isinstance(flavor, str) else list(flavor)
+            # Tag by the last (most-specific) flavor; a modifier like valgrind has no label.
+            tag = FLAVOR_LABEL.get(flavors[-1], flavors[-1])
+            name = f"{p['name']}:{_provider(job)}:{run_seg}:{tag}"
+            flavor_flags = " ".join(f"--flavor {f}" for f in flavors)
+            args = f"{job} --nodes {entry['nodes']} --config {entry['config']} {flavor_flags}"
+            g = entry.get("group") or _pretrain_group(job, flavors[0])
             groups[g].append(_job(name, [".run_job", runner], job_args=args, timeout=timeout))
-            # nvrx perf emits checkpoint times, not parseable bw metrics, so it has no
-            # baseline to refresh — skip its update sibling (matches the single-node nvrx-perf).
-            if entry["with_update"] and not (job == "pretrain-nvrx" and flavor == "perf"):
+            # valgrind (memcheck) and nvrx-perf produce no baseline -> no update sibling.
+            skip_update = "valgrind" in flavors or (job == "pretrain-nvrx" and "perf" in flavors)
+            if entry["with_update"] and not skip_update:
                 groups[g].append(_update(name, runner, timeout=timeout))
 
 
 def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
-    """Bucket every job (and update sibling) for one platform into its group. Opt-in vs
-    automatic is the group's trigger, not the job — so nothing here is marked manual."""
+    """Emit every job (and update sibling) for one platform into its group."""
     runner = f".runner_{p['name']}"
     name, gpus = p["name"], p["gpus"]
 
-    # ckptbench — its own entry script and group.
     ckpt = f"{name}:ckptbench:{gpus}"
     groups["ckptbench"] += [_job(ckpt, [".run_ckptbench", runner]), _update(ckpt, runner)]
 
-    # pretrain-native (deterministic, perf) + pretrain-nvrx (deterministic): each in its
-    # provider+flavor group, with an update_baselines sibling.
     standard = (
         ("pretrain-native", "deterministic"),
         ("pretrain-native", "perf"),
         ("pretrain-nvrx", "deterministic"),
     )
     for job, flavor in standard:
-        jname = f"{name}:{_provider(job)}:{gpus}:{FLAVOR_LABEL.get(flavor, flavor)}"
+        jname = f"{name}:{_provider(job)}:pico_{gpus}:{FLAVOR_LABEL.get(flavor, flavor)}"
         args = f"{job} --config pico --flavor {flavor}"
         g = _pretrain_group(job, flavor)
         groups[g] += [_job(jname, [".run_job", runner], job_args=args), _update(jname, runner)]
 
-    # valgrind — memcheck, in the manual valgrind group, no update sibling. It keeps
-    # .run_job's allow_failure: exit_codes:[3], so a memcheck error or stall (exit 42 /
-    # RuntimeError — anything != 3) fails its child rather than being masked.
-    vg = f"{name}:valgrind:{gpus}"
+    # valgrind memcheck: no baseline, so no update sibling.
+    vg = f"{name}:valgrind:pico_{gpus}"
     groups["valgrind"].append(
         _job(vg, [".run_job", runner], job_args="pretrain-native --config pico --flavor deterministic --flavor valgrind"),
     )
-    # 2-node valgrind: memchecks every node's server (each node's local rank 0 runs its own
-    # valgrind server), exercising the cross-node ShardedObject merge under memcheck. Multinode
-    # platforms only (the single-node devbox has an empty multinode list).
+    # 2-node valgrind exercises the cross-node server merge under memcheck; multinode platforms only.
     if p.get("multinode"):
         per_node = gpus.split("x")[1]
         groups["valgrind"].append(
             _job(
-                f"{name}:valgrind:2x{per_node}",
+                f"{name}:valgrind:pico_2x{per_node}",
                 [".run_job", runner],
                 job_args="pretrain-native --nodes 2 --config pico --flavor deterministic --flavor valgrind",
                 timeout="1d",
             ),
         )
 
-    # nvrx perf — a fast-path (flash + fusion) smoke of the nvrx provider, in the manual
-    # nvrx-perf group. No update sibling: the nvrx provider emits checkpoint times, not
-    # parseable bw metrics, so its run prints those for inspection.
-    nvrx_perf = f"{name}:nvrx:{gpus}:{FLAVOR_LABEL['perf']}"
+    # nvrx perf smoke; no baseline (emits checkpoint times, not parseable bw metrics).
+    nvrx_perf = f"{name}:nvrx:pico_{gpus}:{FLAVOR_LABEL['perf']}"
     groups["nvrx-perf"].append(
         _job(nvrx_perf, [".run_job", runner], job_args="pretrain-nvrx --config pico --flavor perf"),
     )
@@ -306,12 +242,11 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     header = _read_header().rstrip() + "\n"
     groups: dict[str, list[str]] = {g: [] for g in GROUPS}
     for p in PLATFORMS:
         _emit_platform(p, groups)
-    # One standalone child pipeline per non-empty group, written to the cwd
-    # (the CI job runs from $CI_PROJECT_DIR; artifacts: generated-*.yml collects them).
     written: list[tuple[str, int]] = []
     for g in GROUPS:
         if not groups[g]:
@@ -320,7 +255,7 @@ def main() -> None:
         path.write_text(f"{header}\n{HEADER_MARKER} (group: {g})\n\n" + "\n\n".join(groups[g]) + "\n")
         written.append((path.name, len(groups[g])))
     for fname, n in written:
-        print(f"wrote {fname} ({n} blocks)")
+        logger.info(f"wrote {fname} ({n} blocks)")
 
 
 if __name__ == "__main__":

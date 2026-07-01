@@ -2,7 +2,7 @@
 #
 # Flattened to CLI args by the pretrain job: `key: value` -> `--key value`,
 # `key: true` -> `--key`, `key: [a, b]` -> `--key a b`, `key: false`/null drops
-# the flag. A profile (pico.yaml / nano.yaml / ultra.yaml, selected by
+# the flag. A profile (pico.yaml / nano3.yaml / nano4.yaml / ultra.yaml, selected by
 # `--config <profile>`) deep-merges over this; the profile pins model size,
 # routing top-k, and parallelism. Runtime values are supplied in code, not here:
 # checkpoint provider/format/save-load, save/log/eval/exit intervals and
@@ -35,7 +35,7 @@ moe-latent-size: 1024
 num-layers-at-start-in-bf16: 0
 
 # Parallelism (tensor/expert model-parallel sizes and global batch size are computed
-# in code so the pico profile tracks the runner's GPU count; nano/ultra pin them).
+# in code so the pico profile tracks the runner's GPU count; nano3/nano4/ultra pin them).
 expert-tensor-parallel-size: 1
 pipeline-model-parallel-size: 1
 sequence-parallel: true

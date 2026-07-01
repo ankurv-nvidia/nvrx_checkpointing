@@ -54,10 +54,15 @@ stages:
     - python3 "${CI_SCRIPTS_DIR}/run_job.py" ${JOB_ARGS} || exit $?
   after_script:
     - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+    # Soft-stop any leftover checkpoint_server so it doesn't hold the per-node port and trip the
+    # next job (runner 16.11.1+ runs after_script on cancel; a no-op when none is listening).
+    - curl -s --max-time 5 http://127.0.0.1:41000/api/stop || true
   artifacts:
     paths:
       - megatron/native/ci/ci-results/*.log
       - megatron/native/ci/ci-results/*_report.json
+      # Resolved Megatron arguments block per config+flavor (committed to baselines by update_baselines).
+      - megatron/native/ci/ci-results/*_arguments.txt
       # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
       - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
@@ -185,10 +190,18 @@ valgrind:
         job: generate-native-pipeline
     strategy: depend
 
-8node-nano:
+8node-nano3:
   extends: [.native_trigger, .manual_optional]
   trigger:
     include:
-      - artifact: generated-8node-nano.yml
+      - artifact: generated-8node-nano3.yml
+        job: generate-native-pipeline
+    strategy: depend
+
+8node-nano4:
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-8node-nano4.yml
         job: generate-native-pipeline
     strategy: depend

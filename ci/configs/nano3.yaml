@@ -1,4 +1,4 @@
-# nano profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes,
+# nano3 profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes,
 # mirroring a real nemotron-MoE "nano" training run as closely as the CI harness
 # allows. Deep-merged over base.yaml. Model dimensions, routing, attention
 # grouping, the bf16 layer head/tail, MTP, the precision-aware (bf16) optimizer,
