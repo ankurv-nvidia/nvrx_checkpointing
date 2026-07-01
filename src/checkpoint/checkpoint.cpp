@@ -91,8 +91,10 @@ static bool TryConnectToCheckpointService()
         return true;
     }
 
-    fmt::print(stderr, "[native_ckpt:cli][ERROR] Attempting to connect with checkpoint service failed with: {}\n", ec.what());
-
+    if (ec != boost::asio::error::connection_refused)
+    {
+        fmt::print(stderr, "[native_ckpt:cli][ERROR] Attempting to connect with checkpoint service failed with: {}\n", ec.what());
+    }
     return false;
 }
 
@@ -239,11 +241,6 @@ struct CheckpointWriter
     // Resolve this rank's channel and mmap its shm queue (cheap; logs the open time).
     static cipc::MsgQueue OpenMsgQueue(RankTopology const& topo)
     {
-        int numa = GetCurrentNumaNode();
-#ifdef PHOENIX_HAVE_CUDA
-        // The GPU, fixed by the rank, decides where the D2H copy lands fastest.
-        if (int gpuNuma = DeviceContext::CudaGetCurrentDeviceNumaNode(); gpuNuma >= 0) { numa = gpuNuma; }
-#endif
         auto localRank = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
         // One queue per rank when MaxRanksPerNode covers the node's ranks; if a node
         // has more ranks than queues, consecutive (same-socket) ranks share one.
@@ -252,7 +249,6 @@ struct CheckpointWriter
         auto index       = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
         auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
         auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
-        fmt::print(stderr, "[native_ckpt:cli][{}][INFO][perf][NUMA#{}] Using channel={}\n", topo.rank, numa, channelName);
         return cipc::MsgQueue::Open(channelName);
     }
 
@@ -480,15 +476,6 @@ struct CheckpointWriter
         public:
         void WriteTensors()
         {
-
-            auto startTime = std::chrono::system_clock::now();
-            fmt::print(stderr,
-                       "[native_ckpt:cli][{}][INFO] Starting worker {} for partition [{} - {})\n",
-                       that->root.GlobalRank(),
-                       index,
-                       partitionStart,
-                       partitionEnd);
-
             that->root.WalkNodes([&](StateNode const& node) {
                 auto type = static_cast<StateNode::Type>(node.data.index());
                 if (type != StateNode::Type::TensorShard && type != StateNode::Type::ShardedTensor) { return; }
@@ -533,14 +520,6 @@ struct CheckpointWriter
                                 partitionEnd));
             }
 
-            fmt::print(stderr,
-                       "[native_ckpt:cli][{}:{}][INFO] Finished partition [{}:{}] in {}us {}\n",
-                       that->root.GlobalRank(),
-                       index,
-                       partitionStart,
-                       partitionEnd,
-                       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now() - startTime).count(),
-                       that->msgQueue);
         }
     };
 
@@ -654,8 +633,6 @@ void WarmUpCheckpoint(RankTopology const& topo)
 
 void FinalizeStateRegistry(StateTree& self)
 {
-    fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Finalizing State Registry\n", self.Topo().rank);
-    SvcPing();    // TODO: Get rid of this
     SetThreadName("ncc:finst");
     auto const& topo     = self.Topo();
     auto&       msgQueue = CheckpointWriter::GetMsgQueue(topo);
@@ -678,7 +655,6 @@ void FinalizeStateRegistry(StateTree& self)
         msgQueue.Push(cipc::Message::LocalStateRegistry{.sessionId = cipc::SessionId{0}, .messageSize = static_cast<uint32_t>(msg.size())},
                       msg.data(),
                       msg.size());
-        fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Send LocalStateRegistry MsgSize = {}\n", self.GlobalRank(), msg.size());
     }
 }
 

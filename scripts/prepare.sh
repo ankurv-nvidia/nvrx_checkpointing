@@ -228,10 +228,10 @@ function megatron {
     curl -LsSf https://astral.sh/uv/install.sh | sh
     source $HOME/.local/bin/env
     export UV_CACHE_DIR="$(mktemp -d)"
-    uv pip install --system --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools
-    uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
-    uv pip install --system --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
-    uv pip install --system --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models
+    uv pip install --system --no-cache --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models
     unset CC
     unset CXX
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true

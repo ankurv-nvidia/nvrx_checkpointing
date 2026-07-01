@@ -39,7 +39,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -267,13 +266,19 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
     });
 }
 
-[[nodiscard]] static auto CreateRequestForPeer(boost::asio::io_context&  ioc,
-                                               boost::beast::tcp_stream& stream,
-                                               std::string const&        peer,
-                                               std::string_view const&   target)
+static auto ResolvePeerEndpoint(boost::asio::io_context& ioc, std::string const& peer)
 {
+    // For some weird reason resolver does not like quering the same peer multiple times
+    // Ends up giving host not found. So just cache the results to avoid duplicate work
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type> EndpointCache;
+    static std::mutex                                                                         Mutex;
+    SUPPRESS_WARNINGS_END
+
     boost::urls::url peerAddr;
-    auto             it = peer.find(':');
+
+    auto it = peer.find(':');
     if (it != std::string::npos)
     {
         peerAddr.set_host(peer.substr(0, it));
@@ -285,13 +290,23 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
         peerAddr.set_port(std::to_string(cipc::Message::Port));
     }
 
-    // Connect to peer, trying every resolved endpoint until one accepts. A host
-    // like `localhost` resolves to both ::1 and 127.0.0.1 and the server binds
-    // IPv4, so connect() must fall through the address list to the reachable one.
+    std::scoped_lock lock(Mutex);
+    if (auto it1 = EndpointCache.find(peerAddr); it1 != EndpointCache.end()) { return std::make_pair(it1->first, it1->second); }
+
     boost::asio::ip::tcp::resolver resolver(ioc);
     auto                           results = resolver.resolve(peerAddr.host(), peerAddr.port());
-    if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve peer address={}", peer)); }
-    auto const endpoint = stream.connect(results);
+    if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve address for peer={}", peer)); }
+    EndpointCache[peerAddr] = results;
+    return std::make_pair(peerAddr, results);
+}
+
+[[nodiscard]] static auto CreateRequestForPeer(boost::asio::io_context&  ioc,
+                                               boost::beast::tcp_stream& stream,
+                                               std::string const&        peer,
+                                               std::string_view const&   target)
+{
+    auto [peerAddr, resolveResults] = ResolvePeerEndpoint(ioc, peer);
+    auto const endpoint             = stream.connect(resolveResults);
     fmt::print(stderr, "[native_ckpt:svr] Connected to endpoint={} resolved from peer={}\n", endpoint, peer);
 
     Request req;
@@ -788,52 +803,10 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 
 // TODO_MULTILOCAL_CKPT
 void Session::SendPeerFinalizeSnapshotComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
-{
-    boost::asio::io_context  ioc;
-    boost::beast::tcp_stream stream(ioc);
-    {
-        auto req = CreateRequestForPeer(
-            ioc, stream, peer, fmt::format("/api/peer/finalizecomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId));
-        // req.set(boost::beast::http::field::expect, "100-continue");
-        boost::beast::http::request_serializer<boost::beast::http::buffer_body, boost::beast::http::fields> sr{req};
-        boost::beast::http::write_header(stream, sr);
-    }
-    // Read the response
-    boost::beast::flat_buffer                                     buffer;
-    boost::beast::http::response<boost::beast::http::string_body> res;
-    boost::beast::http::read(stream, buffer, res);
-
-    if (res.result() != boost::beast::http::status::ok)
-    {
-        throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
-    }
-    TryCleanShutdown(stream);
-}
+{ SendToPeerWithRetries_(peer, "", fmt::format("/api/peer/finalizecomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId)); }
 
 void Session::SendPeerWriteCkptComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
-{
-    boost::asio::io_context  ioc;
-    boost::beast::tcp_stream stream(ioc);
-    {
-        auto req = CreateRequestForPeer(
-            ioc, stream, peer, fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId));
-        // req.set(boost::beast::http::field::expect, "100-continue");
-        boost::beast::http::request_serializer<boost::beast::http::buffer_body, boost::beast::http::fields> sr{req};
-        boost::beast::http::write_header(stream, sr);
-    }
-    // Read the response
-    boost::beast::flat_buffer                                     buffer;
-    boost::beast::http::response<boost::beast::http::string_body> res;
-    boost::beast::http::read(stream, buffer, res);
-
-    if (res.result() != boost::beast::http::status::ok)
-    {
-        throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
-    }
-    TryCleanShutdown(stream);
-}
+{ SendToPeerWithRetries_(peer, "", fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId)); }
 
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
 {
@@ -883,36 +856,84 @@ void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string 
     TryCleanShutdown(stream);
 }
 
+static constexpr int  MaxRetries             = 20;
+static constexpr auto IntervalBetweenRetries = std::chrono::milliseconds(10);
+
+void Session::SendLocalShardedStateRegistryToPeerWithRetries_(cipc::Rank rank, std::string const& peer)
+{
+    for (int attempt = 1; attempt <= MaxRetries; ++attempt)
+    {
+        try
+        {
+            SendLocalShardedStateRegistryToPeer_(rank, peer);
+            return;
+        } catch (std::exception const& ex)
+        {
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][ERROR] Attempt {} SendLocalShardedStateRegistryToPeer_ rank={} peer={} failed sending "
+                       "shards: {}\n",
+                       *server,
+                       sessionId,
+                       attempt,
+                       rank,
+                       peer,
+                       ex.what());
+            std::this_thread::sleep_for(IntervalBetweenRetries);
+        }
+    }
+}
+
+void Session::SendToPeerWithRetries_(std::string const& peer, std::string const& body, std::string const& target) const
+{
+    for (int attempt = 1; attempt <= MaxRetries; ++attempt)
+    {
+        try
+        {
+            boost::asio::io_context  ioc;
+            boost::beast::tcp_stream stream(ioc);
+            auto                     req = CreateRequestForPeer(ioc, stream, peer, target);
+            req.body().data = const_cast<char*>(body.data());    // NOLINT — beast buffer_body is non-owning; body outlives the write
+            req.body().size = body.size();
+            req.body().more = false;
+            req.prepare_payload();
+            boost::beast::http::write(stream, req);
+
+            boost::beast::flat_buffer                                     buffer;
+            boost::beast::http::response<boost::beast::http::string_body> res;
+            boost::beast::http::read(stream, buffer, res);
+            if (res.result() != boost::beast::http::status::ok)
+            {
+                throw std::runtime_error(fmt::format(
+                    "[native_ckpt:svr][{}#{}][ERROR] Peer {} globalregistry returned {}", *server, sessionId, peer, res.result_int()));
+            }
+            TryCleanShutdown(stream);
+        } catch (std::exception const& ex)
+        {
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][ERROR] Attempt {} peer={} failed target={} {}\n",
+                       *server,
+                       sessionId,
+                       attempt,
+                       peer,
+                       target,
+                       ex.what());
+            std::this_thread::sleep_for(IntervalBetweenRetries);
+        }
+    }
+}
+
 void Session::BroadcastGlobalRegistryToPeers_(cipc::SnapshotId snapshotId, StateTree const& registry) const
 {
     if (topo.peers.size() <= 1) { return; }
-    // Serialize the merged registry once (topology + every node), then ship the same bytes to
-    // each non-coordinator peer so they hold the global registry rather than just their fragment.
     std::ostringstream oss;
     StateSerDes::Write(oss, registry, StateNode::Handle::Root);
     std::string const body = oss.str();
 
     for (size_t p = 1; p < topo.peers.size(); ++p)
     {
-        boost::asio::io_context  ioc;
-        boost::beast::tcp_stream stream(ioc);
-        auto req = CreateRequestForPeer(ioc, stream, topo.peers[p], fmt::format("/api/peer/globalregistry/{}/{}", sessionId, snapshotId));
-        req.body().data = const_cast<char*>(body.data());    // NOLINT — beast buffer_body is non-owning; body outlives the write
-        req.body().size = body.size();
-        req.body().more = false;
-        req.prepare_payload();
-        boost::beast::http::write(stream, req);
-
-        boost::beast::flat_buffer                                     buffer;
-        boost::beast::http::response<boost::beast::http::string_body> res;
-        boost::beast::http::read(stream, buffer, res);
-        if (res.result() != boost::beast::http::status::ok)
-        {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Peer {} globalregistry returned {}", *server, sessionId, topo.peers[p], res.result_int()));
-        }
-        TryCleanShutdown(stream);
+        SendToPeerWithRetries_(topo.peers[p], body, fmt::format("/api/peer/globalregistry/{}/{}", sessionId, snapshotId));
     }
+
     fmt::print(stderr,
                "[native_ckpt:svr][{}#{}][INFO] Broadcast global registry for snapshot {} to {} peer(s)\n",
                *server,
@@ -926,27 +947,7 @@ void Session::BroadcastSnapshotCompleteToPeers_(cipc::SnapshotId snapshotId) con
     if (topo.peers.size() <= 1) { return; }
     for (size_t p = 1; p < topo.peers.size(); ++p)
     {
-        boost::asio::io_context  ioc;
-        boost::beast::tcp_stream stream(ioc);
-        auto req = CreateRequestForPeer(ioc, stream, topo.peers[p], fmt::format("/api/peer/snapshotcomplete/{}/{}", sessionId, snapshotId));
-        req.body().data = nullptr;
-        req.body().size = 0;
-        req.body().more = false;
-        req.prepare_payload();
-        boost::beast::http::write(stream, req);
-
-        boost::beast::flat_buffer                                     buffer;
-        boost::beast::http::response<boost::beast::http::string_body> res;
-        boost::beast::http::read(stream, buffer, res);
-        if (res.result() != boost::beast::http::status::ok)
-        {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer {} snapshotcomplete returned {}",
-                                                 *server,
-                                                 sessionId,
-                                                 topo.peers[p],
-                                                 res.result_int()));
-        }
-        TryCleanShutdown(stream);
+        SendToPeerWithRetries_(topo.peers[p], "", fmt::format("/api/peer/snapshotcomplete/{}/{}", sessionId, snapshotId));
     }
     fmt::print(stderr,
                "[native_ckpt:svr][{}#{}][INFO] Broadcast snapshot {} complete to {} peer(s)\n",
@@ -990,11 +991,11 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
         std::ofstream sstrm(ckptPath, std::ios::binary);
         if (!sstrm.good())
         {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for writing: {}", *server, sessionId, ckptPath.string()));
+            throw std::runtime_error(
+                fmt::format("[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for writing: {}", *server, sessionId, ckptPath));
         }
         StateSerDes::Write(sstrm, *snapshot.registry, StateNode::Handle::Root);
-        fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Finished writing metadata to file={} \n", *server, sessionId, ckptPath.string());
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Finished writing metadata to file={} \n", *server, sessionId, ckptPath);
     }
     // Verify if this was written correctly
     // Note because of empty nodes not being serialized this might not be a perfect match
@@ -1004,10 +1005,8 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
         std::ifstream sstrm(ckptPath, std::ios::binary);
         if (!sstrm.good())
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for verification: {}",
-                                                 *server,
-                                                 sessionId,
-                                                 ckptPath.string()));
+            throw std::runtime_error(fmt::format(
+                "[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for verification: {}", *server, sessionId, ckptPath));
         }
         auto readBack = StateSerDes::Read(snapshot.registry->GlobalRank(), snapshot.registry->GlobalWorldSize(), sstrm);
 
@@ -1036,13 +1035,9 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
                                                  *server,
                                                  sessionId,
                                                  snapshot.registry->GlobalRank(),
-                                                 ckptPath.string()));
+                                                 ckptPath));
         }
-        fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}][INFO] Metadata roundtrip verification passed for: {}\n",
-                   *server,
-                   sessionId,
-                   ckptPath.string());
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Metadata roundtrip verification passed for: {}\n", *server, sessionId, ckptPath);
 #endif
     }
     for (auto const& [localStateRank, localState] : snapshot.localStates)
@@ -1106,8 +1101,11 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<ch
     // ranks on other peers forward their fragment to the coordinator (peers[0]).
     if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
     {
-        asyncTasks.push_back(std::async(
-            std::launch::async | std::launch::deferred, &Session::SendLocalShardedStateRegistryToPeer_, this, rank, topo.peers[0]));
+        asyncTasks.push_back(std::async(std::launch::async | std::launch::deferred,
+                                        &Session::SendLocalShardedStateRegistryToPeerWithRetries_,
+                                        this,
+                                        rank,
+                                        topo.peers[0]));
     }
 }
 
@@ -1220,7 +1218,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
                hdr.snapshotId,
                hdr.globalRank,
                hdr.snapshotSize,
-               ckptPath.string());
+               ckptPath);
 }
 
 void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char, cipc::D2HBufferSize> const& /* buf */)
@@ -1233,15 +1231,15 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
 
         if (localState.writtenTensorSize != localState.blob.size)
         {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Incomplete tensor data received. sessionid={}. rcvd-size={}(range{} - {}) expected={} ",
-                *server,
-                sessionId,
-                hdr.sessionId,
-                localState.writtenTensorSize,
-                localState.writtenTensorRangeBegin,
-                localState.writtenTensorRangeEnd,
-                localState.blob.size));
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Incomplete tensor data received. sessionid={}. "
+                                                 "rcvd-size={}(range{} - {}) expected={} ",
+                                                 *server,
+                                                 sessionId,
+                                                 hdr.sessionId,
+                                                 localState.writtenTensorSize,
+                                                 localState.writtenTensorRangeBegin,
+                                                 localState.writtenTensorRangeEnd,
+                                                 localState.blob.size));
         }
         if (localState.writtenTensorRangeBegin != 0 || localState.writtenTensorRangeEnd != localState.blob.size)
         {
@@ -2059,7 +2057,8 @@ struct Server
         boost::system::error_code ec;
         ec = _tcpAcceptor.bind(endpoint, ec);
         if (ec) { throw cipc::ErrorAlreadyRunning(); }
-        _tcpAcceptor.listen(boost::asio::socket_base::max_listen_connections);
+        ec = _tcpAcceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) { throw cipc::ErrorAlreadyRunning(); }
 
         boost::asio::co_spawn(_ioc, DoListen_(), [](std::exception_ptr const& e) {
             if (e) try

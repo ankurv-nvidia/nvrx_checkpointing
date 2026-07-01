@@ -1,16 +1,21 @@
 #include "messages.h"
 #include "server.h"
 
+#include <cpptrace/cpptrace.hpp>
 #include <fmt/core.h>
 
-#include <cpptrace/cpptrace.hpp>
-
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+
+// TODO: avoid backtrace()
+#include <execinfo.h>
 
 extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);
@@ -18,16 +23,16 @@ extern "C" void FatalSignalHandler(int sig);
 namespace
 {
 
-// Expand %h (hostname) and %p (pid) in a server-log path so each node's per-node
-// singleton writes a distinct file. run_job points $NATIVE_CKPT_SERVER_LOG at the
-// shared ci-results dir with a %h token, and that dir is uploaded as a CI artifact,
-// so the crash backtrace this daemon logs survives the job and is collectible
-// per-node even on a multinode run where every node runs its own server.
-std::string ExpandLogPath(std::string path)
+// Allow templated names and Expand %h (hostname) and %p (pid) to avoid collision on network-shared-fs
+std::string GetLogPath()
 {
-    char        hostbuf[256] = {};    // NOLINT — zero-init guarantees NUL-termination even on truncation
-    std::string const host   = (::gethostname(hostbuf, sizeof(hostbuf) - 1) == 0) ? std::string(hostbuf) : std::string("unknown-host");
-    auto              subst   = [](std::string& s, char const* tok, std::string const& val) {
+    char const*           envLog  = ::getenv("NATIVE_CKPT_SERVER_LOG");
+    std::string           path    = (envLog != nullptr && *envLog != '\0') ? std::string(envLog) : "/tmp/native_ckpt_server.%h_%p.log";
+    std::array<char, 256> hostbuf = {};
+    std::string const     host
+        = (::gethostname(hostbuf.data(), hostbuf.size() - 1) == 0) ? std::string(hostbuf.data()) : std::string("unknown-host");
+
+    auto subst = [](std::string& s, char const* tok, std::string const& val) {
         std::string const token(tok);
         for (std::size_t pos = s.find(token); pos != std::string::npos; pos = s.find(token, pos + val.size()))
         {
@@ -39,38 +44,35 @@ std::string ExpandLogPath(std::string path)
     return path;
 }
 
-// Detach inherited stdin/stderr so the daemon never blocks on a pipe owned by the
-// now-departed client. Stdout is intentionally left pointing at the launcher pipe
-// so RunServer's "READY\n" handshake (server.cpp) still reaches the launcher; that
-// fd is single-write-only and SIGPIPE is ignored, so it can't hang us later.
-// Stderr log path honors $NATIVE_CKPT_SERVER_LOG; falls back to
-// /tmp/native_ckpt_server.<pid>.log.
+// Detach stdin/stderr so the daemon never blocks on a pipe owned by the departed client.
+// Stdout stays on the launcher pipe for RunServer's "READY\n" handshake (single-write, SIGPIPE ignored).
+// Stderr goes to the log file; if it can't be opened the daemon refuses to start.
 void RedirectStdio()
 {
-    char const* envLog = ::getenv("NATIVE_CKPT_SERVER_LOG");
-    std::string logPath = (envLog != nullptr && *envLog != '\0') ? ExpandLogPath(std::string(envLog))
-                                                                  : fmt::format("/tmp/native_ckpt_server.{}.log", ::getpid());
-
+    auto                    logPath     = GetLogPath();
     static constexpr mode_t LogFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    int                     logFd       = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, LogFileMode);    // NOLINT
-    if (logFd < 0) { logFd = ::open("/dev/null", O_WRONLY | O_CLOEXEC); }                                                     // NOLINT
-    int nullFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);                                                                   // NOLINT
+    int                     logFd
+        = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, LogFileMode);    // NOLINT(cppcoreguidelines-pro-type-vararg)
+    if (logFd < 0)
+    {
+        // Refuse to start without a log: stderr still points at the launcher pipe here (not yet
+        // redirected), so this throw reaches main's catch and the launcher sees the real reason.
+        int const err = errno;
+        throw std::runtime_error(fmt::format("cannot open server log {}: {}", logPath, std::strerror(err)));
+    }
+    int nullFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);    // NOLINT(cppcoreguidelines-pro-type-vararg)
 
     if (nullFd >= 0)
     {
         ::dup2(nullFd, STDIN_FILENO);
         if (nullFd > STDERR_FILENO) { ::close(nullFd); }
     }
-    if (logFd >= 0)
-    {
-        ::dup2(logFd, STDERR_FILENO);
-        if (logFd > STDERR_FILENO) { ::close(logFd); }
-    }
+    ::dup2(logFd, STDERR_FILENO);
+    if (logFd > STDERR_FILENO) { ::close(logFd); }
 }
 
-// Logs a breadcrumb then re-raises with the default disposition so we exit with the standard
-// signal status. Safe because RedirectStdio has pointed STDERR_FILENO at a regular file: write()
-// on a regular file cannot block on a dead pipe and cannot raise SIGPIPE.
+// Log a breadcrumb then re-raise with the default disposition to exit with the standard signal
+// status. Safe: RedirectStdio pointed STDERR at a regular file, so write() can't block or SIGPIPE.
 extern "C" void LogAndExitHandler(int sig)
 {
     char const* name = [](int signal) -> char const* {
@@ -84,37 +86,59 @@ extern "C" void LogAndExitHandler(int sig)
     }(sig);
 
     // Only async-signal-safe calls in here.
-    static constexpr char Prefix[] = "[native_ckpt:svr][SIGNAL] received ";    // NOLINT
-    static constexpr char Suffix[] = "\n";                                     // NOLINT
-    (void)::write(STDERR_FILENO, Prefix, sizeof(Prefix) - 1);                  // NOLINT
+    static constexpr std::string_view Prefix = "[native_ckpt:svr][SIGNAL] received ";
+    static constexpr std::string_view Suffix = "\n";
+    (void)::write(STDERR_FILENO, std::data(Prefix), Prefix.size());
     (void)::write(STDERR_FILENO, name, std::strlen(name));
-    (void)::write(STDERR_FILENO, Suffix, sizeof(Suffix) - 1);    // NOLINT
+    (void)::write(STDERR_FILENO, std::data(Suffix), Suffix.size());
 
     ::signal(sig, SIG_DFL);    // NOLINT(concurrency-mt-unsafe)
     ::raise(sig);
 }
 
-// Write a demangled, file:line-resolved backtrace to STDERR_FILENO (RedirectStdio points it at
-// the log file) via cpptrace. Shared by the fatal-signal and std::terminate handlers.
-//
-// Not strictly async-signal-safe: generate_trace() unwinds and resolves symbols (allocates,
-// reads the binary). The fatal-signal handler accepts this — it re-raises to the default
-// disposition afterward, so the kernel still drops a core even if a trace from deep heap
-// corruption is truncated, and a demangled trace is far more useful for diagnosing the crash
-// than a mangled-but-signal-safe one. absorb_trace_exceptions (set in main) keeps it from
-// throwing; resolving one trace at startup warms the resolver so the first crash is cheap.
+// Full demangled, file:line backtrace via cpptrace. Used by the std::terminate handler, which
+// runs in a normal context where allocation + symbolization are safe.
 void DumpBacktraceToLog()
 {
     fmt::print(stderr, "[native_ckpt:svr][CRASH] backtrace (most recent call first):\n");
     cpptrace::generate_trace().print(std::cerr);
 }
 
-// Fatal-signal handler: a crash (segfault, abort/assert, bus error, ...) otherwise dies with
-// no log line, so the server log the heartbeat-failure diagnostic dumps is empty. Log the
-// signal + a backtrace, then restore the default disposition and re-raise so the process still
-// exits with the signal's status and drops a core.
+// Async-signal-safe backtrace via glibc execinfo: cpptrace allocates (and can_signal_safe_unwind()
+// is false on this build's unwind backend), so it re-aborts on a corrupt heap — the common SIGABRT
+// case. backtrace_symbols_fd() writes "<object>(<symbol>+0x<off>) [0x<addr>]" to the fd without
+// malloc; resolve offline with addr2line. backtrace()'s lazy unwinder load is warmed in main().
+void DumpSafeBacktrace(int fd)
+{
+    static constexpr std::string_view Hdr = "[native_ckpt:svr][CRASH] backtrace (most recent call first):\n";
+    (void)::write(fd, std::data(Hdr), Hdr.size());
+    static constexpr int                MaxFrames = 128;
+    static std::array<void*, MaxFrames> Frames{};    // static: keep the buffer off the small sigaltstack
+    int const                           n = ::backtrace(Frames.data(), MaxFrames);
+    if (n <= 0)
+    {
+        static constexpr std::string_view Msg = "[native_ckpt:svr][CRASH]   (no frames captured)\n";
+        (void)::write(fd, std::data(Msg), Msg.size());
+        return;
+    }
+    ::backtrace_symbols_fd(Frames.data(), n, fd);    // async-signal-safe: writes to fd, never calls malloc
+}
+
+// Fatal-signal handler: a crash otherwise dies with no log line. Log the signal + a backtrace,
+// then restore the default disposition and re-raise to exit with the signal's status + a core.
 extern "C" void FatalSignalHandler(int sig)
 {
+    // Re-entry/cross-thread guard: SA_NODEFER leaves the signal unblocked, so a re-fault here would
+    // re-enter and spin forever. Only the first fatal signal runs the backtrace; any concurrent or
+    // re-entrant signal restores the default disposition and re-raises so the kernel finishes up.
+    static sig_atomic_t volatile InHandler = 0;
+    if (__atomic_exchange_n(&InHandler, 1, __ATOMIC_SEQ_CST) != 0)
+    {
+        ::signal(sig, SIG_DFL);    // NOLINT(concurrency-mt-unsafe)
+        ::raise(sig);
+        return;
+    }
+
     char const* name = [](int signal) -> char const* {
         switch (signal)
         {
@@ -128,31 +152,29 @@ extern "C" void FatalSignalHandler(int sig)
     }(sig);
     static constexpr char Prefix[] = "[native_ckpt:svr][CRASH] crashed on ";    // NOLINT
     static constexpr char Suffix[] = "\n";                                      // NOLINT
-    (void)::write(STDERR_FILENO, Prefix, sizeof(Prefix) - 1);
+    (void)::write(STDERR_FILENO, std::data(Prefix), sizeof(Prefix) - 1);
     (void)::write(STDERR_FILENO, name, std::strlen(name));
-    (void)::write(STDERR_FILENO, Suffix, sizeof(Suffix) - 1);
-    DumpBacktraceToLog();
+    (void)::write(STDERR_FILENO, std::data(Suffix), sizeof(Suffix) - 1);
+    // Signal-safe (no allocation) so it still produces a trace when the heap is corrupt — the
+    // common SIGABRT cause. DumpBacktraceToLog's symbolizing trace would re-abort here.
+    DumpSafeBacktrace(STDERR_FILENO);
     ::signal(sig, SIG_DFL);    // NOLINT(concurrency-mt-unsafe)
     ::raise(sig);
 }
 
 // std::terminate handler: an uncaught C++ exception calls terminate (not a signal), so we run
 // in a normal context where full symbolization is safe — recover the what() and print a
-// demangled, file:line-resolved trace via cpptrace. On the Itanium ABI the stack is not unwound
-// before terminate, so the trace still includes the throw site. [[noreturn]]: always abort()s.
+// demangled, file:line-resolved trace via cpptrace.
 [[noreturn]] void TerminateHandler()
 {
-    static constexpr char Hdr[] = "[native_ckpt:svr][CRASH] std::terminate — uncaught exception\n";    // NOLINT
-    (void)::write(STDERR_FILENO, Hdr, sizeof(Hdr) - 1);
+    static constexpr std::string_view Hdr = "[native_ckpt:svr][CRASH] std::terminate — uncaught exception\n";
+    (void)::write(STDERR_FILENO, std::data(Hdr), Hdr.size());
     if (std::exception_ptr const ex = std::current_exception())
     {
         try
         {
             std::rethrow_exception(ex);
-        } catch (std::exception const& e)
-        {
-            fmt::print(stderr, "[native_ckpt:svr][CRASH] what(): {}\n", e.what());
-        } catch (...)
+        } catch (std::exception const& e) { fmt::print(stderr, "[native_ckpt:svr][CRASH] what(): {}\n", e.what()); } catch (...)
         {
             fmt::print(stderr, "[native_ckpt:svr][CRASH] non-std exception\n");
         }
@@ -195,10 +217,10 @@ void InstallSignalHandlers()
     // alternate stack (SA_ONSTACK) so a stack-overflow SIGSEGV can still be reported; SA_NODEFER
     // lets the final re-raise redeliver. SIGABRT also covers abort()/assert() and the
     // terminate-handler's abort.
-    static char altStackStorage[64 * 1024];    // NOLINT — fixed size; SIGSTKSZ is not constant on modern glibc
-    stack_t    altStack{};
-    altStack.ss_sp    = static_cast<void*>(altStackStorage);
-    altStack.ss_size  = sizeof(altStackStorage);
+    static std::array<char, 64ul * 1024ul> AltStackStorage{};
+    stack_t                                altStack{};
+    altStack.ss_sp    = static_cast<void*>(AltStackStorage.data());
+    altStack.ss_size  = AltStackStorage.size();
     altStack.ss_flags = 0;
     ::sigaltstack(&altStack, nullptr);
 
@@ -223,6 +245,12 @@ try
     // unwinder + libdwarf reader so the first crash backtrace is cheap.
     cpptrace::absorb_trace_exceptions(true);
     (void)cpptrace::generate_trace();
+    // Warm glibc's unwinder too: backtrace()'s first call may lazily dlopen libgcc_s (which
+    // allocates), so prime it now — the fatal handler's DumpSafeBacktrace must not allocate.
+    {
+        std::array<void*, 1> warm{};
+        (void)::backtrace(warm.data(), 1);
+    }
     InstallSignalHandlers();
     fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon started pid={} sid={} ppid={}\n", ::getpid(), ::getsid(0), ::getppid());
     RunServer();
@@ -232,6 +260,8 @@ try
 {
     // Another instance is already running; the launcher will connect to it.
     fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
+    std::error_code ec;
+    std::filesystem::remove(GetLogPath(), ec);
     return 0;
 } catch (std::exception const& e)
 {

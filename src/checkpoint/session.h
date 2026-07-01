@@ -121,10 +121,13 @@ struct Session
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
 
+    void SendToPeerWithRetries_(std::string const& peer, std::string const& body, std::string const& target) const;
+
     void SendPeerFinalizeSnapshotComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
     void SendPeerWriteCkptComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
+    void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     // Coordinator-only: once the merged registry is final / the whole snapshot is write-complete,
     // push that out to the other nodes so they can finish and mark the snapshot complete locally.

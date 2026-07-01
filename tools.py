@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 from pathlib import Path
 
 import torch
@@ -23,6 +22,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.utils import print_rank_0
 
 from . import checkpoint, mapping
+from .ckpt_diag import diagnose_checkpoint_server_failure
 
 
 def _expand_slurm_nodelist(nodelistspec: str) -> list[str]:
@@ -69,7 +69,7 @@ def _expand_tasks_per_node(tasks_per_node_spec: str) -> list[int]:
     return result
 
 
-def get_slurm_nodelist(rank: int, world_size: int) -> list[str]:
+def get_slurm_nodelist(_rank: int, world_size: int) -> list[str]:
     if "SLURM_JOB_NODELIST" not in os.environ:
         raise RuntimeError("SLURM_JOB_NODELIST environment variable not found")
     if "SLURM_TASKS_PER_NODE" not in os.environ:
@@ -90,15 +90,15 @@ def get_slurm_nodelist(rank: int, world_size: int) -> list[str]:
         )
 
     rank_expanded_nodelist = [node for node, ntasks in zip(expanded_nodelist, ntasks_per_node) for _ in range(ntasks)]  # noqa: B905
-    sys.stdout.write(
-        f"SLURM_JOB_NODELIST: {nodelistspec}\n"
-        f"SLURM_TASKS_PER_NODE: {ntasks_per_node_spec}\n"
-        f"Expanded SLURM_JOB_NODELIST: {', '.join(expanded_nodelist)}\n"
-        f"Expanded SLURM_TASKS_PER_NODE: {', '.join(map(str, ntasks_per_node))}\n"
-        f"Rank-expanded SLURM_JOB_NODELIST: {', '.join(rank_expanded_nodelist)}\n"
-        f"World size = {world_size}\n"
-        f"Rank = {rank}\n",
-    )
+    # sys.stdout.write(
+    #    f"SLURM_JOB_NODELIST: {nodelistspec}\n"
+    #    f"SLURM_TASKS_PER_NODE: {ntasks_per_node_spec}\n"
+    #    f"Expanded SLURM_JOB_NODELIST: {', '.join(expanded_nodelist)}\n"
+    #    f"Expanded SLURM_TASKS_PER_NODE: {', '.join(map(str, ntasks_per_node))}\n"
+    #    f"Rank-expanded SLURM_JOB_NODELIST: {', '.join(rank_expanded_nodelist)}\n"
+    #    f"World size = {world_size}\n"
+    #    f"Rank = {rank}\n",
+    # )
     if len(rank_expanded_nodelist) != world_size:
         raise RuntimeError(f"SLURM_JOB_NODELIST {nodelistspec!r} expands to {len(rank_expanded_nodelist)} ranks, expected {world_size}.")
 
@@ -155,6 +155,29 @@ def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
 
 
 def save_checkpoint(  # noqa: PLR0913
+    iteration: int,
+    model,  # noqa: ANN001
+    optimizer,  # noqa: ANN001
+    opt_param_scheduler,  # noqa: ANN001
+    num_floating_point_operations_so_far: int,
+    train_data_iterator=None,  # noqa: ANN001
+) -> None:
+    try:
+        _save_checkpoint_impl(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            train_data_iterator=train_data_iterator,
+        )
+    except Exception as e:
+        diagnose_checkpoint_server_failure(e)
+        print_rank_0(f"Error saving checkpoint at iteration {iteration}: {e}")
+        raise
+
+
+def _save_checkpoint_impl(  # noqa: PLR0913
     iteration: int,
     model,  # noqa: ANN001
     optimizer,  # noqa: ANN001

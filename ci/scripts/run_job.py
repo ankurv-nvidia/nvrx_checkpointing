@@ -1126,7 +1126,7 @@ class CheckpointServer:
         try:
             with urllib.request.urlopen(url, timeout=2.0):
                 pass
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError) as exc:
             logger.info(f"[run_job]   stop request failed: {exc}")
 
     # Socket read timeout for the spin-down request. The server sends frequent heartbeats while
@@ -1143,7 +1143,7 @@ class CheckpointServer:
         try:
             with urllib.request.urlopen(url, timeout=CheckpointServer._SPINDOWN_READ_TIMEOUT_S) as resp:
                 resp.read()  # blocks until the server finishes spinning down
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError) as exc:
             logger.info(f"[run_job]  spindown request failed: {exc}")
 
     @staticmethod
@@ -2223,116 +2223,14 @@ class PretrainJob:
                 except Exception as exc:  # noqa: BLE001 — a metrics hiccup must never mask the training result
                     print(f"[native_ckpt:mem] unavailable: {exc}", flush=True)  # noqa: T201
 
-    # Substrings that mark a checkpoint-server failure worth probing. The probe runs only when
-    # training has already failed, matching these on the caught exception.
-    _CKPT_FAILURE_MARKERS = (
-        "Failed to start or connect to checkpoint service",  # startup / connect
-        "No heartbeat from reader",  # server reader stalled mid-save
-    )
-
     @staticmethod
     def _diagnose_checkpoint_failure(exc: BaseException) -> None:
         """Probe the per-node checkpoint server when a training rank fails. Pings its port and,
         only when the failure implicates the server, dumps its log (if dead) or its stack (if alive
         but stuck); stays quiet otherwise. One probe per node; never raises."""
-        import glob  # noqa: PLC0415
-        import shutil  # noqa: PLC0415
-        import socket  # noqa: PLC0415
-        import subprocess  # noqa: PLC0415
-        import traceback  # noqa: PLC0415
+        from megatron.native.ckpt_diag import diagnose_checkpoint_server_failure  # noqa: PLC0415
 
-        rank = os.environ.get("RANK", "?")
-        local_rank = os.environ.get("LOCAL_RANK", "0")
-        host, port = "127.0.0.1", 41000  # checkpoint::ipc::Message::Port — per-node singleton
-        marker_hit = any(marker in str(exc) for marker in PretrainJob._CKPT_FAILURE_MARKERS)
-
-        alive = False
-        try:
-            with socket.create_connection((host, port), timeout=5):
-                alive = True
-        except OSError:
-            alive = False
-
-        # A healthy server on an unrelated training failure is not worth a diagnostic.
-        if alive and not marker_hit:
-            return
-
-        print(
-            f"[native_ckpt:diag][rank{rank}] pretrain failed; checkpoint_server on "
-            f"{host}:{port} is {'ALIVE' if alive else 'DEAD (socket released — crashed/exited)'}.",
-            flush=True,
-        )  # noqa: T201
-
-        # Only one rank per node probes that node's singleton server.
-        if local_rank == "0":
-            if not alive:
-                hostname = socket.gethostname()
-                # The server writes into ci-results (NATIVE_CKPT_SERVER_LOG, %h -> hostname).
-                logs = sorted(glob.glob(str(RESULTS_DIR / "checkpoint_server.*.log")))
-                # Fallback: a server that ignored the env path (e.g. a stale singleton from a
-                # prior job) logs to node-local /tmp; copy those into ci-results so they upload.
-                tmp_logs = sorted(glob.glob("/tmp/native_ckpt_server.*.log"))
-                for tmp_log in tmp_logs:
-                    try:
-                        dest = RESULTS_DIR / f"checkpoint_server.{hostname}.{os.path.basename(tmp_log)}"
-                        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(tmp_log, dest)
-                        logs.append(str(dest))
-                    except OSError as copy_err:
-                        print(f"[native_ckpt:diag][rank{rank}] could not copy {tmp_log}: {copy_err}", flush=True)  # noqa: T201
-                        logs.append(tmp_log)
-                logs = list(dict.fromkeys(logs))  # dedupe, preserve order
-                if not logs:
-                    print(
-                        f"[native_ckpt:diag][rank{rank}] no server log in {RESULTS_DIR} or /tmp/native_ckpt_server.*.log",
-                        flush=True,
-                    )  # noqa: T201
-                for log_path in logs[-2:]:
-                    print(f"[native_ckpt:diag][rank{rank}] ==== server log {log_path} (tail) ====", flush=True)  # noqa: T201
-                    try:
-                        with open(log_path) as log_file:
-                            print("".join(log_file.readlines()[-300:]), flush=True)  # noqa: T201
-                    except OSError as read_err:
-                        print(f"[native_ckpt:diag][rank{rank}] could not read {log_path}: {read_err}", flush=True)  # noqa: T201
-            else:
-                pid = None
-                if shutil.which("pgrep"):
-                    try:
-                        found = subprocess.run(
-                            ["pgrep", "-f", "checkpoint_server"],
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                            check=False,
-                        )
-                        pids = [p for p in found.stdout.split() if p.isdigit()]
-                        pid = pids[0] if pids else None
-                    except (OSError, subprocess.SubprocessError):
-                        pid = None
-                if pid and shutil.which("gdb"):
-                    print(f"[native_ckpt:diag][rank{rank}] ==== server (pid {pid}) stack via gdb ====", flush=True)  # noqa: T201
-                    try:
-                        bt = subprocess.run(
-                            ["gdb", "-p", pid, "-batch", "-ex", "thread apply all bt"],
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                            check=False,
-                        )
-                        print(bt.stdout, flush=True)  # noqa: T201
-                        if bt.stderr.strip():
-                            print(f"[native_ckpt:diag][rank{rank}] gdb stderr: {bt.stderr}", flush=True)  # noqa: T201
-                    except (OSError, subprocess.SubprocessError) as gdb_err:
-                        print(f"[native_ckpt:diag][rank{rank}] gdb on server pid {pid} failed: {gdb_err}", flush=True)  # noqa: T201
-                else:
-                    print(
-                        f"[native_ckpt:diag][rank{rank}] cannot dump server stack "
-                        f"(checkpoint_server pid={pid}, gdb={'present' if shutil.which('gdb') else 'absent'}).",
-                        flush=True,
-                    )  # noqa: T201
-
-        print(f"[native_ckpt:diag][rank{rank}] client-side stack trace:", flush=True)  # noqa: T201
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        diagnose_checkpoint_server_failure(exc, log_dir=RESULTS_DIR)
 
     @staticmethod
     def _run_pretrain_determinism_check(args: argparse.Namespace, cfg: str) -> None:  # noqa: C901, PLR0912, PLR0915 — sequential orchestration (run1 → save → wipe → run2 → diff)

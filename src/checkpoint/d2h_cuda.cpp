@@ -131,7 +131,6 @@ struct CudaContext : public DeviceContext
 void DeviceContext::CudaRegisterHostBuffer(void* ptr, size_t size)
 {
     CUDA_CHECK(cudaHostRegister(ptr, size, cudaHostRegisterDefault), "Failed to register host buffer at {:p} of size {}", ptr, size);    //
-    fmt::print(stderr, "Registered host buffer with CUDA. addr={:p} size={}\n", ptr, size);
 }
 
 void DeviceContext::CudaUnregisterHostBuffer(void* ptr)
@@ -148,7 +147,7 @@ int DeviceContext::CudaGetCurrentDeviceNumaNode()
     // sysfs PCI paths are lowercase; cudaDeviceGetPCIBusId yields uppercase hex.
     for (auto& ch : busId) { ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); }
     std::ifstream f(std::string("/sys/bus/pci/devices/") + busId.data() + "/numa_node");
-    int node = -1;
+    int           node = -1;
     if (f >> node) { return node; }    // a value of -1 here means "no NUMA affinity"
     return -1;
 }

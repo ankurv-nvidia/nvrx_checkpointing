@@ -595,10 +595,6 @@ static void RegisterStateDict(StateTree& self, nb::dict const& container)
     std::unordered_set<PyObject*> visited;
     RegisterStateDictRecr(self, StateNode::Handle::Root, container, true, visited);
     auto stop = std::chrono::system_clock::now();
-    fmt::print(stderr,
-               "[native_ckpt:cli][{}][INFO] RegisterStateDict took {} us\n",
-               self.GlobalRank(),
-               std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count());
 }
 
 static void RegisterStateDictAsync(StateTree& self, nb::dict const& container)
