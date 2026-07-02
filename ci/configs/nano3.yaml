@@ -99,15 +99,4 @@ megatron-fsdp-main-grads-dtype: bf16
 straggler-minmax-count: 1
 log-num-zeros-in-grad: false
 
-# The production recipe is sample-based (lr-decay-samples / lr-warmup-samples /
-# lr-wsd-decay-samples + lr-decay-style WSD), but the CI run is iter-based
-# (--train-iters), and megatron requires iters xor samples — so the sample-based
-# decay horizon is omitted here. Only the LR magnitude (above) is matched.
-lr-decay-samples: 38000
-lr-decay-style: WSD
-lr-warmup-samples: 2000
-lr-wsd-decay-samples: 40000
-train-samples: 51200
-
 high-priority-stream-groups: ep
-moe-grouped-gemm: true

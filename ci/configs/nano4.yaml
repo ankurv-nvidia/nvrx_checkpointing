@@ -79,11 +79,8 @@ manual-gc-interval: 10
 ckpt-fully-parallel-save: true
 ckpt-fully-parallel-load: true
 
-# Perf-only acceleration: CUDA graphs and selective MoE activation recompute.
-# These are active only under the perf flavor; the deterministic and valgrind
-# flavors strip them (see run_job.py DeterministicFlavor/ValgrindFlavor) because
-# graph capture fights --deterministic-mode and valgrind memcheck.
+# Selective MoE activation recompute; the deterministic flavor strips it (it adds
+# compute) and valgrind strips it too. CUDA graphs are enabled in base.yaml for
+# every profile.
 recompute-granularity: selective
 recompute-modules: moe
-cuda-graph-impl: local
-cuda-graph-modules: [mamba, attn, moe_router]

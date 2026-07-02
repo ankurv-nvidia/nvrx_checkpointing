@@ -79,11 +79,11 @@
   create_attention_mask_in_dataloader ............. False
   cross_entropy_fusion_impl ....................... native
   cross_entropy_loss_fusion ....................... True
-  cuda_graph_impl ................................. none
-  cuda_graph_modules .............................. []
+  cuda_graph_impl ................................. local
+  cuda_graph_modules .............................. [<CudaGraphModule.mamba: 6>, <CudaGraphModule.attn: 1>, <CudaGraphModule.moe_router: 4>]
   cuda_graph_warmup_steps ......................... 3
   data_args_path .................................. None
-  data_cache_path ................................. /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/1/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/data-cache
+  data_cache_path ................................. /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/data-cache
   data_parallel_random_init ....................... False
   data_parallel_sharding_strategy ................. optim_grads_params
   data_parallel_size .............................. 1
@@ -286,7 +286,7 @@
   inference_batch_times_seqlen_threshold .......... -1
   inference_coordinator_port ...................... None
   inference_cuda_graph_all_prefills ............... False
-  inference_cuda_graph_scope ...................... InferenceCudaGraphScope.none
+  inference_cuda_graph_scope ...................... InferenceCudaGraphScope.layer
   inference_disable_ep_consensus .................. False
   inference_disable_triton_nvls_kernels ........... False
   inference_dynamic_batching ...................... False
@@ -359,7 +359,7 @@
   linear_value_head_dim ........................... 128
   lion_beta1 ...................................... 0.95
   lion_beta2 ...................................... 0.98
-  load ............................................ /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/1/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/phase1-checkpoints
+  load ............................................ /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/phase1-checkpoints
   load_main_params_from_ckpt ...................... False
   local_rank ...................................... 0
   log_device_memory_used .......................... False
@@ -668,7 +668,7 @@
   rotary_seq_len_interpolation_factor ............. None
   run_workload_inspector_server ................... False
   sample_rate ..................................... 1.0
-  save ............................................ /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/1/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/checkpoints
+  save ............................................ /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/checkpoints
   save_activations_interval ....................... None
   save_dgrads_interval ............................ None
   save_interval ................................... 250
@@ -704,7 +704,7 @@
   te_precision_config_file ........................ None
   te_rng_tracker .................................. True
   tensor_model_parallel_size ...................... 4
-  tensorboard_dir ................................. /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/1/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/tensorboard
+  tensorboard_dir ................................. /lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/ankurv/nemotron6/ci/builds/w_r2WMVmK/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x4/tensorboard
   tensorboard_log_interval ........................ 1
   tensorboard_queue_size .......................... 1000
   test_data_path .................................. None

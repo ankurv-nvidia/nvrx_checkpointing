@@ -79,8 +79,8 @@
   create_attention_mask_in_dataloader ............. False
   cross_entropy_fusion_impl ....................... native
   cross_entropy_loss_fusion ....................... False
-  cuda_graph_impl ................................. none
-  cuda_graph_modules .............................. []
+  cuda_graph_impl ................................. local
+  cuda_graph_modules .............................. [<CudaGraphModule.mamba: 6>, <CudaGraphModule.attn: 1>, <CudaGraphModule.moe_router: 4>]
   cuda_graph_warmup_steps ......................... 3
   data_args_path .................................. None
   data_cache_path ................................. /root/ci/builds/mPDe2Xxxh/0/ankurv/megatron-lm/megatron/native/ci/ci-runs/pico_1x2/data-cache
@@ -286,7 +286,7 @@
   inference_batch_times_seqlen_threshold .......... -1
   inference_coordinator_port ...................... None
   inference_cuda_graph_all_prefills ............... False
-  inference_cuda_graph_scope ...................... InferenceCudaGraphScope.none
+  inference_cuda_graph_scope ...................... InferenceCudaGraphScope.layer
   inference_disable_ep_consensus .................. False
   inference_disable_triton_nvls_kernels ........... False
   inference_dynamic_batching ...................... False
