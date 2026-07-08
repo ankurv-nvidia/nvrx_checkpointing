@@ -357,8 +357,16 @@ class DeterministicFlavor(Flavor):
         # reproducibility); drop only the activation recompute, which adds compute.
         self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
-        # int(): the SLURM --time template wants integer minutes (a float renders as "45.0").
-        recipe.srun_time_min = int(recipe.srun_time_min * 1.5)
+        # The fused Mamba mem-eff kernel (mamba_split_conv1d_scan_combined) ignores
+        # MAMBA_DETERMINISTIC in its backward — it always uses atomic-add reductions.
+        # Routing to the non-fused conv+scan path makes the mamba/conv1d backward honor
+        # MAMBA_DETERMINISTIC=1 (requires mamba-ssm >= 2.3.0, causal-conv1d >= 1.6.0).
+        self._add_flag(recipe.opts, "--disable-mamba-mem-eff-path")
+        # The non-fused mamba path is ~1.3x slower than the fused mem-eff kernel, and the
+        # determinism check runs two full training+save passes back to back; the heaviest
+        # config (nano4 8x4) overran a 45-min --time. --time is a ceiling (jobs finish early),
+        # so provision generously. int(): the template wants integer minutes.
+        recipe.srun_time_min = int(recipe.srun_time_min * 3)
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
@@ -1937,6 +1945,31 @@ def _run_cfg(args: argparse.Namespace, nodes: int, gpus_per_node: int) -> str:
     return f"{args.config}_{nodes}x{gpus_per_node}"
 
 
+def _log_determinism_versions() -> None:
+    """Record, from inside the srun/container environment (rank 0 only), the versions of the
+    packages whose kernels gate reproducibility, plus whether mamba's deterministic path is
+    active. Deterministic mamba/conv1d backward needs mamba-ssm >= 2.3.0 and causal-conv1d
+    >= 1.6.0; older bundled wheels make MAMBA_DETERMINISTIC=1 a silent no-op."""
+    if os.environ.get("SLURM_PROCID", "0") != "0":
+        return
+    from importlib.metadata import version as _pkg_version
+
+    parts: list[str] = []
+    for dist in ("mamba-ssm", "causal-conv1d", "torch", "transformer-engine", "triton"):
+        try:
+            parts.append(f"{dist}={_pkg_version(dist)}")
+        except Exception as exc:  # noqa: BLE001 — diagnostic must never break the run
+            parts.append(f"{dist}=<{type(exc).__name__}>")
+    try:
+        from mamba_ssm.utils.determinism import use_deterministic_mode
+
+        parts.append(f"mamba_deterministic_active={use_deterministic_mode()}")
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"mamba_deterministic_active=<{type(exc).__name__}>")
+    parts.append(f"MAMBA_DETERMINISTIC={os.environ.get('MAMBA_DETERMINISTIC', '<unset>')}")
+    logger.info("[run_job] determinism pkg versions: " + " ".join(parts))
+
+
 class PretrainJob:
     @staticmethod
     def run_pretrain(args: argparse.Namespace) -> None:
@@ -1948,6 +1981,7 @@ class PretrainJob:
         sys_path_insert(megatron_root())
 
         if in_srun():
+            _log_determinism_versions()
             # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
             nodes = int(os.environ.get("SLURM_NNODES", "1"))
             cfg = _run_cfg(args, nodes, args.gpus_per_node)
