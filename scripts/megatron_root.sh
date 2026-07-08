@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeoux pipefail
 
-COMMIT_HASH=773f875607507d4e917502dd99aaf41421312c5d
+COMMIT_HASH=e418294cff7322467e4a1f66e939d44275702f0f
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 
@@ -24,17 +24,27 @@ echo "cloneurl=${cloneurl}" >&2
 
 REPO_ROOT=${SCRIPT_DIR}/..
 MEGATRON_ROOT=${1:-${REPO_ROOT}/../nvrx-megatron-lm}
+
+# Serialize concurrent srun ranks: only the lock holder clones/checks out the pinned
+# commit; the others block here and then observe the ready clone.
+mkdir -p "$(dirname ${MEGATRON_ROOT})"
+exec 9>"${MEGATRON_ROOT}.lock"
+flock 9
+
 if [[ ! -d ${MEGATRON_ROOT} ]]; then
     git clone --quiet ${MEGATRON_REPO_URL} ${MEGATRON_ROOT}
 fi
 
-if [[ "${COMMIT_HASH}" == $(git -C ${MEGATRON_ROOT} rev-parse HEAD) ]]; then
-    echo ${MEGATRON_ROOT}
-    exit 0
+if [[ "${COMMIT_HASH}" != $(git -C ${MEGATRON_ROOT} rev-parse HEAD) ]]; then
+    git -C ${MEGATRON_ROOT} checkout --quiet -- .
+    git -C ${MEGATRON_ROOT} clean --quiet -f -d -x .
+    git -C ${MEGATRON_ROOT} -c remote.neworigin.url=${MEGATRON_REPO_URL} fetch neworigin --quiet ${COMMIT_HASH}
+    git -C ${MEGATRON_ROOT} checkout --quiet ${COMMIT_HASH}
 fi
 
-git -C ${MEGATRON_ROOT} checkout --quiet -- .
-git -C ${MEGATRON_ROOT} clean --quiet -f -d -x . 
-git -C ${MEGATRON_ROOT} -c remote.neworigin.url=${MEGATRON_REPO_URL} fetch neworigin --quiet ${COMMIT_HASH}
-git -C ${MEGATRON_ROOT} checkout --quiet ${COMMIT_HASH}
+# Don't persist the token-embedded URL in the clone's git config.
+if [[ -n "${MEGATRON_CI_TOKEN:-}" || -n "${CI_JOB_TOKEN:-}" ]]; then
+    git -C ${MEGATRON_ROOT} remote set-url origin https://gitlab-master.nvidia.com/ankurv/megatron-lm.git
+fi
+
 echo ${MEGATRON_ROOT}

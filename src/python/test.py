@@ -4,7 +4,7 @@ import threading
 from enum import Enum, auto
 from pathlib import Path
 
-sys.path.append(Path(__file__).parent.parent.parent.parent.parent.as_posix())
+sys.path.append(Path(__file__).parent.parent.parent.parent.as_posix())
 
 import nvrx_checkpointing.checkpoint
 import nvrx_checkpointing.mapping

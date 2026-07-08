@@ -150,7 +150,7 @@ SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx 
 def ensure_vcpkg_root() -> None:
     """Pin the build-dependency root beside the checkout so the in-container build finds it and
     concurrent builds on one runner don't contend on a shared lock."""
-    os.environ.setdefault("VCPKG_ROOT", str(REPO_ROOT.parent.parent.parent / "vcpkg"))
+    os.environ.setdefault("VCPKG_ROOT", (REPO_ROOT.parent / "vcpkg").as_posix())
 
 
 def _is_pretrain_job(job: str) -> bool:
