@@ -2,8 +2,7 @@
 set -Eeoux pipefail
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-MEGATRON_ROOT=${SCRIPT_DIR}/../../..
-REPO_ROOT=${SCRIPT_DIR}/..
+MEGATRON_ROOT=$(${SCRIPT_DIR}/megatron_root.sh)
 ARCH=$(uname -m)
 
 declare -A CUDA_REPOS=()

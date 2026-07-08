@@ -13,10 +13,10 @@ stages:
     max: 1
     when: runner_system_failure
   variables:
-    CI_SCRIPTS_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/scripts"
-    BASELINES_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/baselines"
-    RESULTS_DIR: "${CI_PROJECT_DIR}/megatron/native/ci/ci-results"
-    METADATA_DIR: "${CI_PROJECT_DIR}/megatron/native/metadata"
+    CI_SCRIPTS_DIR: "${CI_PROJECT_DIR}/ci/scripts"
+    BASELINES_DIR: "${CI_PROJECT_DIR}/ci/baselines"
+    RESULTS_DIR: "${CI_PROJECT_DIR}/ci/ci-results"
+    METADATA_DIR: "${CI_PROJECT_DIR}/metadata"
   before_script:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
@@ -53,24 +53,24 @@ stages:
   script:
     - python3 "${CI_SCRIPTS_DIR}/run_job.py" ${JOB_ARGS} || exit $?
   after_script:
-    - du -h megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+    - du -h ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
     # Soft-stop any leftover checkpoint_server so it doesn't hold the per-node port and trip the
     # next job (runner 16.11.1+ runs after_script on cancel; a no-op when none is listening).
     - curl -s --max-time 5 http://127.0.0.1:41000/api/stop || true
   artifacts:
     paths:
-      - megatron/native/ci/ci-results/*.log
-      - megatron/native/ci/ci-results/*_report.json
+      - ci/ci-results/*.log
+      - ci/ci-results/*_report.json
       # Resolved Megatron arguments block per config+flavor (committed to baselines by update_baselines).
-      - megatron/native/ci/ci-results/*_arguments.txt
+      - ci/ci-results/*_arguments.txt
       # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/registry.bin
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/*.txt
+      - ci/ci-runs/*/checkpoints/iter_*/registry.bin
+      - ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/checkpoints/iter_*/*.txt
       # Raw .metadata pickles — the only survivor if the trace raises before writing.
-      - megatron/native/ci/ci-runs/*/checkpoints/iter_*/.metadata
+      - ci/ci-runs/*/checkpoints/iter_*/.metadata
       # nvrx run-1 reference, parked for an offline cross-run diff on mismatch.
-      - megatron/native/ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
+      - ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
     expire_in: 30 days
     when: always
 
@@ -124,7 +124,7 @@ generate-native-pipeline:
   # perflab's default image lacks python3; the slim image has the stdlib this needs.
   image: python:3.12-slim
   script:
-    - python3 "${CI_PROJECT_DIR}/megatron/native/ci/generate-ci.py"
+    - python3 "${CI_PROJECT_DIR}/ci/generate-ci.py"
   artifacts:
     paths: [generated-*.yml]
 

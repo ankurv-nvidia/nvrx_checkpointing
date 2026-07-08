@@ -190,7 +190,7 @@ CachedTypes const& CachedTypesGet()
     static CachedTypes Types = []() {
         nb::gil_scoped_acquire acquire;
         auto                   torchModule   = nb::module_::import_("torch");
-        auto                   mappingModule = nb::module_::import_("megatron.native.mapping");
+        auto                   mappingModule = nb::module_::import_("nvrx_checkpointing.mapping");
         return CachedTypes{
             .torchTensor                 = torchModule.attr("Tensor"),
             .torchDtype                  = torchModule.attr("dtype"),

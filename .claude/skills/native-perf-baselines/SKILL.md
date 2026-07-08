@@ -6,7 +6,7 @@ when_to_use: A native CI pipeline has yellow/exit-3 perf-drift warnings on gb200
 
 # Native Perf Baselines — reseed & NUMA diagnosis
 
-Reseed the `megatron/native/ci/baselines/*.yaml` perf baselines so the
+Reseed the `ci/baselines/*.yaml` perf baselines so the
 ckptbench / `pretrain-native:perf` jobs stop tripping the non-blocking exit-3
 perf-drift check, then open a draft MR. Also: diagnose run-to-run variance by
 breaking the aggregate `bw_mbps` into its per-rank samples and per-NUMA-socket
@@ -43,11 +43,11 @@ NUMA analysis."* (URL optional; default to the latest pipeline on `ankurv/main`.
 
 ```bash
 export GITLAB_TOKEN_FILE=/path/to/your/gitlab_token   # or: export GITLAB_TOKEN=glpat-...
-source megatron/native/.claude/skills/native-perf-baselines/perf_baseline_tools.sh   # pstatus/pwatch/perrank/numa/...
+source .claude/skills/native-perf-baselines/perf_baseline_tools.sh   # pstatus/pwatch/perrank/numa/...
 ```
 Token: set `GITLAB_TOKEN` (value) or `GITLAB_TOKEN_FILE` (path) before sourcing. Project `ankurv/megatron-lm` on
 `gitlab-master.nvidia.com`. The project `ci_config_path` is
-`megatron/native/ci/gitlab-ci-native.yml` (no `workflow:` rules), so **any push
+`ci/gitlab-ci-native.yml` (no `workflow:` rules), so **any push
 to any branch triggers a full pipeline** running the auto (non-manual) jobs.
 
 ## The jobs & baseline mechanism

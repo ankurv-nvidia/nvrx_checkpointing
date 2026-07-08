@@ -40,8 +40,8 @@ logger = logging.getLogger("native_ci")
 
 
 def _ckptbench_binary() -> Path:
-    sys.path.insert(0, Path(__file__).parent.parent.parent.parent.parent.as_posix())
-    import megatron.native as _native  # noqa: F401, PLC0415 — triggers CMake build
+    sys.path.insert(0, Path(__file__).parent.parent.parent.parent.as_posix())
+    import nvrx_checkpointing as _native  # noqa: F401, PLC0415 — triggers CMake build
 
     native_dir = REPO_ROOT
     build_dir = (

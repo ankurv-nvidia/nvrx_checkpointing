@@ -52,13 +52,13 @@ from pathlib import Path
 
 
 def main(checkpoint_dir: Path, baseline_dir: Path, provider: str) -> int:
-    import megatron.native.debug  # noqa: PLC0415 — defer until argparse done so --help is fast
+    import nvrx_checkpointing.debug  # noqa: PLC0415 — defer until argparse done so --help is fast
 
     try:
         # verify_native_server=False for both providers — this script's only job
         # is the trace-vs-baseline diff; the server-claim check is a separate
         # diagnostic available via distcp_trace's CLI for offline debugging.
-        megatron.native.debug.distcp_trace(
+        nvrx_checkpointing.debug.distcp_trace(
             checkpoint_dir,
             extract_tensor_data=False,
             verify_native_server=False,
@@ -88,7 +88,7 @@ def main(checkpoint_dir: Path, baseline_dir: Path, provider: str) -> int:
         return 1
 
     try:
-        diff_count = megatron.native.debug.compare_reference_metadata(checkpoint_dir, baseline_dir)
+        diff_count = nvrx_checkpointing.debug.compare_reference_metadata(checkpoint_dir, baseline_dir)
     except Exception as ex:  # noqa: BLE001
         print(f"FAIL (compare): {type(ex).__name__}: {ex}", file=sys.stderr)  # noqa: T201
         return 1

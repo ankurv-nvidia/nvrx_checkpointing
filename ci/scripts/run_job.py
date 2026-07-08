@@ -116,8 +116,9 @@ def image_path() -> Path:
 
 
 def megatron_root() -> Path:
-    """Path to the megatron-lm repo root (holds megatron.core / megatron.training)."""
-    return ENROOT_SCRIPTS_DIR.parent.parent.parent.resolve()
+    """Path to the megatron"""
+    out = subprocess.check_output(["bash", (ENROOT_SCRIPTS_DIR / "megatron_root.sh").as_posix()], text=True)  # noqa: S607
+    return Path(out.strip()).resolve()
 
 
 def _triton_cache_dir() -> Path:
@@ -532,9 +533,9 @@ class ValgrindFlavor(Flavor):
 
     @staticmethod
     def _binary() -> Path:
-        import megatron.native as _native  # noqa: PLC0415 — triggers CMake build
+        import nvrx_checkpointing  # noqa: PLC0415 — triggers CMake build
 
-        binary = _native.SERVER_PATH
+        binary = nvrx_checkpointing.SERVER_PATH
         if not binary.is_file():
             raise FileNotFoundError(f"checkpoint_server not found at {binary}")
         return binary
@@ -1659,7 +1660,7 @@ class PerfReport:
                 [
                     sys.executable,
                     "-m",
-                    "megatron.native.scripts.metadata_compare",
+                    "nvrx_checkpointing.scripts.metadata_compare",
                     "--checkpoint-dir",
                     str(iter_dir),
                     "--baseline-dir",
@@ -2476,7 +2477,7 @@ class PretrainJob:
         """Probe the per-node checkpoint server when a training rank fails. Pings its port and,
         only when the failure implicates the server, dumps its log (if dead) or its stack (if alive
         but stuck); stays quiet otherwise. One probe per node; never raises."""
-        from megatron.native.ckpt_diag import diagnose_checkpoint_server_failure  # noqa: PLC0415
+        from nvrx_checkpointing.ckpt_diag import diagnose_checkpoint_server_failure  # noqa: PLC0415
 
         diagnose_checkpoint_server_failure(exc, log_dir=RESULTS_DIR)
 

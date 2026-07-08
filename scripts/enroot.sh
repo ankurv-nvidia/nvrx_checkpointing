@@ -31,7 +31,7 @@ else
     SCRIPT_PATH=$(realpath "$0")
 fi
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
-MEGATRON_ROOT=${SCRIPT_DIR}/../../..
+MEGATRON_ROOT=$(${SCRIPT_DIR}/megatron_root.sh)
 DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.04-py3"
 # First 10 hex chars of sha256(prepare.sh) — must match _prepare_sh_hash() in
 # ci/scripts/run_job.py so both paths agree on the filename.

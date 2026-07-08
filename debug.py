@@ -196,18 +196,18 @@ def flatten_to_entries(prefix: str, obj: object, entries: dict, visited: set[int
 
 def try_ping() -> None:
     try:
-        import megatron.native.checkpoint  # noqa: PLC0415
+        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
 
-        megatron.native.checkpoint.ping()
+        nvrx_checkpointing.checkpoint.ping()
     except ImportError:
         pass
 
 
 def svc_stop() -> None:
     try:
-        import megatron.native.checkpoint  # noqa: PLC0415
+        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
 
-        megatron.native.checkpoint.svc_stop()
+        nvrx_checkpointing.checkpoint.svc_stop()
     except ImportError:
         pass
 
@@ -220,9 +220,9 @@ def svc_spindown() -> None:
     hard stop; None lets the server apply its own default bound.
     """
     try:
-        import megatron.native.checkpoint  # noqa: PLC0415
+        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
 
-        megatron.native.checkpoint.svc_spindown()
+        nvrx_checkpointing.checkpoint.svc_spindown()
     except ImportError:
         pass
 
