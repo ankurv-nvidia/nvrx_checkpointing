@@ -6,7 +6,7 @@ srun
   --mem=0
   --nodes=1
   --gpus-per-node=${gpus_per_node}
-  --container-mounts=${home}:${home},${home}:/root,/lustre:/lustre
+  --container-mounts=${home}:${home},${root}:/root,/lustre:/lustre
   --container-image=${image_base}
   --container-save=${image_out}
   --container-writable

@@ -48,3 +48,7 @@ ignore = [
 markers = [
     "integration: requires the full checkpoint_server subprocess + IPC; gate via MEGATRON_NATIVE_RUN_SERVER_TESTS=1",
 ]
+
+[build-system]
+requires = ["cmake_pywhl"]
+build-backend = "cmake_pywhl.build"

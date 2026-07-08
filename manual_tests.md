@@ -1,10 +1,10 @@
 # oci-hsg
 
-git -C ~/data/megatron-lm/ pull; rm -rf ~/data/megatron-lm/runs/checkpoints/; bash ~/data/megatron-lm/megatron/native/scripts/enroot.sh run |& tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/data/megatron-lm/megatron/native/perf-rslt-ocihsg.log &
+git -C ~/data/megatron-lm/ pull; rm -rf ~/data/megatron-lm/runs/checkpoints/; bash ~/data/megatron-lm/scripts/enroot.sh run |& tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/data/megatron-lm/perf-rslt-ocihsg.log &
 
 # cw-dfw
 
-git -C ~/data/megatron-lm/ pull; rm -rf ~/data/megatron-lm/runs/checkpoints/; bash ~/data/megatron-lm/megatron/native/scripts/enroot.sh run |&  tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/data/megatron-lm/megatron/native/perf-rslt-cwdfw.log &
+git -C ~/data/megatron-lm/ pull; rm -rf ~/data/megatron-lm/runs/checkpoints/; bash ~/data/megatron-lm/scripts/enroot.sh run |&  tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/data/megatron-lm/perf-rslt-cwdfw.log &
 
 ```
 Notes for a 32GB buffer
@@ -24,4 +24,4 @@ Pinned buffer registration time : ~9s on first attempt for 32GB buffer and 3s on
 
 # devbox
 
-rm -rf ~/megatron-lm/runs/checkpoints/; bash ~/megatron-lm/megatron/native/scripts/run.sh |& tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/megatron-lm/megatron/native/perf-rslt-devbox.log &
+rm -rf ~/megatron-lm/runs/checkpoints/; bash ~/megatron-lm/scripts/run.sh |& tee /tmp/out.log |& grep -E 'native_ckpt.*perf' > ~/megatron-lm/perf-rslt-devbox.log &

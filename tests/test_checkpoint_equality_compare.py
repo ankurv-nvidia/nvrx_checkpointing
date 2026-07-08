@@ -35,8 +35,8 @@ class _RunMode(enum.Enum):
 
 # `scripts/` is a sibling directory of `tests/`, not a Python package, so we
 # load `checkpoint_equality_compare.py` directly via `importlib`. Going via
-# `from megatron.native.scripts...` would trigger the CMake autobuild in
-# `megatron/native/__init__.py`, which the C++ tests use but a pure-Python
+# `from nvrx_checkpointing.scripts...` would trigger the CMake autobuild in
+# `__init__.py`, which the C++ tests use but a pure-Python
 # unit test should sidestep.
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "checkpoint_equality_compare.py"
 _spec = importlib.util.spec_from_file_location("checkpoint_equality_compare", _SCRIPT_PATH)

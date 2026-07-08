@@ -74,7 +74,7 @@ def build_native_extensions() -> None:
         shlib_realpath = SHLIB_PATH.readlink().absolute()
         if not shlib_realpath.is_relative_to(native_build_dir.absolute()):
             sys.stderr.write(
-                f"[megatron.native] Native extension path {shlib_realpath} "
+                f"[nvrx_checkpointing] Native extension path {shlib_realpath} "
                 f"is not within auto-build dir {native_build_dir}, skipping auto-build.\n",
             )
             return
@@ -86,12 +86,12 @@ def build_native_extensions() -> None:
         return
 
     if rank is not None and rank != 0:
-        sys.stderr.write(f"[megatron.native] src_hash={CURRENT_HASH} rank={rank}: waiting for rank 0 to complete native build...\n")
+        sys.stderr.write(f"[nvrx_checkpointing] src_hash={CURRENT_HASH} rank={rank}: waiting for rank 0 to complete native build...\n")
         while True:
             if hash_file.is_file() and hash_file.read_text().strip() == build_native_extensions.CURRENT_HASH:
                 break
             time.sleep(1)
-        sys.stderr.write(f"[megatron.native] src_hash={CURRENT_HASH} rank={rank}: native build complete.\n")
+        sys.stderr.write(f"[nvrx_checkpointing] src_hash={CURRENT_HASH} rank={rank}: native build complete.\n")
         return
 
     cmake_exe = shutil.which("cmake")
@@ -112,7 +112,7 @@ def build_native_extensions() -> None:
         check=True,
     )
     subprocess.run([cmake_exe, "--build", str(native_build_dir), "-j16"], check=True)
-    sys.stderr.write(f"[megatron.native] src_hash={CURRENT_HASH} rank={rank}: native build complete.\n")
+    sys.stderr.write(f"[nvrx_checkpointing] src_hash={CURRENT_HASH} rank={rank}: native build complete.\n")
     # Write hash file to signal to waiting ranks that the build is complete.
     hash_file.write_text(build_native_extensions.CURRENT_HASH)
 
@@ -121,8 +121,8 @@ if _is_git_repo():
     build_native_extensions()
 
 if not SHLIB_PATH.is_file():
-    raise RuntimeError("[megatron.native] extensions were not built successfully.")
+    raise RuntimeError("[nvrx_checkpointing] extensions were not built successfully.")
 if not SERVER_PATH.is_file():
     raise RuntimeError(
-        "[megatron.native] checkpoint_server was not built successfully.",
+        "[nvrx_checkpointing] checkpoint_server was not built successfully.",
     )

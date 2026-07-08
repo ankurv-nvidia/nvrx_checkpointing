@@ -5,7 +5,7 @@ srun
   --time=00:${time_minutes}:00
   --mem=0
   --gpus-per-node=${gpus_per_node}
-  --container-mounts=${home}:${home},${home}:/root,/lustre:/lustre,/scratch:/scratch
+  --container-mounts=${home}:${home},${root}:/root,/lustre:/lustre,/scratch:/scratch
   --container-image=${image_base}
   --container-save=${image_out}
   --container-writable

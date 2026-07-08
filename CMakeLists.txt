@@ -27,7 +27,9 @@ if (APPLE)
     endif()
 endif()
 
-option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"         ON)
+option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"      ON)
+option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         OFF)
+
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"         ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"  OFF)
 option(PHOENIX_BUILD_FOR_PERF "Build with full perf at the cost of increased resource usage" OFF)
@@ -38,6 +40,10 @@ DetectVar(PHOENIX_BUILD_FOR_VALGRIND OFF)
 
 if (PHOENIX_BUILD_FOR_PERF AND PHOENIX_BUILD_FOR_VALGRIND)
     message(FATAL_ERROR "PHOENIX_BUILD_FOR_PERF and PHOENIX_BUILD_FOR_VALGRIND are mutually exclusive")
+endif()
+
+if (PHOENIX_BUILD_WHEEL AND NOT PHOENIX_BUILD_PYTHON_BINDINGS)
+    message(FATAL_ERROR "PHOENIX_BUILD_WHEEL requires PHOENIX_BUILD_PYTHON_BINDINGS")
 endif()
 
 if (PHOENIX_BUILD_FOR_VALGRIND)
@@ -329,4 +335,33 @@ if (PHOENIX_BUILD_TESTS)
                 MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
     endif()
+endif()
+
+if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
+    pip_install(cmake-pywhl)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import cmake_pywhl.build,pathlib; print(pathlib.Path(cmake_pywhl.build.__file__).parent)"
+        OUTPUT_VARIABLE PyWhl_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+
+    find_package(PyWhl CONFIG REQUIRED)
+    add_pywhl_module(nvrx_checkpointing
+        TARGETS
+            checkpoint_server
+            checkpoint
+        SCRIPTS
+            __init__.py
+            ckpt_diag.py
+            debug.py
+            mapping.py
+            tools.py
+    )
+
+    add_pywhl_package(nvrx_checkpointing
+        VERSION "${PROJECT_VERSION}"
+        MODULES nvrx_checkpointing
+        LICENSE_FILE LICENSE
+    )
 endif()

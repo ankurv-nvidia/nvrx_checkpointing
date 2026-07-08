@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MEGATRON_ROOT = (SCRIPT_DIR / "../../../..").resolve()
+REPO_ROOT = (SCRIPT_DIR / "../..").resolve()
 BASELINES_DIR = (SCRIPT_DIR / "../baselines").resolve()
 CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
 logger = logging.getLogger("native_ci")
@@ -64,18 +64,24 @@ logger = logging.getLogger("native_ci")
 # artifact and is not mirrored into the baseline tree.
 _CKPTBENCH_REGISTRY_CFG = "pico_1x2"
 _CKPTBENCH_REGISTRY_ITER = "0000250"
-CKPTBENCH_REGISTRY = (
-    MEGATRON_ROOT / "megatron/native/metadata" / f"{_CKPTBENCH_REGISTRY_CFG}_checkpoints_iter_{_CKPTBENCH_REGISTRY_ITER}" / "registry.bin"
-)
+CKPTBENCH_REGISTRY = REPO_ROOT / "metadata" / f"{_CKPTBENCH_REGISTRY_CFG}_checkpoints_iter_{_CKPTBENCH_REGISTRY_ITER}" / "registry.bin"
 
 # Sentinel first arg that re-enters this script as the in-process training entry, so the
 # launched and in-process paths share one code path.
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
 
-sys.path.insert(0, str(MEGATRON_ROOT))
-
-ENROOT_SCRIPTS_DIR = (MEGATRON_ROOT / "megatron/native/scripts").resolve()
+ENROOT_SCRIPTS_DIR = (REPO_ROOT / "scripts").resolve()
 DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.04-py3")
+
+
+def sys_path_insert(path: Path) -> None:
+    """Insert a path into sys.path if not already present, using the path's as_posix() form."""
+    p = path.as_posix()
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    pythonpath = os.environ.get("PYTHONPATH", "").split(":")
+    if p not in pythonpath:
+        os.environ["PYTHONPATH"] = ":".join([p, *pythonpath])
 
 
 def wait_for_file(path: Path, timeout_seconds: int) -> None:
@@ -109,6 +115,11 @@ def image_path() -> Path:
     return Path(os.environ.get("ENROOT_IMAGE", _default_enroot_image()))
 
 
+def megatron_root() -> Path:
+    """Path to the megatron-lm repo root (holds megatron.core / megatron.training)."""
+    return ENROOT_SCRIPTS_DIR.parent.parent.parent.resolve()
+
+
 def _triton_cache_dir() -> Path:
     """Node-local kernel cache. A shared-filesystem cache races across nodes (a kernel written
     on one node isn't yet visible on another), so each node gets its own under local storage."""
@@ -125,10 +136,7 @@ def platform_tag() -> str:
     return tag or socket.gethostname().split(".")[0]
 
 
-# Put the repo root on the import path so imports work however the script is invoked.
-if str(MEGATRON_ROOT) not in sys.path:
-    sys.path.insert(0, str(MEGATRON_ROOT))
-RESULTS_DIR = MEGATRON_ROOT / "megatron" / "native" / "ci" / "ci-results"
+RESULTS_DIR = REPO_ROOT / "ci" / "ci-results"
 PERF_TOLERANCE = 0.05  # 5% tolerance — both regressions and improvements beyond this fail
 # Max tolerated bandwidth ratio between the two socket halves; a breach means a
 # per-socket imbalance has returned.
@@ -141,7 +149,7 @@ SOFT_FAIL_RC = 3  # exit code for a tolerated soft fail (perf regression / nvrx 
 def ensure_vcpkg_root() -> None:
     """Pin the build-dependency root beside the checkout so the in-container build finds it and
     concurrent builds on one runner don't contend on a shared lock."""
-    os.environ.setdefault("VCPKG_ROOT", str(MEGATRON_ROOT.parent / "vcpkg"))
+    os.environ.setdefault("VCPKG_ROOT", str(REPO_ROOT.parent.parent.parent / "vcpkg"))
 
 
 def _is_pretrain_job(job: str) -> bool:
@@ -516,9 +524,9 @@ class ValgrindFlavor(Flavor):
 
     @staticmethod
     def _binary() -> Path:
-        import megatron.native as _native  # noqa: F401, PLC0415 — triggers CMake build
+        import megatron.native as _native  # noqa: PLC0415 — triggers CMake build
 
-        binary = MEGATRON_ROOT / "megatron/native/checkpoint_server"
+        binary = _native.SERVER_PATH
         if not binary.is_file():
             raise FileNotFoundError(f"checkpoint_server not found at {binary}")
         return binary
@@ -561,7 +569,7 @@ class ValgrindFlavor(Flavor):
             CheckpointServer.request_server_stop()
             # Primary gate: wait for exit, bounded by checkpoint-file activity. A stall re-stops
             # then kills the server (hard failure); a non-zero clean exit is failed by the check below.
-            ckpt_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs" / ctx.cfg
+            ckpt_root = REPO_ROOT / "ci/ci-runs" / ctx.cfg
             rc, stalled = self._await_server_exit(proc, ckpt_root)
             ctx.valgrind_rc = rc  # record before cleanup so epilog sees it even if cleanup raises
             watcher.join(timeout=5)
@@ -931,6 +939,7 @@ def build_srun_cmd(  # noqa: PLR0913
         "image": image,
         "container_env": container_env,
         "home": Path.home().as_posix(),
+        "root": Path(image).parent.as_posix(),
         "account": account,
         "partition": os.environ.get("SLURM_PARTITION", "interactive"),
     }
@@ -1089,7 +1098,7 @@ class CheckpointServer:
     def _report_native_checkpoint_files(cfg: str) -> None:
         """Confirm each saved checkpoint is non-empty and log every file's size. The graceful
         spin-down returns only once writes are flushed, so the files are final by the time we look."""
-        ckpt_root = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
+        ckpt_root = REPO_ROOT / f"ci/ci-runs/{cfg}/checkpoints"
         iter_dirs = sorted(d for d in ckpt_root.glob("iter_*") if d.is_dir()) if ckpt_root.is_dir() else []
         if not iter_dirs:
             raise FileNotFoundError(f"no checkpoints found under {ckpt_root}")
@@ -1619,16 +1628,14 @@ class PerfReport:
         hard-fails on mismatch, nvrx soft-fails. Each compare runs as a subprocess for env parity."""
         strict_on_mismatch = provider == "native"
 
-        ckpt_root = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
-        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
+        ckpt_root = REPO_ROOT / f"ci/ci-runs/{cfg}/checkpoints"
+        metadata_root = REPO_ROOT / "metadata"
         iter_dirs = sorted(ckpt_root.glob("iter_*"))
         if not iter_dirs:
             raise RuntimeError(f"no iter_* dirs in {ckpt_root}")
-        # Thread MEGATRON_ROOT onto PYTHONPATH so `-m megatron.native.scripts.*` resolves
+        # Thread REPO_ROOT onto PYTHONPATH so `-m nvrx_checkpointing.scripts.*` resolves
         # regardless of cwd (CI launches from $CI_PROJECT_DIR; manual runs don't).
         env = os.environ.copy()
-        existing_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{MEGATRON_ROOT}{os.pathsep}{existing_pp}" if existing_pp else str(MEGATRON_ROOT)
         # srun --container-env can mangle TORCHINDUCTOR_WORKER_START into a value newer
         # torch._inductor rejects; set it explicitly for the compare subprocesses.
         env["TORCHINDUCTOR_WORKER_START"] = "fork"
@@ -1689,10 +1696,10 @@ class BaselineUpdater:
         gflag = f"--gpus-per-node {gpus_per_node}"
         flavor_flags = "".join(f" --flavor {f}" for f in flavor_tag.split("-") if f)
         if job == "ckptbench":
-            script = "python3 megatron/native/ci/scripts/ckptbench.py"
+            script = "python3 ci/scripts/ckptbench.py"
             flags = f"--slurm {gflag}"
         else:
-            script = "python3 megatron/native/ci/scripts/run_job.py"
+            script = "python3 ci/scripts/run_job.py"
             # config is the run key "{profile}_NxG" (e.g. pico_1x2, nano3_8x4); recover the
             # profile and node count for a runnable reproducer command.
             m = re.match(r"^(?P<profile>.+)_(?P<nodes>\d+)x(?P<gpus>\d+)$", config)
@@ -1869,14 +1876,7 @@ class BaselineUpdater:
         other configs' registry.bin files stay runtime-only."""
         if filter_config not in (None, _CKPTBENCH_REGISTRY_CFG):
             return
-        src = (
-            MEGATRON_ROOT
-            / "megatron/native/ci/ci-runs"
-            / _CKPTBENCH_REGISTRY_CFG
-            / "checkpoints"
-            / f"iter_{_CKPTBENCH_REGISTRY_ITER}"
-            / "registry.bin"
-        )
+        src = REPO_ROOT / "ci/ci-runs" / _CKPTBENCH_REGISTRY_CFG / "checkpoints" / f"iter_{_CKPTBENCH_REGISTRY_ITER}" / "registry.bin"
         if not src.is_file():
             # filter_config=None means "update whatever ran"; the registry's config may
             # not have run in this batch, so skip silently. An explicit request for it must
@@ -1895,8 +1895,8 @@ class BaselineUpdater:
     def _update_nvrx_baseline_files(filter_config: str | None) -> None:
         """Refresh the checked-in per-tensor md5 baseline (one file per iteration) from the
         latest run's output — the reference both providers compare against."""
-        metadata_root = MEGATRON_ROOT / "megatron/native/metadata"
-        ci_runs_root = MEGATRON_ROOT / "megatron/native/ci/ci-runs"
+        metadata_root = REPO_ROOT / "metadata"
+        ci_runs_root = REPO_ROOT / "ci/ci-runs"
         iter_pattern = re.compile(r"^iter_(\d{7})$")
         # Matches the "{profile}_NxG" ci-runs dirs (e.g. pico_1x4, nano4_8x4).
         cfg_pattern = re.compile(r"^.+_\d+x\d+$")
@@ -1944,6 +1944,9 @@ class PretrainJob:
         cfg = _run_cfg(args, args.nodes, args.gpus_per_node)
         extra_args = getattr(args, "extra_args", None)
 
+        sys_path_insert(REPO_ROOT.parent)
+        sys_path_insert(megatron_root())
+
         if in_srun():
             # GPUs-per-node arrives on argv (round-tripping it through the container env corrupted it).
             nodes = int(os.environ.get("SLURM_NNODES", "1"))
@@ -1970,7 +1973,7 @@ class PretrainJob:
         # Clear stale checkpoints once in the launcher so in-srun tasks don't race on rmtree.
         # Both phase dirs are cleared so phase 1 always starts from random init.
         for stale in (
-            MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints",
+            REPO_ROOT / f"ci/ci-runs/{cfg}/checkpoints",
             PretrainJob._phase1_ckpt_dir(cfg),
         ):
             if stale.exists():
@@ -2064,7 +2067,7 @@ class PretrainJob:
     @staticmethod
     def _phase1_ckpt_dir(cfg: str) -> Path:
         """Phase 1's own checkpoint dir, kept apart so the measured dir holds only later checkpoints."""
-        return MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/phase1-checkpoints"
+        return REPO_ROOT / f"ci/ci-runs/{cfg}/phase1-checkpoints"
 
     @staticmethod
     def _wait_for_phase1_checkpoint(cfg: str, timeout_seconds: int = 1800) -> None:
@@ -2087,7 +2090,7 @@ class PretrainJob:
     ) -> tuple[list[str], dict]:
         """Build the command and env to run the pretrain entry on a compute node. The first phase
         trains from scratch and saves; the second loads that and saves the measured checkpoints."""
-        run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
+        run_dir = REPO_ROOT / f"ci/ci-runs/{cfg}"
         ckpt_dir = run_dir / "checkpoints"
         phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
         tb_dir = run_dir / "tensorboard"
@@ -2236,7 +2239,7 @@ class PretrainJob:
         """Run pretrain in-process for single-GPU runs, tee'ing output so the perf check can parse it."""
         args, cfg = ctx.args, ctx.cfg
         nodes, gpus_per_node = args.nodes, args.gpus_per_node
-        run_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}"
+        run_dir = REPO_ROOT / f"ci/ci-runs/{cfg}"
         ckpt_dir = run_dir / "checkpoints"
         tb_dir = run_dir / "tensorboard"
         datacache = run_dir / "data-cache"
@@ -2308,8 +2311,8 @@ class PretrainJob:
         """Call pretrain directly — in the calling process for one GPU, via spawned workers for more."""
         import time  # noqa: PLC0415
 
-        if str(MEGATRON_ROOT) not in sys.path:
-            sys.path.insert(0, str(MEGATRON_ROOT))
+        sys_path_insert(REPO_ROOT.parent)
+        sys_path_insert(megatron_root())
 
         program_start = time.time()
 
@@ -2367,6 +2370,9 @@ class PretrainJob:
         (a phase banner up front and peak-memory on exit), emitted on rank 0 only."""
         import time  # noqa: PLC0415
         from functools import partial  # noqa: PLC0415
+
+        sys_path_insert(REPO_ROOT.parent)
+        sys_path_insert(megatron_root())
 
         from megatron.core.enums import ModelType  # noqa: PLC0415
         from megatron.training import inprocess_restart, pretrain, set_startup_timestamps  # noqa: PLC0415
@@ -2446,9 +2452,9 @@ class PretrainJob:
         determinism gate. A soft-fail against the seeded baseline is tolerated; the cross-run diff
         is what gates."""
         extra_args = getattr(args, "extra_args", None)
-        ckpt_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/checkpoints"
+        ckpt_dir = REPO_ROOT / f"ci/ci-runs/{cfg}/checkpoints"
         phase1_dir = PretrainJob._phase1_ckpt_dir(cfg)
-        sidecar_dir = MEGATRON_ROOT / f"megatron/native/ci/ci-runs/{cfg}/run1-references"
+        sidecar_dir = REPO_ROOT / f"ci/ci-runs/{cfg}/run1-references"
         machine = platform_tag()
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         cmd = PretrainJob._build_pretrain_srun_cmd(
@@ -2621,7 +2627,7 @@ def main() -> None:
     )
     args, extra_args = p.parse_known_args()
     args.extra_args = extra_args
-    ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
+    ensure_vcpkg_root()  # before any `import nvrx_checkpointing` triggers the CMake build
     # Honor the runner's configured scheduler mode (SLURM_ACCOUNT set => SLURM),
     # so the CI YAML needn't pass --slurm in JOB_ARGS.
     if runner_uses_slurm():

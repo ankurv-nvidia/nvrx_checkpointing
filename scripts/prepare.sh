@@ -3,6 +3,7 @@ set -Eeoux pipefail
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 MEGATRON_ROOT=${SCRIPT_DIR}/../../..
+REPO_ROOT=${SCRIPT_DIR}/..
 ARCH=$(uname -m)
 
 declare -A CUDA_REPOS=()
@@ -88,7 +89,7 @@ function fedora {
 }
 
 function test {
-    bash ${MEGATRON_ROOT}/megatron/native/scripts/run.sh
+    bash ${SCRIPT_DIR}/run.sh
 }
 
 function pytorch {
@@ -121,6 +122,7 @@ function ubuntu2404 {
         clangd-${CLANG_VERSION}
         llvm-${CLANG_VERSION}
         gdb
+        strace
         cmake
         mold
         ninja-build
@@ -192,11 +194,12 @@ function container {
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/cache/dnf \
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/lib/dnf \
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/lib/apt \
-        -v ${MEGATRON_ROOT}/..:/root \
+        -v ${MEGATRON_ROOT}:/root/megatron-lm \
+        -v ${REPO_ROOT}:/root/nvrx_checkpointing \
         -d -it ${BASE_IMAGE} \
         bash
 
-    podman exec -it ${CONTAINER_NAME}-build bash /root/megatron-lm/megatron/native/scripts/prepare.sh $*
+    podman exec -it ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
 
     podman commit ${CONTAINER_NAME}-build ${CONTAINER_NAME}-image
     podman run --name ${CONTAINER_NAME} --shm-size=34g --cap-add=SYS_PTRACE --replace ${PODMAN_DEVICES_ARG} --security-opt=label=disable -v ${MEGATRON_ROOT}/..:/root -d -it ${CONTAINER_NAME}-image bash
@@ -227,8 +230,9 @@ function megatron {
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
     curl -LsSf https://astral.sh/uv/install.sh | sh
     source $HOME/.local/bin/env
+    # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
+    # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
-    uv pip install --system --no-cache --break-system-packages pybind11 poetry poetry_dynamic_versioning grpcio-tools
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models

@@ -19,7 +19,7 @@ from pathlib import Path
 from run_job import (  # companion script, shares run_job's build helpers
     BASELINES_DIR,
     CKPTBENCH_REGISTRY,
-    MEGATRON_ROOT,
+    REPO_ROOT,
     RESULTS_DIR,
     SOFT_FAIL_RC,
     CheckpointServer,
@@ -40,9 +40,10 @@ logger = logging.getLogger("native_ci")
 
 
 def _ckptbench_binary() -> Path:
+    sys.path.insert(0, Path(__file__).parent.parent.parent.parent.parent.as_posix())
     import megatron.native as _native  # noqa: F401, PLC0415 — triggers CMake build
 
-    native_dir = MEGATRON_ROOT / "megatron/native"
+    native_dir = REPO_ROOT
     build_dir = (
         Path(os.environ["MEGATRON_NATIVE_BUILD_DIR"]).resolve() if os.environ.get("MEGATRON_NATIVE_BUILD_DIR") else native_dir / "build"
     )
@@ -135,7 +136,7 @@ def main() -> None:
     args, extra_args = p.parse_known_args()
     args.extra_args = extra_args
     args.flavor_tag = ""
-    ensure_vcpkg_root()  # before any `import megatron.native` triggers the CMake build
+    ensure_vcpkg_root()  # before any `import nvrx_checkpointing` triggers the CMake build
     # Honor the runner's configured scheduler mode (SLURM_PARTITION set => SLURM).
     if runner_uses_slurm():
         args.slurm = True

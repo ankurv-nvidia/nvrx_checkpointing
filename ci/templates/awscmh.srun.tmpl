@@ -8,5 +8,5 @@ srun
   --mem=0
   --job-name=${job_name}
   --container-image=${image}
-  --container-mounts=${home}:${home},/lustre:/lustre,/scratch:/scratch
+  --container-mounts=${home}:${home},${root}:/root,/lustre:/lustre,/scratch:/scratch
   --container-env=${container_env}

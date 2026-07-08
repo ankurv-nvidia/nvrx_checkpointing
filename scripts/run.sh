@@ -3,6 +3,7 @@ SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 MEGATRON_ROOT=${SCRIPT_DIR}/../../..
 NATIVE_BUILD_DIR=${SCRIPT_DIR}/../build
+REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 
 set -Eeoux pipefail
 
@@ -22,7 +23,6 @@ RUN_DIR="${MEGATRON_ROOT}/runs"
 MEGATRON_LM_DIR="${MEGATRON_ROOT}"
 DATACACHE_DIR="${MY_RUN_DIR}/data-cache/"
 
-TOKENIZER_MODEL_PATH="${SCRIPT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
 BLEND_PATH="${MEGATRON_ROOT}/../blend_files/superblend1-exposure-filtered.json"
 
 
@@ -140,8 +140,8 @@ OPTIONS=(
 	#--per-split-data-args-path ${BLEND_PATH}
 	--data-cache-path ${DATACACHE_DIR}
 	--tiktoken-pattern v2
-	--tokenizer-type TikTokenizer
-	--tokenizer-model ${TOKENIZER_MODEL_PATH}
+	--tokenizer-type NullTokenizer
+	--vocab-size 131072
 	--micro-batch-size 1
 	--global-batch-size ${GLOBAL_BATCH}
 	--lr 4.5e-4
@@ -179,7 +179,7 @@ OPTIONS=(
 MEGATRON_LAUNCHER=${MEGATRON_LAUNCHER:-"python3 -m torch.distributed.launch --nproc-per-node=${WORLD_SIZE}"}
 
 if [[ $WORLD_SIZE -gt 1 ]]; then
-	PYTHONPATH=${MEGATRON_ROOT} ${MEGATRON_LAUNCHER} ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]} 2>&1 | tee ${MY_RUN_DIR}/log.txt
+	PYTHONPATH=${MEGATRON_ROOT}:${REPO_ROOT}/.. ${MEGATRON_LAUNCHER} ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]} 2>&1 | tee ${MY_RUN_DIR}/log.txt
 else
-	PYTHONPATH=${MEGATRON_ROOT} MASTER_ADDR=localhost MASTER_PORT=48000 python3 ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]}  2>&1 | tee ${MY_RUN_DIR}/log.txt
+	PYTHONPATH=${MEGATRON_ROOT}:${REPO_ROOT}/.. MASTER_ADDR=localhost MASTER_PORT=48000 python3 ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]}  2>&1 | tee ${MY_RUN_DIR}/log.txt
 fi

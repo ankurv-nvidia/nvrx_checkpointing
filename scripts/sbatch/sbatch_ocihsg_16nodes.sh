@@ -295,7 +295,7 @@ RUN_CMD="numactl --localalloc --physcpubind=$([ "${SLURM_LOCALID:-0}" -le 1 ] &&
 
 srun -l \
      --container-image=${IMAGE} \
-     --container-mounts="${HOME}:${HOME},${HOME}:/root,/lustre:/lustre" \
+     --container-mounts="${HOME}:${HOME},/lustre:/lustre" \
      --container-env=NCCL_IB_TIMEOUT,UCX_MEM_MMAP_HOOK_MODE,UCX_MEM_CUDA_HOOK_MODE,UCX_MEM_MALLOC_HOOKS,UCX_ERROR_SIGNALS \
      --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
      sh -c "${RUN_CMD}"

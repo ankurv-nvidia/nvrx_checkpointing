@@ -26,7 +26,7 @@
 ## Capturing State Dictionary
 
 ```
-root = megatron.native.checkpoint.model_state.create_root()
+root = nvrx_checkpointing.checkpoint.model_state.create_root()
 root.register_state_dict(state_dict)
 root.finalize_registry()
 
@@ -62,7 +62,7 @@ m.register_sharded_dict("foo",
 ## Async Save Checkpoint
 
 ```
-# root = megatron.native.checkpoint.model_state.create_root()
+# root = nvrx_checkpointing.checkpoint.model_state.create_root()
 # Register state and finalize_registry
 root.save_async(<checkpoint-dir>) 
 root.save(<checpoint-dir>) # synchronous save

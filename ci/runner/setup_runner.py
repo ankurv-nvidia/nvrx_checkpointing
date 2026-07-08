@@ -19,7 +19,7 @@ File layout under CI_DIR:
   image_prep.tmpl      (optional) per-cluster override of the project-image build srun command.
                        Drop any of these template files here to override the repo default for
                        this cluster; if absent, run_job.py uses the default shipped in
-                       megatron/native/ci/templates/. Write account, partition, mounts and
+                       ci/templates/. Write account, partition, mounts and
                        GPU-request syntax directly into the file.
   gitlab-runner     The runner binary (downloaded by setup).
   config.toml       Runner config (written by setup after registration).

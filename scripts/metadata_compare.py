@@ -13,7 +13,7 @@ For one iter directory of a single-provider pretrain run, this script:
    via ``compare_reference_metadata``.
 
 The baseline is the nvrx-derived reference metadata checked into
-``megatron/native/metadata/<cfg>_checkpoints_iter_NNNNNNN/`` as an xz-compressed
+``metadata/<cfg>_checkpoints_iter_NNNNNNN/`` as an xz-compressed
 ``reference.metadata.info.xz`` — it is the cross-provider equality contract
 that both pretrain-nvrx (self-consistency) and pretrain-native (cross-provider)
 compare against. ``compare_reference_metadata`` decompresses it in memory.
@@ -32,13 +32,13 @@ Exit codes (callers decide whether to warn or hard-fail on each):
 Runs as a subprocess from ``_compare_iters_to_baseline`` in ``run_job.py``:
 the in-srun parent process lacks the ``TORCHINDUCTOR_WORKER_START`` env
 overlay that the training subprocess gets, so importing ``megatron.core``
-(transitively pulled in by ``megatron.native.debug``) there trips
+(transitively pulled in by ``nvrx_checkpointing.debug``) there trips
 ``torch._inductor.config.decide_worker_start_method``. Subprocessing lets us
 forward the same overlay used by the training subprocess via ``env=...``.
 
 CLI::
 
-    python -m megatron.native.scripts.metadata_compare \\
+    python -m nvrx_checkpointing.scripts.metadata_compare \\
         --checkpoint-dir <iter_NNNNNNN> \\
         --baseline-dir   <metadata/<cfg>_checkpoints_iter_NNNNNNN> \\
         --provider       native|nvrx

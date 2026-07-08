@@ -36,7 +36,7 @@ Exit codes:
 
 CLI::
 
-    python -m megatron.native.scripts.checkpoint_equality_compare \\
+    python -m nvrx_checkpointing.scripts.checkpoint_equality_compare \\
         --native <ckpt_dir>/native \\
         --nvrx   <ckpt_dir>/nvrx
 """

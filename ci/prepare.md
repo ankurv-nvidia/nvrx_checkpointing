@@ -3,7 +3,7 @@
 All state — token, config, binary, logs — lives under `/home/ankurv/data/ci`.
 Lock down access once: `chmod 700 /home/ankurv/data/ci`
 
-Script: `megatron/native/ci/runner/setup_runner.py`
+Script: `ci/runner/setup_runner.py`
 
 ---
 
@@ -98,7 +98,7 @@ possible but rare, since the shared image is normally already present.
 ### Customizing SLURM commands per cluster (template files)
 
 The SLURM commands run_job.py issues come from template files. The repo ships
-defaults that model **cw-dfw** under `megatron/native/ci/templates/`:
+defaults that model **cw-dfw** under `ci/templates/`:
 
 | Template | What it builds |
 |---|---|
@@ -111,7 +111,7 @@ mounts, or extra srun flags, **copy the template next to this config and edit
 it** — no environment variables involved:
 
 ```bash
-cp <megatron-root>/megatron/native/ci/templates/srun.tmpl $CI_DIR/srun.tmpl
+cp <megatron-root>/ci/templates/srun.tmpl $CI_DIR/srun.tmpl
 # then edit $CI_DIR/srun.tmpl, e.g. add `--partition=...`, replace
 # `--gpus-per-node=${gpus_per_node}` with `--gres=gpu:${gpus_per_node}`,
 # change `--container-mounts=...`, drop the GPU lines for clusters that
@@ -136,7 +136,7 @@ chmod 600 /home/ankurv/data/ci/token
 ## 3. Register and start (first time only)
 
 ```bash
-python3 megatron/native/ci/runner/setup_runner.py setup
+python3 ci/runner/setup_runner.py setup
 ```
 
 This does three things:
