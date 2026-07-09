@@ -13,8 +13,10 @@
 #include "tensor.h"
 
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/streambuf.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -24,6 +26,8 @@
 #include <boost/beast/http/file_body.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/config.hpp>
+#include <boost/interprocess/exceptions.hpp>
+#include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/iostreams/device/array.hpp>
 #include <boost/iostreams/stream.hpp>
 #include <boost/lexical_cast.hpp>
@@ -34,6 +38,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -49,6 +54,7 @@
 #include <vector>
 
 using namespace std::chrono_literals;
+namespace bip   = boost::interprocess;
 namespace cipc  = checkpoint::ipc;
 using PerfClock = std::chrono::high_resolution_clock;
 
@@ -1303,6 +1309,7 @@ struct Server
         if (_running) { return; }
         _ioc.restart();
 
+        _handlerPool = std::make_unique<boost::asio::thread_pool>(HandlerThreads);
         StartTcpListener_();
         _running = true;
 
@@ -1533,9 +1540,19 @@ struct Server
         if (!wasRunning) { return; }
 
         boost::system::error_code ec;
-        if (_tcpAcceptor.close(ec))
+        for (auto& acceptor : _tcpAcceptors)
         {
-            fmt::print(stderr, "[native_ckpt:svr][{}][TCP][WARN] Failed to close acceptor: {}\n", *this, ec.message());
+            if (acceptor.close(ec))
+            {
+                fmt::print(stderr, "[native_ckpt:svr][{}][TCP][WARN] Failed to close acceptor: {}\n", *this, ec.message());
+            }
+        }
+        // Drain in-flight connection handlers before tearing down the io_context their
+        // accepted sockets are bound to.
+        if (_handlerPool)
+        {
+            _handlerPool->stop();
+            _handlerPool->join();
         }
         // Reset the session so they wait for the async ops to finish
         _ioc.stop();
@@ -2046,31 +2063,88 @@ struct Server
         SetThreadName("ncs:w");
     }
 
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+    void AcquireInstanceLock_()
+    {
+        if (_instanceLock) { return; }
+
+        auto const lockPath = std::filesystem::temp_directory_path() / fmt::format("nvrx_ckpt_server.{}.lock", Port + _index);
+        {
+            std::ofstream lockFile(lockPath, std::ios::app);
+            if (!lockFile.good()) { throw std::runtime_error(fmt::format("Instance lock create failed: {}", lockPath)); }
+        }
+
+        try
+        {
+            auto lock = std::make_unique<bip::file_lock>(lockPath.string().c_str());
+            if (!lock->try_lock()) { throw cipc::ErrorAlreadyRunning(); }
+            _instanceLock = std::move(lock);
+        } catch (bip::interprocess_exception const& e)
+        {
+            throw std::runtime_error(fmt::format("Instance lock {}: {}", lockPath, e.what()));
+        }
+    }
+
+    class ReusePortOption
+    {
+        public:
+        explicit ReusePortOption(bool enabled) : _value(enabled ? 1 : 0) {}
+
+        template <typename Protocol> int         level(Protocol const&) const { return SOL_SOCKET; }
+        template <typename Protocol> int         name(Protocol const&) const { return SO_REUSEPORT; }
+        template <typename Protocol> void const* data(Protocol const&) const { return &_value; }
+        template <typename Protocol> std::size_t size(Protocol const&) const { return sizeof(_value); }
+
+        private:
+        int _value;
+    };
+#endif
+
     void StartTcpListener_()
     {
         using boost::asio::ip::tcp;
         auto const    address = boost::asio::ip::make_address("0.0.0.0");
         tcp::endpoint endpoint(address, Port + _index);
-        // use synchronous acceptor to simplify shutdown logic (no need to cancel async accept)
-        _tcpAcceptor.open(endpoint.protocol());
-        _tcpAcceptor.set_option(boost::asio::socket_base::reuse_address(true));
-        boost::system::error_code ec;
-        ec = _tcpAcceptor.bind(endpoint, ec);
-        if (ec) { throw cipc::ErrorAlreadyRunning(); }
-        ec = _tcpAcceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
-        if (ec) { throw cipc::ErrorAlreadyRunning(); }
 
-        boost::asio::co_spawn(_ioc, DoListen_(), [](std::exception_ptr const& e) {
-            if (e) try
-                {
-                    std::rethrow_exception(e);
-                } catch (boost::system::system_error& e)
-                {
-                    if (e.code() != boost::asio::error::operation_aborted) { throw; }
-                } catch (std::exception& e) { fmt::print(stderr, "Error in acceptor: {}\n", e.what()); }
-        });
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+        // When SO_REUSEPORT is enabled, the TCP port no longer elects a single owner.
+        // Losers must throw before touching acceptors or shm rings; Start() spawns the
+        // shm consumer threads only after this returns.
+        AcquireInstanceLock_();
+#endif
 
-        for (size_t i = 0; i < 4; i++)
+        _tcpAcceptors.clear();
+        _tcpAcceptors.reserve(AcceptorCount);
+        for (size_t i = 0; i < AcceptorCount; ++i)
+        {
+            auto& acceptor = _tcpAcceptors.emplace_back(_ioc);
+            acceptor.open(endpoint.protocol());
+            acceptor.set_option(boost::asio::socket_base::reuse_address(true));
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+            int const enable = 1;
+            ::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
+#endif
+            boost::system::error_code ec;
+            ec = acceptor.bind(endpoint, ec);
+            if (ec) { throw cipc::ErrorAlreadyRunning(); }
+            ec = acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+            if (ec) { throw cipc::ErrorAlreadyRunning(); }
+        }
+
+        for (auto& acceptor : _tcpAcceptors)
+        {
+            boost::asio::co_spawn(_ioc, DoListen_(acceptor), [](std::exception_ptr const& e) {
+                if (e) try
+                    {
+                        std::rethrow_exception(e);
+                    } catch (boost::system::system_error& e)
+                    {
+                        if (e.code() != boost::asio::error::operation_aborted) { throw; }
+                    } catch (std::exception& e) { fmt::print(stderr, "Error in acceptor: {}\n", e.what()); }
+            });
+        }
+
+        for (size_t i = 0; i < AcceptorCount; i++)
         {
             _threads.emplace_back([this, i]() {
                 SetThreadName(fmt::format("ncs:ios:{}", i).c_str());
@@ -2079,26 +2153,36 @@ struct Server
         }
     }
 
-    boost::asio::awaitable<void> DoListen_()
+    // The accept loop only accepts and hands each connection to `_handlerPool`, then
+    // returns to async_accept at once. HandleRequest_ does synchronous, sometimes
+    // long-running work (peer forwards, file writes, a bounded wait for a session);
+    // running it inline serializes accepts and lets the kernel listen backlog overflow
+    // under a many-node connect storm (the "connection refused on node:0" symptom).
+    boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor)
     {
-        static constexpr auto Timeout = std::chrono::seconds{30};
-
         while (true)
         {
-            tcp_stream stream(co_await _tcpAcceptor.async_accept());
-            stream.expires_after(Timeout);
-            try
-            {
-                HandleRequest_(stream);
-            } catch (boost::system::system_error const& e)
-            {
-                TryCleanShutdown(stream);
-                if (e.code() != boost::beast::http::error::end_of_stream) { fmt::print(stderr, "Error handling request: {}\n", e.what()); }
-            } catch (std::exception const& e)
-            {
-                TryCleanShutdown(stream);
-                fmt::print(stderr, "Error: {}\n", e.what());
-            }
+            auto socket = co_await acceptor.async_accept();
+            boost::asio::post(*_handlerPool, [this, sock = std::move(socket)]() mutable {
+                static constexpr auto Timeout = std::chrono::seconds{30};
+                tcp_stream            stream(std::move(sock));
+                stream.expires_after(Timeout);
+                try
+                {
+                    HandleRequest_(stream);
+                } catch (boost::system::system_error const& e)
+                {
+                    TryCleanShutdown(stream);
+                    if (e.code() != boost::beast::http::error::end_of_stream)
+                    {
+                        fmt::print(stderr, "Error handling request: {}\n", e.what());
+                    }
+                } catch (std::exception const& e)
+                {
+                    TryCleanShutdown(stream);
+                    fmt::print(stderr, "Error: {}\n", e.what());
+                }
+            });
         }
     }
 
@@ -2114,8 +2198,28 @@ struct Server
     // Live spin-down waiter threads, each holding one client connection open until idle.
     std::vector<std::thread> _spinDownThreads;
 
-    boost::asio::io_context        _ioc;
-    boost::asio::ip::tcp::acceptor _tcpAcceptor{_ioc};
+    boost::asio::io_context _ioc;
+    // N acceptors share the port via SO_REUSEPORT where available, so the kernel spreads
+    // inbound connections across N accept queues. Without SO_REUSEPORT, fall back to one
+    // acceptor and keep the offloaded handler pool.
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+    static constexpr size_t AcceptorCount = 8;
+#else
+    static constexpr size_t AcceptorCount = 1;
+#endif
+    std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
+
+    // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
+    std::unique_ptr<bip::file_lock> _instanceLock;
+
+    // Connection handlers run here, off the accept loop. Declared after _ioc so it is
+    // joined (destroyed) before the io_context the handlers' sockets are bound to.
+#ifdef PHOENIX_BUILD_FOR_VALGRIND
+    static constexpr size_t HandlerThreads = 4;
+#else
+    static constexpr size_t HandlerThreads = 64;
+#endif
+    std::unique_ptr<boost::asio::thread_pool> _handlerPool;
 
     // TODO_NOPENDING_STRUCT
     struct PendingSessionData

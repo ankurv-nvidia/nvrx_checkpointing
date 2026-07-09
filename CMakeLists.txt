@@ -171,6 +171,15 @@ if (PHOENIX_BUILD_BENCHMARK)
     add_executable(shm_ipc_benchmark src/benchmark/shm_ipc_benchmark.cpp)
     target_include_directories(shm_ipc_benchmark PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${CMAKE_CURRENT_LIST_DIR}/src/checkpoint)
     target_link_libraries(shm_ipc_benchmark PRIVATE fmt::fmt-header-only Boost::interprocess Boost::process Boost::program_options)
+
+    # Connection-layer scale test for the checkpoint web service. Reuses the real
+    # in-process server (via the fixture -> server object files) and drives it with
+    # a Boost.Beast async connect storm.
+    add_executable(ckpt_stress_test src/benchmark/ckpt_stress_test.cpp)
+    target_link_libraries(ckpt_stress_test PRIVATE
+        phoenix_checkpoint_fixture
+        Boost::asio Boost::beast Boost::program_options
+        fmt::fmt-header-only)
 endif()
 
 if (PHOENIX_BUILD_PYTHON_BINDINGS)

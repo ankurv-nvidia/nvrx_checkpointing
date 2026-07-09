@@ -79,6 +79,14 @@ stages:
   script:
     - python3 "${CI_SCRIPTS_DIR}/ckptbench.py" || exit $?
 
+# Functional gate on the checkpoint web service (daemon election + connect burst);
+# loopback-only, no GPUs, no perf baseline. 1h absorbs a cold build directory.
+.run_ckpt_stress:
+  extends: .run_job
+  timeout: 1h
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/ckpt_stress.py" ${JOB_ARGS} || exit $?
+
 # Optional manual trigger bridge: allow_failure:true keeps an unplayed group from blocking
 # or reddening the parent. Opt-in lives here; the jobs inside each group run automatically.
 .manual_optional:

@@ -25,6 +25,7 @@ PLATFORMS = [
         "name": "devbox",
         "gpus": "1x2",
         "has_image": False,
+        "stress": True,
         "multinode": [],
     },
     {
@@ -123,11 +124,13 @@ def _read_header() -> str:
     return head.rstrip() + "\n"
 
 
-def _job(name: str, extends: list[str], *, job_args: str | None = None, timeout: str | None = None) -> str:
+def _job(name: str, extends: list[str], *, job_args: str | None = None, timeout: str | None = None, needs: str | None = None) -> str:
     """Render one concrete job block; ``timeout`` overrides .run_job's default 4h job timeout."""
     lines = [f"{name}:", f"  extends: [{', '.join(extends)}]"]
     if timeout is not None:
         lines.append(f"  timeout: {timeout}")
+    if needs is not None:
+        lines += ["  needs:", f"    - job: {needs}", "      artifacts: false"]
     if job_args is not None:
         lines += ["  variables:", f'    JOB_ARGS: "{job_args}"']
     return "\n".join(lines)
@@ -203,6 +206,12 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
 
     ckpt = f"{name}:ckptbench:{gpus}"
     groups["ckptbench"] += [_job(ckpt, [".run_ckptbench", runner]), _update(ckpt, runner)]
+
+    # Web-service scaling gate (daemon election + connect burst). `needs` serializes it
+    # after ckptbench inside the child pipeline: both claim port 41000 and the shm
+    # request channels on the runner host.
+    if p.get("stress"):
+        groups["ckptbench"].append(_job(f"{name}:ckpt-stress:{gpus}", [".run_ckpt_stress", runner], needs=ckpt))
 
     standard = (
         ("pretrain-native", "deterministic"),

@@ -252,8 +252,11 @@ class Flavor(ABC):
             "TRITON_CACHE_DIR": str(triton_dir),
             "TRITON_CACHE_PATH": str(triton_dir),
             # Route the server log into the uploaded artifact dir (not node-local
-            # storage), with a per-node filename so multinode runs don't collide.
-            "NATIVE_CKPT_SERVER_LOG": str(RESULTS_DIR / "checkpoint_server.%h.log"),
+            # storage). %h keeps multinode runs from colliding; %p keeps daemon
+            # candidates apart — every rank's launcher spawns a candidate whose
+            # startup opens the log and whose losing exit removes it, so a shared
+            # per-node name would let a loser unlink the winning daemon's live log.
+            "NATIVE_CKPT_SERVER_LOG": str(RESULTS_DIR / "checkpoint_server.%h.%p.log"),
         }
 
     @staticmethod
@@ -2162,6 +2165,12 @@ class PretrainJob:
 
         env = os.environ.copy()
         env.update(recipe.env)
+        # The teardown diagnostics in this wrapper (dump_server_log,
+        # _append_to_server_log) resolve the server-log template from their own
+        # environment; use the value re-derived here — the container-forwarded
+        # copy arrives corrupted through the launcher's --container-env value
+        # forwarding on some clusters.
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = recipe.env["NATIVE_CKPT_SERVER_LOG"]
 
         if use_torchrun:
             launcher = ["torchrun", "--nproc_per_node", str(gpus_per_node)]
