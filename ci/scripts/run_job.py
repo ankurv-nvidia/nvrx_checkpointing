@@ -84,21 +84,26 @@ def sys_path_insert(path: Path) -> None:
         os.environ["PYTHONPATH"] = ":".join([p, *pythonpath])
 
 
-def wait_for_file(path: Path, timeout_seconds: int) -> None:
-    """Poll until the file exists (or any match, when the name is a glob), bounded by a timeout."""
+def wait_for_file(path: Path, timeout_seconds: int, *, poll_s: int = 10, log_every_s: int = 30) -> None:
+    """Poll until the file exists (or any match, when the name is a glob), bounded by a timeout.
+    Logs at most every log_every_s so a long many-rank barrier wait doesn't flood the job log."""
     has_wildcard = any(c in path.name for c in "*?[")
     start_time = time.time()
+    last_log = 0.0
     while True:
         if has_wildcard:
             if any(path.parent.glob(path.name)):
                 return
         elif path.is_file():
             return
-        if time.time() - start_time > timeout_seconds:
+        now = time.time()
+        if now - start_time > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for {path} after {timeout_seconds} seconds")
-        prefix = "[in-srun] " if "SLURM_PROCID" in os.environ else ""
-        logger.info(f"{prefix}Waiting for {path} to be available...")
-        time.sleep(10)
+        if now - last_log >= log_every_s:
+            prefix = "[in-srun] " if "SLURM_PROCID" in os.environ else ""
+            logger.info(f"{prefix}Waiting for {path} to be available...")
+            last_log = now
+        time.sleep(poll_s)
 
 
 def _prepare_sh_hash() -> str:
@@ -361,22 +366,20 @@ class DeterministicFlavor(Flavor):
         # reproducibility); drop only the activation recompute, which adds compute.
         self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
-        # The fused Mamba mem-eff kernel (mamba_split_conv1d_scan_combined) ignores
-        # MAMBA_DETERMINISTIC in its backward — it always uses atomic-add reductions.
-        # Routing to the non-fused conv+scan path makes the mamba/conv1d backward honor
-        # MAMBA_DETERMINISTIC=1 (requires mamba-ssm >= 2.3.0, causal-conv1d >= 1.6.0).
-        self._add_flag(recipe.opts, "--disable-mamba-mem-eff-path")
-        # The non-fused mamba path is ~1.3x slower than the fused mem-eff kernel, and the
-        # determinism check runs two full training+save passes back to back; the heaviest
-        # config (nano4 8x4) overran a 45-min --time. --time is a ceiling (jobs finish early),
-        # so provision generously. int(): the template wants integer minutes.
+        # The deterministic gate runs two full training+save passes back to back (the <=2-node
+        # cross-run check, or the >2-node in-allocation reference check), and the heaviest config
+        # (nano4 8x4) overran a 45-min --time. --time is a ceiling (jobs finish early), so
+        # provision generously. int(): the template wants integer minutes.
         recipe.srun_time_min = int(recipe.srun_time_min * 3)
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
         # Skipped under valgrind: that flavor owns the server and tears it down before the
         # epilog, leaving the md5 trace with no server (md5 is covered by the plain run).
-        if ctx.is_worker and not ctx.has("valgrind"):
+        # Skipped past two nodes: training there is bit-reproducible only within one
+        # allocation, so no committed baseline can match — the in-allocation reference
+        # check (run_pretrain) owns that compare.
+        if ctx.is_worker and not ctx.has("valgrind") and int(os.environ.get("SLURM_NNODES", "1")) <= 2:  # noqa: PLR2004
             PerfReport.compare_iters_to_baseline(ctx.cfg, ctx.provider)
         # Warn (non-blocking exit 3) on perf drift against this flavor's own slower baseline;
         # the md5 mismatch above still hard-fails.
@@ -750,8 +753,10 @@ _ARGS_BLOCK_END = "-------------------- end of arguments ---------------------"
 # captured block matches Megatron's raw output; the value lines themselves start with spaces. srun
 # right-justifies the task number to the max-rank width (" 0: " at >= 10 tasks), hence the \s*.
 _ARGS_LINE_PREFIX_RE = re.compile(r"^(?:\[rank\d+\]:\s?|\s*\d+:\s)")
-# Collapse the per-runner build-dir prefix of ci-runs/ paths (save/load/data_cache_path/
-# tensorboard_dir) so the args compare ignores where the job happened to check out.
+# Arguments whose value is a per-runner CI output path (save/load/data_cache_path/
+# tensorboard_dir — all under ci-runs/) are pure build-location noise that varies by
+# runner. These lines are pruned from the captured/committed arguments block and ignored
+# in the compare, so a baseline never carries a checkout-specific path.
 _ARGS_VOLATILE_PATH_RE = re.compile(r"/\S*/ci-runs/")
 # Megatron prints one "  name ....... value" line per argument. A clean line starts with two
 # spaces, the name, then the dotted leader (or padding spaces for a long name).
@@ -776,7 +781,12 @@ def _clean_arguments_line(line: str) -> str | None:
         if not m:
             return None
         arg = line[m.start() :]
-    return _ARGS_APPENDED_RE.sub("", arg)
+    arg = _ARGS_APPENDED_RE.sub("", arg)
+    # Prune volatile per-runner CI output paths (save/load/data_cache_path/tensorboard_dir)
+    # so they never reach the captured/committed arguments.txt.
+    if _ARGS_VOLATILE_PATH_RE.search(arg):
+        return None
+    return arg
 
 
 def _extract_arguments_block(log_text: str) -> str | None:
@@ -820,8 +830,9 @@ def _read_arguments_block(stem: str) -> str | None:
 
 
 def _normalize_arguments(block: str) -> str:
-    """Canonicalize an arguments block for comparison: collapse volatile ci-runs/ path prefixes."""
-    return _ARGS_VOLATILE_PATH_RE.sub("/.../ci-runs/", block)
+    """Canonicalize an arguments block for comparison: drop volatile ci-runs/ path arguments, so
+    a baseline captured before pruning still matches a freshly-captured block that omits them."""
+    return "\n".join(ln for ln in block.splitlines() if not _ARGS_VOLATILE_PATH_RE.search(ln))
 
 
 def capture_arguments(stem: str) -> None:
@@ -1920,6 +1931,13 @@ class BaselineUpdater:
         )
 
         for cfg in cfgs:
+            scale = re.match(r"^.+_(\d+)x\d+$", cfg)
+            if scale is not None and int(scale.group(1)) > 2:  # noqa: PLR2004
+                # No committed baseline exists at this scale: training there is
+                # bit-reproducible only within one allocation, so the deterministic jobs
+                # regenerate their reference in-job (the in-allocation reference check).
+                logger.info(f"[run_job] skipping metadata baseline for {cfg}: gated by the in-allocation reference check")
+                continue
             ckpt_root = ci_runs_root / cfg / "checkpoints"
             if not ckpt_root.is_dir():
                 raise FileNotFoundError(
@@ -1991,20 +2009,22 @@ class PretrainJob:
             cfg = _run_cfg(args, nodes, args.gpus_per_node)
             ctx = RunCtx(args, args.job, cfg, provider, platform_tag(), args.flavors)
             with _flavored_run(ctx):
-                # Two sequential processes in one task share one server lifecycle: the first
-                # trains and saves, the second loads it and saves the measured checkpoints.
-                common = {"ckpt_provider": provider, "flavors": args.flavors, "extra_args": extra_args, "config_profile": args.config}
-                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, args.gpus_per_node, phase=1, **common)
-                subprocess.run(cmd, env=env, check=True)
-                PretrainJob._wait_for_phase1_checkpoint(cfg)
-                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, args.gpus_per_node, phase=2, **common)
-                subprocess.run(cmd, env=env, check=True)
+                common = {"flavors": args.flavors, "extra_args": extra_args, "config_profile": args.config}
+                # Valgrind keeps the plain routine at any scale: its gate is memcheck, and the
+                # manifest equality it would re-run is covered by the plain deterministic job.
+                if ctx.has("deterministic") and not ctx.has("valgrind") and nodes > 2:  # noqa: PLR2004
+                    PretrainJob._run_in_allocation_reference_check(cfg, nodes, args.gpus_per_node, provider, common)
+                else:
+                    PretrainJob._run_two_phase(cfg, nodes, args.gpus_per_node, provider, common)
             return
 
-        # nvrx deterministic via SLURM/multinode runs the two-run cross-run determinism check;
-        # perf falls through to a single measured run (the check needs deterministic references).
+        # nvrx deterministic via SLURM/multinode up to two nodes runs the two-run cross-run
+        # determinism check; perf falls through to a single measured run (the check needs
+        # deterministic references). Past two nodes training is bit-reproducible only within
+        # one allocation, so two independent runs cannot be compared — the in-allocation
+        # reference check (in-srun above) gates those instead.
         is_deterministic = any(f.name == "deterministic" for f in args.flavors)
-        if provider == "nvrx" and is_deterministic and (args.nodes > 1 or args.slurm):
+        if provider == "nvrx" and is_deterministic and (args.nodes > 1 or args.slurm) and args.nodes <= 2:  # noqa: PLR2004
             PretrainJob._run_pretrain_determinism_check(args, cfg)
             return
 
@@ -2019,6 +2039,10 @@ class PretrainJob:
 
         ctx = RunCtx(args, args.job, cfg, provider, platform_tag(), args.flavors)
         ctx.log_file = RESULTS_DIR / f"{ctx.stem}.log"
+        # The <=2-node determinism check writes {stem}_run1/2.log, and the args capture keeps
+        # the last block across those too — drop any stale pair a prior job on this runner left.
+        for stale_log in RESULTS_DIR.glob(f"{ctx.stem}_run*.log"):
+            stale_log.unlink()
         if args.nodes > 1 or args.slurm:
             # Launcher: training + worker epilogs run in the srun task; this launcher tees the log
             # and runs the perf epilog from it.
@@ -2070,6 +2094,11 @@ class PretrainJob:
 
         recipe = Recipe(opts=[], env=Flavor.base_env(triton_dir))
         _apply_flavors(recipe, flavors)
+        flavor_names = {f.name for f in flavors}
+        if nodes > 2 and "deterministic" in flavor_names and "valgrind" not in flavor_names:  # noqa: PLR2004
+            # The in-allocation reference check runs the full routine twice (reference
+            # provider, then the job's) plus the manifest derivations, all in this one srun.
+            recipe.srun_time_min *= 2
         # Run env as KEY=VALUE; the build-related vars are forwarded by name, since forwarding
         # them by value has hit parsing ambiguity in the launcher.
         container_env = ",".join(f"{k}={v}" for k, v in recipe.env.items())
@@ -2113,6 +2142,193 @@ class PretrainJob:
         marker = PretrainJob._phase1_ckpt_dir(cfg) / f"iter_{_PHASE1_TRAIN_ITERS:07d}" / ".metadata"
         logger.info(f"[run_job] waiting for phase-1 checkpoint to flush: {marker}")
         wait_for_file(marker, timeout_seconds)
+
+    @staticmethod
+    def _run_two_phase(cfg: str, nodes: int, gpus_per_node: int, ckpt_provider: str, common: dict, *, routine: str = "") -> None:
+        """One full checkpoint routine: phase 1 trains from scratch and saves the handoff
+        checkpoint, phase 2 loads it and saves the measured checkpoints. Two sequential
+        processes in one task share one server lifecycle.
+
+        With ``routine`` set (the reference check, which runs this 32-way inside one srun),
+        each task's training output goes to its own file instead of the merged job log —
+        nano4's per-expert save enumeration otherwise blows the CI log cap before the
+        reference-check verdict prints. Rank 0's file is uploaded as an artifact; a failing
+        phase surfaces its tail. Without ``routine`` (the plain path) output is inherited so
+        the launcher's tee still feeds the perf parser."""
+        redirect = bool(routine)
+        log_file = None
+        if redirect:
+            procid = os.environ.get("SLURM_PROCID", "0")
+            # Rank 0's routine log is an artifact (ci-results/*.log); worker ranks park theirs
+            # out of the artifact glob to avoid 32-fold bloat, kept only for a failure tail.
+            log_root = RESULTS_DIR if procid == "0" else (REPO_ROOT / f"ci/ci-runs/{cfg}/worker-logs")
+            log_root.mkdir(parents=True, exist_ok=True)
+            log_file = log_root / (f"{cfg}_{routine}-routine.log" if procid == "0" else f"{cfg}_{routine}-routine_rank{procid}.log")
+            log_file.unlink(missing_ok=True)
+        for phase in (1, 2):
+            cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, gpus_per_node, phase=phase, ckpt_provider=ckpt_provider, **common)
+            if redirect:
+                with log_file.open("ab") as fh:
+                    rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False).returncode  # noqa: S603
+                if rc != 0:
+                    tail = "\n".join(log_file.read_text(errors="replace").splitlines()[-40:])
+                    logger.error(f"[run_job] {routine} routine phase {phase} failed (rc={rc}); tail of {log_file.name}:\n{tail}")
+                    raise RuntimeError(f"{routine} routine phase {phase} failed with exit code {rc} — see {log_file}")
+            else:
+                subprocess.run(cmd, env=env, check=True)  # noqa: S603
+            if phase == 1:
+                PretrainJob._wait_for_phase1_checkpoint(cfg)
+
+    # The provider whose output is the equality reference the other provider is compared
+    # against — committed metadata/ baselines at <=2 nodes, the in-allocation reference
+    # routine past that.
+    _REFERENCE_PROVIDER = "nvrx"
+    # Manifest derivation streams every checkpoint byte for the md5s (minutes per iter dir at
+    # 8x4), and the non-zero ranks sit at the barrier through four derivations plus the wipe
+    # of the multi-TB reference checkpoints.
+    _REFERENCE_SYNC_TIMEOUT_S = 7200
+
+    @staticmethod
+    def _checkpoint_iter_dirs(cfg: str) -> list[tuple[str, Path]]:
+        """Every checkpoint one routine leaves on disk, as (group, iter_dir): the phase-1
+        handoff save plus the measured phase-2 saves."""
+        groups = (
+            ("phase1", PretrainJob._phase1_ckpt_dir(cfg)),
+            ("checkpoints", REPO_ROOT / f"ci/ci-runs/{cfg}/checkpoints"),
+        )
+        out: list[tuple[str, Path]] = []
+        for group, root in groups:
+            iter_dirs = sorted(d for d in root.glob("iter_*") if d.is_dir())
+            if not iter_dirs:
+                raise RuntimeError(f"no iter_* checkpoints under {root}")
+            out.extend((group, d) for d in iter_dirs)
+        return out
+
+    @staticmethod
+    def _common_state_lines(dir_path: Path) -> list[str]:
+        """The training-STATE lines of common_pt_dump.info (iteration, FLOPs, LR schedule,
+        rerun state...). The args.* lines record the invocation, and the two routines'
+        invocations differ in provider selection by design (--ckpt-provider and the flags
+        derived from it); argument drift has its own gate (_arguments_match_baseline)."""
+        lines = (dir_path / "common_pt_dump.info").read_text().splitlines()
+        return [ln for ln in lines if not ln.startswith("args.")]
+
+    @staticmethod
+    def _derive_manifest(iter_dir: Path, baseline_dir: Path | None = None) -> int:
+        """Derive iter_dir's reference.metadata.info + common_pt_dump.info (distcp_trace),
+        diffing the manifest against baseline_dir when given. Runs metadata_compare as a
+        subprocess for env parity (see compare_iters_to_baseline). Returns its exit code:
+        0 equal (or derive-only), 3 manifest mismatch, anything else structural failure."""
+        env = os.environ.copy()
+        env["TORCHINDUCTOR_WORKER_START"] = "fork"
+        env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+        # Derive-only: point at a dir that holds no baseline — the reference provider's lenient
+        # bootstrap path then derives the manifest and skips the diff. With a baseline present
+        # the provider only names the strict branch should the baseline turn out incomplete.
+        provider = PretrainJob._REFERENCE_PROVIDER if baseline_dir is None else "native"
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "nvrx_checkpointing.scripts.metadata_compare",
+                "--checkpoint-dir",
+                str(iter_dir),
+                "--baseline-dir",
+                str(baseline_dir if baseline_dir is not None else iter_dir / "unseeded"),
+                "--provider",
+                provider,
+            ],
+            env=env,
+            check=False,
+        ).returncode
+
+    @staticmethod
+    def _run_in_allocation_reference_check(cfg: str, nodes: int, gpus_per_node: int, provider: str, common: dict) -> None:
+        """The >2-node deterministic gate: run the checkpoint routine twice inside this one
+        allocation — first with the reference provider, then with the job's provider — and
+        require bit-identical manifests for every checkpoint (the phase-1 handoff and each
+        measured save).
+
+        Training past two nodes is bit-reproducible only on a fixed node set (the reduction
+        order of node-spanning collectives follows the allocation's topology), so the
+        reference is regenerated here, where both routines share the allocation, instead of
+        read from a committed baseline. An nvrx job runs two identical routines — a
+        training+save determinism gate; a native job diffs its serialization of the same
+        trajectory against the nvrx reference — a cross-provider equality gate."""
+        run_dir = REPO_ROOT / f"ci/ci-runs/{cfg}"
+        reference_root = run_dir / "reference-run"
+        ready_marker = run_dir / "reference-run.ready"
+        failed_marker = run_dir / "reference-run.failed"
+        is_rank0 = os.environ.get("SLURM_PROCID", "0") == "0"
+
+        # Stale state from a prior job on this runner is cleared before the reference routine
+        # starts: every task reaches the marker wait only after that routine's collective
+        # training, which cannot begin before this cleanup.
+        if is_rank0:
+            shutil.rmtree(reference_root, ignore_errors=True)
+            ready_marker.unlink(missing_ok=True)
+            failed_marker.unlink(missing_ok=True)
+
+        PretrainJob._run_two_phase(cfg, nodes, gpus_per_node, PretrainJob._REFERENCE_PROVIDER, common, routine="reference")
+
+        if is_rank0:
+            # This task's phase-2 exit means rank 0's save finalization completed, and that
+            # finalization gathers every rank's write results first — the checkpoints are whole.
+            try:
+                for group, iter_dir in PretrainJob._checkpoint_iter_dirs(cfg):
+                    rc = PretrainJob._derive_manifest(iter_dir)
+                    if rc != 0:
+                        raise RuntimeError(f"reference manifest derivation failed for {group}/{iter_dir.name} (rc={rc})")
+                    stash_dir = reference_root / group / iter_dir.name
+                    stash_dir.mkdir(parents=True)
+                    for name in ("reference.metadata.info", "common_pt_dump.info"):
+                        shutil.copy2(iter_dir / name, stash_dir / name)
+                for stale in (run_dir / "checkpoints", PretrainJob._phase1_ckpt_dir(cfg)):
+                    shutil.rmtree(stale)
+            except BaseException:
+                failed_marker.touch()  # release the waiting tasks before propagating
+                raise
+            ready_marker.touch()
+        else:
+            wait_for_file(run_dir / "reference-run.*", PretrainJob._REFERENCE_SYNC_TIMEOUT_S, poll_s=15, log_every_s=120)
+            if failed_marker.exists():
+                raise RuntimeError("reference routine failed on the coordinator task — see its log above")
+
+        PretrainJob._run_two_phase(cfg, nodes, gpus_per_node, provider, common, routine=f"measured-{provider}")
+
+        if not is_rank0:
+            return
+        produced = PretrainJob._checkpoint_iter_dirs(cfg)
+        stashed = {(g.name, d.name) for g in reference_root.iterdir() for d in g.iterdir()}
+        if {(g, d.name) for g, d in produced} != stashed:
+            raise RuntimeError(
+                f"reference check: checkpoint sets differ — reference run saved {sorted(stashed)}, "
+                f"{provider} run saved {sorted((g, d.name) for g, d in produced)}",
+            )
+        failures: list[str] = []
+        for group, iter_dir in produced:
+            stash_dir = reference_root / group / iter_dir.name
+            rc = PretrainJob._derive_manifest(iter_dir, stash_dir)
+            if rc != 0:
+                failures.append(f"{group}/{iter_dir.name} (manifest rc={rc})")
+                continue
+            reference = PretrainJob._common_state_lines(stash_dir)
+            current = PretrainJob._common_state_lines(iter_dir)
+            if reference != current:
+                diff = list(difflib.unified_diff(reference, current, fromfile="reference", tofile=provider, n=1))
+                logger.info(f"[run_job] reference check: common.pt content differs for {group}/{iter_dir.name} ({len(diff)} diff lines)")
+                for line in diff[:30]:
+                    logger.info(line.rstrip("\n"))
+                failures.append(f"{group}/{iter_dir.name} (common.pt)")
+        if failures:
+            raise RuntimeError(
+                f"reference check FAILED on {len(failures)} checkpoint(s): {', '.join(failures)} — the {provider} "
+                f"routine's checkpoints do not match the same-allocation {PretrainJob._REFERENCE_PROVIDER} reference",
+            )
+        logger.info(
+            f"[run_job] reference check PASS: {len(produced)} checkpoint(s) bit-identical between the "
+            f"{PretrainJob._REFERENCE_PROVIDER} reference and {provider} routines",
+        )
 
     @staticmethod
     def _pretrain_cmd_and_env(  # noqa: PLR0913

@@ -71,6 +71,13 @@ stages:
       - ci/ci-runs/*/checkpoints/iter_*/.metadata
       # nvrx run-1 reference, parked for an offline cross-run diff on mismatch.
       - ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
+      # In-allocation reference check (>2 nodes): both sides of the manifest diff — the
+      # stashed reference-routine manifests and the measured routine's, per checkpoint.
+      - ci/ci-runs/*/checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/phase1-checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/phase1-checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/reference-run/*/iter_*/reference.metadata.info
+      - ci/ci-runs/*/reference-run/*/iter_*/common_pt_dump.info
     expire_in: 30 days
     when: always
 

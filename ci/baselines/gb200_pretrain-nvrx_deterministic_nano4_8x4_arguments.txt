@@ -83,7 +83,6 @@
   cuda_graph_modules .............................. []
   cuda_graph_warmup_steps ......................... 3
   data_args_path .................................. None
-  data_cache_path ................................. /scratch/fsw/portfolios/nemotron/projects/nemotron_sw_resiliency/users/ankurv/ci/builds/dqrTDGCxA/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/nano4_8x4/data-cache
   data_parallel_random_init ....................... False
   data_parallel_sharding_strategy ................. optim_grads_params
   data_parallel_size .............................. 16
@@ -359,7 +358,6 @@
   linear_value_head_dim ........................... 128
   lion_beta1 ...................................... 0.95
   lion_beta2 ...................................... 0.98
-  load ............................................ /scratch/fsw/portfolios/nemotron/projects/nemotron_sw_resiliency/users/ankurv/ci/builds/dqrTDGCxA/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/nano4_8x4/phase1-checkpoints
   load_main_params_from_ckpt ...................... False
   local_rank ...................................... 0
   log_device_memory_used .......................... False
@@ -668,7 +666,6 @@
   rotary_seq_len_interpolation_factor ............. None
   run_workload_inspector_server ................... False
   sample_rate ..................................... 1.0
-  save ............................................ /scratch/fsw/portfolios/nemotron/projects/nemotron_sw_resiliency/users/ankurv/ci/builds/dqrTDGCxA/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/nano4_8x4/checkpoints
   save_activations_interval ....................... None
   save_dgrads_interval ............................ None
   save_interval ................................... 10
@@ -704,7 +701,6 @@
   te_precision_config_file ........................ None
   te_rng_tracker .................................. True
   tensor_model_parallel_size ...................... 2
-  tensorboard_dir ................................. /scratch/fsw/portfolios/nemotron/projects/nemotron_sw_resiliency/users/ankurv/ci/builds/dqrTDGCxA/3/ankurv/megatron-lm/megatron/native/ci/ci-runs/nano4_8x4/tensorboard
   tensorboard_log_interval ........................ 1
   tensorboard_queue_size .......................... 1000
   test_data_path .................................. None
@@ -753,7 +749,7 @@
   use_layer_wise_distributed_optimizer ............ False
   use_layer_wise_param_layout ..................... True
   use_legacy_static_engine ........................ False
-  use_mamba_mem_eff_path .......................... False
+  use_mamba_mem_eff_path .......................... True
   use_megatron_fsdp ............................... False
   use_mp_args_from_checkpoint_args ................ False
   use_mup ......................................... False
