@@ -229,18 +229,20 @@ macro(vcpkg_init)
         message(FATAL_ERROR "VCPKG_ROOT is not defined and cannot be auto-detected")
     endif()
 
+    if ("${VCPKG_AUTOCLONE_URL}" STREQUAL "")
+        set(VCPKG_AUTOCLONE_URL "https://github.com/microsoft/vcpkg.git")
+    endif()
+    if ("${VCPKG_AUTOCLONE_COMMIT}" STREQUAL "")
+        set(VCPKG_AUTOCLONE_COMMIT "master")
+    endif()
     if (NOT EXISTS "${VCPKG_ROOT}")
-        if ("${VCPKG_AUTOCLONE_URL}" STREQUAL "")
-            set(VCPKG_AUTOCLONE_URL "https://github.com/microsoft/vcpkg.git")
-        endif()
-        if (NOT "${VCPKG_AUTOCLONE_COMMIT}" STREQUAL "")
-            set(VCPKG_AUTOCLONE_COMMIT "master")
-        endif()
-        message(STATUS "Cloning vcpkg at commit ${VCPKG_AUTOCLONE_COMMIT} to ${VCPKG_ROOT}")
+        message(STATUS "Cloning vcpkg at ${VCPKG_AUTOCLONE_COMMIT} to ${VCPKG_ROOT}")
         execute_process(COMMAND_ERROR_IS_FATAL ANY
             COMMAND
                 git clone --depth 1 --single-branch --branch "${VCPKG_AUTOCLONE_COMMIT}" "${VCPKG_AUTOCLONE_URL}" "${VCPKG_ROOT}"
         )
+    else()
+        _vcpkg_ensure_min_commit("${VCPKG_ROOT}" "${VCPKG_AUTOCLONE_COMMIT}")
     endif()
     if (NOT EXISTS ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
         message(FATAL_ERROR "Cannot find ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
@@ -258,6 +260,34 @@ macro(vcpkg_init)
     message(STATUS "VCPKG_ROOT::${VCPKG_ROOT} VCPKG_TARGET_TRIPLET::${VCPKG_TARGET_TRIPLET}")
     _vcpkg_refresh_available_ports()
 endmacro()
+
+# VCPKG_AUTOCLONE_COMMIT is the minimum vcpkg the ports need: an existing
+# checkout is accepted when its HEAD contains that commit (HEAD may be newer),
+# and is fetched — unshallowed when needed — and pinned to it otherwise. The
+# vcpkg tool is removed on re-pin so the bootstrap in vcpkg_init rebuilds it
+# to match the ports tree. "master" and non-git roots (exported trees) skip
+# the check.
+function(_vcpkg_ensure_min_commit root min_commit)
+    if ("${min_commit}" STREQUAL "master" OR NOT EXISTS "${root}/.git")
+        return()
+    endif()
+    execute_process(
+        COMMAND git -C "${root}" merge-base --is-ancestor "${min_commit}" HEAD
+        RESULT_VARIABLE min_commit_missing
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if (NOT min_commit_missing)
+        return()
+    endif()
+    message(STATUS "vcpkg at ${root} does not contain ${min_commit}; fetching and checking it out")
+    if (EXISTS "${root}/.git/shallow")
+        execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" fetch --unshallow --tags origin)
+    else()
+        execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" fetch --tags origin)
+    endif()
+    execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" checkout --detach "${min_commit}")
+    file(REMOVE "${root}/vcpkg" "${root}/vcpkg.exe")
+endfunction()
 
 function(_vcpkg_refresh_available_ports)
     set(VCPKG_AVAILABLE_PORT_LIST_FILE "${PROJECT_BINARY_DIR}/vcpkg-available-port-list.json")

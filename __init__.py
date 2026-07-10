@@ -71,8 +71,11 @@ def build_native_extensions() -> None:
 
     native_build_dir = get_native_build_dir()
     if SHLIB_PATH.is_file():
-        shlib_realpath = SHLIB_PATH.readlink().absolute()
-        if not shlib_realpath.is_relative_to(native_build_dir.absolute()):
+        # resolve() maps a dev symlink to its build-tree target and a prebuilt
+        # regular file (e.g. extracted from a wheel artifact) to itself, so
+        # both forms of an externally provided extension skip the auto-build.
+        shlib_realpath = SHLIB_PATH.resolve()
+        if not shlib_realpath.is_relative_to(native_build_dir.resolve()):
             sys.stderr.write(
                 f"[nvrx_checkpointing] Native extension path {shlib_realpath} "
                 f"is not within auto-build dir {native_build_dir}, skipping auto-build.\n",
@@ -82,7 +85,15 @@ def build_native_extensions() -> None:
     rank = try_get_rank()
     hash_file = native_build_dir / "source.hash"
     build_native_extensions.CURRENT_HASH = _compute_source_hash()
-    if hash_file.is_file() and hash_file.read_text().strip() == build_native_extensions.CURRENT_HASH:
+    # A matching hash only counts with the artifacts present — the repo-root
+    # files can disappear independently of the build tree (e.g. a cleanup of
+    # extracted wheel binaries), and rebuilding is what restores them.
+    if (
+        hash_file.is_file()
+        and hash_file.read_text().strip() == build_native_extensions.CURRENT_HASH
+        and SHLIB_PATH.is_file()
+        and SERVER_PATH.is_file()
+    ):
         return
 
     if rank is not None and rank != 0:

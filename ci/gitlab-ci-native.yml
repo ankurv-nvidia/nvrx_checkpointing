@@ -27,16 +27,25 @@ stages:
     - export PLATFORM="${PLATFORM:-${CLUSTER}}"
     - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
 
-# Per-runner tag only. GPUs-per-node, SLURM mode, platform, and cluster are configured per
-# runner at setup, so the same JOB_ARGS run anywhere — no scale or --slurm flag in the YAML.
+# Per-runner tag plus the platform's CPU arch. GPUs-per-node, SLURM mode, platform, and
+# cluster are configured per runner at setup, so the same JOB_ARGS run anywhere — no scale
+# or --slurm flag in the YAML. WHEEL_ARCH names the wheel a job may install from the
+# pipeline's wheel builds (ci/scripts/wheel_install.py); it lives here because the slurm
+# launcher's own arch is not authoritative for the compute nodes.
 .runner_gb200:
   tags: [gb200]
+  variables:
+    WHEEL_ARCH: aarch64
 
 .runner_h100:
   tags: [h100]
+  variables:
+    WHEEL_ARCH: x86_64
 
 .runner_devbox:
   tags: [devbox]
+  variables:
+    WHEEL_ARCH: x86_64
 
 # Run a job via run_job.py. The image build runs in before_script (not a separate job) so
 # it lands on the same machine as the workload; it's a fast no-op when already present.
@@ -129,6 +138,220 @@ stages:
 
 # >>> generate-ci.py: concrete jobs are generated below this line <<<
 
+# ---------------------------------------------------------------------------
+# Wheel pipeline (parent-only): build the perf-flavor wheel + dev binaries per
+# arch on the shared perflab docker runners, gate it with the pytest suite on
+# the same runners, and publish it for the GPU matrix.
+#
+# The child-pipeline test jobs run in parallel with these builds — they can't
+# `needs:` a parent job without serializing behind it — so wheel-publish:*
+# pushes the gated wheel to the project's generic package registry keyed by
+# commit SHA, and run_job.py opportunistically installs from there
+# (wheel_install.py), falling back to the import-triggered source build when
+# the wheel isn't ready yet.
+# ---------------------------------------------------------------------------
+
+# Per-arch builder image, pushed to the project registry with a buildx layer
+# cache. Registry paths stay shallow (image at the project root with arch in
+# the tag, cache one subpath deep) so CI_JOB_TOKEN's write scope reaches them.
+.wheel_image:
+  stage: build
+  needs: []
+  image: docker:28.4.0
+  services:
+    - docker:28.4.0-dind
+  timeout: 2h
+  retry:
+    max: 1
+    when: runner_system_failure
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker context create wheel-build
+    - docker buildx create wheel-build --driver docker-container --use
+    - |
+      TAG_PREFIX=builder-${WHEEL_ARCH}
+      CACHE_REF=$CI_REGISTRY_IMAGE/${TAG_PREFIX}-cache
+      docker buildx build --push \
+        --cache-to type=registry,ref=${CACHE_REF},mode=max \
+        --cache-from type=registry,ref=${CACHE_REF} \
+        --provenance=false \
+        -f Dockerfile.ci \
+        -t ${CI_REGISTRY_IMAGE}:${TAG_PREFIX}-${CI_COMMIT_SHA} \
+        -t ${CI_REGISTRY_IMAGE}:${TAG_PREFIX}-latest \
+        .
+
+wheel-image:x86_64:
+  extends: .wheel_image
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-image:aarch64:
+  extends: .wheel_image
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# Two configures per arch:
+#   build-wheel — the perf-flavor wheel (checkpoint.abi3.so + checkpoint_server,
+#   PHOENIX_BUILD_FOR_PERF ring sizing, -march=native disabled so the binaries
+#   run on machines other than the builder). The wheel target is built by name —
+#   the default target also editable-installs into the configuring interpreter,
+#   which a CI job doesn't want.
+#   build-dev — ckpttest / _distcp_shim for the wheel-pytest jobs. CUDA is
+#   off (the tests are all-CPU and the runners have no driver) and
+#   -march=native is disabled because the binaries run on other perflab
+#   machines than the builder.
+#
+# Perf baselines note: wheel binaries drop -march=native, so bw/latency
+# baselines measured against on-machine source builds drift when a perf job
+# first picks the wheel up; reseed via the update_baselines jobs.
+.wheel_build:
+  stage: build
+  timeout: 2h
+  retry:
+    max: 1
+    when: runner_system_failure
+  variables:
+    # The configures install ports per the vcpkg_install() call sites in
+    # CMakeLists.txt / cmake/modules — the single source of truth — restored
+    # from a binary cache in the project's generic package registry
+    # (cmake/vcpkg.cmake forwards an externally set VCPKG_BINARY_SOURCES).
+    # A port missing from the cache (new port, or a key rotated by a
+    # toolchain/vcpkg bump) is compiled in-job once and uploaded; the 2h
+    # timeout absorbs that cold build.
+    VCPKG_BINARY_SOURCES: "clear;http,${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/vcpkg-cache/{triplet}/{name}-{sha}.zip,readwrite,JOB-TOKEN: ${CI_JOB_TOKEN}"
+  artifacts:
+    when: always
+    paths:
+      - dist/*.whl
+      - dev_binaries/
+    expire_in: 30 days
+  script:
+    - |
+      cmake -B build-wheel -S . -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python \
+        -DPHOENIX_BUILD_WHEEL=ON \
+        -DPHOENIX_REQUIRE_CUDA=ON \
+        -DPHOENIX_BUILD_BENCHMARK=OFF \
+        -DPHOENIX_BUILD_TESTS=OFF \
+        -DPHOENIX_BUILD_FOR_PERF=ON \
+        -DBUILDENV_DISABLE_MARCH_NATIVE=ON
+    - cmake --build build-wheel -j"$(nproc)" --target nvrx_checkpointing_whl
+    - |
+      cmake -B build-dev -S . -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python \
+        -DPHOENIX_BUILD_WHEEL=OFF \
+        -DPHOENIX_BUILD_BENCHMARK=OFF \
+        -DPHOENIX_BUILD_TESTS=ON \
+        -DPHOENIX_BUILD_CUDA=OFF \
+        -DBUILDENV_DISABLE_MARCH_NATIVE=ON
+    - cmake --build build-dev -j"$(nproc)" --target ckpttest _distcp_shim
+    - mkdir -p dist dev_binaries
+    - cp build-wheel/*-abi3-*.whl dist/
+    - cp build-dev/ckpttest build-dev/_distcp_shim*.so dev_binaries/
+    - ls -la dist/ dev_binaries/
+
+wheel:x86_64:
+  extends: .wheel_build
+  needs: [wheel-image:x86_64]
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel:aarch64:
+  extends: .wheel_build
+  needs: [wheel-image:aarch64]
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# Install the wheel exactly as consumers do (wheel_install.py extraction into
+# the checkout, which the root __init__.py's prebuilt guard honors), then run
+# the pytest suite and the Catch2 binary. tests/ imports _distcp_shim from
+# dev_binaries; torch / pytest / hypothesis ship in the builder image's
+# /opt/venv. ckpttest's registry round-trip case SKIPs itself without a
+# --registry path and on small /dev/shm — the rest of the suite still runs.
+.wheel_pytest:
+  stage: test
+  timeout: 30m
+  artifacts:
+    when: always
+    paths:
+      - ci/ci-results/pytest.xml
+    reports:
+      junit: ci/ci-results/pytest.xml
+    expire_in: 30 days
+  script:
+    - python3 ci/scripts/wheel_install.py --from-dist dist
+    - mkdir -p ci/ci-results
+    - export PYTHONPATH="${CI_PROJECT_DIR}/..:${CI_PROJECT_DIR}/dev_binaries"
+    - /opt/venv/bin/python -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
+    - /opt/venv/bin/python -m pytest tests -v --junitxml=ci/ci-results/pytest.xml
+    - chmod +x dev_binaries/ckpttest
+    - ./dev_binaries/ckpttest
+
+wheel-pytest:x86_64:
+  extends: .wheel_pytest
+  needs: [wheel-image:x86_64, wheel:x86_64]
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-pytest:aarch64:
+  extends: .wheel_pytest
+  needs: [wheel-image:aarch64, wheel:aarch64]
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# Publish the wheel to the generic package registry only after the wheel test
+# job passes, so the GPU matrix can't install a wheel whose binaries are known
+# broken. Exact-SHA URL; see wheel_install.py for the consumer side.
+.wheel_publish:
+  stage: test
+  timeout: 15m
+  script:
+    - |
+      URL=$(python3 ci/scripts/wheel_install.py --registry-url)
+      curl --fail --silent --show-error -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file dist/*.whl "${URL}"
+      echo "published ${URL}"
+
+wheel-publish:x86_64:
+  extends: .wheel_publish
+  needs:
+    - job: wheel-image:x86_64
+      artifacts: false
+    - job: wheel:x86_64
+      artifacts: true
+    - job: wheel-pytest:x86_64
+      artifacts: false
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-publish:aarch64:
+  extends: .wheel_publish
+  needs:
+    - job: wheel-image:aarch64
+      artifacts: false
+    - job: wheel:aarch64
+      artifacts: true
+    - job: wheel-pytest:aarch64
+      artifacts: false
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
 # Bootstrap (parent-only): render the per-platform jobs and trigger one child pipeline per
 # group. Keep these triggers in sync with GROUPS in generate-ci.py.
 generate-native-pipeline:
@@ -163,8 +386,15 @@ ckptbench:
         job: generate-native-pipeline
     strategy: depend
 
+# Perf jobs install the published wheel rather than building from source, so
+# their child pipeline waits for both arches' gated publish — the wheel is
+# guaranteed to be in the registry before any [PERF] job starts.
 "[PERF].native":
   extends: .native_trigger
+  needs:
+    - generate-native-pipeline
+    - wheel-publish:x86_64
+    - wheel-publish:aarch64
   trigger:
     include:
       - artifact: generated-native-perf.yml
@@ -181,6 +411,9 @@ ckptbench:
         job: generate-native-pipeline
     strategy: depend
 
+# Not gated on wheel-publish like "[PERF].native": a manual bridge whose needs
+# failed loses its play button, and the prep step's source-build fallback keeps
+# these jobs runnable without a published wheel.
 "[PERF].nvrx":
   extends: [.native_trigger, .manual_optional]
   trigger:

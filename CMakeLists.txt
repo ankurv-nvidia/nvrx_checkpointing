@@ -3,7 +3,9 @@ project(phoenix)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
-set(VCPKG_AUTOCLONE_COMMIT "2026.02.27" CACHE STRING "The commit to clone vcpkg at if auto-cloning is enabled")
+# The pin lives in its own file so Dockerfile.ci can read the same value.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-commit.txt" PHOENIX_VCPKG_COMMIT LIMIT_COUNT 1)
+set(VCPKG_AUTOCLONE_COMMIT "${PHOENIX_VCPKG_COMMIT}" CACHE STRING "The minimum commit vcpkg is cloned or fast-forwarded to when auto-cloning is enabled")
 set(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR ON CACHE BOOL "Allow vcpkg to be found in the binary directory if not found in the source directory")
 
 include(CMakeDependentOption)
@@ -34,6 +36,7 @@ option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"         ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"  OFF)
 option(PHOENIX_BUILD_FOR_PERF "Build with full perf at the cost of increased resource usage" OFF)
 option(PHOENIX_BUILD_FOR_VALGRIND "Build with reduced memory usage" OFF)
+option(PHOENIX_REQUIRE_CUDA "Fail the configure when CUDA support is unavailable" OFF)
 
 DetectVar(PHOENIX_BUILD_FOR_PERF OFF)
 DetectVar(PHOENIX_BUILD_FOR_VALGRIND OFF)
@@ -64,6 +67,14 @@ endif()
 # set dependent default to ON if cuda is found
 cmake_dependent_option(PHOENIX_BUILD_CUDA   "Build CUDA Support"    ON CUDAToolkit_FOUND    OFF)
 cmake_dependent_option(PHOENIX_BUILD_METAL  "Build Metal Support"   ON METAL_FOUND          OFF)
+
+# CUDA is autodetected, so a broken toolchain degrades to a CPU-only build
+# silently. Builds that ship to GPU machines (the CI wheels) must fail the
+# configure instead: a CPU-only DeviceContext maps device pointers into
+# CPUContext::AddD2H and crashes at runtime.
+if (PHOENIX_REQUIRE_CUDA AND NOT PHOENIX_BUILD_CUDA)
+    message(FATAL_ERROR "PHOENIX_REQUIRE_CUDA is set but the CUDA toolkit was not found")
+endif()
 
 set(PYTHON_VENV_USE_SYSTEM_PACKAGES ON)
 
@@ -372,5 +383,13 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
         VERSION "${PROJECT_VERSION}"
         MODULES nvrx_checkpointing
         LICENSE_FILE LICENSE
+        WHL_FILE_OUTVAR PHOENIX_WHEEL_FILE
     )
+    # Buildable wheel target for CI. The pywhl `nvrx_checkpointing` target
+    # names its ninja depfile as a target-level dependency, which a fresh
+    # Ninja tree rejects (nothing produces the depfile until the packaging
+    # command has run once); `all_whl` additionally editable-installs into
+    # the configuring interpreter. Depending on the wheel file itself avoids
+    # both.
+    add_custom_target(nvrx_checkpointing_whl DEPENDS "${PHOENIX_WHEEL_FILE}")
 endif()

@@ -2,9 +2,16 @@
 set -Eeoux pipefail
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-MEGATRON_ROOT=$(${SCRIPT_DIR}/megatron_root.sh)
 REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 ARCH=$(uname -m)
+
+# Resolved on demand: only the container/megatron functions need the
+# megatron-lm checkout, and resolving it clones the repo — toolchain-only
+# invocations (e.g. Dockerfile.ci running `prepare.sh ubuntu2404`) run
+# without git or repo credentials.
+function resolve_megatron_root {
+    MEGATRON_ROOT=${MEGATRON_ROOT:-$(${SCRIPT_DIR}/megatron_root.sh)}
+}
 
 declare -A CUDA_REPOS=()
 CUDA_REPOS["noble_x86_64"]="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
@@ -176,6 +183,7 @@ function ubuntu2404 {
 }
 
 function container {
+    resolve_megatron_root
     PLAT_SUFFIX=$1
     BASE_IMAGE=${BASE_IMAGE:-${DOCKER_IMAGES["${PLAT_SUFFIX}"]}}
     CONTAINER_NAME=${CONTAINER_NAME:-mlm}
@@ -207,6 +215,7 @@ function container {
 }
 
 function megatron {
+    resolve_megatron_root
     nvcc --version || cuda13
     nvcc --version
     export MAX_JOBS=4

@@ -50,6 +50,7 @@ from typing import IO, TYPE_CHECKING, ClassVar
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+import wheel_install  # companion script in ci/scripts
 import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -946,9 +947,17 @@ def build_srun_cmd(  # noqa: PLR0913
     gpus_per_node: int,
     total_gpus: int,
     extra_srun_args: list[str] | None = None,
+    strip_container: bool = False,
+    overlap: bool = False,
+    label: bool = True,
 ) -> list[str]:
     """Render the scheduler template into the launch-command prefix (callers append the payload),
-    exempting every job from the idle-GPU reaper for its full time budget."""
+    exempting every job from the idle-GPU reaper for its full time budget.
+
+    ``strip_container`` drops the template's --container-* args, yielding the
+    host-level allocation srun for the prep/run dispatch; ``overlap`` marks an
+    inner job step that shares that allocation's resources.
+    """
     account = os.environ.get("SLURM_ACCOUNT", "").strip()
     if not account:
         raise RuntimeError("SLURM_ACCOUNT is not set — required for SLURM job submission")
@@ -981,8 +990,16 @@ def build_srun_cmd(  # noqa: PLR0913
     )
     # --label makes srun buffer each task's stdout on line boundaries before merging, so one
     # rank's partial write can't splice mid-line into another's (which clobbers rank 0's argument
-    # dump). Appended here, not in the templates, so every cluster's render carries it.
-    return [*shlex.split(string.Template(body).safe_substitute(values)), reaper, "--label", *(extra_srun_args or [])]
+    # dump). Appended here, not in the templates, so every cluster's render carries it. The
+    # allocation-level dispatch srun passes label=False: only its task 0 emits output, and a
+    # second prefix on the inner run srun's already-labeled lines would break the arguments
+    # capture (whose regexes strip exactly one prefix).
+    tokens = shlex.split(string.Template(body).safe_substitute(values))
+    if strip_container:
+        tokens = [tok for tok in tokens if not tok.startswith("--container-")]
+    if overlap:
+        tokens.insert(1, "--overlap")
+    return [*tokens, reaper, *(["--label"] if label else []), *(extra_srun_args or [])]
 
 
 def runner_gpus_per_node() -> int | None:
@@ -2088,6 +2105,16 @@ class PretrainJob:
         extra_args: list[str] | None = None,
         config_profile: str = "pico",
     ) -> list[str]:
+        """Prep-then-run dispatch inside one allocation.
+
+        The allocation-level srun (no container) lands a dispatcher on each
+        node; task 0 runs two overlapping inner job steps. The prep step
+        installs the native binaries into the shared checkout — the published
+        wheel for perf, a source-built wheel for the other flavors — and the
+        run step launches the workload. Every rank of the run step then finds
+        installed binaries, so the run is identical across flavors and never
+        compiles during the measured job.
+        """
         image = image_path().as_posix()
         triton_dir = _triton_cache_dir()
         total_tasks = nodes * gpus_per_node
@@ -2099,23 +2126,32 @@ class PretrainJob:
             # The in-allocation reference check runs the full routine twice (reference
             # provider, then the job's) plus the manifest derivations, all in this one srun.
             recipe.srun_time_min *= 2
-        # Run env as KEY=VALUE; the build-related vars are forwarded by name, since forwarding
-        # them by value has hit parsing ambiguity in the launcher.
-        container_env = ",".join(f"{k}={v}" for k, v in recipe.env.items())
-        container_env += "," + ",".join(["VCPKG_ROOT", *recipe.build_env])
+        # The srun forwards only what the tasks cannot re-derive: a
+        # runner-configured VCPKG_ROOT, plus — for the prep step's registry
+        # fetch fallback — the CI coordinates. Everything else the in-srun
+        # re-entry rebuilds from argv (the run env is injected into the phase
+        # processes from the re-derived recipe), and the flavor build env
+        # rides wheel_install's argv like the other per-run knobs.
+        srun_common = {
+            "time_minutes": recipe.srun_time_min,
+            "job_name": f"{job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
+            "image": image,
+            "gpus_per_node": gpus_per_node,
+            "extra_srun_args": recipe.srun_comments,
+        }
 
-        return [
-            *build_srun_cmd(
-                nodes=nodes,
-                ntasks=total_tasks,
-                time_minutes=recipe.srun_time_min,
-                job_name=f"{job}_{cfg}_{os.environ.get('CI_PIPELINE_ID', 'local')}",
-                image=image,
-                container_env=container_env,
-                gpus_per_node=gpus_per_node,
-                total_gpus=total_tasks,
-                extra_srun_args=recipe.srun_comments,
-            ),
+        wheel_prep_mode = "--ensure-prebuilt" if [f.name for f in flavors] == ["perf"] else "--build-from-source"
+        prep_container_env = "VCPKG_ROOT,CI_API_V4_URL,CI_PROJECT_ID,CI_JOB_TOKEN,CI_COMMIT_SHA,WHEEL_ARCH"
+        prep_cmd = [
+            *build_srun_cmd(nodes=1, ntasks=1, total_gpus=gpus_per_node, overlap=True, container_env=prep_container_env, **srun_common),
+            "python3",
+            "-u",
+            str(Path(wheel_install.__file__).resolve()),
+            wheel_prep_mode,
+            *[f"--define={k}={v}" for k, v in recipe.build_env.items()],
+        ]
+        run_cmd = [
+            *build_srun_cmd(nodes=nodes, ntasks=total_tasks, total_gpus=total_tasks, overlap=True, container_env="VCPKG_ROOT", **srun_common),
             # SLURM_PROCID will be set on each task, triggering in-srun mode.
             "python3",
             "-u",
@@ -2129,6 +2165,38 @@ class PretrainJob:
             config_profile,
             *[tok for f in flavors for tok in ("--flavor", f.name)],
             *(extra_args or []),
+        ]
+
+        run_dir = REPO_ROOT / f"ci/ci-runs/{cfg}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        dispatch = run_dir / "dispatch.sh"
+        dispatch.write_text(
+            "#!/bin/bash\n"
+            "# Generated by run_job.py (_build_pretrain_srun_cmd): prep-then-run job steps\n"
+            "# sharing one allocation. The allocation srun carries the run step's full\n"
+            "# task footprint (a smaller request would cap the CPUs the inner steps may\n"
+            "# use); task 0 drives both steps, every other task exits, and --overlap\n"
+            "# lets the inner steps span the whole allocation.\n"
+            "set -Eeuo pipefail\n"
+            ': "${SLURM_JOB_ID:?dispatch must run inside the srun allocation}"\n'
+            'if [ "${SLURM_PROCID:-0}" != "0" ]; then exit 0; fi\n'
+            f"{shlex.join(prep_cmd)}\n"
+            f"exec {shlex.join(run_cmd)}\n",
+        )
+        dispatch.chmod(0o755)
+
+        return [
+            *build_srun_cmd(
+                nodes=nodes,
+                ntasks=total_tasks,
+                total_gpus=total_tasks,
+                strip_container=True,
+                label=False,
+                container_env="",
+                **srun_common,
+            ),
+            "bash",
+            str(dispatch),
         ]
 
     @staticmethod
@@ -2906,6 +2974,16 @@ def main() -> None:
     build_env = Recipe(opts=[], env={})
     _apply_flavors(build_env, args.flavors)
     os.environ.update(build_env.build_env)
+
+    # Perf jobs can skip the source build when the pipeline's wheel job has
+    # published a perf wheel for this commit + arch. Only the perf flavor
+    # matches the wheel's build config (deterministic runs the plain build,
+    # valgrind needs PHOENIX_BUILD_FOR_VALGRIND). The launcher installs once;
+    # srun workers see the extracted files through the shared checkout, so
+    # in-srun re-entries skip the lookup. The load probe only applies where
+    # the binaries run on the runner host itself (non-slurm).
+    if not in_srun() and [f.name for f in args.flavors] == ["perf"]:
+        wheel_install.install_prebuilt_wheel(probe=not args.slurm)
 
     if args.job == "update_baselines":
         BaselineUpdater.run_update_baselines(args)
