@@ -4,9 +4,8 @@ project(phoenix)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 # The pin lives in its own file so Dockerfile.ci can read the same value.
-file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-commit.txt" PHOENIX_VCPKG_COMMIT LIMIT_COUNT 1)
-set(VCPKG_AUTOCLONE_COMMIT "${PHOENIX_VCPKG_COMMIT}" CACHE STRING "The minimum commit vcpkg is cloned or fast-forwarded to when auto-cloning is enabled")
-set(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR ON CACHE BOOL "Allow vcpkg to be found in the binary directory if not found in the source directory")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-commit.txt" VCPKG_AUTOCLONE_COMMIT LIMIT_COUNT 1)
+set(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR ON CACHE BOOL "Allow vcpkg  be found in the binary directory if not found in the source directory")
 
 include(CMakeDependentOption)
 

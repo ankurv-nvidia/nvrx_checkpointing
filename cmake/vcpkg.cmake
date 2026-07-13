@@ -285,7 +285,7 @@ function(_vcpkg_ensure_min_commit root min_commit)
     else()
         execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" fetch --tags origin)
     endif()
-    execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" checkout --detach "${min_commit}")
+    execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" checkout "${min_commit}")
     file(REMOVE "${root}/vcpkg" "${root}/vcpkg.exe")
 endfunction()
 

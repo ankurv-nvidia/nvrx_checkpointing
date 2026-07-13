@@ -367,11 +367,6 @@ class DeterministicFlavor(Flavor):
         # reproducibility); drop only the activation recompute, which adds compute.
         self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
-        # The deterministic gate runs two full training+save passes back to back (the <=2-node
-        # cross-run check, or the >2-node in-allocation reference check), and the heaviest config
-        # (nano4 8x4) overran a 45-min --time. --time is a ceiling (jobs finish early), so
-        # provision generously. int(): the template wants integer minutes.
-        recipe.srun_time_min = int(recipe.srun_time_min * 3)
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
@@ -451,7 +446,7 @@ class ValgrindFlavor(Flavor):
                 try:
                     if p.is_file():
                         out[str(p.relative_to(ckpt_root))] = p.stat().st_mtime
-                except OSError:
+                except OSError:  # noqa: PERF203
                     continue
         except OSError:
             pass
@@ -518,9 +513,6 @@ class ValgrindFlavor(Flavor):
         # Strip CUDA graphs AND recompute: graph capture is infeasible under memcheck. valgrind
         # composes with deterministic (which keeps CUDA graphs), so drop them explicitly here.
         self._drop_opts(recipe.opts, self._CUDA_GRAPH_FLAGS + self._RECOMPUTE_FLAGS)
-        # valgrind runs far slower; double the time budget so the stall guard, not the
-        # scheduler's time limit, ends a hung run.
-        recipe.srun_time_min = recipe.srun_time_min * 2
 
     @contextlib.contextmanager
     def prolog(self, ctx: RunCtx) -> Iterator[None]:
@@ -973,7 +965,7 @@ def build_srun_cmd(  # noqa: PLR0913
         "home": Path.home().as_posix(),
         "root": Path(image).parent.as_posix(),
         "account": account,
-        "partition": os.environ.get("SLURM_PARTITION", "interactive"),
+        "partition": os.environ.get("SLURM_PARTITION", "interactive" if nodes == 1 else "batch"),
     }
     body = "\n".join(ln for ln in _load_template("srun.tmpl").splitlines() if not ln.lstrip().startswith("#"))
     # Exempt the job from the idle-GPU reaper for its full time budget, so transient idle
@@ -1335,7 +1327,7 @@ class CheckpointServer:
         for shm in Path("/dev/shm").glob("checkpoint_request_*"):  # noqa: S108 — named shm, not a temp file
             try:
                 shm.unlink()
-            except OSError as ex:
+            except OSError as ex:  # noqa: PERF203
                 logger.info(f"[run_job] could not remove stale shm {shm}: {ex}")
 
     @staticmethod
@@ -1991,22 +1983,22 @@ def _log_determinism_versions() -> None:
     >= 1.6.0; older bundled wheels make MAMBA_DETERMINISTIC=1 a silent no-op."""
     if os.environ.get("SLURM_PROCID", "0") != "0":
         return
-    from importlib.metadata import version as _pkg_version
+    from importlib.metadata import version as _pkg_version  # noqa: PLC0415
 
     parts: list[str] = []
     for dist in ("mamba-ssm", "causal-conv1d", "torch", "transformer-engine", "triton"):
         try:
             parts.append(f"{dist}={_pkg_version(dist)}")
-        except Exception as exc:  # noqa: BLE001 — diagnostic must never break the run
+        except Exception as exc:  # noqa: BLE001, PERF203
             parts.append(f"{dist}=<{type(exc).__name__}>")
     try:
-        from mamba_ssm.utils.determinism import use_deterministic_mode
+        from mamba_ssm.utils.determinism import use_deterministic_mode  # pyright: ignore[reportMissingImports] # noqa: PLC0415
 
         parts.append(f"mamba_deterministic_active={use_deterministic_mode()}")
     except Exception as exc:  # noqa: BLE001
         parts.append(f"mamba_deterministic_active=<{type(exc).__name__}>")
     parts.append(f"MAMBA_DETERMINISTIC={os.environ.get('MAMBA_DETERMINISTIC', '<unset>')}")
-    logger.info("[run_job] determinism pkg versions: " + " ".join(parts))
+    logger.info("[run_job] determinism pkg versions: " + " ".join(parts))  # noqa: G003
 
 
 class PretrainJob:
@@ -2121,11 +2113,7 @@ class PretrainJob:
 
         recipe = Recipe(opts=[], env=Flavor.base_env(triton_dir))
         _apply_flavors(recipe, flavors)
-        flavor_names = {f.name for f in flavors}
-        if nodes > 2 and "deterministic" in flavor_names and "valgrind" not in flavor_names:  # noqa: PLR2004
-            # The in-allocation reference check runs the full routine twice (reference
-            # provider, then the job's) plus the manifest derivations, all in this one srun.
-            recipe.srun_time_min *= 2
+        recipe.srun_time_min = PretrainJob._job_time_min(config_profile, flavors, "srun", recipe.srun_time_min)
         # The srun forwards only what the tasks cannot re-derive: a
         # runner-configured VCPKG_ROOT, plus — for the prep step's registry
         # fetch fallback — the CI coordinates. Everything else the in-srun
@@ -2151,7 +2139,14 @@ class PretrainJob:
             *[f"--define={k}={v}" for k, v in recipe.build_env.items()],
         ]
         run_cmd = [
-            *build_srun_cmd(nodes=nodes, ntasks=total_tasks, total_gpus=total_tasks, overlap=True, container_env="VCPKG_ROOT", **srun_common),
+            *build_srun_cmd(
+                nodes=nodes,
+                ntasks=total_tasks,
+                total_gpus=total_tasks,
+                overlap=True,
+                container_env="VCPKG_ROOT",
+                **srun_common,
+            ),
             # SLURM_PROCID will be set on each task, triggering in-srun mode.
             "python3",
             "-u",
@@ -2212,7 +2207,7 @@ class PretrainJob:
         wait_for_file(marker, timeout_seconds)
 
     @staticmethod
-    def _run_two_phase(cfg: str, nodes: int, gpus_per_node: int, ckpt_provider: str, common: dict, *, routine: str = "") -> None:
+    def _run_two_phase(cfg: str, nodes: int, gpus_per_node: int, ckpt_provider: str, common: dict, *, routine: str = "") -> None:  # noqa: PLR0913
         """One full checkpoint routine: phase 1 trains from scratch and saves the handoff
         checkpoint, phase 2 loads it and saves the measured checkpoints. Two sequential
         processes in one task share one server lifecycle.
@@ -2237,15 +2232,16 @@ class PretrainJob:
             cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, gpus_per_node, phase=phase, ckpt_provider=ckpt_provider, **common)
             if redirect:
                 with log_file.open("ab") as fh:
-                    rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False).returncode  # noqa: S603
+                    rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False).returncode
                 if rc != 0:
                     tail = "\n".join(log_file.read_text(errors="replace").splitlines()[-40:])
                     logger.error(f"[run_job] {routine} routine phase {phase} failed (rc={rc}); tail of {log_file.name}:\n{tail}")
                     raise RuntimeError(f"{routine} routine phase {phase} failed with exit code {rc} — see {log_file}")
             else:
-                subprocess.run(cmd, env=env, check=True)  # noqa: S603
+                subprocess.run(cmd, env=env, check=True)
             if phase == 1:
-                PretrainJob._wait_for_phase1_checkpoint(cfg)
+                budget = PretrainJob._job_time_min(common["config_profile"], common["flavors"], "phase1-flush", 30)
+                PretrainJob._wait_for_phase1_checkpoint(cfg, budget * 60)
 
     # The provider whose output is the equality reference the other provider is compared
     # against — committed metadata/ baselines at <=2 nodes, the in-allocation reference
@@ -2311,7 +2307,7 @@ class PretrainJob:
         ).returncode
 
     @staticmethod
-    def _run_in_allocation_reference_check(cfg: str, nodes: int, gpus_per_node: int, provider: str, common: dict) -> None:
+    def _run_in_allocation_reference_check(cfg: str, nodes: int, gpus_per_node: int, provider: str, common: dict) -> None:  # noqa: C901, PLR0912
         """The >2-node deterministic gate: run the checkpoint routine twice inside this one
         allocation — first with the reference provider, then with the job's provider — and
         require bit-identical manifests for every checkpoint (the phase-1 handoff and each
@@ -2346,7 +2342,7 @@ class PretrainJob:
                 for group, iter_dir in PretrainJob._checkpoint_iter_dirs(cfg):
                     rc = PretrainJob._derive_manifest(iter_dir)
                     if rc != 0:
-                        raise RuntimeError(f"reference manifest derivation failed for {group}/{iter_dir.name} (rc={rc})")
+                        raise RuntimeError(f"reference manifest derivation failed for {group}/{iter_dir.name} (rc={rc})")  # noqa: TRY301
                     stash_dir = reference_root / group / iter_dir.name
                     stash_dir.mkdir(parents=True)
                     for name in ("reference.metadata.info", "common_pt_dump.info"):
@@ -2552,8 +2548,8 @@ class PretrainJob:
         return _flatten_cli({**dynamic, **model}) + checkpoint_opts
 
     @staticmethod
-    def _load_model_config(profile: str) -> dict:
-        """Static model + training args, deep-merged with the named profile override."""
+    def _load_profile_config(profile: str) -> dict:
+        """base.yaml deep-merged with the named profile override, including CI-scoped keys."""
         base = yaml.safe_load((CONFIGS_DIR / "base.yaml").read_text()) or {}
         override = CONFIGS_DIR / f"{profile}.yaml"
         if not override.exists():
@@ -2561,6 +2557,20 @@ class PretrainJob:
                 f"unknown config profile {profile!r}: {override} not found (available: {', '.join(_available_profiles())})",
             )
         return _deep_merge(base, yaml.safe_load(override.read_text()) or {})
+
+    @staticmethod
+    def _load_model_config(profile: str) -> dict:
+        """Static model + training args: the profile config minus the CI-scoped keys."""
+        return {k: v for k, v in PretrainJob._load_profile_config(profile).items() if k != "job_time_in_mins"}
+
+    @staticmethod
+    def _job_time_min(profile: str, flavors: list | None, use_case: str, default: int) -> int:
+        """A flavor-keyed time budget from the profile config: job_time_in_mins[use_case]
+        maps the sorted flavor-name chain (e.g. "deterministic-valgrind") to minutes,
+        falling back to the use-case's "default" entry, then to ``default``."""
+        table = (PretrainJob._load_profile_config(profile).get("job_time_in_mins") or {}).get(use_case) or {}
+        chain = "-".join(sorted(f.name for f in (flavors or []))) or "default"
+        return int(table.get(chain, table.get("default", default)))
 
     @staticmethod
     def _launch_pretrain_inline(ctx: RunCtx) -> None:
@@ -2702,24 +2712,28 @@ class PretrainJob:
         sys_path_insert(REPO_ROOT.parent)
         sys_path_insert(megatron_root())
 
-        from megatron.core.enums import ModelType  # noqa: PLC0415
-        from megatron.training import inprocess_restart, pretrain, set_startup_timestamps  # noqa: PLC0415
-        from megatron.training.argument_utils import (  # noqa: PLC0415
+        from megatron.core.enums import ModelType  # pyright: ignore[reportMissingImports] # noqa: PLC0415
+        from megatron.training import (  # pyright: ignore[reportMissingImports] # noqa: PLC0415
+            inprocess_restart,
+            pretrain,
+            set_startup_timestamps,
+        )
+        from megatron.training.argument_utils import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
             hybrid_config_from_args,
             pretrain_cfg_container_from_args,
         )
-        from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415
+        from megatron.training.arguments import parse_and_validate_args  # pyright: ignore[reportMissingImports] # noqa: PLC0415
 
         try:
-            from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415
+            from megatron.post_training.arguments import add_modelopt_args  # pyright: ignore[reportMissingImports] # noqa: PLC0415
 
             has_modelopt = True
         except ImportError:
             has_modelopt = False
 
-        import pretrain_hybrid as ph  # noqa: PLC0415
-        from hybrid_builders import hybrid_builder  # noqa: PLC0415
-        from model_provider import model_provider as _mp  # noqa: PLC0415
+        import pretrain_hybrid as ph  # pyright: ignore[reportMissingImports] # noqa: PLC0415
+        from hybrid_builders import hybrid_builder  # pyright: ignore[reportMissingImports] # noqa: PLC0415
+        from model_provider import model_provider as _mp  # pyright: ignore[reportMissingImports] # noqa: PLC0415
 
         rank0 = int(os.environ.get("RANK", "0")) == 0
         # Parser markers print to stdout: this subprocess has no logging handler and
@@ -2770,7 +2784,7 @@ class PretrainJob:
         """Probe the per-node checkpoint server when a training rank fails. Pings its port and,
         only when the failure implicates the server, dumps its log (if dead) or its stack (if alive
         but stuck); stays quiet otherwise. One probe per node; never raises."""
-        from nvrx_checkpointing.ckpt_diag import diagnose_checkpoint_server_failure  # noqa: PLC0415
+        from nvrx_checkpointing.ckpt_diag import diagnose_checkpoint_server_failure  # pyright: ignore[reportMissingImports] # noqa: PLC0415
 
         diagnose_checkpoint_server_failure(exc, log_dir=RESULTS_DIR)
 

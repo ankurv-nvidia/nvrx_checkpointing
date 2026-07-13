@@ -20,4 +20,3 @@ moe-router-topk-scaling-factor: "5.0"
 # Parallelism + batch size (pinned, not scaled to the runner's GPU count)
 tensor-model-parallel-size: 2
 expert-model-parallel-size: 64
-global-batch-size: 3072

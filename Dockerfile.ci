@@ -66,7 +66,12 @@ ENV CC=clang-22 CXX=clang++-22
 # toolchain/vcpkg change — is compiled, and its archive is uploaded for
 # the runs that follow.
 COPY cmake/vcpkg-commit.txt /tmp/vcpkg-commit.txt
-RUN git clone --branch "$(cat /tmp/vcpkg-commit.txt)" --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+# The pin is a commit SHA, which `git clone --branch` cannot take; shallow-fetch the
+# exact commit instead (GitHub serves arbitrary-SHA fetches).
+RUN git init /opt/vcpkg \
+ && git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git \
+ && git -C /opt/vcpkg fetch --depth 1 origin "$(cat /tmp/vcpkg-commit.txt)" \
+ && git -C /opt/vcpkg checkout --detach FETCH_HEAD \
  && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics \
  && rm -f /tmp/vcpkg-commit.txt
 ENV VCPKG_ROOT=/opt/vcpkg

@@ -103,7 +103,6 @@ straggler-minmax-count: 16
 timing-log-option: minmax
 
 # Misc
-eval-iters: 14
 no-mmap-bin-files: true
 no-create-attention-mask-in-dataloader: true
 distributed-timeout-minutes: 30
@@ -121,3 +120,22 @@ lr-decay-style: WSD
 lr-warmup-samples: 2000
 lr-wsd-decay-samples: 40000
 train-samples: 51200
+
+# CI job time budgets (minutes). Each use-case maps the job's sorted flavor chain
+# (with a "default" fallback) to its budget; profiles override entries through the
+# usual deep merge.
+job_time_in_mins:
+  # srun --time ceiling — jobs finish early — sized for the heaviest scale that
+  # runs the flavor (nano4 8x4 perf needs ~50 minutes; the 8x4 in-allocation
+  # deterministic gate runs the full routine twice).
+  srun:
+    default: 30
+    perf: 60
+    deterministic: 180
+    deterministic-valgrind: 180
+  # Budget for the phase-1 checkpoint to become durable before phase 2 loads it.
+  # Memcheck serializes the server's fragment pipeline ~30x, so the valgrind
+  # flavor legitimately needs most of an hour.
+  phase1-flush:
+    default: 30
+    deterministic-valgrind: 60

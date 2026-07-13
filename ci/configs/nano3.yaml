@@ -31,7 +31,6 @@ ckpt-fully-parallel-load-process-group: ep_dp
 # there is no --ckpt-fully-parallel-save-deprecated. Parallel save is on by default.
 ckpt-fully-parallel-save: true
 ckpt-fully-parallel-save-process-group: ep_dp
-eval-global-batch-size: 256
 # Sequence length (production nano trains at 8192, not the base 1024)
 seq-length: 8192
 max-position-embeddings: 8192
@@ -83,7 +82,6 @@ manual-gc: true
 manual-gc-interval: 100
 num-workers: 2
 distributed-timeout-minutes: 120
-eval-iters: 7
 
 # LR magnitude (the sample-based WSD horizon is omitted; see header)
 lr: "8e-4"
