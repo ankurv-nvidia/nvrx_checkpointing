@@ -61,7 +61,10 @@ using PerfClock = std::chrono::high_resolution_clock;
 #ifdef PHOENIX_BUILD_FOR_VALGRIND
 static constexpr auto AutoShutdownTimeout = 900s;
 #else
-static constexpr auto AutoShutdownTimeout = 450s;
+// TODO_CLI_SVR_RESPAWN
+// Must exceed the longest inter-save training stretch a job produces since the client
+// cannot handle cleanly if a daemon spinsdown and respaws.
+static constexpr auto AutoShutdownTimeout = 900s;
 #endif
 
 // uint32_t ranks
@@ -913,6 +916,7 @@ void Session::SendToPeerWithRetries_(std::string const& peer, std::string const&
                     "[native_ckpt:svr][{}#{}][ERROR] Peer {} globalregistry returned {}", *server, sessionId, peer, res.result_int()));
             }
             TryCleanShutdown(stream);
+            return;
         } catch (std::exception const& ex)
         {
             fmt::print(stderr,
@@ -1100,18 +1104,22 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<ch
                rank,
                hdr.messageSize,
                offset);
-    asyncTasks.emplace_back(
-        std::async(std::launch::async | std::launch::deferred, &Session::OnRecieveLocalStateRegistryAsync_, this, rank));
-
-    // Coordinator-peer ranks merge into the global registry locally (OnRecieve); only
-    // ranks on other peers forward their fragment to the coordinator (peers[0]).
-    if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
     {
-        asyncTasks.push_back(std::async(std::launch::async | std::launch::deferred,
-                                        &Session::SendLocalShardedStateRegistryToPeerWithRetries_,
-                                        this,
-                                        rank,
-                                        topo.peers[0]));
+        // Concurrent handlers push here; an unlocked emplace corrupts sibling futures.
+        std::scoped_lock lock(mutex);
+        asyncTasks.emplace_back(
+            std::async(std::launch::async | std::launch::deferred, &Session::OnRecieveLocalStateRegistryAsync_, this, rank));
+
+        // Coordinator-peer ranks merge into the global registry locally (OnRecieve); only
+        // ranks on other peers forward their fragment to the coordinator (peers[0]).
+        if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
+        {
+            asyncTasks.push_back(std::async(std::launch::async | std::launch::deferred,
+                                            &Session::SendLocalShardedStateRegistryToPeerWithRetries_,
+                                            this,
+                                            rank,
+                                            topo.peers[0]));
+        }
     }
 }
 
@@ -1273,7 +1281,10 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char
     // TODO_SAVETENSORS : Write out the rank specific checkpoint file
     // WriteTensorsToFile(snapshot, snapshot.path / "tensors.bin");
 
-    asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::OnFinalizeSnapshotAsync_, this, hdr));
+    {
+        std::scoped_lock lock(mutex);    // see Handle(LocalStateRegistry): the task list is shared across concurrent handlers
+        asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::OnFinalizeSnapshotAsync_, this, hdr));
+    }
 }
 
 void Session::HandleStateRegistryFragment(Rank recvRank, std::vector<TensorShardInfo> const& tensorShards)
@@ -1347,16 +1358,21 @@ struct Server
                             _msgQueue.erase(&msgQueue);
                             return;
                         }
-                        HandleMessage(hdr, buf);
+                        // The slot returns to the writer even on a throw; a skipped EndRead
+                        // leaks it permanently and a saturated leak wedges the queue.
+                        try
+                        {
+                            HandleMessage(hdr, buf);
+                        } catch (std::exception const& e)
+                        {
+                            fmt::print(
+                                stderr, "[native_ckpt:svr][{}][ERROR] Exception handling message (slot released): {}\n", *this, e.what());
+                        }
                         msgQueue.EndRead();
 
                     } catch (std::exception const& e)
                     {
                         fmt::print(stderr, "[native_ckpt:svr][{}][ERROR] Exception: {}\n", *this, e.what());
-                        // Stopping could cause clients to hang if they are waiting for a response.
-                        // _running = false;
-                        // _msgQueue.erase(std::remove(_msgQueue.begin(), _msgQueue.end(), &msgQueue), _msgQueue.end());    //
-                        // NOLINT throw;
                     }
             });
         }
@@ -1533,7 +1549,11 @@ struct Server
             std::vector<std::vector<std::future<void>>> allTasks;
             {
                 std::scoped_lock<std::mutex> lock(_mutex);
-                for (auto& [id, session] : _activeSessions) { allTasks.push_back(std::move(session->asyncTasks)); }
+                for (auto& [id, session] : _activeSessions)
+                {
+                    std::scoped_lock sessionLock(session->mutex);    // handlers push under this lock
+                    allTasks.push_back(std::move(session->asyncTasks));
+                }
             }
         }
 
