@@ -258,6 +258,7 @@ struct CheckpointWriter
     {
         std::unique_ptr<cipc::MsgQueue> queue;
         std::shared_future<void>        ready;
+        int                             numaNode{-1};
     };
 
     struct QueueRegistry
@@ -289,6 +290,7 @@ struct CheckpointWriter
         // pinned pages won't migrate.
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
+        state->numaNode = numa;
         std::thread([topo, numa, state, readyP]() {
             SvcPing();
             SetThreadName("ncc:bufwarm");
@@ -311,7 +313,7 @@ struct CheckpointWriter
         }).detach();
     }
 
-    static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo)
+    static std::shared_ptr<QueueState> GetQueueState(RankTopology const& topo)
     {
         WarmUpCheckpoint(topo);
         std::shared_ptr<QueueState> state;
@@ -321,14 +323,18 @@ struct CheckpointWriter
             state = reg.states.at(topo.rank);
         }
         state->ready.get();    // rethrows if the warmup failed to open/pin
-        return *state->queue;
+        return state;
     }
 
-    cipc::MsgQueue&     msgQueue = GetMsgQueue(root.Topo());
-    size_t const        slotSize = msgQueue.SlotSize();    // runtime shm slot capacity, set by the server
-    std::atomic<size_t> totalD2HRequests{0};
-    std::atomic<size_t> smallD2HRequests{0};
-    std::atomic<size_t> totalWrittenBytes{0};
+    static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo) { return *GetQueueState(topo)->queue; }
+
+    std::shared_ptr<QueueState> queueState = GetQueueState(root.Topo());
+    cipc::MsgQueue&             msgQueue   = *queueState->queue;
+    int const                   numaNode   = queueState->numaNode;
+    size_t const                slotSize   = msgQueue.SlotSize();    // runtime shm slot capacity, set by the server
+    std::atomic<size_t>         totalD2HRequests{0};
+    std::atomic<size_t>         smallD2HRequests{0};
+    std::atomic<size_t>         totalWrittenBytes{0};
 
     TimePoint const start = Clock::now();
 
@@ -568,12 +574,9 @@ struct CheckpointWriter
         auto stop1                       = Clock::now();
 
         {
-            int numaNode = -1;
-#ifdef PHOENIX_HAVE_CUDA
-            // Tell the server this rank's GPU-local NUMA node so it can place the
-            // accumulation blob there, keeping its dequeue copy on-socket.
-            numaNode = DeviceContext::CudaGetCurrentDeviceNumaNode();
-#endif
+            // The CUDA current device is thread-local. Reuse the node captured while
+            // opening this rank's queue instead of querying again from an async writer
+            // thread, where the current device may have fallen back to device 0.
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
             auto msg = sstrm.str();

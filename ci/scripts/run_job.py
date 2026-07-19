@@ -143,6 +143,11 @@ def platform_tag() -> str:
     return tag or socket.gethostname().split(".")[0]
 
 
+def cluster_tag() -> str:
+    """Runner cluster identifier used only for cluster-specific perf centers."""
+    return os.environ.get("CLUSTER", "").strip()
+
+
 RESULTS_DIR = REPO_ROOT / "ci" / "ci-results"
 PERF_TOLERANCE = 0.05  # 5% tolerance — both regressions and improvements beyond this fail
 # Max tolerated bandwidth ratio between the two socket halves; a breach means a
@@ -1395,6 +1400,21 @@ class CheckpointServer:
 
 class PerfReport:
     @staticmethod
+    def _select_cluster_baseline(baseline: dict, cluster: str) -> dict:
+        """Overlay a cluster's metric centers while retaining the platform-wide gates.
+
+        Platforms can have materially different healthy throughput across clusters. The
+        tolerance and fixed socket-imbalance threshold remain shared; only metric centers
+        explicitly listed under ``cluster_metrics`` are replaced.
+        """
+        overrides = (baseline.get("cluster_metrics") or {}).get(cluster)
+        if not isinstance(overrides, dict):
+            return baseline
+        selected = dict(baseline)
+        selected["metrics"] = {**(baseline.get("metrics") or {}), **overrides}
+        return selected
+
+    @staticmethod
     def _report_checkpoint_times(log_text: str) -> None:
         """Print each phase's save-checkpoint times plus the second phase's load time, splitting
         the combined two-phase log on its phase banner."""
@@ -1431,6 +1451,7 @@ class PerfReport:
         PerfReport._report_checkpoint_times(log_text)
 
         metrics = PerfReport._parse_metrics(log_text, job, gpus_per_node)
+        cluster = cluster_tag()
 
         if not metrics:
             if job == "pretrain-nvrx":
@@ -1440,13 +1461,22 @@ class PerfReport:
                 raise RuntimeError(f"no perf metrics found in {log_file}")
 
         if update_baseline:
-            BaselineUpdater.update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+            BaselineUpdater.update_baseline_file(
+                baseline_file,
+                metrics,
+                job,
+                config,
+                flavor_tag,
+                gpus_per_node,
+                cluster=cluster,
+            )
             return True
 
         baseline = {}
         if baseline_file.exists():
             with baseline_file.open() as f:
                 baseline = yaml.safe_load(f)
+        baseline = PerfReport._select_cluster_baseline(baseline, cluster)
 
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
         PerfReport._print_perf_summary(comparison, passed, metrics)
@@ -1458,6 +1488,7 @@ class PerfReport:
             "gpus_per_node": gpus_per_node,
             "log": str(log_file),
             "baseline": str(baseline_file),
+            "cluster": cluster,
             "passed": passed,
             "metrics": {k: {kk: vv for kk, vv in v.items() if kk not in ("samples", "ranks")} for k, v in metrics.items()},
             "comparison": comparison,
@@ -1794,7 +1825,16 @@ class BaselineUpdater:
         return round(mean, 6)
 
     @staticmethod
-    def update_baseline_file(baseline_file: Path, metrics: dict, job: str, config: str, flavor_tag: str, gpus_per_node: int) -> None:  # noqa: PLR0913
+    def update_baseline_file(  # noqa: PLR0913
+        baseline_file: Path,
+        metrics: dict,
+        job: str,
+        config: str,
+        flavor_tag: str,
+        gpus_per_node: int,
+        *,
+        cluster: str = "",
+    ) -> None:
         if baseline_file.exists():
             with baseline_file.open() as f:
                 baseline = yaml.safe_load(f)
@@ -1807,7 +1847,10 @@ class BaselineUpdater:
                 "metrics": {},
             }
 
-        existing = baseline.setdefault("metrics", {})
+        platform_metrics = baseline.setdefault("metrics", {})
+        overrides = (baseline.get("cluster_metrics") or {}).get(cluster)
+        existing = overrides if isinstance(overrides, dict) else platform_metrics
+        effective_metrics = {**platform_metrics, **existing}
         tolerances = baseline.get("tolerances") or {}
         changed: list[str] = []
         for name, data in metrics.items():
@@ -1820,7 +1863,7 @@ class BaselineUpdater:
             mean = data.get("mean")
             if mean is None:
                 continue
-            old_val = existing.get(name)
+            old_val = effective_metrics.get(name)
             higher_is_better = data.get("higher_is_better")
             # Effective tolerance mirrors _compare_to_baseline. YAML's int-vs-float spelling
             # does not affect comparison semantics: directional metrics use the perf tolerance,
@@ -1918,7 +1961,15 @@ class BaselineUpdater:
                     continue
 
                 baseline_file = BASELINES_DIR / f"{artifact_stem(machine, job, flavor_tag, config)}.yaml"
-                BaselineUpdater.update_baseline_file(baseline_file, metrics, job, config, flavor_tag, gpus_per_node)
+                BaselineUpdater.update_baseline_file(
+                    baseline_file,
+                    metrics,
+                    job,
+                    config,
+                    flavor_tag,
+                    gpus_per_node,
+                    cluster=report.get("cluster", ""),
+                )
 
         # The metadata md5 snapshot is only produced by deterministic runs. nvrx
         # always runs deterministic; native does so only under the deterministic flavor.

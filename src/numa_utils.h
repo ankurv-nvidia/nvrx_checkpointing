@@ -7,6 +7,7 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
 // Process-lifetime hwloc topology, loaded once. hwloc_topology_load scans /sys,
 // so it must not run per-operation (e.g. on the checkpoint server's per-snapshot
@@ -64,19 +65,33 @@ inline void UnbindThreadCpu()
     }
 }
 
-// Count NUMA nodes that have CPUs. GB200 exposes GPU-memory NUMA nodes (cpuset
-// empty); those must not inflate the socket count used for queue placement.
-inline uint8_t DetectNumaNodeCount()
+// Return NUMA nodes that can both run a CPU thread and back host allocations.
+// A NUMA object's cpuset expresses CPU locality, so it may be non-empty even
+// when that memory target has no local capacity.
+inline std::vector<int> DetectHostMemoryNumaNodes()
 {
-    hwloc_topology_t topo  = HwlocTopology();
-    int              count = 0;
-    hwloc_obj_t      obj   = nullptr;
+    hwloc_topology_t topo = HwlocTopology();
+    std::vector<int> nodes;
+    int              fallbackNode = 0;
+    bool             hasFallback  = false;
+    hwloc_obj_t      obj          = nullptr;
     while ((obj = hwloc_get_next_obj_by_type(topo, HWLOC_OBJ_NUMANODE, obj)) != nullptr)
     {
-        if (obj->cpuset != nullptr && hwloc_bitmap_iszero(obj->cpuset) == 0) { ++count; }
+        bool const hasCpus = obj->cpuset != nullptr && hwloc_bitmap_iszero(obj->cpuset) == 0;
+        if (!hasCpus) { continue; }
+        if (!hasFallback)
+        {
+            fallbackNode = static_cast<int>(obj->os_index);
+            hasFallback  = true;
+        }
+        if (obj->attr != nullptr && obj->attr->numanode.local_memory > 0) { nodes.push_back(static_cast<int>(obj->os_index)); }
     }
-    return count > 0 ? static_cast<uint8_t>(count) : 1;
+    if (nodes.empty()) { nodes.push_back(fallbackNode); }
+    return nodes;
 }
+
+inline uint8_t DetectNumaNodeCount()
+{ return static_cast<uint8_t>(DetectHostMemoryNumaNodes().size()); }
 
 // Migrate a mapped range to `node` (OS index) so its pages are local to the GPU
 // that copies into it, regardless of which thread/process first touched them.
@@ -90,8 +105,7 @@ inline void BindRegionToNumaNode(int node, void* addr, size_t size)
     hwloc_topology_t topo = HwlocTopology();
     if (hwloc_obj_t obj = NumaNodeByOsIndex(topo, node); obj != nullptr && obj->nodeset != nullptr)
     {
-        (void)hwloc_set_area_membind(
-            topo, addr, size, obj->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET | HWLOC_MEMBIND_MIGRATE);
+        (void)hwloc_set_area_membind(topo, addr, size, obj->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET | HWLOC_MEMBIND_MIGRATE);
     }
 }
 
@@ -100,9 +114,9 @@ inline int GetCurrentNumaNode()
     hwloc_topology_t topo      = HwlocTopology();
     auto             numaCount = hwloc_get_nbobjs_by_type(topo, HWLOC_OBJ_NUMANODE);
     if (numaCount <= 1) { return 0; }
-    hwloc_cpuset_t cpuset = hwloc_bitmap_alloc();
-    auto           cleanup = [&] { hwloc_bitmap_free(cpuset); };
-    auto getCpusetStr = [&]() {
+    hwloc_cpuset_t cpuset       = hwloc_bitmap_alloc();
+    auto           cleanup      = [&] { hwloc_bitmap_free(cpuset); };
+    auto           getCpusetStr = [&]() {
         std::array<char, 256> buf{};
         hwloc_bitmap_list_snprintf(buf.data(), buf.size(), cpuset);
         return std::string(buf.data());

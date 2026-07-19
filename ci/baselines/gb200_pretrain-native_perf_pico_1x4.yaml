@@ -4,7 +4,11 @@ update_cmd:
   python3 ci/scripts/run_job.py pretrain-native --slurm
   --update-baseline
 metrics:
-  bw_mbps: 135000.0
-  wr_tnsr_us: 38000.0
+  bw_mbps: 142000.0
+  wr_tnsr_us: 36300.0
   total_written_bytes: 5404165856
   gpu_peak_bytes: 10048860160
+cluster_metrics:
+  awscmh:
+    bw_mbps: 104000.0
+    wr_tnsr_us: 49700.0

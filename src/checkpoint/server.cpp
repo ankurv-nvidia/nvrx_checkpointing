@@ -36,6 +36,7 @@
 #include <hwloc.h>
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -1342,17 +1343,27 @@ struct Server
         {
             _threads.emplace_back([this, i, queueSize, &queuesReady]() {
                 SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
-                // First-touch this queue's shm control region (slot atomics/condvars)
-                // on the NUMA domain its ranks use, so far-socket clients don't reach
-                // those per-slot atomics cross-socket. Pin only across Create, then
-                // unpin so the dequeue loop's blocking wait isn't socket-restricted.
-                if (auto numDomains = DetectNumaNodeCount(); numDomains > 1)
+                // Map queues across host-memory NUMA domains. Pinning around Create
+                // places the control page; materializing the data pages in the owner
+                // mapping prevents CUDA registration in a restricted client process
+                // from faulting every shared page onto one socket.
+                auto const numaNodes = DetectHostMemoryNumaNodes();
+                int        queueNuma = numaNodes.front();
+                if (numaNodes.size() > 1)
                 {
-                    uint8_t queuesPerDomain = cipc::MaxRanksPerNode / numDomains;
+                    size_t queuesPerDomain = static_cast<size_t>(cipc::MaxRanksPerNode) / numaNodes.size();
                     if (queuesPerDomain == 0) { queuesPerDomain = 1; }
-                    BindThreadCpuToNumaNode(std::min<int>(numDomains - 1, i / queuesPerDomain));
+                    size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
+                    queueNuma           = numaNodes[domain];
+                    BindThreadCpuToNumaNode(queueNuma);
                 }
                 auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize);
+                if (numaNodes.size() > 1)
+                {
+                    auto region = msgQueue.GetShmDataRegion();
+                    BindRegionToNumaNode(queueNuma, region.data(), region.size());
+                    std::fill(region.begin() + static_cast<std::ptrdiff_t>(cipc::MsgQueue::HdrAllocSize), region.end(), char{});
+                }
                 UnbindThreadCpu();
                 // Create publishes the queue geometry. Only after every queue reaches
                 // this point may a ping report the service as ready: clients start their
