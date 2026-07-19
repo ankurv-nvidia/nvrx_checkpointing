@@ -65,23 +65,35 @@ PLATFORMS = [
                 "with_update": True,
                 "group": "8node-nano4",
                 "timeout": "1d",
+                # No valgrind job: nano4's per-rank snapshot blob (~65 GB) exceeds
+                # memcheck's per-allocation ceiling, so the server cannot host even one
+                # generation under valgrind. nano3 8x4 memchecks the same code paths.
                 "jobs": [
                     ("pretrain-native", "deterministic"),
                     ("pretrain-native", "perf"),
                     ("pretrain-nvrx", "deterministic"),
                     ("pretrain-nvrx", "perf"),
-                    ("pretrain-native", ["deterministic", "valgrind"]),
                 ],
             },
             {
                 "key": "multinode-perf",
-                "config": "ultra",
+                "config": "ultra3bf16",
                 "nodes": 16,
                 "scale": "16x4",
-                "with_update": False,
-                "group": "16node-ultra",
+                "with_update": True,
+                "group": "16node-ultra3bf16",
                 "timeout": "1d",
-                "jobs": [("pretrain-native", "perf")],
+                "jobs": [("pretrain-native", "perf"), ("pretrain-nvrx", "perf")],
+            },
+            {
+                "key": "multinode-perf-64",
+                "config": "ultra3fp8",
+                "nodes": 64,
+                "scale": "64x4",
+                "with_update": True,
+                "group": "64node-ultra3fp8",
+                "timeout": "1d",
+                "jobs": [("pretrain-native", "perf"), ("pretrain-nvrx", "perf")],
             },
         ],
     },
@@ -98,16 +110,8 @@ PLATFORMS = [
                 "with_update": True,
                 "jobs": [("pretrain-native", "deterministic"), ("pretrain-nvrx", "deterministic")],
             },
-            {
-                "key": "multinode-perf",
-                "config": "ultra",
-                "nodes": 16,
-                "scale": "16x8",
-                "with_update": False,
-                "group": "16node-ultra",
-                "timeout": "1d",
-                "jobs": [("pretrain-native", "perf")],
-            },
+            # No 16-node set: the h100 runner's partition QOS caps allocations below
+            # 16 nodes, so the jobs can never schedule.
         ],
     },
 ]
@@ -160,7 +164,8 @@ GROUPS = (
     "nvrx-deterministic",
     "nvrx-perf",
     "valgrind",
-    "16node-ultra",
+    "16node-ultra3bf16",
+    "64node-ultra3fp8",
     "8node-nano3",
     "8node-nano4",
 )
@@ -213,11 +218,13 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
     if p.get("stress"):
         groups["ckptbench"].append(_job(f"{name}:ckpt-stress:{gpus}", [".run_ckpt_stress", runner], needs=ckpt))
 
-    standard = (
+    standard = [
         ("pretrain-native", "deterministic"),
         ("pretrain-native", "perf"),
         ("pretrain-nvrx", "deterministic"),
-    )
+    ]
+    if name == "devbox":
+        standard.remove(("pretrain-native", "perf"))
     for job, flavor in standard:
         jname = f"{name}:{_provider(job)}:pico_{gpus}:{FLAVOR_LABEL.get(flavor, flavor)}"
         args = f"{job} --config pico --flavor {flavor}"

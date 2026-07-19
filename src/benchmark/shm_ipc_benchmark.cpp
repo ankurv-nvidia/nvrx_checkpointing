@@ -1,6 +1,7 @@
 #include "SetThreadName.h"
 #include "blob.h"
 #include "messages.h"
+#include "shm_ring_buffer.h"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/process.hpp>
@@ -17,10 +18,15 @@
 
 namespace bpo = boost::program_options;
 using namespace checkpoint::ipc;
-static constexpr char const* QueueName          = "shm_ipc_benchmark";
-static constexpr size_t      DefaultIter        = 128;
-static constexpr size_t      DefaultMessageSize = D2HBufferSize;
-static constexpr size_t      DefaultRanks       = 2;
+static constexpr char const* QueueName   = "shm_ipc_benchmark";
+static constexpr size_t      DefaultIter = 128;
+// Per-slot shm capacity for the benchmark queue. Runtime queue paths read the
+// actual slot size back from the queue; the pure-memcpy baselines (no queue)
+// use this constant directly.
+static constexpr size_t BenchSlotSize = 32ull * 1024 * 1024;
+// Total shm to request so the queue's runtime slot size equals BenchSlotSize.
+static constexpr size_t DefaultMessageSize = BenchSlotSize;
+static constexpr size_t DefaultRanks       = 2;
 
 static std::atomic<PerfMetrics::Clock::time_point> StartTime{};    // NOLINT
 static std::atomic<PerfMetrics::Clock::duration>   Duration{};     // NOLINT
@@ -35,16 +41,17 @@ static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool valida
 {
     SetThreadName("ncs:server");
     if (debug) { fmt::print("[s] starting\n"); }
-    auto msgQueue = MsgQueue::Create(QueueName);
+    auto msgQueue = MsgQueue::Create(QueueName, MsgQueue::HdrAllocSize + (D2HBufferCount * BenchSlotSize));
     if (debug) { fmt::print("[s] created queue {}\n", QueueName); }
-    auto totalBytes    = msgCount * memorySize * ranks;
-    auto totalMessages = totalBytes / D2HBufferSize;
+    auto const slotSize      = msgQueue.SlotSize();
+    auto       totalBytes    = msgCount * memorySize * ranks;
+    auto       totalMessages = totalBytes / slotSize;
 
-    Blob buffer(D2HBufferSize * D2HBufferCount);
+    Blob buffer(slotSize * D2HBufferCount);
 
-    for (size_t i = 0; i < totalBytes; i += D2HBufferSize)
+    for (size_t i = 0; i < totalBytes; i += slotSize)
     {
-        auto msgIndex                        = i / D2HBufferSize;
+        auto msgIndex                        = i / slotSize;
         auto const [stopRequested, hdr, buf] = msgQueue.BeginRead();
         if (stopRequested) { throw std::runtime_error("Stop requested"); }
         auto  hdr1    = std::get<Message::LocalStateData>(hdr);
@@ -60,10 +67,10 @@ static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool valida
                                                      static_cast<uint32_t>(Message::Type::LocalStateData),
                                                      hdr.index()));
             }
-            if (hdr1.messageSize != D2HBufferSize)
+            if (hdr1.messageSize != slotSize)
             {
-                throw std::runtime_error(fmt::format(
-                    "Validation failed for msg {}. Expected message size {} but got {}", msgIndex, D2HBufferSize, hdr1.messageSize));
+                throw std::runtime_error(
+                    fmt::format("Validation failed for msg {}. Expected message size {} but got {}", msgIndex, slotSize, hdr1.messageSize));
             }
             for (size_t j = 0; j < hdr1.messageSize; j++)
             {
@@ -84,32 +91,33 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
     std::string threadName = fmt::format("nv:client{}", rank);
     SetThreadName(threadName.c_str());
 
-    if (memorySize % D2HBufferSize != 0) { throw std::runtime_error("Memory size must be a multiple of D2H buffer size"); }
-
     if (debug) { fmt::print("[c{}] starting\n", rank); }
     auto msgQueue = MsgQueue::Open(QueueName);
     if (debug) { fmt::print("[c{}] opened queue\n", rank); }
+    auto const slotSize = msgQueue.SlotSize();
+
+    if (memorySize % slotSize != 0) { throw std::runtime_error("Memory size must be a multiple of the queue slot size"); }
 
     // auto data = std::vector<size_t>(std::from_range, std::views::iota(size_t{0}, memorySize / sizeof(size_t)));
     std::vector<uint8_t> data;
     data.reserve(memorySize);
     auto totalBytes    = msgCount * memorySize;
-    auto totalMessages = totalBytes / D2HBufferSize;
+    auto totalMessages = totalBytes / slotSize;
 
     for (size_t j = 0; j < memorySize; ++j) { data.push_back(static_cast<uint8_t>(rank)); }
     StartTime = PerfMetrics::Clock::now();
 
-    for (size_t i = 0; i < totalBytes; i += D2HBufferSize)
+    for (size_t i = 0; i < totalBytes; i += slotSize)
     {
-        auto  msgIndex   = i / D2HBufferSize;
+        auto  msgIndex   = i / slotSize;
         auto* srcptr     = data.data() + (i % memorySize);
         auto [slot, buf] = msgQueue.AllocSlot(Message::LocalStateData{.sessionId   = SessionId{0},
                                                                       .snapshotId  = SnapshotId{0},
                                                                       .globalRank  = Rank{rank},
-                                                                      .messageSize = D2HBufferSize,
+                                                                      .messageSize = static_cast<uint32_t>(slotSize),
                                                                       .offset      = i * memorySize});
 
-        std::memcpy(buf, srcptr, D2HBufferSize);
+        std::memcpy(buf, srcptr, slotSize);
         msgQueue.CommitSlot(slot);
         if (debug) { fmt::print("[c{}] sent msg[{}/{}] {} msgQ = {}\n", rank, msgIndex, totalMessages, slot, msgQueue); }
     }
@@ -128,14 +136,14 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
 
 static void MemcpyBenchmark(size_t ranks, size_t msgCount, size_t memorySize)
 {
-    auto bufSize = D2HBufferSize / 64;
+    auto bufSize = BenchSlotSize / 64;
     Blob src{bufSize};
     Blob dst{bufSize};
     for (size_t j = 0; j < bufSize; ++j) { src.At<uint8_t>(j) = 1u; }
 
     auto totalBytes    = msgCount * memorySize * ranks;
     StartTime          = PerfMetrics::Clock::now();
-    auto totalMessages = totalBytes / D2HBufferSize;
+    auto totalMessages = totalBytes / BenchSlotSize;
 
     for (size_t i = 0; i < totalBytes; i += bufSize) { memcpy(dst.data, src.data, bufSize); }
 
@@ -157,25 +165,25 @@ static void MemcpyBounceBufferBenchmark(size_t ranks, size_t msgCount, size_t me
 {
     Blob dst{memorySize};
     Blob src{memorySize};
-    Blob buf{D2HBufferSize * D2HBufferCount};
+    Blob buf{BenchSlotSize * D2HBufferCount};
 
     for (size_t j = 0; j < memorySize; ++j) { src.At<uint8_t>(j) = 1u; }
 
     auto totalBytes    = msgCount * memorySize;
-    auto totalMessages = totalBytes / D2HBufferSize;
+    auto totalMessages = totalBytes / BenchSlotSize;
 
     StartTime = PerfMetrics::Clock::now();
     for (size_t rank = 0; rank < ranks; rank++)
     {
         uint64_t currentSlot = 0;
-        for (size_t i = 0; i < totalBytes; i += D2HBufferSize, currentSlot++)
+        for (size_t i = 0; i < totalBytes; i += BenchSlotSize, currentSlot++)
         {
             auto  slot    = currentSlot % D2HBufferCount;
-            auto* slotptr = buf[slot * D2HBufferSize];
+            auto* slotptr = buf[slot * BenchSlotSize];
             auto* srcptr  = src[i % memorySize];
             auto* dstptr  = dst[i % memorySize];
-            std::memcpy(slotptr, srcptr, D2HBufferSize);
-            std::memcpy(dstptr, slotptr, D2HBufferSize);
+            std::memcpy(slotptr, srcptr, BenchSlotSize);
+            std::memcpy(dstptr, slotptr, BenchSlotSize);
             //  buffers.push_back(std::move(buffer));
             //  if (buffers.size() == D2HBufferCount) { buffers.clear(); }
         }

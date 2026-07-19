@@ -237,10 +237,13 @@ macro(vcpkg_init)
     endif()
     if (NOT EXISTS "${VCPKG_ROOT}")
         message(STATUS "Cloning vcpkg at ${VCPKG_AUTOCLONE_COMMIT} to ${VCPKG_ROOT}")
-        execute_process(COMMAND_ERROR_IS_FATAL ANY
-            COMMAND
-                git clone --depth 1 --single-branch --branch "${VCPKG_AUTOCLONE_COMMIT}" "${VCPKG_AUTOCLONE_URL}" "${VCPKG_ROOT}"
-        )
+        execute_process(COMMAND ${CMAKE_COMMAND} -E remove_directory "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git init "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" remote add origin1 "${VCPKG_AUTOCLONE_URL}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" fetch --depth 1 origin1 "${VCPKG_AUTOCLONE_COMMIT}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" checkout ${VCPKG_AUTOCLONE_COMMIT} COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND ${CMAKE_COMMAND} -E rename "${VCPKG_ROOT}.tmp" "${VCPKG_ROOT}" COMMAND_ERROR_IS_FATAL ANY)
     else()
         _vcpkg_ensure_min_commit("${VCPKG_ROOT}" "${VCPKG_AUTOCLONE_COMMIT}")
     endif()

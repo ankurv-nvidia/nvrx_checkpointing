@@ -12,21 +12,21 @@ perf-drift check, then open a draft MR. Also: diagnose run-to-run variance by
 breaking the aggregate `bw_mbps` into its per-rank samples and per-NUMA-socket
 groups.
 
-**Trigger prompt to remember:** *"Reseed the native perf baselines for pipeline
+**Trigger prompt to remember:** _"Reseed the native perf baselines for pipeline
 &lt;url&gt; — iterate to green, no widening tolerances, and do the per-rank
-NUMA analysis."* (URL optional; default to the latest pipeline on `ankurv/main`.)
+NUMA analysis."_ (URL optional; default to the latest pipeline on `ankurv/main`.)
 
 ## Hard rules (from the user)
 
 1. **Do NOT widen tolerances.** Every job must pass at the default **±5%**.
    The baseline YAML supports a `tolerances:` map and `_compare_to_baseline`
    honors it — **do not use it.** Recenter the baseline instead.
-2. **Center on the "most likely" value** from *clean* runs. Don't chase
+2. **Center on the "most likely" value** from _clean_ runs. Don't chase
    outliers; an occasional outlier run tripping the non-blocking check is
    acceptable. Don't infinite-loop.
    - **When a metric's spread genuinely can't fit ±5%** (e.g. h100 perf's
-     residual per-socket NUMA swing), bias the baseline to fail *high, never
-     low*: set it no more than **5% above the minimum** clean sample
+     residual per-socket NUMA swing), bias the baseline to fail _high, never
+     low_: set it no more than **5% above the minimum** clean sample
      (`baseline ≈ min × 1.05`) so the slowest run still passes at the lower
      edge and only a faster-than-expected run trips the non-blocking check.
      The check is a symmetric ±5% band on the raw value, so this applies
@@ -35,7 +35,7 @@ NUMA analysis."* (URL optional; default to the latest pipeline on `ankurv/main`.
      metric whose low-side false alarm you most want to avoid rather than
      min-anchoring both at once.
 3. **Run ONE pipeline at a time.** Always `pl_cancel` the prior pipeline on the
-   branch *before* pushing the next. Overlapping pipelines contend for storage
+   branch _before_ pushing the next. Overlapping pipelines contend for storage
    IO on the shared runners and produce false slow-mode outliers.
 4. Work on a branch off `origin/ankurv/main`; finish with a **draft** MR.
 
@@ -45,6 +45,7 @@ NUMA analysis."* (URL optional; default to the latest pipeline on `ankurv/main`.
 export GITLAB_TOKEN_FILE=/path/to/your/gitlab_token   # or: export GITLAB_TOKEN=glpat-...
 source .claude/skills/native-perf-baselines/perf_baseline_tools.sh   # pstatus/pwatch/perrank/numa/...
 ```
+
 Token: set `GITLAB_TOKEN` (value) or `GITLAB_TOKEN_FILE` (path) before sourcing. Project `ankurv/megatron-lm` on
 `gitlab-master.nvidia.com`. The project `ci_config_path` is
 `ci/gitlab-ci-native.yml` (no `workflow:` rules), so **any push
@@ -103,12 +104,10 @@ to look for and conclude:
 
 - **Dual modality:** per-rank bw partitions along the GPU/socket boundary. On an
   8-GPU 2-NUMA h100 node, ranks 0-3 = NUMA#0, ranks 4-7 = NUMA#1 (confirm with
-  `numa`). If one socket is *consistently* faster across every run (never
+  `numa`). If one socket is _consistently_ faster across every run (never
   reversed), that's a systematic asymmetry, not jitter. The aggregate "bimodal"
   mean = a fast-socket + slow-socket population whose mix/amplitude varies.
-- **NUMA root cause (confirmed for h100 perf):** the **perf build**
-  (`PHOENIX_BUILD_FOR_PERF` in `src/checkpoint/messages.h`) sets
-  `MaxRanksPerNode = 4` (default build = 8). The client channel index is
+- **NUMA root cause (confirmed for h100 perf):** The client channel index is
   `(rank % ranksPerPeer) % MaxRanksPerNode`, so 8 ranks share only **4** D2H shm
   staging queues — each pinned buffer (`CudaRegisterHostBuffer` on the queue's
   shm region, `checkpoint.cpp` `InitMsgQueue`) is shared by one NUMA#0 rank and
@@ -116,14 +115,14 @@ to look for and conclude:
   touches the buffers on its own socket, so the 4 ranks on the far socket pay a
   cross-socket D2H penalty (~+17–72% gap) every run. gb200 (4 GPUs/node =
   `MaxRanksPerNode`, single coherent NUMA domain) shows no split and is stable
-  (<3%) on the *same code* — the control that isolates it to host NUMA topology.
+  (<3%) on the _same code_ — the control that isolates it to host NUMA topology.
 - **Confounder to call out:** the dropped warmup save and occasional save spikes
   to 40000+ MB/s look like page-cache (non-durable) writes — separate from NUMA.
 - **Fix direction (follow-up, not the baseline task):** set the perf build's
   `MaxRanksPerNode` to the real gpus-per-node (8 for h100) so each rank gets its
   own queue, and/or NUMA-bind/first-touch each queue's shm buffer on its rank's
   local node. Note `D2HBufferSize = TotalShmSize / D2HBufferCount /
-  MaxRanksPerNode`, so bumping ranks shrinks per-buffer size unless TotalShmSize
+MaxRanksPerNode`, so bumping ranks shrinks per-buffer size unless TotalShmSize
   grows.
 
 ## Useful API calls

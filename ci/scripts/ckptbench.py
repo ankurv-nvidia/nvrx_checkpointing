@@ -137,7 +137,6 @@ def main() -> None:
     args.extra_args = extra_args
     args.flavor_tag = ""
     ensure_vcpkg_root()  # before any `import nvrx_checkpointing` triggers the CMake build
-    # Honor the runner's configured scheduler mode (SLURM_PARTITION set => SLURM).
     if runner_uses_slurm():
         args.slurm = True
     if args.gpus_per_node is None:

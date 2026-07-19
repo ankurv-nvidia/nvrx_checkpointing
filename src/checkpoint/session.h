@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -85,15 +86,11 @@ struct Session
 
     void Activate();
 
-    void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
-
-    void Handle(checkpoint::ipc::Message::LocalStateData const& hdr1, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
-
-    void Handle(checkpoint::ipc::Message::ActivateSnapshot const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
-
-    void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
-
-    void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::array<char, checkpoint::ipc::D2HBufferSize> const& buf);
+    void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::LocalStateData const& hdr1, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);
 
     void HandleStateRegistryFragment(checkpoint::ipc::Rank recvRank, std::vector<TensorShardInfo> const& tensorShards);
     bool AllSnapshotsComplete() const

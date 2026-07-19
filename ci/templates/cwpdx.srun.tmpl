@@ -1,0 +1,13 @@
+srun
+  --account=${account}
+  --partition=interactive
+  --nodes=${nodes}
+  --ntasks=${ntasks}
+  --time=00:${time_minutes}:00
+  --gpus=${total_gpus}
+  --gpus-per-node=${gpus_per_node}
+  --mem=0
+  --job-name=${job_name}
+  --container-image=${image}
+  --container-mounts=${home}:${home},${root}:/root,/lustre:/lustre
+  --container-env=${container_env}

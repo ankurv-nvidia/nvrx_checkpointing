@@ -8,6 +8,7 @@
 #include "serdes_utils.h"
 #include "server.h"
 #include "session.h"
+#include "shm_ring_buffer.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -41,9 +42,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -590,14 +593,16 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     auto& localState = *localStatePtr;
 
     // TODO_GLOBAL_REGISTRY_BCASE
-    auto localNodeWorldSize = hdr.globalRank == Rank{0} ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
+    // Coordinator-peer ranks wait for every fragment: remote merges reallocate the tree's
+    // node array, and the WriteRankShard walk below is unlocked.
+    bool const onCoordinatorPeer  = static_cast<uint32_t>(hdr.globalRank) / topo.ranksPerPeer == 0;
+    auto const localNodeWorldSize = onCoordinatorPeer ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
 
-    // Wait for all ranks to merge before capturing the shared registry (it keeps mutating until then).
     while (true)
     {
         {
             std::scoped_lock lock(mutex);
-            if (recievedFrom.size() >= localNodeWorldSize)
+            if (recievedFrom.size() >= localNodeWorldSize && recievedFrom.contains(hdr.globalRank))
             {
                 snapshotPtr->registry = sessionState.registry;
                 break;
@@ -692,49 +697,53 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         // The whole snapshot is durable now; tell the other nodes so they can mark it complete
         // and spin down — they only ever counted their own ranks' write-completes locally.
         BroadcastSnapshotCompleteToPeers_(hdr.snapshotId);
+    }
+
+    // A daemon's snapshot data has no use once its local shards are written: the
+    // coordinator evicts after rank 0's metadata, other peers once their ranks finish.
+    if (hdr.globalRank == Rank{0} || !onCoordinatorPeer)
+    {
+        // free Snapshot blobs (multi-GB) OUTSIDE the session mutex to avoid mutex blocking
+        std::vector<std::unique_ptr<Snapshot>> evicted;
+        size_t                                 remainingSnapshots = 0;
         {
-            // free Snapshot blobs (multi-GB) OUTSIDE the session mutex to avoid mutex blocking
-            std::vector<std::unique_ptr<Snapshot>> evicted;
-            size_t                                 remainingSnapshots = 0;
+            std::scoped_lock lock(mutex);
+            while (!snapshots.empty() && snapshots.size() > numActiveSnapshots)
             {
-                std::scoped_lock lock(mutex);
-                while (!snapshots.empty() && snapshots.size() > numActiveSnapshots)
+                auto       it       = snapshots.begin();
+                auto const expected = static_cast<size_t>(localNodeWorldSize);
+                if (it->second->writeCkptCompletedRanks.size() < expected) { break; }
+                // Eviction gates on write-complete only; warn if we drop a snapshot whose
+                // finalize hasn't landed from every rank yet (e.g. a peer node's finalize
+                // still in flight) — that snapshot is then gone for any late peer forward.
+                if (it->second->finalizedRanks.size() < expected)
                 {
-                    auto       it        = snapshots.begin();
-                    auto const worldSize = static_cast<size_t>(topo.worldSize);
-                    if (it->second->writeCkptCompletedRanks.size() < worldSize) { break; }
-                    // Eviction gates on write-complete only; warn if we drop a snapshot whose
-                    // finalize hasn't landed from every rank yet (e.g. a peer node's finalize
-                    // still in flight) — that snapshot is then gone for any late peer forward.
-                    if (it->second->finalizedRanks.size() < worldSize)
-                    {
-                        fmt::print(stderr,
-                                   "[native_ckpt:svr][{}#{}][WARN] evicting snapshot {} with finalize INCOMPLETE: "
-                                   "finalized {}/{}, write-completed {}/{}\n",
-                                   *server,
-                                   sessionId,
-                                   it->first,
-                                   it->second->finalizedRanks.size(),
-                                   worldSize,
-                                   it->second->writeCkptCompletedRanks.size(),
-                                   worldSize);
-                    }
-                    evicted.push_back(std::move(it->second));
-                    snapshots.erase(it);
+                    fmt::print(stderr,
+                               "[native_ckpt:svr][{}#{}][WARN] evicting snapshot {} with finalize INCOMPLETE: "
+                               "finalized {}/{}, write-completed {}/{}\n",
+                               *server,
+                               sessionId,
+                               it->first,
+                               it->second->finalizedRanks.size(),
+                               expected,
+                               it->second->writeCkptCompletedRanks.size(),
+                               expected);
                 }
-                remainingSnapshots = snapshots.size();
+                evicted.push_back(std::move(it->second));
+                snapshots.erase(it);
             }
-            fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after finalizing snapshot={} rank={}. Remaining snapshots "
-                       "in memory={} numActiveSnapshots={}\n",
-                       *server,
-                       sessionId,
-                       evicted.size(),
-                       hdr.snapshotId,
-                       hdr.globalRank,
-                       remainingSnapshots,
-                       numActiveSnapshots);
+            remainingSnapshots = snapshots.size();
         }
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after finalizing snapshot={} rank={}. Remaining snapshots "
+                   "in memory={} numActiveSnapshots={}\n",
+                   *server,
+                   sessionId,
+                   evicted.size(),
+                   hdr.snapshotId,
+                   hdr.globalRank,
+                   remainingSnapshots,
+                   numActiveSnapshots);
     }
 
     fmt::print(stderr,
@@ -1068,7 +1077,7 @@ void Session::Activate()
     // noop
 }
 
-void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<char, cipc::D2HBufferSize> const& buf)
+void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf)
 {
     BufStream istrm{buf.data(), hdr.messageSize};
     auto      localRegistry  = StateSerDes::Read(istrm);
@@ -1123,7 +1132,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::array<ch
     }
 }
 
-void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char, cipc::D2HBufferSize> const& buf)
+void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
 {
     void* ptr = nullptr;
     {
@@ -1164,7 +1173,7 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::array<char,
     std::memcpy(ptr, buf.data(), hdr1.messageSize);
 }
 
-void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char, cipc::D2HBufferSize> const& buf)
+void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
     BufStream bufStream{buf.data(), buf.size()};
     auto      ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
@@ -1235,7 +1244,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::array<char
                ckptPath);
 }
 
-void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::array<char, cipc::D2HBufferSize> const& /* buf */)
+void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char const> /* buf */)
 {
     {
         std::scoped_lock lock(mutex);
@@ -1301,7 +1310,7 @@ void Session::HandleStateRegistryFragment(Rank recvRank, std::vector<TensorShard
                fmt::join(recievedFrom, ","));
 }
 
-void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::array<char, cipc::D2HBufferSize> const& /* buf */)
+void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
 {}
 
 struct Server
@@ -1322,13 +1331,16 @@ struct Server
 
         _handlerPool = std::make_unique<boost::asio::thread_pool>(HandlerThreads);
         StartTcpListener_();
-        _running = true;
-
+        _running             = true;
+        auto       queueSize = cipc::MsgQueue::DetectShmSize(
+                                   cipc::Message::RequestChannelName(_index, cipc::MaxRanksPerNode + 1), cipc::MaxShmSize, cipc::MinShmSize)
+                               / cipc::MaxRanksPerNode;
+        std::latch queuesReady{cipc::MaxRanksPerNode};
         // Start server thread
         //_serverThread = std::thread([this]() {
         for (uint8_t i = 0; i < cipc::MaxRanksPerNode; ++i)
         {
-            _threads.emplace_back([this, i]() {
+            _threads.emplace_back([this, i, queueSize, &queuesReady]() {
                 SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
                 // First-touch this queue's shm control region (slot atomics/condvars)
                 // on the NUMA domain its ranks use, so far-socket clients don't reach
@@ -1340,13 +1352,18 @@ struct Server
                     if (queuesPerDomain == 0) { queuesPerDomain = 1; }
                     BindThreadCpuToNumaNode(std::min<int>(numDomains - 1, i / queuesPerDomain));
                 }
-                auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i));
+                auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize);
                 UnbindThreadCpu();
+                // Create publishes the queue geometry. Only after every queue reaches
+                // this point may a ping report the service as ready: clients start their
+                // fixed shared-memory open window immediately after SvcPing returns.
+                queuesReady.count_down();
                 {
                     std::scoped_lock lock1(_mutex);
                     _msgQueue.insert(&msgQueue);
                 }
-                fmt::print(stderr, "[native_ckpt:svr][{}] Checkpoint server started. Waiting for messages...\n", *this);
+                fmt::print(
+                    stderr, "[native_ckpt:svr][{}] Checkpoint server started QueueSize={} Waiting for messages...\n", *this, queueSize);
                 std::fflush(stderr);
                 while (true) try
                     {
@@ -1376,6 +1393,8 @@ struct Server
                     }
             });
         }
+        queuesReady.wait();
+        StartTcpAcceptors_();
     }
 
     bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
@@ -1412,7 +1431,7 @@ struct Server
         _lastPingTime = PerfClock::now();
     }
 
-    void HandleMessage(cipc::Message::Header const& hdr, std::array<char, cipc::D2HBufferSize> const& buf)
+    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
     {
         switch (static_cast<cipc::Message::Type>(hdr.index()))
         {
@@ -1829,10 +1848,12 @@ struct Server
             tensorShards.push_back(std::move(info));
         }
 
+        // Every dispatch takes _mutex; release it before the merge below holds the
+        // session mutex for a whole insert batch.
+        Session* session = nullptr;
         {
             auto lock = std::scoped_lock<std::mutex>(_mutex);
             auto it   = _activeSessions.find(sessionId);
-            // This is a bit ugly
             if (it == _activeSessions.end() || it->second->sessionState.registry == nullptr)
             {
                 fmt::print(stderr,
@@ -1846,18 +1867,17 @@ struct Server
                 pendingData->recvFrom     = fromRank;
                 pendingData->recievedAt   = PerfClock::now();
                 _pendingSessionData[sessionId].push_back(std::move(pendingData));
+                return;
             }
-            else
-            {
-                it->second->HandleStateRegistryFragment(fromRank, tensorShards);
-                fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
-                           *this,
-                           sessionId,
-                           tensorShards.size(),
-                           fromRank);
-            }
+            session = it->second.get();
         }
+        session->HandleStateRegistryFragment(fromRank, tensorShards);
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
+                   *this,
+                   sessionId,
+                   tensorShards.size(),
+                   fromRank);
     }
 
     void SpinDownWaitLoop_(tcp_stream stream)
@@ -2150,7 +2170,10 @@ struct Server
             ec = acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
             if (ec) { throw cipc::ErrorAlreadyRunning(); }
         }
+    }
 
+    void StartTcpAcceptors_()
+    {
         for (auto& acceptor : _tcpAcceptors)
         {
             boost::asio::co_spawn(_ioc, DoListen_(acceptor), [](std::exception_ptr const& e) {
@@ -2333,7 +2356,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
         auto itp  = server->_pendingSessionData.find(sessionId);
         if (itp != server->_pendingSessionData.end())
         {
-            for (auto const& p : itp->second)
+            for (auto& p : itp->second)
             {
                 fmt::print(stderr,
                            "[native_ckpt:svr][{}#{}][WARN] Found pending session data. activating session with pending data\n",

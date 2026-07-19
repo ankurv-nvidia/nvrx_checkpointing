@@ -703,10 +703,11 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     }
     if (!std::filesystem::exists(registryPath)) { SKIP(fmt::format("registry path does not exist: {}", registryPath.string())); }
 
-    // Conservative RAM threshold. The IPC ring buffers consume ~1 GiB per queue
-    // (D2HBufferSize × D2HBufferCount = 32 MiB × 32) — empirically 8 of them
-    // for a worldSize=2 registry, ~8 GiB resident in `/dev/shm` (tmpfs) and
-    // therefore in RAM. Add slack for the test process and the checkpoint
+    // Conservative RAM threshold. Each IPC ring buffer sizes its shared memory
+    // at runtime, requesting up to MaxShmSize/MaxRanksPerNode per queue and
+    // halving toward MinShmSize/MaxRanksPerNode when `/dev/shm` (tmpfs) is short
+    // on space; only touched slots become resident. A worldSize=2 registry uses
+    // empirically 8 queues. Add slack for the test process and the checkpoint
     // working set. Tune up if a larger registry comes along.
     constexpr uint64_t kMinPhysRamBytes = 16ull * 1024 * 1024 * 1024;
     long const         pages            = ::sysconf(_SC_PHYS_PAGES);

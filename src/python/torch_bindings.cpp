@@ -358,7 +358,10 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         key(nameIn)
     {}
 
-    void Update() override {}
+    // Re-read the (possibly re-pointed) container so node.data tracks the current tensor. The bf16
+    // optimizer moments are transient get_unscaled_state().float() copies the optimizer never
+    // rewrites; without this the once-registered handle re-saves stale iter-of-registration bytes.
+    void Update() override { meta = Convert_(key, container); }
 
     static DS4Tensor Convert_(nb::str& name, nb::dict const& container)
     {
@@ -565,11 +568,73 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         throw std::runtime_error("SetTensorState not implemented for ShardedTensor");
     }
 
+    // Re-point at a freshly-extracted ShardedTensor's __dict__ before Update() re-reads it.
+    // Caller (RefreshShardedTensors) holds the GIL; not safe from a non-Python thread.
+    void SetContainer(nb::dict newContainer) { container = std::move(newContainer); }
+
     DS4Tensor meta;
     nb::dict  container;
     nb::str   key;
 };
+
+// Identity of a registered shard within the tree: the ShardedTensor key plus its shard offset range
+// and full shape. dp_reshardable buckets register many param/padding ShardedTensors under ONE key,
+// distinguished only by flattened_range (-> sharddim), so the key alone is not unique.
+std::string ShardCompositeKey(std::string_view keyStr, DS4Tensor const& meta)
+{
+    std::string out(keyStr);
+    out += '#';
+    for (auto const& r : meta.sharddim) { out += fmt::format("{}-{},", r.begin, r.end); }
+    out += '#';
+    for (auto const& d : meta.fulldim) { out += fmt::format("{},", d); }
+    return out;
+}
 }    // namespace
+
+// Re-materialize the registered ShardedTensor nodes in place on the cached root from a fresh flat
+// list of ShardedTensors (no collective re-registration). Used by warm saves to un-stale the bf16
+// optimizer moment buffers. Matching is by (key, sharddim, fulldim) — NOT key alone, because
+// dp_reshardable buckets register many param/padding ShardedTensors under one key. Asserts a 1:1
+// correspondence (every node matched, every fresh used) so a stale shard can never be re-saved.
+void RefreshShardedTensors(StateTree& self, nb::list const& freshList)
+{
+    nb::gil_scoped_acquire                      acquire;
+    std::unordered_map<std::string, nb::object> byComposite;
+    for (auto const& item : freshList)
+    {
+        auto fresh     = nb::borrow<nb::object>(item);
+        auto dict      = nb::cast<nb::dict>(fresh.attr("__dict__"));
+        auto key       = nb::cast<nb::str>(dict["key"]);
+        auto tmp       = StateTreeShardedTensorHandler::Create(dict, key);    // computes meta via Convert_
+        auto composite = ShardCompositeKey(StrView(tmp->key), tmp->meta);
+        if (!byComposite.emplace(composite, fresh).second)
+        {
+            throw std::runtime_error(fmt::format("RefreshShardedTensors: duplicate fresh shard composite {}", composite));
+        }
+    }
+
+    size_t matched = 0;
+    self.WalkNodes([&](StateNode& node) {
+        if (!node.handler) { return; }
+        auto* handler = dynamic_cast<StateTreeShardedTensorHandler*>(node.handler.get());
+        if (handler == nullptr) { return; }    // skip plain torch tensors (live aliases) and non-tensors
+        auto composite = ShardCompositeKey(StrView(handler->key), handler->meta);
+        auto it        = byComposite.find(composite);
+        if (it == byComposite.end())
+        {
+            throw std::runtime_error(fmt::format("RefreshShardedTensors: registered shard {} has no fresh match", composite));
+        }
+        handler->SetContainer(nb::cast<nb::dict>(it->second.attr("__dict__")));
+        node.handler->Update();    // public virtual on the IHandler base; re-Converts the new container
+        if (static_cast<StateNode::Type>(node.data.index()) == StateNode::Type::TensorShard) { node.data = node.handler->GetTensorState(); }
+        ++matched;
+    });
+    if (matched != byComposite.size())
+    {
+        throw std::runtime_error(
+            fmt::format("RefreshShardedTensors: {} fresh shards but matched {} registered nodes", byComposite.size(), matched));
+    }
+}
 
 static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle node, nb::str const& name, nb::object const& container)
 {
@@ -622,6 +687,27 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
     }
 }
 
+// Mirror of megatron.core ShardedBase.is_main_replica: an int replica_id of 0, or an
+// all-zero tuple/list, marks the canonical copy. DCP persists only that copy.
+static bool IsMainReplica(nb::handle replicaId)
+{
+    if (replicaId.is_none()) { return true; }
+    if (nb::isinstance<nb::int_>(replicaId)) { return nb::cast<int64_t>(replicaId) == 0; }
+    if (nb::isinstance<nb::tuple>(replicaId))
+    {
+        auto tuple = nb::cast<nb::tuple>(replicaId);
+        return std::ranges::all_of(tuple, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
+    }
+    if (nb::isinstance<nb::list>(replicaId))
+    {
+        auto list = nb::cast<nb::list>(replicaId);
+        return std::ranges::all_of(list, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
+    }
+    // Fail loud on an unrecognized replica_id type: silently treating it as main would
+    // register every rank's copy again and reintroduce the non-deterministic object dedup.
+    throw std::runtime_error("RegisterShardedObject: unrecognized replica_id type (expected None, int, or tuple/list of int)");
+}
+
 static void RegisterShardedObject(StateTree& root, nb::handle val)
 {
     // Persist a Megatron ShardedObject (e.g. TransformerEngine `_extra_state`, the
@@ -632,6 +718,12 @@ static void RegisterShardedObject(StateTree& root, nb::handle val)
     // md5 baseline) and the loader reconstructs `[data]`. The bytes are held inline
     // as a Blob node keyed by the object's unique_key (its DCP fqn); rank 0 later
     // writes them into its `.distcp` shard and emits the BytesStorageMetadata entry.
+    // Persist only the main replica. Every rank that holds a copy carries the same
+    // unique_key but a non-identical serialization, so registering the non-main
+    // replicas too made the cross-node / within-node fqn-dedup keep whichever copy
+    // arrived first — non-deterministic, diverging the 8-node distributed-optimizer
+    // object state run-to-run. DCP/nvrx write only the main replica; match that.
+    if (!IsMainReplica(val.attr("replica_id"))) { return; }
     auto const key   = nb::cast<std::string>(val.attr("unique_key"));
     nb::object io    = nb::module_::import_("io");
     nb::object torch = nb::module_::import_("torch");

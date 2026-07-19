@@ -61,7 +61,7 @@ EOF
 chmod 600 $CI_DIR/config
 ```
 
-`PLATFORM`, `CLUSTER`, `GPUS_PER_NODE` and `SLURM_PARTITION` live here (per runner)
+`PLATFORM`, `CLUSTER`, `GPUS_PER_NODE` live here (per runner)
 rather than in the CI YAML, so the pipeline stays cluster-agnostic — no `--gpus-per-node`
 and no `--slurm` flag in `JOB_ARGS`. `setup_runner.py` forwards them (and `CI_DIR`) into
 the runner environment, which `run_job.py` honors. `PLATFORM` (gb200/h100/h100/devbox)

@@ -193,20 +193,6 @@ wheel-image:aarch64:
   variables:
     WHEEL_ARCH: aarch64
 
-# Two configures per arch:
-#   build-wheel — the perf-flavor wheel (checkpoint.abi3.so + checkpoint_server,
-#   PHOENIX_BUILD_FOR_PERF ring sizing, -march=native disabled so the binaries
-#   run on machines other than the builder). The wheel target is built by name —
-#   the default target also editable-installs into the configuring interpreter,
-#   which a CI job doesn't want.
-#   build-dev — ckpttest / _distcp_shim for the wheel-pytest jobs. CUDA is
-#   off (the tests are all-CPU and the runners have no driver) and
-#   -march=native is disabled because the binaries run on other perflab
-#   machines than the builder.
-#
-# Perf baselines note: wheel binaries drop -march=native, so bw/latency
-# baselines measured against on-machine source builds drift when a perf job
-# first picks the wheel up; reseed via the update_baselines jobs.
 .wheel_build:
   stage: build
   timeout: 2h
@@ -237,7 +223,6 @@ wheel-image:aarch64:
         -DPHOENIX_REQUIRE_CUDA=ON \
         -DPHOENIX_BUILD_BENCHMARK=OFF \
         -DPHOENIX_BUILD_TESTS=OFF \
-        -DPHOENIX_BUILD_FOR_PERF=ON \
         -DBUILDENV_DISABLE_MARCH_NATIVE=ON
     - cmake --build build-wheel -j"$(nproc)" --target nvrx_checkpointing_whl
     - |
@@ -430,11 +415,19 @@ valgrind:
         job: generate-native-pipeline
     strategy: depend
 
-16node-ultra:
+16node-ultra3bf16:
   extends: [.native_trigger, .manual_optional]
   trigger:
     include:
-      - artifact: generated-16node-ultra.yml
+      - artifact: generated-16node-ultra3bf16.yml
+        job: generate-native-pipeline
+    strategy: depend
+
+64node-ultra3fp8:
+  extends: [.native_trigger, .manual_optional]
+  trigger:
+    include:
+      - artifact: generated-64node-ultra3fp8.yml
         job: generate-native-pipeline
     strategy: depend
 

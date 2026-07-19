@@ -47,15 +47,11 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}
 # requires --account to be specified explicitly.
 SLURM_ACCOUNT=${SLURM_ACCOUNT:-coreai_resiliency_osiris}
 SLURM_TIME=${SLURM_TIME:-00:60:00}
-SLURM_PARTITION=${SLURM_PARTITION:-interactive}
 slurm_common_args=(
     "--account=${SLURM_ACCOUNT}"
     "--time=${SLURM_TIME}"
     "--mem=0"
 )
-if [[ -n "${SLURM_PARTITION:-}" ]]; then
-    slurm_common_args+=("--partition=${SLURM_PARTITION}")
-fi
 
 # GPU request for the build/run srun. The image build itself doesn't need GPUs,
 # but some schedulers require the request; prepare.sh tolerates their absence.

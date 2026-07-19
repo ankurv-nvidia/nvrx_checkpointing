@@ -31,18 +31,12 @@ endif()
 option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"      ON)
 option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         OFF)
 
-option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"         ON)
-option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"  OFF)
-option(PHOENIX_BUILD_FOR_PERF "Build with full perf at the cost of increased resource usage" OFF)
-option(PHOENIX_BUILD_FOR_VALGRIND "Build with reduced memory usage" OFF)
-option(PHOENIX_REQUIRE_CUDA "Fail the configure when CUDA support is unavailable" OFF)
+option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
+option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"      OFF)
+option(PHOENIX_BUILD_FOR_VALGRIND       "Build with reduced memory usage"   OFF)
+option(PHOENIX_REQUIRE_CUDA             "Fail if CUDA is unavailable"       OFF)
 
-DetectVar(PHOENIX_BUILD_FOR_PERF OFF)
 DetectVar(PHOENIX_BUILD_FOR_VALGRIND OFF)
-
-if (PHOENIX_BUILD_FOR_PERF AND PHOENIX_BUILD_FOR_VALGRIND)
-    message(FATAL_ERROR "PHOENIX_BUILD_FOR_PERF and PHOENIX_BUILD_FOR_VALGRIND are mutually exclusive")
-endif()
 
 if (PHOENIX_BUILD_WHEEL AND NOT PHOENIX_BUILD_PYTHON_BINDINGS)
     message(FATAL_ERROR "PHOENIX_BUILD_WHEEL requires PHOENIX_BUILD_PYTHON_BINDINGS")
@@ -52,11 +46,6 @@ if (PHOENIX_BUILD_FOR_VALGRIND)
     message(STATUS "PHOENIX_BUILD_FOR_VALGRIND is set: disabling -march=native and shrinking D2H buffer sizes")
     set(BUILDENV_DISABLE_MARCH_NATIVE ON)
     add_compile_definitions(PHOENIX_BUILD_FOR_VALGRIND=1)
-endif()
-
-if (PHOENIX_BUILD_FOR_PERF)
-    message(STATUS "PHOENIX_BUILD_FOR_PERF is set:  maxing out D2H buffer sizes")
-    add_compile_definitions(PHOENIX_BUILD_FOR_PERF=1)
 endif()
 
 # The pure-C++ distcp writer no longer requires Python; the Python bindings

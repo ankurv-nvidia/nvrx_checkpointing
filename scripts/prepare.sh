@@ -172,6 +172,8 @@ function ubuntu2404 {
     update-alternatives --install /usr/bin/python python /usr/bin/python3 1
     update-alternatives --install /usr/bin/python3-config python3-config /usr/bin/python3.12-config 1
 
+    # Remove cmake /usr/local/bin that conflicts with /usr/bin/cmake installed by apt
+    rm -f /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack
     # Print out tool version info
     for tool in cmake cc gcc g++ clang-${CLANG_VERSION}; do
     echo .
@@ -194,6 +196,7 @@ function container {
     PODMAN_DEVICES_ARG=$([[ -e /var/run/cdi/nvidia.yaml ]] && echo "--device nvidia.com/gpu=all" || echo "")
     podman run --rm \
         --name ${CONTAINER_NAME}-build \
+        --shm-size=34g \
         --cap-add=SYS_PTRACE \
         --replace ${PODMAN_DEVICES_ARG} \
         --security-opt=label=disable \
@@ -202,7 +205,7 @@ function container {
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/cache/dnf \
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/lib/dnf \
         -v ${CACHE_PATH}/pkg_cache_${PLAT_SUFFIX}:/var/lib/apt \
-        -v ${MEGATRON_ROOT}:/root/megatron-lm \
+        -v ${MEGATRON_ROOT}:/root/nvrx-megatron-lm \
         -v ${REPO_ROOT}:/root/nvrx_checkpointing \
         -d -it ${BASE_IMAGE} \
         bash
@@ -210,7 +213,14 @@ function container {
     podman exec -it ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
 
     podman commit ${CONTAINER_NAME}-build ${CONTAINER_NAME}-image
-    podman run --name ${CONTAINER_NAME} --shm-size=34g --cap-add=SYS_PTRACE --replace ${PODMAN_DEVICES_ARG} --security-opt=label=disable -v ${MEGATRON_ROOT}/..:/root -d -it ${CONTAINER_NAME}-image bash
+    podman run \
+        --name ${CONTAINER_NAME} \
+        --shm-size=34g \
+        --cap-add=SYS_PTRACE \
+        --replace ${PODMAN_DEVICES_ARG} \
+        --security-opt=label=disable \
+        -v ${REPO_ROOT}/..:/root \
+        -d -it ${CONTAINER_NAME}-image bash
     podman stop ${CONTAINER_NAME}-build
 }
 
@@ -242,9 +252,11 @@ function megatron {
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[build,training,dev]"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[te,ssm]"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation tiktoken flash-attn # Needed for running models
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn 
+    # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
+    # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
+
     unset CC
     unset CXX
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true

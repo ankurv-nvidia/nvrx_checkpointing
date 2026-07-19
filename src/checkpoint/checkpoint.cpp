@@ -138,6 +138,7 @@ void SvcPing()
         }
     }
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
+    fmt::print(stderr, "[native_ckpt:cli][INFO] SvcPing completed from {} svcbin={}\n", selfLoc.string(), svcExeLoc.string());
 }
 
 void SvcStop()
@@ -324,6 +325,7 @@ struct CheckpointWriter
     }
 
     cipc::MsgQueue&     msgQueue = GetMsgQueue(root.Topo());
+    size_t const        slotSize = msgQueue.SlotSize();    // runtime shm slot capacity, set by the server
     std::atomic<size_t> totalD2HRequests{0};
     std::atomic<size_t> smallD2HRequests{0};
     std::atomic<size_t> totalWrittenBytes{0};
@@ -356,7 +358,7 @@ struct CheckpointWriter
         std::vector<D2HRequest> pendingD2HRequests;
         uint64_t                sendOffset{};
         uint64_t                readOffset{};
-        size_t                  bufBytesRemaining{cipc::D2HBufferSize};
+        size_t                  bufBytesRemaining;    // remaining free space in the current slot; starts at a full slot
 
         PartitionContext(CheckpointWriter*       thatIn,
                          uint8_t                 indexIn,
@@ -368,14 +370,15 @@ struct CheckpointWriter
             partitionStart(partitionStartIn),
             partitionEnd(partitionEndIn),
             snapshotId(snapshotIdIn),
-            sendOffset(partitionStartIn)
+            sendOffset(partitionStartIn),
+            bufBytesRemaining(thatIn->slotSize)
         { pendingD2HRequests.reserve(ExpectedPendingD2HRequestsPerBuffer); }
 
         CLASS_DELETE_COPY_AND_MOVE(PartitionContext);
 
         ~PartitionContext()
         {
-            assert(bufBytesRemaining == cipc::D2HBufferSize);
+            assert(bufBytesRemaining == that->slotSize);
             if (pendingD2HRequests.capacity() > ExpectedPendingD2HRequestsPerBuffer)
             {
                 fmt::print(stderr,
@@ -413,23 +416,23 @@ struct CheckpointWriter
                 startOffset += bufBytesRemaining;
                 bytesRemaining -= bufBytesRemaining;
                 bufBytesRemaining = 0;
-                FlushBytes_(cipc::D2HBufferSize);
+                FlushBytes_(that->slotSize);
             }
             if (bytesRemaining > 0)
             {
                 pendingD2HRequests.emplace_back(device, tensorHandle + startOffset, bytesRemaining);
                 bufBytesRemaining -= bytesRemaining;
             }
-            if (bufBytesRemaining == 0) { FlushBytes_(cipc::D2HBufferSize); }
+            if (bufBytesRemaining == 0) { FlushBytes_(that->slotSize); }
             readOffset = next;
         }
 
-        void FlushBytes_(uint32_t sendBytes)
+        void FlushBytes_(size_t sendBytes)
         {
             auto [slot, slotbuf] = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{.sessionId   = cipc::SessionId{0},
                                                                                           .snapshotId  = snapshotId,
                                                                                           .globalRank  = that->root.GlobalRank(),
-                                                                                          .messageSize = sendBytes,
+                                                                                          .messageSize = static_cast<uint32_t>(sendBytes),
                                                                                           .offset      = sendOffset});
             auto*                              ptr               = slotbuf;
             DeviceContext*                     lastDeviceContext = nullptr;
@@ -457,8 +460,8 @@ struct CheckpointWriter
             that->totalD2HRequests.fetch_add(1);
             sendOffset += sendBytes;
 
-            assert(sendBytes + bufBytesRemaining == cipc::D2HBufferSize);
-            bufBytesRemaining = cipc::D2HBufferSize;
+            assert(sendBytes + bufBytesRemaining == that->slotSize);
+            bufBytesRemaining = that->slotSize;
         }
 
         // Flush pending D2H data and release the stream lock.
@@ -466,11 +469,11 @@ struct CheckpointWriter
         // deviceContext->StreamAcquire() afterwards (FlushFullBuffer_ does this internally).
         void FlushRemaining_()
         {
-            assert(bufBytesRemaining <= cipc::D2HBufferSize);
-            if (bufBytesRemaining == cipc::D2HBufferSize) { return; }
+            assert(bufBytesRemaining <= that->slotSize);
+            if (bufBytesRemaining == that->slotSize) { return; }
             if (pendingD2HRequests.empty()) { return; }
             that->smallD2HRequests.fetch_add(1);
-            FlushBytes_(static_cast<uint32_t>(cipc::D2HBufferSize - bufBytesRemaining));
+            FlushBytes_(that->slotSize - bufBytesRemaining);
         }
 
         public:
@@ -519,26 +522,27 @@ struct CheckpointWriter
                                 partitionStart,
                                 partitionEnd));
             }
-
         }
     };
 
     void WriteTensors(cipc::SnapshotId const& snapshotId)
     {
+        static constexpr size_t D2HNumConcurrency = 4;
+
         auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
         if (totalTensorStateSizeInBytes == 0) { return; }
 
-        std::array<std::future<void>, cipc::D2HNumConcurrency> writerTasks{};
+        std::array<std::future<void>, D2HNumConcurrency> writerTasks{};
 
-        auto buffersChunksPerPartition = (totalTensorStateSizeInBytes + (cipc::D2HBufferSize * cipc::D2HNumConcurrency) - 1)
-                                         / (cipc::D2HBufferSize * cipc::D2HNumConcurrency);
+        auto buffersChunksPerPartition
+            = (totalTensorStateSizeInBytes + (slotSize * D2HNumConcurrency) - 1) / (slotSize * D2HNumConcurrency);
         // std::views::enumerate not yet available in libc++ 21.1.7 as of (2026-01-05)
         // https://github.com/llvm/llvm-project/pull/73617 for (auto [index, task] : std::views::enumerate(writerTasks))
 
-        for (uint8_t index = 0; index < cipc::D2HNumConcurrency; ++index)
+        for (uint8_t index = 0; index < D2HNumConcurrency; ++index)
         {
             auto&          task                = writerTasks[index];    // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
-            uint64_t const partitionBufferSize = (buffersChunksPerPartition * cipc::D2HBufferSize);
+            uint64_t const partitionBufferSize = (buffersChunksPerPartition * slotSize);
             uint64_t const partitionStart      = partitionBufferSize * index;
             uint64_t const partitionEnd        = std::min(partitionStart + partitionBufferSize, totalTensorStateSizeInBytes);
             if (partitionStart >= partitionEnd) { break; }

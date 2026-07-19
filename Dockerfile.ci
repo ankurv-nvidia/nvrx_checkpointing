@@ -14,14 +14,8 @@
 # Build:
 #   docker buildx build -f Dockerfile.ci .
 
-# The CUDA devel base ships nvcc/cudart under /usr/local/cuda, which flips
-# PHOENIX_BUILD_CUDA=ON at configure time so the wheel carries the CUDA D2H
-# path (a CUDA-less build maps device pointers into CPUContext::AddD2H and
-# segfaults at runtime). Pinned to 13.1 to match the cudart expected by the
-# nvcr.io/nvidia/pytorch:26.04-py3 deploy container the GPU jobs run in.
-# The :devel-ubuntu24.04 tag is a multi-arch manifest list — the same line
-# resolves to x86_64 on amd64 builders and sbsa on aarch64 builders.
-FROM nvcr.io/nvidia/cuda:13.1.0-devel-ubuntu24.04
+FROM nvcr.io/nvidia/pytorch:26.06-py3 
+#FROM nvcr.io/nvidia/cuda:13.3.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -35,39 +29,15 @@ RUN bash /tmp/prepare.sh ubuntu2404 \
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
 
-# /opt/venv is the interpreter handed to the wheel build via
-# -DPython3_EXECUTABLE. nanobind and cmake-pywhl are pip_install()ed by the
-# configure (a no-op when already present); pytest/pytest-cmake/hypothesis/
-# numpy/torch back the PHOENIX_BUILD_TESTS=ON configure and the wheel-pytest
-# job, and pyyaml backs the ci/scripts (run_job.py imports yaml) that the
-# wheel-ckptbench job runs in this same image. CPU torch keeps the image
-# GPU-agnostic; the pytest suite needs no CUDA.
-RUN python3.12 -m venv /opt/venv \
+RUN python3.12 -m venv --system-site-packages /opt/venv \
  && uv pip install --python /opt/venv/bin/python \
-        nanobind 'cmake-pywhl>=0.0.4' pytest pytest-cmake hypothesis numpy pyyaml \
- && uv pip install --python /opt/venv/bin/python \
-        --index-url https://download.pytorch.org/whl/cpu torch
+        nanobind 'cmake-pywhl>=0.0.4' pytest pytest-cmake hypothesis numpy pyyaml
+# && uv pip install --python /opt/venv/bin/python \
+#        --index-url https://download.pytorch.org/whl/cpu torch
 
-# Ports built in the jobs must use the same compiler as the repo so LTO'd
-# static archives link cleanly — and the compiler is part of vcpkg's cache
-# key; prepare.sh points cc/c++ at clang-22 but vcpkg reads CC/CXX.
 ENV CC=clang-22 CXX=clang++-22
 
-# vcpkg classic-mode tree at /opt/vcpkg, pinned to the same commit the
-# CMake configure enforces (cmake/vcpkg-commit.txt is the single source of
-# truth; a pin bump re-clones this layer, and cmake/vcpkg.cmake would
-# fetch-and-pin an out-of-date tree at configure time anyway).
-#
-# No ports are pre-installed: the wheel jobs' configures install exactly
-# what the vcpkg_install() call sites in CMakeLists.txt / cmake/modules
-# name, restored from the project's generic-package-registry binary cache
-# (VCPKG_BINARY_SOURCES, set per job in ci/gitlab-ci-native.yml). Only a
-# port whose archive is missing — a new port, or a cache key rotated by a
-# toolchain/vcpkg change — is compiled, and its archive is uploaded for
-# the runs that follow.
 COPY cmake/vcpkg-commit.txt /tmp/vcpkg-commit.txt
-# The pin is a commit SHA, which `git clone --branch` cannot take; shallow-fetch the
-# exact commit instead (GitHub serves arbitrary-SHA fetches).
 RUN git init /opt/vcpkg \
  && git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git \
  && git -C /opt/vcpkg fetch --depth 1 origin "$(cat /tmp/vcpkg-commit.txt)" \

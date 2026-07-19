@@ -12,7 +12,7 @@ server, single-node).
 
 SLURM vs inline is inferred from SLURM_ACCOUNT being set; --slurm forces SLURM for local runs.
 Per-cluster srun/image-build templates live in templates/ (selected by CLUSTER); env knobs:
-PLATFORM (tag + baseline namespace), CLUSTER, GPUS_PER_NODE, SLURM_ACCOUNT, SLURM_PARTITION, CI_DIR.
+PLATFORM (tag + baseline namespace), CLUSTER, GPUS_PER_NODE, SLURM_ACCOUNT, CI_DIR.
 
 Exit codes: 0 = pass (or --skip-perf), 3 = perf regression (soft), 1 = job/setup failure.
 """
@@ -306,6 +306,8 @@ class Flavor(ABC):
 
     @classmethod
     def _drop_opts(cls, opts: list[str], flags: tuple[str, ...]) -> None:
+        # A bare string would iterate per character and silently drop nothing.
+        assert not isinstance(flags, str), "pass a tuple of flags, not a bare string"
         for flag in flags:
             cls._drop_opt_multi(opts, flag)
 
@@ -319,7 +321,7 @@ class PerfFlavor(Flavor):
     name = "perf"
 
     def transform(self, recipe: Recipe) -> None:
-        recipe.build_env["PHOENIX_BUILD_FOR_PERF"] = "1"
+        pass
 
     def epilog(self, ctx: RunCtx) -> None:
         self.run_perf_epilog(ctx)
@@ -363,10 +365,9 @@ class DeterministicFlavor(Flavor):
         self._set_opt(recipe.opts, "--attention-backend", "unfused")
         self._drop_opt(recipe.opts, "--cross-entropy-loss-fusion")
         self._drop_opt(recipe.opts, "--cross-entropy-fusion-impl", has_value=True)
-        # Keep CUDA graphs (they cut the run time; the cross-run determinism check guards
-        # reproducibility); drop only the activation recompute, which adds compute.
         self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
+        self._drop_opt(recipe.opts, "--async-ckpt-use-cpu-shm")
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
@@ -625,7 +626,7 @@ class ValgrindFlavor(Flavor):
         ready = threading.Event()
 
         def _pump() -> None:
-            assert proc.stdout is not None  # noqa: S101 — Popen with stdout=PIPE always has it
+            assert proc.stdout is not None
             for line in proc.stdout:
                 log_fp.write(line)
                 log_fp.flush()
@@ -758,8 +759,9 @@ _ARGS_LINE_RE = re.compile(r"^  [A-Za-z_]\w* [.\s]")
 # trailing newline prepends junk to the next argument line, which we recover from here.
 _ARGS_EMBEDDED_RE = re.compile(r"  [A-Za-z_]\w* \.{3,} ")
 # A stderr log line can also merge onto the END of an argument's value (no separator), e.g.
-# "logging_level ... 20WARNING: TensorBoard ..."; drop the appended message from the level marker on.
-_ARGS_APPENDED_RE = re.compile(r"(?:WARNING|INFO|ERROR|DEBUG|CRITICAL): .*$")
+# "logging_level ... 20WARNING: TensorBoard ..." or "bf16 ... True> setting tensorboard ...";
+# drop the appended message from its log marker on.
+_ARGS_APPENDED_RE = re.compile(r"(?:(?:WARNING|INFO|ERROR|DEBUG|CRITICAL): |>\s*setting tensorboard\b).*$")
 
 
 def _clean_arguments_line(line: str) -> str | None:
@@ -965,7 +967,6 @@ def build_srun_cmd(  # noqa: PLR0913
         "home": Path.home().as_posix(),
         "root": Path(image).parent.as_posix(),
         "account": account,
-        "partition": os.environ.get("SLURM_PARTITION", "interactive" if nodes == 1 else "batch"),
     }
     body = "\n".join(ln for ln in _load_template("srun.tmpl").splitlines() if not ln.lstrip().startswith("#"))
     # Exempt the job from the idle-GPU reaper for its full time budget, so transient idle
@@ -1054,7 +1055,7 @@ class PretrainRunConfig:
     phase: int = 2
     load_dir: Path | None = None  # --load source; None starts from random init
     synchronous_save: bool = False  # phase 1: stock torch_dist save (no server, durable on exit)
-    config_profile: str = "pico"  # model profile (pico/nano3/nano4/ultra): base.yaml + <profile>.yaml
+    config_profile: str = "pico"  # model profile (pico/nano3/nano4/ultra3bf16/ultra3fp8): base.yaml + <profile>.yaml
 
     @property
     def scale(self) -> str:
@@ -1429,7 +1430,7 @@ class PerfReport:
 
         PerfReport._report_checkpoint_times(log_text)
 
-        metrics = PerfReport._parse_metrics(log_text, job)
+        metrics = PerfReport._parse_metrics(log_text, job, gpus_per_node)
 
         if not metrics:
             if job == "pretrain-nvrx":
@@ -1481,7 +1482,7 @@ class PerfReport:
         }
 
     @staticmethod
-    def _parse_metrics(log_text: str, _job: str) -> dict:
+    def _parse_metrics(log_text: str, job: str, gpus_per_node: int | None = None) -> dict:
         """Parse all perf metrics for the given job type from log_text."""
         result = {}
 
@@ -1494,10 +1495,26 @@ class PerfReport:
         if bw_matches:
             ranks = [int(m.group(1)) for m in bw_matches]
             bw_samples = [float(m.group(2)) for m in bw_matches]
+            wr_samples = [int(m.group(3)) for m in bw_matches]
+            bw_metric = PerfReport._make_metric(bw_samples, "MB/s", higher_is_better=True, ranks=ranks)
+            wr_metric = PerfReport._make_metric(wr_samples, "us", higher_is_better=False, ranks=ranks)
+
+            # ckptbench currently runs two ranks. Its rank 0 measures the stable local fast
+            # path, while the peer's placement-dependent result can vary by an order of
+            # magnitude across allocations. Gate the reproducible reference-rank measurement;
+            # keep the full spread and rank-imbalance metric below so the skew stays visible.
+            unique_ranks = sorted(set(ranks))
+            if job == "ckptbench" and len(unique_ranks) == 2:  # noqa: PLR2004
+                reference_rank = unique_ranks[0]
+                bw_metric["mean"] = statistics.mean(v for r, v in zip(ranks, bw_samples) if r == reference_rank)  # noqa: B905
+                wr_metric["mean"] = statistics.mean(v for r, v in zip(ranks, wr_samples) if r == reference_rank)  # noqa: B905
+                bw_metric["aggregation"] = f"rank{reference_rank}"
+                wr_metric["aggregation"] = f"rank{reference_rank}"
+
             result.update(
                 {
-                    "bw_mbps": PerfReport._make_metric(bw_samples, "MB/s", higher_is_better=True, ranks=ranks),
-                    "wr_tnsr_us": PerfReport._make_metric([int(m.group(3)) for m in bw_matches], "us", higher_is_better=False, ranks=ranks),
+                    "bw_mbps": bw_metric,
+                    "wr_tnsr_us": wr_metric,
                     "total_written_bytes": PerfReport._make_metric([int(m.group(4)) for m in bw_matches], "B", None, ranks=ranks),
                 },
             )
@@ -1510,13 +1527,21 @@ class PerfReport:
             rank_means = [statistics.mean(per_rank[r]) for r in ordered_ranks]
             if len(rank_means) > 1 and min(rank_means) > 0:
                 result["bw_rank_imbalance"] = PerfReport._make_metric([max(rank_means) / min(rank_means)], "ratio", higher_is_better=None)
-                # Socket imbalance (gated): ratio of the two rank-halves' means. The halves map
-                # to the two sockets, so averaging over a half cancels per-rank noise.
-                half = len(rank_means) // 2
-                h0 = statistics.mean(rank_means[:half])
-                h1 = statistics.mean(rank_means[half:])
-                if min(h0, h1) > 0:
-                    result["bw_socket_imbalance"] = PerfReport._make_metric([max(h0, h1) / min(h0, h1)], "ratio", higher_is_better=None)
+                # Socket imbalance (gated): ratio of the two rank-halves' means. It is valid
+                # only for a single node with at least two ranks per half. In a multinode job,
+                # splitting global ranks in half compares nodes rather than sockets; with only
+                # two ranks, it degenerates into the noisy per-rank ratio above.
+                is_single_node = gpus_per_node is not None and len(rank_means) == gpus_per_node
+                if is_single_node and len(rank_means) >= 4 and len(rank_means) % 2 == 0:  # noqa: PLR2004
+                    half = len(rank_means) // 2
+                    h0 = statistics.mean(rank_means[:half])
+                    h1 = statistics.mean(rank_means[half:])
+                    if min(h0, h1) > 0:
+                        result["bw_socket_imbalance"] = PerfReport._make_metric(
+                            [max(h0, h1) / min(h0, h1)],
+                            "ratio",
+                            higher_is_better=None,
+                        )
 
         mem_matches = list(_RE_NATIVE_MEM.finditer(log_text))
         if mem_matches:
@@ -1578,6 +1603,7 @@ class PerfReport:
                     "max": measured.get("max"),
                     "median": measured.get("median"),
                     "n_samples": len(measured.get("samples", [])),
+                    "aggregation": measured.get("aggregation"),
                 }
             elif higher_is_better is None:
                 results[metric_name] = {"status": "info", "measured": measured_val}
@@ -1591,6 +1617,7 @@ class PerfReport:
                     "max": measured.get("max"),
                     "median": measured.get("median"),
                     "n_samples": len(measured.get("samples", [])),
+                    "aggregation": measured.get("aggregation"),
                 }
         return results, all_passed
 
@@ -1619,8 +1646,10 @@ class PerfReport:
                 pct_str = f"{sign}{pct:.1f}%" if pct is not None else "N/A"
                 tol = data.get("tolerance_pct", "?")
                 samples = data.get("n_samples", "?")
+                aggregation = f", aggregate={data['aggregation']}" if data.get("aggregation") else ""
                 logger.info(
-                    f"  [{status}] {name}: {measured:.4f} {unit}  (baseline={baseline:.4f}, Δ={pct_str}, tol=±{tol}%, n={samples})",
+                    f"  [{status}] {name}: {measured:.4f} {unit}  "
+                    f"(baseline={baseline:.4f}, Δ={pct_str}, tol=±{tol}%, n={samples}{aggregation})",
                 )
                 # The pass/fail above is on the mean; print the underlying samples so multi-modal
                 # behaviour is visible rather than averaged away.
@@ -1782,19 +1811,30 @@ class BaselineUpdater:
         tolerances = baseline.get("tolerances") or {}
         changed: list[str] = []
         for name, data in metrics.items():
+            # These ratios are deliberately not baseline-relative: rank imbalance is
+            # informational, while socket imbalance has a fixed one-sided safety gate.
+            # Recording either one would turn run-to-run noise into a brittle exact-match
+            # baseline (or misleadingly imply that the socket threshold is configurable).
+            if name in ("bw_rank_imbalance", "bw_socket_imbalance"):
+                continue
             mean = data.get("mean")
             if mean is None:
                 continue
             old_val = existing.get(name)
             higher_is_better = data.get("higher_is_better")
-            # Effective tolerance mirrors _compare_to_baseline; for new metrics (no old_val) we
-            # fall back to higher_is_better since type-of-baseline isn't available yet.
-            if name in tolerances:
-                tol = tolerances[name]
-            elif old_val is not None:
-                tol = 0.0 if isinstance(old_val, int) else PERF_TOLERANCE
-            else:
-                tol = 0.0 if higher_is_better is None else PERF_TOLERANCE
+            # Effective tolerance mirrors _compare_to_baseline. YAML's int-vs-float spelling
+            # does not affect comparison semantics: directional metrics use the perf tolerance,
+            # while metrics without a direction (for example total_written_bytes) match exactly.
+            tol = tolerances.get(name, 0.0 if higher_is_better is None else PERF_TOLERANCE)
+
+            # A baseline centered on multiple healthy runner modes should remain stable when
+            # the latest sample is already inside its accepted band. This also avoids harmless
+            # within-tolerance CI runs churning the committed value on every manual update.
+            if old_val is not None:
+                lo = old_val * (1.0 - tol)
+                hi = old_val * (1.0 + tol)
+                if lo <= mean <= hi:
+                    continue
 
             new_val = BaselineUpdater._round_for_baseline(mean, tol, higher_is_better)
             if old_val is None or abs(new_val - old_val) / max(abs(old_val), 1e-9) > _BASELINE_CHANGE_THRESHOLD:
@@ -1868,6 +1908,13 @@ class BaselineUpdater:
                 if filter_config is not None and config != filter_config:
                     continue
                 if filter_flavor is not None and flavor_tag != filter_flavor:
+                    continue
+
+                socket_result = report.get("comparison", {}).get("bw_socket_imbalance", {})
+                if socket_result.get("status") == "FAIL":
+                    logger.warning(
+                        f"[run_job] skipping perf baseline update from {report_file}: the run breached the fixed socket-imbalance gate",
+                    )
                     continue
 
                 baseline_file = BASELINES_DIR / f"{artifact_stem(machine, job, flavor_tag, config)}.yaml"
@@ -2242,6 +2289,23 @@ class PretrainJob:
             if phase == 1:
                 budget = PretrainJob._job_time_min(common["config_profile"], common["flavors"], "phase1-flush", 30)
                 PretrainJob._wait_for_phase1_checkpoint(cfg, budget * 60)
+                # ValgrindFlavor explicitly owns one server around both phases and disables
+                # client auto-launch. Keep that server alive so phase 2 can reuse it; the
+                # flavor context stops it after phase 2 and collects the memcheck report.
+                if not any(flavor.name == "valgrind" for flavor in common["flavors"]):
+                    # Normal runs turn the daemon over at the phase boundary: phase 2 gets a
+                    # fresh process whose session table and heap carry nothing from phase 1.
+                    # Every local rank holds here until the node's daemon is gone — a sibling
+                    # rank that entered phase 2 early would race the port handoff.
+                    if os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")) == "0":
+                        if not CheckpointServer._stop_checkpoint_server():
+                            raise RuntimeError("checkpoint_server did not stop at the phase boundary")
+                    else:
+                        deadline = time.monotonic() + 90.0
+                        while CheckpointServer._checkpoint_server_pids() and time.monotonic() < deadline:
+                            time.sleep(0.5)
+                        if CheckpointServer._checkpoint_server_pids():
+                            raise RuntimeError("checkpoint_server still running 90s into the phase boundary")
 
     # The provider whose output is the equality reference the other provider is compared
     # against — committed metadata/ baselines at <=2 nodes, the in-allocation reference
@@ -2428,6 +2492,10 @@ class PretrainJob:
                 config_profile=config_profile,
             )
         else:
+            # Memcheck cannot host a second resident snapshot generation at 8-node scale
+            # (multi-GB arena allocations stall the reader); save once over the full span.
+            valgrind = any(f.name == "valgrind" for f in (flavors or []))
+            span = PretrainRunConfig.save_interval * PretrainRunConfig.num_checkpoints
             config = PretrainRunConfig(
                 nodes=nodes,
                 gpus_per_node=gpus_per_node,
@@ -2437,6 +2505,7 @@ class PretrainJob:
                 ckpt_provider=ckpt_provider,
                 load_dir=phase1_dir,
                 config_profile=config_profile,
+                **({"save_interval": span, "num_checkpoints": 1} if valgrind else {}),
             )
         opts = PretrainJob._pretrain_cli_args(config)
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
@@ -2525,7 +2594,7 @@ class PretrainJob:
         ]
 
         # Runtime defaults; a model config overrides shared keys. pico scales parallelism +
-        # batch to GPU count, nano/ultra pin them; eval-interval tracks the full horizon.
+        # batch to GPU count, nano/ultra3* pin them; eval-interval tracks the full horizon.
         dynamic = {
             "tensor-model-parallel-size": config.gpus_per_node,
             "expert-model-parallel-size": config.gpus_per_node,
@@ -2936,7 +3005,7 @@ def main() -> None:
         choices=_available_profiles(),
         help="Model config profile (default: pico). Selects configs/<profile>.yaml, deep-merged "
         "over configs/base.yaml. pico scales parallelism to the runner's GPUs; nano3/nano4 "
-        "(8 nodes) and ultra (16 nodes) pin it.",
+        "(8 nodes) and the ultra3 profiles (16/64 nodes) pin it.",
     )
     p.add_argument(
         "--gpus-per-node",

@@ -717,6 +717,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
         .def_prop_ro("globalWorldSize", &StateTree::GlobalWorldSize)
         .def("register", &Register)
         .def("register_state_dict", &RegisterStateDict)
+        .def("refresh_sharded_tensors", &RefreshShardedTensors, nb::arg("fresh_list"))
         .def("register_state_dict_async", &RegisterStateDictAsync)
         .def("register_scalars_in_dict", &RegisterScalarsInDict)
         .def("register_weight_tensor", &RegisterDeferredSaveTensor)

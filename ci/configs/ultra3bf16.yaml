@@ -1,4 +1,4 @@
-# ultra profile: a large Mamba-hybrid MoE model with fixed parallelism, run at
+# ultra3bf16 profile: a large Mamba-hybrid MoE model with fixed parallelism, run at
 # 16 nodes. Deep-merged over base.yaml; only the keys that differ from base are
 # listed (everything else — MTP, MoE routing recipe, fused ops, optimizer,
 # logging, ...) is inherited.

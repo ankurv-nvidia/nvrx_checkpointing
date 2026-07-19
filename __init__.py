@@ -110,16 +110,18 @@ def build_native_extensions() -> None:
         raise RuntimeError("CMake is not installed or not found in PATH.")
     native_build_dir.mkdir(parents=True, exist_ok=True)
     (native_build_dir / "CMakeCache.txt").unlink(missing_ok=True)
+    configure_cmd = [
+        cmake_exe,
+        "-B",
+        native_build_dir.as_posix(),
+        "-S",
+        SCRIPT_DIR.as_posix(),
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "--debug-trycompile",
+    ]
+    sys.stderr.write(f"configure_cmd: {' '.join(configure_cmd)}\n")
     subprocess.run(
-        [
-            cmake_exe,
-            "-B",
-            native_build_dir.as_posix(),
-            "-S",
-            SCRIPT_DIR.as_posix(),
-            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-            "--debug-trycompile",
-        ],
+        configure_cmd,
         check=True,
     )
     subprocess.run([cmake_exe, "--build", str(native_build_dir), "-j16"], check=True)

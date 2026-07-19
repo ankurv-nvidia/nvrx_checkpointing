@@ -21,30 +21,6 @@ enum class SnapshotId : uint32_t
 };
 using Rank = ::Rank;
 
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-// Valgrind tracks V-bits/A-bits for every mapped byte and keeps a fixed-size
-// segment table (aspacem). The default sizes below produce 1 GiB of shm per
-// rank plus many 8 MiB writer-thread stacks, which exhausts valgrind's
-// shadow memory / segment table on multi-rank runs. Shrink aggressively when
-// building specifically for a valgrind run.
-static constexpr size_t  TotalShmSize      = 128ull * 1024ull * 1024ull;
-static constexpr size_t  D2HNumConcurrency = 2;
-static constexpr size_t  D2HBufferCount    = 4;
-static constexpr uint8_t MaxRanksPerNode   = 2;
-#elif (defined PHOENIX_BUILD_FOR_PERF)
-static constexpr size_t  TotalShmSize      = 24ull * 1024ull * 1024ull * 1024ull;
-static constexpr size_t  D2HNumConcurrency = 4;
-static constexpr size_t  D2HBufferCount    = 32;
-static constexpr uint8_t MaxRanksPerNode   = 4;
-#else
-static constexpr size_t  TotalShmSize      = 8ull * 1024ull * 1024ull * 1024ull;    // 8GB
-static constexpr size_t  D2HNumConcurrency = 4;
-static constexpr size_t  D2HBufferCount    = 32;
-static constexpr uint8_t MaxRanksPerNode   = 8;
-#endif
-
-static constexpr size_t D2HBufferSize = TotalShmSize / D2HBufferCount / MaxRanksPerNode;    // 512MB
-
 /*
 A server can contain multiple sessions
 A session consist of multiple peers(ranks) participating in a distributed job
@@ -189,7 +165,7 @@ struct Message
     // static_assert(std::is_same_v<StateDataFragment, std::variant_alternative_t<static_cast<size_t>(Type::StateDataFragment), Header>>);
 };
 
-using MsgQueue = checkpoint::ipc::ShmRingBuffer<Message::Header, D2HBufferSize, D2HBufferCount>;
+using MsgQueue = checkpoint::ipc::ShmRingBuffer<Message::Header, D2HBufferCount>;
 
 struct ErrorAlreadyRunning : std::runtime_error
 {

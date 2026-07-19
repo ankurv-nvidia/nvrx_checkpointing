@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 from megatron.core import mpu
 from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.serialization import _CONTENT_METADATA_KEY
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 from megatron.core.dist_checkpointing.utils import extract_nonpersistent, extract_sharded_base
@@ -136,6 +138,27 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
 register_state_dict.root = None
 
 
+def _fresh_sharded_tensors(model, optimizer, metadata: dict) -> list:  # noqa: ANN001
+    """Re-extract the model + optimizer ShardedTensors (a flat list) for an in-place root refresh.
+
+    The bf16 Adam moments (exp_avg/exp_avg_sq) are transient get_unscaled_state().float() copies the
+    optimizer never writes to again, so the root's once-registered handlers re-save the first-save
+    values. Re-extracting the sharded tensors each warm save and re-pointing the registered handlers
+    at them keeps the saved moments current — what regenerating the full state dict does for nvrx —
+    while skipping the collective re-registration. Model/master-param ShardedTensors alias live
+    storage, so refreshing them re-points to the same buffer (a no-op); refreshing all of them lets
+    the native side assert a 1:1 node correspondence.
+    """
+    model = unwrap_model(model)
+    state_dict = {}
+    for i in range(len(model)):
+        key = "model" if len(model) == 1 else f"model{i}"
+        state_dict[key] = model[i].sharded_state_dict(metadata=metadata)
+    state_dict["optimizer"] = optimizer.sharded_state_dict(state_dict, metadata=metadata)
+    sharded_part, _ = save_preprocess(state_dict, validate_access_integrity=False)
+    return [leaf for leaf in nested_values(sharded_part) if isinstance(leaf, ShardedTensor)]
+
+
 def warmup() -> None:
     """Warm up the pinned buffers used for D2H transfers in checkpointing to avoid first save penalty"""
     rank = torch.distributed.get_rank()
@@ -188,10 +211,10 @@ def _save_checkpoint_impl(  # noqa: PLR0913
     """Save a synchronous torch_dist checkpoint through the native writer.
 
     The first save builds the full sharded state dict and registers it; later saves reuse
-    that registration — model/optimizer tensors are read live, the frozen sharded objects
-    (RNG, distributed-optimizer state) are re-emitted from their registration-time bytes,
-    and only the plain common scalars are refreshed — so generate_state_dict and
-    re-registration are skipped entirely.
+    that registration — model weights and master params are read live through the frozen
+    handles, the optimizer ShardedTensors are re-extracted and refreshed each save (their
+    bf16 moment storage is a transient copy that would otherwise go stale), and the plain
+    common scalars are refreshed — so the collective re-registration is skipped.
 
     TODO: omits work the generic save_checkpoint does, to add back as needed: dataloader /
     Energon resume, one_logger/wandb hooks, fault tolerance, save_retain cleanup, ModelOpt.
@@ -234,6 +257,11 @@ def _save_checkpoint_impl(  # noqa: PLR0913
             rerun_state = get_rerun_state_machine().state_dict(data_iterator=train_data_iterator, ckpt_format=args.ckpt_format)
             _, persistent = extract_nonpersistent(rerun_state)
             _, common["rerun_state_machine"] = extract_sharded_base(persistent)
+        # Re-point the registered ShardedTensor handlers at freshly-extracted tensors so the root
+        # re-reads current data instead of the transient bf16 moment copies frozen at the first save.
+        fresh = _fresh_sharded_tensors(model, optimizer, _build_sharded_state_dict_metadata(args))
+        register_state_dict.root.refresh_sharded_tensors(fresh)
+        save_checkpoint.last_refresh = fresh  # keep the transient fp32 moment buffers alive through save()
 
     print_rank_0(f"saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format")
     save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
@@ -247,6 +275,7 @@ def _save_checkpoint_impl(  # noqa: PLR0913
 
 
 save_checkpoint.common = None
+save_checkpoint.last_refresh = None
 
 
 __all__ = ["register_state_dict", "save", "save_checkpoint", "warmup"]

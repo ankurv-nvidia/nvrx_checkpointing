@@ -15,15 +15,21 @@ WORLD_SIZE=${WORLD_SIZE:-2}
 GLOBAL_BATCH=${WORLD_SIZE}
 export QUANTIZATION_TYPE_DEBUG=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Megatron asserts this on pre-Blackwell GPUs whenever CUDA graphs run with
+# expandable_segments (core/transformer/cuda_graphs.py) - and this script
+# enables both.
+export NCCL_GRAPH_REGISTER=0
 # AssertionError: Using tensor model parallelism or context parallelism require setting the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-MY_RUN_DIR="${MEGATRON_ROOT}/runs"
-RUN_DIR="${MEGATRON_ROOT}/runs"
+MY_RUN_DIR="${REPO_ROOT}/ci/ci-runs"
+RUN_DIR="${REPO_ROOT}/ci/ci-runs"
 MEGATRON_LM_DIR="${MEGATRON_ROOT}"
 DATACACHE_DIR="${MY_RUN_DIR}/data-cache/"
+export NATIVE_CKPT_SERVER_LOG="${MY_RUN_DIR}/native_ckpt_server.log"
+export PHOENIX_BUILD_FOR_VALGRIND=1 # lower memory consumption
 
-BLEND_PATH="${MEGATRON_ROOT}/../blend_files/superblend1-exposure-filtered.json"
+BLEND_PATH="${REPO_ROOT}/../blend_files/superblend1-exposure-filtered.json"
 
 
 CHECKPOINT_DIR="${MY_RUN_DIR}/checkpoints/phase1_rerun/"
@@ -60,8 +66,8 @@ OPTIONS=(
 	--calculate-per-token-loss
 	--mtp-loss-scaling-factor 0.3
 
-	# --enable-cuda-graph
-	# --cuda-graph-scope mamba attn moe_router
+	--enable-cuda-graph
+	--cuda-graph-scope mamba attn moe_router
 	--te-rng-tracker
 	--ddp-num-buckets 10
 	--high-priority-stream-groups ep
@@ -91,9 +97,10 @@ OPTIONS=(
 	--num-workers 1
 	--disable-gloo-process-groups
 	--ckpt-format torch_dist
-#	--ckpt-fully-parallel-save
-#	--ckpt-fully-parallel-load
+	--ckpt-fully-parallel-save
+	--ckpt-fully-parallel-load
 	--ckpt-assume-constant-structure
+	--ckpt-provider nvrx
 #	--async-save
 #	--use-persistent-ckpt-worker
 

@@ -11,9 +11,7 @@ File layout under CI_DIR:
                     gb200/h100/h100/devbox — the GitLab runner tag that routes jobs + baseline
                     namespace), CLUSTER (required; datacenter e.g. cwdfw/ocihsg — selects the srun
                     templates), CONCURRENT, GPUS_PER_NODE, SLURM_ACCOUNT (set => this cluster runs
-                    via SLURM; also the srun --account), SLURM_PARTITION (srun --partition; defaults
-                    to "batch" when unset). PLATFORM, CLUSTER, GPUS_PER_NODE, SLURM_ACCOUNT and
-                    SLURM_PARTITION are forwarded into the runner env for run_job.py.
+                    via SLURM; also the srun --account)
   srun.tmpl            (optional) per-cluster override of the job-launch srun template.
   enroot_import.tmpl   (optional) per-cluster override of the base-image import srun command.
   image_prep.tmpl      (optional) per-cluster override of the project-image build srun command.
@@ -52,7 +50,6 @@ so it becomes the default on the next run (CLI wins, then caches):
   --concurrent N        Max concurrent jobs for this runner                (CONCURRENT)
   --gpus-per-node N     GPUs per node for srun jobs on this cluster        (GPUS_PER_NODE)
   --slurm-account NAME      SLURM account; set => run via SLURM (srun --account)  (SLURM_ACCOUNT)
-  --slurm-partition NAME    SLURM partition (srun --partition; defaults to "batch")  (SLURM_PARTITION)
 
   Anything else cluster-specific (partition, container mounts, GPU-request syntax,
   whether GPUs are requested at all) lives in the srun.tmpl / enroot_import.tmpl /
@@ -117,7 +114,6 @@ def read_config(ci_dir: Path) -> dict:
         "RUNNER_VERSION": "latest",
         "GPUS_PER_NODE": "",
         "SLURM_ACCOUNT": "",
-        "SLURM_PARTITION": "",
     }
     config_file = ci_dir / "config"
     if config_file.exists():
@@ -139,7 +135,6 @@ CLI_CONFIG_KEYS = {
     "CONCURRENT": "concurrent",
     "GPUS_PER_NODE": "gpus_per_node",
     "SLURM_ACCOUNT": "slurm_account",
-    "SLURM_PARTITION": "slurm_partition",
 }
 
 
@@ -383,12 +378,6 @@ def main() -> None:
         default=None,
         dest="slurm_account",
         help="SLURM account for srun --account; set => this cluster runs via SLURM (persisted to config)",
-    )
-    p.add_argument(
-        "--slurm-partition",
-        default=None,
-        dest="slurm_partition",
-        help="SLURM partition for srun --partition; defaults to 'batch' when unset (persisted to config)",
     )
     p.add_argument("--force-reinstall", action="store_true", help="Re-download binary even if already present")
     p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for cleanup")
