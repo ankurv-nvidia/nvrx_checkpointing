@@ -22,6 +22,7 @@ import torch
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     ChunkStorageMetadata,
+    FileSystemReader,
     TensorStorageMetadata,
 )
 from torch.distributed.checkpoint.filesystem import _StorageInfo
@@ -232,6 +233,32 @@ def svc_spindown() -> None:
 # read buffer lets the client coalesce and read ahead once the reads are issued
 # in ascending-offset order.
 _DCP_READ_BUFFER_BYTES = 16 * 1024 * 1024
+_DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
+
+
+def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
+    """Load non-sharded state from legacy or current Megatron checkpoints."""
+    checkpoint_dir = Path(checkpoint_dir)
+    commonpt = checkpoint_dir / "common.pt"
+    if commonpt.is_file():
+        return torch.load(commonpt, map_location="cpu", weights_only=False)
+
+    state_dict = {_DCP_COMMON_STATE_KEY: io.BytesIO()}
+    torch.distributed.checkpoint.load(
+        state_dict,
+        storage_reader=FileSystemReader(str(checkpoint_dir)),
+        no_dist=True,
+    )
+    loaded = state_dict[_DCP_COMMON_STATE_KEY]
+    if isinstance(loaded, io.BytesIO):
+        loaded.seek(0)
+        loaded = torch.load(loaded, map_location="cpu", weights_only=False)
+    if not isinstance(loaded, list) or len(loaded) != 1:
+        raise TypeError(f"Expected one embedded common-state object, got {type(loaded).__name__}")
+    common_state = loaded[0]
+    if not isinstance(common_state, dict):
+        raise TypeError(f"Expected common state dict, got {type(common_state).__name__}")
+    return common_state
 
 
 def distcp_trace(  # noqa: C901, PLR0912, PLR0915
@@ -250,15 +277,12 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
         checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {checkpoint_dir} does not exist")
-    commonpt = checkpoint_dir / "common.pt"
     metadata_file = checkpoint_dir / ".metadata"
-    if not commonpt.exists():
-        raise FileNotFoundError(f"common.pt file does not exist in checkpoint directory {checkpoint_dir}")
     if not metadata_file.exists():
         raise FileNotFoundError(f"Metadata file {metadata_file} does not exist in checkpoint directory {checkpoint_dir}")
     with metadata_file.open("rb") as fd:
         metadata = pickle.load(fd)  # noqa: S301
-    common_pt_data = torch.load(f"{checkpoint_dir}/common.pt", map_location="cpu", weights_only=False)
+    common_pt_data = load_common_state_dict(checkpoint_dir)
 
     common_pt_entries: dict[str, str] = {}
     for k, v in common_pt_data.items():

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import enum
 import importlib.util
+import io
 import types
 from pathlib import Path
 
@@ -52,6 +53,15 @@ def _make_checkpoint(d: Path, tensors: dict[str, torch.Tensor], common: dict) ->
     torch.save(common, d / "common.pt")
 
 
+def _make_current_checkpoint(d: Path, tensors: dict[str, torch.Tensor], common: dict) -> None:
+    """Drop a checkpoint using Megatron's embedded common-state format."""
+    d.mkdir(parents=True, exist_ok=True)
+    serialized = io.BytesIO()
+    torch.save([common], serialized)
+    serialized.seek(0)
+    dcp.save({**tensors, "common_state/shard_0_1": serialized}, checkpoint_id=str(d))
+
+
 @pytest.fixture
 def base_tensors() -> dict[str, torch.Tensor]:
     return {
@@ -81,6 +91,15 @@ def test_equal_directories_pass(tmp_path, base_tensors, base_common) -> None:
     nvrx = tmp_path / "nvrx"
     _make_checkpoint(native, base_tensors, base_common)
     _make_checkpoint(nvrx, base_tensors, base_common)
+
+    assert main(native, nvrx) == 0
+
+
+def test_current_nvrx_common_state_matches_legacy_native(tmp_path, base_tensors, base_common) -> None:
+    native = tmp_path / "native"
+    nvrx = tmp_path / "nvrx"
+    _make_checkpoint(native, base_tensors, base_common)
+    _make_current_checkpoint(nvrx, base_tensors, base_common)
 
     assert main(native, nvrx) == 0
 

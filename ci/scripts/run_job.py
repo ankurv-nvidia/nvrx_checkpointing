@@ -1087,10 +1087,6 @@ def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: 
     return rc
 
 
-def _md5(path: Path) -> str:
-    return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324 — integrity check, not security
-
-
 # Perf log parsers
 
 _RE_NATIVE_BW = re.compile(
@@ -2878,10 +2874,10 @@ class PretrainJob:
         try:
             pretrain_fn(
                 full_config,
-                ph.train_valid_test_datasets_provider,
-                partial(_mp, hybrid_builder),
-                ModelType.encoder_or_decoder,
-                ph.forward_step,
+                train_valid_test_dataset_provider=ph.train_valid_test_datasets_provider,
+                model_provider=partial(_mp, hybrid_builder),
+                model_type=ModelType.encoder_or_decoder,
+                forward_step_func=ph.forward_step,
                 store=store,
             )
         except Exception as exc:
@@ -2958,12 +2954,12 @@ class PretrainJob:
                 raise RuntimeError(f"determinism: {label} produced no iter_* under {root}")
             return iter_dirs
 
-        # --- Run 1: stash the per-tensor trace and the non-tensor state (common.pt) ---
+        # --- Run 1: stash the per-tensor trace and normalized non-tensor state. ---
         _run(RESULTS_DIR / f"{stem}_run1.log", "determinism: run 1/2")
         for iter_dir in _collect_iter_refs(ckpt_dir, "run 1/2"):
             dst_dir = sidecar_dir / iter_dir.name
             dst_dir.mkdir(parents=True)
-            for name in ("reference.metadata.info", "common.pt"):
+            for name in ("reference.metadata.info", "common_pt_dump.info"):
                 src = iter_dir / name
                 if not src.is_file():
                     raise RuntimeError(f"determinism: run 1/2 produced no {name} at {src}")
@@ -2979,7 +2975,7 @@ class PretrainJob:
         # --- Run 2 ---
         _run(RESULTS_DIR / f"{stem}_run2.log", "determinism: run 2/2")
 
-        # --- Cross-run diff: per-tensor trace (text) + common.pt (binary md5) ---
+        # --- Cross-run diff: per-tensor trace + normalized common state. ---
         failures: list[str] = []
         iter_dirs = _collect_iter_refs(ckpt_dir, "run 2/2")
         for iter_dir in iter_dirs:
@@ -3003,12 +2999,13 @@ class PretrainJob:
                     logger.info(f"... ({len(diff) - 30} more diff lines suppressed; full files in artifacts)")
                 failures.append(f"{iter_dir.name}/reference.metadata.info")
 
-            common2 = iter_dir / "common.pt"
+            common1 = sidecar_dir / iter_dir.name / "common_pt_dump.info"
+            common2 = iter_dir / "common_pt_dump.info"
             if not common2.is_file():
-                raise RuntimeError(f"determinism: missing run-2 common.pt at {common2}")
-            if _md5(sidecar_dir / iter_dir.name / "common.pt") != _md5(common2):
-                logger.info(f"[run_job] determinism FAIL on {iter_dir.name}: common.pt md5 differs between the two runs")
-                failures.append(f"{iter_dir.name}/common.pt")
+                raise RuntimeError(f"determinism: missing run-2 common-state dump at {common2}")
+            if common1.read_text() != common2.read_text():
+                logger.info(f"[run_job] determinism FAIL on {iter_dir.name}: common state differs between the two runs")
+                failures.append(f"{iter_dir.name}/common_pt_dump.info")
 
         if failures:
             raise RuntimeError(
@@ -3016,7 +3013,7 @@ class PretrainJob:
                 f"Training is not bit-deterministic across runs even under --deterministic-mode — "
                 f"see the diff snippets above and the per-iter artifacts.",
             )
-        logger.info(f"[run_job] determinism PASS: {len(iter_dirs)} iter(s) bit-identical (tensors + common.pt) across two nvrx runs")
+        logger.info(f"[run_job] determinism PASS: {len(iter_dirs)} iter(s) bit-identical (tensors + common state) across two nvrx runs")
 
 
 # Entry point

@@ -4,6 +4,7 @@
   account_for_loss_in_pipeline_split .............. False
   accumulate_allreduce_grads_in_fp32 .............. True
   activation_func_clamp_value ..................... None
+  activation_offload_fraction ..................... 1.0
   adam_beta1 ...................................... 0.9
   adam_beta2 ...................................... 0.95
   adam_eps ........................................ 1e-08
@@ -91,6 +92,7 @@
   data_sharding ................................... True
   dataloader_defer_npy_index_mmap ................. False
   dataloader_fast_cache_load ...................... False
+  dataloader_inter_document_masking ............... False
   dataloader_type ................................. single
   ddp_average_in_collective ....................... False
   ddp_bucket_size ................................. None
@@ -107,7 +109,9 @@
   decoupled_min_lr ................................ None
   decrease_batch_size_if_needed ................... False
   defer_embedding_wgrad_compute ................... False
+  delay_offload_until_cuda_graph .................. False
   delay_wgrad_compute ............................. False
+  delta_offload_bytes_across_pp_ranks ............. 0
   deprecated_use_mcore_models ..................... True
   deterministic_mode .............................. False
   dino_bottleneck_size ............................ 256
@@ -135,10 +139,18 @@
   distributed_timeout_minutes ..................... 30
   distributed_timeout_seconds_after_init .......... None
   dsa_indexer_head_dim ............................ None
+  dsa_indexer_k_norm_epsilon ...................... None
+  dsa_indexer_k_norm_fp32 ......................... False
   dsa_indexer_loss_coeff .......................... None
   dsa_indexer_n_heads ............................. None
+  dsa_indexer_rope_interleaved .................... False
+  dsa_indexer_rotate_activation ................... True
+  dsa_indexer_scoring_relu ........................ True
+  dsa_indexer_skip_topk_offset .................... 0
   dsa_indexer_topk ................................ None
+  dsa_indexer_topk_freq ........................... 1
   dsa_indexer_use_sparse_loss ..................... False
+  dsa_kernel_backend .............................. none
   dump_param_to_param_group_map ................... None
   embedding_init_method_std ....................... None
   embedding_path .................................. None
@@ -244,6 +256,8 @@
   fp8_recipe ...................................... delayed
   fp8_wgrad ....................................... True
   freeze_all_layers ............................... False
+  freeze_base_for_mtp ............................. False
+  fsdp_db_use_persist_buf_on_alloc_fail ........... False
   fsdp_double_buffer .............................. False
   fsdp_manual_registration ........................ False
   ft_num_warmup_iters ............................. 5
@@ -289,11 +303,13 @@
   inference_disable_ep_consensus .................. False
   inference_disable_triton_nvls_kernels ........... False
   inference_dynamic_batching ...................... False
+  inference_dynamic_batching_async_sched_mode ..... legacy
   inference_dynamic_batching_block_size ........... 256
   inference_dynamic_batching_buffer_size_gb ....... 40.0
   inference_dynamic_batching_cuda_graph_mixed_prefill_count  16
   inference_dynamic_batching_cuda_graph_sizing_distribution  exponential
   inference_dynamic_batching_enable_prefix_caching  False
+  inference_dynamic_batching_logprobs_mode ........ raw_logprobs
   inference_dynamic_batching_mamba_memory_ratio ... None
   inference_dynamic_batching_max_requests ......... None
   inference_dynamic_batching_max_tokens ........... None
@@ -424,6 +440,7 @@
   megatron_fsdp_grad_comm_dtype ................... None
   megatron_fsdp_main_grads_dtype .................. None
   megatron_fsdp_main_params_dtype ................. torch.float32
+  megatron_fsdp_max_pool_double_buffer ............ False
   memory_snapshot_path ............................ snapshot.pickle
   merge_file ...................................... None
   metadata_path ................................... None
@@ -441,13 +458,14 @@
   modelopt_enabled ................................ False
   moe_apply_probs_on_input ........................ False
   moe_aux_loss_coeff .............................. 0.0001
-  moe_deepep_num_sms .............................. 20
+  moe_deepep_num_sms .............................. None
   moe_enable_deepep ............................... False
   moe_enable_routing_replay ....................... False
   moe_expert_capacity_factor ...................... None
   moe_expert_rank_capacity_factor ................. None
   moe_ffn_hidden_size ............................. 1344
   moe_flex_dispatcher_backend ..................... deepep
+  moe_flex_dispatcher_num_sms ..................... None
   moe_grouped_gemm ................................ True
   moe_hybridep_num_blocks_permute ................. None
   moe_hybridep_num_blocks_unpermute ............... None
@@ -458,6 +476,8 @@
   moe_layer_freq .................................. 1
   moe_layer_recompute ............................. False
   moe_mlp_glu_interleave_size ..................... None
+  moe_ncclep_static_shape ......................... False
+  moe_ncclep_use_symm_mem ......................... False
   moe_pad_expert_input_to_capacity ................ False
   moe_pad_experts_for_cuda_graph_inference ........ False
   moe_paged_stash ................................. False
@@ -482,7 +502,13 @@
   moe_router_score_function ....................... sigmoid
   moe_router_topk ................................. 11
   moe_router_topk_scaling_factor .................. 5.0
+  moe_routing_trace_capture_hidden_states ......... False
+  moe_routing_trace_capture_logits ................ False
+  moe_routing_trace_dump_weights .................. False
+  moe_routing_trace_max_training_iters ............ None
+  moe_routing_trace_path .......................... None
   moe_shared_expert_gate .......................... False
+  moe_shared_expert_glu_interleave_size ........... None
   moe_shared_expert_intermediate_size ............. 2688
   moe_shared_expert_overlap ....................... False
   moe_single_grouped_bias ......................... False
@@ -599,6 +625,7 @@
   pytorch_profiler_collect_chakra ................. False
   pytorch_profiler_collect_shapes ................. False
   q_lora_rank ..................................... None
+  qad_train_target ................................ None
   qk_clip ......................................... False
   qk_clip_alpha ................................... 0.5
   qk_clip_threshold ............................... 100
@@ -745,6 +772,7 @@
   use_fused_weighted_squared_relu ................. True
   use_gloo_process_groups ......................... False
   use_grouped_gemm_for_dense_mlp .................. False
+  use_grouped_gemm_for_shared_expert .............. False
   use_kitchen_attention ........................... False
   use_layer_wise_distributed_optimizer ............ False
   use_layer_wise_param_layout ..................... True
@@ -790,4 +818,8 @@
   window_size ..................................... None
   world_size ...................................... 4
   yaml_cfg ........................................ None
+  yarn_beta_fast .................................. None
+  yarn_beta_slow .................................. None
+  yarn_correction_range_round_to_int .............. None
+  yarn_original_max_position_embeddings ........... None
 -------------------- end of arguments ---------------------

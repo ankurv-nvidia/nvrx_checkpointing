@@ -44,6 +44,7 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 import types
 from pathlib import Path
@@ -85,10 +86,9 @@ def _load_tensors(ckpt_dir: Path) -> tuple[dict[str, torch.Tensor], Metadata]:
     metadata = reader.read_metadata()
     template: dict[str, torch.Tensor] = {}
     for fqn, meta in metadata.state_dict_metadata.items():
-        # Both writers route non-tensor state through `common.pt`, so
-        # `BytesStorageMetadata` entries here would be unexpected. Skipping
-        # them silently is fine in practice; if either writer starts
-        # emitting them, comparison gains would need a separate pass.
+        # Current Megatron stores common state as BytesStorageMetadata while
+        # legacy/native checkpoints use common.pt. Common state is loaded in a
+        # separate pass below, so only tensor entries belong in this template.
         if isinstance(meta, TensorStorageMetadata):
             template[fqn] = torch.zeros(meta.size, dtype=meta.properties.dtype)
     dcp.load(template, checkpoint_id=str(ckpt_dir))
@@ -118,7 +118,27 @@ def _shard_locations(metadata: Metadata, fqn: str) -> list[str]:
 
 
 def _load_common(ckpt_dir: Path) -> dict:
-    return torch.load(ckpt_dir / "common.pt", weights_only=False)
+    commonpt = ckpt_dir / "common.pt"
+    if commonpt.is_file():
+        return torch.load(commonpt, map_location="cpu", weights_only=False)
+
+    key = "common_state/shard_0_1"
+    state_dict = {key: io.BytesIO()}
+    dcp.load(
+        state_dict,
+        storage_reader=FileSystemReader(str(ckpt_dir)),
+        no_dist=True,
+    )
+    loaded = state_dict[key]
+    if isinstance(loaded, io.BytesIO):
+        loaded.seek(0)
+        loaded = torch.load(loaded, map_location="cpu", weights_only=False)
+    if not isinstance(loaded, list) or len(loaded) != 1:
+        raise TypeError(f"Expected one embedded common-state object, got {type(loaded).__name__}")
+    common_state = loaded[0]
+    if not isinstance(common_state, dict):
+        raise TypeError(f"Expected common state dict, got {type(common_state).__name__}")
+    return common_state
 
 
 def _compare_tensors(

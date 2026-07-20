@@ -298,4 +298,4 @@ else
     $*
 fi
 
-# git-merge-base a58373f332496f08c6584b3196233275ff69f175
+# git-merge-base 1aa880d0ea1dfddef567785ebc9a384f2a600d18

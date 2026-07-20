@@ -1,7 +1,7 @@
 # Using `nvrx_checkpointing` from an sbatch script
 
 Use the public Megatron-LM checkout pinned by this repository
-(`a58373f332496f08c6584b3196233275ff69f175`) and make sure the
+(`1aa880d0ea1dfddef567785ebc9a384f2a600d18`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every
 node.
 
