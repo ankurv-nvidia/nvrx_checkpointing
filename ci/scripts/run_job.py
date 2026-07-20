@@ -2629,11 +2629,6 @@ class PretrainJob:
                 "--async-save",
                 "--use-persistent-ckpt-worker",
             ]
-            # nvrx async worker stages D2H copies through CPU shared memory instead
-            # of pinned host buffers; pairs with dropping the pre-save GPU-headroom
-            # release (empty_cache / free_overlap_buffers) in training.py.
-            if "nvrx" in config.ckpt_provider:
-                checkpoint_opts.append("--async-ckpt-use-cpu-shm")
         checkpoint_opts += ["--save", str(config.ckpt_dir)]
         if config.load_dir is not None:
             checkpoint_opts += ["--load", str(config.load_dir)]
@@ -2832,6 +2827,13 @@ class PretrainJob:
         sys_path_insert(REPO_ROOT.parent)
         sys_path_insert(megatron_root())
 
+        from nvrx_checkpointing import megatron_integration  # pyright: ignore[reportMissingImports] # noqa: PLC0415
+
+        # Keep the public Megatron checkout unmodified.  The adapter relocates the
+        # historical five-file patch into this process before Megatron's training
+        # functions and argument validator are imported below.
+        megatron_integration.install()
+
         from megatron.core.enums import ModelType  # pyright: ignore[reportMissingImports] # noqa: PLC0415
         from megatron.training import (  # pyright: ignore[reportMissingImports] # noqa: PLC0415
             inprocess_restart,
@@ -2868,7 +2870,7 @@ class PretrainJob:
         pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
         args = parse_and_validate_args(
-            extra_args_provider=add_modelopt_args if has_modelopt else None,
+            extra_args_provider=megatron_integration.compose_extra_args_provider(add_modelopt_args if has_modelopt else None),
             args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
         )
         model_cfg = hybrid_config_from_args(args)

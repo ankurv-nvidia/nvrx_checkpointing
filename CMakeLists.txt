@@ -364,6 +364,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             ckpt_diag.py
             debug.py
             mapping.py
+            megatron_integration.py
             tools.py
     )
 

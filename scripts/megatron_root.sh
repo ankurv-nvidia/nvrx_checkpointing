@@ -1,26 +1,12 @@
 #!/usr/bin/env bash
 set -Eeoux pipefail
 
-COMMIT_HASH=e418294cff7322467e4a1f66e939d44275702f0f
+COMMIT_HASH=a58373f332496f08c6584b3196233275ff69f175
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 
-cloneurl=$(git -C ${SCRIPT_DIR} config --get remote.origin.url)
-if [[ -n "${MEGATRON_CI_TOKEN:-}" ]]; then
-    # Dedicated access token (PAT / project / group) scoped to megatron-lm.
-    # oauth2 works as the username for any token type.
-    MEGATRON_REPO_URL=https://oauth2:${MEGATRON_CI_TOKEN}@gitlab-master.nvidia.com/ankurv/megatron-lm.git
-elif [[ -n "${CI_JOB_TOKEN:-}" ]]; then
-    MEGATRON_REPO_URL=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab-master.nvidia.com/ankurv/megatron-lm.git
-elif [[ ${cloneurl} == ssh://git@* ]]; then
-    # if clone url is ssh then use ssh url
-    MEGATRON_REPO_URL=ssh://git@gitlab-master.nvidia.com:12051/ankurv/megatron-lm.git
-else
-    MEGATRON_REPO_URL=https://gitlab-master.nvidia.com/ankurv/megatron-lm.git
-fi
-# print cloneurl to stderr
+MEGATRON_REPO_URL=${MEGATRON_REPO_URL:-https://github.com/NVIDIA/Megatron-LM.git}
 echo "MEGATRON_REPO_URL=${MEGATRON_REPO_URL}" >&2
-echo "cloneurl=${cloneurl}" >&2
 
 REPO_ROOT=${SCRIPT_DIR}/..
 MEGATRON_ROOT=${1:-${REPO_ROOT}/../nvrx-megatron-lm}
@@ -35,16 +21,15 @@ if [[ ! -d ${MEGATRON_ROOT} ]]; then
     git clone --quiet ${MEGATRON_REPO_URL} ${MEGATRON_ROOT}
 fi
 
+# Existing CI caches may have been cloned from the historical private fork.
+# Always point the retained checkout at the public repository before fetching.
+git -C ${MEGATRON_ROOT} remote set-url origin ${MEGATRON_REPO_URL}
+
 if [[ "${COMMIT_HASH}" != $(git -C ${MEGATRON_ROOT} rev-parse HEAD) ]]; then
     git -C ${MEGATRON_ROOT} checkout --quiet -- .
     git -C ${MEGATRON_ROOT} clean --quiet -f -d -x .
     git -C ${MEGATRON_ROOT} -c remote.neworigin.url=${MEGATRON_REPO_URL} fetch neworigin --quiet ${COMMIT_HASH}
     git -C ${MEGATRON_ROOT} checkout --quiet ${COMMIT_HASH}
-fi
-
-# Don't persist the token-embedded URL in the clone's git config.
-if [[ -n "${MEGATRON_CI_TOKEN:-}" || -n "${CI_JOB_TOKEN:-}" ]]; then
-    git -C ${MEGATRON_ROOT} remote set-url origin https://gitlab-master.nvidia.com/ankurv/megatron-lm.git
 fi
 
 echo ${MEGATRON_ROOT}

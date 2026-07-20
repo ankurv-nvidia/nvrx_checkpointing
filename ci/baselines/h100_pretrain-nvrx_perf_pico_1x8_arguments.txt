@@ -23,7 +23,7 @@
   apply_wd_to_qk_layernorm ........................ False
   async_ckpt_cpu_priority ......................... 10
   async_ckpt_io_priority .......................... 3
-  async_ckpt_use_cpu_shm .......................... True
+  async_ckpt_use_cpu_shm .......................... False
   async_save ...................................... True
   async_strategy .................................. nvrx
   attention_backend ............................... AttnBackend.flash

@@ -180,24 +180,42 @@ struct CachedTypes
     nb::object torchTensor;
     nb::object torchDtype;
     nb::object torchGenerator;
-    nb::object mappingShardedTensor;
-    nb::object mappingShardedTensorFactory;
-    nb::object mappingShardedObject;
+    nb::object localShardedTensor;
+    nb::object localShardedTensorFactory;
+    nb::object localShardedObject;
+    nb::object megatronShardedTensor;
+    nb::object megatronShardedTensorFactory;
+    nb::object megatronShardedObject;
 };
 
 CachedTypes const& CachedTypesGet()
 {
     static CachedTypes Types = []() {
         nb::gil_scoped_acquire acquire;
-        auto                   torchModule   = nb::module_::import_("torch");
-        auto                   mappingModule = nb::module_::import_("nvrx_checkpointing.mapping");
+        auto                   torchModule                  = nb::module_::import_("torch");
+        auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.mapping");
+        auto                   megatronShardedTensor        = nb::object(nb::none());
+        auto                   megatronShardedTensorFactory = nb::object(nb::none());
+        auto                   megatronShardedObject        = nb::object(nb::none());
+        auto                   importlibUtil                = nb::module_::import_("importlib.util");
+        if (!importlibUtil.attr("find_spec")("megatron").is_none()
+            && !importlibUtil.attr("find_spec")("megatron.core.dist_checkpointing.mapping").is_none())
+        {
+            auto megatronMappingModule   = nb::module_::import_("megatron.core.dist_checkpointing.mapping");
+            megatronShardedTensor        = megatronMappingModule.attr("ShardedTensor");
+            megatronShardedTensorFactory = megatronMappingModule.attr("ShardedTensorFactory");
+            megatronShardedObject        = megatronMappingModule.attr("ShardedObject");
+        }
         return CachedTypes{
-            .torchTensor                 = torchModule.attr("Tensor"),
-            .torchDtype                  = torchModule.attr("dtype"),
-            .torchGenerator              = torchModule.attr("Generator"),
-            .mappingShardedTensor        = mappingModule.attr("ShardedTensor"),
-            .mappingShardedTensorFactory = mappingModule.attr("ShardedTensorFactory"),
-            .mappingShardedObject        = mappingModule.attr("ShardedObject"),
+            .torchTensor                  = torchModule.attr("Tensor"),
+            .torchDtype                   = torchModule.attr("dtype"),
+            .torchGenerator               = torchModule.attr("Generator"),
+            .localShardedTensor           = mappingModule.attr("ShardedTensor"),
+            .localShardedTensorFactory    = mappingModule.attr("ShardedTensorFactory"),
+            .localShardedObject           = mappingModule.attr("ShardedObject"),
+            .megatronShardedTensor        = std::move(megatronShardedTensor),
+            .megatronShardedTensorFactory = std::move(megatronShardedTensorFactory),
+            .megatronShardedObject        = std::move(megatronShardedObject),
         };
     }();
     return Types;
@@ -210,11 +228,23 @@ bool IsTorchDtype(nb::handle obj)
 bool IsTorchGenerator(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchGenerator); }
 bool IsMegatronShardedTensor(nb::handle obj)
-{ return nb::isinstance(obj, CachedTypesGet().mappingShardedTensor); }
+{
+    auto const& types = CachedTypesGet();
+    return nb::isinstance(obj, types.localShardedTensor)
+           || (!types.megatronShardedTensor.is_none() && nb::isinstance(obj, types.megatronShardedTensor));
+}
 bool IsMegatronShardedTensorFactory(nb::handle obj)
-{ return nb::isinstance(obj, CachedTypesGet().mappingShardedTensorFactory); }
+{
+    auto const& types = CachedTypesGet();
+    return nb::isinstance(obj, types.localShardedTensorFactory)
+           || (!types.megatronShardedTensorFactory.is_none() && nb::isinstance(obj, types.megatronShardedTensorFactory));
+}
 bool IsMegatronShardedObject(nb::handle obj)
-{ return nb::isinstance(obj, CachedTypesGet().mappingShardedObject); }
+{
+    auto const& types = CachedTypesGet();
+    return nb::isinstance(obj, types.localShardedObject)
+           || (!types.megatronShardedObject.is_none() && nb::isinstance(obj, types.megatronShardedObject));
+}
 
 // === Handler bodies ===
 
