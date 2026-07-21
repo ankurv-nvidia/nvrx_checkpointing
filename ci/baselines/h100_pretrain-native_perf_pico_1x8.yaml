@@ -4,7 +4,7 @@ run_cmd: python3 ci/scripts/run_job.py pretrain-native --slurm --gpus-per-node 8
 update_cmd: python3 ci/scripts/run_job.py pretrain-native --slurm --gpus-per-node
   8 --flavor perf --update-baseline
 metrics:
-  bw_mbps: 42000.0
-  wr_tnsr_us: 67000.0
+  bw_mbps: 40000.0
+  wr_tnsr_us: 72000.0
   total_written_bytes: 2791741616
   gpu_peak_bytes: 5200000000

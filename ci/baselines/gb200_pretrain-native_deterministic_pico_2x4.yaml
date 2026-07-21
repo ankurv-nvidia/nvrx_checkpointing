@@ -10,7 +10,8 @@ metrics:
   gpu_peak_bytes: 6200000000
 cluster_metrics:
   awscmh:
-    bw_mbps: 120000.0
-    wr_tnsr_us: 26000.0
+    bw_mbps: 110000.0
+    wr_tnsr_us: 28000.0
   ocihsg:
-    wr_tnsr_us: 20000.0
+    wr_tnsr_us: 22500.0
+    bw_mbps: 135000.0

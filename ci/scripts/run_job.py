@@ -258,6 +258,13 @@ class Flavor(ABC):
             "NVTE_BWD_LAYERNORM_SM_MARGIN": "16",
             "TORCHINDUCTOR_WORKER_START": "fork",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
+            # Silence two benign third-party deprecation notices that each print once per
+            # rank (512 lines at 64 nodes): torch.cuda's pynvml FutureWarning and modelopt's
+            # transformers-version UserWarning. Narrow message filters, not a blanket ignore.
+            "PYTHONWARNINGS": (
+                "ignore:The pynvml package is deprecated:FutureWarning,"
+                "ignore:transformers .* is not tested with current version of modelopt:UserWarning"
+            ),
             "QUANTIZATION_TYPE_DEBUG": "1",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "TRITON_CACHE_DIR": str(triton_dir),
@@ -372,7 +379,12 @@ class DeterministicFlavor(Flavor):
         self._drop_opt(recipe.opts, "--cross-entropy-fusion-impl", has_value=True)
         self._drop_opts(recipe.opts, self._RECOMPUTE_FLAGS)
         self._add_flag(recipe.opts, "--deterministic-mode")
-        self._drop_opt(recipe.opts, "--async-ckpt-use-cpu-shm")
+        # Save synchronously: the async writer's byte-exactness is a liability for the md5
+        # gates. Its GPU-IPC staging path re-saves the first save's dequantized
+        # (precision-aware bf16) optimizer moments on every warm save, and async staging
+        # overlapped with training can take run-dependent paths. Deterministic runs want
+        # reproducible bytes, not the async path — the perf flavor exercises that.
+        self._drop_opts(recipe.opts, ("--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm"))
         recipe.env.update(self.ENV)
 
     def epilog(self, ctx: RunCtx) -> None:
@@ -554,12 +566,27 @@ class ValgrindFlavor(Flavor):
             raise RuntimeError("valgrind not found in PATH — required for the valgrind flavor")
         server = self._binary()
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        # Per-node filename: on multinode each node's local rank 0 runs its own valgrind server,
+        # Per-node filenames: on multinode each node's local rank 0 runs its own valgrind server,
         # and RESULTS_DIR is shared, so a single name would clobber across nodes.
-        server_log = RESULTS_DIR / f"{ctx.stem}_server.{socket.gethostname().split('.')[0]}.log"
+        host = socket.gethostname().split(".")[0]
+        # server_log carries the daemon's own stdout/stderr (the READY marker _watch_log tails
+        # for readiness, spindown lines, its diagnostics) via the pump and its direct writes.
+        server_log = RESULTS_DIR / f"{ctx.stem}_server.{host}.log"
         server_log.write_bytes(b"")  # truncate any prior run's log
+        # valgrind writes its memcheck report and any crash backtrace straight to report_log via
+        # --log-file — a file valgrind owns and flushes itself, so the report survives the process
+        # teardown instead of depending on the pump thread draining the pipe before the kill.
+        report_log = RESULTS_DIR / f"{ctx.stem}_valgrind.{host}.log"
 
-        cmd = [valgrind, "--tool=memcheck", "--leak-check=full", "--show-leak-kinds=all", "--error-exitcode=42", "--log-fd=2", str(server)]
+        cmd = [
+            valgrind,
+            "--tool=memcheck",
+            "--leak-check=full",
+            "--show-leak-kinds=all",
+            "--error-exitcode=42",
+            f"--log-file={report_log}",
+            str(server),
+        ]
         logger.info(f"[run_job] Launching checkpoint_server under valgrind; log: {server_log}")
         CheckpointServer.require_no_checkpoint_server()  # a leftover here means a prior run didn't spin down
 
@@ -587,20 +614,32 @@ class ValgrindFlavor(Flavor):
             rc, stalled = self._await_server_exit(proc, ckpt_root)
             ctx.valgrind_rc = rc  # record before cleanup so epilog sees it even if cleanup raises
             watcher.join(timeout=5)
-            pump.join(timeout=60)  # let the pump drain valgrind's full exit report before the file is closed
+            pump.join(timeout=60)  # drain the daemon's remaining stdout before closing its log
             log_fp.close()
             if rc is not None:
-                logger.info(f"[run_job] valgrind exited with code {rc}; server log: {server_log}")
+                logger.info(f"[run_job] valgrind exited with code {rc}; report: {report_log}")
 
             # ROBUST CROSS-CHECK (kept; a summary + backstop, NOT the primary gate):
             # list the memcheck errors valgrind flagged, however it exited.
-            errors = self._scan_valgrind_errors(server_log)
+            errors = self._scan_valgrind_errors(report_log)
             summary = "; ".join(errors[: self._MAX_ERRORS_SUMMARY]) + (" ..." if len(errors) > self._MAX_ERRORS_SUMMARY else "")
             if errors:
-                logger.error(f"[run_job] valgrind memcheck summary: {len(errors)} error type(s): {summary}; see {server_log}")
+                logger.error(f"[run_job] valgrind memcheck summary: {len(errors)} error type(s): {summary}; see {report_log}")
             else:
-                logger.info(f"[run_job] valgrind memcheck summary: no errors found in {server_log}")
+                logger.info(f"[run_job] valgrind memcheck summary: no errors found in {report_log}")
 
+            # Best-effort: on any failure, dump the valgrind report tail into the job output.
+            # The per-node report lives on the runner's checkout and can miss the artifact
+            # upload, so the trace is the surest place a maintainer sees it — when the file
+            # exists (a crash that preempts valgrind's own flush leaves nothing to dump).
+            if stalled or errors or rc not in (None, 0):
+                try:
+                    with report_log.open("rb") as fh:
+                        fh.seek(max(0, report_log.stat().st_size - CheckpointServer._SERVER_LOG_TAIL_BYTES))
+                        tail = fh.read().decode(errors="replace")
+                    logger.error(f"[run_job] tail of {report_log.name}:\n{tail}")
+                except OSError as exc:
+                    logger.error(f"[run_job] could not read {report_log}: {exc}")
             # Regular guard: a stalled server is a hard failure.
             if stalled:
                 raise RuntimeError(
@@ -612,12 +651,12 @@ class ValgrindFlavor(Flavor):
             if rc == 0 and errors:
                 raise RuntimeError(
                     "valgrind reported memcheck errors that the exit-code/stall guards did NOT catch — "
-                    f"the regular guards need strengthening: {summary}; see {server_log}",
+                    f"the regular guards need strengthening: {summary}; see {report_log}",
                 ) from None
             # Fail here (not just in the global-rank-0 epilog) so every node's local rank 0 reports
             # its own server's valgrind errors — required for per-node multinode memcheck.
             if rc not in (None, 0):
-                raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {server_log}") from None
+                raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {report_log}") from None
 
     def _spawn(
         self,
@@ -815,8 +854,15 @@ def _extract_arguments_block(log_text: str) -> str | None:
 
 def _read_arguments_block(stem: str) -> str | None:
     """The resolved arguments block from this run's log(s), or None if none was printed. For the
-    two-run nvrx determinism check the run-2 log wins (its block is the last one read)."""
-    candidates = [RESULTS_DIR / f"{stem}.log", *sorted(RESULTS_DIR.glob(f"{stem}_run*.log"))]
+    two-run nvrx determinism check the run-2 log wins (its block is the last one read). Past two
+    nodes the measured run's output is redirected into its routine log, so that file is a
+    candidate too (the job runs a single config, so only its own routine logs exist here); the
+    reference routine's log is NOT read — it runs the other provider."""
+    candidates = [
+        RESULTS_DIR / f"{stem}.log",
+        *sorted(RESULTS_DIR.glob(f"{stem}_run*.log")),
+        *sorted(RESULTS_DIR.glob("*_measured-*-routine.log")),
+    ]
     block: str | None = None
     for log in candidates:
         try:
@@ -2557,6 +2603,13 @@ class PretrainJob:
         opts = PretrainJob._pretrain_cli_args(config)
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
         _apply_flavors(recipe, flavors or [])
+        if "--fine-grained-activation-offloading" in recipe.opts:
+            # TE >= 2.10 asserts at init when fine-grained activation offloading is
+            # on unless NVTE_CPU_OFFLOAD_V1=1 selects the v1 semantics that keep
+            # weights resident (ultra3fp8 pins it today). Keyed on the resolved flag,
+            # not the profile, so it follows the config that actually offloads.
+            recipe.env.setdefault("NVTE_CPU_OFFLOAD_V1", "1")
+        recipe.env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         opts = recipe.opts
 
         env = os.environ.copy()
@@ -2571,10 +2624,12 @@ class PretrainJob:
         if use_torchrun:
             launcher = ["torchrun", "--nproc_per_node", str(gpus_per_node)]
         else:
-            logger.info(
-                f"[run_job] in-srun mode: RANK={env['RANK']} LOCAL_RANK={env['LOCAL_RANK']} WORLD_SIZE={env['WORLD_SIZE']}"
-                f"MASTER_ADDR={env['MASTER_ADDR']} MASTER_PORT={env['MASTER_PORT']}",
-            )
+            # One line, not one-per-rank: at 64 nodes 256 copies of this bloat the log.
+            if env["RANK"] == "0":
+                logger.info(
+                    f"[run_job] in-srun mode: WORLD_SIZE={env['WORLD_SIZE']} "
+                    f"MASTER_ADDR={env['MASTER_ADDR']} MASTER_PORT={env['MASTER_PORT']}",
+                )
             launcher = ["python3", "-u"]
 
         # Re-invoke this script in entry mode so the CI markers stay in this tree and the training

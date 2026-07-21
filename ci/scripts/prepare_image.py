@@ -124,7 +124,10 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     prepare_sh = (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix()
     prep_cmd = build_cmd_from_template(
         "image_prep.tmpl",
-        {**srun_values, "time_minutes": 60},
+        # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
+        # roughly doubles the image-build time over the toolchain+megatron+flash-attn
+        # baseline, which overran the previous 60-minute window.
+        {**srun_values, "time_minutes": 120},
         ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
     # scripts/run.sh intentionally enables the low-memory Valgrind build for its

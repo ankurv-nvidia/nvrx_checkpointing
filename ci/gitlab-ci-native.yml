@@ -120,6 +120,12 @@ stages:
       git config user.email "ci-bot@noreply"
       git config user.name  "CI Baseline Bot"
       git remote set-url origin "ssh://git@${CI_SERVER_HOST}:12051/${CI_PROJECT_PATH}.git"
+      # Sibling update jobs advance the branch during this stage, so the rebase below must
+      # replay onto their baseline pushes. On the runner's shallow clone the baseline files'
+      # origin history is cut off and the rebase hits add/add; deepen to full history on
+      # demand here (no-op once the clone is already complete) rather than unshallowing the
+      # whole job via GIT_DEPTH.
+      if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then git fetch --unshallow origin; fi
       git pull --rebase origin "${CI_COMMIT_BRANCH}"
     - python3 "${CI_SCRIPTS_DIR}/run_job.py" update_baselines
     - |

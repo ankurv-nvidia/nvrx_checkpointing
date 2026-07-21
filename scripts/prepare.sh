@@ -253,9 +253,20 @@ function megatron {
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn 
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
+
+    # DeepEP HybridEP: the flex+hybridep MoE token dispatcher the ultra profiles pin needs
+    # this package, which is not on PyPI. Pin the exact commit, apply the local build patch,
+    # and build for the arches the GPU matrix spans (H100 sm90, GB200 sm100, consumer sm120).
+    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    pushd DeepEP
+        git checkout 34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72
+        patch -p1 < "${SCRIPT_DIR}/deepep.patch"
+    popd
+    TORCH_CUDA_ARCH_LIST="12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
+    rm -rf DeepEP
 
     unset CC
     unset CXX

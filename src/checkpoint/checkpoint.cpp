@@ -139,7 +139,7 @@ void SvcPing()
         }
     }
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
-    fmt::print(stderr, "[native_ckpt:cli][INFO] SvcPing completed from {} svcbin={}\n", selfLoc.string(), svcExeLoc.string());
+    // A failed connect throws above; the success case needs no per-rank log line.
 }
 
 void SvcStop()

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -Eeoux pipefail
+set -Eeou pipefail
 
 COMMIT_HASH=1aa880d0ea1dfddef567785ebc9a384f2a600d18
 SCRIPT_PATH=$(realpath "$0")

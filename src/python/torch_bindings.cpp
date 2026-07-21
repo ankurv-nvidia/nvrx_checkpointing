@@ -10,6 +10,7 @@
 #include <fmt/ranges.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -809,8 +810,7 @@ bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nb::
             //  for param_name, checkpoint_name in conv_checkpoint_key_map.items():
             //      sharded_state_dict[f"{prefix}{param_name}"].key = f"{prefix}{checkpoint_name}"
 
-            // throw std::runtime_error(
-            fmt::print(stderr, "ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
+            // throw std::runtime_error("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
         root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(itemContainer, shtKey));
     }

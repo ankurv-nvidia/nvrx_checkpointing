@@ -782,7 +782,7 @@
   use_mp_args_from_checkpoint_args ................ False
   use_mup ......................................... False
   use_one_sent_docs ............................... False
-  use_persistent_ckpt_worker ...................... True
+  use_persistent_ckpt_worker ...................... False
   use_precision_aware_optimizer ................... False
   use_pytorch_profiler ............................ False
   use_ring_exchange_p2p ........................... False

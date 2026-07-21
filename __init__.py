@@ -76,10 +76,6 @@ def build_native_extensions() -> None:
         # both forms of an externally provided extension skip the auto-build.
         shlib_realpath = SHLIB_PATH.resolve()
         if not shlib_realpath.is_relative_to(native_build_dir.resolve()):
-            sys.stderr.write(
-                f"[nvrx_checkpointing] Native extension path {shlib_realpath} "
-                f"is not within auto-build dir {native_build_dir}, skipping auto-build.\n",
-            )
             return
 
     rank = try_get_rank()
