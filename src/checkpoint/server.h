@@ -12,6 +12,10 @@ void RunServer();
 
 void RunInprocServer(uint16_t nodes);
 
+// Waits until every in-process daemon has made its active snapshots durable.
+// This is intended for test and benchmark teardown, not the measured save path.
+void WaitForInprocServerWrites();
+
 void StopInprocServer();
 
 using ServerSessionCallback = void (*)(void*                        cbData,

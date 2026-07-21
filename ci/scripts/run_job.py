@@ -2491,10 +2491,10 @@ class PretrainJob:
             current = PretrainJob._common_state_lines(iter_dir)
             if reference != current:
                 diff = list(difflib.unified_diff(reference, current, fromfile="reference", tofile=provider, n=1))
-                logger.info(f"[run_job] reference check: common.pt content differs for {group}/{iter_dir.name} ({len(diff)} diff lines)")
+                logger.info(f"[run_job] reference check: common state differs for {group}/{iter_dir.name} ({len(diff)} diff lines)")
                 for line in diff[:30]:
                     logger.info(line.rstrip("\n"))
-                failures.append(f"{group}/{iter_dir.name} (common.pt)")
+                failures.append(f"{group}/{iter_dir.name} (common state)")
         if failures:
             raise RuntimeError(
                 f"reference check FAILED on {len(failures)} checkpoint(s): {', '.join(failures)} — the {provider} "

@@ -31,6 +31,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -565,7 +566,9 @@ struct CheckpointWriter
         }
     }
 
-    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
+    void SendToServer(cipc::SnapshotId const&                  snapshotId,
+                      std::filesystem::path const&             ckptPath,
+                      std::span<StateTree::SnapshotBlob const> snapshotBlobs)
     {
         SetThreadName("ncc:sendsvr");
 
@@ -579,6 +582,12 @@ struct CheckpointWriter
             // thread, where the current device may have fallen back to device 0.
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
+            serdes::WriteTrivial(sstrm, static_cast<uint32_t>(snapshotBlobs.size()));
+            for (auto const& blob : snapshotBlobs)
+            {
+                serdes::WriteBlobWithSize<uint16_t>(sstrm, blob.fqn);
+                serdes::WriteBlobWithSize<uint32_t>(sstrm, blob.data);
+            }
             auto msg = sstrm.str();
             msgQueue.Push({cipc::Message::ActivateSnapshot{.sessionId    = cipc::SessionId{0},
                                                            .snapshotId   = snapshotId,
@@ -622,11 +631,14 @@ struct CheckpointWriter
 };
 }    // namespace
 
-void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
+void SaveCheckpoint(StateTree const&                         root,
+                    cipc::SnapshotId const&                  snapshotId,
+                    std::filesystem::path const&             ckptPath,
+                    std::span<StateTree::SnapshotBlob const> snapshotBlobs)
 {
     fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Saving Checkpoint to dir {}\n", root.GlobalRank(), ckptPath.string());
     CheckpointWriter writer{root};
-    writer.SendToServer(snapshotId, ckptPath);
+    writer.SendToServer(snapshotId, ckptPath, snapshotBlobs);
 }
 
 void WaitForCheckpointSave(RankTopology const& topo)

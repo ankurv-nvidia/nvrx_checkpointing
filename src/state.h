@@ -68,6 +68,7 @@ struct StateNode
         virtual Type GetType() = 0;
 
         virtual void Update() = 0;
+        virtual bool IsSnapshotScoped() const { return false; }
 
         virtual Scalar            GetScalarState() = 0;
         virtual std::vector<char> GetBlob()        = 0;
@@ -99,7 +100,14 @@ template <> struct fmt::formatter<StateNode::Handle> : fmt::formatter<std::strin
 
 struct StateTree
 {
-    using NodeId = std::string;
+    struct SnapshotBlob
+    {
+        std::string fqn;
+        std::string data;
+    };
+
+    using NodeId        = std::string;
+    using SnapshotBlobs = std::vector<SnapshotBlob>;
 
     StateTree(RankTopology topo) : _topo(std::move(topo))
     {
@@ -187,6 +195,56 @@ struct StateTree
         return std::make_pair(std::string_view(itb, ite), node);
     }
 
+    StateNode::Handle FindNodeByFQN(std::string_view const& fqn) const
+    {
+        if (fqn.empty()) { return StateNode::Handle::Root; }
+
+        auto node = StateNode::Handle::Root;
+        auto itb  = fqn.begin();
+        while (itb != fqn.end())
+        {
+            auto const  ite       = std::find(itb, fqn.end(), '.');
+            auto const  childName = std::string_view(itb, ite);
+            auto const& parent    = GetNode(node).data;
+            if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { return StateNode::Handle::Invalid; }
+
+            auto const& children = std::get<StateNode::Dict>(parent);
+            auto const  childIt
+                = std::ranges::find_if(children, [&](StateNode::Handle childHandle) { return GetNode(childHandle).name == childName; });
+            if (childIt == children.end()) { return StateNode::Handle::Invalid; }
+            node = *childIt;
+            itb  = ite == fqn.end() ? ite : ite + 1;
+        }
+        return node;
+    }
+
+    void SetBlob(std::string_view const& fqn, std::string_view const& data)
+    {
+        auto const handle = FindNodeByFQN(fqn);
+        if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("Blob state '{}' is not registered", fqn)); }
+        auto& node = GetNode(handle);
+        if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob))
+        {
+            throw std::runtime_error(fmt::format("State '{}' is not a Blob", fqn));
+        }
+        node.data = StateNode::Blob(data.begin(), data.end());
+    }
+
+    SnapshotBlobs CaptureSnapshotBlobs() const
+    {
+        SnapshotBlobs result;
+        WalkNodes([&](StateNode const& node) {
+            if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob) || node.handler == nullptr
+                || !node.handler->IsSnapshotScoped())
+            {
+                return;
+            }
+            auto const blob = node.handler->GetBlob();
+            result.push_back({.fqn = GetNodeId(node.handle), .data = std::string(blob.begin(), blob.end())});
+        });
+        return result;
+    }
+
     void RegisterStateHandler(StateNode::Handle node, std::unique_ptr<IStateHandler> handler)
     {
         auto const& stateName = handler->name;
@@ -238,8 +296,8 @@ struct StateTree
         }
     }
 
-    auto const& GetNode(StateNode::Handle handle) const { return _nodes[static_cast<size_t>(handle)]; }
-    auto&       GetNode(StateNode::Handle handle) { return _nodes[static_cast<size_t>(handle)]; }
+    StateNode const& GetNode(StateNode::Handle handle) const { return _nodes[static_cast<size_t>(handle)]; }
+    StateNode&       GetNode(StateNode::Handle handle) { return _nodes[static_cast<size_t>(handle)]; }
 
     auto GlobalRank() const { return _topo.rank; }
     auto GlobalWorldSize() const { return _topo.worldSize; }

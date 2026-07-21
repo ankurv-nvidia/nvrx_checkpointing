@@ -8,13 +8,17 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 
 void SvcIncrRef();
 void SvcDecrRef();
 
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
 
-void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
+void SaveCheckpoint(StateTree const&                         root,
+                    checkpoint::ipc::SnapshotId const&       snapshotId,
+                    std::filesystem::path const&             ckptPath,
+                    std::span<StateTree::SnapshotBlob const> snapshotBlobs = {});
 void FinalizeStateRegistry(StateTree& self);
 void WaitForCheckpointSave(RankTopology const& topo);
 

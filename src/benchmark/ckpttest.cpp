@@ -5,6 +5,7 @@
 #include "distcp.h"
 #include "distcp_internal.h"
 #include "server.h"
+#include "session.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -163,6 +164,36 @@ void AddShardedTensorLeaf(StateTree&                 tree,
 
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
+
+TEST_CASE("snapshot completion is global on the coordinator and local on peers", "[server][completion]")
+{
+    auto makeSession = [](uint32_t rank) {
+        return std::make_unique<Session>(
+            nullptr,
+            checkpoint::ipc::SessionId{1},
+            std::filesystem::path{},
+            RankTopology{.rank = Rank{rank}, .worldSize = Rank{4}, .ranksPerPeer = 2, .peersPerNode = 1, .peers = {"coordinator", "peer"}});
+    };
+    auto addSnapshot = [](Session& session) -> Session::Snapshot& {
+        auto snapshot        = std::make_unique<Session::Snapshot>();
+        snapshot->snapshotId = checkpoint::ipc::SnapshotId{1};
+        return *session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot)).first->second;
+    };
+
+    auto  coordinator         = makeSession(0);
+    auto& coordinatorSnapshot = addSnapshot(*coordinator);
+    for (uint32_t rank = 1; rank < 4; ++rank) { coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{rank}); }
+    REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
+    coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{0});
+    REQUIRE(coordinator->AllSnapshotsComplete());
+
+    auto  peer         = makeSession(2);
+    auto& peerSnapshot = addSnapshot(*peer);
+    peerSnapshot.writeCkptCompletedRanks.insert(Rank{2});
+    REQUIRE_FALSE(peer->AllSnapshotsComplete());
+    peerSnapshot.writeCkptCompletedRanks.insert(Rank{3});
+    REQUIRE(peer->AllSnapshotsComplete());
+}
 
 TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[distcp][tier1]")
 {

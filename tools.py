@@ -1,10 +1,10 @@
+import io
 import os
 import re
 from pathlib import Path
 
 import torch
 from megatron.core import mpu
-from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.serialization import _CONTENT_METADATA_KEY
@@ -25,6 +25,8 @@ from megatron.training.utils import print_rank_0
 
 from . import checkpoint, mapping
 from .ckpt_diag import diagnose_checkpoint_server_failure
+
+_DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 
 
 def _expand_slurm_nodelist(nodelistspec: str) -> list[str]:
@@ -132,10 +134,12 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
         root.register_state_dict(sharded_state_dict)
         root.finalize_registry()
         register_state_dict.root = root
+        register_state_dict.snapshot_state = sharded_state_dict if _DCP_COMMON_STATE_KEY in sharded_state_dict else None
     return register_state_dict.root
 
 
 register_state_dict.root = None
+register_state_dict.snapshot_state = None
 
 
 def _fresh_sharded_tensors(model, optimizer, metadata: dict) -> list:  # noqa: ANN001
@@ -167,12 +171,15 @@ def warmup() -> None:
 
 
 def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
-    """Write common.pt and the registered sharded shards for one checkpoint."""
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    """Queue common state and registered tensor shards for daemon-side DCP output."""
     if torch.distributed.get_rank() == 0:
-        torch.save(common_state, checkpoint_dir / "common.pt")
-        # metadata.json marker so the standard torch_dist loader recognizes these shards.
-        save_config(CheckpointingConfig(sharded_backend="torch_dist"), str(checkpoint_dir))
+        buffer = io.BytesIO()
+        # Match Megatron's current ShardedObject representation: DCP stores a
+        # torch.save archive containing a one-element list with the common dict.
+        torch.save([common_state], buffer)
+        if register_state_dict.snapshot_state is None:
+            raise RuntimeError("common-state snapshot dictionary was not registered")
+        register_state_dict.snapshot_state[_DCP_COMMON_STATE_KEY] = buffer.getvalue()
     register_state_dict.root.save_async(iteration, checkpoint_dir)
     register_state_dict.root.wait_for_deferred_save()
 
@@ -240,10 +247,12 @@ def _save_checkpoint_impl(  # noqa: PLR0913
         state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
         # validate_access_integrity off: nvrx runs its own cross-rank validation on the same dict.
         sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
+        if torch.distributed.get_rank() == 0:
+            sharded_part[_DCP_COMMON_STATE_KEY] = b""
         register_state_dict(sharded_part)
         if torch.distributed.get_rank() == 0:
             # content_metadata lets load pick the matching optimizer sharding type; only rank 0
-            # writes common.pt. dp_cp_group is dropped because it is not serializable.
+            # serializes common state. dp_cp_group is dropped because it is not serializable.
             common[_CONTENT_METADATA_KEY] = {k: v for k, v in metadata.items() if k != "dp_cp_group"}
         save_checkpoint.common = common
     else:

@@ -89,7 +89,13 @@ try
     benchmark::Shutdown();
 
     JoinClientThreads(Ctx, tasks);
-    if (!outofproc) { StopInprocServer(); }
+    if (!outofproc)
+    {
+        // Keep disk I/O outside BM_SaveCheckpoint while ensuring the in-process
+        // daemon is not torn down with background DCP writes still in flight.
+        WaitForInprocServerWrites();
+        StopInprocServer();
+    }
 
     return 0;
 } catch (std::exception const& e)

@@ -74,7 +74,22 @@ InputEntry ConvertEntry(nb::tuple const& t)
     return e;
 }
 
-nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy)
+void AddObjects(StateTree& tree, nb::list const& objectsPy)
+{
+    for (auto const& object : objectsPy)
+    {
+        auto entry = nb::cast<nb::tuple>(object);
+        if (entry.size() != 2) { throw std::runtime_error("distcp_shim: each object must be (fqn, bytes)"); }
+        auto fqn  = nb::cast<std::string>(entry[0]);
+        auto data = nb::cast<nb::bytes>(entry[1]);
+
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        auto& leaf              = tree.AddChild(parent, leafName);
+        leaf.data               = StateNode::Blob(data.c_str(), data.c_str() + data.size());
+    }
+}
+
+nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy, nb::list const& objectsPy)
 {
     std::vector<InputEntry> entries;
     entries.reserve(entriesPy.size());
@@ -129,6 +144,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
 
         offset += e.bytes.size();
     }
+    AddObjects(tree, objectsPy);
 
     checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, blob);
 
@@ -171,7 +187,7 @@ DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
 // The (file_offset, length) values are used as the verification side-channel
 // inside WriteMetadata — they're asserted against the analytical prediction.
-void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
+void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects)
 {
     RankTopology topo{
         .rank         = Rank{0},
@@ -219,6 +235,7 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors)
 
         leaf.data = std::move(st);
     }
+    AddObjects(tree, objects);
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
@@ -233,16 +250,18 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("out_dir"),
           nb::arg("rank"),
           nb::arg("entries"),
+          nb::arg("objects") = nb::list(),
           "Write `<out_dir>/__<rank>_0.distcp` from a list of (fqn, dtype_name, "
-          "shape, data_bytes) entries. Returns the populated writeLog as a list of "
+          "shape, data_bytes) entries and optional (fqn, bytes) objects. Returns the populated writeLog as a list of "
           "(fqn, sharddim, file_offset, length) tuples.");
 
     m.def("write_metadata",
           &WriteMetadataImpl,
           nb::arg("out_dir"),
           nb::arg("tensors"),
+          nb::arg("objects") = nb::list(),
           "Write `<out_dir>/.metadata` from a list of (fqn, dtype_name, full_shape, "
-          "shards) tuples, where each shards entry is (rank, sharddim). The "
+          "shards) tuples and optional (fqn, bytes) objects, where each shards entry is (rank, sharddim). The "
           "per-shard (file_offset, length) is inferred analytically from the "
           "shape/dtype — no need to pass it in.");
 }

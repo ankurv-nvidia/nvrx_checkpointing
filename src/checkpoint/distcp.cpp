@@ -1157,6 +1157,47 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
     {
         throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", filepath.string()));
     }
+
+    // Megatron uses this marker to recognize the directory as a torch_dist
+    // checkpoint. Publish it from the daemon alongside .metadata so the
+    // training process does not write checkpoint sidecars in the exposed path.
+    static constexpr std::string_view ConfigJson = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
+    auto const                        configPath = ckptDir / "metadata.json";
+    int const configFd = ::open(configPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (configFd < 0)
+    {
+        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: open({}) failed", configPath.string()));
+    }
+    try
+    {
+        char const* p   = ConfigJson.data();
+        size_t      rem = ConfigJson.size();
+        while (rem > 0)
+        {
+            ssize_t const n = ::write(configFd, p, rem);
+            if (n < 0)
+            {
+                if (errno == EINTR) { continue; }
+                throw std::system_error(errno,
+                                        std::generic_category(),
+                                        fmt::format("distcp: write({}) failed with {} bytes remaining", configPath.string(), rem));
+            }
+            p += n;
+            rem -= static_cast<size_t>(n);
+        }
+        if (::fsync(configFd) != 0)
+        {
+            throw std::system_error(errno, std::generic_category(), fmt::format("distcp: fsync({}) failed", configPath.string()));
+        }
+    } catch (...)
+    {
+        ::close(configFd);
+        throw;
+    }
+    if (::close(configFd) != 0)
+    {
+        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", configPath.string()));
+    }
 }
 
 }    // namespace checkpoint::distcp

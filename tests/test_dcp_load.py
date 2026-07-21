@@ -14,6 +14,9 @@ single process, so it falls back to local I/O.
 from __future__ import annotations
 
 # sys.path + MEGATRON_NATIVE_BUILD_DIR opt-out are wired by `pytest_discover_tests`.
+import io
+import json
+
 import _distcp_shim
 import torch
 import torch.distributed.checkpoint as dcp
@@ -58,10 +61,10 @@ def _state_dict(draw) -> dict[str, torch.Tensor]:
     return {f"layer.{i}.weight": draw(_tensor()) for i in range(n)}
 
 
-def _write_single_rank(out_dir, state_dict) -> None:
+def _write_single_rank(out_dir, state_dict, objects=()) -> None:
     """Write `state_dict` as rank 0 into `out_dir` (one __0_0.distcp + .metadata)."""
     entries = [(fqn, _dtype_name(t.dtype), tuple(int(d) for d in t.shape), _tensor_bytes(t)) for fqn, t in state_dict.items()]
-    _distcp_shim.write_rank_shard(str(out_dir), 0, entries)
+    _distcp_shim.write_rank_shard(str(out_dir), 0, entries, list(objects))
 
     # write_metadata reconstructs (file_offset, length) from (dtype, sharddim,
     # data_size) on the C++ side — see ComputeShardArchiveSize. We just hand
@@ -71,7 +74,24 @@ def _write_single_rank(out_dir, state_dict) -> None:
         full_shape = [int(d) for d in t.shape]
         sharddim = [(0, int(d)) for d in t.shape]
         tensors.append((fqn, _dtype_name(t.dtype), full_shape, [(0, sharddim)]))
-    _distcp_shim.write_metadata(str(out_dir), tensors)
+    _distcp_shim.write_metadata(str(out_dir), tensors, list(objects))
+
+
+def _serialize_common_state(common_state) -> bytes:
+    buffer = io.BytesIO()
+    torch.save([common_state], buffer)
+    return buffer.getvalue()
+
+
+def _load_common_state(checkpoint_dir):
+    key = "common_state/shard_0_1"
+    loaded = {key: io.BytesIO()}
+    dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+    value = loaded[key]
+    if isinstance(value, io.BytesIO):
+        value.seek(0)
+        value = torch.load(value, weights_only=False)
+    return value[0]
 
 
 def test_smoke_single_float32_tensor_dcp_load(tmp_path) -> None:
@@ -98,6 +118,25 @@ def test_multi_tensor_mixed_dtype_dcp_load(tmp_path) -> None:
 
     for fqn, expected in state_dict.items():
         assert torch.equal(loaded[fqn], expected), f"mismatch for {fqn!r}"
+
+
+def test_common_state_is_embedded_and_fresh_for_each_checkpoint(tmp_path) -> None:
+    key = "common_state/shard_0_1"
+    checkpoints = []
+    for iteration in (1, 2):
+        checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
+        common_state = {"iteration": iteration, "scheduler": {"num_steps": iteration * 10}}
+        objects = [(key, _serialize_common_state(common_state))]
+        _write_single_rank(checkpoint_dir, {"weight": torch.tensor([iteration])}, objects)
+        checkpoints.append((checkpoint_dir, common_state))
+
+    for checkpoint_dir, expected in checkpoints:
+        assert _load_common_state(checkpoint_dir) == expected
+        assert not (checkpoint_dir / "common.pt").exists()
+        assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
+            "sharded_backend": "torch_dist",
+            "sharded_backend_version": 1,
+        }
 
 
 @given(state_dict=_state_dict())

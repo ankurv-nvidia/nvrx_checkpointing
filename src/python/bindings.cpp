@@ -158,6 +158,32 @@ struct StateTreeStringHandler : StateTree::StateHandler<StateTree::StateType::Bl
     nb::str  key;
 };
 
+struct StateTreeBytesHandler : StateTree::StateHandler<StateTree::StateType::Blob>
+{
+    StateTreeBytesHandler(nb::dict containerIn, nb::str const& nameIn) :
+        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
+    {}
+
+    void Update() override {}
+    bool IsSnapshotScoped() const override { return true; }
+
+    std::vector<char> GetBlob() override
+    {
+        nanobind::gil_scoped_acquire acquire;
+        auto const                   value = nb::cast<nb::bytes>(container[key]);
+        return {value.c_str(), value.c_str() + value.size()};
+    }
+
+    void SetBlob(std::string_view const& value) override
+    {
+        nanobind::gil_scoped_acquire acquire;
+        container[key] = nb::bytes(value.data(), value.size());
+    }
+
+    nb::dict container;
+    nb::str  key;
+};
+
 template <typename T, typename TPy> struct StateTreeTrivialTupleHandler : StateTree::StateHandler<StateTree::StateType::Blob>
 {
     StateTreeTrivialTupleHandler(nb::dict containerIn, nb::str const& nameIn) :
@@ -428,6 +454,7 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
         root.RegisterStateHandler(node, std::make_unique<StateTreeScalarHandler>(container, key));
     }
     else if (nb::isinstance<nb::str>(val)) { root.RegisterStateHandler(node, std::make_unique<StateTreeStringHandler>(container, key)); }
+    else if (nb::isinstance<nb::bytes>(val)) { root.RegisterStateHandler(node, std::make_unique<StateTreeBytesHandler>(container, key)); }
     else if (IsEnum(val))
     {
         if (!nb::isinstance<int64_t>(val.attr("value")))
@@ -625,19 +652,21 @@ static void WaitForDeferredSave(StateTree& self)
 
 static void SaveAsync(StateTree& self, int iteration, std::filesystem::path const& dirpath)
 {
+    auto                         snapshotBlobs = self.CaptureSnapshotBlobs();
     nanobind::gil_scoped_release release;
 
-    self.ChainAsyncCall([&self, iteration, dirpath]() {
+    self.ChainAsyncCall([&self, iteration, dirpath, snapshotBlobs = std::move(snapshotBlobs)]() {
         // self.Update();
-        SaveCheckpoint(self, static_cast<cipc::SnapshotId>(iteration), dirpath);
+        SaveCheckpoint(self, static_cast<cipc::SnapshotId>(iteration), dirpath, snapshotBlobs);
     });
 }
 
 static void Save(StateTree& self, int iteration, std::filesystem::path const& dirpath)
 {
+    auto                         snapshotBlobs = self.CaptureSnapshotBlobs();
     nanobind::gil_scoped_release release;
     // self.Update();
-    SaveCheckpoint(self, static_cast<cipc::SnapshotId>(iteration), dirpath);
+    SaveCheckpoint(self, static_cast<cipc::SnapshotId>(iteration), dirpath, snapshotBlobs);
 }
 
 NB_MODULE(checkpoint, m)    // NOLINT

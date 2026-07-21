@@ -96,8 +96,7 @@ struct Message
         int32_t    numaNode = -1;    // this rank's GPU-local NUMA node, or -1 if unknown
         /*Message Format
         std::string ckptPath;
-        std::string snapshotName;
-        std::string format;
+        std::vector<StateTree::SnapshotBlob> snapshotBlobs; // rank 0 only
         */
     };
 
