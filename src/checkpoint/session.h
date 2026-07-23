@@ -32,7 +32,8 @@ struct TensorShardInfo
 struct Session
 {
 #ifdef PHOENIX_BUILD_FOR_VALGRIND
-    static constexpr uint32_t MaxActiveSnapshots = 1;
+    // Snapshots can be too large to retain in memory for valgrind runs.
+    static constexpr uint32_t MaxActiveSnapshots = 0;
 #else
     static constexpr uint32_t MaxActiveSnapshots = 4;
 #endif

@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 import wheel_install  # companion script in ci/scripts
 import yaml
@@ -238,7 +238,7 @@ class Flavor(ABC):
         """Edit the core recipe in place. Default: identity (the fast path)."""
 
     @contextlib.contextmanager
-    def prolog(self, ctx: RunCtx) -> Iterator[None]:  # noqa: ARG002 — ctx is for overrides
+    def prolog(self, ctx: RunCtx) -> Generator[None, None, None]:  # noqa: ARG002 — ctx is for overrides
         """Wrap the training launch. Default: no setup/teardown."""
         yield
 
@@ -319,7 +319,7 @@ class Flavor(ABC):
     @classmethod
     def _drop_opts(cls, opts: list[str], flags: tuple[str, ...]) -> None:
         # A bare string would iterate per character and silently drop nothing.
-        assert not isinstance(flags, str), "pass a tuple of flags, not a bare string"
+        assert not isinstance(flags, str), "pass a tuple of flags, not a bare string"  # noqa: S101
         for flag in flags:
             cls._drop_opt_multi(opts, flag)
 
@@ -368,6 +368,9 @@ class DeterministicFlavor(Flavor):
     # before argument parsing runs.
     ENV: ClassVar[dict[str, str]] = {
         "NCCL_ALGO": "Ring",
+        "NCCL_PROTO": "Simple",
+        "NCCL_NVLS_ENABLE": "0",
+        "NCCL_TUNER_PLUGIN": "none",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "MAMBA_DETERMINISTIC": "1",
@@ -405,6 +408,7 @@ class ValgrindFlavor(Flavor):
     Single-node only."""
 
     name = "valgrind"
+    _ctx: RunCtx | None = None
 
     _READY_MARKER = "Checkpoint server started"
     # Logged when the server begins orderly shutdown; once seen we stop tee'ing to the
@@ -533,16 +537,46 @@ class ValgrindFlavor(Flavor):
         self._drop_opts(recipe.opts, self._CUDA_GRAPH_FLAGS + self._RECOMPUTE_FLAGS)
 
     @contextlib.contextmanager
-    def prolog(self, ctx: RunCtx) -> Iterator[None]:
-        # Each node's local rank 0 hosts that node's memchecked (valgrind) server; the node's
-        # other ranks connect to it (suppress their auto-fork). So every node's server runs under
-        # memcheck, not just the coordinator's.
-        if ctx.is_local_rank0:
-            with self._server(ctx):
-                yield
-            return
+    def prolog(self, ctx: RunCtx) -> Generator[None, None, None]:
+        # The two training phases are separate clients. Keep their shared run context here,
+        # while server_for_phase gives each client a fresh memchecked daemon.
+        self._ctx = ctx
         os.environ["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
+        try:
+            yield
+        finally:
+            self._ctx = None
+
+    @contextlib.contextmanager
+    def server_for_phase(self, phase: int) -> Generator[None, None, None]:
+        """Run one fresh per-node valgrind server for a single training phase."""
+        ctx = self._ctx
+        if ctx is None:
+            raise RuntimeError("valgrind phase server requested outside the flavor prolog")
+
+        # Phase- and allocation-specific markers synchronize the node's sibling ranks. The
+        # completion marker keeps them inside this context until local rank 0 has drained and
+        # reaped the daemon, so none can race phase 2 startup or the outer teardown.
+        host = socket.gethostname().split(".")[0]
+        allocation = os.environ.get("SLURM_JOB_ID", os.environ.get("CI_JOB_ID", str(os.getpid())))
+        marker_stem = f".valgrind-{allocation}-phase{phase}-{host}"
+        ready_marker = RESULTS_DIR / f"{marker_stem}.ready"
+        done_marker = RESULTS_DIR / f"{marker_stem}.done"
+        if ctx.is_local_rank0:
+            ready_marker.unlink(missing_ok=True)
+            done_marker.unlink(missing_ok=True)
+            try:
+                with self._server(ctx, phase):
+                    ready_marker.write_text("ready\n")
+                    yield
+            finally:
+                ready_marker.unlink(missing_ok=True)
+                done_marker.write_text("done\n")
+            return
+
+        wait_for_file(ready_marker, timeout_seconds=600)
         yield
+        wait_for_file(done_marker, timeout_seconds=3600)
 
     def epilog(self, ctx: RunCtx) -> None:
         if ctx.is_worker and ctx.valgrind_rc not in (None, 0):
@@ -558,7 +592,7 @@ class ValgrindFlavor(Flavor):
         return binary
 
     @contextlib.contextmanager
-    def _server(self, ctx: RunCtx) -> Iterator[None]:
+    def _server(self, ctx: RunCtx, phase: int) -> Generator[None, None, None]:
         """Pre-launch the server under valgrind for the block: start it, route the client to it,
         wait for readiness; on exit wait for its idle auto-shutdown so the leak report flushes."""
         valgrind = shutil.which("valgrind")
@@ -571,12 +605,12 @@ class ValgrindFlavor(Flavor):
         host = socket.gethostname().split(".")[0]
         # server_log carries the daemon's own stdout/stderr (the READY marker _watch_log tails
         # for readiness, spindown lines, its diagnostics) via the pump and its direct writes.
-        server_log = RESULTS_DIR / f"{ctx.stem}_server.{host}.log"
+        server_log = RESULTS_DIR / f"{ctx.stem}_server_phase{phase}.{host}.log"
         server_log.write_bytes(b"")  # truncate any prior run's log
         # valgrind writes its memcheck report and any crash backtrace straight to report_log via
         # --log-file — a file valgrind owns and flushes itself, so the report survives the process
         # teardown instead of depending on the pump thread draining the pipe before the kill.
-        report_log = RESULTS_DIR / f"{ctx.stem}_valgrind.{host}.log"
+        report_log = RESULTS_DIR / f"{ctx.stem}_valgrind_phase{phase}.{host}.log"
 
         cmd = [
             valgrind,
@@ -604,14 +638,17 @@ class ValgrindFlavor(Flavor):
             logger.info("[run_job] checkpoint_server is ready — proceeding with pretrain")
             yield
         finally:
-            # Ask the server to stop now rather than waiting out its idle auto-shutdown — under
-            # memcheck that wait plus the slow teardown can blow the time budget.
-            logger.info("[run_job] Pretrain finished — stopping checkpoint_server so valgrind can flush its report")
-            CheckpointServer.request_server_stop()
+            # Graceful spin-down preserves any physical checkpoint write still in flight when
+            # the training client exits. Run the blocking request in a helper thread so the
+            # checkpoint-file activity guard below can still detect a stalled daemon.
+            logger.info("[run_job] Pretrain finished — draining checkpoint_server so valgrind can flush its report")
+            spindown = threading.Thread(target=CheckpointServer.request_server_spindown, daemon=True)
+            spindown.start()
             # Primary gate: wait for exit, bounded by checkpoint-file activity. A stall re-stops
             # then kills the server (hard failure); a non-zero clean exit is failed by the check below.
             ckpt_root = REPO_ROOT / "ci/ci-runs" / ctx.cfg
             rc, stalled = self._await_server_exit(proc, ckpt_root)
+            spindown.join(timeout=5)
             ctx.valgrind_rc = rc  # record before cleanup so epilog sees it even if cleanup raises
             watcher.join(timeout=5)
             pump.join(timeout=60)  # drain the daemon's remaining stdout before closing its log
@@ -627,36 +664,47 @@ class ValgrindFlavor(Flavor):
                 logger.error(f"[run_job] valgrind memcheck summary: {len(errors)} error type(s): {summary}; see {report_log}")
             else:
                 logger.info(f"[run_job] valgrind memcheck summary: no errors found in {report_log}")
+            self._check_valgrind_outcome(rc, stalled, errors, summary, report_log, server_log)
 
-            # Best-effort: on any failure, dump the valgrind report tail into the job output.
-            # The per-node report lives on the runner's checkout and can miss the artifact
-            # upload, so the trace is the surest place a maintainer sees it — when the file
-            # exists (a crash that preempts valgrind's own flush leaves nothing to dump).
-            if stalled or errors or rc not in (None, 0):
-                try:
-                    with report_log.open("rb") as fh:
-                        fh.seek(max(0, report_log.stat().st_size - CheckpointServer._SERVER_LOG_TAIL_BYTES))
-                        tail = fh.read().decode(errors="replace")
-                    logger.error(f"[run_job] tail of {report_log.name}:\n{tail}")
-                except OSError as exc:
-                    logger.error(f"[run_job] could not read {report_log}: {exc}")
-            # Regular guard: a stalled server is a hard failure.
-            if stalled:
-                raise RuntimeError(
-                    f"checkpoint_server stalled (no checkpoint-file activity for {self._STALL_SILENCE_S}s) "
-                    f"and had to be stopped/killed — see the thread dump above and {server_log}",
-                ) from None
-            # Backstop: a clean exit that nonetheless logged memcheck errors means one
-            # slipped past the guards — fail loudly rather than lean on this scan.
-            if rc == 0 and errors:
-                raise RuntimeError(
-                    "valgrind reported memcheck errors that the exit-code/stall guards did NOT catch — "
-                    f"the regular guards need strengthening: {summary}; see {report_log}",
-                ) from None
-            # Fail here (not just in the global-rank-0 epilog) so every node's local rank 0 reports
-            # its own server's valgrind errors — required for per-node multinode memcheck.
-            if rc not in (None, 0):
-                raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {report_log}") from None
+    def _check_valgrind_outcome(  # noqa: PLR0913
+        self,
+        rc: int | None,
+        stalled: bool,
+        errors: list[str],
+        summary: str,
+        report_log: Path,
+        server_log: Path,
+    ) -> None:
+        """Dump the valgrind report on any failure and raise on stall, memcheck errors, or non-zero exit."""
+        # Best-effort: on any failure, dump the valgrind report tail into the job output.
+        # The per-node report lives on the runner's checkout and can miss the artifact
+        # upload, so the trace is the surest place a maintainer sees it — when the file
+        # exists (a crash that preempts valgrind's own flush leaves nothing to dump).
+        if stalled or errors or rc not in (None, 0):
+            try:
+                with report_log.open("rb") as fh:
+                    fh.seek(max(0, report_log.stat().st_size - CheckpointServer.SERVER_LOG_TAIL_BYTES))
+                    tail = fh.read().decode(errors="replace")
+                logger.error(f"[run_job] tail of {report_log.name}:\n{tail}")
+            except OSError:
+                logger.exception(f"[run_job] could not read {report_log}")
+        # Regular guard: a stalled server is a hard failure.
+        if stalled:
+            raise RuntimeError(
+                f"checkpoint_server stalled (no checkpoint-file activity for {self._STALL_SILENCE_S}s) "
+                f"and had to be stopped/killed — see the thread dump above and {server_log}",
+            ) from None
+        # Backstop: a clean exit that nonetheless logged memcheck errors means one
+        # slipped past the guards — fail loudly rather than lean on this scan.
+        if rc == 0 and errors:
+            raise RuntimeError(
+                "valgrind reported memcheck errors that the exit-code/stall guards did NOT catch — "
+                f"the regular guards need strengthening: {summary}; see {report_log}",
+            ) from None
+        # Fail here (not just in the global-rank-0 epilog) so every node's local rank 0 reports
+        # its own server's valgrind errors — required for per-node multinode memcheck.
+        if rc not in (None, 0):
+            raise RuntimeError(f"valgrind reported errors in checkpoint_server (exit {rc}); see {report_log}") from None
 
     def _spawn(
         self,
@@ -670,7 +718,7 @@ class ValgrindFlavor(Flavor):
         ready = threading.Event()
 
         def _pump() -> None:
-            assert proc.stdout is not None
+            assert proc.stdout is not None  # noqa: S101
             for line in proc.stdout:
                 log_fp.write(line)
                 log_fp.flush()
@@ -739,7 +787,7 @@ def _apply_flavors(recipe: Recipe, flavors: list[Flavor]) -> None:
 
 
 @contextlib.contextmanager
-def _flavored_run(ctx: RunCtx) -> Iterator[None]:
+def _flavored_run(ctx: RunCtx) -> Generator[None, None, None]:
     """Bracket a pretrain run: set up each flavor, run training, then spin the per-node checkpoint
     daemon down on every rank (on success and failure) and run the rank-0 checks."""
     stack = contextlib.ExitStack()
@@ -1163,7 +1211,7 @@ class CheckpointServer:
         immediately (waiting for idle would stall, since the work never completes), best-effort."""
         if not ctx.is_worker or ctx.provider != "native" or ctx.has("valgrind"):
             return
-        if not CheckpointServer._stop_checkpoint_server(graceful=graceful) and fail_on_timeout:
+        if not CheckpointServer.stop_checkpoint_server(graceful=graceful) and fail_on_timeout:
             CheckpointServer.dump_server_log()
             CheckpointServer.dump_server_threads()
             CheckpointServer.gcore_and_kill_server()
@@ -1191,7 +1239,7 @@ class CheckpointServer:
                 logger.info(f"[run_job]   {p.relative_to(iter_dir)}: {p.stat().st_size} bytes")
 
     @staticmethod
-    def _checkpoint_server_pids() -> list[str]:
+    def checkpoint_server_pids() -> list[str]:
         """PIDs of any running checkpoint server on this host — the liveness signal (the process
         outlives its port). The match pattern is bracketed so concurrent checks don't match each other."""
         try:
@@ -1202,7 +1250,7 @@ class CheckpointServer:
 
     # Cap the per-log console dump so a runaway log can't flood the job output; the crash
     # diagnostics (asan/heap-corruption report, fatal stderr) sit at the tail.
-    _SERVER_LOG_TAIL_BYTES = 256 * 1024
+    SERVER_LOG_TAIL_BYTES = 256 * 1024
 
     @staticmethod
     def dump_server_log() -> None:
@@ -1228,11 +1276,11 @@ class CheckpointServer:
             try:
                 size = log_path.stat().st_size
                 with log_path.open("rb") as fp:
-                    if size > CheckpointServer._SERVER_LOG_TAIL_BYTES:
-                        fp.seek(size - CheckpointServer._SERVER_LOG_TAIL_BYTES)
+                    if size > CheckpointServer.SERVER_LOG_TAIL_BYTES:
+                        fp.seek(size - CheckpointServer.SERVER_LOG_TAIL_BYTES)
                         raw = fp.read()
                         raw = raw[raw.find(b"\n") + 1 :]  # drop the partial leading line
-                        span = f"last {CheckpointServer._SERVER_LOG_TAIL_BYTES // 1024} KiB of {size} bytes"
+                        span = f"last {CheckpointServer.SERVER_LOG_TAIL_BYTES // 1024} KiB of {size} bytes"
                     else:
                         raw = fp.read()
                         span = f"{size} bytes"
@@ -1254,7 +1302,7 @@ class CheckpointServer:
             return None
         resolved = template.replace("%h", socket.gethostname())
         if "%p" in resolved:
-            pids = CheckpointServer._checkpoint_server_pids()
+            pids = CheckpointServer.checkpoint_server_pids()
             if not pids:
                 return None
             resolved = resolved.replace("%p", pids[0])
@@ -1283,7 +1331,7 @@ class CheckpointServer:
         too. Always captures /proc kernel stacks (which need no ptrace, so they work even when
         gdb can't attach — restricted ptrace_scope, or a sibling rank already attached on a
         multi-rank node) in addition to the symbolized gdb backtrace. Never raises."""
-        pids = CheckpointServer._checkpoint_server_pids()
+        pids = CheckpointServer.checkpoint_server_pids()
         if not pids:
             logger.info("[run_job] no checkpoint_server process found to dump")
             return
@@ -1330,7 +1378,7 @@ class CheckpointServer:
     def gcore_and_kill_server() -> None:
         """Snapshot a core file for any running checkpoint server, then kill it — the core aids
         post-mortem and the kill frees the port and shm for the next job. Never raises."""
-        pids = CheckpointServer._checkpoint_server_pids()
+        pids = CheckpointServer.checkpoint_server_pids()
         if not pids:
             return
         gcore = shutil.which("gcore")
@@ -1364,7 +1412,7 @@ class CheckpointServer:
     def require_no_checkpoint_server() -> None:
         """Fail loudly (with a thread dump) if a server from a prior job is still running, rather
         than force-killing it; otherwise clear any orphaned shm so the next server starts clean."""
-        pids = CheckpointServer._checkpoint_server_pids()
+        pids = CheckpointServer.checkpoint_server_pids()
         if pids:
             logger.info(f"[run_job] checkpoint_server already running (pids {', '.join(pids)})")
             CheckpointServer.dump_server_threads()
@@ -1402,7 +1450,7 @@ class CheckpointServer:
     _SPINDOWN_READ_TIMEOUT_S = 60.0
 
     @staticmethod
-    def _request_server_spindown() -> None:
+    def request_server_spindown() -> None:
         """Block until the server is idle and spinning down. Unlike a hard stop it leaves in-flight
         saves running, so one node's stop can't abort work the other nodes still need."""
         if not CheckpointServer._is_port_in_use(_CHECKPOINT_SERVER_PORT):
@@ -1415,25 +1463,25 @@ class CheckpointServer:
             logger.info(f"[run_job]  spindown request failed: {exc}")
 
     @staticmethod
-    def _stop_checkpoint_server(timeout: float = 30.0, *, graceful: bool = True) -> bool:
+    def stop_checkpoint_server(timeout: float = 30.0, *, graceful: bool = True) -> bool:
         """Stop the server, then wait for the process to fully exit — it outlives its port, so a
         port check would strand its shm. Graceful waits for idle; the hard path is for crash
         teardown, where waiting for idle would stall since the work never completes. Returns False
         on timeout so the caller can fail."""
-        if not CheckpointServer._checkpoint_server_pids():
+        if not CheckpointServer.checkpoint_server_pids():
             return True
 
         if graceful:
             logger.info("[run_job] checkpoint_server running; requesting graceful spin-down")
-            CheckpointServer._request_server_spindown()
+            CheckpointServer.request_server_spindown()
         else:
             logger.info("[run_job] checkpoint_server running; requesting immediate stop")
             CheckpointServer.request_server_stop()
 
         deadline = time.monotonic() + timeout
-        while CheckpointServer._checkpoint_server_pids() and time.monotonic() < deadline:
+        while CheckpointServer.checkpoint_server_pids() and time.monotonic() < deadline:
             time.sleep(0.25)
-        if CheckpointServer._checkpoint_server_pids():
+        if CheckpointServer.checkpoint_server_pids():
             logger.info(f"[run_job]   checkpoint_server process still alive after {timeout:.0f}s")
             return False
         logger.info("[run_job]   checkpoint_server stopped (process exited)")
@@ -2217,11 +2265,22 @@ class PretrainJob:
                     "extra_args": extra_args,
                     "config_profile": args.config,
                 }
-                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=1, **common)
-                tee_run(cmd, ctx.log_file, env=env)
-                PretrainJob._wait_for_phase1_checkpoint(cfg)
-                cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, args.nodes, args.gpus_per_node, phase=2, **common)
-                ctx.soft_fail = tee_run(cmd, ctx.log_file, env=env, append=True) == SOFT_FAIL_RC
+                valgrind_flavor = next((flavor for flavor in args.flavors if isinstance(flavor, ValgrindFlavor)), None)
+                for phase in (1, 2):
+                    cmd, env = PretrainJob._pretrain_cmd_and_env(
+                        cfg,
+                        args.nodes,
+                        args.gpus_per_node,
+                        phase=phase,
+                        **common,
+                    )
+                    phase_server = valgrind_flavor.server_for_phase(phase) if valgrind_flavor is not None else contextlib.nullcontext()
+                    with phase_server:
+                        rc = tee_run(cmd, ctx.log_file, env=env, append=phase == 2)
+                        if phase == 1:
+                            PretrainJob._wait_for_phase1_checkpoint(cfg)
+                        else:
+                            ctx.soft_fail = rc == SOFT_FAIL_RC
         else:
             # Single-GPU inline: call pretrain() in-process (debugger-friendly).
             with _flavored_run(ctx):
@@ -2347,10 +2406,24 @@ class PretrainJob:
         wait_for_file(marker, timeout_seconds)
 
     @staticmethod
+    def _stop_server_at_phase_boundary() -> None:
+        """Turn the daemon over between phases: local rank 0 stops it; all other ranks wait for
+        it to exit. Every local rank holds here so none can race the port handoff into phase 2."""
+        if os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")) == "0":
+            if not CheckpointServer.stop_checkpoint_server():
+                raise RuntimeError("checkpoint_server did not stop at the phase boundary")
+        else:
+            deadline = time.monotonic() + 90.0
+            while CheckpointServer.checkpoint_server_pids() and time.monotonic() < deadline:
+                time.sleep(0.5)
+            if CheckpointServer.checkpoint_server_pids():
+                raise RuntimeError("checkpoint_server still running 90s into the phase boundary")
+
+    @staticmethod
     def _run_two_phase(cfg: str, nodes: int, gpus_per_node: int, ckpt_provider: str, common: dict, *, routine: str = "") -> None:  # noqa: PLR0913
         """One full checkpoint routine: phase 1 trains from scratch and saves the handoff
-        checkpoint, phase 2 loads it and saves the measured checkpoints. Two sequential
-        processes in one task share one server lifecycle.
+        checkpoint, then phase 2 loads it and saves the measured checkpoints. Valgrind gives
+        the two sequential client processes separate memchecked server lifecycles.
 
         With ``routine`` set (the reference check, which runs this 32-way inside one srun),
         each task's training output goes to its own file instead of the merged job log —
@@ -2368,37 +2441,27 @@ class PretrainJob:
             log_root.mkdir(parents=True, exist_ok=True)
             log_file = log_root / (f"{cfg}_{routine}-routine.log" if procid == "0" else f"{cfg}_{routine}-routine_rank{procid}.log")
             log_file.unlink(missing_ok=True)
+        valgrind_flavor = next((flavor for flavor in common["flavors"] if isinstance(flavor, ValgrindFlavor)), None)
         for phase in (1, 2):
             cmd, env = PretrainJob._pretrain_cmd_and_env(cfg, nodes, gpus_per_node, phase=phase, ckpt_provider=ckpt_provider, **common)
-            if redirect:
-                with log_file.open("ab") as fh:
-                    rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False).returncode
-                if rc != 0:
-                    tail = "\n".join(log_file.read_text(errors="replace").splitlines()[-40:])
-                    logger.error(f"[run_job] {routine} routine phase {phase} failed (rc={rc}); tail of {log_file.name}:\n{tail}")
-                    raise RuntimeError(f"{routine} routine phase {phase} failed with exit code {rc} — see {log_file}")
-            else:
-                subprocess.run(cmd, env=env, check=True)
-            if phase == 1:
-                budget = PretrainJob._job_time_min(common["config_profile"], common["flavors"], "phase1-flush", 30)
-                PretrainJob._wait_for_phase1_checkpoint(cfg, budget * 60)
-                # ValgrindFlavor explicitly owns one server around both phases and disables
-                # client auto-launch. Keep that server alive so phase 2 can reuse it; the
-                # flavor context stops it after phase 2 and collects the memcheck report.
-                if not any(flavor.name == "valgrind" for flavor in common["flavors"]):
-                    # Normal runs turn the daemon over at the phase boundary: phase 2 gets a
-                    # fresh process whose session table and heap carry nothing from phase 1.
-                    # Every local rank holds here until the node's daemon is gone — a sibling
-                    # rank that entered phase 2 early would race the port handoff.
-                    if os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")) == "0":
-                        if not CheckpointServer._stop_checkpoint_server():
-                            raise RuntimeError("checkpoint_server did not stop at the phase boundary")
-                    else:
-                        deadline = time.monotonic() + 90.0
-                        while CheckpointServer._checkpoint_server_pids() and time.monotonic() < deadline:
-                            time.sleep(0.5)
-                        if CheckpointServer._checkpoint_server_pids():
-                            raise RuntimeError("checkpoint_server still running 90s into the phase boundary")
+            phase_server = valgrind_flavor.server_for_phase(phase) if valgrind_flavor is not None else contextlib.nullcontext()
+            with phase_server:
+                if redirect:
+                    with log_file.open("ab") as fh:
+                        rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT, check=False).returncode
+                    if rc != 0:
+                        tail = "\n".join(log_file.read_text(errors="replace").splitlines()[-40:])
+                        logger.error(f"[run_job] {routine} routine phase {phase} failed (rc={rc}); tail of {log_file.name}:\n{tail}")
+                        raise RuntimeError(f"{routine} routine phase {phase} failed with exit code {rc} — see {log_file}")
+                else:
+                    subprocess.run(cmd, env=env, check=True)
+                if phase == 1:
+                    budget = PretrainJob._job_time_min(common["config_profile"], common["flavors"], "phase1-flush", 30)
+                    PretrainJob._wait_for_phase1_checkpoint(cfg, budget * 60)
+            if phase == 1 and valgrind_flavor is None:
+                # Normal runs turn the daemon over at the phase boundary: phase 2 gets a
+                # fresh process whose session table and heap carry nothing from phase 1.
+                PretrainJob._stop_server_at_phase_boundary()
 
     # The provider whose output is the equality reference the other provider is compared
     # against — committed metadata/ baselines at <=2 nodes, the in-allocation reference

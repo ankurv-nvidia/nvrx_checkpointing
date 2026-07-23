@@ -293,10 +293,10 @@ struct CheckpointWriter
 #endif
         state->numaNode = numa;
         std::thread([topo, numa, state, readyP]() {
-            SvcPing();
             SetThreadName("ncc:bufwarm");
             try
             {
+                SvcPing();
                 state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(topo));
 #ifdef PHOENIX_HAVE_CUDA
                 auto region = state->queue->GetShmDataRegion();

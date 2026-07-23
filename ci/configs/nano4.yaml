@@ -79,8 +79,6 @@ manual-gc-interval: 10
 ckpt-fully-parallel-save: true
 ckpt-fully-parallel-load: true
 
-# Selective MoE activation recompute; the deterministic flavor strips it (it adds
-# compute) and valgrind strips it too. CUDA graphs are enabled in base.yaml for
-# every profile.
+# Selective MoE activation recompute from the production recipe.
 recompute-granularity: selective
 recompute-modules: moe

@@ -265,7 +265,7 @@ function megatron {
         git checkout 34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72
         patch -p1 < "${SCRIPT_DIR}/deepep.patch"
     popd
-    TORCH_CUDA_ARCH_LIST="12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
     rm -rf DeepEP
 
     unset CC

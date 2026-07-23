@@ -5,7 +5,3 @@ metrics:
   bw_mbps: 150000.0
   wr_tnsr_us: 68000.0
   total_written_bytes: 10629014336
-cluster_metrics:
-  ocihsg:
-    bw_mbps: 150000.0
-    wr_tnsr_us: 68000
