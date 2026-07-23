@@ -1018,7 +1018,7 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
 
 }    // namespace
 
-void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, Blob const& blob)
+void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
 {
     std::filesystem::create_directories(ckptDir);
 
@@ -1031,7 +1031,7 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
     uint64_t cursor = 0;
     try
     {
-        auto const* base = static_cast<char const*>(blob.data);
+        auto const* base = static_cast<char const*>(tensorStorage.data);
         registry.WalkNodes([&](StateNode const& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
             // The registry handed in is always the post-merge global registry

@@ -3,7 +3,7 @@
 // test_distcp_roundtrip.py) can drive the writer without spinning up the
 // server, IPC, or async dispatch.
 
-#include "blob.h"
+#include "byte_storage.h"
 #include "distcp.h"
 #include "distcp_internal.h"
 #include "state.h"
@@ -100,7 +100,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
         totalBytes += entries.back().bytes.size();
     }
 
-    // `Blob`'s aligned_alloc is POSIX-conformant: `size` must be a multiple of
+    // `ByteStorage`'s aligned_alloc is POSIX-conformant: `size` must be a multiple of
     // `alignof(std::max_align_t)` (typically 16). Hypothesis-drawn tensors
     // smaller than that — e.g. `tensor([0.])` (4 B) — would otherwise fall
     // through to a null return and a bad_alloc. We only use this buffer as a
@@ -109,7 +109,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     constexpr size_t kAlign     = alignof(std::max_align_t);
     size_t const     wantedSize = totalBytes == 0 ? kAlign : totalBytes;
     size_t const     blobSize   = (wantedSize + kAlign - 1) & ~(kAlign - 1);
-    Blob             blob(blobSize);
+    ByteStorage      tensorStorage(blobSize);
 
     // Single-rank topology — multi-rank parity is exercised by sequential calls
     // to write_rank_shard from the test, each with its own (rank, world_size).
@@ -129,7 +129,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     size_t offset = 0;
     for (auto const& e : entries)
     {
-        std::memcpy(blob[offset], e.bytes.data(), e.bytes.size());
+        std::memcpy(tensorStorage[offset], e.bytes.data(), e.bytes.size());
 
         DS4Tensor::Dim fulldim;
         for (auto d : e.shape) { fulldim.push_back(d); }
@@ -146,7 +146,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     }
     AddObjects(tree, objectsPy);
 
-    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, blob);
+    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage);
 
     nb::list out;
     uint64_t cursor = 0;

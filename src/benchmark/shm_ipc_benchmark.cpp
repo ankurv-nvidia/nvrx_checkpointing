@@ -1,5 +1,5 @@
 #include "SetThreadName.h"
-#include "blob.h"
+#include "byte_storage.h"
 #include "messages.h"
 #include "shm_ring_buffer.h"
 
@@ -47,7 +47,7 @@ static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool valida
     auto       totalBytes    = msgCount * memorySize * ranks;
     auto       totalMessages = totalBytes / slotSize;
 
-    Blob buffer(slotSize * D2HBufferCount);
+    ByteStorage buffer(slotSize * D2HBufferCount);
 
     for (size_t i = 0; i < totalBytes; i += slotSize)
     {
@@ -136,9 +136,9 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
 
 static void MemcpyBenchmark(size_t ranks, size_t msgCount, size_t memorySize)
 {
-    auto bufSize = BenchSlotSize / 64;
-    Blob src{bufSize};
-    Blob dst{bufSize};
+    auto        bufSize = BenchSlotSize / 64;
+    ByteStorage src{bufSize};
+    ByteStorage dst{bufSize};
     for (size_t j = 0; j < bufSize; ++j) { src.At<uint8_t>(j) = 1u; }
 
     auto totalBytes    = msgCount * memorySize * ranks;
@@ -163,9 +163,9 @@ static void MemcpyBenchmark(size_t ranks, size_t msgCount, size_t memorySize)
 
 static void MemcpyBounceBufferBenchmark(size_t ranks, size_t msgCount, size_t memorySize)
 {
-    Blob dst{memorySize};
-    Blob src{memorySize};
-    Blob buf{BenchSlotSize * D2HBufferCount};
+    ByteStorage dst{memorySize};
+    ByteStorage src{memorySize};
+    ByteStorage buf{BenchSlotSize * D2HBufferCount};
 
     for (size_t j = 0; j < memorySize; ++j) { src.At<uint8_t>(j) = 1u; }
 

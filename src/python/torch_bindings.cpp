@@ -339,7 +339,7 @@ struct StateTreeTorchGeneratorHandler : StateTree::StateHandler<StateTree::State
 
     void Update() override {}
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nb::gil_scoped_acquire acquire;
         auto                   state = container[key].attr("get_state")();

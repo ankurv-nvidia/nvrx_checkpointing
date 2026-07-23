@@ -1,6 +1,6 @@
 #pragma once
 
-#include "blob.h"
+#include "byte_storage.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -51,7 +51,7 @@ void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree);
 
 // Walks `localState` and verifies each shard's bytes in `blob` still match the FQN
 // pattern that BuildPerRankStateTree wrote. Throws std::runtime_error on mismatch.
-void ValidateRoundTrip(StateTree const& localState, Blob const& blob);
+void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorStorage);
 
 // Drives a save: SaveCheckpoint -> WaitForCheckpointSave. No validation — used by
 // the benchmark timing path so the round-trip walk doesn't dominate the measurement.

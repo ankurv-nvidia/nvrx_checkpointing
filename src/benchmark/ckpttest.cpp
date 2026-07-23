@@ -1,6 +1,6 @@
 #include "CommonMacros.h"
 
-#include "blob.h"
+#include "byte_storage.h"
 #include "ckpt_fixture.h"
 #include "distcp.h"
 #include "distcp_internal.h"
@@ -75,10 +75,10 @@ struct TestShardEntry
     DS4Tensor::Dim      shape;
 };
 
-std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank rank, Blob const& blob)
+std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank rank, ByteStorage const& tensorStorage)
 {
     std::vector<TestShardEntry> out;
-    auto const*                 base = static_cast<char const*>(blob.data);
+    auto const*                 base = static_cast<char const*>(tensorStorage.data);
     tree.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         auto const fqn  = tree.GetNodeId(node.handle);
@@ -126,7 +126,7 @@ std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank ran
 }
 
 // Attaches a fully-occupied (sharddim == fulldim) TensorShard leaf at the
-// given FQN. `handle` is the byte offset into the surrounding Blob.
+// given FQN. `handle` is the byte offset into the surrounding ByteStorage.
 void AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
 {
     auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
@@ -197,14 +197,14 @@ TEST_CASE("snapshot completion is global on the coordinator and local on peers",
 
 TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(64);
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(64);
 
     AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);    // 16 B
     AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, 16);         //  4 B
     AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, 32);      // 16 B
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 3);
     REQUIRE(entries[0].fqn == "a");
@@ -219,7 +219,7 @@ TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[di
     REQUIRE(entries[1].length == 4);
     REQUIRE(entries[2].length == 16);
 
-    auto const* base = static_cast<char const*>(blob.data);
+    auto const* base = static_cast<char const*>(tensorStorage.data);
     REQUIRE(entries[0].srcPtr == base + 0);
     REQUIRE(entries[1].srcPtr == base + 16);
     REQUIRE(entries[2].srcPtr == base + 32);
@@ -227,8 +227,8 @@ TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[di
 
 TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(128);
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(128);
 
     // Fully-occupied 1-D tensor — shape matches fulldim.
     AddTensorShardLeaf(tree, "full", DS4Tensor::DType::Float32, {4}, 0);
@@ -248,7 +248,7 @@ TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[
         leaf.data = StateNode::TensorShard{tnsr};
     }
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 2);
 
@@ -263,8 +263,8 @@ TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[
 
 TEST_CASE("distcp shard walk expands ShardedTensor into per-rank entries", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo(0, 2));
-    Blob      blob(64);
+    StateTree   tree(SingleRankTopo(0, 2));
+    ByteStorage tensorStorage(64);
 
     auto [leafName, parent] = tree.FindOrAddNodeByFQN("shrd");
     auto&          leaf     = tree.AddChild(parent, leafName);
@@ -280,23 +280,23 @@ TEST_CASE("distcp shard walk expands ShardedTensor into per-rank entries", "[dis
     tnsr.AddShard({.sharddim = r1, .device = DeviceId{"cpu"}, .handle = 16, .rank = Rank{1}});
     leaf.data = std::move(tnsr);
 
-    auto const rank0 = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const rank0 = CollectShardsForTest(tree, Rank{0}, tensorStorage);
     REQUIRE(rank0.size() == 1);
     REQUIRE(rank0[0].fqn == "shrd");
     REQUIRE(rank0[0].sharddim[0].begin == 0);
     REQUIRE(rank0[0].length == 16);
-    REQUIRE(rank0[0].srcPtr == static_cast<char const*>(blob.data) + 0);
+    REQUIRE(rank0[0].srcPtr == static_cast<char const*>(tensorStorage.data) + 0);
 
-    auto const rank1 = CollectShardsForTest(tree, Rank{1}, blob);
+    auto const rank1 = CollectShardsForTest(tree, Rank{1}, tensorStorage);
     REQUIRE(rank1.size() == 1);
     REQUIRE(rank1[0].sharddim[0].begin == 4);
-    REQUIRE(rank1[0].srcPtr == static_cast<char const*>(blob.data) + 16);
+    REQUIRE(rank1[0].srcPtr == static_cast<char const*>(tensorStorage.data) + 16);
 }
 
 TEST_CASE("distcp shard walk orders same-rank shards by sharddim", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo(0, 2));
-    Blob      blob(64);
+    StateTree   tree(SingleRankTopo(0, 2));
+    ByteStorage tensorStorage(64);
 
     auto [leafName, parent] = tree.FindOrAddNodeByFQN("shrd");
     auto&          leaf     = tree.AddChild(parent, leafName);
@@ -315,7 +315,7 @@ TEST_CASE("distcp shard walk orders same-rank shards by sharddim", "[distcp][tie
 
     leaf.data = std::move(tnsr);
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 2);
     REQUIRE(entries[0].sharddim[0].begin == 0);
@@ -324,8 +324,8 @@ TEST_CASE("distcp shard walk orders same-rank shards by sharddim", "[distcp][tie
 
 TEST_CASE("distcp shard walk handles mixed TensorShard and ShardedTensor nodes", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo(0, 2));
-    Blob      blob(128);
+    StateTree   tree(SingleRankTopo(0, 2));
+    ByteStorage tensorStorage(128);
 
     AddTensorShardLeaf(tree, "before", DS4Tensor::DType::Float32, {4}, 0);
 
@@ -343,7 +343,7 @@ TEST_CASE("distcp shard walk handles mixed TensorShard and ShardedTensor nodes",
 
     AddTensorShardLeaf(tree, "after", DS4Tensor::DType::Float32, {2}, 48);
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 3);
     REQUIRE(entries[0].fqn == "before");
@@ -353,14 +353,14 @@ TEST_CASE("distcp shard walk handles mixed TensorShard and ShardedTensor nodes",
 
 TEST_CASE("distcp shard walk joins nested dict names with dots", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(64);
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(64);
 
     AddTensorShardLeaf(tree, "model.layer0.weight", DS4Tensor::DType::Float32, {2}, 0);
     AddTensorShardLeaf(tree, "model.layer0.bias", DS4Tensor::DType::Float32, {2}, 8);
     AddTensorShardLeaf(tree, "model.layer1.weight", DS4Tensor::DType::Float32, {2}, 16);
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 3);
     REQUIRE(entries[0].fqn == "model.layer0.weight");
@@ -370,8 +370,8 @@ TEST_CASE("distcp shard walk joins nested dict names with dots", "[distcp][tier1
 
 TEST_CASE("distcp shard walk skips zero-length shards", "[distcp][tier1]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(16);
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(16);
 
     AddTensorShardLeaf(tree, "non_empty", DS4Tensor::DType::Float32, {2}, 0);
 
@@ -386,7 +386,7 @@ TEST_CASE("distcp shard walk skips zero-length shards", "[distcp][tier1]")
         leaf.data   = StateNode::TensorShard{tnsr};
     }
 
-    auto const entries = CollectShardsForTest(tree, Rank{0}, blob);
+    auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
     REQUIRE(entries.size() == 1);
     REQUIRE(entries[0].fqn == "non_empty");
@@ -452,12 +452,12 @@ std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
 
 TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs", "[distcp][tier2]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(64);
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(64);
     // Deterministic source bytes — keep them simple so any future stride/dtype
     // bug shows up as a torch.load mismatch on inspection.
-    auto* bytes = static_cast<unsigned char*>(blob.data);
-    for (size_t i = 0; i < blob.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
+    auto* bytes = static_cast<unsigned char*>(tensorStorage.data);
+    for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
 
     AddShardedTensorLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);    // 16 B
     AddShardedTensorLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, Rank{0}, 16);         //  4 B
@@ -466,7 +466,7 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
     auto outDir = CkptDir("tier2_layout");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, blob);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
 
     auto const predicted = PredictRankLayout(tree);
     REQUIRE(predicted.size() == 3);
@@ -496,8 +496,8 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
 
     struct LocalState
     {
-        std::unique_ptr<StateTree> tree;
-        std::unique_ptr<Blob>      blob;
+        std::unique_ptr<StateTree>   tree;
+        std::unique_ptr<ByteStorage> tensorStorage;
     };
 
     struct Snapshot
@@ -511,12 +511,12 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
     snapshot.states.resize(kWorldSize);
     for (uint32_t r = 0; r < kWorldSize; ++r)
     {
-        auto& ls = snapshot.states[r];
-        ls.blob  = std::make_unique<Blob>(64);
+        auto& ls         = snapshot.states[r];
+        ls.tensorStorage = std::make_unique<ByteStorage>(64);
         // Rank-specific deterministic bytes so a cross-rank write would surface
         // as bogus payload at a recorded (offset, length).
-        auto* bytes = static_cast<unsigned char*>(ls.blob->data);
-        for (size_t i = 0; i < ls.blob->size; ++i) { bytes[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
+        auto* bytes = static_cast<unsigned char*>(ls.tensorStorage->data);
+        for (size_t i = 0; i < ls.tensorStorage->size; ++i) { bytes[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
         ls.tree = std::make_unique<StateTree>(SingleRankTopo(r, kWorldSize));
         AddShardedTensorLeaf(*ls.tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{r}, 0);    // 16 B
         AddShardedTensorLeaf(*ls.tree, "b", DS4Tensor::DType::Int8, {4}, Rank{r}, 16);         //  4 B
@@ -532,7 +532,7 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
     {
         workers.emplace_back([&snapshot, &outDir, r] {
             auto& ls = snapshot.states[r];
-            checkpoint::distcp::WriteRankShard(outDir, Rank{r}, *ls.tree, *ls.blob);
+            checkpoint::distcp::WriteRankShard(outDir, Rank{r}, *ls.tree, *ls.tensorStorage);
             std::scoped_lock lock(snapshot.mutex);
             snapshot.writeCkptCompletedRanks.insert(Rank{r});
         });
@@ -593,10 +593,10 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
 
 TEST_CASE("ComputeShardArchiveSize matches WriteRankShard's on-disk layout", "[distcp][tier1][predict]")
 {
-    StateTree tree(SingleRankTopo());
-    Blob      blob(256);
-    auto*     bytes = static_cast<unsigned char*>(blob.data);
-    for (size_t i = 0; i < blob.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(256);
+    auto*       bytes = static_cast<unsigned char*>(tensorStorage.data);
+    for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
 
     // Mix of dtypes that produce different `data.pkl` sizes and shard byte
     // counts. FB padding is offset-dependent, so any shape arrangement gets
@@ -610,7 +610,7 @@ TEST_CASE("ComputeShardArchiveSize matches WriteRankShard's on-disk layout", "[d
     auto outDir = CkptDir("predict_consistency");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, blob);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
 
     auto const predicted = PredictRankLayout(tree);
     REQUIRE(predicted.size() == 5);
@@ -686,17 +686,17 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     // single-shard ShardedTensors. WriteRankShard requires the global-
     // registry shape (asserted internally), and WriteMetadata consumes the
     // resulting writeLog as a verification side-channel.
-    StateTree tree(SingleRankTopo());
-    Blob      blob(64);
-    auto*     bytes = static_cast<unsigned char*>(blob.data);
-    for (size_t i = 0; i < blob.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
+    StateTree   tree(SingleRankTopo());
+    ByteStorage tensorStorage(64);
+    auto*       bytes = static_cast<unsigned char*>(tensorStorage.data);
+    for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
     AddShardedTensorLeaf(tree, "weight", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
     AddShardedTensorLeaf(tree, "block.weight", DS4Tensor::DType::Int64, {3}, Rank{0}, 16);
 
     auto outDir = CkptDir("metadata_unpickle");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, blob);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
     checkpoint::distcp::WriteMetadata(outDir, tree);
 
     auto const metaPath = outDir / ".metadata";

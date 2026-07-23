@@ -1,5 +1,5 @@
 #pragma once
-#include "blob.h"
+#include "byte_storage.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -8,6 +8,6 @@
 namespace checkpoint::distcp
 {
 
-void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& globalRegistry, Blob const& blob);
+void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& globalRegistry, ByteStorage const& tensorStorage);
 void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry);
 }    // namespace checkpoint::distcp

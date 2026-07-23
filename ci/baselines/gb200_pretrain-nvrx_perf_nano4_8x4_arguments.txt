@@ -25,8 +25,8 @@
   async_ckpt_cpu_priority ......................... 10
   async_ckpt_io_priority .......................... 3
   async_ckpt_use_cpu_shm .......................... False
-  async_save ...................................... False
-  async_strategy .................................. mcore
+  async_save ...................................... True
+  async_strategy .................................. nvrx
   attention_backend ............................... AttnBackend.flash
   attention_dropout ............................... 0.0
   attention_output_gate ........................... False
@@ -783,7 +783,7 @@
   use_mp_args_from_checkpoint_args ................ False
   use_mup ......................................... False
   use_one_sent_docs ............................... False
-  use_persistent_ckpt_worker ...................... False
+  use_persistent_ckpt_worker ...................... True
   use_precision_aware_optimizer ................... False
   use_pytorch_profiler ............................ False
   use_ring_exchange_p2p ........................... False

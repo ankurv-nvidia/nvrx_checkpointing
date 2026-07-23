@@ -7,6 +7,6 @@ update_cmd:
   4 --flavor deterministic --update-baseline
 metrics:
   bw_mbps: 142000.0
-  wr_tnsr_us: 27500.0
+  wr_tnsr_us: 22000.0
   total_written_bytes: 3088094816
   gpu_peak_bytes: 6200000000

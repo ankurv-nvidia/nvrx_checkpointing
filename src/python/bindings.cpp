@@ -96,7 +96,7 @@ struct StateTreeSliceHandler : StateTree::StateHandler<StateTree::StateType::Blo
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
 
@@ -133,7 +133,7 @@ struct StateTreeStringHandler : StateTree::StateHandler<StateTree::StateType::Bl
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
 
@@ -167,7 +167,7 @@ struct StateTreeBytesHandler : StateTree::StateHandler<StateTree::StateType::Blo
     void Update() override {}
     bool IsSnapshotScoped() const override { return true; }
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
         auto const                   value = nb::cast<nb::bytes>(container[key]);
@@ -192,7 +192,7 @@ template <typename T, typename TPy> struct StateTreeTrivialTupleHandler : StateT
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
         auto                         obj = nb::cast<TPy>(container[key]);
@@ -225,7 +225,7 @@ template <typename TPy> struct StateTreeStringTupleHandler : StateTree::StateHan
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
         auto                         obj  = nb::cast<TPy>(container[key]);
@@ -265,7 +265,7 @@ struct StateTreePythonRngStateHandler : StateTree::StateHandler<StateTree::State
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
         auto                         tup   = nb::cast<nb::tuple>(container[key]);
@@ -304,7 +304,7 @@ struct StateTreeNumPyRngStateHandler : StateTree::StateHandler<StateTree::StateT
 
     void Update() override {};
 
-    std::vector<char> GetBlob() override
+    StateNode::Blob GetBlob() override
     {
         nanobind::gil_scoped_acquire acquire;
 

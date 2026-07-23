@@ -144,14 +144,14 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     }
 }
 
-void ValidateRoundTrip(StateTree const& localState, Blob const& blob)
+void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorStorage)
 {
     auto localRank = localState.Topo().rank;
     localState.WalkNodes([&](auto& node) {
         if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
         {
             auto& tnsr          = std::get<StateNode::TensorShard>(node.data);
-            auto* data          = &blob.At<char>(tnsr.handle);    // NOLINT
+            auto* data          = &tensorStorage.At<char>(tnsr.handle);    // NOLINT
             auto  size          = tnsr.ShardSizeBytes();
             auto  shardFqn      = localState.GetNodeId(node.handle);
             auto  actualPattern = std::string_view(static_cast<char const*>(data), std::min(size, static_cast<uint64_t>(shardFqn.size())));
@@ -169,7 +169,7 @@ void ValidateRoundTrip(StateTree const& localState, Blob const& blob)
             auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
-                auto* data          = &blob.At<char>(shard.handle);    // NOLINT
+                auto* data          = &tensorStorage.At<char>(shard.handle);    // NOLINT
                 auto  shardFqn      = fmt::format("{}[{}]", localState.GetNodeId(node.handle), shard.sharddim);
                 auto  size          = std::min(shard.ShardSizeBytes(tnsr.dtype), static_cast<uint64_t>(shardFqn.size()));
                 auto  actualPattern = std::string_view(static_cast<char const*>(data), size);
@@ -201,13 +201,13 @@ void RoundTripCallback(void*                             cbData,
                        std::filesystem::path const&      path,
                        [[maybe_unused]] StateTree const& globalRegistry,
                        StateTree const&                  localState,
-                       Blob const&                       blob)
+                       ByteStorage const&                tensorStorage)
 {
     auto localRank = localState.Topo().rank;
     if (localRank != *static_cast<Rank*>(cbData)) { return; }
     fmt::print(
         stderr, "Validating sessionId={} snapshotId={} name={} path={} rank={}\n", sessionId, snapshotId, name, path.string(), localRank);
-    ValidateRoundTrip(localState, blob);
+    ValidateRoundTrip(localState, tensorStorage);
 }
 }    // namespace
 

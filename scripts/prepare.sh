@@ -257,15 +257,48 @@ function megatron {
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
-    # DeepEP HybridEP: the flex+hybridep MoE token dispatcher the ultra profiles pin needs
-    # this package, which is not on PyPI. Pin the exact commit, apply the local build patch,
-    # and build for the arches the GPU matrix spans (H100 sm90, GB200 sm100, consumer sm120).
-    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    # Keep the DeepEP HybridEP installation symmetric with Megatron-LM's CI image.
+    DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+    export HYBRID_EP_MULTINODE=1
+    export RDMA_CORE_HOME=/opt/rdma-core/build
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
+
+    apt-get update
+    apt-get install --yes --allow-change-held-packages rdma-core libibverbs-dev
+    apt-get clean
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+    if [[ ! -f "/usr/lib/${ARCH_LIB}/libmlx5.so" ]]; then
+        ln -sf "/usr/lib/${ARCH_LIB}/libmlx5.so.1" "/usr/lib/${ARCH_LIB}/libmlx5.so"
+    fi
+    mkdir -p "${RDMA_CORE_HOME}"
+    ln -sfn /usr/include "${RDMA_CORE_HOME}/include"
+    ln -sfn "/usr/lib/${ARCH_LIB}" "${RDMA_CORE_HOME}/lib"
+
+    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.4.5
+    NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
+    pushd "${NVSHMEM_LIB_DIR}"
+        ln -sf libnvshmem_host.so.3 libnvshmem_host.so
+    popd
+
+    git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git checkout 34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72
+        git fetch origin "${DEEPEP_COMMIT}"
+        git checkout FETCH_HEAD
         patch -p1 < "${SCRIPT_DIR}/deepep.patch"
     popd
+
+    # DeepEP compiles against nvml.h from libnvidia-ml-dev. Installing that package
+    # via apt pulls nvidia-firmware-580 (76 MB) and libnvidia-compute as hard
+    # dependencies whose dpkg unpack overruns the enroot writable overlay and aborts
+    # with a broken pipe. Fetch the dev package alone and unpack just its payload
+    # (nvml.h and the libnvidia-ml.so dev symlink); libnvidia-ml.so.1 itself is
+    # already present from the injected driver that nvidia-smi above relies on.
+    apt-get update
+    apt-get download libnvidia-ml-dev
+    dpkg-deb -x libnvidia-ml-dev_*.deb /
+    rm -f libnvidia-ml-dev_*.deb
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
+    rm -rf /var/lib/apt/lists/*
     rm -rf DeepEP
 
     unset CC

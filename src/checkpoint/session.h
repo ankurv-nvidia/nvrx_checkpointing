@@ -1,5 +1,5 @@
 #pragma once
-#include "blob.h"
+#include "byte_storage.h"
 #include "distcp.h"
 #include "messages.h"
 #include "state.h"
@@ -42,7 +42,7 @@ struct Session
     struct LocalState
     {
         std::shared_ptr<StateTree> localRegistry;
-        Blob                       blob;
+        ByteStorage                tensorStorage;
 
         uint64_t writtenTensorRangeBegin{0};
         uint64_t writtenTensorRangeEnd{0};

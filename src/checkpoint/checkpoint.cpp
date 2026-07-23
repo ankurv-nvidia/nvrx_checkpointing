@@ -5,6 +5,7 @@
 #include "fmttensor.h"
 #include "messages.h"
 #include "numa_utils.h"
+#include "service_client.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -48,57 +49,6 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
-static bool TryConnectToCheckpointService()
-{
-    // EINTR is transient, A signal can interrupt the blocking socket syscalls (e.g. SIGCHLD torch's fork etc)
-    static constexpr int MaxRetries = 5;
-    // Seed with interrupted so the loop runs the first attempt; afterwards it only re-enters on EINTR.
-    boost::system::error_code ec = boost::asio::error::interrupted;
-
-    for (int attempt = 0; attempt < MaxRetries && ec == boost::asio::error::interrupted; ++attempt)
-    {
-        boost::asio::io_context        ioc;
-        boost::beast::tcp_stream       stream(ioc);
-        boost::asio::ip::tcp::resolver resolver(ioc);
-
-        auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port), ec);
-        if (ec) { continue; }
-
-        // Try connecting to localhost before we send a request to check and fail-fast
-        [[maybe_unused]] auto endpoint = stream.connect(results, ec);
-        if (ec) { continue; }
-
-        // Create HTTP GET request with buffer_body (avoids copying state data)
-        static constexpr int                                         HttpVersion11 = 11;
-        boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
-        req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
-        req.body().data = nullptr;
-        req.body().size = 0;
-        req.body().more = false;
-        req.prepare_payload();
-
-        // Send the request (Beast sends directly from buffer with Content-Length)
-        boost::beast::http::write(stream, req, ec);
-        if (ec) { continue; }
-
-        // Read the response
-        boost::beast::flat_buffer                                     buffer;
-        boost::beast::http::response<boost::beast::http::string_body> res;
-        boost::beast::http::read(stream, buffer, res, ec);
-        if (ec) { continue; }
-
-        if (res.result() != boost::beast::http::status::ok) { return false; }
-        TryCleanShutdown(stream);
-        return true;
-    }
-
-    if (ec != boost::asio::error::connection_refused)
-    {
-        fmt::print(stderr, "[native_ckpt:cli][ERROR] Attempting to connect with checkpoint service failed with: {}\n", ec.what());
-    }
-    return false;
-}
-
 static auto GetEnv(char const* envVar, std::string_view defaultVal) -> std::string_view
 {
     auto* val = getenv(envVar);
@@ -116,7 +66,10 @@ void SvcPing()
     auto             selfLoc   = boost::dll::this_line_location();
     auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
     if (TryConnectToCheckpointService()) { return; }
-    if (GetEnv("CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH", "0") == "1") { std::this_thread::sleep_for(1s); }
+    if (GetEnv("CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH", "0") == "1")
+    {
+        throw std::runtime_error("Externally managed checkpoint service is unavailable");
+    }
     else
     {
         try
@@ -138,8 +91,10 @@ void SvcPing()
             throw;
         }
     }
+    // Both the elected daemon and losing candidates write READY only after the
+    // elected service answers a ping. The two short attempts inside TryConnect
+    // cover a final scheduling edge without a second readiness policy here.
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
-    // A failed connect throws above; the success case needs no per-rank log line.
 }
 
 void SvcStop()

@@ -1,7 +1,7 @@
 #include "CommonMacros.h"
 #include "SetThreadName.h"
 
-#include "blob.h"
+#include "byte_storage.h"
 #include "fmttensor.h"
 #include "messages.h"
 #include "numa_utils.h"
@@ -442,13 +442,13 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             {
                 auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
                 auto const  size = tnsr.ShardSizeBytes();
-                auto const* data = static_cast<char const*>(localState->blob.data) + tnsr.handle;    // NOLINT
+                auto const* data = static_cast<char const*>(localState->tensorStorage.data) + tnsr.handle;    // NOLINT
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = localState->localRegistry->GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
                     fmt::print(stderr,
-                               "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. Blob Offset={}\n",
+                               "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. ByteStorage Offset={}\n",
                                *server,
                                sessionId,
                                fqn,
@@ -465,13 +465,13 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                 for (auto const& shard : tnsr.shards)
                 {
                     auto const size = shard.ShardSizeBytes(tnsr.dtype);
-                    auto const data = localState->blob.AsSpan<char const>(shard.handle, size);
+                    auto const data = localState->tensorStorage.AsSpan<char const>(shard.handle, size);
 #ifdef NATIVE_CKPT_TRACE_NODE
                     auto fqn = localState->localRegistry->GetNodeId(node.handle);
                     if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                     {
                         fmt::print(stderr,
-                                   "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. Blob Offset={}\n",
+                                   "[native_ckpt:svr][{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. ByteStorage Offset={}\n",
                                    *server,
                                    sessionId,
                                    fqn,
@@ -665,7 +665,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         BroadcastGlobalRegistryToPeers_(hdr.snapshotId, *snapshot.registry);
     }
 
-    checkpoint::distcp::WriteRankShard(snapshot.path.parent_path(), hdr.globalRank, *snapshot.registry, localState.blob);
+    checkpoint::distcp::WriteRankShard(snapshot.path.parent_path(), hdr.globalRank, *snapshot.registry, localState.tensorStorage);
     if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr); }
     // A peer may declare its local shard complete only after the coordinator has
     // acknowledged the notification. Rank 0 is delayed further, until metadata is durable.
@@ -1156,13 +1156,13 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char c
         auto&            snapshot   = GetSnapshot_(lock, hdr1.snapshotId);
         auto&            localState = *snapshot.localStates.at(hdr1.globalRank);
         auto             endOffset  = hdr1.offset + hdr1.messageSize;
-        if (endOffset > localState.blob.size)
+        if (endOffset > localState.tensorStorage.size)
         {
             throw std::runtime_error(fmt::format(
                 "[native_ckpt:svr][{}#{}][ERROR] Received tensor data exceeds allocated size={} for session id={} offset={} size={}",
                 *server,
                 sessionId,
-                localState.blob.size,
+                localState.tensorStorage.size,
                 hdr1.sessionId,
                 hdr1.offset,
                 hdr1.messageSize));
@@ -1171,7 +1171,7 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char c
         localState.writtenTensorSize += hdr1.messageSize;
         localState.writtenTensorRangeBegin = std::min(localState.writtenTensorRangeBegin, static_cast<uint64_t>(hdr1.offset));
         localState.writtenTensorRangeEnd   = std::max(localState.writtenTensorRangeEnd, endOffset);
-        if (localState.writtenTensorSize > localState.blob.size)
+        if (localState.writtenTensorSize > localState.tensorStorage.size)
         {
             throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Received tensor data size={} (range {}-{}) exceeds "
                                                  "total tensor size={} for session id={}",
@@ -1180,11 +1180,11 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char c
                                                  localState.writtenTensorSize,
                                                  localState.writtenTensorRangeBegin,
                                                  localState.writtenTensorRangeEnd,
-                                                 localState.blob.size,
+                                                 localState.tensorStorage.size,
                                                  hdr1.sessionId));
         }
 
-        ptr = localState.blob[hdr1.offset];
+        ptr = localState.tensorStorage[hdr1.offset];
     }
     std::memcpy(ptr, buf.data(), hdr1.messageSize);
 }
@@ -1258,12 +1258,15 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                                                  hdr.globalRank,
                                                  hdr.snapshotId));
         }
-        localState->blob = Blob(hdr.snapshotSize);
+        localState->tensorStorage = ByteStorage(hdr.snapshotSize);
         // Place the accumulation blob on the rank's GPU-local NUMA node (sent by the
         // client) and pin this dequeue thread to the same node, so the shm->blob
         // memcpy is on-socket. Authoritative per rank, so it is correct for any
         // layout — multi-peer and ckptbench included.
-        if (localState->blob.data != nullptr) { BindRegionToNumaNode(hdr.numaNode, localState->blob.data, localState->blob.size); }
+        if (localState->tensorStorage.data != nullptr)
+        {
+            BindRegionToNumaNode(hdr.numaNode, localState->tensorStorage.data, localState->tensorStorage.size);
+        }
         BindThreadCpuToNumaNode(hdr.numaNode);
         snapshotIt->second->localStates[hdr.globalRank] = std::move(localState);
     }
@@ -1286,7 +1289,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
         auto& snapshot   = GetSnapshot_(lock, hdr.snapshotId);
         auto& localState = *snapshot.localStates[hdr.globalRank];
 
-        if (localState.writtenTensorSize != localState.blob.size)
+        if (localState.writtenTensorSize != localState.tensorStorage.size)
         {
             throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Incomplete tensor data received. sessionid={}. "
                                                  "rcvd-size={}(range{} - {}) expected={} ",
@@ -1296,9 +1299,9 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
                                                  localState.writtenTensorSize,
                                                  localState.writtenTensorRangeBegin,
                                                  localState.writtenTensorRangeEnd,
-                                                 localState.blob.size));
+                                                 localState.tensorStorage.size));
         }
-        if (localState.writtenTensorRangeBegin != 0 || localState.writtenTensorRangeEnd != localState.blob.size)
+        if (localState.writtenTensorRangeBegin != 0 || localState.writtenTensorRangeEnd != localState.tensorStorage.size)
         {
             throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Tensor data received has invalid range. sessionid={}. "
                                                  "rcvd-size={}(range{} - {}) expected range=0 - {}",
@@ -1308,7 +1311,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
                                                  localState.writtenTensorSize,
                                                  localState.writtenTensorRangeBegin,
                                                  localState.writtenTensorRangeEnd,
-                                                 localState.blob.size));
+                                                 localState.tensorStorage.size));
         }
         if (sessionState.registry == nullptr)
         {
@@ -1667,7 +1670,7 @@ struct Server
                              snapshot->path,
                              *snapshot->registry,
                              *localState->localRegistry,
-                             localState->blob);
+                             localState->tensorStorage);
                 }
             }
         }

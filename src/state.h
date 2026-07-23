@@ -70,9 +70,9 @@ struct StateNode
         virtual void Update() = 0;
         virtual bool IsSnapshotScoped() const { return false; }
 
-        virtual Scalar            GetScalarState() = 0;
-        virtual std::vector<char> GetBlob()        = 0;
-        virtual DS4Tensor         GetTensorState() = 0;
+        virtual Scalar    GetScalarState() = 0;
+        virtual Blob      GetBlob()        = 0;
+        virtual DS4Tensor GetTensorState() = 0;
 
         virtual void SetScalarState(Scalar const&)    = 0;
         virtual void SetBlob(std::string_view const&) = 0;
@@ -678,9 +678,9 @@ template <> struct StateTree::StateHandler<StateTree::StateType::Scalar> : State
 {
     StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
 
-    [[nodiscard]] StateType        GetType() override { return StateType::Scalar; }
-    [[noreturn]] std::vector<char> GetBlob() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] DS4Tensor         GetTensorState() override { throw std::runtime_error("Invalid operation"); }
+    [[nodiscard]] StateType      GetType() override { return StateType::Scalar; }
+    [[noreturn]] StateNode::Blob GetBlob() override { throw std::runtime_error("Invalid operation"); }
+    [[noreturn]] DS4Tensor       GetTensorState() override { throw std::runtime_error("Invalid operation"); }
 
     [[noreturn]] void SetBlob(std::string_view const& /* data */) override { throw std::runtime_error("Invalid operation"); }
     [[noreturn]] void SetTensorState(DS4Tensor const& /* data */) override { throw std::runtime_error("Invalid operation"); }
@@ -703,9 +703,9 @@ template <> struct StateTree::StateHandler<StateTree::StateType::TensorShard> : 
     StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
     [[nodiscard]] StateType GetType() override { return StateType::TensorShard; }
 
-    [[noreturn]] Scalar            GetScalarState() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] std::vector<char> GetBlob() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] DS4Tensor         GetTensorState() override { throw std::runtime_error("Invalid operation"); }
+    [[noreturn]] Scalar          GetScalarState() override { throw std::runtime_error("Invalid operation"); }
+    [[noreturn]] StateNode::Blob GetBlob() override { throw std::runtime_error("Invalid operation"); }
+    [[noreturn]] DS4Tensor       GetTensorState() override { throw std::runtime_error("Invalid operation"); }
 
     [[noreturn]] void SetScalarState(Scalar const& /* data */) override { throw std::runtime_error("Invalid operation"); }
     [[noreturn]] void SetBlob(std::string_view const& /* data */) override { throw std::runtime_error("Invalid operation"); }

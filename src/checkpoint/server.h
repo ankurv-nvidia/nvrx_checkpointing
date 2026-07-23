@@ -1,5 +1,5 @@
 #pragma once
-#include "blob.h"
+#include "byte_storage.h"
 #include "messages.h"
 #include "state.h"
 
@@ -25,6 +25,6 @@ using ServerSessionCallback = void (*)(void*                        cbData,
                                        std::filesystem::path const& path,
                                        StateTree const&             globalRegistry,
                                        StateTree const&             localState,
-                                       Blob const&                  blob);
+                                       ByteStorage const&           tensorStorage);
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData);

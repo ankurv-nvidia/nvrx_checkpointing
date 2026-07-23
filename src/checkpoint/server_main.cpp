@@ -1,5 +1,6 @@
 #include "messages.h"
 #include "server.h"
+#include "service_client.h"
 
 #include <cpptrace/cpptrace.hpp>
 #include <fmt/core.h>
@@ -258,8 +259,17 @@ try
     return 0;
 } catch (checkpoint::ipc::ErrorAlreadyRunning const& e)
 {
-    // Another instance is already running; the launcher will connect to it.
+    // Another candidate won the instance election. Do not let this candidate's
+    // launcher observe EOF until the elected daemon is actually answering pings;
+    // otherwise several ranks can race ahead while its queues are still booting.
     fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
+    if (!TryConnectToCheckpointService())
+    {
+        fmt::print(stderr, "[native_ckpt:svr][ERROR] Elected checkpoint server did not become ready\n");
+        return 1;
+    }
+    fmt::print(stdout, "READY\n");
+    std::fflush(stdout);
     std::error_code ec;
     std::filesystem::remove(GetLogPath(), ec);
     return 0;
