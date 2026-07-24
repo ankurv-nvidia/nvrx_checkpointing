@@ -20,8 +20,10 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nb = nanobind;
@@ -74,19 +76,21 @@ InputEntry ConvertEntry(nb::tuple const& t)
     return e;
 }
 
-void AddObjects(StateTree& tree, nb::list const& objectsPy)
+// Parse Python's (fqn, bytes) object tuples into owned Blob storage. The
+// parity shim is single-rank, so every Blob belongs to the calling rank.
+std::vector<std::pair<std::string, std::vector<char>>> ParseObjects(nb::list const& objectsPy)
 {
+    std::vector<std::pair<std::string, std::vector<char>>> out;
+    out.reserve(objectsPy.size());
     for (auto const& object : objectsPy)
     {
         auto entry = nb::cast<nb::tuple>(object);
         if (entry.size() != 2) { throw std::runtime_error("distcp_shim: each object must be (fqn, bytes)"); }
         auto fqn  = nb::cast<std::string>(entry[0]);
         auto data = nb::cast<nb::bytes>(entry[1]);
-
-        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-        auto& leaf              = tree.AddChild(parent, leafName);
-        leaf.data               = StateNode::Blob(data.c_str(), data.c_str() + data.size());
+        out.emplace_back(std::move(fqn), std::vector<char>(data.c_str(), data.c_str() + data.size()));
     }
+    return out;
 }
 
 nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy, nb::list const& objectsPy)
@@ -144,9 +148,11 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
 
         offset += e.bytes.size();
     }
-    AddObjects(tree, objectsPy);
+    auto const                     blobBytes = ParseObjects(objectsPy);
+    checkpoint::distcp::BlobsByFqn blobView;
+    for (auto const& [fqn, bytes] : blobBytes) { blobView[fqn] = std::string_view(bytes.data(), bytes.size()); }
 
-    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage);
+    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage, blobView);
 
     nb::list out;
     uint64_t cursor = 0;
@@ -235,8 +241,10 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::l
 
         leaf.data = std::move(st);
     }
-    AddObjects(tree, objects);
-    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
+    auto const                            blobBytes = ParseObjects(objects);
+    checkpoint::distcp::BlobMetadataByFqn blobView;
+    for (auto const& [fqn, bytes] : blobBytes) { blobView[fqn][Rank{0}] = {.length = bytes.size()}; }
+    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, blobView);
 }
 
 }    // namespace

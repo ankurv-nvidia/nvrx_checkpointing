@@ -2665,6 +2665,10 @@ class PretrainJob:
             )
         opts = PretrainJob._pretrain_cli_args(config)
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
+        recipe.env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = PretrainJob._cli_arg_value(
+            opts,
+            "--expert-model-parallel-size",
+        )
         _apply_flavors(recipe, flavors or [])
         if "--fine-grained-activation-offloading" in recipe.opts:
             # TE >= 2.10 asserts at init when fine-grained activation offloading is
@@ -2777,6 +2781,14 @@ class PretrainJob:
         return _flatten_cli({**dynamic, **model}) + checkpoint_opts
 
     @staticmethod
+    def _cli_arg_value(opts: list[str], flag: str) -> str:
+        """Return a required CLI flag's resolved value."""
+        try:
+            return opts[opts.index(flag) + 1]
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"required pretrain option {flag!r} has no value") from exc
+
+    @staticmethod
     def _load_profile_config(profile: str) -> dict:
         """base.yaml deep-merged with the named profile override, including CI-scoped keys."""
         base = yaml.safe_load((CONFIGS_DIR / "base.yaml").read_text()) or {}
@@ -2828,6 +2840,10 @@ class PretrainJob:
             ),
         )
         recipe = Recipe(opts=opts, env=Flavor.base_env(triton_dir))
+        recipe.env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = PretrainJob._cli_arg_value(
+            opts,
+            "--expert-model-parallel-size",
+        )
         _apply_flavors(recipe, args.flavors)
         opts = [*recipe.opts, *(getattr(args, "extra_args", None) or [])]
         # Applied before the in-process import, since some env is read at import time.

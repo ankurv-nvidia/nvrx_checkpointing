@@ -185,14 +185,22 @@ TEST_CASE("snapshot completion is global on the coordinator and local on peers",
     for (uint32_t rank = 1; rank < 4; ++rank) { coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{rank}); }
     REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
     coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{0});
+    REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
+    REQUIRE_FALSE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
+    for (uint32_t rank = 0; rank < 4; ++rank) { coordinatorSnapshot.finalizedRanks.insert(Rank{rank}); }
     REQUIRE(coordinator->AllSnapshotsComplete());
+    REQUIRE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
 
     auto  peer         = makeSession(2);
     auto& peerSnapshot = addSnapshot(*peer);
     peerSnapshot.writeCkptCompletedRanks.insert(Rank{2});
     REQUIRE_FALSE(peer->AllSnapshotsComplete());
     peerSnapshot.writeCkptCompletedRanks.insert(Rank{3});
+    REQUIRE_FALSE(peer->AllSnapshotsComplete());
+    REQUIRE_FALSE(peer->IsSnapshotEvictable(peerSnapshot));
+    for (uint32_t rank = 0; rank < 4; ++rank) { peerSnapshot.finalizedRanks.insert(Rank{rank}); }
     REQUIRE(peer->AllSnapshotsComplete());
+    REQUIRE(peer->IsSnapshotEvictable(peerSnapshot));
 }
 
 TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[distcp][tier1]")
@@ -466,7 +474,7 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
     auto outDir = CkptDir("tier2_layout");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage, {});
 
     auto const predicted = PredictRankLayout(tree);
     REQUIRE(predicted.size() == 3);
@@ -532,7 +540,7 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
     {
         workers.emplace_back([&snapshot, &outDir, r] {
             auto& ls = snapshot.states[r];
-            checkpoint::distcp::WriteRankShard(outDir, Rank{r}, *ls.tree, *ls.tensorStorage);
+            checkpoint::distcp::WriteRankShard(outDir, Rank{r}, *ls.tree, *ls.tensorStorage, {});
             std::scoped_lock lock(snapshot.mutex);
             snapshot.writeCkptCompletedRanks.insert(Rank{r});
         });
@@ -610,7 +618,7 @@ TEST_CASE("ComputeShardArchiveSize matches WriteRankShard's on-disk layout", "[d
     auto outDir = CkptDir("predict_consistency");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage, {});
 
     auto const predicted = PredictRankLayout(tree);
     REQUIRE(predicted.size() == 5);
@@ -673,10 +681,74 @@ TEST_CASE("distcp::WriteMetadata emits .metadata for shards rank 0 never wrote",
     auto outDir = CkptDir("metadata_multi_rank_inference");
     std::filesystem::remove_all(outDir);
 
-    REQUIRE_NOTHROW(checkpoint::distcp::WriteMetadata(outDir, globalTree));
+    REQUIRE_NOTHROW(checkpoint::distcp::WriteMetadata(outDir, globalTree, {}));
     auto const metaPath = outDir / ".metadata";
     REQUIRE(std::filesystem::exists(metaPath));
     REQUIRE(std::filesystem::file_size(metaPath) > 0);
+}
+
+TEST_CASE("distcp Blobs live in their rank's shard file", "[distcp][tier1][metadata][blob]")
+{
+    // Each rank appends its Blobs in fqn order after its tensor region.
+    // The coordinator's FQN-grouped metadata view points at those local files.
+    StateTree globalTree(SingleRankTopo(0, 2));
+
+    std::vector<char> const alphaBytes{'a', 'l', 'p', 'h', 'a'};
+    std::vector<char> const gammaBytes{'g'};
+    std::vector<char> const betaBytes{'b', 'e', 't', 'a'};
+    std::vector<char> const deltaBytes{'d', 'e', 'l', 't', 'a'};
+
+    checkpoint::distcp::BlobsByFqn rank0Writes{
+        {"alpha", std::string_view(alphaBytes.data(), alphaBytes.size())},
+        {"gamma", std::string_view(gammaBytes.data(), gammaBytes.size())},
+    };
+    checkpoint::distcp::BlobsByFqn rank1Writes{
+        {"alpha", std::string_view(alphaBytes.data(), alphaBytes.size())},
+        {"beta", std::string_view(betaBytes.data(), betaBytes.size())},
+        {"delta", std::string_view(deltaBytes.data(), deltaBytes.size())},
+    };
+    checkpoint::distcp::BlobMetadataByFqn view{
+        {"alpha", {{Rank{0}, {.length = alphaBytes.size()}}, {Rank{1}, {.length = alphaBytes.size()}}}},
+        {"beta", {{Rank{1}, {.length = betaBytes.size()}}}},
+        {"delta", {{Rank{1}, {.length = deltaBytes.size()}}}},
+        {"gamma", {{Rank{0}, {.length = gammaBytes.size()}}}},
+    };
+
+    auto outDir = CkptDir("blobs_per_rank");
+    std::filesystem::remove_all(outDir);
+
+    ByteStorage emptyTensorStorage(0);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, globalTree, emptyTensorStorage, rank0Writes);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{1}, globalTree, emptyTensorStorage, rank1Writes);
+    REQUIRE_NOTHROW(checkpoint::distcp::WriteMetadata(outDir, globalTree, view));
+
+    auto readFile = [](std::filesystem::path const& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    REQUIRE(readFile(outDir / "__0_0.distcp") == "alphag");
+    REQUIRE(readFile(outDir / "__1_0.distcp") == "alphabetadelta");
+
+    auto const metadata = readFile(outDir / ".metadata");
+    REQUIRE(metadata.find("__0_0.distcp") != std::string::npos);
+    REQUIRE(metadata.find("__1_0.distcp") != std::string::npos);
+
+#ifdef PHOENIX_VENV_PYTHON
+    // The lowest-rank alpha replica owns the metadata entry. Rank 1 still wrote
+    // its replica, so beta's offset must skip those five unreferenced bytes.
+    auto const metaPath = outDir / ".metadata";
+    auto const cmd      = fmt::format("{} -c \"import pickle; m=pickle.load(open(r'{}','rb')); "
+                                      "s={{i.fqn:(v.relative_path,v.offset,v.length) for i,v in m.storage_data.items()}}; "
+                                      "assert s['alpha']==('__0_0.distcp',0,5); assert s['gamma']==('__0_0.distcp',5,1); "
+                                      "assert s['beta']==('__1_0.distcp',5,4); assert s['delta']==('__1_0.distcp',9,5)\"",
+                                      PHOENIX_VENV_PYTHON,
+                                      metaPath.string());
+    REQUIRE(std::system(cmd.c_str()) == 0);
+#endif
+
+    auto inconsistentView = view;
+    inconsistentView["alpha"][Rank{1}].length--;
+    REQUIRE_THROWS(checkpoint::distcp::WriteMetadata(outDir, globalTree, inconsistentView));
 }
 
 #ifdef PHOENIX_VENV_PYTHON
@@ -696,8 +768,8 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     auto outDir = CkptDir("metadata_unpickle");
     std::filesystem::remove_all(outDir);
 
-    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage);
-    checkpoint::distcp::WriteMetadata(outDir, tree);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{0}, tree, tensorStorage, {});
+    checkpoint::distcp::WriteMetadata(outDir, tree, {});
 
     auto const metaPath = outDir / ".metadata";
     REQUIRE(std::filesystem::exists(metaPath));

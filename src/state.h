@@ -221,7 +221,16 @@ struct StateTree
     void SetBlob(std::string_view const& fqn, std::string_view const& data)
     {
         auto const handle = FindNodeByFQN(fqn);
-        if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("Blob state '{}' is not registered", fqn)); }
+        if (handle == StateNode::Handle::Invalid)
+        {
+            // The coordinator gathers only tensor shards across ranks, so a
+            // snapshot-scoped common-state fqn may not exist in the merged registry
+            // yet (it lives only on rank 0). Materialize it on first set.
+            auto [childName, parent] = FindOrAddNodeByFQN(fqn);
+            auto& child              = AddChild(parent, childName);
+            child.data               = StateNode::Blob(data.begin(), data.end());
+            return;
+        }
         auto& node = GetNode(handle);
         if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob))
         {

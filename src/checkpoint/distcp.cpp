@@ -906,10 +906,11 @@ void EmitMetadataIndexBytes(std::vector<unsigned char>& b, std::string_view fqn)
     EmitNewObjBuildEnd(b);
 }
 
-std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
+std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
 {
     std::vector<unsigned char> b;
     b.reserve(2048);
+    std::unordered_set<std::string> tensorFqns;
 
     PutU8(b, 0x80);    // PROTO
     PutU8(b, 0x02);    // protocol 2
@@ -948,15 +949,31 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
         }
         if (chunkRanges.empty()) { return; }
         auto const fqn = globalRegistry.GetNodeId(node.handle);
+        tensorFqns.insert(fqn);
         PickleBinunicode(b, fqn);
         EmitTensorStorageMetadata(b, tnsr.dtype, tnsr.fulldim, chunkRanges);
     });
-    // ShardedObjects (Blob nodes) — torch.save'd bytes the load path reads back.
-    globalRegistry.WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-        PickleBinunicode(b, globalRegistry.GetNodeId(node.handle));
+    // Blobs are opaque torch.save'd bytes. Tensor and Blob fqns share
+    // one metadata namespace, so reject an accidental collision explicitly.
+    for (auto const& [fqn, copies] : blobs)
+    {
+        if (copies.empty()) { throw std::runtime_error(fmt::format("distcp: Blob fqn '{}' has no owning rank", fqn)); }
+        auto const expectedLength = copies.begin()->second.length;
+        for (auto const& [rank, meta] : copies)
+        {
+            if (meta.length != expectedLength)
+            {
+                throw std::runtime_error(fmt::format("distcp: replicated Blob fqn '{}' has inconsistent lengths {} and {} on rank {}",
+                                                     fqn,
+                                                     expectedLength,
+                                                     meta.length,
+                                                     rank));
+            }
+        }
+        if (tensorFqns.contains(fqn)) { throw std::runtime_error(fmt::format("distcp: fqn '{}' is both a tensor and a Blob", fqn)); }
+        PickleBinunicode(b, fqn);
         EmitBytesStorageMetadata(b);
-    });
+    }
     PutU8(b, 'u');    // SETITEMS
 
     // `storage_data`: dict[MetadataIndex -> _StorageInfo]
@@ -995,17 +1012,25 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
             EmitStorageInfo(b, relPath, curCursor, archiveLen);
         }
     });
-    // ShardedObject bytes are all appended to rank 0's shard file, after rank 0's
-    // tensors (rankCursors[0] now holds rank 0's tensor total). WriteRankShard for
-    // rank 0 writes them in the same WalkNodes order, so these offsets line up.
-    uint64_t& objCursor = rankCursors[static_cast<Rank>(0)];
-    globalRegistry.WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-        auto const& blob = std::get<StateNode::Blob>(node.data);
-        EmitMetadataIndexBytes(b, globalRegistry.GetNodeId(node.handle));
-        EmitStorageInfo(b, "__0_0.distcp", objCursor, blob.size());
-        objCursor += blob.size();
-    });
+    // Each rank writes every local Blob in fqn order, including replicas. The
+    // FQN-first view lets us advance every rank's physical cursor in that same
+    // order while selecting the lowest-rank replica for metadata.
+    std::unordered_map<Rank, uint64_t> blobRegionCursors;
+    for (auto const& [fqn, copies] : blobs)
+    {
+        auto const ownerRank = copies.begin()->first;
+        for (auto const& [rank, meta] : copies)
+        {
+            auto& regionCursor = blobRegionCursors[rank];
+            if (rank == ownerRank)
+            {
+                EmitMetadataIndexBytes(b, fqn);
+                EmitStorageInfo(
+                    b, fmt::format("__{}_0.distcp", static_cast<uint32_t>(rank)), rankCursors[rank] + regionCursor, meta.length);
+            }
+            regionCursor += meta.length;
+        }
+    }
     PutU8(b, 'u');    // SETITEMS
 
     // `planner_data`, `storage_meta`, `version` omitted — dataclass defaults
@@ -1018,7 +1043,11 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry)
 
 }    // namespace
 
-void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
+void WriteRankShard(std::filesystem::path const& ckptDir,
+                    Rank                         rank,
+                    StateTree const&             registry,
+                    ByteStorage const&           tensorStorage,
+                    BlobsByFqn const&            blobs)
 {
     std::filesystem::create_directories(ckptDir);
 
@@ -1075,29 +1104,25 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
             }
         });
 
-        // ShardedObject bytes live only in rank 0's shard file (the metadata points
-        // every BytesStorageMetadata entry at __0_0.distcp). Append them after the
-        // tensors, in the same WalkNodes order BuildMetadataPkl used for the offsets.
-        if (static_cast<uint32_t>(rank) == 0)
-        {
-            registry.WalkNodes([&](StateNode const& node) {
-                if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-                auto const& objBytes = std::get<StateNode::Blob>(node.data);
-                char const* p        = objBytes.data();
-                size_t      rem      = objBytes.size();
-                while (rem > 0)
+        // Append this rank's Blobs after its tensors in fqn order, matching
+        // the per-rank order used by BuildMetadataPkl.
+        auto const writeBlobBytes = [&](char const* p, size_t rem) {
+            while (rem > 0)
+            {
+                ssize_t const n = ::write(fd, p, rem);
+                if (n < 0)
                 {
-                    ssize_t const n = ::write(fd, p, rem);
-                    if (n < 0)
-                    {
-                        if (errno == EINTR) { continue; }
-                        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: write({}) failed", filepath.string()));
-                    }
-                    p += n;
-                    rem -= static_cast<size_t>(n);
+                    if (errno == EINTR) { continue; }
+                    throw std::system_error(errno, std::generic_category(), fmt::format("distcp: write({}) failed", filepath.string()));
                 }
-                cursor += objBytes.size();
-            });
+                p += n;
+                rem -= static_cast<size_t>(n);
+            }
+        };
+        for (auto const& [fqn, bytes] : blobs)
+        {
+            writeBlobBytes(bytes.data(), bytes.size());
+            cursor += bytes.size();
         }
 
         if (::fsync(fd) != 0)
@@ -1116,9 +1141,9 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
     }
 }
 
-void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry)
+void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
 {
-    auto const pkl = BuildMetadataPkl(globalRegistry);
+    auto const pkl = BuildMetadataPkl(globalRegistry, blobs);
 
     std::filesystem::create_directories(ckptDir);
     auto const filepath = ckptDir / ".metadata";
