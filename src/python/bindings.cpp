@@ -165,7 +165,7 @@ struct StateTreeBytesHandler : StateTree::StateHandler<StateTree::StateType::Blo
     {}
 
     void Update() override {}
-    bool IsSnapshotScoped() const override { return true; }
+    [[nodiscard]] bool IsSnapshotScoped() const override { return true; }
 
     StateNode::Blob GetBlob() override
     {
@@ -364,7 +364,7 @@ static void Register(StateTree& self, StateNode::Handle node, nb::str const& nam
     if (nb::isinstance<nb::dict>(value))
     {
         auto d = nb::cast<nb::dict>(value);
-#if !defined NDEBUG
+#ifndef NDEBUG
         if (!d.contains(name)) { throw std::runtime_error(fmt::format("Dictionary does not contain key: {}", name)); }
 #endif
         auto obj = d.attr(name);
@@ -498,7 +498,7 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
     else if (nb::isinstance<nb::list>(val))
     {
         auto listObj = nb::cast<nb::list>(val);
-        if (listObj.size() == 0) { return; }
+        if (listObj.empty()) { return; }
         // Post-`apply_factories` ShardedTensor lists land here — register each
         // element under its own FQN before the generic per-element-type checks
         // below get a chance to mis-classify them (a list of ShardedTensor
@@ -690,7 +690,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
                }
                else
                {
-                   if (peers.size() == 0)
+                   if (peers.empty())
                    {
                        if (ranksPerPeer == globalWorldSize) { peers.emplace_back("localhost"); }
                        else

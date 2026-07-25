@@ -7,6 +7,7 @@
 
 #include <array>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Process-lifetime hwloc topology, loaded once. hwloc_topology_load scans /sys,
@@ -19,14 +20,14 @@ inline hwloc_topology_t HwlocTopology()
     // executable is fine (both read-only), so the duplication warning is benign.
     SUPPRESS_WARNINGS_START
     SUPPRESS_CLANG_WARNING("-Wunique-object-duplication")
-    static hwloc_topology_t topo = [] {
+    static hwloc_topology_t Topo = [] {
         hwloc_topology_t t{};
         hwloc_topology_init(&t);
         hwloc_topology_load(t);
         return t;
     }();
     SUPPRESS_WARNINGS_END
-    return topo;
+    return Topo;
 }
 
 // Resolve a NUMA node by its OS index. `node` is an OS index (e.g. the GPU's
@@ -37,7 +38,7 @@ inline hwloc_obj_t NumaNodeByOsIndex(hwloc_topology_t topo, int node)
     hwloc_obj_t obj = nullptr;
     while ((obj = hwloc_get_next_obj_by_type(topo, HWLOC_OBJ_NUMANODE, obj)) != nullptr)
     {
-        if (obj->os_index == static_cast<unsigned>(node)) { return obj; }
+        if (std::cmp_equal(obj->os_index ,node)) { return obj; }
     }
     return nullptr;
 }

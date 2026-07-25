@@ -25,6 +25,7 @@
 #include "messages.h"
 #include "server.h"
 
+#include <algorithm>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/io_context.hpp>
@@ -41,7 +42,6 @@
 
 #include <sys/resource.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -58,6 +58,7 @@
 #include <thread>
 #include <vector>
 
+// NOLINTBEGIN(readability-magic-numbers, cppcoreguidelines-avoid-reference-coroutine-parameters)
 namespace bpo   = boost::program_options;
 namespace net   = boost::asio;
 namespace beast = boost::beast;
@@ -65,11 +66,11 @@ namespace http  = boost::beast::http;
 using tcp       = boost::asio::ip::tcp;
 using Clock     = std::chrono::steady_clock;
 
+static double ToMs(Clock::duration d)
+{ return std::chrono::duration<double, std::milli>(d).count(); }
+
 namespace
 {
-
-double ToMs(Clock::duration d)
-{ return std::chrono::duration<double, std::milli>(d).count(); }
 
 // Endpoint the storm targets. Both faithfully reproduce the connect-per-message
 // pattern; the difference is only how much work the handler does per request.
@@ -93,23 +94,8 @@ enum class Outcome : uint8_t
     AddrUnavail,    // EADDRNOTAVAIL / EADDRINUSE — client ephemeral-port exhaustion (connect-per-message hazard)
     ResolveErr,
     OtherErr,
-    Count_,
+    Count,
 };
-
-Outcome Classify(boost::system::error_code const& ec)
-{
-    if (ec == beast::error::timeout || ec == net::error::timed_out) { return Outcome::Timeout; }
-    if (ec == net::error::connection_refused) { return Outcome::ConnRefused; }
-    if (ec == net::error::address_in_use || ec == net::error::address_family_not_supported
-        || ec == boost::system::errc::address_not_available)
-    {
-        return Outcome::AddrUnavail;
-    }
-    if (ec == net::error::connection_reset || ec == net::error::broken_pipe || ec == net::error::eof) { return Outcome::ConnReset; }
-    if (ec == net::error::connection_aborted) { return Outcome::ConnReset; }
-    if (ec == net::error::host_unreachable || ec == net::error::host_not_found) { return Outcome::ResolveErr; }
-    return Outcome::OtherErr;
-}
 
 struct Config
 {
@@ -126,7 +112,7 @@ struct Config
 
 struct Stats
 {
-    std::array<std::atomic<long>, static_cast<size_t>(Outcome::Count_)> counts{};
+    std::array<std::atomic<long>, static_cast<size_t>(Outcome::Count)> counts{};
 
     std::mutex          latMu;
     std::vector<double> connectMs;    // successful connects only
@@ -143,19 +129,53 @@ struct Stats
         }
     }
 
-    long Get(Outcome o) const { return counts[static_cast<size_t>(o)].load(std::memory_order_relaxed); }
-    long Total() const
+    [[nodiscard]] long Get(Outcome o) const { return counts[static_cast<size_t>(o)].load(std::memory_order_relaxed); }
+    [[nodiscard]] long Total() const
     {
         long t = 0;
         for (auto const& c : counts) { t += c.load(std::memory_order_relaxed); }
         return t;
     }
 };
+struct LevelResult
+{
+    uint32_t nodes{};
+    long     attempted{};
+    long     ok{};
+    long     refused{};
+    long     reset{};
+    long     timeout{};
+    long     addrUnavail{};
+    long     otherErr{};
+    double   connectP50{};
+    double   connectP99{};
+    double   connectMax{};
+    double   rttP50{};
+    double   rttP99{};
+    double   wallMs{};
+    double   connPerSec{};
+};
+}    // namespace
 
-double Percentile(std::vector<double>& v, double p)
+static Outcome Classify(boost::system::error_code const& ec)
+{
+    if (ec == beast::error::timeout || ec == net::error::timed_out) { return Outcome::Timeout; }
+    if (ec == net::error::connection_refused) { return Outcome::ConnRefused; }
+    if (ec == net::error::address_in_use || ec == net::error::address_family_not_supported
+        || ec == boost::system::errc::address_not_available)
+    {
+        return Outcome::AddrUnavail;
+    }
+    if (ec == net::error::connection_reset || ec == net::error::broken_pipe || ec == net::error::eof) { return Outcome::ConnReset; }
+    if (ec == net::error::connection_aborted) { return Outcome::ConnReset; }
+    if (ec == net::error::host_unreachable || ec == net::error::host_not_found) { return Outcome::ResolveErr; }
+    return Outcome::OtherErr;
+}
+
+static double Percentile(std::vector<double>& v, double p)
 {
     if (v.empty()) { return 0.0; }
-    std::sort(v.begin(), v.end());
+    std::ranges::sort(v);
     if (p <= 0.0) { return v.front(); }
     // p > 0 so ceil(...) >= 1; the -1 converts the 1-based rank to a 0-based index.
     auto idx = static_cast<size_t>(std::ceil(p / 100.0 * static_cast<double>(v.size()))) - 1;
@@ -165,7 +185,7 @@ double Percentile(std::vector<double>& v, double p)
 
 // One faithful peer->coordinator round trip: fresh connect, one HTTP request, read
 // the response, close. Records the outcome and per-phase latency into `stats`.
-net::awaitable<void> DoOneRequest(tcp::resolver::results_type const& eps, Config const& cfg, Stats& stats)
+static net::awaitable<void> DoOneRequest(tcp::resolver::results_type const& eps, Config const& cfg, Stats& stats)
 {
     auto              ex = co_await net::this_coro::executor;
     beast::tcp_stream stream(ex);
@@ -211,7 +231,7 @@ net::awaitable<void> DoOneRequest(tcp::resolver::results_type const& eps, Config
         outcome   = (res.result() == http::status::ok) ? Outcome::Ok : Outcome::HttpError;
 
         beast::error_code ec;
-        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+        ec = stream.socket().shutdown(tcp::socket::shutdown_both, ec);
     } catch (boost::system::system_error const& e) { outcome = Classify(e.code()); } catch (...)
     {
         outcome = Outcome::OtherErr;
@@ -221,31 +241,12 @@ net::awaitable<void> DoOneRequest(tcp::resolver::results_type const& eps, Config
     co_return;
 }
 
-struct LevelResult
-{
-    uint32_t nodes{};
-    long     attempted{};
-    long     ok{};
-    long     refused{};
-    long     reset{};
-    long     timeout{};
-    long     addrUnavail{};
-    long     otherErr{};
-    double   connectP50{};
-    double   connectP99{};
-    double   connectMax{};
-    double   rttP50{};
-    double   rttP99{};
-    double   wallMs{};
-    double   connPerSec{};
-};
-
 // Fires `nodes * iters` requests, holding up to `min(nodes, maxInflight)` in flight
 // at once (a synchronized thundering herd — all peers finalize a checkpoint at nearly
 // the same instant). Each completion spawns a replacement until the level's request
 // budget is exhausted. maxInflight bounds the single-host driver so it stays stable
 // while `nodes` still sets the total offered load.
-LevelResult RunLevel(net::io_context& ioc, tcp::resolver::results_type const& eps, Config const& cfg, uint32_t nodes)
+static LevelResult RunLevel(net::io_context& ioc, tcp::resolver::results_type const& eps, Config const& cfg, uint32_t nodes)
 {
     Stats             stats;
     uint32_t const    concurrency = std::min(nodes, cfg.maxInflight);
@@ -274,7 +275,7 @@ LevelResult RunLevel(net::io_context& ioc, tcp::resolver::results_type const& ep
             // thread-safe, and its timeout timer runs concurrently with the socket
             // op, so without a strand the two race across io threads and corrupt the
             // reactor during teardown of a timed-out connection.
-            net::co_spawn(net::make_strand(ioc), DoOneRequest(eps, cfg, stats), [&, self](std::exception_ptr) {
+            net::co_spawn(net::make_strand(ioc), DoOneRequest(eps, cfg, stats), [&, self](std::exception_ptr const&) {
                 inFlight.fetch_sub(1, std::memory_order_relaxed);
                 long const c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (c >= total)
@@ -312,7 +313,7 @@ LevelResult RunLevel(net::io_context& ioc, tcp::resolver::results_type const& ep
     lr.otherErr    = stats.Get(Outcome::HttpError) + stats.Get(Outcome::ResolveErr) + stats.Get(Outcome::OtherErr);
     lr.connectP50  = Percentile(stats.connectMs, 50);
     lr.connectP99  = Percentile(stats.connectMs, 99);
-    lr.connectMax  = stats.connectMs.empty() ? 0.0 : *std::max_element(stats.connectMs.begin(), stats.connectMs.end());
+    lr.connectMax  = stats.connectMs.empty() ? 0.0 : *std::ranges::max_element(stats.connectMs);
     lr.rttP50      = Percentile(stats.rttMs, 50);
     lr.rttP99      = Percentile(stats.rttMs, 99);
     lr.wallMs      = wallMs;
@@ -320,7 +321,7 @@ LevelResult RunLevel(net::io_context& ioc, tcp::resolver::results_type const& ep
     return lr;
 }
 
-long ReadSysctl(char const* path)
+static long ReadSysctl(char const* path)
 {
     std::ifstream f(path);
     long          v = -1;
@@ -332,14 +333,14 @@ long ReadSysctl(char const* path)
 // ListenOverflows increments each time a completed connection cannot be queued
 // because the listen socket's accept backlog is full — the kernel-level fingerprint
 // of node:0 failing to accept fast enough. Returns -1 if unavailable.
-long ReadTcpExt(std::string_view counter)
+static long ReadTcpExt(std::string_view counter)
 {
     std::ifstream f("/proc/net/netstat");
     std::string   header;
     std::string   values;
     while (std::getline(f, header))
     {
-        if (header.rfind("TcpExt:", 0) != 0) { continue; }
+        if (!header.starts_with("TcpExt:")) { continue; }
         if (!std::getline(f, values)) { break; }
         std::istringstream hs(header);
         std::istringstream vs(values);
@@ -357,7 +358,7 @@ long ReadTcpExt(std::string_view counter)
     return -1;
 }
 
-void RaiseFdLimit()
+static void RaiseFdLimit()
 {
     rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
@@ -370,7 +371,7 @@ void RaiseFdLimit()
 // Unlink the in-process server's shm request queues. Called at startup to clear
 // segments a previously force-exited run left behind (each is ~1 GiB), and on the
 // forced-exit path below.
-void CleanStaleShm()
+static void CleanStaleShm()
 {
     for (uint8_t r = 0; r < checkpoint::ipc::MaxRanksPerNode; ++r)
     {
@@ -379,8 +380,7 @@ void CleanStaleShm()
     }
 }
 
-}    // namespace
-
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int main(int argc, char** argv)
 try
 {
@@ -500,7 +500,7 @@ try
         {
             Stats             probe;
             std::atomic<bool> done{false};
-            net::co_spawn(net::make_strand(ioc), DoOneRequest(eps, cfg, probe), [&](std::exception_ptr) { done.store(true); });
+            net::co_spawn(net::make_strand(ioc), DoOneRequest(eps, cfg, probe), [&](std::exception_ptr const&) { done.store(true); });
             while (!done.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
             ready = probe.Get(Outcome::Ok) > 0;
             if (!ready) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
@@ -568,7 +568,10 @@ try
     LevelResult const* firstFail      = nullptr;
     double             peakConnPerSec = 0.0;
     uint32_t           peakAt         = 0;
-    long               totRefused = 0, totReset = 0, totTimeout = 0, totAddr = 0;
+    long               totRefused     = 0;
+    long               totReset       = 0;
+    long               totTimeout     = 0;
+    long               totAddr        = 0;
     for (auto const& lr : results)
     {
         long const fails = lr.refused + lr.reset + lr.timeout + lr.addrUnavail;
@@ -657,3 +660,4 @@ try
     fmt::print(stderr, "ckpt_stress_test error: {}\n", e.what());
     return 1;
 }
+// NOLINTEND(readability-magic-numbers, cppcoreguidelines-avoid-reference-coroutine-parameters)

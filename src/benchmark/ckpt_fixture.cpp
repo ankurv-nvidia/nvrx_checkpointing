@@ -192,16 +192,14 @@ void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
     WaitForCheckpointSave(tree.Topo());
 }
 
-namespace
-{
-void RoundTripCallback(void*                             cbData,
-                       cipc::SessionId                   sessionId,
-                       cipc::SnapshotId                  snapshotId,
-                       std::string_view const&           name,
-                       std::filesystem::path const&      path,
-                       [[maybe_unused]] StateTree const& globalRegistry,
-                       StateTree const&                  localState,
-                       ByteStorage const&                tensorStorage)
+static void RoundTripCallback(void*                             cbData,
+                              cipc::SessionId                   sessionId,
+                              cipc::SnapshotId                  snapshotId,
+                              std::string_view const&           name,
+                              std::filesystem::path const&      path,
+                              [[maybe_unused]] StateTree const& globalRegistry,
+                              StateTree const&                  localState,
+                              ByteStorage const&                tensorStorage)
 {
     auto localRank = localState.Topo().rank;
     if (localRank != *static_cast<Rank*>(cbData)) { return; }
@@ -209,7 +207,6 @@ void RoundTripCallback(void*                             cbData,
         stderr, "Validating sessionId={} snapshotId={} name={} path={} rank={}\n", sessionId, snapshotId, name, path.string(), localRank);
     ValidateRoundTrip(localState, tensorStorage);
 }
-}    // namespace
 
 void SaveCheckpointAndValidate(StateTree& tree, std::filesystem::path const& ckptDir)
 {

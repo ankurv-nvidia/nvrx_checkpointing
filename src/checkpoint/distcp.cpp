@@ -2,9 +2,9 @@
 #include "distcp_internal.h"
 #include "state.h"
 
-#include <fmt/format.h>
-
 #include <miniz/miniz.h>
+
+#include <fmt/format.h>
 
 #include <array>
 #include <bit>
@@ -18,7 +18,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -29,6 +28,8 @@ static_assert(std::endian::native == std::endian::little,
 #include <fcntl.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+// NOLINTBEGIN(readability-magic-numbers, cppcoreguidelines-pro-type-reinterpret-cast, cppcoreguidelines-pro-type-vararg)
 
 // `__<rank>_0.distcp` is the concatenation of one self-contained `torch.save`
 // ZIP per shard. We emit those ZIPs directly in C++:
@@ -53,9 +54,7 @@ static_assert(std::endian::native == std::endian::little,
 namespace checkpoint::distcp
 {
 
-namespace
-{
-std::string_view DTypeName(DS4Tensor::DType dtype)
+static std::string_view DTypeName(DS4Tensor::DType dtype)
 {
     using DT = DS4Tensor::DType;
     switch (dtype)
@@ -78,7 +77,8 @@ std::string_view DTypeName(DS4Tensor::DType dtype)
     }
 }
 // ---- Pickle stream emission ----------------------------------------------
-
+namespace
+{
 struct DtypePickleInfo
 {
     bool             useV3;
@@ -87,8 +87,9 @@ struct DtypePickleInfo
     std::string_view dtypeMod;
     std::string_view dtypeName;
 };
+}    // namespace
 
-DtypePickleInfo PickleInfoForDtype(DS4Tensor::DType dtype)
+static DtypePickleInfo PickleInfoForDtype(DS4Tensor::DType dtype)
 {
     using DT = DS4Tensor::DType;
     switch (dtype)
@@ -114,29 +115,29 @@ DtypePickleInfo PickleInfoForDtype(DS4Tensor::DType dtype)
     }
 }
 
-void PutU8(std::vector<unsigned char>& b, unsigned char v)
+static void PutU8(std::vector<uint8_t>& b, uint8_t v)
 { b.push_back(v); }
 
-void PutU16LE(std::vector<unsigned char>& b, uint16_t v)
+static void PutU16LE(std::vector<uint8_t>& b, uint16_t v)
 {
-    b.push_back(static_cast<unsigned char>(v & 0xff));
-    b.push_back(static_cast<unsigned char>(v >> 8));
+    b.push_back(static_cast<uint8_t>(v & 0xff));
+    b.push_back(static_cast<uint8_t>(v >> 8));
 }
 
-void PutU32LE(std::vector<unsigned char>& b, uint32_t v)
+static void PutU32LE(std::vector<uint8_t>& b, uint32_t v)
 {
-    for (int i = 0; i < 4; ++i) { b.push_back(static_cast<unsigned char>((v >> (i * 8)) & 0xff)); }
+    for (int i = 0; i < 4; ++i) { b.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xff)); }
 }
 
-void PutBytes(std::vector<unsigned char>& b, std::string_view sv)
+static void PutBytes(std::vector<uint8_t>& b, std::string_view sv)
 { b.insert(b.end(), sv.begin(), sv.end()); }
 
-void PickleInt(std::vector<unsigned char>& b, uint64_t v)
+static void PickleInt(std::vector<uint8_t>& b, uint64_t v)
 {
     if (v < 256)
     {
         PutU8(b, 'K');
-        PutU8(b, static_cast<unsigned char>(v));
+        PutU8(b, static_cast<uint8_t>(v));
     }
     else if (v < 65536)
     {
@@ -150,29 +151,29 @@ void PickleInt(std::vector<unsigned char>& b, uint64_t v)
     }
     else
     {
-        std::array<unsigned char, 9> tmp{};
-        size_t                       n = 0;
-        uint64_t                     x = v;
+        std::array<uint8_t, 9> tmp{};
+        size_t                 n = 0;
+        uint64_t               x = v;
         while (x != 0)
         {
-            tmp[n++] = static_cast<unsigned char>(x & 0xff);
+            tmp[n++] = static_cast<uint8_t>(x & 0xff);
             x >>= 8;
         }
         if (n > 0 && (tmp[n - 1] & 0x80U) != 0U) { tmp[n++] = 0U; }
         PutU8(b, 0x8aU);
-        PutU8(b, static_cast<unsigned char>(n));
+        PutU8(b, static_cast<uint8_t>(n));
         for (size_t i = 0; i < n; ++i) { PutU8(b, tmp[i]); }
     }
 }
 
-void PickleBinunicode(std::vector<unsigned char>& b, std::string_view s)
+static void PickleBinunicode(std::vector<uint8_t>& b, std::string_view s)
 {
     PutU8(b, 'X');
     PutU32LE(b, static_cast<uint32_t>(s.size()));
     PutBytes(b, s);
 }
 
-void PickleGlobal(std::vector<unsigned char>& b, std::string_view mod, std::string_view name)
+static void PickleGlobal(std::vector<uint8_t>& b, std::string_view mod, std::string_view name)
 {
     PutU8(b, 'c');
     PutBytes(b, mod);
@@ -181,13 +182,13 @@ void PickleGlobal(std::vector<unsigned char>& b, std::string_view mod, std::stri
     PutU8(b, '\n');
 }
 
-void PickleBinput(std::vector<unsigned char>& b, uint8_t idx)
+static void PickleBinput(std::vector<uint8_t>& b, uint8_t idx)
 {
     PutU8(b, 'q');
     PutU8(b, idx);
 }
 
-void PickleTupleClose(std::vector<unsigned char>& b, size_t n)
+static void PickleTupleClose(std::vector<uint8_t>& b, size_t n)
 {
     switch (n)
     {
@@ -201,7 +202,7 @@ void PickleTupleClose(std::vector<unsigned char>& b, size_t n)
 
 // Precondition: shape is non-empty. WriteRankShard builds shapes from
 // `sharddim`, which is non-empty for every tensor we write.
-std::vector<unsigned char> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
+static std::vector<uint8_t> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
 {
     auto const info = PickleInfoForDtype(dtype);
 
@@ -217,7 +218,7 @@ std::vector<unsigned char> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim c
 
     uint64_t const storageSize = info.useV3 ? numel * DynamicSharded4TensorTraits::GetDTypeSize(dtype) : numel;
 
-    std::vector<unsigned char> out;
+    std::vector<uint8_t> out;
     out.reserve(192);
 
     uint8_t memo    = 0;
@@ -316,7 +317,7 @@ constexpr uint64_t DataDescriptorSize = 16;
 // `kFieldAlignment` boundary. Replicates `caffe2::serialize::detail::getOffset`
 // / `getPadding` from pytorch/v2.11.0. `cursor` is the archive offset the next
 // LFH will land at (miniz's `m_archive_size`).
-uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
+static uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
 {
     uint64_t const start       = cursor + LocalFileHeaderSize + filenameSize + FbExtraHeaderBytes;
     uint64_t const mod         = start % KFieldAlignment;
@@ -327,7 +328,7 @@ uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
 // Materializes the FB extra-field bytes for WriteShardArchive to hand to
 // miniz. Layout: `'F','B', <padding_size LE 2 bytes>, 'Z' * padding_size`.
 // Total length = padding_size + 4.
-std::vector<unsigned char> BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
+static std::vector<uint8_t> BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
 {
     if (dataSize >= MZ_UINT32_MAX || cursor >= MZ_UINT32_MAX)
     {
@@ -338,12 +339,12 @@ std::vector<unsigned char> BuildFbExtra(size_t cursor, size_t filenameSize, size
     uint64_t const extraSize   = ComputeFbExtraSize(cursor, filenameSize);
     uint64_t const paddingSize = extraSize - FbExtraHeaderBytes;
 
-    std::vector<unsigned char> extra;
+    std::vector<uint8_t> extra;
     extra.resize(static_cast<size_t>(extraSize), 'Z');
     extra[0] = 'F';
     extra[1] = 'B';
-    extra[2] = static_cast<unsigned char>(paddingSize & 0xff);
-    extra[3] = static_cast<unsigned char>((paddingSize >> 8) & 0xff);
+    extra[2] = static_cast<uint8_t>(paddingSize & 0xff);
+    extra[3] = static_cast<uint8_t>((paddingSize >> 8) & 0xff);
     return extra;
 }
 
@@ -379,8 +380,6 @@ constexpr std::string_view StorageAlignmentBytes = "64";
 constexpr std::string_view ByteorderBytes        = "little";
 constexpr std::string_view VersionBytes          = "3\n";
 
-}    // anonymous namespace
-
 uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape, uint64_t shardDataSize)
 {
     if (shardDataSize >= MZ_UINT32_MAX)
@@ -389,17 +388,17 @@ uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& s
             fmt::format("distcp: ComputeShardArchiveSize: shardDataSize {} >= 4 GiB (ZIP64 LFH not implemented)", shardDataSize));
     }
 
-    auto const dataPkl = BuildDataPkl(dtype, shape);
+    auto const dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
     // Per-entry payload size, indexed in lockstep with EntryFullNames.
     std::array<uint64_t, 7> const dataSizes{
         dataPkl.size(),
-        FormatVersionBytes.size(),
-        StorageAlignmentBytes.size(),
-        ByteorderBytes.size(),
+        checkpoint::distcp::FormatVersionBytes.size(),
+        checkpoint::distcp::StorageAlignmentBytes.size(),
+        checkpoint::distcp::ByteorderBytes.size(),
         shardDataSize,
-        VersionBytes.size(),
-        SerializationIdSize,
+        checkpoint::distcp::VersionBytes.size(),
+        checkpoint::distcp::SerializationIdSize,
     };
 
     // LFH + filename + FB extra + data + data descriptor, per entry. Cursor
@@ -409,44 +408,41 @@ uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& s
     // padding off the 64-byte grid too, so the descriptor MUST be folded into
     // cursor advancement, not just added at the end.
     uint64_t cursor = 0;
-    for (size_t i = 0; i < EntryFullNames.size(); ++i)
+    for (size_t i = 0; i < checkpoint::distcp::EntryFullNames.size(); ++i)
     {
-        uint64_t const fnSize    = EntryFullNames.at(i).size();
+        uint64_t const fnSize    = checkpoint::distcp::EntryFullNames.at(i).size();
         uint64_t const dataSize  = dataSizes.at(i);
-        uint64_t const extraSize = ComputeFbExtraSize(cursor, fnSize);
-        cursor += LocalFileHeaderSize + fnSize + extraSize + dataSize;
+        uint64_t const extraSize = checkpoint::distcp::ComputeFbExtraSize(cursor, fnSize);
+        cursor += checkpoint::distcp::LocalFileHeaderSize + fnSize + extraSize + dataSize;
         // All seven of our entries have non-zero body, so the descriptor
         // always fires. The `if` keeps the formula honest if a future
         // change ever introduces a zero-body entry.
-        if (dataSize > 0) { cursor += DataDescriptorSize; }
+        if (dataSize > 0) { cursor += checkpoint::distcp::DataDescriptorSize; }
     }
 
     // Central directory: 46-byte fixed header + filename per entry. We pass
     // null/0 for both `pExtra` and `user_extra_data_central`, and all our
     // LFH offsets/sizes fit in 32 bits, so miniz adds no zip64 extra to CD
     // records either (verified against miniz_zip.c:3184-3221).
-    for (auto const& fn : EntryFullNames) { cursor += CentralDirHeaderSize + fn.size(); }
+    for (auto const& fn : checkpoint::distcp::EntryFullNames) { cursor += checkpoint::distcp::CentralDirHeaderSize + fn.size(); }
 
     // MZ_ZIP_FLAG_WRITE_ZIP64 forces m_zip64 at writer init, so finalize
     // always emits ZIP64 EOCD record + locator before the plain EOCD trailer
     // — even when nothing in the archive actually needs 64-bit fields
     // (miniz_zip.c:4442-4470).
-    cursor += Zip64EocdRecordSize + Zip64EocdLocatorSize + EocdSize;
+    cursor += checkpoint::distcp::Zip64EocdRecordSize + checkpoint::distcp::Zip64EocdLocatorSize + checkpoint::distcp::EocdSize;
 
     return cursor;
 }
 
-namespace
-{
-
 // `c10::hash_combine` from c10/util/hash.h: deterministic mixer used in the
 // serialization_id record-name hash.
-uint64_t HashCombine(uint64_t seed, uint64_t value)
+static uint64_t HashCombine(uint64_t seed, uint64_t value)
 { return seed ^ (value + 0x9e3779b9ULL + (seed << 6U) + (seed >> 2U)); }
 
 // libstdc++'s `std::hash<std::string>` (used by torch's writer via
 // `c10::hash<std::string>{}(...)` -> std::hash) — we just call it directly.
-uint64_t StdHashString(std::string const& s)
+static uint64_t StdHashString(std::string const& s)
 { return std::hash<std::string>{}(s); }
 
 // Writes one self-contained torch.save-compatible ZIP archive containing the
@@ -461,22 +457,22 @@ uint64_t StdHashString(std::string const& s)
 // in one shot. Memory cost = ZIP container overhead + tensor body (the
 // tensor body is the only large field). For multi-gigabyte tensors this is
 // the same RSS hit `dcp.save` takes; revisit if it shows up in a profile.
-uint64_t WriteShardArchive(int                   fd,
-                           DS4Tensor::DType      dtype,
-                           DS4Tensor::Dim const& shape,
-                           char const*           srcPtr,
-                           uint64_t              length,
-                           std::string_view      contextName)
+static uint64_t WriteShardArchive(int                   fd,
+                                  DS4Tensor::DType      dtype,
+                                  DS4Tensor::Dim const& shape,
+                                  char const*           srcPtr,
+                                  uint64_t              length,
+                                  std::string_view      contextName)
 {
-    std::vector<unsigned char> dataPkl = BuildDataPkl(dtype, shape);
+    std::vector<uint8_t> dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
     // Per-entry plan: filename + content pointer + content size.
     struct EntryPlan
     {
-        std::string                fullName;
-        void const*                data;
-        size_t                     size;
-        std::vector<unsigned char> padding;    // 0 for non-data entries
+        std::string          fullName;
+        void const*          data;
+        size_t               size;
+        std::vector<uint8_t> padding;    // 0 for non-data entries
     };
 
     // Record order matches torch.serialization._save / PyTorchStreamWriter::
@@ -485,33 +481,36 @@ uint64_t WriteShardArchive(int                   fd,
     //   data/N..., version, .data/serialization_id
     // Filenames live in `EntryFullNames` so the size predictor uses the same
     // strings. The serialization_id entry is appended after combined-CRC is known.
-    enum Idx : size_t
-    {
-        DataPklIdx    = 0,
-        FormatVerIdx  = 1,
-        StorageAlnIdx = 2,
-        ByteOrderIdx  = 3,
-        DataZeroIdx   = 4,
-        VersionIdx    = 5,
-        SerialIdIdx   = 6,
-    };
+    static constexpr size_t DataPklIdx    = 0;
+    static constexpr size_t FormatVerIdx  = 1;
+    static constexpr size_t StorageAlnIdx = 2;
+    static constexpr size_t ByteOrderIdx  = 3;
+    static constexpr size_t DataZeroIdx   = 4;
+    static constexpr size_t VersionIdx    = 5;
+    static constexpr size_t SerialIdIdx   = 6;
+
     std::array<EntryPlan, 6> entries{
-        EntryPlan{.fullName = std::string{EntryFullNames[DataPklIdx]}, .data = dataPkl.data(), .size = dataPkl.size(), .padding = {}},
-        EntryPlan{.fullName = std::string{EntryFullNames[FormatVerIdx]},
-                  .data     = FormatVersionBytes.data(),
-                  .size     = FormatVersionBytes.size(),
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataPklIdx]},
+                  .data     = dataPkl.data(),
+                  .size     = dataPkl.size(),
                   .padding  = {}},
-        EntryPlan{.fullName = std::string{EntryFullNames[StorageAlnIdx]},
-                  .data     = StorageAlignmentBytes.data(),
-                  .size     = StorageAlignmentBytes.size(),
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[FormatVerIdx]},
+                  .data     = checkpoint::distcp::FormatVersionBytes.data(),
+                  .size     = checkpoint::distcp::FormatVersionBytes.size(),
                   .padding  = {}},
-        EntryPlan{.fullName = std::string{EntryFullNames[ByteOrderIdx]},
-                  .data     = ByteorderBytes.data(),
-                  .size     = ByteorderBytes.size(),
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[StorageAlnIdx]},
+                  .data     = checkpoint::distcp::StorageAlignmentBytes.data(),
+                  .size     = checkpoint::distcp::StorageAlignmentBytes.size(),
                   .padding  = {}},
-        EntryPlan{.fullName = std::string{EntryFullNames[DataZeroIdx]}, .data = srcPtr, .size = length, .padding = {}},
-        EntryPlan{
-            .fullName = std::string{EntryFullNames[VersionIdx]}, .data = VersionBytes.data(), .size = VersionBytes.size(), .padding = {}},
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[ByteOrderIdx]},
+                  .data     = checkpoint::distcp::ByteorderBytes.data(),
+                  .size     = checkpoint::distcp::ByteorderBytes.size(),
+                  .padding  = {}},
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataZeroIdx]}, .data = srcPtr, .size = length, .padding = {}},
+        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[VersionIdx]},
+                  .data     = checkpoint::distcp::VersionBytes.data(),
+                  .size     = checkpoint::distcp::VersionBytes.size(),
+                  .padding  = {}},
     };
 
     // Set up miniz heap writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD
@@ -539,7 +538,7 @@ uint64_t WriteShardArchive(int                   fd,
     lfhOffsets.reserve(entries.size() + 1);
 
     auto addEntry = [&](EntryPlan& plan, std::string_view bareName) {
-        plan.padding = BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
+        plan.padding = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
         lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         plan.fullName.c_str(),
@@ -568,14 +567,14 @@ uint64_t WriteShardArchive(int                   fd,
         // (caffe2/serialize/inline_container.cc::ostream_write_func).
         // mz_crc32 returns mz_ulong (64-bit on x86_64). CRC32 fits in 32 bits
         // by definition; the static_cast is just to silence -Wconversion.
-        auto const entryCrc = static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, static_cast<unsigned char const*>(plan.data), plan.size));
+        auto const entryCrc = static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, static_cast<uint8_t const*>(plan.data), plan.size));
         combinedCrc         = HashCombine(combinedCrc, entryCrc);
         bareNamesWritten.insert(std::string{bareName});
     };
 
     try
     {
-        for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries.at(i), EntryBareNames.at(i)); }
+        for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries.at(i), checkpoint::distcp::EntryBareNames.at(i)); }
 
         // Record-name hash: iterate `bareNamesWritten` (the unordered_set) in
         // its hash-bucket order, like PyTorchStreamWriter::writeSerializationId.
@@ -589,7 +588,7 @@ uint64_t WriteShardArchive(int                   fd,
         std::string const serializationId = fmt::format("{:020d}{:020d}", combinedRecordNameHash, combinedCrc);
 
         EntryPlan idPlan{
-            .fullName = std::string{EntryFullNames[SerialIdIdx]},
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[SerialIdIdx]},
             .data     = serializationId.data(),
             .size     = serializationId.size(),
             .padding  = {},
@@ -598,7 +597,7 @@ uint64_t WriteShardArchive(int                   fd,
         // upstream excludes it (see PyTorchStreamWriter::writeSerializationId, which
         // checks `files_written_.find(kSerializationIdRecordName) == end()` before
         // computing).
-        idPlan.padding = BuildFbExtra(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
+        idPlan.padding = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
         lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         idPlan.fullName.c_str(),
@@ -640,13 +639,13 @@ uint64_t WriteShardArchive(int                   fd,
 
     // Own the heap buffer for the rest of this scope. mz_free is the documented
     // counterpart to the malloc performed by `finalize_heap_archive`.
-    std::unique_ptr<unsigned char, decltype(&::mz_free)> archiveBuf{static_cast<unsigned char*>(archiveBufRaw), &::mz_free};
+    std::unique_ptr<uint8_t, decltype(&::mz_free)> archiveBuf{static_cast<uint8_t*>(archiveBufRaw), &::mz_free};
 
     // Zero last-mod time/date in every LFH and CD record. PyTorchStreamWriter is
     // built against a vendored miniz with MINIZ_NO_TIME, which makes those
     // fields stable zeros. Our vcpkg miniz lacks that knob (it would require
     // a source rebuild), so we patch the finalized buffer to match.
-    unsigned char* const bytes = archiveBuf.get();
+    uint8_t* const bytes = archiveBuf.get();
     for (size_t off : lfhOffsets)
     {
         // LFH: time at +10 (2B), date at +12 (2B). Zero 4 contiguous bytes.
@@ -661,7 +660,7 @@ uint64_t WriteShardArchive(int                   fd,
     // garbage would otherwise be a buffer-overrun surface.
     if (archiveSize >= 22)
     {
-        unsigned char const* eocd = bytes + archiveSize - 22;
+        uint8_t const* eocd = bytes + archiveSize - 22;
         if (eocd[0] == 'P' && eocd[1] == 'K' && eocd[2] == 0x05 && eocd[3] == 0x06)
         {
             uint32_t cdSize{};
@@ -735,49 +734,49 @@ uint64_t WriteShardArchive(int                   fd,
 constexpr std::string_view KMetadataModule   = "torch.distributed.checkpoint.metadata";
 constexpr std::string_view KFilesystemModule = "torch.distributed.checkpoint.filesystem";
 
-void EmitNewObjBuildBegin(std::vector<unsigned char>& b, std::string_view mod, std::string_view name)
+static void EmitNewObjBuildBegin(std::vector<uint8_t>& b, std::string_view mod, std::string_view name)
 {
-    PickleGlobal(b, mod, name);
+    checkpoint::distcp::PickleGlobal(b, mod, name);
     PutU8(b, ')');     // EMPTY_TUPLE
     PutU8(b, 0x81);    // NEWOBJ — push cls.__new__(cls, *())
     PutU8(b, '}');     // EMPTY_DICT — start of state dict
     PutU8(b, '(');     // MARK
 }
 
-void EmitNewObjBuildEnd(std::vector<unsigned char>& b)
+static void EmitNewObjBuildEnd(std::vector<uint8_t>& b)
 {
     PutU8(b, 'u');    // SETITEMS — fold marked (key, value) pairs into the dict
     PutU8(b, 'b');    // BUILD — apply state dict to the instance
 }
 
 // torch.Size(<dims-tuple>) via REDUCE.
-template <typename TInts> void EmitTorchSize(std::vector<unsigned char>& b, TInts const& dims)
+template <typename TInts> static void EmitTorchSize(std::vector<uint8_t>& b, TInts const& dims)
 {
-    PickleGlobal(b, "torch", "Size");
+    checkpoint::distcp::PickleGlobal(b, "torch", "Size");
     if (dims.size() >= 4) { PutU8(b, '('); }
-    for (auto d : dims) { PickleInt(b, static_cast<uint64_t>(d)); }
+    for (auto d : dims) { checkpoint::distcp::PickleInt(b, static_cast<uint64_t>(d)); }
     PickleTupleClose(b, dims.size());
     PutU8(b, 0x85);    // TUPLE1 — wrap the dims tuple as the single ctor arg
     PutU8(b, 'R');     // REDUCE — call torch.Size(dims_tuple)
 }
 
-void EmitTorchDtype(std::vector<unsigned char>& b, DS4Tensor::DType dtype)
+static void EmitTorchDtype(std::vector<uint8_t>& b, DS4Tensor::DType dtype)
 {
     // torch.<dtype> is a module-level attribute (singleton); GLOBAL pushes it directly.
-    PickleGlobal(b, "torch", DTypeName(dtype));
+    checkpoint::distcp::PickleGlobal(b, "torch", checkpoint::distcp::DTypeName(dtype));
 }
 
-void EmitLayoutStrided(std::vector<unsigned char>& b)
+static void EmitLayoutStrided(std::vector<uint8_t>& b)
 {
     // `torch.strided` is a module-level singleton — GLOBAL resolves it directly.
     // dcp.save uses a longer `_get_layout(...)` REDUCE path; this shorter form
     // is semantically equivalent (verified by-hand: `pickle.loads(b'\\x80\\x02ctorch\\nstrided\\n.')`
     // returns the same singleton). `TensorProperties.__setstate__` just assigns
     // it straight to `self.layout` — no enum decode.
-    PickleGlobal(b, "torch", "strided");
+    checkpoint::distcp::PickleGlobal(b, "torch", "strided");
 }
 
-void EmitMemoryFormatContiguousEnum(std::vector<unsigned char>& b)
+static void EmitMemoryFormatContiguousEnum(std::vector<uint8_t>& b)
 {
     // TensorProperties.__getstate__ encodes memory_format via the
     // `_MEM_FORMAT_ENCODING` Enum that lives next to TensorProperties (in
@@ -785,19 +784,19 @@ void EmitMemoryFormatContiguousEnum(std::vector<unsigned char>& b)
     // `__setstate__` compares against `TORCH_CONTIGUOUS_FORMAT` (== 0) and
     // resolves back to the singleton. Emitting the actual `torch.contiguous_format`
     // object here would break the equality check and raise at load time.
-    PickleGlobal(b, KMetadataModule, "_MEM_FORMAT_ENCODING");
-    PickleInt(b, 0);    // TORCH_CONTIGUOUS_FORMAT
-    PutU8(b, 0x85);     // TUPLE1
-    PutU8(b, 'R');      // REDUCE — _MEM_FORMAT_ENCODING(0)
+    checkpoint::distcp::PickleGlobal(b, KMetadataModule, "_MEM_FORMAT_ENCODING");
+    checkpoint::distcp::PickleInt(b, 0);    // TORCH_CONTIGUOUS_FORMAT
+    PutU8(b, 0x85);                         // TUPLE1
+    PutU8(b, 'R');                          // REDUCE — _MEM_FORMAT_ENCODING(0)
 }
 
-void EmitTensorProperties(std::vector<unsigned char>& b, DS4Tensor::DType dtype)
+static void EmitTensorProperties(std::vector<uint8_t>& b, DS4Tensor::DType dtype)
 {
     // TensorProperties has a custom __getstate__/__setstate__ that uses a
     // 5-tuple (not a dict): (dtype, layout, requires_grad, mem_format_encoding,
     // pin_memory). The MARK..TUPLE..BUILD shape feeds that tuple directly into
     // __setstate__.
-    PickleGlobal(b, KMetadataModule, "TensorProperties");
+    checkpoint::distcp::PickleGlobal(b, KMetadataModule, "TensorProperties");
     PutU8(b, ')');     // EMPTY_TUPLE
     PutU8(b, 0x81);    // NEWOBJ
     PutU8(b, '(');     // MARK
@@ -810,16 +809,16 @@ void EmitTensorProperties(std::vector<unsigned char>& b, DS4Tensor::DType dtype)
     PutU8(b, 'b');     // BUILD — apply via __setstate__
 }
 
-void EmitChunkStorageMetadata(std::vector<unsigned char>& b, DS4Tensor::DimRange const& sharddim)
+static void EmitChunkStorageMetadata(std::vector<uint8_t>& b, DS4Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "ChunkStorageMetadata");
 
-    PickleBinunicode(b, "offsets");
+    checkpoint::distcp::PickleBinunicode(b, "offsets");
     DS4Tensor::Dim offsets;
     for (auto const& r : sharddim) { offsets.push_back(r.begin); }
     EmitTorchSize(b, offsets);
 
-    PickleBinunicode(b, "sizes");
+    checkpoint::distcp::PickleBinunicode(b, "sizes");
     DS4Tensor::Dim sizes;
     for (auto const& r : sharddim) { sizes.push_back(r.end - r.begin); }
     EmitTorchSize(b, sizes);
@@ -827,14 +826,14 @@ void EmitChunkStorageMetadata(std::vector<unsigned char>& b, DS4Tensor::DimRange
     EmitNewObjBuildEnd(b);
 }
 
-void EmitTensorStorageMetadata(std::vector<unsigned char>&             b,
-                               DS4Tensor::DType                        dtype,
-                               DS4Tensor::Dim const&                   fulldim,
-                               std::vector<DS4Tensor::DimRange> const& chunks)
+static void EmitTensorStorageMetadata(std::vector<uint8_t>&                   b,
+                                      DS4Tensor::DType                        dtype,
+                                      DS4Tensor::Dim const&                   fulldim,
+                                      std::vector<DS4Tensor::DimRange> const& chunks)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "TensorStorageMetadata");
 
-    PickleBinunicode(b, "properties");
+    checkpoint::distcp::PickleBinunicode(b, "properties");
     EmitTensorProperties(b, dtype);
 
     PickleBinunicode(b, "size");
@@ -849,7 +848,7 @@ void EmitTensorStorageMetadata(std::vector<unsigned char>&             b,
     EmitNewObjBuildEnd(b);
 }
 
-void EmitMetadataIndex(std::vector<unsigned char>& b, std::string_view fqn, DS4Tensor::DimRange const& sharddim)
+static void EmitMetadataIndex(std::vector<uint8_t>& b, std::string_view fqn, DS4Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
 
@@ -867,7 +866,7 @@ void EmitMetadataIndex(std::vector<unsigned char>& b, std::string_view fqn, DS4T
     EmitNewObjBuildEnd(b);
 }
 
-void EmitStorageInfo(std::vector<unsigned char>& b, std::string_view relativePath, uint64_t offset, uint64_t length)
+static void EmitStorageInfo(std::vector<uint8_t>& b, std::string_view relativePath, uint64_t offset, uint64_t length)
 {
     EmitNewObjBuildBegin(b, KFilesystemModule, "_StorageInfo");
 
@@ -889,7 +888,7 @@ void EmitStorageInfo(std::vector<unsigned char>& b, std::string_view relativePat
 // torch.distributed.checkpoint.metadata.BytesStorageMetadata() — an empty
 // dataclass (no fields). Marks `fqn` in state_dict_metadata as a non-tensor
 // (ShardedObject) entry; the DCP load planner reads its bytes via storage_data.
-void EmitBytesStorageMetadata(std::vector<unsigned char>& b)
+static void EmitBytesStorageMetadata(std::vector<uint8_t>& b)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "BytesStorageMetadata");
     EmitNewObjBuildEnd(b);
@@ -898,7 +897,7 @@ void EmitBytesStorageMetadata(std::vector<unsigned char>& b)
 // MetadataIndex for a bytes (ShardedObject) entry. Unlike the tensor index, a
 // bytes index carries no offset/index — both default to None, which torch's
 // writer omits — so the restored key equals MetadataIndex(fqn).
-void EmitMetadataIndexBytes(std::vector<unsigned char>& b, std::string_view fqn)
+static void EmitMetadataIndexBytes(std::vector<uint8_t>& b, std::string_view fqn)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
     PickleBinunicode(b, "fqn");
@@ -906,9 +905,10 @@ void EmitMetadataIndexBytes(std::vector<unsigned char>& b, std::string_view fqn)
     EmitNewObjBuildEnd(b);
 }
 
-std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+static std::vector<uint8_t> BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
 {
-    std::vector<unsigned char> b;
+    std::vector<uint8_t> b;
     b.reserve(2048);
     std::unordered_set<std::string> tensorFqns;
 
@@ -1040,8 +1040,6 @@ std::vector<unsigned char> BuildMetadataPkl(StateTree const& globalRegistry, Blo
     PutU8(b, '.');    // STOP
     return b;
 }
-
-}    // namespace
 
 void WriteRankShard(std::filesystem::path const& ckptDir,
                     Rank                         rank,
@@ -1224,5 +1222,7 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
         throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", configPath.string()));
     }
 }
+
+// NOLINTEND(readability-magic-numbers, cppcoreguidelines-pro-type-reinterpret-cast, cppcoreguidelines-pro-type-vararg)
 
 }    // namespace checkpoint::distcp

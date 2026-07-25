@@ -30,7 +30,7 @@ template <typename T, std::size_t N> struct inplace_vector : std::array<T, N>   
     void                 push_back(T const& value) { this->at(size_++) = value; }    // NOLINT
     [[nodiscard]] size_t size() const { return size_; }                              // NOLINT(readability-identifier-naming)
     [[nodiscard]] auto   end() const                                                 // NOLINT(readability-identifier-naming)
-    { return this->begin() + static_cast<std::ptrdiff_t>(size_); }
+    { return this->begin() + static_cast<std::ptrdiff_t>(size_); }    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
     [[nodiscard]] auto end() { return this->begin() + static_cast<std::ptrdiff_t>(size_); }    // NOLINT(readability-identifier-naming)
 
     // Element-wise comparisons must respect size_. The inherited std::array operators
@@ -245,6 +245,7 @@ template <ConceptTensorTraits Traits> struct TensorT
 
 enum class Rank : uint32_t
 {
+    Default = 0,
     Invalid = std::numeric_limits<uint32_t>::max()
 };
 
@@ -341,7 +342,7 @@ template <ConceptTensorTraits Traits> struct TensorShardMapT
 
     static bool Intersects(DimRange const& r1, DimRange const& r2)
     {
-        for (auto const& [dim1, dim2] : std::ranges::zip_view(r1, r2))
+        for (auto const& [dim1, dim2] : std::ranges::zip_view(r1, r2))    // NOLINT(readability-use-anyofallof)
         {
             if (dim1.end <= dim2.begin || dim2.end <= dim1.begin) { return false; }
         }
@@ -350,7 +351,7 @@ template <ConceptTensorTraits Traits> struct TensorShardMapT
 
     static bool Contains(DimRange const& outer, DimRange const& inner)
     {
-        for (auto const& [dimOuter, dimInner] : std::ranges::zip_view(outer, inner))
+        for (auto const& [dimOuter, dimInner] : std::ranges::zip_view(outer, inner))    // NOLINT(readability-use-anyofallof)
         {
             if (dimOuter.begin > dimInner.begin || dimOuter.end < dimInner.end) { return false; }
         }
@@ -429,6 +430,7 @@ template <> struct std::hash<DynamicSharded4TensorTraits::Range>
 
 using DS4Tensor = TensorT<DynamicSharded4TensorTraits>;
 
-static_assert(sizeof(DS4Tensor) == 136, "Unexpected padding in DS4Tensor. Size should be exactly 64 bytes for efficient serialization");
+// NOLINTNEXTLINE(readability-magic-numbers)
+static_assert(sizeof(DS4Tensor) == 136, "Unexpected padding in DS4Tensor. Size should be exactly 136 bytes for efficient serialization");
 
 using DS4TensorShardMap = TensorShardMapT<DynamicSharded4TensorTraits>;

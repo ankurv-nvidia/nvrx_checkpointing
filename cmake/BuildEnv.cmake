@@ -322,9 +322,6 @@ macro(EnableStrictCompilation)
                     )
             else()
                 list(APPEND extracxxflags -Wno-error=stringop-overflow)
-                if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
-                    list(APPEND extracxxflags -Wno-error=sfinae-incomplete) # gcc-16 fmt incomplete-type probe
-                endif()
             endif()
 
             if (MINGW)
@@ -400,6 +397,14 @@ macro (SupressWarningForFile f)
     endif()
 endmacro()
 
+macro (SupressLintingForTarget targetName)
+    if (TARGET ${targetName})
+        set_target_properties(${targetName} PROPERTIES
+            C_CLANG_TIDY ""
+            CXX_CLANG_TIDY ""
+        )
+    endif()
+endmacro()
 
 macro (SupressWarningForTarget targetName)
     if (TARGET ${targetName})

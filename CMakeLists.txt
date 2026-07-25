@@ -164,6 +164,7 @@ endif()
 if (PHOENIX_BUILD_BENCHMARK)
     include(Benchmark)
     SupressWarningForTarget(benchmark)
+    SupressLintingForTarget(benchmark)
     add_executable(ckptbench src/benchmark/ckptbench.cpp)
     target_link_libraries(ckptbench PRIVATE phoenix_checkpoint_fixture benchmark::benchmark)
 
@@ -196,12 +197,14 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
     find_package(nanobind CONFIG REQUIRED)
     nanobind_add_module(checkpoint
-        FREE_THREADED STABLE_ABI NB_DOMAIN checkpoint
+        FREE_THREADED STABLE_ABI NB_DOMAIN LTO NB_SUPPRESS_WARNINGS
         src/python/bindings.cpp
         src/python/torch_bindings.cpp)
     SupressWarningForTarget(checkpoint)
     SupressWarningForTarget(nanobind-static)
     SupressWarningForTarget(nanobind-static-abi3)
+    SupressLintingForTarget(nanobind-static)
+    SupressLintingForTarget(nanobind-static-abi3)
     target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
     if (PHOENIX_BUILD_TESTS)

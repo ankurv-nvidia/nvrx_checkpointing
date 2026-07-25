@@ -30,8 +30,15 @@ struct DtypeIdEntry
     std::string_view name;
     int64_t          id;
 };
+// Holds the capsule alongside a pointer into its DLTensor. The capsule
+// must outlive any read of the DLTensor fields it points to.
+struct DlpackCapsule
+{
+    nb::object      capsule;
+    DLTensor const* tnsr;
+};
 
-constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>({
+constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>{{
     {.name = "torch.float16", .id = 1},
     {.name = "torch.bfloat16", .id = 2},
     {.name = "torch.float32", .id = 3},
@@ -45,9 +52,24 @@ constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>({
     {.name = "torch.int32", .id = 11},
     {.name = "torch.int64", .id = 12},
     {.name = "torch.bool", .id = 13},
-});
+}};
 
-int64_t DtypeNameToId(std::string_view name)
+struct CachedTypes
+{
+    nb::object torchTensor;
+    nb::object torchDtype;
+    nb::object torchGenerator;
+    nb::object localShardedTensor;
+    nb::object localShardedTensorFactory;
+    nb::object localShardedObject;
+    nb::object megatronShardedTensor;
+    nb::object megatronShardedTensorFactory;
+    nb::object megatronShardedObject;
+};
+
+}    // namespace
+
+static int64_t DtypeNameToId(std::string_view name)
 {
     for (auto const& e : KDtypeIds)
     {
@@ -58,7 +80,7 @@ int64_t DtypeNameToId(std::string_view name)
 
 // === DLPack metadata conversion ===
 
-DS4Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
+static DS4Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
 {
     if (dt.lanes != 1) { throw std::runtime_error(fmt::format("Unsupported DLPack dtype lanes={}", dt.lanes)); }
     switch (dt.code)
@@ -100,7 +122,7 @@ DS4Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
     throw std::runtime_error(fmt::format("Unsupported DLPack dtype: code={} bits={}", static_cast<int>(dt.code), dt.bits));
 }
 
-DeviceId DlpackDeviceToId(DLDevice const& d)
+static DeviceId DlpackDeviceToId(DLDevice const& d)
 {
     char const* prefix = nullptr;
     switch (d.device_type)
@@ -116,7 +138,7 @@ DeviceId DlpackDeviceToId(DLDevice const& d)
 
 // DLPack contiguity check. A null `strides` means row-major contiguous
 // by spec; otherwise the strides must match the row-major progression.
-bool IsRowMajorContiguous(DLTensor const& t)
+static bool IsRowMajorContiguous(DLTensor const& t)
 {
     if (t.strides == nullptr) { return true; }
     int64_t expected = 1;
@@ -128,21 +150,13 @@ bool IsRowMajorContiguous(DLTensor const& t)
     return true;
 }
 
-uint64_t DataPtrFromDlTensor(DLTensor const& t)
+static uint64_t DataPtrFromDlTensor(DLTensor const& t)
 {
     auto base = reinterpret_cast<uintptr_t>(t.data);    // NOLINT
     return (base + static_cast<uintptr_t>(t.byte_offset));
 }
 
-// Holds the capsule alongside a pointer into its DLTensor. The capsule
-// must outlive any read of the DLTensor fields it points to.
-struct DlpackCapsule
-{
-    nb::object      capsule;
-    DLTensor const* tnsr;
-};
-
-DlpackCapsule ReadDlpack(nb::handle tensor)
+static DlpackCapsule ReadDlpack(nb::handle tensor)
 {
     // `.detach()` first: tensors with `requires_grad=True` (i.e. live model
     // parameters mid-training) fail `__dlpack__()` with
@@ -176,20 +190,7 @@ DlpackCapsule ReadDlpack(nb::handle tensor)
 // the first time we see them. Stored as `nb::object*` and intentionally
 // leaked to avoid decref-after-Python-finalization at process exit.
 
-struct CachedTypes
-{
-    nb::object torchTensor;
-    nb::object torchDtype;
-    nb::object torchGenerator;
-    nb::object localShardedTensor;
-    nb::object localShardedTensorFactory;
-    nb::object localShardedObject;
-    nb::object megatronShardedTensor;
-    nb::object megatronShardedTensorFactory;
-    nb::object megatronShardedObject;
-};
-
-CachedTypes const& CachedTypesGet()
+static CachedTypes const& CachedTypesGet()
 {
     static CachedTypes Types = []() {
         nb::gil_scoped_acquire acquire;
@@ -222,25 +223,25 @@ CachedTypes const& CachedTypesGet()
     return Types;
 }
 
-bool IsTorchTensor(nb::handle obj)
+static bool IsTorchTensor(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchTensor); }
-bool IsTorchDtype(nb::handle obj)
+static bool IsTorchDtype(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchDtype); }
-bool IsTorchGenerator(nb::handle obj)
+static bool IsTorchGenerator(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchGenerator); }
-bool IsMegatronShardedTensor(nb::handle obj)
+static bool IsMegatronShardedTensor(nb::handle obj)
 {
     auto const& types = CachedTypesGet();
     return nb::isinstance(obj, types.localShardedTensor)
            || (!types.megatronShardedTensor.is_none() && nb::isinstance(obj, types.megatronShardedTensor));
 }
-bool IsMegatronShardedTensorFactory(nb::handle obj)
+static bool IsMegatronShardedTensorFactory(nb::handle obj)
 {
     auto const& types = CachedTypesGet();
     return nb::isinstance(obj, types.localShardedTensorFactory)
            || (!types.megatronShardedTensorFactory.is_none() && nb::isinstance(obj, types.megatronShardedTensorFactory));
 }
-bool IsMegatronShardedObject(nb::handle obj)
+static bool IsMegatronShardedObject(nb::handle obj)
 {
     auto const& types = CachedTypesGet();
     return nb::isinstance(obj, types.localShardedObject)
@@ -249,7 +250,7 @@ bool IsMegatronShardedObject(nb::handle obj)
 
 // === Handler bodies ===
 
-DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
+static DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
 {
     DS4Tensor meta{};
     meta.dtype  = DlpackDtypeToDs4(t.dtype);
@@ -279,6 +280,8 @@ DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
     meta.AssertShardIsValid();
     return meta;
 }
+namespace
+{
 
 struct StateTreeTorchTensorHandler : StateTree::StateHandler<StateTree::StateType::TensorShard>
 {
@@ -358,9 +361,9 @@ struct StateTreeTorchGeneratorHandler : StateTree::StateHandler<StateTree::State
         }
         if (!IsRowMajorContiguous(*dlp.tnsr)) { throw std::runtime_error(fmt::format("Generator state for {} is not contiguous", name)); }
 
-        auto              nbytes = static_cast<size_t>(dlp.tnsr->shape[0])    // NOLINT
-                                   * static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * static_cast<size_t>(dlp.tnsr->dtype.lanes);
-        auto const*       src    = reinterpret_cast<char const*>(DataPtrFromDlTensor(*dlp.tnsr));    // NOLINT
+        auto        nbytes = static_cast<size_t>(dlp.tnsr->shape[0]) * static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U)    // NOLINT
+                             * static_cast<size_t>(dlp.tnsr->dtype.lanes);
+        auto const* src    = reinterpret_cast<char const*>(DataPtrFromDlTensor(*dlp.tnsr));    // NOLINT
         std::vector<char> data(nbytes);
         std::memcpy(data.data(), src, nbytes);
         return data;
@@ -381,6 +384,11 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         return std::unique_ptr<StateTreeShardedTensorHandler>(new StateTreeShardedTensorHandler(containerIn, nameIn, meta));
     }
 
+    // Re-read the (possibly re-pointed) container so node.data tracks the current tensor. The bf16
+    // optimizer moments are transient get_unscaled_state().float() copies the optimizer never
+    // rewrites; without this the once-registered handle re-saves stale iter-of-registration bytes.
+    void Update() override { meta = Convert_(key, container); }
+
     private:
     StateTreeShardedTensorHandler(nb::dict containerIn, nb::str const& nameIn, DS4Tensor const& metaIn) :
         StateTree::StateHandler<StateTree::StateType::TensorShard>(StrView(nameIn)),
@@ -389,11 +397,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         key(nameIn)
     {}
 
-    // Re-read the (possibly re-pointed) container so node.data tracks the current tensor. The bf16
-    // optimizer moments are transient get_unscaled_state().float() copies the optimizer never
-    // rewrites; without this the once-registered handle re-saves stale iter-of-registration bytes.
-    void Update() override { meta = Convert_(key, container); }
-
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     static DS4Tensor Convert_(nb::str& name, nb::dict const& container)
     {
         nb::gil_scoped_acquire acquire;
@@ -531,7 +535,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                     if (!nb::isinstance<int64_t>(val)) { throwError("replicaId is not tuple[int]"); }
                     if (nb::cast<int64_t>(val) != 0)
                     {
-#if defined TODO_REPLICA_ID_TUPLE
+#ifdef TODO_REPLICA_ID_TUPLE
                         fmt::print(stderr,
                                    "[native_ckpt:cli][TODO][StateDict::Register::ShardedTensor::ReplicaId] key = {}, replica_id = {} \n",
                                    shtKeyView,
@@ -576,7 +580,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         size_t shardBytes = DynamicSharded4TensorTraits::GetDTypeSize(ds4tensor.dtype);
         for (auto const& r : ds4tensor.sharddim) { shardBytes *= (r.end - r.begin); }
 
-        size_t dlpackBytes = static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * dlp.tnsr->dtype.lanes;
+        size_t dlpackBytes = static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * dlp.tnsr->dtype.lanes;    // NOLINT
         for (int i = 0; i < dlp.tnsr->ndim; ++i)
         {
             dlpackBytes *= static_cast<size_t>(dlp.tnsr->shape[i]);    // NOLINT
@@ -607,11 +611,12 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
     nb::dict  container;
     nb::str   key;
 };
+}    // namespace
 
 // Identity of a registered shard within the tree: the ShardedTensor key plus its shard offset range
 // and full shape. dp_reshardable buckets register many param/padding ShardedTensors under ONE key,
 // distinguished only by flattened_range (-> sharddim), so the key alone is not unique.
-std::string ShardCompositeKey(std::string_view keyStr, DS4Tensor const& meta)
+static std::string ShardCompositeKey(std::string_view keyStr, DS4Tensor const& meta)
 {
     std::string out(keyStr);
     out += '#';
@@ -620,7 +625,6 @@ std::string ShardCompositeKey(std::string_view keyStr, DS4Tensor const& meta)
     for (auto const& d : meta.fulldim) { out += fmt::format("{},", d); }
     return out;
 }
-}    // namespace
 
 // Re-materialize the registered ShardedTensor nodes in place on the cached root from a fresh flat
 // list of ShardedTensors (no collective re-registration). Used by warm saves to un-stale the bf16

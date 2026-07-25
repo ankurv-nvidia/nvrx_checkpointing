@@ -13,6 +13,8 @@ SUPPRESS_MSVC_WARNING(4866)    // left to right evaluation not guaranteed
 
 SUPPRESS_WARNINGS_END
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-union-access,bugprone-branch-clone,readability-magic-numbers)
+
 struct Primitives64Bit
 {
     struct Type
@@ -289,6 +291,7 @@ struct Primitives64Bit::Traits<std::array<uint16_t, N>>
         return out;
     }
 };
+// NOLINTEND(cppcoreguidelines-pro-type-union-access,bugprone-branch-clone,readability-magic-numbers)
 
 template <typename T>
 concept ConceptPrimitives64Bit = !Primitives64Bit::Type::IsUnknown(Primitives64Bit::Traits<T>::Type());

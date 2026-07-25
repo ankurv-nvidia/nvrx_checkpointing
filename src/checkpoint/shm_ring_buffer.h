@@ -352,7 +352,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             while ((_ctrl->rend % NSlots) != slot)
             {
                 lock.unlock();
-                std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+                std::this_thread::yield();
                 lock.lock();
             }    // TODO : something better than spin wait
             // readFull = AvailableForRead_() == 0;
@@ -460,7 +460,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
 
                 _shm                     = bip::shared_memory_object(bip::open_or_create, _name.c_str(), bip::read_write);
                 bip::offset_t regionSize = 0;
-                if (!_shm.get_size(regionSize) || regionSize < static_cast<bip::offset_t>(sizeof(Control)))
+                if (!_shm.get_size(regionSize) || std::cmp_less(regionSize, sizeof(Control)))
                 {
                     std::this_thread::sleep_for(HearBeatInterval);
                     continue;

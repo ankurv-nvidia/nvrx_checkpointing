@@ -67,8 +67,8 @@ struct StateNode
         CLASS_DELETE_COPY_AND_MOVE(IHandler);
         virtual Type GetType() = 0;
 
-        virtual void Update() = 0;
-        virtual bool IsSnapshotScoped() const { return false; }
+        virtual void               Update() = 0;
+        [[nodiscard]] virtual bool IsSnapshotScoped() const { return false; }
 
         virtual Scalar    GetScalarState() = 0;
         virtual Blob      GetBlob()        = 0;
@@ -189,7 +189,7 @@ struct StateTree
             auto  childName = std::string_view(itb, ite);
             auto& child     = FindOrAddDictChild(node, childName);
             node            = child.handle;
-            itb             = ite + 1;
+            itb             = ite + 1;    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
             ite             = std::find(itb, fqn.end(), '.');
         }
         return std::make_pair(std::string_view(itb, ite), node);
@@ -199,13 +199,13 @@ struct StateTree
     {
         if (fqn.empty()) { return StateNode::Handle::Root; }
 
-        auto node = StateNode::Handle::Root;
-        auto itb  = fqn.begin();
+        auto        node = StateNode::Handle::Root;
+        auto const* itb  = fqn.begin();
         while (itb != fqn.end())
         {
-            auto const  ite       = std::find(itb, fqn.end(), '.');
-            auto const  childName = std::string_view(itb, ite);
-            auto const& parent    = GetNode(node).data;
+            auto const* const ite       = std::find(itb, fqn.end(), '.');
+            auto const        childName = std::string_view(itb, ite);
+            auto const&       parent    = GetNode(node).data;
             if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { return StateNode::Handle::Invalid; }
 
             auto const& children = std::get<StateNode::Dict>(parent);
@@ -213,7 +213,7 @@ struct StateTree
                 = std::ranges::find_if(children, [&](StateNode::Handle childHandle) { return GetNode(childHandle).name == childName; });
             if (childIt == children.end()) { return StateNode::Handle::Invalid; }
             node = *childIt;
-            itb  = ite == fqn.end() ? ite : ite + 1;
+            itb  = ite == fqn.end() ? ite : ite + 1;    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         }
         return node;
     }

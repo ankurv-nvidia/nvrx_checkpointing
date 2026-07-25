@@ -53,10 +53,11 @@
 
 #define SUPPRESS_WARNINGS_END _Pragma("clang diagnostic pop")
 
-#define SUPPRESS_CLANG_WARNING(warning) _PRAGMA_STRINGIFY(clang diagnostic ignored warning)
-#define SUPPRESS_GCC_WARNING(warning)
-#define SUPPRESS_MSVC_WARNING(warning)
-#define SUPPRESS_WARNING(msvcwarning, clangwarning, gccwarning) SUPPRESS_CLANG_WARNING("clangwarning")
+#define SUPPRESS_CLANG_WARNING(warning) _PRAGMA_STRINGIFY(clang diagnostic ignored warning) /*NOLINT(cppcoreguidelines-macro-usage)*/
+#define SUPPRESS_GCC_WARNING(warning)                                                       /*NOLINT(cppcoreguidelines-macro-usage)*/
+#define SUPPRESS_MSVC_WARNING(warning)                                                      /*NOLINT(cppcoreguidelines-macro-usage)*/
+#define SUPPRESS_WARNING(msvcwarning, clangwarning, gccwarning)                             /*NOLINT(cppcoreguidelines-macro-usage)*/ \
+    SUPPRESS_CLANG_WARNING("clangwarning")
 
 #define SUPPRESS_STL_WARNINGS _Pragma("clang diagnostic ignored \"-Weverything\"")
 

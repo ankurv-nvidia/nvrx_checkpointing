@@ -5,6 +5,7 @@
 #include "state.h"
 #include "tensor.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -120,11 +121,7 @@ struct Session
     bool AllSnapshotsComplete() const
     {
         std::scoped_lock lock(mutex);
-        for (auto const& [snapshotId, snapshot] : snapshots)
-        {
-            if (!IsSnapshotEvictable(*snapshot)) { return false; }
-        }
-        return true;
+        return std::ranges::all_of(snapshots, [&](auto const& snapshot) { return IsSnapshotEvictable(*snapshot.second); });
     }
 
     private:

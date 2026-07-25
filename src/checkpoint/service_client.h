@@ -54,7 +54,7 @@ inline bool TryConnectToCheckpointService()
             if (ec) { continue; }
             if (res.result() != boost::beast::http::status::ok) { break; }
 
-            stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+            ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
             return true;
         }
         if (connectAttempt + 1 < MaxConnectAttempts) { std::this_thread::sleep_for(100ms); }

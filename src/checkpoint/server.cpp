@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <csignal>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -79,6 +78,116 @@ using tcp = boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
 using tcp_stream
     = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
 
+struct Server
+{
+    static constexpr uint16_t Port = cipc::Message::Port;
+
+    public:
+    Server(uint16_t index = 0) : _index(index) {}
+    ~Server() { Stop(); }
+    CLASS_DELETE_COPY_AND_MOVE(Server);
+
+    void Start();
+    bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
+    bool AllSessionsComplete();
+    bool HasSessionsAndAllSessionsComplete();
+    void WaitForShutdown();
+    void Ping();
+    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf, cipc::MsgQueue& msgQueue);
+    void Stop();
+    void QuerySessions(ServerSessionCallback callback, void* cbData);
+
+    private:
+    Session& SessionById_(cipc::SessionId sessionId);
+    void     NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId);
+    void     NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId);
+    void     ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, std::string_view body);
+    void     RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
+                                            cipc::Rank                                                           fromRank,
+                                            tcp_stream&                                                          stream,
+                                            boost::beast::flat_buffer&                                           buffer,
+                                            boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser);
+
+    void SpinDownWaitLoop_(tcp_stream stream);
+    void HandleRequest_(tcp_stream& stream);
+
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+    void AcquireInstanceLock_();
+    class ReusePortOption
+    {
+        public:
+        explicit ReusePortOption(bool enabled) : _value(enabled ? 1 : 0) {}
+
+        template <typename Protocol> int         Level(Protocol const& /*unused*/) const { return SOL_SOCKET; }
+        template <typename Protocol> int         Name(Protocol const& /*unused*/) const { return SO_REUSEPORT; }
+        template <typename Protocol> void const* Data(Protocol const& /*unused*/) const { return &_value; }
+        template <typename Protocol> std::size_t Size(Protocol const& /*unused*/) const { return sizeof(_value); }
+
+        private:
+        int _value;
+    };
+#endif
+
+    void StartTcpListener_();
+    void StartTcpAcceptors_();
+
+    // The accept loop only accepts and hands each connection to `_handlerPool`, then
+    // returns to async_accept at once. HandleRequest_ does synchronous, sometimes
+    // long-running work (peer forwards, file writes, a bounded wait for a session);
+    // running it inline serializes accepts and lets the kernel listen backlog overflow
+    // under a many-node connect storm (the "connection refused on node:0" symptom).
+    boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor);
+
+    private:
+    uint16_t   _index{};
+    std::mutex _mutex;
+
+    PerfClock::time_point               _lastPingTime{PerfClock::now()};
+    std::atomic<bool>                   _stopRequested{false};
+    std::unordered_set<cipc::MsgQueue*> _msgQueue{nullptr};
+    bool                                _running{false};
+    std::vector<std::thread>            _threads;
+    // Live spin-down waiter threads, each holding one client connection open until idle.
+    std::vector<std::thread> _spinDownThreads;
+
+    boost::asio::io_context _ioc;
+    // N acceptors share the port via SO_REUSEPORT where available, so the kernel spreads
+    // inbound connections across N accept queues. Without SO_REUSEPORT, fall back to one
+    // acceptor and keep the offloaded handler pool.
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+    static constexpr size_t AcceptorCount = 8;
+#else
+    static constexpr size_t AcceptorCount = 1;
+#endif
+    std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
+
+    // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
+    std::unique_ptr<bip::file_lock> _instanceLock;
+
+    // Connection handlers run here, off the accept loop. Declared after _ioc so it is
+    // joined (destroyed) before the io_context the handlers' sockets are bound to.
+#ifdef PHOENIX_BUILD_FOR_VALGRIND
+    static constexpr size_t HandlerThreads = 4;
+#else
+    static constexpr size_t HandlerThreads = 64;
+#endif
+    std::unique_ptr<boost::asio::thread_pool> _handlerPool;
+
+    // TODO_NOPENDING_STRUCT
+    struct PendingSessionData
+    {
+        PerfClock::time_point                         recievedAt;
+        Rank                                          recvFrom{Rank::Invalid};
+        std::vector<TensorShardInfo>                  tensorShards;
+        std::vector<std::pair<std::string, uint64_t>> blobMetas;
+    };
+
+    std::unordered_map<cipc::SessionId, std::vector<std::unique_ptr<PendingSessionData>>> _pendingSessionData;
+
+    std::unordered_map<cipc::SessionId, std::unique_ptr<Session>> _activeSessions;
+    friend struct Session;
+};
+
 // Formatter for Server*
 template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
 {
@@ -88,6 +197,7 @@ template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
         return fmt::format_to(ctx.out(), "{:x}", ptrVal);
     }
 };
+
 template <> struct fmt::formatter<boost::asio::ip::tcp::endpoint> : fmt::ostream_formatter
 {};
 template <> struct fmt::formatter<boost::asio::ip::address> : fmt::ostream_formatter
@@ -583,6 +693,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
 }
 #endif
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr)
 {
     // Ranks on the coordinator peer (peers[0]) record their finalize/write-complete
@@ -1470,1003 +1581,915 @@ void Session::PrepareBlobState_(Snapshot& snapshot, LocalState& localState, Rank
 
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
 {}
-
-struct Server
+void Server::Start()
 {
-    static constexpr uint16_t Port = cipc::Message::Port;
+    std::scoped_lock lock(_mutex);
+    _stopRequested = false;
+    if (_running) { return; }
+    _ioc.restart();
 
-    public:
-    Server(uint16_t index = 0) : _index(index) {}
-    ~Server() { Stop(); }
-    CLASS_DELETE_COPY_AND_MOVE(Server);
-
-    void Start()
+    _handlerPool = std::make_unique<boost::asio::thread_pool>(HandlerThreads);
+    StartTcpListener_();
+    _running             = true;
+    auto       queueSize = cipc::MsgQueue::DetectShmSize(
+                               cipc::Message::RequestChannelName(_index, cipc::MaxRanksPerNode + 1), cipc::MaxShmSize, cipc::MinShmSize)
+                           / cipc::MaxRanksPerNode;
+    std::latch queuesReady{cipc::MaxRanksPerNode};
+    // Start server thread
+    //_serverThread = std::thread([this]() {
+    for (uint8_t i = 0; i < cipc::MaxRanksPerNode; ++i)
     {
-        std::scoped_lock lock(_mutex);
-        _stopRequested = false;
-        if (_running) { return; }
-        _ioc.restart();
-
-        _handlerPool = std::make_unique<boost::asio::thread_pool>(HandlerThreads);
-        StartTcpListener_();
-        _running             = true;
-        auto       queueSize = cipc::MsgQueue::DetectShmSize(
-                                   cipc::Message::RequestChannelName(_index, cipc::MaxRanksPerNode + 1), cipc::MaxShmSize, cipc::MinShmSize)
-                               / cipc::MaxRanksPerNode;
-        std::latch queuesReady{cipc::MaxRanksPerNode};
-        // Start server thread
-        //_serverThread = std::thread([this]() {
-        for (uint8_t i = 0; i < cipc::MaxRanksPerNode; ++i)
-        {
-            _threads.emplace_back([this, i, queueSize, &queuesReady]() {
-                SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
-                // Map queues across host-memory NUMA domains. Pinning around Create
-                // places the control page; materializing the data pages in the owner
-                // mapping prevents CUDA registration in a restricted client process
-                // from faulting every shared page onto one socket.
-                auto const numaNodes = DetectHostMemoryNumaNodes();
-                int        queueNuma = numaNodes.front();
-                if (numaNodes.size() > 1)
+        _threads.emplace_back([this, i, queueSize, &queuesReady]() {
+            SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
+            // Map queues across host-memory NUMA domains. Pinning around Create
+            // places the control page; materializing the data pages in the owner
+            // mapping prevents CUDA registration in a restricted client process
+            // from faulting every shared page onto one socket.
+            auto const numaNodes = DetectHostMemoryNumaNodes();
+            int        queueNuma = numaNodes.front();
+            if (numaNodes.size() > 1)
+            {
+                size_t queuesPerDomain = static_cast<size_t>(cipc::MaxRanksPerNode) / numaNodes.size();
+                if (queuesPerDomain == 0) { queuesPerDomain = 1; }
+                size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
+                queueNuma           = numaNodes[domain];
+                BindThreadCpuToNumaNode(queueNuma);
+            }
+            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize);
+            if (numaNodes.size() > 1)
+            {
+                auto region = msgQueue.GetShmDataRegion();
+                BindRegionToNumaNode(queueNuma, region.data(), region.size());
+                std::fill(region.begin() + static_cast<std::ptrdiff_t>(cipc::MsgQueue::HdrAllocSize), region.end(), char{});
+            }
+            UnbindThreadCpu();
+            // Create publishes the queue geometry. Only after every queue reaches
+            // this point may a ping report the service as ready: clients start their
+            // fixed shared-memory open window immediately after SvcPing returns.
+            queuesReady.count_down();
+            {
+                std::scoped_lock lock1(_mutex);
+                _msgQueue.insert(&msgQueue);
+            }
+            fmt::print(stderr, "[native_ckpt:svr][{}] Checkpoint server started QueueSize={} Waiting for messages...\n", *this, queueSize);
+            std::fflush(stderr);
+            while (true) try
                 {
-                    size_t queuesPerDomain = static_cast<size_t>(cipc::MaxRanksPerNode) / numaNodes.size();
-                    if (queuesPerDomain == 0) { queuesPerDomain = 1; }
-                    size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
-                    queueNuma           = numaNodes[domain];
-                    BindThreadCpuToNumaNode(queueNuma);
-                }
-                auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize);
-                if (numaNodes.size() > 1)
-                {
-                    auto region = msgQueue.GetShmDataRegion();
-                    BindRegionToNumaNode(queueNuma, region.data(), region.size());
-                    std::fill(region.begin() + static_cast<std::ptrdiff_t>(cipc::MsgQueue::HdrAllocSize), region.end(), char{});
-                }
-                UnbindThreadCpu();
-                // Create publishes the queue geometry. Only after every queue reaches
-                // this point may a ping report the service as ready: clients start their
-                // fixed shared-memory open window immediately after SvcPing returns.
-                queuesReady.count_down();
-                {
-                    std::scoped_lock lock1(_mutex);
-                    _msgQueue.insert(&msgQueue);
-                }
-                fmt::print(
-                    stderr, "[native_ckpt:svr][{}] Checkpoint server started QueueSize={} Waiting for messages...\n", *this, queueSize);
-                std::fflush(stderr);
-                while (true) try
+                    auto const [stop, hdr, buf] = msgQueue.BeginRead();
+                    if (stop)
                     {
-                        auto const [stop, hdr, buf] = msgQueue.BeginRead();
-                        if (stop)
-                        {
-                            std::scoped_lock lock1(_mutex);
-                            fmt::print(stderr, "[native_ckpt:svr][{}] Stop requested. Shutting down server thread.\n", *this);
-                            _msgQueue.erase(&msgQueue);
-                            return;
-                        }
-                        // The slot returns to the writer even on a throw; a skipped EndRead
-                        // leaks it permanently and a saturated leak wedges the queue.
-                        try
-                        {
-                            HandleMessage(hdr, buf, msgQueue);
-                        } catch (std::exception const& e)
-                        {
-                            fmt::print(
-                                stderr, "[native_ckpt:svr][{}][ERROR] Exception handling message (slot released): {}\n", *this, e.what());
-                        }
-                        msgQueue.EndRead();
-
+                        std::scoped_lock lock1(_mutex);
+                        fmt::print(stderr, "[native_ckpt:svr][{}] Stop requested. Shutting down server thread.\n", *this);
+                        _msgQueue.erase(&msgQueue);
+                        return;
+                    }
+                    // The slot returns to the writer even on a throw; a skipped EndRead
+                    // leaks it permanently and a saturated leak wedges the queue.
+                    try
+                    {
+                        HandleMessage(hdr, buf, msgQueue);
                     } catch (std::exception const& e)
                     {
-                        fmt::print(stderr, "[native_ckpt:svr][{}][ERROR] Exception: {}\n", *this, e.what());
+                        fmt::print(
+                            stderr, "[native_ckpt:svr][{}][ERROR] Exception handling message (slot released): {}\n", *this, e.what());
                     }
-            });
-        }
-        queuesReady.wait();
-        StartTcpAcceptors_();
-    }
+                    msgQueue.EndRead();
 
-    bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
-    {
-        return std::ranges::all_of(_activeSessions, [](auto const& pair) { return pair.second->AllSnapshotsComplete(); });
+                } catch (std::exception const& e) { fmt::print(stderr, "[native_ckpt:svr][{}][ERROR] Exception: {}\n", *this, e.what()); }
+        });
     }
+    queuesReady.wait();
+    StartTcpAcceptors_();
+}
 
-    bool AllSessionsComplete()
-    {
-        std::scoped_lock<std::mutex> lock(_mutex);
-        return AllSessionsComplete(lock);
-    }
+bool Server::AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
+{
+    return std::ranges::all_of(_activeSessions, [](auto const& pair) { return pair.second->AllSnapshotsComplete(); });
+}
 
-    bool HasSessionsAndAllSessionsComplete()
-    {
-        std::scoped_lock<std::mutex> lock(_mutex);
-        return !_activeSessions.empty() && AllSessionsComplete(lock);
-    }
+bool Server::AllSessionsComplete()
+{
+    std::scoped_lock<std::mutex> lock(_mutex);
+    return AllSessionsComplete(lock);
+}
 
-    void WaitForShutdown()
+bool Server::HasSessionsAndAllSessionsComplete()
+{
+    std::scoped_lock<std::mutex> lock(_mutex);
+    return !_activeSessions.empty() && AllSessionsComplete(lock);
+}
+
+void Server::WaitForShutdown()
+{
+    while (true)
     {
-        while (true)
+        if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && HasSessionsAndAllSessionsComplete()))
         {
-            if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && HasSessionsAndAllSessionsComplete()))
-            {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            break;
         }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    Stop();
+}
+
+void Server::Ping()
+{
+    std::scoped_lock lock(_mutex);
+    _lastPingTime = PerfClock::now();
+}
+
+void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf, cipc::MsgQueue& msgQueue)
+{
+    switch (static_cast<cipc::Message::Type>(hdr.index()))
+    {
+    case cipc::Message::Type::Ping:
+    {
+        Ping();
+        return;    // TODO : reset the shutdown timer
+    }
+    case cipc::Message::Type::Shutdown:
+    {
         Stop();
     }
-
-    void Ping()
+    break;
+    // break;
+    case cipc::Message::Type::ActivateSession:
     {
         std::scoped_lock lock(_mutex);
         _lastPingTime = PerfClock::now();
-    }
 
-    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf, cipc::MsgQueue& msgQueue)
+        auto      hdr1 = std::get<cipc::Message::ActivateSession>(hdr);
+        BufStream bufStream{buf.data(), buf.size()};
+        auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
+        auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
+        auto      createSession = [&]() {
+            auto topo                   = StateSerDes::ReadTopology(bufStream);
+            auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
+            session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, Session::MaxActiveSnapshots);
+            session->Activate();
+            return session;
+        };
+
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] ActivateSession workDir={}\n", *this, hdr1.sessionId, workDir);
+        auto it = _activeSessions.find(hdr1.sessionId);
+        it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
+    }
+    break;
+    case cipc::Message::Type::FinalizeSession:
     {
-        switch (static_cast<cipc::Message::Type>(hdr.index()))
-        {
-        case cipc::Message::Type::Ping:
-        {
-            Ping();
-            return;    // TODO : reset the shutdown timer
-        }
-        case cipc::Message::Type::Shutdown:
-        {
-            Stop();
-        }
-        break;
-        // break;
-        case cipc::Message::Type::ActivateSession:
-        {
-            std::scoped_lock lock(_mutex);
-            _lastPingTime = PerfClock::now();
-
-            auto      hdr1 = std::get<cipc::Message::ActivateSession>(hdr);
-            BufStream bufStream{buf.data(), buf.size()};
-            auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
-            auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
-            auto      createSession = [&]() {
-                auto topo                   = StateSerDes::ReadTopology(bufStream);
-                auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
-                session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, Session::MaxActiveSnapshots);
-                session->Activate();
-                return session;
-            };
-
-            fmt::print(stderr, "[native_ckpt:svr][{}#{}] ActivateSession workDir={}\n", *this, hdr1.sessionId, workDir);
-            auto it = _activeSessions.find(hdr1.sessionId);
-            it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
-        }
-        break;
-        case cipc::Message::Type::FinalizeSession:
-        {
-            auto const& hdr1 = std::get<cipc::Message::FinalizeSession>(hdr);
-            fmt::print(stderr, "[native_ckpt:svr][{}#{}] FinalizeSession    \n", *this, hdr1.sessionId);
-            SessionById_(hdr1.sessionId).Handle(hdr1, buf);
-        }
-        break;
-        case cipc::Message::Type::LocalStateRegistry:
-        {
-            auto const& hdr1    = std::get<cipc::Message::LocalStateRegistry>(hdr);
-            auto&       session = SessionById_(hdr1.sessionId);
-            session.Handle(hdr1, buf);
-        }
-        break;
-        case cipc::Message::Type::LocalStateData:
-        {
-            auto const& hdr1 = std::get<cipc::Message::LocalStateData>(hdr);
-            SessionById_(hdr1.sessionId).Handle(hdr1, buf, msgQueue);
-        }
-        break;
-        case cipc::Message::Type::ActivateSnapshot:
-        {
-            auto const& hdr1 = std::get<cipc::Message::ActivateSnapshot>(hdr);
-            SessionById_(hdr1.sessionId).Handle(hdr1, buf);
-        }
-        break;
-        case cipc::Message::Type::FinalizeSnapshot:
-        {
-            // fmt::print(stderr, "[native_ckpt:svr] {}\n", _msgQueue->rlatency);
-            auto const& hdr1 = std::get<cipc::Message::FinalizeSnapshot>(hdr);
-            SessionById_(hdr1.sessionId).Handle(hdr1, buf);
-        }
-        break;
-        case cipc::Message::Type::StateRegistryFragment:
-            throw std::logic_error("StateRegistryFragment messages are not expected at the server");
-        // case cipc::Message::Type::ShardedStateData: [[fallthrough]];
-        case cipc::Message::Type::Unknown: [[fallthrough]];
-        case cipc::Message::Type::Invalid: [[fallthrough]];
-        default: throw std::logic_error("[native_ckpt:svr] Unexpected message type");
-        }
+        auto const& hdr1 = std::get<cipc::Message::FinalizeSession>(hdr);
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] FinalizeSession    \n", *this, hdr1.sessionId);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
-
-    void Stop()
+    break;
+    case cipc::Message::Type::LocalStateRegistry:
     {
-        bool wasRunning = false;
-        {
-            std::scoped_lock lock(_mutex);
-            wasRunning     = _running;
-            _stopRequested = true;
-            // Diagnostic: a graceful stop should only happen once every snapshot is both finalized
-            // and write-completed across all ranks. Warn (loudly) if we are stopping while any is
-            // still incomplete — that flags a premature "idle" decision (e.g. counting only
-            // write-complete and missing a peer node's still-in-flight finalize).
-            if (wasRunning)
-            {
-                for (auto const& [sessionId, session] : _activeSessions)
-                {
-                    auto const       expected = session->ExpectedWriteCompletions();
-                    std::scoped_lock slock(session->mutex);
-                    for (auto const& [snapshotId, snapshot] : session->snapshots)
-                    {
-                        auto const fin = snapshot->finalizedRanks.size();
-                        auto const wr  = snapshot->writeCkptCompletedRanks.size();
-                        if (fin < expected || wr < expected)
-                        {
-                            fmt::print(stderr,
-                                       "[native_ckpt:svr][{}#{}][WARN] stopping with snapshot {} INCOMPLETE: "
-                                       "finalized {}/{}, write-completed {}/{}\n",
-                                       *this,
-                                       sessionId,
-                                       snapshotId,
-                                       fin,
-                                       expected,
-                                       wr,
-                                       expected);
-                        }
-                    }
-                }
-                std::fflush(stderr);
-            }
-            for (auto const& msgQueue : _msgQueue)
-            {
-                if (msgQueue != nullptr) { msgQueue->Stop(); }
-            }
-        }
-        {
-            std::vector<std::thread> spinThreads;
-            {
-                std::scoped_lock lock(_mutex);
-                spinThreads.swap(_spinDownThreads);
-            }
-            for (auto& t : spinThreads)
-            {
-                if (t.joinable()) { t.join(); }
-            }
-        }
-        {
-            std::vector<std::vector<std::future<void>>> allTasks;
-            {
-                std::scoped_lock<std::mutex> lock(_mutex);
-                for (auto& [id, session] : _activeSessions)
-                {
-                    std::scoped_lock sessionLock(session->mutex);    // handlers push under this lock
-                    allTasks.push_back(std::move(session->asyncTasks));
-                }
-            }
-        }
-
-        if (!wasRunning) { return; }
-
-        boost::system::error_code ec;
-        for (auto& acceptor : _tcpAcceptors)
-        {
-            if (acceptor.close(ec))
-            {
-                fmt::print(stderr, "[native_ckpt:svr][{}][TCP][WARN] Failed to close acceptor: {}\n", *this, ec.message());
-            }
-        }
-        // Drain in-flight connection handlers before tearing down the io_context their
-        // accepted sockets are bound to.
-        if (_handlerPool)
-        {
-            _handlerPool->stop();
-            _handlerPool->join();
-        }
-        // Reset the session so they wait for the async ops to finish
-        _ioc.stop();
-        for (auto& t : _threads)
-        {
-            if (t.joinable()) { t.join(); }
-        }
-        {
-            std::scoped_lock<std::mutex> lock(_mutex);
-            _running = false;
-        }
+        auto const& hdr1    = std::get<cipc::Message::LocalStateRegistry>(hdr);
+        auto&       session = SessionById_(hdr1.sessionId);
+        session.Handle(hdr1, buf);
     }
+    break;
+    case cipc::Message::Type::LocalStateData:
+    {
+        auto const& hdr1 = std::get<cipc::Message::LocalStateData>(hdr);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf, msgQueue);
+    }
+    break;
+    case cipc::Message::Type::ActivateSnapshot:
+    {
+        auto const& hdr1 = std::get<cipc::Message::ActivateSnapshot>(hdr);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
+    }
+    break;
+    case cipc::Message::Type::FinalizeSnapshot:
+    {
+        // fmt::print(stderr, "[native_ckpt:svr] {}\n", _msgQueue->rlatency);
+        auto const& hdr1 = std::get<cipc::Message::FinalizeSnapshot>(hdr);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
+    }
+    break;
+    case cipc::Message::Type::StateRegistryFragment:
+        throw std::logic_error("StateRegistryFragment messages are not expected at the server");
+    // case cipc::Message::Type::ShardedStateData: [[fallthrough]];
+    case cipc::Message::Type::Unknown: [[fallthrough]];
+    case cipc::Message::Type::Invalid: [[fallthrough]];
+    default: throw std::logic_error("[native_ckpt:svr] Unexpected message type");
+    }
+}
 
-    void QuerySessions(ServerSessionCallback callback, void* cbData)
+void Server::Stop()
+{
+    bool wasRunning = false;
     {
         std::scoped_lock lock(_mutex);
-        for (auto const& [sessionId, session] : _activeSessions)
+        wasRunning     = _running;
+        _stopRequested = true;
+        // Diagnostic: a graceful stop should only happen once every snapshot is both finalized
+        // and write-completed across all ranks. Warn (loudly) if we are stopping while any is
+        // still incomplete — that flags a premature "idle" decision (e.g. counting only
+        // write-complete and missing a peer node's still-in-flight finalize).
+        if (wasRunning)
         {
-            for (auto const& [snapshotId, snapshot] : session->snapshots)
+            for (auto const& [sessionId, session] : _activeSessions)
             {
-                for (auto const& [rank, localState] : snapshot->localStates)
+                auto const       expected = session->ExpectedWriteCompletions();
+                std::scoped_lock slock(session->mutex);
+                for (auto const& [snapshotId, snapshot] : session->snapshots)
                 {
-                    callback(cbData,
-                             sessionId,
-                             snapshotId,
-                             snapshot->name,
-                             snapshot->path,
-                             *snapshot->registry,
-                             *localState->localRegistry,
-                             localState->tensorStorage);
-                }
-            }
-        }
-    }
-
-    private:
-    Session& SessionById_(cipc::SessionId sessionId)
-    {
-        std::scoped_lock lock(_mutex);
-        _lastPingTime = PerfClock::now();
-        auto it       = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end())
-        {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id={} not found", *this, sessionId));
-        }
-        return *it->second;
-    }
-
-    void NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
-    {
-        fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Finalize complete notification received for snapshot={} from rank={}\n",
-                   *this,
-                   sessionId,
-                   snapshotId,
-                   fromRank);
-        bool emitOnce = false;
-        auto start    = PerfClock::now();
-        while (true)
-        {
-            // Release _mutex before the wait below: ActivateSession also needs it to create the
-            // session, so holding it across the sleep would block the very creation we wait for
-            // (and stall every other handler, including spin-down's idle check).
-            {
-                std::scoped_lock<std::mutex> lock(_mutex);
-                auto                         it = _activeSessions.find(sessionId);
-                if (it != _activeSessions.end())
-                {
-                    auto it2 = it->second->snapshots.find(snapshotId);
-                    if (it2 == it->second->snapshots.end())
-                    {
-                        throw std::runtime_error(
-                            fmt::format("Received finalize complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
-                                        snapshotId,
-                                        fromRank));
-                    }
-                    std::scoped_lock<std::mutex> lock2(it->second->mutex);
-                    it2->second->finalizedRanks.insert(fromRank);
-                    if (emitOnce)
+                    auto const fin = snapshot->finalizedRanks.size();
+                    auto const wr  = snapshot->writeCkptCompletedRanks.size();
+                    if (fin < expected || wr < expected)
                     {
                         fmt::print(stderr,
-                                   "[native_ckpt:svr][{}#{}] Marked snapshot={} finalized for rank={}. Finalized ranks={}/{}\n",
+                                   "[native_ckpt:svr][{}#{}][WARN] stopping with snapshot {} INCOMPLETE: "
+                                   "finalized {}/{}, write-completed {}/{}\n",
                                    *this,
                                    sessionId,
                                    snapshotId,
-                                   fromRank,
-                                   it2->second->finalizedRanks.size(),
-                                   it->second->topo.worldSize);
+                                   fin,
+                                   expected,
+                                   wr,
+                                   expected);
                     }
-                    return;
                 }
             }
-
-            if (PerfClock::now() - start > 30s)
-            {
-                throw std::runtime_error(fmt::format(
-                    "Received finalize complete notification for non-existent session={} from rank={}.\n", sessionId, fromRank));
-            }
-            if (!emitOnce)
-            {
-                fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}] Finalize complete notification received for non-existent session={} from rank={}. "
-                           "Waiting...\n",
-                           *this,
-                           sessionId,
-                           sessionId,
-                           fromRank);
-                emitOnce = true;
-            }
-            std::this_thread::sleep_for(100ms);
+            std::fflush(stderr);
+        }
+        for (auto const& msgQueue : _msgQueue)
+        {
+            if (msgQueue != nullptr) { msgQueue->Stop(); }
         }
     }
-
-    void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
     {
-        fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Write checkpoint complete notification received for snapshot={} from rank={}\n",
-                   *this,
-                   sessionId,
-                   snapshotId,
-                   fromRank);
-        auto lock = std::scoped_lock<std::mutex>(_mutex);
-        auto it   = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end())
-        {
-            throw std::runtime_error(
-                fmt::format("Received write checkpoint complete notification for non-existent session={} from rank={}. Ignoring.\n",
-                            sessionId,
-                            fromRank));
-        }
-        auto it2 = it->second->snapshots.find(snapshotId);
-        if (it2 == it->second->snapshots.end())
-        {
-            throw std::runtime_error(
-                fmt::format("Received write checkpoint complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
-                            snapshotId,
-                            fromRank));
-        }
-        auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
-        it2->second->writeCkptCompletedRanks.insert(fromRank);
-    }
-
-    // Coordinator -> peer: store the broadcast global registry as this snapshot's registry, so the
-    // peer holds the merged view instead of only its own fragment. The arrival also means finalize
-    // is globally done, so mark every rank finalized.
-    void ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, std::string_view body)
-    {
-        BufStream                                       bufStream{body.data(), body.size()};
-        std::shared_ptr<StateTree>                      registry = StateSerDes::Read(bufStream);
-        std::vector<std::unique_ptr<Session::Snapshot>> evicted;
-        size_t                                          remainingSnapshots = 0;
-        uint32_t                                        numActiveSnapshots = 0;
+        std::vector<std::thread> spinThreads;
         {
             std::scoped_lock lock(_mutex);
-            auto             it = _activeSessions.find(sessionId);
-            if (it == _activeSessions.end())
-            {
-                throw std::runtime_error(fmt::format("Received global registry for non-existent session {}\n", sessionId));
-            }
-            auto&            session = *it->second;
-            std::scoped_lock lock2(session.mutex);
-            auto             it2 = session.snapshots.find(snapshotId);
-            if (it2 == session.snapshots.end())
-            {
-                throw std::runtime_error(fmt::format("Received global registry for non-existent snapshot {}\n", snapshotId));
-            }
-            it2->second->registry = std::move(registry);
-            auto const worldSize  = static_cast<uint32_t>(session.topo.worldSize);
-            for (uint32_t r = 0; r < worldSize; ++r) { it2->second->finalizedRanks.insert(cipc::Rank{r}); }
-            fmt::print(stderr, "[native_ckpt:svr][{}#{}] Received global registry for snapshot {}\n", *this, sessionId, snapshotId);
-
-            // Local shard writes can beat this broadcast. If they did, eviction was
-            // deliberately deferred above; finish it now that the coordinator no longer
-            // needs to address this snapshot on the peer.
-            while (!session.snapshots.empty() && session.snapshots.size() > session.numActiveSnapshots)
-            {
-                auto oldest = session.snapshots.begin();
-                if (!session.IsSnapshotEvictable(*oldest->second)) { break; }
-                evicted.push_back(std::move(oldest->second));
-                session.snapshots.erase(oldest);
-            }
-            remainingSnapshots = session.snapshots.size();
-            numActiveSnapshots = session.numActiveSnapshots;
+            spinThreads.swap(_spinDownThreads);
         }
-        if (!evicted.empty())
+        for (auto& t : spinThreads)
         {
-            fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after receiving global registry for snapshot={}. "
-                       "Remaining snapshots in memory={} numActiveSnapshots={}\n",
-                       *this,
-                       sessionId,
-                       evicted.size(),
-                       snapshotId,
-                       remainingSnapshots,
-                       numActiveSnapshots);
+            if (t.joinable()) { t.join(); }
+        }
+    }
+    {
+        std::vector<std::vector<std::future<void>>> allTasks;
+        {
+            std::scoped_lock<std::mutex> lock(_mutex);
+            for (auto& [id, session] : _activeSessions)
+            {
+                std::scoped_lock sessionLock(session->mutex);    // handlers push under this lock
+                allTasks.push_back(std::move(session->asyncTasks));
+            }
         }
     }
 
-    void RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
-                                        cipc::Rank                                                           fromRank,
-                                        tcp_stream&                                                          stream,
-                                        boost::beast::flat_buffer&                                           buffer,
-                                        boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser)
+    if (!wasRunning) { return; }
+
+    boost::system::error_code ec;
+    for (auto& acceptor : _tcpAcceptors)
     {
-        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Receiving state registry chunks for rank={}\n", *this, sessionId, fromRank);
-
-        // Reads exactly dest.size() bytes, looping over partial reads until complete.
-        // Returns bytes read; caller checks for 0+is_done() at record boundaries.
-        auto readSpan = [&](std::span<char> dest, bool allowDone) -> size_t {
-            size_t total    = 0;
-            auto   readSize = dest.size();
-            if (allowDone && parser.is_done()) { return 0; }
-            while (total < readSize)
-            {
-                auto prevRemaining       = readSize - total;
-                parser.get().body().data = dest.subspan(total).data();
-                parser.get().body().size = prevRemaining;
-                parser.get().body().more = true;
-                boost::system::error_code   ec;
-                [[maybe_unused]] auto const n = boost::beast::http::read_some(stream, buffer, parser, ec);
-                if (ec && ec != boost::beast::http::error::need_buffer) { throw boost::system::system_error(ec); }
-                auto const bodyBytesWritten = prevRemaining - parser.get().body().size;
-                total += bodyBytesWritten;
-                if (parser.is_done())
-                {
-                    if (allowDone && bodyBytesWritten == 0) { return 0; }
-                    if (total != readSize)
-                    {
-                        throw std::runtime_error(fmt::format("Unexpected end of HTTP body: read {} bytes, expected {}", total, readSize));
-                    }
-                    break;
-                }
-            }
-            return total;
-        };
-
-        auto readTrivial = [&](auto& value, bool allowDone = false) -> bool {
-            std::span<char> dest{reinterpret_cast<char*>(&value), sizeof(value)};
-            return readSpan(dest, allowDone) == 0;
-        };
-        auto readBlob = [&](char* dest, size_t size, bool allowDone = false) -> bool {
-            std::span<char> destSpan{dest, size};
-            return readSpan(destSpan, allowDone) == 0;
-        };
-
-        std::vector<TensorShardInfo>                  tensorShards;
-        std::vector<std::pair<std::string, uint64_t>> blobMetas;    // (fqn, length); rank is fromRank
-
-        // Read body in chunks; Beast transparently decodes chunked transfer encoding.
-        // Each record is tag-prefixed (PeerRecordTensor / PeerRecordBlob); a clean
-        // end-of-stream at a tag boundary terminates the fragment.
-        while (true)
+        if (acceptor.close(ec))
         {
-            uint8_t recordTag{};
-            if (readTrivial(recordTag, true))
+            fmt::print(stderr, "[native_ckpt:svr][{}][TCP][WARN] Failed to close acceptor: {}\n", *this, ec.message());
+        }
+    }
+    // Drain in-flight connection handlers before tearing down the io_context their
+    // accepted sockets are bound to.
+    if (_handlerPool)
+    {
+        _handlerPool->stop();
+        _handlerPool->join();
+    }
+    // Reset the session so they wait for the async ops to finish
+    _ioc.stop();
+    for (auto& t : _threads)
+    {
+        if (t.joinable()) { t.join(); }
+    }
+    {
+        std::scoped_lock<std::mutex> lock(_mutex);
+        _running = false;
+    }
+}
+
+void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
+{
+    std::scoped_lock lock(_mutex);
+    for (auto const& [sessionId, session] : _activeSessions)
+    {
+        for (auto const& [snapshotId, snapshot] : session->snapshots)
+        {
+            for (auto const& [rank, localState] : snapshot->localStates)
             {
-                break;    // Clean end-of-stream at a record boundary
-            }
-            if (recordTag == PeerRecordTensor)
-            {
-                TensorShardInfo info;
-                uint32_t        nodeIdLen{};
-                readTrivial(info.rank);
-                readTrivial(info.tensorInfo);
-                readTrivial(nodeIdLen);
-                info.nodeId = std::string(nodeIdLen, '\0');
-                readBlob(info.nodeId.data(), nodeIdLen);
-                info.tensorInfo.AssertShardIsValid();
-                tensorShards.push_back(std::move(info));
-            }
-            else if (recordTag == PeerRecordBlob)
-            {
-                uint64_t length{};
-                uint32_t fqnLen{};
-                readTrivial(length);
-                readTrivial(fqnLen);
-                std::string fqn(fqnLen, '\0');
-                readBlob(fqn.data(), fqnLen);
-                blobMetas.emplace_back(std::move(fqn), length);
-            }
-            else
-            {
-                throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Unknown peer fragment record tag={} from rank={}",
-                                                     *this,
-                                                     sessionId,
-                                                     recordTag,
-                                                     fromRank));
+                callback(cbData,
+                         sessionId,
+                         snapshotId,
+                         snapshot->name,
+                         snapshot->path,
+                         *snapshot->registry,
+                         *localState->localRegistry,
+                         localState->tensorStorage);
             }
         }
+    }
+}
 
-        // Every dispatch takes _mutex; release it before the merge below holds the
-        // session mutex for a whole insert batch.
-        Session* session = nullptr;
+Session& Server::SessionById_(cipc::SessionId sessionId)
+{
+    std::scoped_lock lock(_mutex);
+    _lastPingTime = PerfClock::now();
+    auto it       = _activeSessions.find(sessionId);
+    if (it == _activeSessions.end())
+    {
+        throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id={} not found", *this, sessionId));
+    }
+    return *it->second;
+}
+
+void Server::NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
+{
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}] Finalize complete notification received for snapshot={} from rank={}\n",
+               *this,
+               sessionId,
+               snapshotId,
+               fromRank);
+    bool emitOnce = false;
+    auto start    = PerfClock::now();
+    while (true)
+    {
+        // Release _mutex before the wait below: ActivateSession also needs it to create the
+        // session, so holding it across the sleep would block the very creation we wait for
+        // (and stall every other handler, including spin-down's idle check).
         {
-            auto lock = std::scoped_lock<std::mutex>(_mutex);
-            auto it   = _activeSessions.find(sessionId);
-            if (it == _activeSessions.end() || it->second->sessionState.registry == nullptr)
+            std::scoped_lock<std::mutex> lock(_mutex);
+            auto                         it = _activeSessions.find(sessionId);
+            if (it != _activeSessions.end())
             {
-                fmt::print(stderr,
-                           "[native_ckpt:svr][{}#{}][INFO] Received state registry fragment for non-existent session. Adding to "
-                           "pending data\n",
-                           *this,
-                           sessionId,
-                           fromRank);
-                auto pendingData          = std::make_unique<PendingSessionData>();
-                pendingData->tensorShards = std::move(tensorShards);
-                pendingData->blobMetas    = std::move(blobMetas);
-                pendingData->recvFrom     = fromRank;
-                pendingData->recievedAt   = PerfClock::now();
-                _pendingSessionData[sessionId].push_back(std::move(pendingData));
+                auto it2 = it->second->snapshots.find(snapshotId);
+                if (it2 == it->second->snapshots.end())
+                {
+                    throw std::runtime_error(
+                        fmt::format("Received finalize complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
+                                    snapshotId,
+                                    fromRank));
+                }
+                std::scoped_lock<std::mutex> lock2(it->second->mutex);
+                it2->second->finalizedRanks.insert(fromRank);
+                if (emitOnce)
+                {
+                    fmt::print(stderr,
+                               "[native_ckpt:svr][{}#{}] Marked snapshot={} finalized for rank={}. Finalized ranks={}/{}\n",
+                               *this,
+                               sessionId,
+                               snapshotId,
+                               fromRank,
+                               it2->second->finalizedRanks.size(),
+                               it->second->topo.worldSize);
+                }
                 return;
             }
-            session = it->second.get();
         }
-        session->HandleStateRegistryFragment(fromRank, tensorShards, blobMetas);
+
+        if (PerfClock::now() - start > 30s)
+        {
+            throw std::runtime_error(
+                fmt::format("Received finalize complete notification for non-existent session={} from rank={}.\n", sessionId, fromRank));
+        }
+        if (!emitOnce)
+        {
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}] Finalize complete notification received for non-existent session={} from rank={}. "
+                       "Waiting...\n",
+                       *this,
+                       sessionId,
+                       sessionId,
+                       fromRank);
+            emitOnce = true;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+}
+
+void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank fromRank, cipc::SnapshotId snapshotId)
+{
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}] Write checkpoint complete notification received for snapshot={} from rank={}\n",
+               *this,
+               sessionId,
+               snapshotId,
+               fromRank);
+    auto lock = std::scoped_lock<std::mutex>(_mutex);
+    auto it   = _activeSessions.find(sessionId);
+    if (it == _activeSessions.end())
+    {
+        throw std::runtime_error(fmt::format(
+            "Received write checkpoint complete notification for non-existent session={} from rank={}. Ignoring.\n", sessionId, fromRank));
+    }
+    auto it2 = it->second->snapshots.find(snapshotId);
+    if (it2 == it->second->snapshots.end())
+    {
+        throw std::runtime_error(
+            fmt::format("Received write checkpoint complete notification for non-existent snapshot={} from rank={}. Ignoring.\n",
+                        snapshotId,
+                        fromRank));
+    }
+    auto lock2 = std::scoped_lock<std::mutex>(it->second->mutex);
+    it2->second->writeCkptCompletedRanks.insert(fromRank);
+}
+
+// Coordinator -> peer: store the broadcast global registry as this snapshot's registry, so the
+// peer holds the merged view instead of only its own fragment. The arrival also means finalize
+// is globally done, so mark every rank finalized.
+void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, std::string_view body)
+{
+    BufStream                                       bufStream{body.data(), body.size()};
+    std::shared_ptr<StateTree>                      registry = StateSerDes::Read(bufStream);
+    std::vector<std::unique_ptr<Session::Snapshot>> evicted;
+    size_t                                          remainingSnapshots = 0;
+    uint32_t                                        numActiveSnapshots = 0;
+    {
+        std::scoped_lock lock(_mutex);
+        auto             it = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end())
+        {
+            throw std::runtime_error(fmt::format("Received global registry for non-existent session {}\n", sessionId));
+        }
+        auto&            session = *it->second;
+        std::scoped_lock lock2(session.mutex);
+        auto             it2 = session.snapshots.find(snapshotId);
+        if (it2 == session.snapshots.end())
+        {
+            throw std::runtime_error(fmt::format("Received global registry for non-existent snapshot {}\n", snapshotId));
+        }
+        it2->second->registry = std::move(registry);
+        auto const worldSize  = static_cast<uint32_t>(session.topo.worldSize);
+        for (uint32_t r = 0; r < worldSize; ++r) { it2->second->finalizedRanks.insert(cipc::Rank{r}); }
+        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Received global registry for snapshot {}\n", *this, sessionId, snapshotId);
+
+        // Local shard writes can beat this broadcast. If they did, eviction was
+        // deliberately deferred above; finish it now that the coordinator no longer
+        // needs to address this snapshot on the peer.
+        while (!session.snapshots.empty() && session.snapshots.size() > session.numActiveSnapshots)
+        {
+            auto oldest = session.snapshots.begin();
+            if (!session.IsSnapshotEvictable(*oldest->second)) { break; }
+            evicted.push_back(std::move(oldest->second));
+            session.snapshots.erase(oldest);
+        }
+        remainingSnapshots = session.snapshots.size();
+        numActiveSnapshots = session.numActiveSnapshots;
+    }
+    if (!evicted.empty())
+    {
         fmt::print(stderr,
-                   "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
+                   "[native_ckpt:svr][{}#{}][INFO] Evicted {} snapshots after receiving global registry for snapshot={}. "
+                   "Remaining snapshots in memory={} numActiveSnapshots={}\n",
                    *this,
                    sessionId,
-                   tensorShards.size(),
-                   fromRank);
+                   evicted.size(),
+                   snapshotId,
+                   remainingSnapshots,
+                   numActiveSnapshots);
     }
+}
 
-    void SpinDownWaitLoop_(tcp_stream stream)
-    {
-        SetThreadName("ncs:spindown");
-        static constexpr auto HeartbeatInterval = 2s;
-        // No explicit timeout falls back to a generous default so a wedged server can't hang
-        // a caller forever — matched to WaitForShutdown's idle auto-shutdown window.
+void Server::RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
+                                            cipc::Rank                                                           fromRank,
+                                            tcp_stream&                                                          stream,
+                                            boost::beast::flat_buffer&                                           buffer,
+                                            boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser)
+{
+    fmt::print(stderr, "[native_ckpt:svr][{}#{}] Receiving state registry chunks for rank={}\n", *this, sessionId, fromRank);
 
-        auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
-
-        // No deadline on the synchronous writes; the heartbeat cadence, not a socket timeout,
-        // bounds how long we hold the connection.
-        stream.expires_never();
-
-        boost::system::error_code                                    ec;
-        boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, 11};
-        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-        res.chunked(true);
-        boost::beast::http::response_serializer<boost::beast::http::empty_body> sr{res};
-        boost::beast::http::write_header(stream, sr, ec);
-
-        bool hardStop = false;
-        while (!ec)
+    // Reads exactly dest.size() bytes, looping over partial reads until complete.
+    // Returns bytes read; caller checks for 0+is_done() at record boundaries.
+    auto readSpan = [&](std::span<char> dest, bool allowDone) -> size_t {
+        size_t total    = 0;
+        auto   readSize = dest.size();
+        if (allowDone && parser.is_done()) { return 0; }
+        while (total < readSize)
         {
-            if (AllSessionsComplete()) { break; }
-            if (_stopRequested) { break; }    // another path already began shutdown
-            if (PerfClock::now() >= deadline)
+            auto prevRemaining       = readSize - total;
+            parser.get().body().data = dest.subspan(total).data();
+            parser.get().body().size = prevRemaining;
+            parser.get().body().more = true;
+            boost::system::error_code   ec;
+            [[maybe_unused]] auto const n = boost::beast::http::read_some(stream, buffer, parser, ec);
+            if (ec && ec != boost::beast::http::error::need_buffer) { throw boost::system::system_error(ec); }
+            auto const bodyBytesWritten = prevRemaining - parser.get().body().size;
+            total += bodyBytesWritten;
+            if (parser.is_done())
             {
-                hardStop = true;
+                if (allowDone && bodyBytesWritten == 0) { return 0; }
+                if (total != readSize)
+                {
+                    throw std::runtime_error(fmt::format("Unexpected end of HTTP body: read {} bytes, expected {}", total, readSize));
+                }
                 break;
             }
-            // A non-empty chunk keeps the client read alive while we wait for idle. The body
-            // is opaque to the caller, which only inspects the status line.
-            static constexpr std::string_view Heartbeat = " ";
-            boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Heartbeat)), ec);
-            if (ec) { break; }    // client hung up — stop heartbeating, still spin down below
-            std::this_thread::sleep_for(HeartbeatInterval);
         }
+        return total;
+    };
 
-        if (hardStop)
+    auto readTrivial = [&](auto& value, bool allowDone = false) -> bool {
+        std::span<char> dest{reinterpret_cast<char*>(&value), sizeof(value)};    // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        return readSpan(dest, allowDone) == 0;
+    };
+    auto readBlob = [&](char* dest, size_t size, bool allowDone = false) -> bool {
+        std::span<char> destSpan{dest, size};
+        return readSpan(destSpan, allowDone) == 0;
+    };
+
+    std::vector<TensorShardInfo>                  tensorShards;
+    std::vector<std::pair<std::string, uint64_t>> blobMetas;    // (fqn, length); rank is fromRank
+
+    // Read body in chunks; Beast transparently decodes chunked transfer encoding.
+    // Each record is tag-prefixed (PeerRecordTensor / PeerRecordBlob); a clean
+    // end-of-stream at a tag boundary terminates the fragment.
+    while (true)
+    {
+        uint8_t recordTag{};
+        if (readTrivial(recordTag, true))
         {
-            fmt::print(
-                stderr, "[native_ckpt:svr][{}][ERROR] spindown timed out before idle; hard-stopping (aborting in-flight work)\n", *this);
-            std::scoped_lock lock(_mutex);
+            break;    // Clean end-of-stream at a record boundary
+        }
+        if (recordTag == PeerRecordTensor)
+        {
+            TensorShardInfo info;
+            uint32_t        nodeIdLen{};
+            readTrivial(info.rank);
+            readTrivial(info.tensorInfo);
+            readTrivial(nodeIdLen);
+            info.nodeId = std::string(nodeIdLen, '\0');
+            readBlob(info.nodeId.data(), nodeIdLen);
+            info.tensorInfo.AssertShardIsValid();
+            tensorShards.push_back(std::move(info));
+        }
+        else if (recordTag == PeerRecordBlob)
+        {
+            uint64_t length{};
+            uint32_t fqnLen{};
+            readTrivial(length);
+            readTrivial(fqnLen);
+            std::string fqn(fqnLen, '\0');
+            readBlob(fqn.data(), fqnLen);
+            blobMetas.emplace_back(std::move(fqn), length);
+        }
+        else
+        {
+            throw std::runtime_error(fmt::format(
+                "[native_ckpt:svr][{}#{}][ERROR] Unknown peer fragment record tag={} from rank={}", *this, sessionId, recordTag, fromRank));
+        }
+    }
+
+    // Every dispatch takes _mutex; release it before the merge below holds the
+    // session mutex for a whole insert batch.
+    Session* session = nullptr;
+    {
+        auto lock = std::scoped_lock<std::mutex>(_mutex);
+        auto it   = _activeSessions.find(sessionId);
+        if (it == _activeSessions.end() || it->second->sessionState.registry == nullptr)
+        {
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][INFO] Received state registry fragment for non-existent session. Adding to "
+                       "pending data\n",
+                       *this,
+                       sessionId,
+                       fromRank);
+            auto pendingData          = std::make_unique<PendingSessionData>();
+            pendingData->tensorShards = std::move(tensorShards);
+            pendingData->blobMetas    = std::move(blobMetas);
+            pendingData->recvFrom     = fromRank;
+            pendingData->recievedAt   = PerfClock::now();
+            _pendingSessionData[sessionId].push_back(std::move(pendingData));
+            return;
+        }
+        session = it->second.get();
+    }
+    session->HandleStateRegistryFragment(fromRank, tensorShards, blobMetas);
+    fmt::print(stderr,
+               "[native_ckpt:svr][{}#{}] Successfully received and processed {} tensor shards from rank={}\n",
+               *this,
+               sessionId,
+               tensorShards.size(),
+               fromRank);
+}
+
+void Server::SpinDownWaitLoop_(tcp_stream stream)
+{
+    SetThreadName("ncs:spindown");
+    static constexpr auto HeartbeatInterval = 2s;
+    // No explicit timeout falls back to a generous default so a wedged server can't hang
+    // a caller forever — matched to WaitForShutdown's idle auto-shutdown window.
+
+    auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
+
+    // No deadline on the synchronous writes; the heartbeat cadence, not a socket timeout,
+    // bounds how long we hold the connection.
+    stream.expires_never();
+
+    boost::system::error_code ec;
+    // NOLINTNEXTLINE(readability-magic-numbers)
+    boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, 11};
+    res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+    res.chunked(true);
+    boost::beast::http::response_serializer<boost::beast::http::empty_body> sr{res};
+    boost::beast::http::write_header(stream, sr, ec);
+
+    bool hardStop = false;
+    while (!ec)
+    {
+        if (AllSessionsComplete()) { break; }
+        if (_stopRequested) { break; }    // another path already began shutdown
+        if (PerfClock::now() >= deadline)
+        {
+            hardStop = true;
+            break;
+        }
+        // A non-empty chunk keeps the client read alive while we wait for idle. The body
+        // is opaque to the caller, which only inspects the status line.
+        static constexpr std::string_view Heartbeat = " ";
+        boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Heartbeat)), ec);
+        if (ec) { break; }    // client hung up — stop heartbeating, still spin down below
+        std::this_thread::sleep_for(HeartbeatInterval);
+    }
+
+    if (hardStop)
+    {
+        fmt::print(stderr, "[native_ckpt:svr][{}][ERROR] spindown timed out before idle; hard-stopping (aborting in-flight work)\n", *this);
+        std::scoped_lock lock(_mutex);
+        for (auto& session : _activeSessions)
+        {
+            std::scoped_lock slock(session.second->mutex);
+            session.second->stopRequested = true;
+        }
+    }
+    else
+    {
+        fmt::print(stderr, "[native_ckpt:svr][{}][INFO] spindown: all sessions idle; spinning down\n", *this);
+    }
+
+    // Final empty "{}" payload, matching the hard-stop reply, then the terminating chunk.
+    static constexpr std::string_view Final = "{}";
+    boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Final)), ec);
+    boost::asio::write(stream.socket(), boost::beast::http::make_chunk_last(), ec);
+    TryCleanShutdown(stream);
+
+    _stopRequested = true;    // WaitForShutdown observes this and calls Stop()
+}
+
+void Server::HandleRequest_(tcp_stream& stream)
+{
+    boost::beast::flat_buffer buffer;
+    // First, read only the headers to determine the endpoint
+    boost::beast::http::request_parser<boost::beast::http::empty_body> headerParser;
+    headerParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+    boost::beast::http::read_header(stream, buffer, headerParser);
+
+    auto const& headers = headerParser.get();
+    auto        target  = headers.target();
+    SetThreadName(fmt::format("ncs:w:{}", target).c_str());
+
+    auto url     = boost::urls::parse_origin_form(target).value();
+    auto segs    = url.segments();
+    auto it      = segs.begin();
+    auto matches = [&](std::initializer_list<std::string> const& patterns) -> bool {
+        if (segs.size() < patterns.size()) { return false; }
+        it = segs.begin();
+        for (auto const& pattern : patterns)
+        {
+            if (*(it++) != pattern) { return false; }
+        }
+        return true;
+    };
+
+    // Check if this is the state upload endpoint: POST /api/peer/shardedstateregistry/{sessionId}/{rank}
+    if (matches({"api", "peer", "shardedstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto rank      = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
+
+        boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+        RecieveStateRegistryFragments_(sessionId, rank, stream, buffer, bufferParser);
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    // Check if this is the state upload endpoint: POST /api/peer/finalizecomplete/{sessionId}/{rank}/{snapshotId}
+
+    else if (matches({"api", "peer", "finalizecomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
+
+        boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+        NotifyFinalizeComplete_(sessionId, rank, snapshotId);
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    else if (matches({"api", "peer", "writeckptcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
+
+        boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+        NotifyWriteCkptComplete_(sessionId, rank, snapshotId);
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    // Coordinator broadcast: the merged global registry for a snapshot (body = serialized tree).
+    else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint"); }
+
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        ReceiveGlobalRegistry_(sessionId, snapshotId, bodyParser.get().body());
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
+    {
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        Ping();
+    }
+    else if (matches({"api", "stop"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
+    {
+        // Reply OK first, then signal shutdown via the flag that WaitForShutdown polls.
+        // We can't call Stop() inline: it joins _threads and we're running on one of them.
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        _stopRequested = true;
+        {
             for (auto& session : _activeSessions)
             {
-                std::scoped_lock slock(session.second->mutex);
+                std::scoped_lock lock(session.second->mutex);
                 session.second->stopRequested = true;
             }
         }
-        else
-        {
-            fmt::print(stderr, "[native_ckpt:svr][{}][INFO] spindown: all sessions idle; spinning down\n", *this);
-        }
-
-        // Final empty "{}" payload, matching the hard-stop reply, then the terminating chunk.
-        static constexpr std::string_view Final = "{}";
-        boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Final)), ec);
-        boost::asio::write(stream.socket(), boost::beast::http::make_chunk_last(), ec);
-        TryCleanShutdown(stream);
-
-        _stopRequested = true;    // WaitForShutdown observes this and calls Stop()
+    }
+    else if (matches({"api", "spindown"}) && headers.method() == boost::beast::http::verb::get)
+    {
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in spindown endpoint"); }
+        // Hand the connection off to a dedicated waiter thread and return at once: the
+        // accept loop must stay free to service the peer writeckptcomplete/finalizecomplete
+        // notifications that idle-ness depends on, otherwise the wait would deadlock.
+        std::scoped_lock lock(_mutex);
+        _spinDownThreads.emplace_back([this, s = std::move(stream)]() mutable { SpinDownWaitLoop_(std::move(s)); });
+    }
+    else
+    {
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::not_found, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "Endpoint not found";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
     }
 
-    void HandleRequest_(tcp_stream& stream)
+    SetThreadName("ncs:w");
+}
+
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+void Server::AcquireInstanceLock_()
+{
+    if (_instanceLock) { return; }
+
+    auto const lockPath = std::filesystem::temp_directory_path() / fmt::format("nvrx_ckpt_server.{}.lock", Port + _index);
     {
-        boost::beast::flat_buffer buffer;
-        // First, read only the headers to determine the endpoint
-        boost::beast::http::request_parser<boost::beast::http::empty_body> headerParser;
-        headerParser.body_limit(std::numeric_limits<std::uint64_t>::max());
-        boost::beast::http::read_header(stream, buffer, headerParser);
+        std::ofstream lockFile(lockPath, std::ios::app);
+        if (!lockFile.good()) { throw std::runtime_error(fmt::format("Instance lock create failed: {}", lockPath)); }
+    }
 
-        auto const& headers = headerParser.get();
-        auto        target  = headers.target();
-        SetThreadName(fmt::format("ncs:w:{}", target).c_str());
+    try
+    {
+        auto lock = std::make_unique<bip::file_lock>(lockPath.string().c_str());
+        if (!lock->try_lock()) { throw cipc::ErrorAlreadyRunning(); }
+        _instanceLock = std::move(lock);
+    } catch (bip::interprocess_exception const& e) { throw std::runtime_error(fmt::format("Instance lock {}: {}", lockPath, e.what())); }
+}
 
-        auto url     = boost::urls::parse_origin_form(target).value();
-        auto segs    = url.segments();
-        auto it      = segs.begin();
-        auto matches = [&](std::initializer_list<std::string> const& patterns) -> bool {
-            if (segs.size() < patterns.size()) { return false; }
-            it = segs.begin();
-            for (auto const& pattern : patterns)
+#endif
+
+void Server::StartTcpListener_()
+{
+    using boost::asio::ip::tcp;
+    auto const    address = boost::asio::ip::make_address("0.0.0.0");
+    tcp::endpoint endpoint(address, Port + _index);
+
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+    // When SO_REUSEPORT is enabled, the TCP port no longer elects a single owner.
+    // Losers must throw before touching acceptors or shm rings; Start() spawns the
+    // shm consumer threads only after this returns.
+    AcquireInstanceLock_();
+#endif
+
+    _tcpAcceptors.clear();
+    _tcpAcceptors.reserve(AcceptorCount);
+    for (size_t i = 0; i < AcceptorCount; ++i)
+    {
+        auto& acceptor = _tcpAcceptors.emplace_back(_ioc);
+        acceptor.open(endpoint.protocol());
+        acceptor.set_option(boost::asio::socket_base::reuse_address(true));
+#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+        int const enable = 1;
+        ::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
+#endif
+        boost::system::error_code ec;
+        ec = acceptor.bind(endpoint, ec);
+        if (ec) { throw cipc::ErrorAlreadyRunning(); }
+        ec = acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) { throw cipc::ErrorAlreadyRunning(); }
+    }
+}
+
+void Server::StartTcpAcceptors_()
+{
+    for (auto& acceptor : _tcpAcceptors)
+    {
+        boost::asio::co_spawn(_ioc, DoListen_(acceptor), [](std::exception_ptr const& e) {
+            if (e) try
+                {
+                    std::rethrow_exception(e);
+                } catch (boost::system::system_error& e)
+                {
+                    if (e.code() != boost::asio::error::operation_aborted) { throw; }
+                } catch (std::exception& e) { fmt::print(stderr, "Error in acceptor: {}\n", e.what()); }
+        });
+    }
+
+    for (size_t i = 0; i < AcceptorCount; i++)
+    {
+        _threads.emplace_back([this, i]() {
+            SetThreadName(fmt::format("ncs:ios:{}", i).c_str());
+            _ioc.run();
+        });
+    }
+}
+
+// The accept loop only accepts and hands each connection to `_handlerPool`, then
+// returns to async_accept at once. HandleRequest_ does synchronous, sometimes
+// long-running work (peer forwards, file writes, a bounded wait for a session);
+// running it inline serializes accepts and lets the kernel listen backlog overflow
+// under a many-node connect storm (the "connection refused on node:0" symptom).
+boost::asio::awaitable<void>
+Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcoreguidelines-avoid-reference-coroutine-parameters)
+{
+    while (true)
+    {
+        auto socket = co_await acceptor.async_accept();
+        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)]() mutable {
+            static constexpr auto Timeout = std::chrono::seconds{30};
+            tcp_stream            stream(std::move(sock));
+            stream.expires_after(Timeout);
+            try
             {
-                if (*(it++) != pattern) { return false; }
-            }
-            return true;
-        };
-
-        // Check if this is the state upload endpoint: POST /api/peer/shardedstateregistry/{sessionId}/{rank}
-        if (matches({"api", "peer", "shardedstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
-        {
-            auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-            auto rank      = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
-            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
-
-            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
-            RecieveStateRegistryFragments_(sessionId, rank, stream, buffer, bufferParser);
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-        }
-        // Check if this is the state upload endpoint: POST /api/peer/finalizecomplete/{sessionId}/{rank}/{snapshotId}
-
-        else if (matches({"api", "peer", "finalizecomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
-        {
-            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-            auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
-            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
-            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
-
-            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
-            NotifyFinalizeComplete_(sessionId, rank, snapshotId);
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-        }
-        else if (matches({"api", "peer", "writeckptcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
-        {
-            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-            auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
-            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
-            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
-
-            boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
-            NotifyWriteCkptComplete_(sessionId, rank, snapshotId);
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-        }
-        // Coordinator broadcast: the merged global registry for a snapshot (body = serialized tree).
-        else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
-        {
-            auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-            auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
-            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint"); }
-
-            boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
-            bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
-            boost::beast::http::read(stream, buffer, bodyParser);
-            ReceiveGlobalRegistry_(sessionId, snapshotId, bodyParser.get().body());
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-        }
-        else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
-        {
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-            Ping();
-        }
-        else if (matches({"api", "stop"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
-        {
-            // Reply OK first, then signal shutdown via the flag that WaitForShutdown polls.
-            // We can't call Stop() inline: it joins _threads and we're running on one of them.
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "{}";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-            _stopRequested = true;
+                HandleRequest_(stream);
+            } catch (boost::system::system_error const& e)
             {
-                for (auto& session : _activeSessions)
-                {
-                    std::scoped_lock lock(session.second->mutex);
-                    session.second->stopRequested = true;
-                }
+                TryCleanShutdown(stream);
+                if (e.code() != boost::beast::http::error::end_of_stream) { fmt::print(stderr, "Error handling request: {}\n", e.what()); }
+            } catch (std::exception const& e)
+            {
+                TryCleanShutdown(stream);
+                fmt::print(stderr, "Error: {}\n", e.what());
             }
-        }
-        else if (matches({"api", "spindown"}) && headers.method() == boost::beast::http::verb::get)
-        {
-            if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in spindown endpoint"); }
-            // Hand the connection off to a dedicated waiter thread and return at once: the
-            // accept loop must stay free to service the peer writeckptcomplete/finalizecomplete
-            // notifications that idle-ness depends on, otherwise the wait would deadlock.
-            std::scoped_lock lock(_mutex);
-            _spinDownThreads.emplace_back([this, s = std::move(stream)]() mutable { SpinDownWaitLoop_(std::move(s)); });
-        }
-        else
-        {
-            boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::not_found, headers.version()};
-            res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-            res.keep_alive(headers.keep_alive());
-            res.body() = "Endpoint not found";
-            res.prepare_payload();
-            boost::beast::http::write(stream, res);
-        }
-
-        SetThreadName("ncs:w");
+        });
     }
-
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-    void AcquireInstanceLock_()
-    {
-        if (_instanceLock) { return; }
-
-        auto const lockPath = std::filesystem::temp_directory_path() / fmt::format("nvrx_ckpt_server.{}.lock", Port + _index);
-        {
-            std::ofstream lockFile(lockPath, std::ios::app);
-            if (!lockFile.good()) { throw std::runtime_error(fmt::format("Instance lock create failed: {}", lockPath)); }
-        }
-
-        try
-        {
-            auto lock = std::make_unique<bip::file_lock>(lockPath.string().c_str());
-            if (!lock->try_lock()) { throw cipc::ErrorAlreadyRunning(); }
-            _instanceLock = std::move(lock);
-        } catch (bip::interprocess_exception const& e)
-        {
-            throw std::runtime_error(fmt::format("Instance lock {}: {}", lockPath, e.what()));
-        }
-    }
-
-    class ReusePortOption
-    {
-        public:
-        explicit ReusePortOption(bool enabled) : _value(enabled ? 1 : 0) {}
-
-        template <typename Protocol> int         level(Protocol const&) const { return SOL_SOCKET; }
-        template <typename Protocol> int         name(Protocol const&) const { return SO_REUSEPORT; }
-        template <typename Protocol> void const* data(Protocol const&) const { return &_value; }
-        template <typename Protocol> std::size_t size(Protocol const&) const { return sizeof(_value); }
-
-        private:
-        int _value;
-    };
-#endif
-
-    void StartTcpListener_()
-    {
-        using boost::asio::ip::tcp;
-        auto const    address = boost::asio::ip::make_address("0.0.0.0");
-        tcp::endpoint endpoint(address, Port + _index);
-
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-        // When SO_REUSEPORT is enabled, the TCP port no longer elects a single owner.
-        // Losers must throw before touching acceptors or shm rings; Start() spawns the
-        // shm consumer threads only after this returns.
-        AcquireInstanceLock_();
-#endif
-
-        _tcpAcceptors.clear();
-        _tcpAcceptors.reserve(AcceptorCount);
-        for (size_t i = 0; i < AcceptorCount; ++i)
-        {
-            auto& acceptor = _tcpAcceptors.emplace_back(_ioc);
-            acceptor.open(endpoint.protocol());
-            acceptor.set_option(boost::asio::socket_base::reuse_address(true));
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-            int const enable = 1;
-            ::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
-#endif
-            boost::system::error_code ec;
-            ec = acceptor.bind(endpoint, ec);
-            if (ec) { throw cipc::ErrorAlreadyRunning(); }
-            ec = acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
-            if (ec) { throw cipc::ErrorAlreadyRunning(); }
-        }
-    }
-
-    void StartTcpAcceptors_()
-    {
-        for (auto& acceptor : _tcpAcceptors)
-        {
-            boost::asio::co_spawn(_ioc, DoListen_(acceptor), [](std::exception_ptr const& e) {
-                if (e) try
-                    {
-                        std::rethrow_exception(e);
-                    } catch (boost::system::system_error& e)
-                    {
-                        if (e.code() != boost::asio::error::operation_aborted) { throw; }
-                    } catch (std::exception& e) { fmt::print(stderr, "Error in acceptor: {}\n", e.what()); }
-            });
-        }
-
-        for (size_t i = 0; i < AcceptorCount; i++)
-        {
-            _threads.emplace_back([this, i]() {
-                SetThreadName(fmt::format("ncs:ios:{}", i).c_str());
-                _ioc.run();
-            });
-        }
-    }
-
-    // The accept loop only accepts and hands each connection to `_handlerPool`, then
-    // returns to async_accept at once. HandleRequest_ does synchronous, sometimes
-    // long-running work (peer forwards, file writes, a bounded wait for a session);
-    // running it inline serializes accepts and lets the kernel listen backlog overflow
-    // under a many-node connect storm (the "connection refused on node:0" symptom).
-    boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor)
-    {
-        while (true)
-        {
-            auto socket = co_await acceptor.async_accept();
-            boost::asio::post(*_handlerPool, [this, sock = std::move(socket)]() mutable {
-                static constexpr auto Timeout = std::chrono::seconds{30};
-                tcp_stream            stream(std::move(sock));
-                stream.expires_after(Timeout);
-                try
-                {
-                    HandleRequest_(stream);
-                } catch (boost::system::system_error const& e)
-                {
-                    TryCleanShutdown(stream);
-                    if (e.code() != boost::beast::http::error::end_of_stream)
-                    {
-                        fmt::print(stderr, "Error handling request: {}\n", e.what());
-                    }
-                } catch (std::exception const& e)
-                {
-                    TryCleanShutdown(stream);
-                    fmt::print(stderr, "Error: {}\n", e.what());
-                }
-            });
-        }
-    }
-
-    private:
-    uint16_t   _index{};
-    std::mutex _mutex;
-
-    PerfClock::time_point               _lastPingTime{PerfClock::now()};
-    std::atomic<bool>                   _stopRequested{false};
-    std::unordered_set<cipc::MsgQueue*> _msgQueue{nullptr};
-    bool                                _running{false};
-    std::vector<std::thread>            _threads;
-    // Live spin-down waiter threads, each holding one client connection open until idle.
-    std::vector<std::thread> _spinDownThreads;
-
-    boost::asio::io_context _ioc;
-    // N acceptors share the port via SO_REUSEPORT where available, so the kernel spreads
-    // inbound connections across N accept queues. Without SO_REUSEPORT, fall back to one
-    // acceptor and keep the offloaded handler pool.
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-    static constexpr size_t AcceptorCount = 8;
-#else
-    static constexpr size_t AcceptorCount = 1;
-#endif
-    std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
-
-    // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
-    std::unique_ptr<bip::file_lock> _instanceLock;
-
-    // Connection handlers run here, off the accept loop. Declared after _ioc so it is
-    // joined (destroyed) before the io_context the handlers' sockets are bound to.
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-    static constexpr size_t HandlerThreads = 4;
-#else
-    static constexpr size_t HandlerThreads = 64;
-#endif
-    std::unique_ptr<boost::asio::thread_pool> _handlerPool;
-
-    // TODO_NOPENDING_STRUCT
-    struct PendingSessionData
-    {
-        PerfClock::time_point                         recievedAt;
-        Rank                                          recvFrom{Rank::Invalid};
-        std::vector<TensorShardInfo>                  tensorShards;
-        std::vector<std::pair<std::string, uint64_t>> blobMetas;
-    };
-
-    std::unordered_map<cipc::SessionId, std::vector<std::unique_ptr<PendingSessionData>>> _pendingSessionData;
-
-    std::unordered_map<cipc::SessionId, std::unique_ptr<Session>> _activeSessions;
-    friend struct Session;
-};
+}
 
 void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
 {

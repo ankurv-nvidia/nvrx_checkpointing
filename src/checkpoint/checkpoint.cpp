@@ -70,9 +70,8 @@ void SvcPing()
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }
-    else
-    {
-        try
+    
+            try
         {
             boost::asio::io_context    ctx;
             boost::asio::readable_pipe output(ctx);
@@ -90,7 +89,7 @@ void SvcPing()
                        ex.what());
             throw;
         }
-    }
+   
     // Both the elected daemon and losing candidates write READY only after the
     // elected service answers a ping. The two short attempts inside TryConnect
     // cover a final scheduling edge without a second readiness policy here.

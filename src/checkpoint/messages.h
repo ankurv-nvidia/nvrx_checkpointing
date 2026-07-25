@@ -12,11 +12,13 @@ namespace checkpoint::ipc
 
 enum class SessionId : uint32_t
 {
+    Default = 0,
     Invalid = std::numeric_limits<uint32_t>::max()
 };
 
 enum class SnapshotId : uint32_t
 {
+    Default = 0,
     Invalid = std::numeric_limits<uint32_t>::max()
 };
 using Rank = ::Rank;

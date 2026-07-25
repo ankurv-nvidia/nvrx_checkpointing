@@ -124,8 +124,8 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
 
     auto stopTime    = PerfMetrics::Clock::now();
     Duration         = std::chrono::duration_cast<std::chrono::nanoseconds>(stopTime - StartTime.load());
-    double bandwidth = (static_cast<double>(msgCount * memorySize) * 1e9 / 1024 / 1024 / 1024)
-                       / static_cast<double>(Duration.load().count());    // NOLINT
+    double bandwidth = (static_cast<double>(msgCount * memorySize) * 1e9 / 1024 / 1024 / 1024)    // NOLINT(readability-magic-numbers)
+                       / static_cast<double>(Duration.load().count());
     fmt::print("[c{}] finished sending {} messages in {}ms Bandwidth = {:.4f}GB/s. msgQ = {}\n",
                rank,
                msgCount,

@@ -24,9 +24,9 @@ SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 CheckpointTestContext Ctx;    // NOLINT
 SUPPRESS_WARNINGS_END
 
-constexpr char KDefaultCkptDir[] = "/tmp/checkpoint_bench";
+constexpr std::string_view KDefaultCkptDir = "/tmp/checkpoint_bench";
 
-void BM_SaveCheckpoint(benchmark::State& benchState)    // NOLINT(readability-identifier-naming)
+void BM_SaveCheckpoint(benchmark::State& benchState)    // NOLINT(readability-identifier-naming,llvm-prefer-static-over-anonymous-namespace)
 {
     for (auto _ : benchState) { RunOnAllRanks(Ctx, &SaveCheckpointOnly, KDefaultCkptDir); }
 }
@@ -67,8 +67,8 @@ try
         desc.print(std::cerr);
         std::cerr << '\n';
         int   argcForHelp   = 1;
-        char* argvForHelp[] = {argv[0], const_cast<char*>("--help")};
-        benchmark::Initialize(&argcForHelp, argvForHelp);
+        char* argvForHelp[] = {argv[0], const_cast<char*>("--help")};    // NOLINT
+        benchmark::Initialize(&argcForHelp, argvForHelp);                // NOLINT
         return 1;
     }
 

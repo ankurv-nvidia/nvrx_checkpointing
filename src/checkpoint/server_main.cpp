@@ -21,11 +21,8 @@
 extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);
 
-namespace
-{
-
 // Allow templated names and Expand %h (hostname) and %p (pid) to avoid collision on network-shared-fs
-std::string GetLogPath()
+static std::string GetLogPath()
 {
     char const*           envLog  = ::getenv("NATIVE_CKPT_SERVER_LOG");
     std::string           path    = (envLog != nullptr && *envLog != '\0') ? std::string(envLog) : "/tmp/native_ckpt_server.%h_%p.log";
@@ -48,7 +45,7 @@ std::string GetLogPath()
 // Detach stdin/stderr so the daemon never blocks on a pipe owned by the departed client.
 // Stdout stays on the launcher pipe for RunServer's "READY\n" handshake (single-write, SIGPIPE ignored).
 // Stderr goes to the log file; if it can't be opened the daemon refuses to start.
-void RedirectStdio()
+static void RedirectStdio()
 {
     auto                    logPath     = GetLogPath();
     static constexpr mode_t LogFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
@@ -99,7 +96,7 @@ extern "C" void LogAndExitHandler(int sig)
 
 // Full demangled, file:line backtrace via cpptrace. Used by the std::terminate handler, which
 // runs in a normal context where allocation + symbolization are safe.
-void DumpBacktraceToLog()
+static void DumpBacktraceToLog()
 {
     fmt::print(stderr, "[native_ckpt:svr][CRASH] backtrace (most recent call first):\n");
     cpptrace::generate_trace().print(std::cerr);
@@ -109,7 +106,7 @@ void DumpBacktraceToLog()
 // is false on this build's unwind backend), so it re-aborts on a corrupt heap — the common SIGABRT
 // case. backtrace_symbols_fd() writes "<object>(<symbol>+0x<off>) [0x<addr>]" to the fd without
 // malloc; resolve offline with addr2line. backtrace()'s lazy unwinder load is warmed in main().
-void DumpSafeBacktrace(int fd)
+static void DumpSafeBacktrace(int fd)
 {
     static constexpr std::string_view Hdr = "[native_ckpt:svr][CRASH] backtrace (most recent call first):\n";
     (void)::write(fd, std::data(Hdr), Hdr.size());
@@ -166,7 +163,7 @@ extern "C" void FatalSignalHandler(int sig)
 // std::terminate handler: an uncaught C++ exception calls terminate (not a signal), so we run
 // in a normal context where full symbolization is safe — recover the what() and print a
 // demangled, file:line-resolved trace via cpptrace.
-[[noreturn]] void TerminateHandler()
+[[noreturn]] static void TerminateHandler()
 {
     static constexpr std::string_view Hdr = "[native_ckpt:svr][CRASH] std::terminate — uncaught exception\n";
     (void)::write(STDERR_FILENO, std::data(Hdr), Hdr.size());
@@ -184,7 +181,7 @@ extern "C" void FatalSignalHandler(int sig)
     std::abort();
 }
 
-void InstallSignalHandlers()
+static void InstallSignalHandlers()
 {
     // SIGPIPE: a dead reader on a socket or pipe is expected for a long-lived daemon; let write()
     // return EPIPE at the call site instead of trapping. The previous handler wrote to stderr,
@@ -234,7 +231,6 @@ void InstallSignalHandlers()
     // Uncaught C++ exceptions call std::terminate (not a signal): recover what() + backtrace.
     std::set_terminate(&TerminateHandler);
 }
-}    // namespace
 
 int main(int /* argc */, char const* const /* argv */[])
 try
