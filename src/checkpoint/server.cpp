@@ -44,6 +44,7 @@
 #include <fstream>
 #include <latch>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -214,6 +215,121 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
 }
 
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
+
+namespace
+{
+struct TensorReplicaDeduplicationStats
+{
+    size_t                logicalShards{};
+    size_t                replicasRemoved{};
+    std::vector<uint64_t> assignedBytesPerRank;
+};
+
+struct TensorReplicaDeduplicationResult
+{
+    std::shared_ptr<StateTree>      dedupedRegistry;
+    TensorReplicaDeduplicationStats stats;
+};
+}    // namespace
+
+// Build a separate storage registry with one deterministic owner for every
+// logical tensor shard. The merged source registry remains unchanged. Replica
+// identity comes exclusively from normalized server metadata (FQN + dtype +
+// full shape + global shard range).
+static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree const& registry, uint32_t worldSize)
+{
+    if (worldSize == 0) { throw std::invalid_argument("Cannot deduplicate tensor replicas with worldSize=0"); }
+
+    auto dedupedRegistry = registry.Clone();
+
+    using RankedTensorShard = StateNode::ShardedTensor::RankedTensorShard;
+    struct LogicalShard
+    {
+        StateNode::Handle              nodeHandle{StateNode::Handle::Invalid};
+        std::string                    fqn;
+        DS4Tensor::DimRange            sharddim;
+        uint64_t                       sizeBytes{};
+        std::vector<RankedTensorShard> candidates;
+    };
+
+    std::vector<LogicalShard> logicalShards;
+    registry.WalkNodes([&](StateNode const& node) {
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
+        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+
+        std::map<DS4Tensor::DimRange, std::vector<RankedTensorShard>> candidatesByRange;
+        for (auto const& shard : tnsr.shards)
+        {
+            auto const rank = static_cast<uint32_t>(shard.rank);
+            if (rank >= worldSize)
+            {
+                throw std::runtime_error(fmt::format("Tensor '{}' shard {} has owner rank {} outside world size {}",
+                                                     registry.GetNodeId(node.handle),
+                                                     shard.sharddim,
+                                                     rank,
+                                                     worldSize));
+            }
+            candidatesByRange[shard.sharddim].push_back(shard);
+        }
+
+        auto const fqn = registry.GetNodeId(node.handle);
+        for (auto& [sharddim, candidates] : candidatesByRange)
+        {
+            logicalShards.push_back({.nodeHandle = node.handle,
+                                     .fqn        = fqn,
+                                     .sharddim   = sharddim,
+                                     .sizeBytes  = candidates.front().ShardSizeBytes(tnsr.dtype),
+                                     .candidates = std::move(candidates)});
+        }
+    });
+
+    // Mirror the fully-parallel writer's deterministic greedy policy without
+    // consulting replica_id or process-group hints: constrained shards first,
+    // then larger shards, then stable logical identity.
+    std::ranges::sort(logicalShards, [](LogicalShard const& lhs, LogicalShard const& rhs) {
+        if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
+        if (lhs.sizeBytes != rhs.sizeBytes) { return lhs.sizeBytes > rhs.sizeBytes; }
+        if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
+        return lhs.sharddim < rhs.sharddim;
+    });
+
+    TensorReplicaDeduplicationStats stats;
+    stats.logicalShards = logicalShards.size();
+    stats.assignedBytesPerRank.resize(worldSize, 0);
+    std::map<StateNode::Handle, std::vector<RankedTensorShard>> selectedByNode;
+
+    for (auto const& logicalShard : logicalShards)
+    {
+        auto const* selected = &logicalShard.candidates.front();
+        for (auto const& candidate : logicalShard.candidates)
+        {
+            auto const candidateRank = static_cast<uint32_t>(candidate.rank);
+            auto const selectedRank  = static_cast<uint32_t>(selected->rank);
+            if (stats.assignedBytesPerRank[candidateRank] < stats.assignedBytesPerRank[selectedRank]
+                || (stats.assignedBytesPerRank[candidateRank] == stats.assignedBytesPerRank[selectedRank] && candidateRank < selectedRank))
+            {
+                selected = &candidate;
+            }
+        }
+
+        auto const selectedRank = static_cast<uint32_t>(selected->rank);
+        stats.assignedBytesPerRank[selectedRank] += logicalShard.sizeBytes;
+        stats.replicasRemoved += logicalShard.candidates.size() - 1;
+        selectedByNode[logicalShard.nodeHandle].push_back(*selected);
+    }
+
+    dedupedRegistry->WalkNodes([&](StateNode& node) {
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
+        auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        if (tnsr.shards.empty()) { return; }
+
+        StateNode::ShardedTensor selected(tnsr.dtype, tnsr.fulldim);
+        for (auto const& shard : selectedByNode.at(node.handle)) { selected.AddShard(shard); }
+        tnsr = std::move(selected);
+    });
+
+    return {.dedupedRegistry = std::move(dedupedRegistry), .stats = std::move(stats)};
+}
 
 static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, StateTree const& state)
 {
@@ -506,7 +622,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             "[native_ckpt:svr][{}#{}][ERROR] Failed to open native metadata file for writing: {}", *server, sessionId, tmpFile));
     }
 
-    if (snapshot.registry == nullptr)
+    if (snapshot.globalRegistry == nullptr)
     {
         throw std::runtime_error(
             fmt::format("[native_ckpt:svr][{}#{}][ERROR] Active global state is null when finalizing snapshot={} for session id={}",
@@ -516,7 +632,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                         sessionId));
     }
 
-    auto& globalState = *snapshot.registry;
+    auto& globalState = *snapshot.globalRegistry;
 
     // Collect as a vector so we can sort and emit in stable lexicographic order.
     std::vector<std::pair<std::string, std::string>> entries;
@@ -724,19 +840,12 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             bool const       snapshotBlobsReady = !onCoordinatorPeer || snapshotPtr->localStates.contains(Rank{0});
             if (recievedFrom.size() >= localNodeWorldSize && recievedFrom.contains(hdr.globalRank) && snapshotBlobsReady)
             {
-                if (snapshotPtr->registry == nullptr)
+                if (onCoordinatorPeer && snapshotPtr->globalRegistry == nullptr)
                 {
-                    if (snapshotPtr->snapshotBlobs.empty())
-                    {
-                        // Preserve the original zero-copy registry path for callers
-                        // such as ckptbench that have no snapshot-scoped Blob fields.
-                        snapshotPtr->registry = sessionState.registry;
-                    }
-                    else
-                    {
-                        snapshotPtr->registry = sessionState.registry->Clone();
-                        for (auto const& blob : snapshotPtr->snapshotBlobs) { snapshotPtr->registry->SetBlob(blob.fqn, blob.data); }
-                    }
+                    // Keep snapshot-scoped Blob values out of the session
+                    // template while preserving the complete replica view.
+                    snapshotPtr->globalRegistry = sessionState.globalRegistry->Clone();
+                    for (auto const& blob : snapshotPtr->snapshotBlobs) { snapshotPtr->globalRegistry->SetBlob(blob.fqn, blob.data); }
                 }
                 break;
             }
@@ -777,15 +886,56 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to finalize snapshot"); }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
+        std::shared_ptr<StateTree> globalRegistry;
+        {
+            std::scoped_lock lock(mutex);
+            globalRegistry = snapshot.globalRegistry;
+        }
+
         WriteGlobalStateTreeToFile_(snapshot, snapshot.path.parent_path() / "registry.bin");
-        // The merged registry is final now; push it to the other nodes so they hold the global
-        // view instead of only their own fragment.
-        BroadcastGlobalRegistryToPeers_(hdr.snapshotId, *snapshot.registry);
+        // Broadcast the complete replica view. Every daemon derives the same
+        // storage plan locally, without mutating this source registry.
+        BroadcastGlobalRegistryToPeers_(hdr.snapshotId, *globalRegistry);
+
+        auto dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(topo.worldSize));
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}][INFO] Selected owners for {} logical tensor shards; removed {} replicas; "
+                   "assigned bytes by rank=[{}]\n",
+                   *server,
+                   sessionId,
+                   dedupResult.stats.logicalShards,
+                   dedupResult.stats.replicasRemoved,
+                   fmt::join(dedupResult.stats.assignedBytesPerRank, ","));
+        {
+            std::scoped_lock lock(mutex);
+            snapshot.dedupedGlobalRegistry = std::move(dedupResult.dedupedRegistry);
+        }
+    }
+
+    // Every writer must consume its daemon's locally derived storage plan. In
+    // particular, remote peers may not write while the global-registry
+    // broadcast and local derivation are still in flight.
+    std::shared_ptr<StateTree> dedupedGlobalRegistry;
+    while (true)
+    {
+        {
+            std::scoped_lock lock(mutex);
+            dedupedGlobalRegistry = snapshot.dedupedGlobalRegistry;
+            if (dedupedGlobalRegistry != nullptr) { break; }
+            fmt::print(stderr,
+                       "[native_ckpt:svr][{}#{}][INFO] FinalizeSnapshot waiting for deduped global registry for snapshot={} rank={}...\n",
+                       *server,
+                       sessionId,
+                       hdr.snapshotId,
+                       hdr.globalRank);
+        }
+        if (stopRequested) { throw std::runtime_error("Stop requested while waiting for deduped global registry"); }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     PrepareBlobState_(snapshot, localState, hdr.globalRank);
     checkpoint::distcp::WriteRankShard(
-        snapshot.path.parent_path(), hdr.globalRank, *snapshot.registry, localState.tensorStorage, localState.blobs);
+        snapshot.path.parent_path(), hdr.globalRank, *dedupedGlobalRegistry, localState.tensorStorage, localState.blobs);
     if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr); }
     // A peer may declare its local shard complete only after the coordinator has
     // acknowledged the notification. Rank 0 is delayed further, until metadata is durable.
@@ -824,7 +974,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 #endif
         try
         {
-            checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.registry, snapshot.blobMetadata);
+            checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *dedupedGlobalRegistry, snapshot.blobMetadata);
         } catch (std::exception const& ex)
         {
             fmt::print(stderr,
@@ -889,7 +1039,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 {
     fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] MergeFragmentToGlobalState_ shards={}\n", *server, sessionId, tensorShards.size());
 
-    if (sessionState.registry == nullptr)
+    if (sessionState.globalRegistry == nullptr)
     {
         throw std::logic_error("Cannot merge state registry fragments. Global state registry is not initialized");
     }
@@ -914,9 +1064,9 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         if (it == tensorMap.end())
         {
             auto const& stateName        = tensorShard.nodeId;
-            auto [childName, parentNode] = sessionState.registry->FindOrAddNodeByFQN(stateName);
+            auto [childName, parentNode] = sessionState.globalRegistry->FindOrAddNodeByFQN(stateName);
             // Add the final node which contains the handler
-            auto& child = sessionState.registry->AddChild(parentNode, childName, true);
+            auto& child = sessionState.globalRegistry->AddChild(parentNode, childName, true);
             auto  shTen = StateNode::ShardedTensor(tensorShard.tensorInfo.dtype, tensorShard.tensorInfo.fulldim);
             shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{.sharddim = tensorShard.tensorInfo.sharddim,
                                                                        .device   = tensorShard.tensorInfo.device,
@@ -927,7 +1077,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             continue;
         }
         auto  nodeHandle = it->second;
-        auto& node       = sessionState.registry->GetNode(nodeHandle);
+        auto& node       = sessionState.globalRegistry->GetNode(nodeHandle);
         if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor))
         {
             throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor='{}' expected-type={} != actual-type={}",
@@ -942,6 +1092,17 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         }
 
         tensorShard.tensorInfo.AssertShardIsValid();
+        if (tnsr.dtype != tensorShard.tensorInfo.dtype || tnsr.fulldim != tensorShard.tensorInfo.fulldim)
+        {
+            throw std::runtime_error(fmt::format("Received incompatible replicas for tensor='{}': expected dtype={} full-shape=[{}], got "
+                                                 "dtype={} full-shape=[{}] on rank={}",
+                                                 tensorShard.nodeId,
+                                                 tnsr.dtype,
+                                                 tnsr.fulldim,
+                                                 tensorShard.tensorInfo.dtype,
+                                                 tensorShard.tensorInfo.fulldim,
+                                                 tensorShard.rank));
+        }
         tnsr.AddShard({.sharddim = tensorShard.tensorInfo.sharddim,
                        .device   = tensorShard.tensorInfo.device,
                        .handle   = tensorShard.tensorInfo.handle,
@@ -1119,7 +1280,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
 {
     auto start1 = PerfClock::now();
     std::filesystem::create_directories(ckptPath.parent_path());
-    snapshot.registry->WalkNodes([&](StateNode const& node) {
+    snapshot.globalRegistry->WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::TensorShard)
         {
@@ -1127,7 +1288,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
                 "[native_ckpt:svr][{}#{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
                 *server,
                 sessionId,
-                snapshot.registry->GetNodeId(node.handle)));
+                snapshot.globalRegistry->GetNodeId(node.handle)));
         }
         if (type == StateNode::Type::ShardedTensor)
         {
@@ -1139,10 +1300,10 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
                            "[native_ckpt:svr][{}#{}][WARN] empty sharded tensor='{}' in metadata output\n",
                            *server,
                            sessionId,
-                           snapshot.registry->GetNodeId(node.handle));
+                           snapshot.globalRegistry->GetNodeId(node.handle));
                 return;
             }
-            snapshot.registry->AssertShardedTensorHasNoHoles(node.handle);
+            snapshot.globalRegistry->AssertShardedTensorHasNoHoles(node.handle);
         }
     });
     {
@@ -1152,7 +1313,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
             throw std::runtime_error(
                 fmt::format("[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for writing: {}", *server, sessionId, ckptPath));
         }
-        StateSerDes::Write(sstrm, *snapshot.registry, StateNode::Handle::Root);
+        StateSerDes::Write(sstrm, *snapshot.globalRegistry, StateNode::Handle::Root);
         fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Finished writing metadata to file={} \n", *server, sessionId, ckptPath);
     }
     // Verify if this was written correctly
@@ -1166,13 +1327,13 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
             throw std::runtime_error(fmt::format(
                 "[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for verification: {}", *server, sessionId, ckptPath));
         }
-        auto readBack = StateSerDes::Read(snapshot.registry->GlobalRank(), snapshot.registry->GlobalWorldSize(), sstrm);
+        auto readBack = StateSerDes::Read(snapshot.globalRegistry->GlobalRank(), snapshot.globalRegistry->GlobalWorldSize(), sstrm);
 
         // Walk the original tree and compare every node against the read-back tree.
         // Nodes are stored at stable indices, so the same Handle addresses the same node in both trees.
         // StateNode::Variant supports operator== for all alternatives (Primitives64Bit included).
         bool mismatch = false;
-        snapshot.registry->WalkNodes([&](StateNode const& origNode) {
+        snapshot.globalRegistry->WalkNodes([&](StateNode const& origNode) {
             auto const& readBackNode = readBack->GetNode(origNode.handle);
             if (origNode.data != readBackNode.data)
             {
@@ -1180,7 +1341,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
                            "[native_ckpt:svr][{}#{}][ERROR] Node='{}' mismatch after roundtrip\n\tOriginal={}\n\tReadBack={}\n",
                            *server,
                            sessionId,
-                           snapshot.registry->GetNodeId(origNode.handle),
+                           snapshot.globalRegistry->GetNodeId(origNode.handle),
                            origNode.data,
                            readBackNode.data);
                 mismatch = true;
@@ -1192,7 +1353,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
             throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Metadata roundtrip verification failed for {}",
                                                  *server,
                                                  sessionId,
-                                                 snapshot.registry->GlobalRank(),
+                                                 snapshot.globalRegistry->GlobalRank(),
                                                  ckptPath));
         }
         fmt::print(stderr, "[native_ckpt:svr][{}#{}][INFO] Metadata roundtrip verification passed for: {}\n", *server, sessionId, ckptPath);
@@ -1202,7 +1363,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
     {
         DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata_{}.txt", localStateRank), *localState->localRegistry);
     }
-    DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata.txt"), *sessionState.registry);
+    DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata.txt"), *sessionState.globalRegistry);
     fmt::print(stderr,
                "[native_ckpt:svr][{}#{}] Accumulated all localState for global State: Dumped states in {}\n",
                *server,
@@ -1483,7 +1644,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
                                                  localState.writtenTensorRangeEnd,
                                                  localState.tensorStorage.size));
         }
-        if (sessionState.registry == nullptr)
+        if (sessionState.globalRegistry == nullptr)
         {
             fmt::print(stderr,
                        "[native_ckpt:svr][{}#{}][WARN] Global state registry is not initialized when finalizing rank={} snapshot={}\n",
@@ -1886,7 +2047,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
                          snapshotId,
                          snapshot->name,
                          snapshot->path,
-                         *snapshot->registry,
+                         *snapshot->globalRegistry,
                          *localState->localRegistry,
                          localState->tensorStorage);
             }
@@ -1998,13 +2159,14 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::Rank from
     it2->second->writeCkptCompletedRanks.insert(fromRank);
 }
 
-// Coordinator -> peer: store the broadcast global registry as this snapshot's registry, so the
-// peer holds the merged view instead of only its own fragment. The arrival also means finalize
-// is globally done, so mark every rank finalized.
+// Coordinator -> peer: preserve the complete global registry and derive this
+// daemon's shared storage plan. The arrival also means finalize is globally
+// done.
 void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, std::string_view body)
 {
-    BufStream                                       bufStream{body.data(), body.size()};
-    std::shared_ptr<StateTree>                      registry = StateSerDes::Read(bufStream);
+    BufStream                  bufStream{body.data(), body.size()};
+    std::shared_ptr<StateTree> globalRegistry = StateSerDes::Read(bufStream);
+    auto dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(globalRegistry->GlobalWorldSize()));
     std::vector<std::unique_ptr<Session::Snapshot>> evicted;
     size_t                                          remainingSnapshots = 0;
     uint32_t                                        numActiveSnapshots = 0;
@@ -2022,14 +2184,22 @@ void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, cipc::SnapshotId 
         {
             throw std::runtime_error(fmt::format("Received global registry for non-existent snapshot {}\n", snapshotId));
         }
-        it2->second->registry = std::move(registry);
-        auto const worldSize  = static_cast<uint32_t>(session.topo.worldSize);
+        it2->second->globalRegistry        = std::move(globalRegistry);
+        it2->second->dedupedGlobalRegistry = std::move(dedupResult.dedupedRegistry);
+        auto const worldSize               = static_cast<uint32_t>(session.topo.worldSize);
         for (uint32_t r = 0; r < worldSize; ++r) { it2->second->finalizedRanks.insert(cipc::Rank{r}); }
-        fmt::print(stderr, "[native_ckpt:svr][{}#{}] Received global registry for snapshot {}\n", *this, sessionId, snapshotId);
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}] Received global registry for snapshot {} and selected owners for {} logical tensor "
+                   "shards; removed {} replicas; assigned bytes by rank=[{}]\n",
+                   *this,
+                   sessionId,
+                   snapshotId,
+                   dedupResult.stats.logicalShards,
+                   dedupResult.stats.replicasRemoved,
+                   fmt::join(dedupResult.stats.assignedBytesPerRank, ","));
 
-        // Local shard writes can beat this broadcast. If they did, eviction was
-        // deliberately deferred above; finish it now that the coordinator no longer
-        // needs to address this snapshot on the peer.
+        // Writers wait for dedupedGlobalRegistry, so any completed local writes
+        // necessarily used this locally derived storage plan.
         while (!session.snapshots.empty() && session.snapshots.size() > session.numActiveSnapshots)
         {
             auto oldest = session.snapshots.begin();
@@ -2149,7 +2319,7 @@ void Server::RecieveStateRegistryFragments_(cipc::SessionId const&              
     {
         auto lock = std::scoped_lock<std::mutex>(_mutex);
         auto it   = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end() || it->second->sessionState.registry == nullptr)
+        if (it == _activeSessions.end() || it->second->sessionState.globalRegistry == nullptr)
         {
             fmt::print(stderr,
                        "[native_ckpt:svr][{}#{}][INFO] Received state registry fragment for non-existent session. Adding to "
@@ -2504,18 +2674,18 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
                    rank,
                    fmt::join(recievedFrom, ","));
 
-        if (sessionState.registry == nullptr)
+        if (sessionState.globalRegistry == nullptr)
         {
-            sessionState.registry = localState.localRegistry->Clone();
-            sessionState.registry->ConvertTensorShardsToShardedTensors();
-            sessionState.registry->WalkNodes([&](auto& node) {
+            sessionState.globalRegistry = localState.localRegistry->Clone();
+            sessionState.globalRegistry->ConvertTensorShardsToShardedTensors();
+            sessionState.globalRegistry->WalkNodes([&](auto& node) {
                 if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
                 {
                     throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Unexpected TensorShard node in "
                                                          "activeGlobalState. Should only contain ShardedTensor nodes",
                                                          *server,
                                                          sessionId,
-                                                         sessionState.registry->GetNodeId(node.handle)));
+                                                         sessionState.globalRegistry->GetNodeId(node.handle)));
                 }
                 if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor)) { return; }
                 tensorMap[localState.localRegistry->GetNodeId(node.handle)] = node.handle;
@@ -2535,7 +2705,8 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
 #ifdef NATIVE_CKPT_TRACE_NODE
         if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))
         {
-            auto const& shTen = std::get<StateNode::ShardedTensor>(sessionState.registry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
+            auto const& shTen
+                = std::get<StateNode::ShardedTensor>(sessionState.globalRegistry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
             fmt::print(stderr,
                        "[native_ckpt:svr][{}#{}][VERBOSE] Rank={} Found in tensorMap NATIVE_CKPT_TRACE_NODE={}  {}\n",
                        *server,

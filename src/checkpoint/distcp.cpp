@@ -6,14 +6,18 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <ios>
+#include <limits>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -24,12 +28,6 @@
 static_assert(std::endian::native == std::endian::little,
               "distcp writer assumes a little-endian host: archive/byteorder is hardcoded "
               "to \"little\" and the LE serializers are direct memcpys.");
-
-#include <fcntl.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-// NOLINTBEGIN(readability-magic-numbers, cppcoreguidelines-pro-type-reinterpret-cast, cppcoreguidelines-pro-type-vararg)
 
 // `__<rank>_0.distcp` is the concatenation of one self-contained `torch.save`
 // ZIP per shard. We emit those ZIPs directly in C++:
@@ -53,6 +51,19 @@ static_assert(std::endian::native == std::endian::little,
 
 namespace checkpoint::distcp
 {
+
+using ByteBuffer = std::vector<char>;
+
+static constexpr uint8_t  ByteMask                  = 0xffU;
+static constexpr uint64_t PickleBinIntMax           = 0x7fffffffULL;
+static constexpr size_t   PickleLongBufferSize      = 9;
+static constexpr uint8_t  PickleLong1Opcode         = 0x8aU;
+static constexpr uint8_t  PickleNewObjOpcode        = 0x81U;
+static constexpr uint8_t  PickleTuple1Opcode        = 0x85U;
+static constexpr uint8_t  PickleTuple2Opcode        = 0x86U;
+static constexpr uint8_t  PickleTuple3Opcode        = 0x87U;
+static constexpr uint8_t  PickleNewFalseOpcode      = 0x89U;
+static constexpr size_t   InitialPickleReserveBytes = 192;
 
 static std::string_view DTypeName(DS4Tensor::DType dtype)
 {
@@ -115,24 +126,24 @@ static DtypePickleInfo PickleInfoForDtype(DS4Tensor::DType dtype)
     }
 }
 
-static void PutU8(std::vector<uint8_t>& b, uint8_t v)
-{ b.push_back(v); }
+static void PutU8(ByteBuffer& b, uint8_t v)
+{ b.push_back(static_cast<char>(v)); }
 
-static void PutU16LE(std::vector<uint8_t>& b, uint16_t v)
+static void PutU16LE(ByteBuffer& b, uint16_t v)
 {
-    b.push_back(static_cast<uint8_t>(v & 0xff));
-    b.push_back(static_cast<uint8_t>(v >> 8));
+    b.push_back(static_cast<char>(v & ByteMask));
+    b.push_back(static_cast<char>(v >> 8));
 }
 
-static void PutU32LE(std::vector<uint8_t>& b, uint32_t v)
+static void PutU32LE(ByteBuffer& b, uint32_t v)
 {
-    for (int i = 0; i < 4; ++i) { b.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xff)); }
+    for (int i = 0; i < 4; ++i) { b.push_back(static_cast<char>((v >> (i * 8)) & ByteMask)); }
 }
 
-static void PutBytes(std::vector<uint8_t>& b, std::string_view sv)
+static void PutBytes(ByteBuffer& b, std::string_view sv)
 { b.insert(b.end(), sv.begin(), sv.end()); }
 
-static void PickleInt(std::vector<uint8_t>& b, uint64_t v)
+static void PickleInt(ByteBuffer& b, uint64_t v)
 {
     if (v < 256)
     {
@@ -144,36 +155,36 @@ static void PickleInt(std::vector<uint8_t>& b, uint64_t v)
         PutU8(b, 'M');
         PutU16LE(b, static_cast<uint16_t>(v));
     }
-    else if (v <= 0x7fffffffull)
+    else if (v <= PickleBinIntMax)
     {
         PutU8(b, 'J');
         PutU32LE(b, static_cast<uint32_t>(v));
     }
     else
     {
-        std::array<uint8_t, 9> tmp{};
-        size_t                 n = 0;
-        uint64_t               x = v;
+        std::array<uint8_t, PickleLongBufferSize> tmp{};
+        size_t                                    n = 0;
+        uint64_t                                  x = v;
         while (x != 0)
         {
-            tmp[n++] = static_cast<uint8_t>(x & 0xff);
+            tmp[n++] = static_cast<uint8_t>(x & ByteMask);
             x >>= 8;
         }
         if (n > 0 && (tmp[n - 1] & 0x80U) != 0U) { tmp[n++] = 0U; }
-        PutU8(b, 0x8aU);
+        PutU8(b, PickleLong1Opcode);
         PutU8(b, static_cast<uint8_t>(n));
         for (size_t i = 0; i < n; ++i) { PutU8(b, tmp[i]); }
     }
 }
 
-static void PickleBinunicode(std::vector<uint8_t>& b, std::string_view s)
+static void PickleBinunicode(ByteBuffer& b, std::string_view s)
 {
     PutU8(b, 'X');
     PutU32LE(b, static_cast<uint32_t>(s.size()));
     PutBytes(b, s);
 }
 
-static void PickleGlobal(std::vector<uint8_t>& b, std::string_view mod, std::string_view name)
+static void PickleGlobal(ByteBuffer& b, std::string_view mod, std::string_view name)
 {
     PutU8(b, 'c');
     PutBytes(b, mod);
@@ -182,27 +193,27 @@ static void PickleGlobal(std::vector<uint8_t>& b, std::string_view mod, std::str
     PutU8(b, '\n');
 }
 
-static void PickleBinput(std::vector<uint8_t>& b, uint8_t idx)
+static void PickleBinput(ByteBuffer& b, uint8_t idx)
 {
     PutU8(b, 'q');
     PutU8(b, idx);
 }
 
-static void PickleTupleClose(std::vector<uint8_t>& b, size_t n)
+static void PickleTupleClose(ByteBuffer& b, size_t n)
 {
     switch (n)
     {
     case 0: PutU8(b, ')'); return;
-    case 1: PutU8(b, 0x85); return;
-    case 2: PutU8(b, 0x86); return;
-    case 3: PutU8(b, 0x87); return;
+    case 1: PutU8(b, PickleTuple1Opcode); return;
+    case 2: PutU8(b, PickleTuple2Opcode); return;
+    case 3: PutU8(b, PickleTuple3Opcode); return;
     default: PutU8(b, 't'); return;
     }
 }
 
 // Precondition: shape is non-empty. WriteRankShard builds shapes from
 // `sharddim`, which is non-empty for every tensor we write.
-static std::vector<uint8_t> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
+static ByteBuffer BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
 {
     auto const info = PickleInfoForDtype(dtype);
 
@@ -218,8 +229,8 @@ static std::vector<uint8_t> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim 
 
     uint64_t const storageSize = info.useV3 ? numel * DynamicSharded4TensorTraits::GetDTypeSize(dtype) : numel;
 
-    std::vector<uint8_t> out;
-    out.reserve(192);
+    ByteBuffer out;
+    out.reserve(InitialPickleReserveBytes);
 
     uint8_t memo    = 0;
     auto    memoize = [&]() { PickleBinput(out, memo++); };
@@ -259,7 +270,7 @@ static std::vector<uint8_t> BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim 
     PickleTupleClose(out, stride.size());
     memoize();
 
-    PutU8(out, 0x89);
+    PutU8(out, PickleNewFalseOpcode);
 
     PickleGlobal(out, "collections", "OrderedDict");
     memoize();
@@ -311,7 +322,18 @@ constexpr uint64_t SerializationIdSize = 40;
 // Miniz emits the 32-bit variant unless the LFH itself needed a ZIP64 extra
 // (`pExtra_data != NULL`), which only happens when size or offset crosses
 // 4 GiB — gated out by WriteRankShard. See miniz_zip.c:3505-3533.
-constexpr uint64_t DataDescriptorSize = 16;
+constexpr uint64_t   DataDescriptorSize             = 16;
+constexpr size_t     LocalTimestampOffset           = 10;
+constexpr size_t     CentralDirTimestampOffset      = 12;
+constexpr size_t     TimestampFieldBytes            = sizeof(uint16_t) * 2;
+constexpr size_t     EocdCentralDirSizeOffset       = 12;
+constexpr size_t     EocdCentralDirOffsetOffset     = 16;
+constexpr size_t     CentralDirFilenameLengthOffset = 28;
+constexpr size_t     CentralDirExtraLengthOffset    = 30;
+constexpr size_t     CentralDirCommentLengthOffset  = 32;
+constexpr uint32_t   Zip32Sentinel                  = std::numeric_limits<uint32_t>::max();
+constexpr std::array EocdSignature{'P', 'K', '\x05', '\x06'};
+constexpr std::array CentralDirSignature{'P', 'K', '\x01', '\x02'};
 
 // Per-entry extra-field length needed to push the entry's data body onto a
 // `kFieldAlignment` boundary. Replicates `caffe2::serialize::detail::getOffset`
@@ -328,7 +350,7 @@ static uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
 // Materializes the FB extra-field bytes for WriteShardArchive to hand to
 // miniz. Layout: `'F','B', <padding_size LE 2 bytes>, 'Z' * padding_size`.
 // Total length = padding_size + 4.
-static std::vector<uint8_t> BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
+static ByteBuffer BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
 {
     if (dataSize >= MZ_UINT32_MAX || cursor >= MZ_UINT32_MAX)
     {
@@ -339,12 +361,12 @@ static std::vector<uint8_t> BuildFbExtra(size_t cursor, size_t filenameSize, siz
     uint64_t const extraSize   = ComputeFbExtraSize(cursor, filenameSize);
     uint64_t const paddingSize = extraSize - FbExtraHeaderBytes;
 
-    std::vector<uint8_t> extra;
+    ByteBuffer extra;
     extra.resize(static_cast<size_t>(extraSize), 'Z');
     extra[0] = 'F';
     extra[1] = 'B';
-    extra[2] = static_cast<uint8_t>(paddingSize & 0xff);
-    extra[3] = static_cast<uint8_t>((paddingSize >> 8) & 0xff);
+    extra[2] = static_cast<char>(paddingSize & ByteMask);
+    extra[3] = static_cast<char>((paddingSize >> 8) & ByteMask);
     return extra;
 }
 
@@ -437,13 +459,44 @@ uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& s
 
 // `c10::hash_combine` from c10/util/hash.h: deterministic mixer used in the
 // serialization_id record-name hash.
+static constexpr uint64_t HashCombineConstant  = 0x9e3779b9ULL;
+static constexpr uint32_t HashCombineLeftShift = 6U;
+
 static uint64_t HashCombine(uint64_t seed, uint64_t value)
-{ return seed ^ (value + 0x9e3779b9ULL + (seed << 6U) + (seed >> 2U)); }
+{ return seed ^ (value + HashCombineConstant + (seed << HashCombineLeftShift) + (seed >> 2U)); }
 
 // libstdc++'s `std::hash<std::string>` (used by torch's writer via
 // `c10::hash<std::string>{}(...)` -> std::hash) — we just call it directly.
 static uint64_t StdHashString(std::string const& s)
 { return std::hash<std::string>{}(s); }
+
+static std::ofstream OpenOutputFile(std::filesystem::path const& path)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) { throw std::runtime_error(fmt::format("distcp: open({}) failed", path.string())); }
+    return output;
+}
+
+static void WriteBytes(std::ostream& output, char const* data, size_t size, std::string_view contextName)
+{
+    constexpr auto maxWriteSize = static_cast<size_t>(std::numeric_limits<std::streamsize>::max());
+    while (size > 0)
+    {
+        auto const writeSize = std::min(size, maxWriteSize);
+        output.write(data, static_cast<std::streamsize>(writeSize));
+        if (!output) { throw std::runtime_error(fmt::format("distcp: write({}) failed with {} bytes remaining", contextName, size)); }
+        data += writeSize;
+        size -= writeSize;
+    }
+}
+
+static void FinishOutputFile(std::ofstream& output, std::filesystem::path const& path)
+{
+    output.flush();
+    if (!output) { throw std::runtime_error(fmt::format("distcp: flush({}) failed", path.string())); }
+    output.close();
+    if (output.fail()) { throw std::runtime_error(fmt::format("distcp: close({}) failed", path.string())); }
+}
 
 // Writes one self-contained torch.save-compatible ZIP archive containing the
 // 7 entries for a single shard. Returns the bytes appended.
@@ -453,26 +506,26 @@ static uint64_t StdHashString(std::string const& s)
 // `archive/.data/serialization_id`. The data/0 entry is FB-padded to 64-byte
 // alignment so zero-copy mmap downstream lines up.
 //
-// The archive is built in-memory via miniz's heap writer, then dumped to `fd`
+// The archive is built in-memory via miniz's heap writer, then dumped to `output`
 // in one shot. Memory cost = ZIP container overhead + tensor body (the
 // tensor body is the only large field). For multi-gigabyte tensors this is
 // the same RSS hit `dcp.save` takes; revisit if it shows up in a profile.
-static uint64_t WriteShardArchive(int                   fd,
+static uint64_t WriteShardArchive(std::ostream&         output,
                                   DS4Tensor::DType      dtype,
                                   DS4Tensor::Dim const& shape,
                                   char const*           srcPtr,
                                   uint64_t              length,
                                   std::string_view      contextName)
 {
-    std::vector<uint8_t> dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
+    ByteBuffer dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
     // Per-entry plan: filename + content pointer + content size.
     struct EntryPlan
     {
-        std::string          fullName;
-        void const*          data;
-        size_t               size;
-        std::vector<uint8_t> padding;    // 0 for non-data entries
+        std::string fullName;
+        void const* data;
+        size_t      size;
+        ByteBuffer  padding;    // 0 for non-data entries
     };
 
     // Record order matches torch.serialization._save / PyTorchStreamWriter::
@@ -489,7 +542,7 @@ static uint64_t WriteShardArchive(int                   fd,
     static constexpr size_t VersionIdx    = 5;
     static constexpr size_t SerialIdIdx   = 6;
 
-    std::array<EntryPlan, 6> entries{
+    std::array<EntryPlan, checkpoint::distcp::EntryFullNames.size() - 1> entries{
         EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataPklIdx]},
                   .data     = dataPkl.data(),
                   .size     = dataPkl.size(),
@@ -550,7 +603,7 @@ static uint64_t WriteShardArchive(int                   fd,
                                         /*uncomp_size=*/0,
                                         /*uncomp_crc32=*/0,    // miniz computes CRC32 itself
                                         /*last_modified=*/nullptr,
-                                        /*user_extra_data=*/reinterpret_cast<char const*>(plan.padding.data()),
+                                        /*user_extra_data=*/plan.padding.data(),
                                         /*user_extra_data_len=*/static_cast<mz_uint16>(plan.padding.size()),
                                         /*user_extra_data_central=*/nullptr,
                                         /*user_extra_data_central_len=*/0)
@@ -609,7 +662,7 @@ static uint64_t WriteShardArchive(int                   fd,
                                         0,
                                         0,
                                         nullptr,
-                                        reinterpret_cast<char const*>(idPlan.padding.data()),
+                                        idPlan.padding.data(),
                                         static_cast<mz_uint16>(idPlan.padding.size()),
                                         nullptr,
                                         0)
@@ -624,7 +677,7 @@ static uint64_t WriteShardArchive(int                   fd,
         throw;
     }
 
-    // Flush the in-memory ZIP to fd. `mz_zip_writer_finalize_heap_archive`
+    // Flush the in-memory ZIP to the output stream. `mz_zip_writer_finalize_heap_archive`
     // internally finalizes and detaches the heap buffer in one shot — calling
     // `mz_zip_writer_finalize_archive` first would put the state machine in
     // "already finalized" and the detach call would fail.
@@ -639,17 +692,17 @@ static uint64_t WriteShardArchive(int                   fd,
 
     // Own the heap buffer for the rest of this scope. mz_free is the documented
     // counterpart to the malloc performed by `finalize_heap_archive`.
-    std::unique_ptr<uint8_t, decltype(&::mz_free)> archiveBuf{static_cast<uint8_t*>(archiveBufRaw), &::mz_free};
+    std::unique_ptr<char, decltype(&::mz_free)> archiveBuf{static_cast<char*>(archiveBufRaw), &::mz_free};
 
     // Zero last-mod time/date in every LFH and CD record. PyTorchStreamWriter is
     // built against a vendored miniz with MINIZ_NO_TIME, which makes those
     // fields stable zeros. Our vcpkg miniz lacks that knob (it would require
     // a source rebuild), so we patch the finalized buffer to match.
-    uint8_t* const bytes = archiveBuf.get();
+    char* const bytes = archiveBuf.get();
     for (size_t off : lfhOffsets)
     {
         // LFH: time at +10 (2B), date at +12 (2B). Zero 4 contiguous bytes.
-        std::memset(bytes + off + 10, 0, 4);
+        std::memset(bytes + off + LocalTimestampOffset, 0, TimestampFieldBytes);
     }
     // Walk the central directory: EOCD lives in the last 22 bytes (we emit no
     // comment), CD offset/size in EOCD bytes [12..20). With MZ_ZIP_FLAG_WRITE_ZIP64
@@ -658,17 +711,17 @@ static uint64_t WriteShardArchive(int                   fd,
     // upstream `s.length < MZ_UINT32_MAX` guard at the call-site means we don't
     // hit that branch today — but the parser asserts it anyway, since walking
     // garbage would otherwise be a buffer-overrun surface.
-    if (archiveSize >= 22)
+    if (archiveSize >= EocdSize)
     {
-        uint8_t const* eocd = bytes + archiveSize - 22;
-        if (eocd[0] == 'P' && eocd[1] == 'K' && eocd[2] == 0x05 && eocd[3] == 0x06)
+        char const* eocd = bytes + archiveSize - EocdSize;
+        if (std::equal(EocdSignature.begin(), EocdSignature.end(), eocd))
         {
             uint32_t cdSize{};
             uint32_t cdOffset{};
-            std::memcpy(&cdSize, eocd + 12, 4);
-            std::memcpy(&cdOffset, eocd + 16, 4);
+            std::memcpy(&cdSize, eocd + EocdCentralDirSizeOffset, sizeof(cdSize));
+            std::memcpy(&cdOffset, eocd + EocdCentralDirOffsetOffset, sizeof(cdOffset));
 
-            if (cdSize == 0xffffffffU || cdOffset == 0xffffffffU)
+            if (cdSize == Zip32Sentinel || cdOffset == Zip32Sentinel)
             {
                 throw std::runtime_error(fmt::format("distcp: ZIP64 sentinel in EOCD cd_offset/cd_size for '{}'; this means a "
                                                      "shard crossed the 4 GiB boundary that ZIP64 support hasn't been wired in for yet",
@@ -677,41 +730,26 @@ static uint64_t WriteShardArchive(int                   fd,
 
             size_t       cursor = cdOffset;
             size_t const cdEnd  = static_cast<size_t>(cdOffset) + static_cast<size_t>(cdSize);
-            while (cursor + 46 <= cdEnd)
+            while (cursor + CentralDirHeaderSize <= cdEnd)
             {
-                if (bytes[cursor] != 'P' || bytes[cursor + 1] != 'K' || bytes[cursor + 2] != 0x01 || bytes[cursor + 3] != 0x02)
+                if (!std::equal(CentralDirSignature.begin(), CentralDirSignature.end(), bytes + cursor))
                 {
                     break;    // not a CD entry; stop defensively
                 }
                 // CD record: time at +12 (2B), date at +14 (2B). Zero 4 bytes.
-                std::memset(bytes + cursor + 12, 0, 4);
+                std::memset(bytes + cursor + CentralDirTimestampOffset, 0, TimestampFieldBytes);
                 uint16_t fnlen{};
                 uint16_t extlen{};
                 uint16_t cmtlen{};
-                std::memcpy(&fnlen, bytes + cursor + 28, 2);
-                std::memcpy(&extlen, bytes + cursor + 30, 2);
-                std::memcpy(&cmtlen, bytes + cursor + 32, 2);
-                cursor += 46U + fnlen + extlen + cmtlen;
+                std::memcpy(&fnlen, bytes + cursor + CentralDirFilenameLengthOffset, sizeof(fnlen));
+                std::memcpy(&extlen, bytes + cursor + CentralDirExtraLengthOffset, sizeof(extlen));
+                std::memcpy(&cmtlen, bytes + cursor + CentralDirCommentLengthOffset, sizeof(cmtlen));
+                cursor += CentralDirHeaderSize + fnlen + extlen + cmtlen;
             }
         }
     }
 
-    // Stream the buffer to fd. Loop handles short writes / EINTR; Linux's
-    // single-write limit is ~2 GiB.
-    auto const* p   = bytes;
-    size_t      rem = archiveSize;
-    while (rem > 0)
-    {
-        ssize_t n = ::write(fd, p, rem);
-        if (n < 0)
-        {
-            if (errno == EINTR) { continue; }
-            throw std::system_error(
-                errno, std::generic_category(), fmt::format("distcp: write({}) failed with {} bytes remaining", contextName, rem));
-        }
-        p += static_cast<size_t>(n);
-        rem -= static_cast<size_t>(n);
-    }
+    WriteBytes(output, bytes, archiveSize, contextName);
 
     return archiveSize;
 }
@@ -734,39 +772,39 @@ static uint64_t WriteShardArchive(int                   fd,
 constexpr std::string_view KMetadataModule   = "torch.distributed.checkpoint.metadata";
 constexpr std::string_view KFilesystemModule = "torch.distributed.checkpoint.filesystem";
 
-static void EmitNewObjBuildBegin(std::vector<uint8_t>& b, std::string_view mod, std::string_view name)
+static void EmitNewObjBuildBegin(ByteBuffer& b, std::string_view mod, std::string_view name)
 {
     checkpoint::distcp::PickleGlobal(b, mod, name);
-    PutU8(b, ')');     // EMPTY_TUPLE
-    PutU8(b, 0x81);    // NEWOBJ — push cls.__new__(cls, *())
-    PutU8(b, '}');     // EMPTY_DICT — start of state dict
-    PutU8(b, '(');     // MARK
+    PutU8(b, ')');                   // EMPTY_TUPLE
+    PutU8(b, PickleNewObjOpcode);    // NEWOBJ — push cls.__new__(cls, *())
+    PutU8(b, '}');                   // EMPTY_DICT — start of state dict
+    PutU8(b, '(');                   // MARK
 }
 
-static void EmitNewObjBuildEnd(std::vector<uint8_t>& b)
+static void EmitNewObjBuildEnd(ByteBuffer& b)
 {
     PutU8(b, 'u');    // SETITEMS — fold marked (key, value) pairs into the dict
     PutU8(b, 'b');    // BUILD — apply state dict to the instance
 }
 
 // torch.Size(<dims-tuple>) via REDUCE.
-template <typename TInts> static void EmitTorchSize(std::vector<uint8_t>& b, TInts const& dims)
+template <typename TInts> static void EmitTorchSize(ByteBuffer& b, TInts const& dims)
 {
     checkpoint::distcp::PickleGlobal(b, "torch", "Size");
     if (dims.size() >= 4) { PutU8(b, '('); }
     for (auto d : dims) { checkpoint::distcp::PickleInt(b, static_cast<uint64_t>(d)); }
     PickleTupleClose(b, dims.size());
-    PutU8(b, 0x85);    // TUPLE1 — wrap the dims tuple as the single ctor arg
-    PutU8(b, 'R');     // REDUCE — call torch.Size(dims_tuple)
+    PutU8(b, PickleTuple1Opcode);    // TUPLE1 — wrap the dims tuple as the single ctor arg
+    PutU8(b, 'R');                   // REDUCE — call torch.Size(dims_tuple)
 }
 
-static void EmitTorchDtype(std::vector<uint8_t>& b, DS4Tensor::DType dtype)
+static void EmitTorchDtype(ByteBuffer& b, DS4Tensor::DType dtype)
 {
     // torch.<dtype> is a module-level attribute (singleton); GLOBAL pushes it directly.
     checkpoint::distcp::PickleGlobal(b, "torch", checkpoint::distcp::DTypeName(dtype));
 }
 
-static void EmitLayoutStrided(std::vector<uint8_t>& b)
+static void EmitLayoutStrided(ByteBuffer& b)
 {
     // `torch.strided` is a module-level singleton — GLOBAL resolves it directly.
     // dcp.save uses a longer `_get_layout(...)` REDUCE path; this shorter form
@@ -776,7 +814,7 @@ static void EmitLayoutStrided(std::vector<uint8_t>& b)
     checkpoint::distcp::PickleGlobal(b, "torch", "strided");
 }
 
-static void EmitMemoryFormatContiguousEnum(std::vector<uint8_t>& b)
+static void EmitMemoryFormatContiguousEnum(ByteBuffer& b)
 {
     // TensorProperties.__getstate__ encodes memory_format via the
     // `_MEM_FORMAT_ENCODING` Enum that lives next to TensorProperties (in
@@ -786,30 +824,30 @@ static void EmitMemoryFormatContiguousEnum(std::vector<uint8_t>& b)
     // object here would break the equality check and raise at load time.
     checkpoint::distcp::PickleGlobal(b, KMetadataModule, "_MEM_FORMAT_ENCODING");
     checkpoint::distcp::PickleInt(b, 0);    // TORCH_CONTIGUOUS_FORMAT
-    PutU8(b, 0x85);                         // TUPLE1
+    PutU8(b, PickleTuple1Opcode);           // TUPLE1
     PutU8(b, 'R');                          // REDUCE — _MEM_FORMAT_ENCODING(0)
 }
 
-static void EmitTensorProperties(std::vector<uint8_t>& b, DS4Tensor::DType dtype)
+static void EmitTensorProperties(ByteBuffer& b, DS4Tensor::DType dtype)
 {
     // TensorProperties has a custom __getstate__/__setstate__ that uses a
     // 5-tuple (not a dict): (dtype, layout, requires_grad, mem_format_encoding,
     // pin_memory). The MARK..TUPLE..BUILD shape feeds that tuple directly into
     // __setstate__.
     checkpoint::distcp::PickleGlobal(b, KMetadataModule, "TensorProperties");
-    PutU8(b, ')');     // EMPTY_TUPLE
-    PutU8(b, 0x81);    // NEWOBJ
-    PutU8(b, '(');     // MARK
+    PutU8(b, ')');                   // EMPTY_TUPLE
+    PutU8(b, PickleNewObjOpcode);    // NEWOBJ
+    PutU8(b, '(');                   // MARK
     EmitTorchDtype(b, dtype);
     EmitLayoutStrided(b);
-    PutU8(b, 0x89);    // NEWFALSE (requires_grad)
+    PutU8(b, PickleNewFalseOpcode);    // NEWFALSE (requires_grad)
     EmitMemoryFormatContiguousEnum(b);
-    PutU8(b, 0x89);    // NEWFALSE (pin_memory)
-    PutU8(b, 't');     // TUPLE — fold the marked values into a 5-tuple
-    PutU8(b, 'b');     // BUILD — apply via __setstate__
+    PutU8(b, PickleNewFalseOpcode);    // NEWFALSE (pin_memory)
+    PutU8(b, 't');                     // TUPLE — fold the marked values into a 5-tuple
+    PutU8(b, 'b');                     // BUILD — apply via __setstate__
 }
 
-static void EmitChunkStorageMetadata(std::vector<uint8_t>& b, DS4Tensor::DimRange const& sharddim)
+static void EmitChunkStorageMetadata(ByteBuffer& b, DS4Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "ChunkStorageMetadata");
 
@@ -826,7 +864,7 @@ static void EmitChunkStorageMetadata(std::vector<uint8_t>& b, DS4Tensor::DimRang
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitTensorStorageMetadata(std::vector<uint8_t>&                   b,
+static void EmitTensorStorageMetadata(ByteBuffer&                             b,
                                       DS4Tensor::DType                        dtype,
                                       DS4Tensor::Dim const&                   fulldim,
                                       std::vector<DS4Tensor::DimRange> const& chunks)
@@ -848,7 +886,7 @@ static void EmitTensorStorageMetadata(std::vector<uint8_t>&                   b,
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitMetadataIndex(std::vector<uint8_t>& b, std::string_view fqn, DS4Tensor::DimRange const& sharddim)
+static void EmitMetadataIndex(ByteBuffer& b, std::string_view fqn, DS4Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
 
@@ -866,7 +904,7 @@ static void EmitMetadataIndex(std::vector<uint8_t>& b, std::string_view fqn, DS4
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitStorageInfo(std::vector<uint8_t>& b, std::string_view relativePath, uint64_t offset, uint64_t length)
+static void EmitStorageInfo(ByteBuffer& b, std::string_view relativePath, uint64_t offset, uint64_t length)
 {
     EmitNewObjBuildBegin(b, KFilesystemModule, "_StorageInfo");
 
@@ -888,7 +926,7 @@ static void EmitStorageInfo(std::vector<uint8_t>& b, std::string_view relativePa
 // torch.distributed.checkpoint.metadata.BytesStorageMetadata() — an empty
 // dataclass (no fields). Marks `fqn` in state_dict_metadata as a non-tensor
 // (ShardedObject) entry; the DCP load planner reads its bytes via storage_data.
-static void EmitBytesStorageMetadata(std::vector<uint8_t>& b)
+static void EmitBytesStorageMetadata(ByteBuffer& b)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "BytesStorageMetadata");
     EmitNewObjBuildEnd(b);
@@ -897,7 +935,7 @@ static void EmitBytesStorageMetadata(std::vector<uint8_t>& b)
 // MetadataIndex for a bytes (ShardedObject) entry. Unlike the tensor index, a
 // bytes index carries no offset/index — both default to None, which torch's
 // writer omits — so the restored key equals MetadataIndex(fqn).
-static void EmitMetadataIndexBytes(std::vector<uint8_t>& b, std::string_view fqn)
+static void EmitMetadataIndexBytes(ByteBuffer& b, std::string_view fqn)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
     PickleBinunicode(b, "fqn");
@@ -905,10 +943,23 @@ static void EmitMetadataIndexBytes(std::vector<uint8_t>& b, std::string_view fqn
     EmitNewObjBuildEnd(b);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static std::vector<uint8_t> BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
+static std::vector<DS4Tensor::DimRange> CollectChunkRanges(StateNode::ShardedTensor const& tensor)
 {
-    std::vector<uint8_t> b;
+    std::vector<DS4Tensor::DimRange> chunkRanges;
+    chunkRanges.reserve(tensor.shards.size());
+    for (auto const& shard : tensor.shards)
+    {
+        if (shard.ShardSizeBytes(tensor.dtype) == 0) { continue; }
+        // Replicas can be separated by rank ordering, so compare with every
+        // range already collected rather than only the previous shard.
+        if (std::ranges::find(chunkRanges, shard.sharddim) == chunkRanges.end()) { chunkRanges.push_back(shard.sharddim); }
+    }
+    return chunkRanges;
+}
+
+static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
+{
+    ByteBuffer b;
     b.reserve(2048);
     std::unordered_set<std::string> tensorFqns;
 
@@ -925,28 +976,8 @@ static std::vector<uint8_t> BuildMetadataPkl(StateTree const& globalRegistry, Bl
         auto const type = static_cast<StateNode::Type>(node.data.index());
         assert(type != StateNode::Type::TensorShard);
         if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const&                      tnsr = std::get<StateNode::ShardedTensor>(node.data);
-        std::vector<DS4Tensor::DimRange> chunkRanges;
-        chunkRanges.reserve(tnsr.shards.size());
-        for (auto const& shard : tnsr.shards)
-        {
-            if (shard.ShardSizeBytes(tnsr.dtype) == 0) { continue; }
-            // tnsr.shards is ordered by (rank, sharddim), so replicas of one chunk held on
-            // different ranks are not adjacent. Dedup against every chunk collected so far,
-            // not just the previous shard, so each chunk is listed once: a consecutive-only
-            // check leaves duplicate ChunkStorageMetadata entries for cross-node replicas.
-            bool alreadyEmitted = false;
-            for (auto const& emitted : chunkRanges)
-            {
-                if (emitted == shard.sharddim)
-                {
-                    alreadyEmitted = true;
-                    break;
-                }
-            }
-            if (alreadyEmitted) { continue; }
-            chunkRanges.push_back(shard.sharddim);
-        }
+        auto const& tnsr        = std::get<StateNode::ShardedTensor>(node.data);
+        auto const  chunkRanges = CollectChunkRanges(tnsr);
         if (chunkRanges.empty()) { return; }
         auto const fqn = globalRegistry.GetNodeId(node.handle);
         tensorFqns.insert(fqn);
@@ -1047,96 +1078,86 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
                     ByteStorage const&           tensorStorage,
                     BlobsByFqn const&            blobs)
 {
-    std::filesystem::create_directories(ckptDir);
-
     auto const filename = fmt::format("__{}_0.distcp", static_cast<uint32_t>(rank));
     auto const filepath = ckptDir / filename;
 
-    int const fd = ::open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (fd < 0) { throw std::system_error(errno, std::generic_category(), fmt::format("distcp: open({}) failed", filepath.string())); }
-
-    uint64_t cursor = 0;
-    try
+    bool hasPayload = !blobs.empty();
+    if (!hasPayload)
     {
-        auto const* base = static_cast<char const*>(tensorStorage.data);
         registry.WalkNodes([&](StateNode const& node) {
-            auto const type = static_cast<StateNode::Type>(node.data.index());
-            // The registry handed in is always the post-merge global registry
-            // (ShardedTensor entries keyed by rank). Tests construct it with
-            // the same shape.
-            assert(type != StateNode::Type::TensorShard);
-            if (type != StateNode::Type::ShardedTensor) { return; }
+            if (hasPayload || static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
             auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            auto const  fqn  = registry.GetNodeId(node.handle);
-            for (auto const& shard : tnsr.shards)
-            {
-                if (shard.rank != rank) { continue; }
-                auto const size = shard.ShardSizeBytes(tnsr.dtype);
-                if (size == 0) { continue; }
-                DS4Tensor::Dim shape{};
-                for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
-                // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
-                // per-entry call site (the m_zip64 flag) plus the alignment math;
-                // defer until we see a real large-shard case. The archive's EOCD
-                // is already ZIP64 (MZ_ZIP_FLAG_WRITE_ZIP64), but per-entry LFH
-                // sizes are still 32-bit.
-                if (size >= MZ_UINT32_MAX)
-                {
-                    throw std::runtime_error(
-                        fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, size));
-                }
-                uint64_t const predicted = ComputeShardArchiveSize(tnsr.dtype, shape, size);
-                uint64_t const actual    = WriteShardArchive(fd, tnsr.dtype, shape, base + shard.handle, size, fqn);
-                if (predicted != actual)
-                {
-                    throw std::runtime_error(fmt::format("distcp: ComputeShardArchiveSize/WriteShardArchive disagree for '{}' "
-                                                         "(dtype={}, shape=[{}], dataSize={}): predicted={} actual={}",
-                                                         fqn,
-                                                         DTypeName(tnsr.dtype),
-                                                         fmt::join(shape, ","),
-                                                         size,
-                                                         predicted,
-                                                         actual));
-                }
-                cursor += actual;
-            }
+            // A zero-element tensor is still a DCP write item and therefore
+            // still produces a torch.save archive in the NVRx writer.
+            hasPayload = std::ranges::any_of(tnsr.shards, [&](auto const& shard) { return shard.rank == rank; });
         });
+    }
+    if (!hasPayload)
+    {
+        // NVRx creates a file only for a non-empty local write bucket. Remove
+        // an older partial/stale path so a retried save has the same file set.
+        std::error_code ec;
+        std::filesystem::remove(filepath, ec);
+        if (ec) { throw std::system_error(ec, fmt::format("distcp: remove({}) failed", filepath.string())); }
+        return;
+    }
 
-        // Append this rank's Blobs after its tensors in fqn order, matching
-        // the per-rank order used by BuildMetadataPkl.
-        auto const writeBlobBytes = [&](char const* p, size_t rem) {
-            while (rem > 0)
+    std::filesystem::create_directories(ckptDir);
+
+    auto        output = OpenOutputFile(filepath);
+    uint64_t    cursor = 0;
+    auto const* base   = static_cast<char const*>(tensorStorage.data);
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        // The registry handed in is always the post-merge global registry
+        // (ShardedTensor entries keyed by rank). Tests construct it with
+        // the same shape.
+        assert(type != StateNode::Type::TensorShard);
+        if (type != StateNode::Type::ShardedTensor) { return; }
+        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        auto const  fqn  = registry.GetNodeId(node.handle);
+        for (auto const& shard : tnsr.shards)
+        {
+            if (shard.rank != rank) { continue; }
+            auto const size = shard.ShardSizeBytes(tnsr.dtype);
+            if (size == 0) { continue; }
+            DS4Tensor::Dim shape{};
+            for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
+            // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
+            // per-entry call site (the m_zip64 flag) plus the alignment math;
+            // defer until we see a real large-shard case. The archive's EOCD
+            // is already ZIP64 (MZ_ZIP_FLAG_WRITE_ZIP64), but per-entry LFH
+            // sizes are still 32-bit.
+            if (size >= MZ_UINT32_MAX)
             {
-                ssize_t const n = ::write(fd, p, rem);
-                if (n < 0)
-                {
-                    if (errno == EINTR) { continue; }
-                    throw std::system_error(errno, std::generic_category(), fmt::format("distcp: write({}) failed", filepath.string()));
-                }
-                p += n;
-                rem -= static_cast<size_t>(n);
+                throw std::runtime_error(
+                    fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, size));
             }
-        };
-        for (auto const& [fqn, bytes] : blobs)
-        {
-            writeBlobBytes(bytes.data(), bytes.size());
-            cursor += bytes.size();
+            uint64_t const predicted = ComputeShardArchiveSize(tnsr.dtype, shape, size);
+            uint64_t const actual    = WriteShardArchive(output, tnsr.dtype, shape, base + shard.handle, size, fqn);
+            if (predicted != actual)
+            {
+                throw std::runtime_error(fmt::format("distcp: ComputeShardArchiveSize/WriteShardArchive disagree for '{}' "
+                                                     "(dtype={}, shape=[{}], dataSize={}): predicted={} actual={}",
+                                                     fqn,
+                                                     DTypeName(tnsr.dtype),
+                                                     fmt::join(shape, ","),
+                                                     size,
+                                                     predicted,
+                                                     actual));
+            }
+            cursor += actual;
         }
+    });
 
-        if (::fsync(fd) != 0)
-        {
-            throw std::system_error(errno, std::generic_category(), fmt::format("distcp: fsync({}) failed", filepath.string()));
-        }
-    } catch (...)
+    // Append this rank's Blobs after its tensors in fqn order, matching
+    // the per-rank order used by BuildMetadataPkl.
+    for (auto const& [fqn, bytes] : blobs)
     {
-        ::close(fd);
-        throw;
+        WriteBytes(output, bytes.data(), bytes.size(), filepath.string());
+        cursor += bytes.size();
     }
-
-    if (::close(fd) != 0)
-    {
-        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", filepath.string()));
-    }
+    FinishOutputFile(output, filepath);
 }
 
 void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
@@ -1146,83 +1167,18 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
     std::filesystem::create_directories(ckptDir);
     auto const filepath = ckptDir / ".metadata";
 
-    int const fd = ::open(filepath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (fd < 0) { throw std::system_error(errno, std::generic_category(), fmt::format("distcp: open({}) failed", filepath.string())); }
-
-    try
-    {
-        auto const* p   = pkl.data();
-        size_t      rem = pkl.size();
-        while (rem > 0)
-        {
-            ssize_t const n = ::write(fd, p, rem);
-            if (n < 0)
-            {
-                if (errno == EINTR) { continue; }
-                throw std::system_error(errno,
-                                        std::generic_category(),
-                                        fmt::format("distcp: write({}) failed with {} bytes remaining", filepath.string(), rem));
-            }
-            p += static_cast<size_t>(n);
-            rem -= static_cast<size_t>(n);
-        }
-        if (::fsync(fd) != 0)
-        {
-            throw std::system_error(errno, std::generic_category(), fmt::format("distcp: fsync({}) failed", filepath.string()));
-        }
-    } catch (...)
-    {
-        ::close(fd);
-        throw;
-    }
-
-    if (::close(fd) != 0)
-    {
-        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", filepath.string()));
-    }
+    auto output = OpenOutputFile(filepath);
+    WriteBytes(output, pkl.data(), pkl.size(), filepath.string());
+    FinishOutputFile(output, filepath);
 
     // Megatron uses this marker to recognize the directory as a torch_dist
     // checkpoint. Publish it from the daemon alongside .metadata so the
     // training process does not write checkpoint sidecars in the exposed path.
-    static constexpr std::string_view ConfigJson = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
-    auto const                        configPath = ckptDir / "metadata.json";
-    int const configFd = ::open(configPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-    if (configFd < 0)
-    {
-        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: open({}) failed", configPath.string()));
-    }
-    try
-    {
-        char const* p   = ConfigJson.data();
-        size_t      rem = ConfigJson.size();
-        while (rem > 0)
-        {
-            ssize_t const n = ::write(configFd, p, rem);
-            if (n < 0)
-            {
-                if (errno == EINTR) { continue; }
-                throw std::system_error(errno,
-                                        std::generic_category(),
-                                        fmt::format("distcp: write({}) failed with {} bytes remaining", configPath.string(), rem));
-            }
-            p += n;
-            rem -= static_cast<size_t>(n);
-        }
-        if (::fsync(configFd) != 0)
-        {
-            throw std::system_error(errno, std::generic_category(), fmt::format("distcp: fsync({}) failed", configPath.string()));
-        }
-    } catch (...)
-    {
-        ::close(configFd);
-        throw;
-    }
-    if (::close(configFd) != 0)
-    {
-        throw std::system_error(errno, std::generic_category(), fmt::format("distcp: close({}) failed", configPath.string()));
-    }
+    static constexpr std::string_view ConfigJson   = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
+    auto const                        configPath   = ckptDir / "metadata.json";
+    auto                              configOutput = OpenOutputFile(configPath);
+    WriteBytes(configOutput, ConfigJson.data(), ConfigJson.size(), configPath.string());
+    FinishOutputFile(configOutput, configPath);
 }
-
-// NOLINTEND(readability-magic-numbers, cppcoreguidelines-pro-type-reinterpret-cast, cppcoreguidelines-pro-type-vararg)
 
 }    // namespace checkpoint::distcp

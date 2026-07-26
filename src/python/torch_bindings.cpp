@@ -437,7 +437,6 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         auto globalShape    = nb::cast<nb::tuple>(container["global_shape"]);
         auto localShape     = nb::cast<nb::tuple>(container["local_shape"]);
         auto globalOffset   = nb::cast<nb::tuple>(container["global_offset"]);
-        auto replicaId      = container["replica_id"];
         auto flattenedRange = container["flattened_range"];
 
         if (globalShape.size() != globalOffset.size())
@@ -524,41 +523,6 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                                            localDimVal));
                 }
             }
-        }();
-
-        [&]() {
-            if (replicaId.is_none()) { return; }
-            if (nb::isinstance<nb::tuple>(replicaId))
-            {
-                for (auto const& val : nb::cast<nb::tuple>(replicaId))
-                {
-                    if (!nb::isinstance<int64_t>(val)) { throwError("replicaId is not tuple[int]"); }
-                    if (nb::cast<int64_t>(val) != 0)
-                    {
-#ifdef TODO_REPLICA_ID_TUPLE
-                        fmt::print(stderr,
-                                   "[native_ckpt:cli][TODO][StateDict::Register::ShardedTensor::ReplicaId] key = {}, replica_id = {} \n",
-                                   shtKeyView,
-                                   nb::str(nb::cast<nb::tuple>(replicaId)));
-#endif
-                        return;
-                    }
-                }
-                return;
-            }
-            if (nb::isinstance<int64_t>(replicaId))
-            {
-                if (nb::cast<int64_t>(replicaId) != 0)
-                {
-                    fmt::print(stderr,
-                               "[native_ckpt:cli][TODO][StateDict::Register::ShardedTensor::ReplicaId] key = {}, replica_id = {} \n",
-                               shtKeyView,
-                               nb::str(nb::cast<nb::tuple>(replicaId)));
-                    return;
-                }
-                return;
-            }
-            throwError("replicaId is not tuple");
         }();
 
         for (auto const& val : globalShape) { ds4tensor.fulldim.push_back(nb::cast<DS4Tensor::SizeT>(val)); }
@@ -722,8 +686,9 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
     }
 }
 
-// Mirror of megatron.core ShardedBase.is_main_replica: an int replica_id of 0, or an
-// all-zero tuple/list, marks the canonical copy. DCP persists only that copy.
+// Blob/sharded-object behavior is intentionally unchanged for now: opaque
+// values have no global tensor coordinates from which the server can infer
+// replica identity.
 static bool IsMainReplica(nb::handle replicaId)
 {
     if (replicaId.is_none()) { return true; }
@@ -738,8 +703,6 @@ static bool IsMainReplica(nb::handle replicaId)
         auto list = nb::cast<nb::list>(replicaId);
         return std::ranges::all_of(list, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
     }
-    // Fail loud on an unrecognized replica_id type: silently treating it as main would
-    // register every rank's copy again and reintroduce the non-deterministic object dedup.
     throw std::runtime_error("RegisterShardedObject: unrecognized replica_id type (expected None, int, or tuple/list of int)");
 }
 

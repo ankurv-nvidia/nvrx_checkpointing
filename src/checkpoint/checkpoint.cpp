@@ -555,7 +555,8 @@ struct CheckpointWriter
         WriteTensors(snapshotId);
         auto stop2  = Clock::now();
         auto wrTime = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(stop2 - stop1).count()) / 1e9;    // NOLINT
-        auto bandwidth = static_cast<double>(totalTensorStateSizeInBytes) / (1024 * 1024) / wrTime;
+        auto       bandwidth   = static_cast<double>(totalTensorStateSizeInBytes) / (1024 * 1024) / wrTime;
+        auto const d2hRequests = totalD2HRequests.load();
         fmt::print(stderr,
                    "[native_ckpt:cli][{}][INFO][perf] Finished bw_mbps={:.2f} "
                    "| Time(us): dev_buf_init_us={} wr_tnsr_us={} total_us={} "
@@ -568,9 +569,9 @@ struct CheckpointWriter
                    std::chrono::duration_cast<std::chrono::microseconds>(stop2 - start).count(),
                    numTensors,
                    smallD2HRequests.load(),
-                   totalD2HRequests.load(),
+                   d2hRequests,
                    totalWrittenBytes.load(),
-                   totalTensorStateSizeInBytes / totalD2HRequests,
+                   d2hRequests == 0 ? 0 : totalTensorStateSizeInBytes / d2hRequests,
                    totalTensorStateSizeInBytes / std::max(numTensors, size_t{1u}));
 
         if (totalWrittenBytes.load() != totalTensorStateSizeInBytes)

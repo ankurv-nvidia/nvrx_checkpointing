@@ -62,8 +62,13 @@ struct Session
         // snapshot-scoped rather than fixed by the session registry.
         StateTree::SnapshotBlobs snapshotBlobs;
 
-        checkpoint::distcp::BlobMetadataByFqn                                  blobMetadata;
-        std::shared_ptr<StateTree>                                             registry;
+        checkpoint::distcp::BlobMetadataByFqn blobMetadata;
+        // Complete merged registry, including every data-parallel replica. Rank
+        // 0 writes this view to registry.bin and broadcasts it unchanged.
+        std::shared_ptr<StateTree> globalRegistry;
+        // Locally derived storage plan. Its non-null publication is also the
+        // readiness gate for every local rank writer.
+        std::shared_ptr<StateTree>                                             dedupedGlobalRegistry;
         std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>> localStates;
         // Ranks that have sent FinalizeSnapshot for this snapshot
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
@@ -154,8 +159,8 @@ struct Session
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
 
-    // Coordinator-only: push the final merged registry to the other nodes before
-    // they write their local shards.
+    // Coordinator-only: push the complete non-deduped registry to the other
+    // daemons. Each receiving daemon derives one shared local storage plan.
     void BroadcastGlobalRegistryToPeers_(checkpoint::ipc::SnapshotId snapshotId, StateTree const& registry) const;
 
     void WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const;

@@ -11,9 +11,9 @@ struct ByteStorage
     size_t size{0};
 
     ByteStorage() = default;
-    ByteStorage(size_t sizeIn) : data(std::aligned_alloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
+    ByteStorage(size_t sizeIn) : data(sizeIn == 0 ? nullptr : std::aligned_alloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
     {
-        if (data == nullptr)
+        if (sizeIn != 0 && data == nullptr)
         {
             fmt::print(stderr, "[native_ckpt][ERROR] Failed to allocate byte storage of size {} bytes\n", sizeIn);
             throw std::bad_alloc();

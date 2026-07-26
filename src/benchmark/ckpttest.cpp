@@ -150,15 +150,23 @@ void AddShardedTensorLeaf(StateTree&                 tree,
                           Rank                       rank,
                           uint64_t                   handle)
 {
-    auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-    auto&          leaf     = tree.AddChild(parent, leafName);
     DS4Tensor::Dim fulldim;
     for (auto d : shape) { fulldim.push_back(d); }
-    StateNode::ShardedTensor st(dtype, fulldim);
-    DS4Tensor::DimRange      sharddim;
+
+    auto nodeHandle = tree.FindNodeByFQN(fqn);
+    if (nodeHandle == StateNode::Handle::Invalid)
+    {
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        auto& leaf              = tree.AddChild(parent, leafName);
+        leaf.data               = StateNode::ShardedTensor(dtype, fulldim);
+        nodeHandle              = leaf.handle;
+    }
+    auto& st = std::get<StateNode::ShardedTensor>(tree.GetNode(nodeHandle).data);
+    if (st.dtype != dtype || st.fulldim != fulldim) { throw std::runtime_error("Incompatible test tensor replica"); }
+
+    DS4Tensor::DimRange sharddim;
     for (auto d : shape) { sharddim.push_back({.begin = 0, .end = d}); }
     st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = handle, .rank = rank});
-    leaf.data = std::move(st);
 }
 }    // namespace
 
@@ -496,6 +504,29 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
         REQUIRE(rec.length >= sizeof(KZipLocalFileMagic));
         for (size_t i = 0; i < sizeof(KZipLocalFileMagic); ++i) { REQUIRE(fileBytes[rec.fileOffset + i] == KZipLocalFileMagic[i]); }
     }
+}
+
+TEST_CASE("distcp::WriteRankShard omits ranks with no local payload", "[distcp][tier1][dedup]")
+{
+    StateTree globalTree(SingleRankTopo(0, 2));
+    AddShardedTensorLeaf(globalTree, "weight", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+
+    auto outDir = CkptDir("empty_rank_omitted");
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    // A retry must remove a stale/partial file left by an earlier attempt.
+    auto const emptyRankPath = outDir / "__1_0.distcp";
+    {
+        std::ofstream stale(emptyRankPath, std::ios::binary);
+        stale << "stale";
+    }
+    REQUIRE(std::filesystem::exists(emptyRankPath));
+
+    ByteStorage emptyTensorStorage(0);
+    checkpoint::distcp::WriteRankShard(outDir, Rank{1}, globalTree, emptyTensorStorage, {});
+
+    REQUIRE_FALSE(std::filesystem::exists(emptyRankPath));
 }
 
 TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tier6]")
