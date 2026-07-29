@@ -94,7 +94,7 @@ struct Server
     bool HasSessionsAndAllSessionsComplete();
     void WaitForShutdown();
     void Ping();
-    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf, cipc::MsgQueue& msgQueue);
+    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
     void Stop();
     void QuerySessions(ServerSessionCallback callback, void* cbData);
 
@@ -1432,7 +1432,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     }
 }
 
-void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf, cipc::MsgQueue& msgQueue)
+void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
 {
     void* ptr = nullptr;
     {
@@ -1470,23 +1470,7 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char c
 
         ptr = localState.tensorStorage[hdr1.offset];
     }
-
-    // A queue slot can carry hundreds of MiB. At scale, copying one complete slot
-    // while four local ranks contend for memory bandwidth can legitimately take
-    // longer than the writer's one-second deadlock threshold. Report actual copy
-    // progress between bounded chunks so Flush can distinguish a slow live reader
-    // from one that is stuck. Do not use an independent heartbeat thread: that
-    // would keep a genuinely deadlocked handler looking healthy.
-    static constexpr size_t CopyProgressChunk = 16ull * 1024ull * 1024ull;
-    auto*                   dst               = static_cast<char*>(ptr);
-    size_t                  copied            = 0;
-    while (copied < hdr1.messageSize)
-    {
-        auto const chunk = std::min(CopyProgressChunk, static_cast<size_t>(hdr1.messageSize) - copied);
-        std::memcpy(dst + copied, buf.data() + copied, chunk);
-        copied += chunk;
-        msgQueue.Heartbeat();
-    }
+    std::memcpy(ptr, buf.data(), hdr1.messageSize);
 }
 
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
@@ -1742,6 +1726,7 @@ void Session::PrepareBlobState_(Snapshot& snapshot, LocalState& localState, Rank
 
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
 {}
+
 void Server::Start()
 {
     std::scoped_lock lock(_mutex);
@@ -1808,7 +1793,7 @@ void Server::Start()
                     // leaks it permanently and a saturated leak wedges the queue.
                     try
                     {
-                        HandleMessage(hdr, buf, msgQueue);
+                        HandleMessage(hdr, buf);
                     } catch (std::exception const& e)
                     {
                         fmt::print(
@@ -1859,7 +1844,7 @@ void Server::Ping()
     _lastPingTime = PerfClock::now();
 }
 
-void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf, cipc::MsgQueue& msgQueue)
+void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
 {
     switch (static_cast<cipc::Message::Type>(hdr.index()))
     {
@@ -1905,15 +1890,14 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     break;
     case cipc::Message::Type::LocalStateRegistry:
     {
-        auto const& hdr1    = std::get<cipc::Message::LocalStateRegistry>(hdr);
-        auto&       session = SessionById_(hdr1.sessionId);
-        session.Handle(hdr1, buf);
+        auto const& hdr1 = std::get<cipc::Message::LocalStateRegistry>(hdr);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;
     case cipc::Message::Type::LocalStateData:
     {
         auto const& hdr1 = std::get<cipc::Message::LocalStateData>(hdr);
-        SessionById_(hdr1.sessionId).Handle(hdr1, buf, msgQueue);
+        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;
     case cipc::Message::Type::ActivateSnapshot:
