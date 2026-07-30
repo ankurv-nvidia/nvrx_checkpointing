@@ -28,15 +28,15 @@
       "name": "py-pretrain-mamba",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/ci/scripts/run_job.py",
-      "args": ["pretrain", "--gpus-per-node=1"]
+      "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
+      "args": ["pretrain-native", "--gpus-per-node=1"]
     },
     {
       "name": "py-pretrain-mamba-multi",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/ci/scripts/run_job.py",
-      "args": ["pretrain", "--gpus-per-node=2"],
+      "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
+      "args": ["pretrain-native", "--gpus-per-node=2"],
       "subProcess": true
     },
     {
@@ -45,7 +45,7 @@
       "request": "launch",
       "program": "${command:python.interpreterPath}", //Users/ankurv/cmakebuild/python_venv/bin/python3",
       "args": [
-        "${workspaceFolder}/ci/scripts/run_job.py",
+        "${workspaceFolder}/ci/scripts/slurm_job.py",
         "pretrain-native",
         "--gpus-per-node=1",
         "--save-iter-zero"
@@ -63,8 +63,8 @@
       "request": "launch",
       "program": "${command:python.interpreterPath}", //Users/ankurv/cmakebuild/python_venv/bin/python3",
       "args": [
-        "${workspaceFolder}/ci/scripts/run_job.py",
-        "pretrain",
+        "${workspaceFolder}/ci/scripts/slurm_job.py",
+        "pretrain-native",
         "--gpus-per-node=2"
       ],
       "cwd": "${command:cmake.getLaunchTargetDirectory}",

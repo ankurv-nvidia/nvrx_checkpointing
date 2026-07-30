@@ -1,5 +1,8 @@
 # Using `nvrx_checkpointing` from an sbatch script
 
+For named Ultra v3 runs, background submission, per-run work directories, and
+custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
+
 Use the public Megatron-LM checkout pinned by this repository
 (`1aa880d0ea1dfddef567785ebc9a384f2a600d18`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every

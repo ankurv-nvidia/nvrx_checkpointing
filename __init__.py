@@ -32,6 +32,11 @@ def get_native_build_dir() -> Path:
     return SCRIPT_DIR / "build"
 
 
+def get_vcpkg_cmake_args() -> list[str]:
+    root = os.environ.get("VCPKG_ROOT")
+    return [f"-DVCPKG_ROOT={Path(root).expanduser().resolve()}"] if root else []
+
+
 def _is_git_repo() -> bool:
     return (
         subprocess.run(
@@ -114,6 +119,7 @@ def build_native_extensions() -> None:
         SCRIPT_DIR.as_posix(),
         "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
         "--debug-trycompile",
+        *get_vcpkg_cmake_args(),
     ]
     sys.stderr.write(f"configure_cmd: {' '.join(configure_cmd)}\n")
     subprocess.run(

@@ -31,12 +31,10 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from run_job import (  # companion script, shares run_job's build helpers
+from daemon_tools import CHECKPOINT_SERVER
+from slurm_job import (
     REPO_ROOT,
     RESULTS_DIR,
-    CheckpointServer,
-    artifact_stem,
-    detect_local_gpu_count,
     ensure_vcpkg_root,
     platform_tag,
     runner_gpus_per_node,
@@ -49,7 +47,11 @@ READY_MARKER = "READY"
 ELECTION_LOSER_TIMEOUT_S = 15
 SERVER_READY_TIMEOUT_S = 60
 SERVER_EXIT_TIMEOUT_S = 60
-BASE_URL = "http://127.0.0.1:41000"
+BASE_URL = CHECKPOINT_SERVER.base_url.removesuffix("/api")
+
+
+def _artifact_stem(*parts: str) -> str:
+    return "_".join(filter(None, parts))
 
 
 def _build_binaries() -> tuple[Path, Path]:
@@ -92,7 +94,7 @@ def _http(path: str, timeout: float = 5.0) -> int:
 def check_daemon_election(server: Path) -> None:
     """Assert the second daemon candidate loses the election and the first keeps serving."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = artifact_stem(platform_tag(), "ckpt-stress", "", "election")
+    stem = _artifact_stem(platform_tag(), "ckpt-stress", "election")
     winner, ready = _spawn_daemon(server, RESULTS_DIR / f"{stem}_winner.%p.log")
     try:
         if not ready.wait(timeout=SERVER_READY_TIMEOUT_S):
@@ -129,8 +131,10 @@ def check_daemon_election(server: Path) -> None:
 
 def run_connect_burst(stress: Path, args: argparse.Namespace) -> None:
     """Scaled-down connect storm against the in-process server; hard-fails on any connection failure."""
-    gpus = args.gpus_per_node or runner_gpus_per_node() or detect_local_gpu_count()
-    stem = artifact_stem(platform_tag(), "ckpt-stress", "", f"1x{gpus}")
+    gpus = args.gpus_per_node or runner_gpus_per_node()
+    if not gpus:
+        raise RuntimeError("GPUS_PER_NODE or --gpus-per-node is required")
+    stem = _artifact_stem(platform_tag(), "ckpt-stress", f"1x{gpus}")
     cmd = [
         str(stress),
         "--ramp",
@@ -164,7 +168,7 @@ def main() -> None:
     stress, server = _build_binaries()
     # Fail fast if a prior job left a checkpoint_server bound to the port; both
     # phases need exclusive ownership of it.
-    CheckpointServer.require_no_checkpoint_server()
+    CHECKPOINT_SERVER.require_stopped()
     check_daemon_election(server)
     run_connect_burst(stress, args)
     logger.info("[ckpt_stress] all gates passed")

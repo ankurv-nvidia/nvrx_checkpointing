@@ -1,0 +1,410 @@
+# Shared CI templates and wheel jobs. generate-ci.py inserts the platform
+# workload matrix at the marker near the end.
+
+stages:
+  - launch
+  - build
+  - test
+# >>> generate-ci.py: workload stages <<<
+
+variables:
+  PIPELINE_SUITE:
+    value: default
+    options: [default, nvrx, large-scale]
+    description: "Workloads to run; nvrx and large-scale are manually launched suites."
+
+.default_pipeline:
+  rules:
+    - if: '$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale"'
+      when: never
+    - when: on_success
+
+.ci_base:
+  extends: .default_pipeline
+  interruptible: false
+  retry:
+    max: 1
+    when: runner_system_failure
+  variables:
+    CI_SCRIPTS_DIR: "${CI_PROJECT_DIR}/ci/scripts"
+    BASELINES_DIR: "${CI_PROJECT_DIR}/ci/baselines"
+    RESULTS_DIR: "${CI_PROJECT_DIR}/ci/ci-results"
+    METADATA_DIR: "${CI_PROJECT_DIR}/metadata"
+  before_script:
+    - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
+    - echo "=== Running on $(hostname) ==="
+    # Load runner config; export the platform tag (baseline namespace) and cluster (selects
+    # srun templates), with fallbacks for local runs.
+    - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
+    - export CLUSTER="${CLUSTER:-devbox}"
+    - export PLATFORM="${PLATFORM:-${CLUSTER}}"
+    - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
+
+# Per-runner tag, GPU topology, and CPU arch. Platform and cluster are configured per
+# runner at setup. WHEEL_ARCH names the wheel a job may install from the
+# pipeline's wheel builds (ci/scripts/wheel_install.py); it lives here because the slurm
+# launcher's own arch is not authoritative for the compute nodes.
+.runner_gb200:
+  tags: [gb200]
+  variables:
+    GPUS_PER_NODE: "4"
+    WHEEL_ARCH: aarch64
+
+.runner_h100:
+  tags: [h100]
+  variables:
+    GPUS_PER_NODE: "8"
+    WHEEL_ARCH: x86_64
+
+.runner_devbox:
+  tags: [devbox]
+  variables:
+    GPUS_PER_NODE: "2"
+    WHEEL_ARCH: x86_64
+
+# Run a job via slurm_job.py. The image build runs in before_script (not a separate job) so
+# it lands on the same machine as the workload; it's a fast no-op when already present.
+.slurm_job:
+  extends: .ci_base
+  variables:
+    SLURMJOB_OPT_WORK_DIR: "${CI_PROJECT_DIR}/ci/ci-runs"
+  before_script:
+    - !reference [.ci_base, before_script]
+    - python3 "${CI_SCRIPTS_DIR}/prepare_image.py"
+  stage: test
+  needs: []
+  timeout: 8h
+  allow_failure:
+    exit_codes: [3]
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/slurm_job.py" ${JOB_ARGS} || exit $?
+  after_script:
+    - |
+      if [[ "${CI_JOB_STATUS:-}" == canceled ]]; then
+        while IFS= read -r -d '' marker; do
+          [[ "$(<"${marker}")" == "${CI_JOB_ID}" ]] || continue
+          job_id="$(<"${marker%/*}/job_id")"
+          [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
+          echo "Canceling Slurm job ${job_id} for canceled GitLab job ${CI_JOB_ID}"
+          scancel -- "${job_id}" || true
+        done < <(find ci/ci-runs -mindepth 2 -maxdepth 2 -name gitlab_job_id -print0 2>/dev/null)
+      fi
+    - du -h ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+  artifacts:
+    paths:
+      - ci/ci-results/*.log
+      - ci/ci-results/*_report.json
+      - ci/ci-runs/*/logs/*.log
+      - ci/ci-runs/*/logs/*_report.json
+      # The submitted sbatch script; its header records the exact submit command, so it
+      # doubles as a reproducer for re-running the SLURM job by hand.
+      - ci/ci-results/*.sbatch
+      - ci/ci-runs/*/run.sbatch
+      # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
+      - ci/ci-runs/*/checkpoints/iter_*/registry.bin
+      - ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/checkpoints/iter_*/*.txt
+      # Raw .metadata pickles — the only survivor if the trace raises before writing.
+      - ci/ci-runs/*/checkpoints/iter_*/.metadata
+      # nvrx run-1 reference, parked for an offline cross-run diff on mismatch.
+      - ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
+      # In-allocation reference check (>2 nodes): both sides of the manifest diff — the
+      # stashed reference-routine manifests and the measured routine's, per checkpoint.
+      - ci/ci-runs/*/checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/phase1-checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/phase1-checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/reference-run/*/iter_*/reference.metadata.info
+      - ci/ci-runs/*/reference-run/*/iter_*/common_pt_dump.info
+    expire_in: 30 days
+    when: always
+
+# Functional gate on the checkpoint web service (daemon election + connect burst);
+# loopback-only, no GPUs, no perf baseline. 1h absorbs a cold build directory.
+.run_ckpt_stress:
+  extends: .slurm_job
+  before_script:
+    - !reference [.ci_base, before_script]
+  timeout: 1h
+  script:
+    - python3 "${CI_SCRIPTS_DIR}/ckpt_stress.py" ${JOB_ARGS} || exit $?
+
+# Optional workload jobs do not block the pipeline when left unplayed.
+.manual_optional:
+  rules:
+    - if: '$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale"'
+      when: never
+    - if: '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - when: manual
+      allow_failure: true
+
+.nvrx_pipeline:
+  allow_failure: false
+  rules:
+    - if: '$PIPELINE_SUITE == "nvrx"'
+      when: on_success
+    - when: never
+
+.large_scale_pipeline:
+  allow_failure: false
+  rules:
+    - if: '$PIPELINE_SUITE == "large-scale"'
+      when: on_success
+    - when: never
+
+.pipeline_launcher:
+  stage: launch
+  image: curlimages/curl:8.15.0
+  tags: [perflab, type/docker, os/linux]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: never
+    - when: manual
+      allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |
+      suite_ref="${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-${CI_COMMIT_REF_NAME}}"
+      response="$(curl --fail-with-body --silent --show-error --request POST \
+        --form "token=${CI_JOB_TOKEN}" \
+        --form "ref=${suite_ref}" \
+        --form "variables[PIPELINE_SUITE]=${PIPELINE_SUITE}" \
+        --form "variables[UPSTREAM_PIPELINE_SHA]=${CI_COMMIT_SHA}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/trigger/pipeline")"
+      printf '%s\n' "${response}" | grep -Eq "\"sha\":[[:space:]]*\"${CI_COMMIT_SHA}\""
+      pipeline_id="$(printf '%s\n' "${response}" | grep -o '"id":[[:space:]]*[0-9]*' | head -n1 | cut -d: -f2 | tr -d ' ')"
+      echo "Launched ${PIPELINE_SUITE} pipeline ${CI_PROJECT_URL}/-/pipelines/${pipeline_id}"
+
+launch:nvrx-pipeline:
+  extends: .pipeline_launcher
+  variables:
+    PIPELINE_SUITE: nvrx
+
+launch:large-scale-pipeline:
+  extends: .pipeline_launcher
+  variables:
+    PIPELINE_SUITE: large-scale
+
+# Run updates to open merge requests, but not ordinary branch pushes.
+# Explicit web/API runs remain available for pre-MR verification.
+workflow:
+  rules:
+    - if: '$UPSTREAM_PIPELINE_SHA && $UPSTREAM_PIPELINE_SHA != $CI_COMMIT_SHA'
+      when: never
+    - if: '$PIPELINE_SUITE && $PIPELINE_SUITE != "default" && $PIPELINE_SUITE != "nvrx" && $PIPELINE_SUITE != "large-scale"'
+      when: never
+    - if: '$PIPELINE_SUITE && $PIPELINE_SUITE != "default" && $CI_PIPELINE_SOURCE != "web" && $CI_PIPELINE_SOURCE != "api" && $CI_PIPELINE_SOURCE != "trigger" && $CI_PIPELINE_SOURCE != "pipeline" && $CI_PIPELINE_SOURCE != "parent_pipeline"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api" || $CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $RUN_PIPELINE == "true"'
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Wheel pipeline (parent-only): build the perf-flavor wheel + dev binaries per
+# arch on the shared perflab docker runners, gate it with the pytest suite on
+# the same runners, and publish it for the GPU matrix.
+#
+# Native perf jobs directly need wheel-publish:* and install the gated wheel
+# from the project's generic package registry. Other workload jobs start
+# immediately and build their flavor from source.
+# ---------------------------------------------------------------------------
+
+# Per-arch builder image, pushed to the project registry with a buildx layer
+# cache. Registry paths stay shallow (image at the project root with arch in
+# the tag, cache one subpath deep) so CI_JOB_TOKEN's write scope reaches them.
+.wheel_image:
+  extends: .default_pipeline
+  stage: build
+  needs: []
+  image: docker:28.4.0
+  services:
+    - docker:28.4.0-dind
+  timeout: 2h
+  retry:
+    max: 1
+    when: runner_system_failure
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker context create wheel-build
+    - docker buildx create wheel-build --driver docker-container --use
+    - |
+      TAG_PREFIX=builder-${WHEEL_ARCH}
+      CACHE_REF=$CI_REGISTRY_IMAGE/${TAG_PREFIX}-cache
+      docker buildx build --push \
+        --cache-to type=registry,ref=${CACHE_REF},mode=max \
+        --cache-from type=registry,ref=${CACHE_REF} \
+        --provenance=false \
+        -f Dockerfile.ci \
+        -t ${CI_REGISTRY_IMAGE}:${TAG_PREFIX}-${CI_COMMIT_SHA} \
+        -t ${CI_REGISTRY_IMAGE}:${TAG_PREFIX}-latest \
+        .
+
+wheel-image:x86_64:
+  extends: .wheel_image
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-image:aarch64:
+  extends: .wheel_image
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+.wheel_build:
+  extends: .default_pipeline
+  stage: build
+  timeout: 2h
+  retry:
+    max: 1
+    when: runner_system_failure
+  variables:
+    # The configures install ports per the vcpkg_install() call sites in
+    # CMakeLists.txt / cmake/modules — the single source of truth — restored
+    # from a binary cache in the project's generic package registry
+    # (cmake/vcpkg.cmake forwards an externally set VCPKG_BINARY_SOURCES).
+    # A port missing from the cache (new port, or a key rotated by a
+    # toolchain/vcpkg bump) is compiled in-job once and uploaded; the 2h
+    # timeout absorbs that cold build.
+    VCPKG_BINARY_SOURCES: "clear;http,${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/vcpkg-cache/{triplet}/{name}-{sha}.zip,readwrite,JOB-TOKEN: ${CI_JOB_TOKEN}"
+  artifacts:
+    when: always
+    paths:
+      - dist/*.whl
+      - dev_binaries/
+    expire_in: 30 days
+  script:
+    - |
+      cmake -B build-wheel -S . -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python \
+        -DPHOENIX_BUILD_WHEEL=ON \
+        -DPHOENIX_REQUIRE_CUDA=ON \
+        -DPHOENIX_BUILD_BENCHMARK=OFF \
+        -DPHOENIX_BUILD_TESTS=OFF \
+        -DBUILDENV_DISABLE_MARCH_NATIVE=ON
+    - cmake --build build-wheel -j"$(nproc)" --target nvrx_checkpointing_whl
+    - |
+      cmake -B build-dev -S . -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python \
+        -DPHOENIX_BUILD_WHEEL=OFF \
+        -DPHOENIX_BUILD_BENCHMARK=OFF \
+        -DPHOENIX_BUILD_TESTS=ON \
+        -DPHOENIX_BUILD_CUDA=OFF \
+        -DBUILDENV_DISABLE_MARCH_NATIVE=ON
+    - cmake --build build-dev -j"$(nproc)" --target ckpttest _distcp_shim
+    - mkdir -p dist dev_binaries
+    - cp build-wheel/*-abi3-*.whl dist/
+    - cp build-dev/ckpttest build-dev/_distcp_shim*.so dev_binaries/
+    - ls -la dist/ dev_binaries/
+
+wheel:x86_64:
+  extends: .wheel_build
+  needs: [wheel-image:x86_64]
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel:aarch64:
+  extends: .wheel_build
+  needs: [wheel-image:aarch64]
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# Install the wheel with pip exactly as consumers do, then run
+# the pytest suite and the Catch2 binary. tests/ imports _distcp_shim from
+# dev_binaries; torch / pytest / hypothesis ship in the builder image's
+# /opt/venv. ckpttest's registry round-trip case SKIPs itself without a
+# --registry path and on small /dev/shm — the rest of the suite still runs.
+.wheel_pytest:
+  extends: .default_pipeline
+  stage: test
+  timeout: 30m
+  artifacts:
+    when: always
+    paths:
+      - ci/ci-results/pytest.xml
+    reports:
+      junit: ci/ci-results/pytest.xml
+    expire_in: 30 days
+  script:
+    - /opt/venv/bin/python ci/scripts/wheel_install.py --from-dist dist
+    - mkdir -p ci/ci-results
+    - export PYTHONPATH="${CI_PROJECT_DIR}/dev_binaries"
+    - /opt/venv/bin/python -m pip show nvrx_checkpointing
+    - /opt/venv/bin/python -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
+    - /opt/venv/bin/python -m nvrx_checkpointing.metadata_compare --help >/dev/null
+    - /opt/venv/bin/python -m pytest tests -v --junitxml=ci/ci-results/pytest.xml
+    - chmod +x dev_binaries/ckpttest
+    - ./dev_binaries/ckpttest
+
+wheel-pytest:x86_64:
+  extends: .wheel_pytest
+  needs: [wheel-image:x86_64, wheel:x86_64]
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-pytest:aarch64:
+  extends: .wheel_pytest
+  needs: [wheel-image:aarch64, wheel:aarch64]
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# Publish the wheel to the generic package registry only after the wheel test
+# job passes, so the GPU matrix can't install a wheel whose binaries are known
+# broken. Exact-SHA URL; see wheel_install.py for the consumer side.
+.wheel_publish:
+  extends: .default_pipeline
+  stage: test
+  timeout: 15m
+  script:
+    - |
+      WHEEL=$(find dist -maxdepth 1 -type f -name "*-linux_${WHEEL_ARCH}.whl" -print -quit)
+      WHEEL_NAME=$(basename "${WHEEL}")
+      WHEEL_URL=$(python3 ci/scripts/wheel_install.py --registry-url "${WHEEL_NAME}")
+      POINTER_URL=$(python3 ci/scripts/wheel_install.py --registry-url)
+      curl --fail --silent --show-error -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "${WHEEL}" "${WHEEL_URL}"
+      printf '%s\n' "${WHEEL_NAME}" | curl --fail --silent --show-error -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file - "${POINTER_URL}"
+      echo "published ${WHEEL_URL}"
+
+wheel-publish:x86_64:
+  extends: .wheel_publish
+  needs:
+    - job: wheel-image:x86_64
+      artifacts: false
+    - job: wheel:x86_64
+      artifacts: true
+    - job: wheel-pytest:x86_64
+      artifacts: false
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
+  variables:
+    WHEEL_ARCH: x86_64
+
+wheel-publish:aarch64:
+  extends: .wheel_publish
+  needs:
+    - job: wheel-image:aarch64
+      artifacts: false
+    - job: wheel:aarch64
+      artifacts: true
+    - job: wheel-pytest:aarch64
+      artifacts: false
+  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
+  tags: [perflab-arm, type/docker, os/linux-arm]
+  variables:
+    WHEEL_ARCH: aarch64
+
+# >>> generate-ci.py: workload jobs <<<

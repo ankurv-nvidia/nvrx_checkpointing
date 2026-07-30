@@ -1,4 +1,5 @@
 #! /usr/bin/python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 import argparse
 import difflib
 import enum
@@ -328,13 +329,9 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             start_offset += info["storage_info"].length
 
     if gap_count:
-        # TODO(ankurv/megatron-lm#6): these gaps disappear once the native writer dedups
-        # replicated tensors at registration time. dcp.load seeks by the recorded offset and
-        # ignores the orphan bytes, so tensors still round-trip correctly — warn, don't raise.
-        sys.stderr.write(
-            f"WARN: {gap_count} non-contiguous tensor offset(s) across {len(files_with_gaps)} file(s) "
-            f"(+{gap_bytes} orphan bytes from replicated shards); tensors still round-trip. "
-            f"TODO(ankurv/megatron-lm#6): remove once the native writer dedups replicated tensors.\n",
+        raise RuntimeError(
+            f"{gap_count} non-contiguous tensor offset(s) across {len(files_with_gaps)} file(s) "
+            f"(+{gap_bytes} orphan bytes from replicated shards); tensors still round-trip. ",
         )
 
     tensormeta = {}
@@ -593,7 +590,7 @@ def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | 
     multinode native runs, where replicated chunks are written once per node.
 
     Returns the number of differing entries — 0 means equal. Callers decide
-    whether to warn or hard-fail; see ``scripts/metadata_compare.py``.
+    whether to warn or hard-fail; see ``metadata_compare.py``.
 
     Raises:
         FileNotFoundError: when either dir is missing reference.metadata.info.

@@ -65,10 +65,7 @@ def _is_dtype_pair(value: object) -> bool:
 
 
 def _stringify_dtype_keys(mapping: dict[Any, Any]) -> dict[Any, Any]:
-    return {
-        _dtype_param_grad_key(*key) if _is_dtype_pair(key) else key: value
-        for key, value in mapping.items()
-    }
+    return {_dtype_param_grad_key(*key) if _is_dtype_pair(key) else key: value for key, value in mapping.items()}
 
 
 def _dtype_key_lookup(optimizer: Any, torch_module: Any) -> dict[str, tuple[Any, Any]]:

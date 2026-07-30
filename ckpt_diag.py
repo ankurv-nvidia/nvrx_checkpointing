@@ -2,7 +2,7 @@
 
 Pure-stdlib module — no megatron imports — so it can be imported both from
 training code (tools.py) and from the CI runner
-(ci/scripts/run_job.py) without pulling in heavy deps.
+(ci/scripts/slurm_job.py) without pulling in heavy deps.
 """
 
 import os

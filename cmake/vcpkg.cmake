@@ -253,11 +253,13 @@ macro(vcpkg_init)
     include(${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
     find_program(VCPKG_EXE vcpkg QUIET PATHS ${VCPKG_ROOT} NO_DEFAULT_PATH)
     if (NOT EXISTS "${VCPKG_EXE}")
-            execute_process(
-                COMMAND_ERROR_IS_FATAL ANY
-                WORKING_DIRECTORY ${VCPKG_ROOT}
-                COMMAND "${Z_VCPKG_BOOTSTRAP_SCRIPT}" ${VCPKG_BOOTSTRAP_OPTIONS}
-            )
+        execute_process(
+            COMMAND_ERROR_IS_FATAL ANY
+            WORKING_DIRECTORY ${VCPKG_ROOT}
+            COMMAND "${Z_VCPKG_BOOTSTRAP_SCRIPT}" ${VCPKG_BOOTSTRAP_OPTIONS}
+        )
+        unset(VCPKG_EXE CACHE)
+        unset(VCPKG_EXE)
     endif()
     find_program(VCPKG_EXE vcpkg REQUIRED QUIET PATHS ${VCPKG_ROOT} NO_DEFAULT_PATH)
     message(STATUS "VCPKG_ROOT::${VCPKG_ROOT} VCPKG_TARGET_TRIPLET::${VCPKG_TARGET_TRIPLET}")

@@ -3,7 +3,7 @@ srun
   --partition=batch
   --nodes=${nodes}
   --ntasks=${ntasks}
-  --time=00:${time_minutes}:00
+  --time=${slurm_time}
   --gpus-per-node=${gpus_per_node}
   --mem=0
   --job-name=${job_name}

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Build the enroot .sqsh image for native CI when it is missing.
 
-Runs in every workload job's before_script (see gitlab-ci-native.yml). Fast no-op
-when the shared image already exists, and a no-op on inline/non-SLURM runners
-(which use no image). Shares the template/image-path helpers with run_job.py.
+Runs in every Slurm workload's before_script and shares the template/image-path
+helpers with slurm_job.py.
 
 Concurrency model: each job builds the image into its own per-job path (under
 $CI_PROJECT_DIR — every GitLab job/runner slot gets a distinct build directory),
@@ -23,16 +22,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_job import (  # companion script, shares run_job's build helpers
+from slurm_job import (
     DOCKER_IMAGE_BASE,
     ENROOT_SCRIPTS_DIR,
     REPO_ROOT,
     build_cmd_from_template,
-    detect_local_gpu_count,
     ensure_vcpkg_root,
     image_path,
     runner_gpus_per_node,
-    runner_uses_slurm,
 )
 
 
@@ -77,8 +74,41 @@ def _publish_to_shared(local: Path, image: Path) -> bool:
     if image.exists():  # a peer published while we were moving
         staged.unlink(missing_ok=True)
         return False
-    os.replace(staged, image)  # atomic on the shared FS (benign last-writer-wins if a peer races here)
+    staged.replace(image)  # atomic on the shared FS (benign last-writer-wins if a peer races here)
     return True
+
+
+def _valid_partition(cmd: list[str]) -> str:
+    account = next(token for token in cmd if token.startswith("--account="))
+    configured = [token.split("=", 1)[1] for token in cmd if token.startswith("--partition=")]
+    info = subprocess.run(["sinfo", "--noheader", "--format=%P"], capture_output=True, check=True, text=True)  # noqa: S607
+    candidates = [*configured, *(line.strip().rstrip("*") for line in info.stdout.splitlines())]
+    gpu_args = [token for token in cmd if token.startswith(("--gpus=", "--gpus-per-node=", "--gres="))]
+    errors = []
+    for partition in dict.fromkeys(filter(None, candidates)):
+        probe = subprocess.run(
+            [  # noqa: S607
+                "sbatch",
+                "--test-only",
+                account,
+                f"--partition={partition}",
+                "--nodes=1",
+                "--mem=0",
+                *gpu_args,
+                "--wrap=true",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return partition
+        errors.append(f"{partition}: {probe.stderr.strip()}")
+    raise RuntimeError("no valid Slurm partition for image build; " + "; ".join(errors))
+
+
+def _set_partition(cmd: list[str], partition: str) -> list[str]:
+    return [cmd[0], f"--partition={partition}", *(token for token in cmd[1:] if not token.startswith("--partition="))]
 
 
 def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
@@ -108,27 +138,32 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         "gpus_per_node": gpus_per_node,
     }
 
+    import_cmd = build_cmd_from_template(
+        "enroot_import.tmpl",
+        {**srun_values, "time_minutes": 20},
+        ["enroot", "import", "--output", (local.parent / base_image.name).as_posix(), f"docker://{DOCKER_IMAGE_BASE}"],
+    )
+    partition = _valid_partition(import_cmd)
     if not base_image.exists():
         local_base_image = local.parent / base_image.name
         local_base_image.unlink(missing_ok=True)  # clear any leftover from a previously failed build
         sys.stderr.write(f"[prepare-image] base image not found: {base_image} — importing from registry\n")
-        import_cmd = build_cmd_from_template(
-            "enroot_import.tmpl",
-            {**srun_values, "time_minutes": 20},
-            ["enroot", "import", "--output", local_base_image.as_posix(), f"docker://{DOCKER_IMAGE_BASE}"],
-        )
+        import_cmd = _set_partition(import_cmd, partition)
         sys.stderr.write(f"[prepare-image] running import command: {' '.join(import_cmd)}\n")
         subprocess.run(import_cmd, check=True)
         shutil.move(str(local_base_image), str(base_image))  # move to final location after successful import
 
     prepare_sh = (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix()
-    prep_cmd = build_cmd_from_template(
-        "image_prep.tmpl",
-        # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
-        # roughly doubles the image-build time over the toolchain+megatron+flash-attn
-        # baseline, which overran the previous 60-minute window.
-        {**srun_values, "time_minutes": 120},
-        ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
+    prep_cmd = _set_partition(
+        build_cmd_from_template(
+            "image_prep.tmpl",
+            # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
+            # roughly doubles the image-build time over the toolchain+megatron+flash-attn
+            # baseline, which overran the previous 60-minute window.
+            {**srun_values, "time_minutes": 120},
+            ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
+        ),
+        partition,
     )
     # scripts/run.sh intentionally enables the low-memory Valgrind build for its
     # image smoke test. Keep that build out of the workload's default build/
@@ -152,14 +187,14 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
 
 def main() -> None:
     ensure_vcpkg_root()
-    if not runner_uses_slurm():
-        sys.stderr.write("[prepare-image] non-SLURM runner — no enroot image needed; nothing to do\n")
-        return
     image = image_path()
     if image.exists():
         sys.stderr.write(f"[prepare-image] image already present, nothing to build: {image}\n")
         return
-    _ensure_enroot_image(image, runner_gpus_per_node() or detect_local_gpu_count())
+    gpus_per_node = runner_gpus_per_node()
+    if not gpus_per_node:
+        raise RuntimeError("GPUS_PER_NODE is required to build a Slurm image")
+    _ensure_enroot_image(image, gpus_per_node)
 
 
 if __name__ == "__main__":

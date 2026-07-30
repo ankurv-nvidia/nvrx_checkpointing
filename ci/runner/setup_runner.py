@@ -16,7 +16,7 @@ File layout under CI_DIR:
   enroot_import.tmpl   (optional) per-cluster override of the base-image import srun command.
   image_prep.tmpl      (optional) per-cluster override of the project-image build srun command.
                        Drop any of these template files here to override the repo default for
-                       this cluster; if absent, run_job.py uses the default shipped in
+                       this cluster; if absent, slurm_job.py uses the default shipped in
                        ci/templates/. Write account, partition, mounts and
                        GPU-request syntax directly into the file.
   gitlab-runner     The runner binary (downloaded by setup).
@@ -221,7 +221,7 @@ def install(ci_dir: Path, version: str, force: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def register(ci_dir: Path, url: str, token: str, platform_tag: str, cluster: str, concurrent: int) -> None:
+def register(ci_dir: Path, url: str, token: str, platform_tag: str, cluster: str, concurrent: int) -> None:  # noqa: PLR0913
     p = paths(ci_dir)
     name = f"{platform_tag}-{cluster}-{socket.gethostname().split('.')[0]}-{os.environ.get('USER', 'runner')}"
     p["builds"].mkdir(parents=True, exist_ok=True)
@@ -279,17 +279,14 @@ def start(ci_dir: Path) -> None:
     # overrides into it, so this also honors flags passed to setup/start.
     cfg = read_config(ci_dir)
     env = os.environ.copy()
-    # Tell run_job.py where this runner's state lives so it finds override
+    # Tell slurm_job.py where this runner's state lives so it finds override
     # templates (srun.tmpl / enroot_import.tmpl / image_prep.tmpl) placed next to the config.
     env["CI_DIR"] = ci_dir.as_posix()
-    # Hardware platform (e.g. gb200): the GitLab runner tag + baseline-file namespace
-    # that run_job.py reads via _platform_tag(). Fall back to CLUSTER for configs that
-    # predate the PLATFORM/CLUSTER split.
+    # Hardware platform (e.g. gb200): GitLab runner tag and baseline namespace.
     env["PLATFORM"] = cfg["PLATFORM"]
     # Datacenter (e.g. cwdfw): selects the per-cluster srun/enroot_import/image_prep templates.
     env["CLUSTER"] = cfg["CLUSTER"]
-    # SLURM account: forwarded so run_job.py uses it as the srun --account and
-    # treats this cluster as SLURM-based (its presence is the slurm-vs-inline switch).
+    # SLURM account used by slurm_job.py and image preparation.
     if cfg.get("SLURM_ACCOUNT", ""):
         env["SLURM_ACCOUNT"] = cfg["SLURM_ACCOUNT"]
         # SLURM partition: forwarded as the srun --partition; defaults to "batch".

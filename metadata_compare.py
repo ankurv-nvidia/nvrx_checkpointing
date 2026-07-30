@@ -1,4 +1,4 @@
-"""Generate a per-tensor md5 trace for a checkpoint dir and diff it against a baseline.
+"""Generate a per-tensor md5 trace and compare it with a checkpoint baseline.
 
 For one iter directory of a single-provider pretrain run, this script:
 
@@ -20,16 +20,14 @@ compare against. ``compare_reference_metadata`` decompresses it in memory.
 
 Exit codes (callers decide whether to warn or hard-fail on each):
 
-  0 — equal, or no baseline yet for provider=nvrx (lenient bootstrap path so
-      pretrain-nvrx can seed the baseline on a fresh cfg/iter via its
-      update-baselines job).
+  0 — equal, or no baseline yet for provider=nvrx (lenient bootstrap path).
   1 — structural error: missing inputs, distcp_trace crashed, OR no baseline
       for provider=native (silent-pass here would mask a misconfigured run,
       since native compares against the nvrx-derived baseline that should
       already be in metadata/).
   3 — baseline mismatch (reference.metadata.info differs from baseline).
 
-Runs as a subprocess from ``_compare_iters_to_baseline`` in ``run_job.py``:
+Runs as a subprocess from ``_compare_iters_to_baseline`` in ``slurm_job.py``:
 the in-srun parent process lacks the ``TORCHINDUCTOR_WORKER_START`` env
 overlay that the training subprocess gets, so importing ``megatron.core``
 (transitively pulled in by ``nvrx_checkpointing.debug``) there trips
@@ -38,7 +36,7 @@ forward the same overlay used by the training subprocess via ``env=...``.
 
 CLI::
 
-    python -m nvrx_checkpointing.scripts.metadata_compare \\
+    python -m nvrx_checkpointing.metadata_compare \\
         --checkpoint-dir <iter_NNNNNNN> \\
         --baseline-dir   <metadata/<cfg>_checkpoints_iter_NNNNNNN> \\
         --provider       native|nvrx
@@ -69,20 +67,15 @@ def main(checkpoint_dir: Path, baseline_dir: Path, provider: str) -> int:
 
     baseline_ref = baseline_dir / "reference.metadata.info"
     if not baseline_ref.is_file() and not (baseline_dir / "reference.metadata.info.xz").is_file():
-        # Provider-asymmetric bootstrap policy: nvrx is the source of truth
-        # that seeds the baseline (via pretrain-nvrx → update-baselines), so
-        # let it pass without a baseline. Native compares against that already-
-        # seeded snapshot, so a missing baseline means the run isn't actually
-        # validating anything — surface as a hard fail rather than silent-pass.
+        # NVRx produces the reference; native must compare against one.
         if provider == "nvrx":
-            print(
-                f"INFO: no baseline at {baseline_ref} — skipping compare (run pretrain-nvrx:*:update_baselines to seed)",
+            print(  # noqa: T201
+                f"INFO: no baseline at {baseline_ref} — skipping compare",
                 file=sys.stderr,
             )
             return 0
-        print(
-            f"FAIL: no baseline at {baseline_ref} — pretrain-native requires the nvrx baseline to be seeded "
-            f"first (run pretrain-nvrx → pretrain-nvrx:*:update_baselines)",
+        print(  # noqa: T201
+            f"FAIL: no baseline at {baseline_ref} — pretrain-native requires an NVRx reference",
             file=sys.stderr,
         )
         return 1

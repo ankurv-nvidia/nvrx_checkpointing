@@ -65,10 +65,8 @@ squared-relu: true
 te-rng-tracker: true
 ddp-num-buckets: 10
 
-# CUDA graphs over the mamba / attention / moe-router subgraphs, enabled for every
-# profile. The perf and deterministic flavors keep them (checkpoints stay
-# bit-identical, so the md5 gate is unaffected); the valgrind flavor strips them
-# because graph capture is infeasible under memcheck.
+# CUDA graphs over the mamba / attention / moe-router subgraphs. Flavors disable
+# them when graph capture is incompatible with the workload.
 cuda-graph-impl: local
 cuda-graph-modules: [mamba, attn, moe_router]
 

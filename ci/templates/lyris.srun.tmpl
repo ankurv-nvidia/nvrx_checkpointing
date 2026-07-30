@@ -3,7 +3,7 @@ srun
   --partition=gb200
   --nodes=${nodes}
   --ntasks=${ntasks}
-  --time=00:${time_minutes}:00
+  --time=${slurm_time}
   --mem=0
   --job-name=${job_name}
   --container-image=${image}

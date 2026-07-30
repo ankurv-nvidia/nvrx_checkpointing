@@ -368,6 +368,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             debug.py
             mapping.py
             megatron_integration.py
+            metadata_compare.py
             tools.py
     )
 

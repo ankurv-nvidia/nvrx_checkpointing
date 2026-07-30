@@ -215,7 +215,7 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
     integration, _ = _load_integration(monkeypatch)
     resolver = (REPO_ROOT / "scripts/megatron_root.sh").read_text()
 
-    assert f"COMMIT_HASH={integration.SUPPORTED_MEGATRON_COMMIT}" in resolver
+    assert f"COMMIT_HASH=${{MEGATRON_COMMIT:-{integration.SUPPORTED_MEGATRON_COMMIT}}}" in resolver
     assert "https://github.com/NVIDIA/Megatron-LM.git" in resolver
     assert "gitlab-master.nvidia.com/ankurv/megatron-lm" not in resolver
 
