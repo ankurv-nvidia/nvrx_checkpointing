@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -39,6 +43,8 @@ ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
 DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.04-py3")
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
+_NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
+_NVRX_MODULE = "nvidia_resiliency_ext"
 SOFT_FAIL_RC = 3
 PERF_TOLERANCE = 0.05
 MAX_BW_SOCKET_IMBALANCE = 1.30
@@ -106,7 +112,7 @@ _BW_RE = re.compile(
 )
 _MEM_RE = re.compile(r"\[native_ckpt:mem\] gpu_peak_bytes=(\d+) cpu_rss_bytes=(\d+)")
 _PHASE2_MARKER = "[native_ckpt:phase] phase=2"
-_SAVE_RE = re.compile(r"successfully saved checkpoint from iteration\s+\d+\s+to\s+(\S+)")
+_SAVE_RE = re.compile(r"successfully saved (?:async )?checkpoint from iteration\s+\d+\s+to\s+(\S+)")
 
 def sys_path_insert(path: Path) -> None:
     value = path.as_posix()
@@ -249,6 +255,47 @@ def ensure_vcpkg_root() -> None:
         str(RUN_ROOT / "deps/python" if RUN_ROOT else REPO_ROOT / "build/wheel-install"),
     )
     sys_path_insert(Path(os.environ["SLURMJOB_OPT_PYTHON_INSTALL_DIR"]))
+
+def uninstall_nvrx_for_native() -> None:
+    """Remove NVRx inside a marked native worker container and prove it is absent."""
+    if RUN_ROOT is None:
+        raise RuntimeError("run directory is not configured")
+    host = socket.gethostname().split(".", 1)[0]
+    lock_path = RUN_ROOT / f".nvrx-uninstall-{host}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        # Ranks on a node may share the writable container filesystem. Serialize their
+        # package inspection/removal while retaining one lock per node at large scale.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            importlib.metadata.distribution(_NVRX_DISTRIBUTION)
+        except importlib.metadata.PackageNotFoundError:
+            logger.info(f"[slurm_job] {_NVRX_DISTRIBUTION} is already uninstalled")
+        else:
+            logger.info(f"[slurm_job] uninstalling {_NVRX_DISTRIBUTION} for native perf verification")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "uninstall",
+                    "--yes",
+                    "--break-system-packages",
+                    _NVRX_DISTRIBUTION,
+                ],
+                check=True,
+            )
+        importlib.invalidate_caches()
+        try:
+            importlib.metadata.distribution(_NVRX_DISTRIBUTION)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        else:
+            raise RuntimeError(f"{_NVRX_DISTRIBUTION} remains installed after uninstall")
+        if importlib.util.find_spec(_NVRX_MODULE) is not None:
+            raise RuntimeError(f"{_NVRX_MODULE} remains importable after uninstall")
+        logger.info(f"[slurm_job] verified {_NVRX_DISTRIBUTION} is not installed or importable")
+
 def in_srun() -> bool:
     return "SLURM_PROCID" in os.environ
 def runner_gpus_per_node() -> int | None:
@@ -670,6 +717,7 @@ class FlavorPolicy:
     phase2_save_interval: int = 250
     phase2_checkpoints: int = 3
     manages_native_server: bool = True
+    requires_nvrx_absent: bool = False
     wheel_prep_mode: str = "--build-from-source"
     wheel_defines: tuple[str, ...] = ()
     install_prebuilt: bool = False
@@ -743,6 +791,7 @@ class PerfFlavor(Flavor):
     exclusive_groups = ("execution-mode",)
 
     def configure(self, policy: FlavorPolicy) -> None:
+        policy.requires_nvrx_absent = True
         policy.wheel_prep_mode = "--ensure-prebuilt"
         policy.install_prebuilt = True
         policy.reporter = self.report
@@ -1179,6 +1228,8 @@ def _pretrain_entry(phase: int) -> None:
 
 def _worker(args: argparse.Namespace) -> None:
     provider = args.job.split("-", 1)[1]
+    if provider == "native" and args.flavors.policy.requires_nvrx_absent:
+        uninstall_nvrx_for_native()
     if provider == "native":
         policy = args.flavors.policy
         checkpoints = policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
@@ -1240,7 +1291,8 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     epilog_args = [*worker_args]
     worker_args.extend(args.extra_args)
     container_env = ",".join(_env_names("w"))
-    run = [*step(args.nodes, total_tasks, container_env),
+    native_perf_verification = args.job == "pretrain-native" and flavors.policy.requires_nvrx_absent
+    run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification),
            "python3", "-u", str(Path(__file__).resolve()), *worker_args]
     epilog = [
         "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *epilog_args,

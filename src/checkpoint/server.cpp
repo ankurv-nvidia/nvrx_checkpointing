@@ -110,6 +110,8 @@ struct Server
                                             boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser);
 
     void SpinDownWaitLoop_(tcp_stream stream);
+    void FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration);
+    bool IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, cipc::SnapshotId& snapshotId, bool& resolved);
     void HandleRequest_(tcp_stream& stream);
 
 #if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
@@ -150,6 +152,9 @@ struct Server
     std::vector<std::thread>            _threads;
     // Live spin-down waiter threads, each holding one client connection open until idle.
     std::vector<std::thread> _spinDownThreads;
+    // Live wait-for-ckpt-finalize handlers, one per client wait connection. Reaped when new waits
+    // arrive and drained on Stop().
+    std::vector<std::future<void>> _finalizeWaits;
 
     boost::asio::io_context _ioc;
     // N acceptors share the port via SO_REUSEPORT where available, so the kernel spreads
@@ -1009,6 +1014,13 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                 // that broadcast marks every global rank finalized; otherwise the peer rejects
                 // the late registry and the coordinator can never publish durable metadata.
                 if (!IsSnapshotEvictable(*it->second)) { break; }
+                // Eviction only drops an evictable (write-complete and finalized) snapshot, so it
+                // always drops a durable one: advance the highwater a late wait-for-finalize consults.
+                if (highestEvictedDurableSnapshot == cipc::SnapshotId::Invalid
+                    || static_cast<uint32_t>(it->first) > static_cast<uint32_t>(highestEvictedDurableSnapshot))
+                {
+                    highestEvictedDurableSnapshot = it->first;
+                }
                 evicted.push_back(std::move(it->second));
                 snapshots.erase(it);
             }
@@ -1727,6 +1739,42 @@ void Session::PrepareBlobState_(Snapshot& snapshot, LocalState& localState, Rank
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
 {}
 
+bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
+{
+    if (iteration >= 0)
+    {
+        out = static_cast<cipc::SnapshotId>(static_cast<uint32_t>(iteration));
+        return true;
+    }
+    // Negative: 1-based index back from the newest known snapshot.
+    std::scoped_lock lock(mutex);
+    auto const idx = static_cast<size_t>(-iteration);
+    if (idx <= snapshots.size())
+    {
+        auto it = snapshots.rbegin();
+        std::advance(it, static_cast<std::ptrdiff_t>(idx - 1));
+        out = it->first;
+        return true;
+    }
+    // Nothing (or not enough) resident: -1 can still name the newest durable-evicted snapshot.
+    if (idx == 1 && highestEvictedDurableSnapshot != cipc::SnapshotId::Invalid)
+    {
+        out = highestEvictedDurableSnapshot;
+        return true;
+    }
+    return false;
+}
+
+bool Session::IsSnapshotDurable(cipc::SnapshotId snapshotId) const
+{
+    std::scoped_lock lock(mutex);
+    auto it = snapshots.find(snapshotId);
+    if (it != snapshots.end()) { return it->second->writeCkptCompletedRanks.size() >= ExpectedWriteCompletions(); }
+    // Not resident: durable iff it completed and was evicted (snapshot ids are monotonic).
+    return highestEvictedDurableSnapshot != cipc::SnapshotId::Invalid
+           && static_cast<uint32_t>(snapshotId) <= static_cast<uint32_t>(highestEvictedDurableSnapshot);
+}
+
 void Server::Start()
 {
     std::scoped_lock lock(_mutex);
@@ -1975,6 +2023,16 @@ void Server::Stop()
         {
             if (t.joinable()) { t.join(); }
         }
+    }
+    {
+        // wait-for-ckpt-finalize handlers observe _stopRequested and exit within a heartbeat;
+        // destroying their futures joins the underlying threads.
+        std::vector<std::future<void>> finalizeWaits;
+        {
+            std::scoped_lock lock(_mutex);
+            finalizeWaits.swap(_finalizeWaits);
+        }
+        finalizeWaits.clear();
     }
     {
         std::vector<std::vector<std::future<void>>> allTasks;
@@ -2393,6 +2451,88 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
     _stopRequested = true;    // WaitForShutdown observes this and calls Stop()
 }
 
+// Hold one client connection open, heartbeating, until the requested snapshot is durable on this
+// daemon (or the deadline elapses). Scoped to a single snapshot and, unlike spin-down, never
+// triggers shutdown. Runs on a dedicated thread (see _finalizeWaits): completion depends on peer
+// writeckptcomplete/finalizecomplete notifications that the handler pool services, so occupying
+// that pool would deadlock the very progress it waits on.
+void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration)
+{
+    SetThreadName("ncs:finwait");
+    static constexpr auto HeartbeatInterval = 2s;
+    auto const            deadline          = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
+    stream.expires_never();
+
+    boost::system::error_code                                    ec;
+    boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, 11};
+    res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+    res.set(boost::beast::http::field::content_type, "application/x-ndjson");
+    res.chunked(true);
+    boost::beast::http::response_serializer<boost::beast::http::empty_body> sr{res};
+    boost::beast::http::write_header(stream, sr, ec);
+
+    bool             resolved = false;
+    cipc::SnapshotId snapshotId{cipc::SnapshotId::Invalid};
+    bool             durable  = false;
+    bool             timedOut = false;
+    while (!ec)
+    {
+        if (IsFinalizeComplete_(sessionId, iteration, snapshotId, resolved))
+        {
+            durable = true;
+            break;
+        }
+        if (_stopRequested) { break; }
+        if (PerfClock::now() >= deadline)
+        {
+            timedOut = true;
+            break;
+        }
+        // Newline-delimited JSON heartbeat keeps the client read alive and leaves room for real
+        // progress events later; the client only blocks on the terminating chunk for now.
+        auto heartbeat = fmt::format("{{\"event\":\"waiting\",\"iteration\":{}}}\n", iteration);
+        boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(heartbeat)), ec);
+        if (ec) { break; }    // client hung up
+        std::this_thread::sleep_for(HeartbeatInterval);
+    }
+
+    std::string finalEvent;
+    if (durable)
+    {
+        finalEvent
+            = fmt::format("{{\"event\":\"complete\",\"iteration\":{},\"snapshot\":{}}}\n", iteration, static_cast<uint32_t>(snapshotId));
+    }
+    else if (timedOut)
+    {
+        finalEvent = fmt::format("{{\"event\":\"timeout\",\"iteration\":{}}}\n", iteration);
+        fmt::print(
+            stderr, "[native_ckpt:svr][{}#{}][ERROR] wait-for-ckpt-finalize timed out for iteration={}\n", *this, sessionId, iteration);
+    }
+    else
+    {
+        finalEvent = fmt::format("{{\"event\":\"aborted\",\"iteration\":{}}}\n", iteration);
+    }
+    boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(finalEvent)), ec);
+    boost::asio::write(stream.socket(), boost::beast::http::make_chunk_last(), ec);
+    TryCleanShutdown(stream);
+}
+
+// Wait-loop helper: resolve `iteration` to a snapshot once, then report its durability. Returns
+// false (keep waiting) while the session or its snapshot is not yet known.
+bool Server::IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, cipc::SnapshotId& snapshotId, bool& resolved)
+{
+    std::scoped_lock lock(_mutex);
+    auto             it = _activeSessions.find(sessionId);
+    if (it == _activeSessions.end()) { return false; }
+    auto& session = *it->second;
+    if (!resolved)
+    {
+        if (!session.ResolveSnapshotId(iteration, snapshotId)) { return false; }
+        resolved = true;
+    }
+    return session.IsSnapshotDurable(snapshotId);
+}
+
 void Server::HandleRequest_(tcp_stream& stream)
 {
     boost::beast::flat_buffer buffer;
@@ -2523,6 +2663,24 @@ void Server::HandleRequest_(tcp_stream& stream)
         // notifications that idle-ness depends on, otherwise the wait would deadlock.
         std::scoped_lock lock(_mutex);
         _spinDownThreads.emplace_back([this, s = std::move(stream)]() mutable { SpinDownWaitLoop_(std::move(s)); });
+    }
+    // Block until a checkpoint is durable: GET /api/wait-for-ckpt-finalize/{sessionId}/{iteration}.
+    // `iteration` is signed — negative values index back from the newest snapshot (-1 = latest).
+    else if (matches({"api", "wait-for-ckpt-finalize"}) && headers.method() == boost::beast::http::verb::get && (it != segs.end()))
+    {
+        auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("wait-for-ckpt-finalize requires a /{sessionId}/{iteration} path"); }
+        auto iteration = boost::lexical_cast<int64_t>(*(it++));
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in wait-for-ckpt-finalize endpoint"); }
+        // Hand off to a dedicated waiter thread and return at once, like spin-down: the handler
+        // pool must stay free to service the peer notifications durability depends on. Reap
+        // finished waits opportunistically so the tracking vector does not grow across a run.
+        std::scoped_lock lock(_mutex);
+        std::erase_if(_finalizeWaits,
+                      [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration]() mutable {
+            FinalizeWaitLoop_(std::move(s), sessionId, iteration);
+        }));
     }
     else
     {

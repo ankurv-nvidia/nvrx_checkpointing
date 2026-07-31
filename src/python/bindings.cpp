@@ -674,6 +674,14 @@ NB_MODULE(checkpoint, m)    // NOLINT
     m.def("ping", &SvcPing);
     m.def("svc_stop", &SvcStop);
     m.def("svc_spindown", &SvcSpinDown /* , nanobind::arg("timeout") = nanobind::none() */);
+    m.def(
+        "wait_for_ckpt_finalize",
+        [](uint32_t sessionId, int64_t iteration) {
+            nb::gil_scoped_release release;
+            WaitForCkptFinalize(sessionId, iteration);
+        },
+        nb::arg("session_id"),
+        nb::arg("iteration"));
     auto cls = nb::class_<StateTree>(std::move(m), "model_state");
 
     cls.def_static(

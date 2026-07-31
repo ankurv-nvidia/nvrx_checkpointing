@@ -369,6 +369,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             mapping.py
             megatron_integration.py
             metadata_compare.py
+            native_async.py
             tools.py
     )
 

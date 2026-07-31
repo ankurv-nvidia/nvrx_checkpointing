@@ -33,9 +33,10 @@ separate setup process will not work because the patches are process-local.
 
 Keep the existing `--ckpt-format torch_dist`, `--save`, `--load`, and
 `--save-interval` arguments. The launcher adds `--ckpt-provider`; it defaults
-to `native`, which selects this repository's checkpoint writer. Existing
-Megatron async-worker flags may remain in the script—the integration disables
-Megatron's worker when the native provider is selected.
+to `native`, which selects this repository's checkpoint writer. With
+`--async-save`, the native provider stages each checkpoint synchronously and
+finalizes it—waiting for the checkpoint daemon to persist it, then advancing
+the tracker file—off the training thread through Megatron's async queue.
 
 For an explicit provider selection, add:
 

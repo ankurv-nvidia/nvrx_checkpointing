@@ -184,6 +184,61 @@ def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
     register_state_dict.root.wait_for_deferred_save()
 
 
+# The native writer registers every rank under session id 0 (cipc::SessionId{0}); the finalize
+# wait targets that same session.
+_SESSION_ID = 0
+
+
+def _wait_for_ckpt_finalize(session_id: int, iteration: int) -> None:
+    """Block until the node-local daemon reports the snapshot for ``iteration`` durable.
+
+    Kept module-level (picklable) and self-contained: it runs in the async caller's worker process
+    — a fork of the trainer — where it opens its own daemon connection and relies on no pre-fork
+    state.
+    """
+    checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+
+def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
+    """Advance the tracker file so the loader resolves ``iteration`` as the latest checkpoint."""
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        with open_file(get_checkpoint_tracker_filename(args.save), "w") as f:
+            f.write(str(iteration))
+
+
+def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
+    """Finalize a staged checkpoint, deferring the durability wait + tracker update when async.
+
+    With ``--async-save`` the daemon-durability wait and tracker update are scheduled on Megatron's
+    async queue so they overlap training: the request's ``async_fn`` blocks a worker process (not the
+    trainer) on the daemon write, and its ``finalize_fns`` advance the tracker on all ranks once every
+    rank's wait returns — so the tracker never names a not-yet-durable checkpoint. The sync path
+    matches the historical writer: it advances the tracker optimistically (the daemon writes in the
+    background, made durable at spin-down) and barriers.
+    """
+    if getattr(args, "async_save", False):
+        from .native_async import AsyncRequest, schedule_async_save  # noqa: PLC0415
+
+        def finalize_fn() -> None:
+            _write_checkpoint_tracker(args, iteration)
+            print_rank_0(f"  successfully saved async checkpoint from iteration {iteration:7d} to {args.save}")
+
+        schedule_async_save(
+            AsyncRequest(
+                async_fn=_wait_for_ckpt_finalize,
+                async_fn_args=(_SESSION_ID, iteration),
+                finalize_fns=[finalize_fn],
+            ),
+        )
+        print_rank_0(f"  scheduled async checkpoint finalize from iteration {iteration:7d} to {args.save}")
+        return
+
+    _write_checkpoint_tracker(args, iteration)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    print_rank_0(f"  successfully saved checkpoint from iteration {iteration:7d} to {args.save}")
+
+
 def save_checkpoint(  # noqa: PLR0913
     iteration: int,
     model,  # noqa: ANN001
@@ -274,13 +329,7 @@ def _save_checkpoint_impl(  # noqa: PLR0913
 
     print_rank_0(f"saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format")
     save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
-
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        with open_file(get_checkpoint_tracker_filename(args.save), "w") as f:
-            f.write(str(iteration))
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    print_rank_0(f"  successfully saved checkpoint from iteration {iteration:7d} to {args.save}")
+    _finalize_checkpoint(args, iteration)
 
 
 save_checkpoint.common = None

@@ -99,6 +99,11 @@ struct Session
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
+    // Highest snapshotId that reached durability before eviction dropped it from `snapshots`.
+    // A wait for an already-evicted snapshot (id <= this) reports durable: ids are monotonic,
+    // and a snapshot is only evicted once write-complete.
+    checkpoint::ipc::SnapshotId highestEvictedDurableSnapshot{checkpoint::ipc::SnapshotId::Invalid};
+
     std::vector<std::future<void>> asyncTasks;
 
     Session(Server* serverIn, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
@@ -128,6 +133,16 @@ struct Session
         std::scoped_lock lock(mutex);
         return std::ranges::all_of(snapshots, [&](auto const& snapshot) { return IsSnapshotEvictable(*snapshot.second); });
     }
+
+    // Map a wait-for-finalize iteration to a concrete snapshotId. A non-negative iteration is the
+    // snapshotId directly. A negative iteration is an index from the newest known snapshot
+    // (-1 = latest, -2 = second-latest, ...), resolved against the ordered `snapshots` map (or the
+    // evicted-durable highwater when nothing is resident). Returns false if not yet resolvable.
+    bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
+
+    // True once `snapshotId` is durable on this daemon: its shard writes are complete
+    // (writeCkptCompletedRanks reaches ExpectedWriteCompletions), or it completed and was evicted.
+    bool IsSnapshotDurable(checkpoint::ipc::SnapshotId snapshotId) const;
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank);

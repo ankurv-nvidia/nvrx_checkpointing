@@ -1,4 +1,5 @@
 # ruff: noqa: ANN401, C901, PLC0415, SLF001
+# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Runtime integration for an unmodified Megatron-LM checkout.
 
@@ -29,6 +30,8 @@ _NATIVE_PROVIDER = "native"
 _REFERENCE_PROVIDER = "nvrx"
 _SUPPORTED_PROVIDERS = (_NATIVE_PROVIDER, _REFERENCE_PROVIDER)
 _INSTALL_MARKER = "_nvrx_checkpointing_integration_installed"
+_NATIVE_ASYNC_MARKER = "_nvrx_checkpointing_native_async_installed"
+_NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
 
 
 def add_arguments(parser: Any) -> Any:
@@ -132,28 +135,132 @@ def _patch_distributed_optimizer() -> None:
     setattr(optimizer_cls, _INSTALL_MARKER, True)
 
 
-def _patch_argument_validation() -> None:
-    """Register the provider argument and disable Megatron async save for native runs."""
+def _patch_argument_registration() -> None:
+    """Register the ``--ckpt-provider`` argument on Megatron's parser.
+
+    The native provider keeps both ``--async-save`` and the configured ``async_strategy`` intact.
+    Its async lifecycle is redirected separately to the repo-owned implementation, so the argument
+    is never used to resolve an NVRx or MCore checkpoint implementation for native saves.
+    """
     from megatron.training import arguments as arguments_module  # type: ignore[import-not-found]
 
     if getattr(arguments_module, _INSTALL_MARKER, False):
         return
     original_parse_args = arguments_module.parse_args
-    original_validate_args = arguments_module.validate_args
 
     @wraps(original_parse_args)
     def parse_args(extra_args_provider: Callable[[Any], Any] | None = None, ignore_unknown_args: bool = False) -> Any:
         return original_parse_args(compose_extra_args_provider(extra_args_provider), ignore_unknown_args)
 
-    @wraps(original_validate_args)
-    def validate_args(args: Any, defaults: dict[str, Any] | None = None) -> Any:
-        if getattr(args, "ckpt_provider", None) == _NATIVE_PROVIDER:
-            args.async_save = False
-        return original_validate_args(args, {} if defaults is None else defaults)
-
     arguments_module.parse_args = parse_args
-    arguments_module.validate_args = validate_args
     setattr(arguments_module, _INSTALL_MARKER, True)
+
+
+def _patch_native_async_lifecycle() -> None:
+    """Redirect native-provider async hooks without selecting an external strategy."""
+    from megatron.training import async_utils as async_utils_module  # type: ignore[import-not-found]
+    from megatron.training import checkpointing as checkpointing_module  # type: ignore[import-not-found]
+    from megatron.training import initialize as initialize_module  # type: ignore[import-not-found]
+    from megatron.training import training as training_module  # type: ignore[import-not-found]
+
+    if getattr(async_utils_module, _NATIVE_ASYNC_MARKER, False):
+        return
+
+    from . import native_async
+
+    original_init = async_utils_module.init_persistent_async_worker
+    original_schedule = async_utils_module.schedule_async_save
+    original_finalize = async_utils_module.maybe_finalize_async_save
+    original_is_empty = async_utils_module.is_empty_async_queue
+    original_reset = async_utils_module.reset_persistent_async_worker
+
+    def is_native() -> bool:
+        return getattr(training_module.get_args(), "ckpt_provider", None) == _NATIVE_PROVIDER
+
+    @wraps(original_init)
+    def init_persistent_async_worker(rank: int, mp_mode: str = "spawn") -> Any:
+        if is_native():
+            return native_async.init_persistent_async_worker(rank, mp_mode)
+        return original_init(rank, mp_mode)
+
+    @wraps(original_schedule)
+    def schedule_async_save(request: Any) -> Any:
+        if is_native():
+            return native_async.schedule_async_save(request)
+        return original_schedule(request)
+
+    @wraps(original_finalize)
+    def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -> Any:
+        if is_native():
+            return native_async.maybe_finalize_async_save(blocking, terminate)
+        return original_finalize(blocking, terminate)
+
+    @wraps(original_is_empty)
+    def is_empty_async_queue() -> bool:
+        if is_native():
+            return native_async.is_empty_async_queue()
+        return original_is_empty()
+
+    @wraps(original_reset)
+    def reset_persistent_async_worker(async_strategy: str) -> Any:
+        if is_native():
+            return native_async.reset_persistent_async_worker(async_strategy)
+        return original_reset(async_strategy)
+
+    async_utils_module.init_persistent_async_worker = init_persistent_async_worker
+    async_utils_module.schedule_async_save = schedule_async_save
+    async_utils_module.maybe_finalize_async_save = maybe_finalize_async_save
+    async_utils_module.is_empty_async_queue = is_empty_async_queue
+    async_utils_module.reset_persistent_async_worker = reset_persistent_async_worker
+
+    # These modules imported the hooks by name before install() ran, so replace
+    # their local bindings as well as the defining module's attributes.
+    initialize_module.init_persistent_async_worker = init_persistent_async_worker
+    training_module.maybe_finalize_async_save = maybe_finalize_async_save
+    checkpointing_module.schedule_async_save = schedule_async_save
+    checkpointing_module.is_empty_async_queue = is_empty_async_queue
+
+    try:
+        from megatron.training import inprocess_restart as restart_module  # type: ignore[import-not-found]
+    except ImportError:
+        restart_module = None
+    if restart_module is not None:
+        restart_module.reset_persistent_async_worker = reset_persistent_async_worker
+
+    setattr(async_utils_module, _NATIVE_ASYNC_MARKER, True)
+
+
+def _patch_native_load_reader() -> None:
+    """Bypass external async-strategy reader resolution for native loads."""
+    from megatron.core.dist_checkpointing.strategies import torch as torch_strategy_module  # type: ignore[import-not-found]
+    from megatron.training import training as training_module  # type: ignore[import-not-found]
+
+    if getattr(torch_strategy_module, _NATIVE_LOAD_MARKER, False):
+        return
+
+    from . import native_async
+
+    original_get_filesystem_reader = torch_strategy_module._get_filesystem_reader
+
+    @wraps(original_get_filesystem_reader)
+    def get_filesystem_reader(
+        checkpoint_dir: str | Path,
+        cache_metadata: bool = False,
+        async_strategy: str = "mcore",
+    ) -> Any:
+        if getattr(training_module.get_args(), "ckpt_provider", None) == _NATIVE_PROVIDER:
+            return native_async.get_filesystem_reader(
+                checkpoint_dir,
+                cache_metadata=cache_metadata,
+            )
+        return original_get_filesystem_reader(
+            checkpoint_dir,
+            cache_metadata=cache_metadata,
+            async_strategy=async_strategy,
+        )
+
+    torch_strategy_module._get_filesystem_reader = get_filesystem_reader
+    setattr(torch_strategy_module, _NATIVE_LOAD_MARKER, True)
 
 
 def _patch_training() -> None:
@@ -245,8 +352,10 @@ def _patch_training() -> None:
 
 def install() -> None:
     """Install the supported Megatron integration into the current Python process."""
-    _patch_argument_validation()
+    _patch_argument_registration()
     _patch_distributed_optimizer()
+    _patch_native_async_lifecycle()
+    _patch_native_load_reader()
     _patch_training()
 
 

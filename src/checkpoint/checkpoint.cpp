@@ -184,6 +184,48 @@ void SvcSpinDown()
     TryCleanShutdown(stream);
 }
 
+void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
+{
+    boost::system::error_code ec;
+
+    boost::asio::io_context        ioc;
+    boost::beast::tcp_stream       stream(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+
+    auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port), ec);
+    if (ec) { throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: resolve failed: {}", ec.message())); }
+    [[maybe_unused]] auto endpoint = stream.connect(results, ec);
+    if (ec) { throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: connect failed: {}", ec.message())); }
+
+    auto                 target        = fmt::format("/api/wait-for-ckpt-finalize/{}/{}", sessionId, iteration);
+    static constexpr int HttpVersion11 = 11;
+    boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, target, HttpVersion11};
+    req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
+    req.body().data = nullptr;
+    req.body().size = 0;
+    req.body().more = false;
+    req.prepare_payload();
+    boost::beast::http::write(stream, req, ec);
+    if (ec) { throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: request write failed: {}", ec.message())); }
+
+    // The server holds the connection open with chunked heartbeats and only completes the response
+    // once the snapshot is durable. No stream timeout is set, so the read blocks across heartbeats
+    // for the full (possibly long) finalize rather than timing out.
+    boost::beast::flat_buffer                                           buffer;
+    boost::beast::http::response_parser<boost::beast::http::string_body> parser;
+    parser.body_limit(std::numeric_limits<std::uint64_t>::max());
+    boost::beast::http::read(stream, buffer, parser, ec);
+    if (ec && ec != boost::beast::http::error::end_of_stream)
+    {
+        throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: response read failed: {}", ec.message()));
+    }
+    if (parser.get().result() != boost::beast::http::status::ok)
+    {
+        throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: server returned HTTP {}", parser.get().result_int()));
+    }
+    TryCleanShutdown(stream);
+}
+
 namespace
 {
 struct CheckpointWriter

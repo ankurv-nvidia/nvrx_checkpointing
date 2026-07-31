@@ -2,6 +2,7 @@
 # ruff: noqa: ANN202, INP001, PLR0915, S101, S607, SLF001
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import io
 import shlex
@@ -460,13 +461,57 @@ def test_native_restarts_the_daemon_for_each_finite_checkpoint(
     args.flavors.policy.worker = lambda _cfg, run_args, _provider: calls.append(
         (run_args.checkpoints_per_run, run_args.repeat),
     )
+    uninstalls = []
+    monkeypatch.setattr(slurm_job, "uninstall_nvrx_for_native", lambda: uninstalls.append(job))
     monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(require_stopped=lambda: None))
 
     slurm_job._worker(args)
 
     assert calls == [expected]
+    assert uninstalls == ([job] if job == "pretrain-native" else [])
     assert args.checkpoints_per_run == checkpoints
     assert args.repeat == repeat
+
+
+def test_uninstall_nvrx_for_native_is_serialized_and_verified(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    installed = True
+    commands: list[list[str]] = []
+    monkeypatch.setattr(slurm_job, "RUN_ROOT", tmp_path)
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node.example")
+
+    def distribution(name: str) -> object:
+        assert name == "nvidia-resiliency-ext"
+        if installed:
+            return object()
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    def run(command: list[str], *, check: bool) -> SimpleNamespace:
+        nonlocal installed
+        commands.append(command)
+        assert check is True
+        installed = False
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(slurm_job.importlib.metadata, "distribution", distribution)
+    monkeypatch.setattr(slurm_job.importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(slurm_job.subprocess, "run", run)
+
+    slurm_job.uninstall_nvrx_for_native()
+
+    assert (tmp_path / ".nvrx-uninstall-node.lock").exists()
+    assert commands == [[
+        sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "--yes",
+        "--break-system-packages",
+        "nvidia-resiliency-ext",
+    ]]
 
 
 def test_long_run_options_are_exported_and_override_allocation_time(
@@ -605,6 +650,7 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     assert "${SLURMJOB_OPT_WORK_DIR}:${SLURMJOB_OPT_WORK_DIR}" in reproducer
     assert "VCPKG_ROOT,MEGATRON_NATIVE_BUILD_DIR,NVRX_REPO_ROOT" in reproducer
     worker_step = next(line for line in reproducer.splitlines() if " --ntasks=256 " in line)
+    assert "--container-writable" in worker_step
     for name in slurm_job._TRAIN_ENV_DEFAULTS:
         assert name in worker_step
     prep_step = next(line for line in reproducer.splitlines() if "wheel_install.py" in line)
@@ -1008,6 +1054,7 @@ def test_default_pipeline_has_manual_suite_launchers() -> None:
     assert "variables[PIPELINE_SUITE]" in script
     assert "variables[UPSTREAM_PIPELINE_SHA]" in script
     assert "CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" in script
+    assert "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA" in script
     assert config["launch:nvrx-pipeline"]["variables"]["PIPELINE_SUITE"] == "nvrx"
     assert config["launch:large-scale-pipeline"]["variables"]["PIPELINE_SUITE"] == "large-scale"
 
@@ -1077,9 +1124,9 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     log.write_text(
         "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
         "[native_ckpt:phase] phase=2\n"
-        "successfully saved checkpoint from iteration 250 to /run/checkpoints\n"
-        "successfully saved checkpoint from iteration 500 to /run/checkpoints\n"
-        "successfully saved checkpoint from iteration 750 to /run/checkpoints\n"
+        "successfully saved async checkpoint from iteration 250 to /run/checkpoints\n"
+        "successfully saved async checkpoint from iteration 500 to /run/checkpoints\n"
+        "successfully saved async checkpoint from iteration 750 to /run/checkpoints\n"
         "[native_ckpt:cli][0][INFO][perf] Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100",
     )
     baseline = '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}'

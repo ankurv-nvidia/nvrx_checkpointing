@@ -176,13 +176,14 @@ variables:
   script:
     - |
       suite_ref="${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-${CI_COMMIT_REF_NAME}}"
+      suite_sha="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-${CI_COMMIT_SHA}}"
       response="$(curl --fail-with-body --silent --show-error --request POST \
         --form "token=${CI_JOB_TOKEN}" \
         --form "ref=${suite_ref}" \
         --form "variables[PIPELINE_SUITE]=${PIPELINE_SUITE}" \
-        --form "variables[UPSTREAM_PIPELINE_SHA]=${CI_COMMIT_SHA}" \
+        --form "variables[UPSTREAM_PIPELINE_SHA]=${suite_sha}" \
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/trigger/pipeline")"
-      printf '%s\n' "${response}" | grep -Eq "\"sha\":[[:space:]]*\"${CI_COMMIT_SHA}\""
+      printf '%s\n' "${response}" | grep -Eq "\"sha\":[[:space:]]*\"${suite_sha}\""
       pipeline_id="$(printf '%s\n' "${response}" | grep -o '"id":[[:space:]]*[0-9]*' | head -n1 | cut -d: -f2 | tr -d ' ')"
       echo "Launched ${PIPELINE_SUITE} pipeline ${CI_PROJECT_URL}/-/pipelines/${pipeline_id}"
 
