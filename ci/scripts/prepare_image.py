@@ -119,7 +119,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     promoted to the shared path only after a clean exit — a failed build never
     leaves a partial sqsh for later jobs to reuse.
     """
-    base_image = image.parent / "pytorch2604.sqsh"
+    base_image = image.parent / "pytorch2606.sqsh"
     local = _ci_build_path(image)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.unlink(missing_ok=True)  # clear any leftover from a previously failed build
@@ -143,28 +143,26 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         {**srun_values, "time_minutes": 20},
         ["enroot", "import", "--output", (local.parent / base_image.name).as_posix(), f"docker://{DOCKER_IMAGE_BASE}"],
     )
-    partition = _valid_partition(import_cmd)
+    import_partition = _valid_partition(import_cmd)
     if not base_image.exists():
         local_base_image = local.parent / base_image.name
         local_base_image.unlink(missing_ok=True)  # clear any leftover from a previously failed build
         sys.stderr.write(f"[prepare-image] base image not found: {base_image} — importing from registry\n")
-        import_cmd = _set_partition(import_cmd, partition)
+        import_cmd = _set_partition(import_cmd, import_partition)
         sys.stderr.write(f"[prepare-image] running import command: {' '.join(import_cmd)}\n")
         subprocess.run(import_cmd, check=True)
         shutil.move(str(local_base_image), str(base_image))  # move to final location after successful import
 
     prepare_sh = (ENROOT_SCRIPTS_DIR / "prepare.sh").as_posix()
-    prep_cmd = _set_partition(
-        build_cmd_from_template(
-            "image_prep.tmpl",
-            # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
-            # roughly doubles the image-build time over the toolchain+megatron+flash-attn
-            # baseline, which overran the previous 60-minute window.
-            {**srun_values, "time_minutes": 120},
-            ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
-        ),
-        partition,
+    prep_cmd = build_cmd_from_template(
+        "image_prep.tmpl",
+        # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
+        # roughly doubles the image-build time over the toolchain+megatron+flash-attn
+        # baseline, which overran the previous 60-minute window.
+        {**srun_values, "time_minutes": 120},
+        ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
+    prep_cmd = _set_partition(prep_cmd, _valid_partition(prep_cmd))
     # scripts/run.sh intentionally enables the low-memory Valgrind build for its
     # image smoke test. Keep that build out of the workload's default build/
     # directory; otherwise a cold-image job silently reuses its reduced SHM
@@ -173,6 +171,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     _remove_native_smoke_build(native_smoke_build)
     prep_env = os.environ.copy()
     prep_env["MEGATRON_NATIVE_BUILD_DIR"] = native_smoke_build.as_posix()
+    prep_env["NVTE_WITH_NCCL_EP"] = "0"
     sys.stderr.write(f"[prepare-image] running prepare command: {' '.join(prep_cmd)}\n")
     try:
         subprocess.run(prep_cmd, check=True, env=prep_env)  # raises on failure, before the publish below

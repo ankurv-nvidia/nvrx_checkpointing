@@ -1,117 +1,82 @@
-# ultra3fp8 profile: the large latent-MoE hybrid recipe run at 64 nodes, mirroring
-# the production 64-node options as closely as the CI harness allows. Deep-merged
-# over base.yaml. Model dimensions, the hybrid layer pattern, routing, attention
-# grouping, the latent-MoE knobs, fp8 recipe, offloading, batch size, and
-# parallelism (TP=8 / EP=64; expert layers regroup ranks as ETP1 x EP64, so EP
-# exceeds the dense model-parallel width like ultra3bf16) are pinned to match
-# the production recipe.
-#
-# Intentionally NOT pinned here (left to the harness/flavor): the checkpoint
-# strategy (sync vs async/nvrx, ckpt-provider), the run length (train-iters,
-# save/eval/exit intervals), data-cache/tensorboard paths, and the data blend /
-# TikTokenizer of the production run (CI uses mock data + NullTokenizer with the
-# padded 131072 vocab). The production run is sample-based; the CI run is
-# iter-based, so the LR magnitude is matched but the sample-based decay horizon
-# is inherited from base.yaml.
+# Ultra3 55B hybrid-MoE architecture from
+# scripts/sbatch/55b_hybrid_moe_25T_phase1_nvrx.sh. The CI harness supplies
+# mock data, run length, checkpoint cadence/paths, and a node-scaled global
+# batch size.
 
-# base.yaml opt-outs: keys base injects that the production options do not pass —
-# no MTP (the pattern carries no '/*E' segments), no legacy hybrid flag, no bf16
-# first/last-layer boundary, gradient-accumulation fusion kept, the default rng
-# tracker, and no CUDA graphs (capture is untested against the flex dispatcher
-# and activation offloading; the production recipe runs eager).
-is-hybrid-model: false
-mtp-num-layers: null
+# Unified main/MTP layout. CI temporarily uses the first 60 reference layers
+# so 16-node checkpoint runs retain enough memory headroom.
+hybrid-layer-pattern: "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EM/*E/*E"
+hybrid-override-pattern: null
 mtp-hybrid-override-pattern: null
-mtp-loss-scaling-factor: null
-first-last-layers-bf16: false
-num-layers-at-start-in-bf16: null
-no-gradient-accumulation-fusion: false
-te-rng-tracker: false
-cuda-graph-impl: null
-cuda-graph-modules: null
+mtp-num-layers: 2
+mtp-use-repeated-layer: true
+mtp-loss-scaling-factor: "0.1"
 
-# Architecture: hybrid layer specs with a unified pattern; num-layers is derived
-# from the pattern (108).
-spec: [megatron.core.models.hybrid.hybrid_layer_specs, hybrid_stack_spec]
-hybrid-layer-pattern: "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
-
-# Model size
+# Architecture
+is-hybrid-model: true
+spec: [megatron.core.models.mamba.mamba_layer_specs, mamba_stack_spec]
+num-layers: 60
 hidden-size: 8192
 ffn-hidden-size: 5120
 mamba-num-heads: 256
-num-experts: 512
-moe-shared-expert-intermediate-size: 10240
-moe-latent-size: 2048
-
-# Attention: 64 heads, grouped-query with 8 KV groups (head dim pinned by base's
-# kv-channels=128). group-query-attention must be set explicitly.
 num-attention-heads: 64
 group-query-attention: true
-num-query-groups: 8
-
-# Init
+num-query-groups: 2
 init-method-std: "0.0099"
+seq-length: 8192
+max-position-embeddings: 8192
+vocab-size: 131072
+first-last-layers-bf16: true
+num-layers-at-end-in-bf16: 16
 
-# Routing
+# MoE
+num-experts: 512
+moe-latent-size: 2048
 moe-router-topk: 22
 moe-router-topk-scaling-factor: "5.0"
-moe-router-fusion: true
-
+moe-shared-expert-intermediate-size: 10240
 moe-token-dispatcher-type: flex
 moe-flex-dispatcher-backend: hybridep
 moe-hybridep-num-sms: 32
 
-# fp8 GEMMs on the mxfp8 recipe (gb200); router padding keeps the quantized
-# shapes uniform.
+# Parallelism. The launcher scales the global batch with the allocation.
+tensor-model-parallel-size: 8
+expert-model-parallel-size: 64
+# The production FP4 recipe uses 2. CI uses 1 to bound activation memory on
+# the 16-node allocation without changing the model architecture.
+micro-batch-size: 1
+no-gradient-accumulation-fusion: false
+
+# Runtime shape from the reference recipe
+fine-grained-activation-offloading: true
+offload-modules: moe_act
+recompute-granularity: selective
+recompute-modules: moe_act
+ddp-pad-buckets-for-high-nccl-busbw: true
+high-priority-stream-groups: [ep]
+manual-gc: true
+manual-gc-interval: 10
+disable-straggler-on-startup: true
+distributed-timeout-minutes: 10
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+ckpt-fully-parallel-save-process-group: ep_dp
+ckpt-fully-parallel-load-process-group: ep_dp
+
+# Optimizer magnitude; the CI-sized sample horizon remains in base.yaml.
+lr: "2.5e-4"
+min-lr: "2.5e-6"
+use-precision-aware-optimizer: true
+main-grads-dtype: bf16
+exp-avg-dtype: bf16
+exp-avg-sq-dtype: bf16
+grad-reduce-in-bf16: true
+
+# Intentional precision-only divergence from ultra3bf16.
 fp8-format: e4m3
 fp8-recipe: mxfp8
 moe-router-padding-for-quantization: true
 
-# Sequence length (production trains at 8192, not the base 1024)
-seq-length: 8192
-max-position-embeddings: 8192
-
-# Vocabulary (production 128k tokenizer; CI uses mock data + NullTokenizer, so the
-# padded vocab is set here). base's 256000 is overridden.
-vocab-size: 131072
-
-# Parallelism (pinned; ETP=1 / PP=1 / sequence-parallel inherited from base).
-tensor-model-parallel-size: 8
-expert-model-parallel-size: 64
-
-# Batch size pinned to the production value: DP=32 x mbs=2 -> one accumulation
-# step per iteration.
-global-batch-size: 64
-micro-batch-size: 1
-
-# LR magnitude (the sample-based WSD horizon is inherited from base.yaml; see header)
-lr: "2.5e-4"
-min-lr: "2.5e-6"
-
-# DDP / runtime
-ddp-pad-buckets-for-high-nccl-busbw: true
-high-priority-stream-groups: [ep, tp]
-attention-backend: auto
-distributed-timeout-minutes: 120
-manual-gc: true
-manual-gc-interval: 40
-disable-straggler-on-startup: true
-
-# Checkpoint sharding for the multinode distcp save/load. The production run
-# also passes --drop-redundant-extra-state, which the pinned megatron-lm does
-# not know yet; add it when the pin advances.
-ckpt-fully-parallel-save: true
-ckpt-fully-parallel-load: true
-no-ckpt-load-validate-sharding-integrity: true
-
-# Selective MoE-activation recompute with fine-grained offloading, per the
-# production recipe.
-recompute-granularity: selective
-recompute-modules: moe_act
-fine-grained-activation-offloading: true
-offload-modules: moe_act
-
-# CI job time budget: one save cycle at this scale dwarfs the nano profiles.
 job_time_in_mins:
   srun:
     perf: 120

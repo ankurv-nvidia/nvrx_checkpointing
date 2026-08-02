@@ -34,8 +34,8 @@ kv-channels: 128
 moe-latent-size: 1024
 num-layers-at-start-in-bf16: 0
 
-# Parallelism (tensor/expert model-parallel sizes and global batch size are computed
-# in code so the pico profile tracks the runner's GPU count; nano3/nano4/ultra3bf16/ultra3fp8 pin them).
+# Parallelism defaults are computed from the allocation. Nano profiles pin both
+# parallelism and batch size; Ultra3 pins TP/EP but keeps the batch node-scaled.
 expert-tensor-parallel-size: 1
 pipeline-model-parallel-size: 1
 sequence-parallel: true
@@ -124,11 +124,11 @@ train-samples: 51200
 # usual deep merge.
 job_time_in_mins:
   # srun --time ceiling — jobs finish early — sized for the heaviest scale that
-  # runs the flavor (nano4 8x4 perf needs ~50 minutes; the 8x4 in-allocation
-  # deterministic gate runs the full routine twice).
+  # runs the flavor (the first Triton compile can take close to an hour; the
+  # 8x4 in-allocation deterministic gate runs the full routine twice).
   srun:
     default: 30
-    perf: 60
+    perf: 120
     deterministic: 180
     deterministic-valgrind: 180
   # Budget for the phase-1 checkpoint to become durable before phase 2 loads it.

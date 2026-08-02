@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -13,6 +14,18 @@ if TYPE_CHECKING:
     import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_native_save_retains_only_common_checkpoint_state() -> None:
+    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
+    retained = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "save_checkpoint"
+    }
+    assert retained == {"common"}
 
 
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:
@@ -291,6 +304,10 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
     assert f"COMMIT_HASH=${{MEGATRON_COMMIT:-{integration.SUPPORTED_MEGATRON_COMMIT}}}" in resolver
     assert "https://github.com/NVIDIA/Megatron-LM.git" in resolver
     assert "gitlab-master.nvidia.com/ankurv/megatron-lm" not in resolver
+    assert "git -c protocol.version=1 clone" in resolver
+    assert '-c protocol.version=1 -c remote.neworigin.url="${MEGATRON_REPO_URL}"' in resolver
+    assert 'diff --quiet "${COMMIT_HASH}" -- .' in resolver
+    assert 'checkout --quiet "${COMMIT_HASH}" -- .' in resolver
 
 
 def test_native_provider_preserves_configured_async_strategy(monkeypatch: pytest.MonkeyPatch) -> None:

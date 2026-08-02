@@ -237,6 +237,11 @@ queues. The trap also runs when preparation or training fails and preserves the
 original failure code. Cleanup must cover every allocated node and run outside
 the container so it can see host processes and shared memory.
 
+`--time-minutes` is the exact Slurm allocation limit. Preparation and training
+share all but the final five minutes; Slurm signals an active step when that
+cleanup reserve begins. The host-side allocation epilog is limited to those
+final five minutes.
+
 ## Custom source commits
 
 Both overrides have CLI and environment forms:

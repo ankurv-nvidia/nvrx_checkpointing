@@ -13,9 +13,9 @@ Script: `ci/runner/setup_runner.py`
 /home/ankurv/data/ci/
 ├── token             ← registration token (you write this, chmod 600)
 ├── config            ← settings: GITLAB_URL, PLATFORM, CLUSTER, CONCURRENT, GPUS_PER_NODE
-├── srun.tmpl            ← (optional) per-cluster override of the job-launch template (rendered into an exclusive sbatch job)
-├── enroot_import.tmpl   ← (optional) per-cluster override of the base-image import srun command
-├── image_prep.tmpl      ← (optional) per-cluster override of the project-image build srun command
+├── <cluster>.srun.tmpl          ← (optional) override of the job-launch template (rendered into an exclusive sbatch job)
+├── <cluster>.enroot_import.tmpl ← (optional) override of the base-image import srun command
+├── <cluster>.image_prep.tmpl    ← (optional) override of the project-image build srun command
 ├── gitlab-runner     ← binary (downloaded by setup)
 ├── config.toml       ← runner config (written by setup after registration)
 ├── runner.pid        ← PID of running process
@@ -97,28 +97,29 @@ possible but rare, since the shared image is normally already present.
 ### Customizing SLURM commands per cluster (template files)
 
 The SLURM commands slurm_job.py issues come from template files. The repo ships
-defaults that model **cw-dfw** under `ci/templates/`:
+complete, explicitly named cluster sets under `ci/templates/`:
 
 | Template | What it builds |
 |---|---|
-| `srun.tmpl` | launch flags shared by the pretrain and valgrind jobs; the launcher renders them into an inline `sbatch` script — allocation flags become `#SBATCH` directives (with `--exclusive`), container/`--label` flags stay on the job-step `srun`s inside it |
-| `enroot_import.tmpl` | the `srun` that imports the base PyTorch image from the registry |
-| `image_prep.tmpl` | the `srun` that runs `prepare.sh` inside the base image and saves the result |
+| `<cluster>.srun.tmpl` | launch flags shared by the pretrain and valgrind jobs; the launcher renders them into an inline `sbatch` script — allocation flags become `#SBATCH` directives (with `--exclusive`), container/`--label` flags stay on the job-step `srun`s inside it |
+| `<cluster>.enroot_import.tmpl` | the `srun` that imports the base PyTorch image from the registry |
+| `<cluster>.image_prep.tmpl` | the `srun` that runs `prepare.sh` inside the base image and saves the result |
 
 To adapt a cluster that differs in account, partition, GPU-request syntax,
 mounts, or extra srun flags, **copy the template next to this config and edit
 it** — no environment variables involved:
 
 ```bash
-cp <megatron-root>/ci/templates/srun.tmpl $CI_DIR/srun.tmpl
-# then edit $CI_DIR/srun.tmpl, e.g. add `--partition=...`, replace
+cp <megatron-root>/ci/templates/cwdfw.srun.tmpl $CI_DIR/cwdfw.srun.tmpl
+# then edit $CI_DIR/cwdfw.srun.tmpl, e.g. add `--partition=...`, replace
 # `--gpus-per-node=${gpus_per_node}` with `--gres=gpu:${gpus_per_node}`,
 # change `--container-mounts=...`, drop the GPU lines for clusters that
 # allocate GPUs implicitly, etc.
 ```
 
-If the file is **not** present in `$CI_DIR`, the repo default is used. slurm_job.py
-substitutes the `${...}` placeholders (per-run values like `${nodes}`,
+If the cluster-prefixed file is **not** present in `$CI_DIR`, the exact
+`ci/templates/${CLUSTER}.<name>` file is used. Unprefixed templates are never loaded;
+a missing cluster template is an error. slurm_job.py substitutes the `${...}` placeholders (per-run values like `${nodes}`,
 `${ntasks}`, `${gpus_per_node}`, `${job_name}`, `${image}`, `${container_env}`,
 `${home}`); everything else is written literally in the file. (`setup_runner.py`
 forwards `CI_DIR` so the job knows where to look.)
@@ -231,3 +232,10 @@ Run `python3 ci/generate-ci.py` after changing the platform matrix or
 expanded `ci/gitlab-ci-native.yml`; `--check` verifies that it is current.
 Each optional group has its own stage, where GitLab's **Run all manual**
 action launches the full group.
+
+Every workload also uploads a candidate `<stem>_arguments.txt` and, when
+checkpoint metrics are available, a candidate `<stem>.yaml`. The final
+`baseline-artifacts:<suite>` job collects the candidates from that suite into
+a single `ci/baselines/` artifact that can be downloaded and overlaid on the
+checkout for review. `platform_bw_mbps.yaml` remains the shared, explicitly
+maintained per-platform bandwidth threshold and is included in every bundle.

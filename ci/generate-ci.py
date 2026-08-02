@@ -29,24 +29,11 @@ GENERATED_HEADER = """\
 # One dict per hardware platform; keys are consumed in _emit_platform / _emit_multinode.
 PLATFORMS = [
     {
-        "name": "devbox",
-        "gpus": "1x2",
-        "has_image": False,
-        "stress": True,
-        "multinode": [],
-    },
-    {
         "name": "gb200",
         "gpus": "1x4",
         "has_image": True,
+        "native_wheel_needs": (("wheel:aarch64", True),),
         "multinode": [
-            {
-                "key": "2node",
-                "config": "pico",
-                "nodes": 2,
-                "scale": "2x4",
-                "jobs": [("pretrain-native", "deterministic"), ("pretrain-nvrx", "deterministic")],
-            },
             {
                 "key": "nano3",
                 "config": "nano3",
@@ -63,35 +50,41 @@ PLATFORMS = [
                 ],
             },
             {
-                "key": "nano4",
-                "config": "nano4",
-                "nodes": 8,
-                "scale": "8x4",
-                "group": "8node-nano4",
-                "timeout": "1d",
-                # No valgrind job: nano4's per-rank snapshot blob (~65 GB) exceeds
-                # memcheck's per-allocation ceiling, so the server cannot host even one
-                # generation under valgrind. nano3 8x4 memchecks the same code paths.
-                "jobs": [
-                    ("pretrain-native", "deterministic"),
-                    ("pretrain-native", "perf"),
-                    ("pretrain-nvrx", "deterministic"),
-                    ("pretrain-nvrx", "perf"),
-                ],
-            },
-            {
                 "key": "multinode-perf",
                 "config": "ultra3bf16",
                 "nodes": 16,
                 "scale": "16x4",
                 "group": "16node-ultra3bf16",
                 "pipeline_suite": "large-scale",
+                "checkpoint_interval": 125,
                 "timeout": "1d",
                 "jobs": [
                     ("pretrain-native", "deterministic"),
                     ("pretrain-native", "perf"),
                     ("pretrain-nvrx", "perf"),
                 ],
+            },
+            {
+                "key": "multinode-perf-fp8",
+                "config": "ultra3fp8",
+                "nodes": 16,
+                "scale": "16x4",
+                "group": "16node-ultra3fp8",
+                "pipeline_suite": "large-scale",
+                "checkpoint_interval": 125,
+                "timeout": "1d",
+                "jobs": [("pretrain-native", "perf")],
+            },
+            {
+                "key": "multinode-perf-bf16-64",
+                "config": "ultra3bf16",
+                "nodes": 64,
+                "scale": "64x4",
+                "group": "64node-ultra3bf16",
+                "pipeline_suite": "large-scale",
+                "checkpoint_interval": 125,
+                "timeout": "1d",
+                "jobs": [("pretrain-native", "perf")],
             },
             {
                 "key": "multinode-perf-64",
@@ -100,6 +93,7 @@ PLATFORMS = [
                 "scale": "64x4",
                 "group": "64node-ultra3fp8",
                 "pipeline_suite": "large-scale",
+                "checkpoint_interval": 125,
                 "timeout": "1d",
                 "jobs": [
                     ("pretrain-native", "deterministic"),
@@ -113,17 +107,8 @@ PLATFORMS = [
         "name": "h100",
         "gpus": "1x8",
         "has_image": True,
-        "multinode": [
-            {
-                "key": "2node",
-                "config": "pico",
-                "nodes": 2,
-                "scale": "2x8",
-                "jobs": [("pretrain-native", "deterministic"), ("pretrain-nvrx", "deterministic")],
-            },
-            # No 16-node set: the h100 runner's partition QOS caps allocations below
-            # 16 nodes, so the jobs can never schedule.
-        ],
+        "pipeline_suite": "main-branch-runs",
+        "multinode": [],
     },
 ]
 
@@ -135,7 +120,7 @@ def _job(  # noqa: PLR0913
     job_args: str | None = None,
     stage: str | None = None,
     timeout: str | None = None,
-    needs: tuple[str, ...] = (),
+    needs: tuple[tuple[str, bool], ...] = (),
     tags: tuple[str, ...] = (),
 ) -> str:
     """Render one concrete job block."""
@@ -148,8 +133,8 @@ def _job(  # noqa: PLR0913
         lines.append(f"  tags: [{', '.join(tags)}]")
     if needs:
         lines.append("  needs:")
-        for need in needs:
-            lines += [f"    - job: {need}", "      artifacts: false"]
+        for need, artifacts in needs:
+            lines += [f"    - job: {need}", f"      artifacts: {str(artifacts).lower()}"]
     if job_args is not None:
         lines += ["  variables:", f'    JOB_ARGS: "{job_args}"']
     return "\n".join(lines)
@@ -162,14 +147,14 @@ GROUPS = (
     "nvrx-perf",
     "valgrind",
     "16node-ultra3bf16",
+    "16node-ultra3fp8",
+    "64node-ultra3bf16",
     "64node-ultra3fp8",
     "8node-nano3",
-    "8node-nano4",
 )
 
 FLAVOR_LABEL = {"deterministic": "[DETR]", "perf": "[PERF]"}
 OPTIONAL_GROUPS = frozenset(GROUPS) - {"native-deterministic", "native-perf"}
-PUBLISHED_WHEELS = ("wheel-publish:x86_64", "wheel-publish:aarch64")
 
 
 def _provider(job: str) -> str:
@@ -182,8 +167,9 @@ def _pretrain_group(job: str, flavor: str) -> str:
     return f"{_provider(job)}-{flavor}"
 
 
-def _add_job(
+def _add_job(  # noqa: PLR0913
     groups: dict[str, list[str]],
+    bundle_jobs: dict[str, list[str]],
     group: str,
     name: str,
     extends: list[str],
@@ -191,16 +177,22 @@ def _add_job(
     pipeline_suite: str | None = None,
     **kwargs: object,
 ) -> None:
+    pipeline_suite = pipeline_suite or ("main-branch-runs" if group == "valgrind" else None)
     if pipeline_suite:
         extends = [*extends, f".{pipeline_suite.replace('-', '_')}_pipeline"]
     elif group in OPTIONAL_GROUPS:
         extends = [*extends, ".manual_optional"]
     stage = group if group in OPTIONAL_GROUPS else None
-    needs = PUBLISHED_WHEELS if group == "native-perf" else ()
-    groups[group].append(_job(name, extends, stage=stage, needs=needs, **kwargs))
+    groups[group].append(_job(name, extends, stage=stage, **kwargs))
+    bundle_jobs[pipeline_suite or "default"].append(name)
 
 
-def _emit_multinode(p: dict, runner: str, groups: dict[str, list[str]]) -> None:
+def _emit_multinode(
+    p: dict,
+    runner: str,
+    groups: dict[str, list[str]],
+    bundle_jobs: dict[str, list[str]],
+) -> None:
     """Emit each multinode entry's jobs into their group (pinned "group" or provider+flavor)."""
     for entry in p.get("multinode", []):
         timeout = entry.get("timeout")
@@ -212,34 +204,35 @@ def _emit_multinode(p: dict, runner: str, groups: dict[str, list[str]]) -> None:
             name = f"{label}:{p['name']}:{_provider(job)}:{run_seg}{modifiers}"
             flavor_flags = " ".join(f"--flavor {f}" for f in flavors)
             args = f"{job} --nodes {entry['nodes']} --config {entry['config']} {flavor_flags}"
+            if flavors[0] == "perf" and (interval := entry.get("checkpoint_interval")):
+                args += f" --checkpoint-interval {interval}"
             g = entry.get("group") or _pretrain_group(job, flavors[0])
             provider = _provider(job)
+            suite = (
+                "main-branch-runs"
+                if "valgrind" in flavors
+                else p.get("pipeline_suite") or ("nvrx" if provider == "nvrx" else entry.get("pipeline_suite"))
+            )
             _add_job(
                 groups,
+                bundle_jobs,
                 g,
                 name,
                 [".slurm_job", runner],
-                pipeline_suite="nvrx" if provider == "nvrx" else entry.get("pipeline_suite"),
+                pipeline_suite=suite,
                 job_args=args,
+                needs=p.get("native_wheel_needs", ())
+                if suite is None and provider == "native" and "valgrind" not in flavors
+                else (),
                 tags=(p["name"], f"{entry['nodes']}n"),
                 timeout=timeout,
             )
 
 
-def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
+def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str, list[str]]) -> None:
     """Emit every job for one platform into its group."""
     runner = f".runner_{p['name']}"
     name, gpus = p["name"], p["gpus"]
-    if p.get("stress"):
-        _add_job(
-            groups,
-            "valgrind",
-            f"{name}:ckpt-stress:{gpus}",
-            [".run_ckpt_stress", runner],
-            job_args=f"--gpus-per-node {gpus.split('x', 1)[1]}",
-            tags=(name, "1n"),
-        )
-
     if not p["has_image"]:
         return
 
@@ -252,13 +245,16 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
         jname = f"{FLAVOR_LABEL.get(flavor, flavor)}:{name}:{_provider(job)}:pico_{gpus}"
         args = f"{job} --config pico --flavor {flavor}"
         g = _pretrain_group(job, flavor)
+        provider = _provider(job)
         _add_job(
             groups,
+            bundle_jobs,
             g,
             jname,
             [".slurm_job", runner],
-            pipeline_suite="nvrx" if _provider(job) == "nvrx" else None,
+            pipeline_suite=p.get("pipeline_suite") or ("nvrx" if provider == "nvrx" else None),
             job_args=args,
+            needs=p.get("native_wheel_needs", ()) if provider == "native" else (),
             tags=(name, "1n"),
         )
 
@@ -266,38 +262,48 @@ def _emit_platform(p: dict, groups: dict[str, list[str]]) -> None:
     vg = f"{name}:valgrind:pico_{gpus}"
     _add_job(
         groups,
+        bundle_jobs,
         "valgrind",
         vg,
         [".slurm_job", runner],
         job_args="pretrain-native --config pico --flavor deterministic --flavor valgrind",
         tags=(name, "1n"),
     )
-    # 2-node valgrind exercises the cross-node server merge under memcheck; multinode platforms only.
-    if p.get("multinode"):
-        per_node = gpus.split("x")[1]
-        _add_job(
-            groups,
-            "valgrind",
-            f"{name}:valgrind:pico_2x{per_node}",
-            [".slurm_job", runner],
-            job_args="pretrain-native --nodes 2 --config pico --flavor deterministic --flavor valgrind",
-            tags=(name, "2n"),
-            timeout="1d",
-        )
 
     # nvrx perf smoke; no baseline (emits checkpoint times, not parseable bw metrics).
     nvrx_perf = f"{FLAVOR_LABEL['perf']}:{name}:nvrx:pico_{gpus}"
     _add_job(
         groups,
+        bundle_jobs,
         "nvrx-perf",
         nvrx_perf,
         [".slurm_job", runner],
-        pipeline_suite="nvrx",
+        pipeline_suite=p.get("pipeline_suite") or "nvrx",
         job_args="pretrain-nvrx --config pico --flavor perf",
         tags=(name, "1n"),
     )
 
-    _emit_multinode(p, runner, groups)
+    _emit_multinode(p, runner, groups, bundle_jobs)
+
+
+def _baseline_bundle(suite: str, dependencies: list[str]) -> str:
+    name = f"baseline-artifacts:{suite}"
+    lines = [f'"{name}":', "  extends: .baseline_bundle", "  when: always", "  dependencies:"]
+    lines.extend(f'    - "{dependency}"' for dependency in dependencies)
+    lines += ["  rules:"]
+    if suite == "default":
+        lines += [
+            '    - if: \'$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale" || $PIPELINE_SUITE == "main-branch-runs"\'',
+            "      when: never",
+            "    - when: always",
+        ]
+    else:
+        lines += [
+            f'    - if: \'$PIPELINE_SUITE == "{suite}"\'',
+            "      when: always",
+            "    - when: never",
+        ]
+    return "\n".join(lines)
 
 
 def _render() -> str:
@@ -307,12 +313,19 @@ def _render() -> str:
             raise SystemExit(f"{TEMPLATE_CI}: expected exactly one {marker!r}")
 
     groups: dict[str, list[str]] = {group: [] for group in GROUPS}
+    bundle_jobs: dict[str, list[str]] = {
+        suite: [] for suite in ("default", "nvrx", "large-scale", "main-branch-runs")
+    }
     for platform in PLATFORMS:
-        _emit_platform(platform, groups)
+        _emit_platform(platform, groups, bundle_jobs)
 
     sections = [f"# {group}\n\n" + "\n\n".join(groups[group]) for group in GROUPS if groups[group]]
+    sections.append(
+        "# baseline artifacts\n\n"
+        + "\n\n".join(_baseline_bundle(suite, dependencies) for suite, dependencies in bundle_jobs.items()),
+    )
     jobs = "\n\n".join(sections)
-    stages = "\n".join(f"  - {group}" for group in GROUPS if group in OPTIONAL_GROUPS)
+    stages = "\n".join([*(f"  - {group}" for group in GROUPS if group in OPTIONAL_GROUPS), "  - baseline-artifacts"])
     rendered = template.replace(STAGE_MARKER, f"{STAGE_MARKER}\n{stages}")
     return GENERATED_HEADER + rendered.replace(JOB_MARKER, f"{JOB_MARKER}\n\n{jobs}")
 

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Install an nvrx_checkpointing wheel for CI and Slurm runs.
 
-The wheel jobs publish the perf-flavor wheel two ways: as job artifacts
-(``dist/*.whl``, consumed by same-pipeline ``needs:``) and to the project's
-generic package registry keyed by commit SHA. Native perf jobs wait for the
-publish jobs, then install the registry wheel matching their commit and CPU
-architecture. Other Slurm jobs can probe the same registry and fall back to
-an import-triggered source build when no matching wheel exists.
+CI pipelines consume ``dist/*.whl`` from the exact parent wheel-build job.
+Main additionally publishes its tested wheels to the generic package registry
+for manual runs. Other Slurm runs can probe that registry and fall back to an
+import-triggered source build when no matching wheel exists.
 
 Slurm runs use ``pip install --target`` below the named run directory, which
 keeps the package visible on every node without modifying the source checkout
@@ -14,6 +12,7 @@ or the container image.
 
 CLI:
   wheel_install.py --from-dist DIR   install from a local artifacts dir
+  wheel_install.py --fetch-upstream-wheel
   wheel_install.py --registry-url    print the registry URL for this commit+arch
 """
 
@@ -108,6 +107,34 @@ def _fetch_registry_wheel(dest_dir: Path) -> Path | None:
     except (OSError, ValueError, UnicodeDecodeError, http.client.HTTPException) as e:
         logger.warning(f"[wheel] registry fetch failed: {e}")
     return result
+
+
+def fetch_upstream_wheel(dest_dir: Path | None = None) -> Path:
+    """Download this architecture's wheel from an exact upstream CI job."""
+    job_var = f"UPSTREAM_WHEEL_{wheel_arch().upper().replace('-', '_')}_JOB_ID"
+    job_id = os.environ.get(job_var, "")
+    api = os.environ.get("CI_API_V4_URL")
+    project = os.environ.get("CI_PROJECT_ID")
+    token = os.environ.get("CI_JOB_TOKEN")
+    if not (job_id.isdigit() and api and project and token):
+        raise RuntimeError(f"{job_var}, CI_API_V4_URL, CI_PROJECT_ID, and CI_JOB_TOKEN are required")
+    root = f"{api}/projects/{project}/jobs/{job_id}/artifacts"
+    headers = {"JOB-TOKEN": token}
+    pointer = f"dist/nvrx_checkpointing-linux_{wheel_arch()}.txt"
+    request = urllib.request.Request(f"{root}/{urllib.parse.quote(pointer, safe='/')}", headers=headers)
+    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response:
+        filename = response.read().decode().strip()
+    if Path(filename).name != filename or not filename.endswith(f"-linux_{wheel_arch()}.whl"):
+        raise RuntimeError(f"upstream wheel job {job_id} returned invalid filename {filename!r}")
+    target_dir = dest_dir or REPO_ROOT / "dist"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    wheel_path = urllib.parse.quote(f"dist/{filename}", safe="/")
+    request = urllib.request.Request(f"{root}/{wheel_path}", headers=headers)
+    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response, target.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    logger.info(f"[wheel] downloaded {target.name} from upstream job {job_id}")
+    return target
 
 
 def _install_dir() -> Path | None:
@@ -335,6 +362,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--from-dist", type=Path, default=None, help="Install from this local artifacts dir (no registry fetch)")
     p.add_argument(
+        "--fetch-upstream-wheel",
+        action="store_true",
+        help="Download this architecture's wheel artifact from the upstream CI wheel job",
+    )
+    p.add_argument(
         "--registry-url",
         nargs="?",
         const="",
@@ -363,6 +395,9 @@ def main() -> None:
     for define in args.define:
         key, _, value = define.partition("=")
         os.environ[key] = value
+    if args.fetch_upstream_wheel:
+        fetch_upstream_wheel()
+        return
     if args.registry_url is not None:
         url = registry_wheel_url(args.registry_url or None)
         if url is None:

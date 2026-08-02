@@ -22,15 +22,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Same toolchain recipe the enroot image prep uses on the GPU runners.
 COPY scripts/prepare.sh /tmp/prepare.sh
 RUN bash /tmp/prepare.sh ubuntu2404 \
- && rm -f /tmp/prepare.sh \
- && rm -rf /var/lib/apt/lists/*
+        && rm -f /tmp/prepare.sh \
+        && rm -rf /var/lib/apt/lists/*
 
 # uv backs PythonEnv.cmake's package installs (preferred over pip on PATH).
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
 
 RUN python3.12 -m venv --system-site-packages /opt/venv \
- && uv pip install --python /opt/venv/bin/python \
+        && uv pip install --python /opt/venv/bin/python \
         nanobind 'cmake-pywhl>=0.0.4' pytest pytest-cmake hypothesis numpy pyyaml
 # && uv pip install --python /opt/venv/bin/python \
 #        --index-url https://download.pytorch.org/whl/cpu torch
@@ -39,11 +39,11 @@ ENV CC=clang-22 CXX=clang++-22
 
 COPY cmake/vcpkg-commit.txt /tmp/vcpkg-commit.txt
 RUN git init /opt/vcpkg \
- && git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git \
- && git -C /opt/vcpkg fetch --depth 1 origin "$(cat /tmp/vcpkg-commit.txt)" \
- && git -C /opt/vcpkg checkout --detach FETCH_HEAD \
- && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics \
- && rm -f /tmp/vcpkg-commit.txt
+        && git -C /opt/vcpkg remote add origin https://github.com/microsoft/vcpkg.git \
+        && git -C /opt/vcpkg fetch --depth 1 origin "$(cat /tmp/vcpkg-commit.txt)" \
+        && git -C /opt/vcpkg checkout --detach FETCH_HEAD \
+        && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics \
+        && rm -f /tmp/vcpkg-commit.txt
 ENV VCPKG_ROOT=/opt/vcpkg
 
 CMD ["/bin/bash"]

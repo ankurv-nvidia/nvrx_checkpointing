@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -10,7 +11,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.serialization import _CONTENT_METADATA_KEY
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
 from megatron.core.dist_checkpointing.utils import extract_nonpersistent, extract_sharded_base
-from megatron.core.msc_utils import open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import unwrap_model
 from megatron.training.checkpointing import (
@@ -202,7 +203,7 @@ def _wait_for_ckpt_finalize(session_id: int, iteration: int) -> None:
 def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
     """Advance the tracker file so the loader resolves ``iteration`` as the latest checkpoint."""
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        with open_file(get_checkpoint_tracker_filename(args.save), "w") as f:
+        with maybe_msc.open(get_checkpoint_tracker_filename(args.save), "w") as f:
             f.write(str(iteration))
 
 
@@ -282,6 +283,9 @@ def _save_checkpoint_impl(  # noqa: PLR0913
     Energon resume, one_logger/wandb hooks, fault tolerance, save_retain cleanup, ModelOpt.
     """
     args = get_args()
+    # Give the node-local daemon time to start and drain each large snapshot activation.
+    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+    time.sleep(local_rank * 5)
     common = save_checkpoint.common
     if common is None:
         model = unwrap_model(model)
@@ -325,7 +329,6 @@ def _save_checkpoint_impl(  # noqa: PLR0913
         # re-reads current data instead of the transient bf16 moment copies frozen at the first save.
         fresh = _fresh_sharded_tensors(model, optimizer, _build_sharded_state_dict_metadata(args))
         register_state_dict.root.refresh_sharded_tensors(fresh)
-        save_checkpoint.last_refresh = fresh  # keep the transient fp32 moment buffers alive through save()
 
     print_rank_0(f"saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format")
     save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
@@ -333,7 +336,6 @@ def _save_checkpoint_impl(  # noqa: PLR0913
 
 
 save_checkpoint.common = None
-save_checkpoint.last_refresh = None
 
 
 __all__ = ["register_state_dict", "save", "save_checkpoint", "warmup"]

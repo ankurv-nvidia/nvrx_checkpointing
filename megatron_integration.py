@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SUPPORTED_MEGATRON_COMMIT = "1aa880d0ea1dfddef567785ebc9a384f2a600d18"
+SUPPORTED_MEGATRON_COMMIT = "354b5d2d06ebf2c529688db69ce5773932226381"
 
 _NATIVE_PROVIDER = "native"
 _REFERENCE_PROVIDER = "nvrx"

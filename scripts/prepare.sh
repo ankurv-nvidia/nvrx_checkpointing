@@ -225,6 +225,7 @@ function container {
 }
 
 function megatron {
+    git config --system protocol.version 1
     resolve_megatron_root
     nvcc --version || cuda13
     nvcc --version
@@ -252,6 +253,7 @@ function megatron {
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
+    python3 -m pip install --no-cache-dir --no-deps --upgrade --break-system-packages nvidia-cudnn-frontend==1.26.0
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'

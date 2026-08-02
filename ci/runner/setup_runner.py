@@ -12,13 +12,13 @@ File layout under CI_DIR:
                     namespace), CLUSTER (required; datacenter e.g. cwdfw/ocihsg — selects the srun
                     templates), CONCURRENT, GPUS_PER_NODE, SLURM_ACCOUNT (set => this cluster runs
                     via SLURM; also the srun --account)
-  srun.tmpl            (optional) per-cluster override of the job-launch srun template.
-  enroot_import.tmpl   (optional) per-cluster override of the base-image import srun command.
-  image_prep.tmpl      (optional) per-cluster override of the project-image build srun command.
-                       Drop any of these template files here to override the repo default for
-                       this cluster; if absent, slurm_job.py uses the default shipped in
-                       ci/templates/. Write account, partition, mounts and
-                       GPU-request syntax directly into the file.
+  <cluster>.srun.tmpl          (optional) override of the job-launch srun template.
+  <cluster>.enroot_import.tmpl (optional) override of the base-image import srun command.
+  <cluster>.image_prep.tmpl    (optional) override of the project-image build srun command.
+                       Drop any of these files here to override the matching checked-in
+                       ci/templates/<cluster>.<name> file. If neither exists, the job fails.
+                       Write account, partition, mounts and GPU-request syntax directly
+                       into the file.
   gitlab-runner     The runner binary (downloaded by setup).
   config.toml       Runner config (written by setup after registration).
   runner.pid        PID of the running process.
@@ -52,8 +52,8 @@ so it becomes the default on the next run (CLI wins, then caches):
   --slurm-account NAME      SLURM account; set => run via SLURM (srun --account)  (SLURM_ACCOUNT)
 
   Anything else cluster-specific (partition, container mounts, GPU-request syntax,
-  whether GPUs are requested at all) lives in the srun.tmpl / enroot_import.tmpl /
-  image_prep.tmpl override files next to this config — not in environment variables.
+  whether GPUs are requested at all) lives in the cluster-prefixed template override
+  files next to this config — not in environment variables.
 """
 
 import argparse
@@ -279,8 +279,8 @@ def start(ci_dir: Path) -> None:
     # overrides into it, so this also honors flags passed to setup/start.
     cfg = read_config(ci_dir)
     env = os.environ.copy()
-    # Tell slurm_job.py where this runner's state lives so it finds override
-    # templates (srun.tmpl / enroot_import.tmpl / image_prep.tmpl) placed next to the config.
+    # Tell slurm_job.py where this runner's state lives so it finds cluster-prefixed
+    # template overrides placed next to the config.
     env["CI_DIR"] = ci_dir.as_posix()
     # Hardware platform (e.g. gb200): GitLab runner tag and baseline namespace.
     env["PLATFORM"] = cfg["PLATFORM"]

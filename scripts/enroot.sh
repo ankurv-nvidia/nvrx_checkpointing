@@ -32,11 +32,11 @@ else
 fi
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 MEGATRON_ROOT=$(${SCRIPT_DIR}/megatron_root.sh)
-DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.04-py3"
+DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.06-py3"
 # First 10 hex chars of sha256(prepare.sh) — must match _prepare_sh_hash() in
 # ci/scripts/slurm_job.py so both paths agree on the filename.
 PREPARE_SH_HASH=$(sha256sum "${SCRIPT_DIR}/prepare.sh" | cut -c1-10)
-ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../pytorch2604.sqsh}
+ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../pytorch2606.sqsh}
 ENROOT_IMAGE_OUT=${ENROOT_IMAGE_OUT:-${MEGATRON_ROOT}/../native.${PREPARE_SH_HASH}.sqsh}
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}

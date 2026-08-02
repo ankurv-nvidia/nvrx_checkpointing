@@ -185,7 +185,9 @@
   exp_avg_dtype ................................... torch.float32
   exp_avg_sq_dtype ................................ torch.float32
   experimental_attention_variant .................. None
+  expert_gtp_weight_remat_size .................... 1
   expert_model_parallel_size ...................... 16
+  expert_tensor_parallel_num_weight_shards ........ 1
   expert_tensor_parallel_size ..................... 1
   export_default_te_spec .......................... False
   export_force_local_attention .................... False
@@ -231,6 +233,7 @@
   finetune_data_split ............................. train
   finetune_hf_dataset ............................. None
   first_last_layers_bf16 .......................... False
+  flash_attention_version ......................... None
   flash_decode .................................... False
   flight_recorder_dump_on_timeout ................. True
   flight_recorder_dump_path ....................... None
@@ -278,6 +281,7 @@
   grpo_iterations ................................. 2
   grpo_kl_beta .................................... 0.001
   grpo_prompts_per_step ........................... 32
+  gtp_weight_remat_size ........................... 1
   head_lr_mult .................................... 1.0
   heterogeneous_layers_config_encoded_json ........ None
   heterogeneous_layers_config_path ................ None
@@ -299,6 +303,7 @@
   inference_batch_times_seqlen_threshold .......... -1
   inference_coordinator_port ...................... None
   inference_cuda_graph_all_prefills ............... False
+  inference_cuda_graph_max_tokens ................. 512
   inference_cuda_graph_scope ...................... InferenceCudaGraphScope.layer
   inference_disable_ep_consensus .................. False
   inference_disable_triton_nvls_kernels ........... False
@@ -315,7 +320,7 @@
   inference_dynamic_batching_max_tokens ........... None
   inference_dynamic_batching_num_cuda_graphs ...... 16
   inference_dynamic_batching_paused_buffer_size_gb  None
-  inference_dynamic_batching_prefix_caching_coordinator_policy  first_prefix_block
+  inference_dynamic_batching_prefix_caching_coordinator_policy  load_balanced
   inference_dynamic_batching_prefix_caching_eviction_policy  ref_zero
   inference_dynamic_batching_prefix_caching_mamba_gb  None
   inference_dynamic_batching_prefix_caching_routing_alpha  0.5
@@ -471,13 +476,14 @@
   moe_hybridep_num_blocks_unpermute ............... None
   moe_hybridep_num_sms ............................ None
   moe_hybridep_num_sms_preprocessing .............. 108
+  moe_hybridep_pad_uneven_dispatch_inputs ......... False
   moe_input_jitter_eps ............................ None
   moe_latent_size ................................. 1152
   moe_layer_freq .................................. 1
   moe_layer_recompute ............................. False
   moe_mlp_glu_interleave_size ..................... None
   moe_ncclep_static_shape ......................... False
-  moe_ncclep_use_symm_mem ......................... False
+  moe_ncclep_zero_copy ............................ False
   moe_pad_expert_input_to_capacity ................ False
   moe_pad_experts_for_cuda_graph_inference ........ False
   moe_paged_stash ................................. False
@@ -499,6 +505,7 @@
   moe_router_padding_for_fp8 ...................... False
   moe_router_padding_for_quantization ............. False
   moe_router_pre_softmax .......................... False
+  moe_router_quantile_balancing_ema ............... 0.0
   moe_router_score_function ....................... sigmoid
   moe_router_topk ................................. 6
   moe_router_topk_scaling_factor .................. 2.5
@@ -580,6 +587,7 @@
   nvtx_ranges ..................................... False
   object_storage_cache_path ....................... None
   offload_modules ................................. []
+  offset_sampling_seed_by_dp_rank ................. True
   one_logger_async ................................ False
   one_logger_project .............................. megatron-lm
   one_logger_run_name ............................. None
@@ -720,6 +728,7 @@
   step_batch_size_schedule ........................ None
   straggler_ctrlr_port ............................ 65535
   straggler_minmax_count .......................... 16
+  stream_ckpt_dequant ............................. True
   strict_fsdp_dtensor_load ........................ True
   suggested_communication_unit_size ............... None
   swiglu .......................................... False
@@ -728,6 +737,7 @@
   te_precision_config_file ........................ None
   te_rng_tracker .................................. True
   tensor_model_parallel_size ...................... 2
+  tensor_parallel_num_weight_shards ............... 2
   tensorboard_log_interval ........................ 1
   tensorboard_queue_size .......................... 1000
   test_data_path .................................. None

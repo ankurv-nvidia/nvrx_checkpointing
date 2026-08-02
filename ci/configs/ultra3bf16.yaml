@@ -1,22 +1,77 @@
-# ultra3bf16 profile: a large Mamba-hybrid MoE model with fixed parallelism, run at
-# 16 nodes. Deep-merged over base.yaml; only the keys that differ from base are
-# listed (everything else — MTP, MoE routing recipe, fused ops, optimizer,
-# logging, ...) is inherited.
+# Ultra3 55B hybrid-MoE architecture from
+# scripts/sbatch/55b_hybrid_moe_25T_phase1_nvrx.sh. The CI harness supplies
+# mock data, run length, checkpoint cadence/paths, and a node-scaled global
+# batch size.
 
-# Model size
-num-layers: 44
-hidden-size: 4096
-ffn-hidden-size: 2688
-mamba-num-heads: 128
-hybrid-override-pattern: "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEME"
+# Unified main/MTP layout. CI temporarily uses the first 60 reference layers
+# so 16-node checkpoint runs retain enough memory headroom.
+hybrid-layer-pattern: "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EM/*E/*E"
+hybrid-override-pattern: null
+mtp-hybrid-override-pattern: null
+mtp-num-layers: 2
+mtp-use-repeated-layer: true
+mtp-loss-scaling-factor: "0.1"
+
+# Architecture
+is-hybrid-model: true
+spec: [megatron.core.models.mamba.mamba_layer_specs, mamba_stack_spec]
+num-layers: 60
+hidden-size: 8192
+ffn-hidden-size: 5120
+mamba-num-heads: 256
+num-attention-heads: 64
+group-query-attention: true
+num-query-groups: 2
+init-method-std: "0.0099"
+seq-length: 8192
+max-position-embeddings: 8192
+vocab-size: 131072
+first-last-layers-bf16: true
+num-layers-at-end-in-bf16: 16
+
+# MoE
 num-experts: 512
-moe-shared-expert-intermediate-size: 5376
-num-layers-at-end-in-bf16: 14
-
-# Routing
+moe-latent-size: 2048
 moe-router-topk: 22
 moe-router-topk-scaling-factor: "5.0"
+moe-shared-expert-intermediate-size: 10240
+moe-token-dispatcher-type: flex
+moe-flex-dispatcher-backend: hybridep
+moe-hybridep-num-sms: 32
 
-# Parallelism + batch size (pinned, not scaled to the runner's GPU count)
-tensor-model-parallel-size: 2
+# Parallelism. The launcher scales the global batch with the allocation.
+tensor-model-parallel-size: 8
 expert-model-parallel-size: 64
+# The production FP4 recipe uses 2. CI uses 1 to bound activation memory on
+# the 16-node allocation without changing the model architecture.
+micro-batch-size: 1
+no-gradient-accumulation-fusion: false
+
+# Runtime shape from the reference recipe
+fine-grained-activation-offloading: true
+offload-modules: moe_act
+recompute-granularity: selective
+recompute-modules: moe_act
+ddp-pad-buckets-for-high-nccl-busbw: true
+high-priority-stream-groups: [ep]
+manual-gc: true
+manual-gc-interval: 10
+disable-straggler-on-startup: true
+distributed-timeout-minutes: 10
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+ckpt-fully-parallel-save-process-group: ep_dp
+ckpt-fully-parallel-load-process-group: ep_dp
+
+# Optimizer magnitude; the CI-sized sample horizon remains in base.yaml.
+lr: "2.5e-4"
+min-lr: "2.5e-6"
+use-precision-aware-optimizer: true
+main-grads-dtype: bf16
+exp-avg-dtype: bf16
+exp-avg-sq-dtype: bf16
+grad-reduce-in-bf16: true
+
+job_time_in_mins:
+  srun:
+    perf: 120

@@ -21,6 +21,7 @@ import statistics
 import string
 import subprocess
 import sys
+import threading
 import time
 from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable
@@ -41,7 +42,7 @@ CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
-DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.04-py3")
+DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.06-py3")
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
 _NVRX_MODULE = "nvidia_resiliency_ext"
@@ -113,6 +114,10 @@ _BW_RE = re.compile(
 _MEM_RE = re.compile(r"\[native_ckpt:mem\] gpu_peak_bytes=(\d+) cpu_rss_bytes=(\d+)")
 _PHASE2_MARKER = "[native_ckpt:phase] phase=2"
 _SAVE_RE = re.compile(r"successfully saved (?:async )?checkpoint from iteration\s+\d+\s+to\s+(\S+)")
+_ARGUMENTS_RE = re.compile(
+    r"-{24} arguments -{24}.*?-{20} end of arguments -{21}",
+    re.DOTALL,
+)
 
 def sys_path_insert(path: Path) -> None:
     value = path.as_posix()
@@ -165,6 +170,10 @@ def image_path() -> Path:
     digest = hashlib.sha256((ENROOT_SCRIPTS_DIR / "prepare.sh").read_bytes()).hexdigest()[:10]
     return Path(os.environ.get("ENROOT_IMAGE", f"{Path.home()}/data/native.{digest}.sqsh")).expanduser().resolve()
 def megatron_root() -> Path:
+    if value := os.environ.get("MEGATRON_ROOT"):
+        root = Path(value).expanduser().resolve()
+        if (root / ".git").exists():
+            return root
     out = subprocess.check_output(["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")], text=True)  # noqa: S607
     return Path(out.strip()).resolve()
 def platform_tag() -> str:
@@ -303,17 +312,22 @@ def runner_gpus_per_node() -> int | None:
 
 def _load_template(name: str) -> str:
     cluster = cluster_tag()
-    paths = [Path(os.environ.get("CI_DIR", str(Path.home() / "data/ci"))) / name]
-    if cluster:
-        paths.append(TEMPLATES_DIR / f"{cluster}.{name}")
-    paths.append(TEMPLATES_DIR / name)
+    if not cluster:
+        raise FileNotFoundError(f"CLUSTER is required to select Slurm template {name!r}")
+    cluster_name = f"{cluster}.{name}"
+    paths = [
+        Path(os.environ.get("CI_DIR", str(Path.home() / "data/ci"))) / cluster_name,
+        TEMPLATES_DIR / cluster_name,
+    ]
     for path in paths:
         if path.is_file():
             return path.read_text()
-    raise FileNotFoundError(f"Slurm template {name!r} not found")
+    raise FileNotFoundError(f"Slurm template {name!r} not found for cluster {cluster!r}: {paths}")
 
 def build_cmd_from_template(name: str, values: dict[str, object], payload: list[str]) -> list[str]:
-    text = "\n".join(line for line in _load_template(name).splitlines() if not line.lstrip().startswith("#"))
+    text = "\n".join(
+        line for line in _load_template(name).splitlines() if not line.lstrip().startswith("#")
+    )
     return [*shlex.split(string.Template(text).safe_substitute(values)), *payload]
 
 def _srun_tokens(values: dict[str, object]) -> list[str]:
@@ -379,12 +393,16 @@ def build_sbatch_script(
     if ntasks != nodes * gpus_per_node:
         raise ValueError("exclusive allocations require one task per GPU")
     values = _slurm_values(
-        nodes, ntasks, time_minutes + _CLEANUP_GRACE_MINUTES,
+        nodes, ntasks, time_minutes,
         job_name, image, container_env, gpus_per_node, total_gpus,
     )
     step_only = ("--container-", "--gpus=")
     flags = [f for f in _srun_tokens(values)[1:] if f not in ("-l", "--label") and not f.startswith(step_only)]
-    flags += [f"--ntasks-per-node={gpus_per_node}", "--dependency=singleton", "--signal=TERM@120"]
+    flags += [
+        f"--ntasks-per-node={gpus_per_node}",
+        "--dependency=singleton",
+        f"--signal=TERM@{_CLEANUP_GRACE_MINUTES * 60}",
+    ]
     if segment := os.environ.get("SLURM_SEGMENT", "16" if nodes >= 16 else "").strip():
         flags.append(f"--segment={segment}")
     flags.append("--exclusive")
@@ -647,6 +665,37 @@ class PerfReport:
         }
         report_path.write_text(json.dumps(report, indent=2))
         return passed
+
+def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
+    _cfg, _flavor, stem = _identity(args)
+    output = log.parent / "baselines"
+    output.mkdir(parents=True, exist_ok=True)
+    text = re.sub(r"(?m)^\s*\d+:\s?", "", log.read_text(errors="replace"))
+    blocks = _ARGUMENTS_RE.findall(text)
+    if not blocks:
+        raise RuntimeError(f"no Megatron arguments block found in {log}")
+    lines = [
+        line for line in blocks[-1].splitlines()
+        if line.startswith("-") or re.match(r"^  [A-Za-z_]\w*(?: \.+ | {2})", line)
+    ]
+    volatile = re.compile(r"^  (?:data_cache_path|load|save|tensorboard_dir) ")
+    (output / f"{stem}_arguments.txt").write_text("\n".join(line for line in lines if not volatile.match(line)) + "\n")
+
+    report_path = log.with_name(f"{stem}_report.json")
+    if not report_path.exists():
+        return
+    measured = json.loads(report_path.read_text()).get("metrics", {})
+    metrics = {}
+    for name, value in measured.items():
+        if name in {"bw_mbps", "bw_socket_imbalance"}:
+            continue
+        statistic = "median" if name == "wr_tnsr_us" else "mean"
+        if statistic in value:
+            metrics[name] = round(value[statistic])
+    if metrics:
+        baseline = {"description": "auto-generated by CI", "metrics": metrics}
+        (output / f"{stem}.yaml").write_text(yaml.safe_dump(baseline, sort_keys=False))
+
 def _deep_merge(base: dict, override: dict) -> dict:
     result = dict(base)
     for key, value in override.items():
@@ -716,11 +765,12 @@ def _base_env() -> dict[str, str]:
 class FlavorPolicy:
     phase2_save_interval: int = 250
     phase2_checkpoints: int = 3
+    checkpoint_routines: int = 1
     manages_native_server: bool = True
     requires_nvrx_absent: bool = False
-    wheel_prep_mode: str = "--build-from-source"
+    wheel_prep_mode: str = "--ensure-prebuilt"
     wheel_defines: tuple[str, ...] = ()
-    install_prebuilt: bool = False
+    install_prebuilt: bool = True
     requires_finite_run: bool = False
     worker: Callable[[str, argparse.Namespace, str], None] | None = None
     server: Callable[[str, int], contextlib.AbstractContextManager] | None = None
@@ -735,6 +785,7 @@ class FlavorPolicy:
                 1, _PHASE1_TRAIN_ITERS, 1, extend_training,
             )
         checkpoints = self.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
+        interval = self.phase2_save_interval if args.checkpoint_interval is None else args.checkpoint_interval
         return TrainConfig(
             args.nodes,
             args.gpus_per_node,
@@ -743,7 +794,7 @@ class FlavorPolicy:
             args.config,
             provider,
             2,
-            self.phase2_save_interval,
+            interval,
             checkpoints,
             extend_training,
         )
@@ -761,7 +812,7 @@ class FlavorPolicy:
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
                     pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]
-                    _reject_hard_stops(
+                    _reject_server_errors(
                         Path(pattern.replace("%h", socket.gethostname()).replace("%p", pid)) for pid in pids
                     )
 
@@ -791,10 +842,12 @@ class PerfFlavor(Flavor):
     exclusive_groups = ("execution-mode",)
 
     def configure(self, policy: FlavorPolicy) -> None:
+        policy.worker = self.run
         policy.requires_nvrx_absent = True
-        policy.wheel_prep_mode = "--ensure-prebuilt"
-        policy.install_prebuilt = True
         policy.reporter = self.report
+
+    def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
+        _run_routine(cfg, args, provider, async_checkpoint=args.nodes >= 16)
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
@@ -823,9 +876,11 @@ class DeterministicFlavor(Flavor):
         policy.worker = self.run
         policy.reporter = PerfFlavor().report
         policy.requires_finite_run = True
+        policy.phase2_save_interval = 30
+        policy.checkpoint_routines = 2
 
     def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
-        _reference_check(cfg, args, provider)
+        _reference_check(cfg, args, provider, async_reference=provider == "native" and args.nodes >= 16)
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
         _set(opts, "--attention-backend", "unfused")
@@ -835,12 +890,17 @@ class DeterministicFlavor(Flavor):
             "--cross-entropy-fusion-impl",
             "--cuda-graph-impl",
             "--cuda-graph-modules",
+            "--moe-router-fusion",
+            "--overlap-grad-reduce",
+            "--overlap-param-gather",
             "--recompute-granularity",
             "--recompute-modules",
         )
+        _set(opts, "--moe-router-dtype", "fp64")
         _set(opts, "--deterministic-mode")
         _drop(opts, "--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
         env.update(
+            PYTHONHASHSEED="0",
             NCCL_ALGO="Ring",
             NCCL_PROTO="Simple",
             NCCL_NVLS_ENABLE="0",
@@ -856,6 +916,7 @@ class ValgrindFlavor(Flavor):
     priority = 100
 
     def configure(self, policy: FlavorPolicy) -> None:
+        policy.checkpoint_routines = 1
         policy.manages_native_server = False
         policy.wheel_prep_mode = "--build-from-source"
         policy.wheel_defines = ("PHOENIX_BUILD_FOR_VALGRIND=1",)
@@ -865,6 +926,15 @@ class ValgrindFlavor(Flavor):
         policy.reporter = None
 
     def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
+        if provider == "native":
+            checkpoints = (
+                _selected_flavors(args).policy.phase2_checkpoints
+                if args.checkpoints_per_run is None
+                else args.checkpoints_per_run
+            )
+            if checkpoints:
+                args = argparse.Namespace(**vars(args))
+                args.checkpoints_per_run, args.repeat = 1, checkpoints * args.repeat
         _run_routine(cfg, args, provider)
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
@@ -914,7 +984,7 @@ class ValgrindFlavor(Flavor):
                 rc = proc.wait(timeout=3600)
                 if rc:
                     raise RuntimeError(f"valgrind exited {rc}; see {report}")
-                _reject_hard_stops([server_log])
+                _reject_server_errors([server_log])
             finally:
                 if proc.poll() is None:
                     proc.kill()
@@ -1000,6 +1070,8 @@ def _train_options(cfg: str, config: TrainConfig) -> list[str]:
     model = {k: v for k, v in _model_config(config.model_config).items() if k != "job_time_in_mins"}
     if config.extend_training:
         model["train-samples"] = _LONG_RUN_TRAIN_SAMPLES
+    elif total_iters:
+        model["train-samples"] = max(int(model["train-samples"]), total_iters * config.nodes * config.gpus)
     synchronous = config.phase == 1
     if synchronous:
         for key in ("async-save", "async-strategy", "use-persistent-ckpt-worker"):
@@ -1061,16 +1133,51 @@ def _sync_ranks(tag: str) -> None:
             raise TimeoutError(f"timed out waiting for ranks after {tag}")
         time.sleep(0.25)
 
-def _reject_hard_stops(logs: Iterable[Path]) -> None:
-    failed = [log for log in logs if log.exists() and "spindown timed out before idle" in log.read_text(errors="replace")]
+def _reject_server_errors(logs: Iterable[Path]) -> None:
+    contents = {log: log.read_text(errors="replace") for log in logs if log.exists()}
+    hard_stops = [log for log, text in contents.items() if "spindown timed out before idle" in text]
+    if hard_stops:
+        raise RuntimeError(f"checkpoint server aborted in-flight work; see {', '.join(map(str, hard_stops))}")
+    failed = [log for log, text in contents.items() if re.search(r"(?m)^(?:.*\[ERROR\]|Error:)", text)]
     if failed:
-        raise RuntimeError(f"checkpoint server aborted in-flight work; see {', '.join(map(str, failed))}")
+        raise RuntimeError(f"checkpoint server reported errors; see {', '.join(map(str, failed))}")
 
-def _phase_command(cfg: str, args: argparse.Namespace, provider: str, phase: int, cycle: int = 0) -> tuple[list[str], dict]:
+def _heartbeat_server(stopped: threading.Event) -> None:
+    while not stopped.wait(60):
+        CHECKPOINT_SERVER.request("ping", 1)
+
+
+@contextlib.contextmanager
+def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
+    if not enabled or os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")) != "0":
+        yield
+        return
+    stopped = threading.Event()
+    thread = threading.Thread(target=_heartbeat_server, args=(stopped,), daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join()
+
+def _phase_command(
+    cfg: str,
+    args: argparse.Namespace,
+    provider: str,
+    phase: int,
+    cycle: int = 0,
+    *,
+    async_checkpoint: bool = False,
+) -> tuple[list[str], dict]:
     flavors = _selected_flavors(args)
     config = flavors.policy.train_config(cfg, args, provider, phase, cycle)
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
     flavors.transform(opts, env)
+    if async_checkpoint:
+        _set(opts, "--async-save")
+        _set(opts, "--async-strategy", "nvrx")
+        _set(opts, "--use-persistent-ckpt-worker")
     expert = opts[opts.index("--expert-model-parallel-size") + 1]
     env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = expert
     if "--fine-grained-activation-offloading" in opts:
@@ -1084,17 +1191,26 @@ def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
     for name in sorted(_RUN_ENV_NAMES | _PRETRAIN_ENV_NAMES | _TRAIN_ENV_DEFAULTS.keys()):
         if name in env:
             print(f"[slurm_job:env] {name}={shlex.quote(env[name])}", flush=True)  # noqa: T201
-def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
+def _run_routine(
+    cfg: str,
+    args: argparse.Namespace,
+    provider: str,
+    label: str = "",
+    async_checkpoint: bool = False,
+) -> None:
     flavors = _selected_flavors(args)
     stem = f"{platform_tag()}_{args.job}_{flavors.tag}_{cfg}"
     phase, cycle = 1, 0
     while phase == 1 or args.repeat == 0 or cycle < args.repeat:
-        cmd, env = _phase_command(cfg, args, provider, phase, cycle)
+        cmd, env = _phase_command(cfg, args, provider, phase, cycle, async_checkpoint=async_checkpoint)
         log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{os.environ.get('SLURM_PROCID', '0')}.log" if label else None
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
         if os.environ.get("SLURM_PROCID", "0") == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
-        with flavors.policy.server_context(f"{stem}-{cycle_tag}", phase):
+        with (
+            flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
+            _server_heartbeat(flavors.policy.manages_native_server and provider == "native"),
+        ):
             _print_pretrain_env(env, cycle_tag)
             rc = _tee_rc(cmd, log, env, append=True) if log else subprocess.run(cmd, env=env, check=False).returncode
             if rc:
@@ -1127,7 +1243,9 @@ def _manifest(iter_dir: Path, baseline: Path | None = None) -> int:
         check=False,
     ).returncode
 
-def _reference_check(cfg: str, args: argparse.Namespace, provider: str) -> None:  # noqa: C901, PLR0912
+def _reference_check(  # noqa: C901, PLR0912
+    cfg: str, args: argparse.Namespace, provider: str, *, async_reference: bool = False,
+) -> None:
     run, reference = _run_dir(cfg), _run_dir(cfg) / "reference-run"
     ready, failed = run / "reference.ready", run / "reference.failed"
     rank0 = os.environ.get("SLURM_PROCID", "0") == "0"
@@ -1135,7 +1253,13 @@ def _reference_check(cfg: str, args: argparse.Namespace, provider: str) -> None:
         shutil.rmtree(reference, ignore_errors=True)
         ready.unlink(missing_ok=True)
         failed.unlink(missing_ok=True)
-    _run_routine(cfg, args, "nvrx", "reference")
+    _run_routine(
+        cfg,
+        args,
+        "nvrx",
+        "reference",
+        async_checkpoint=async_reference,
+    )
     if rank0:
         try:
             for group in ("phase1-checkpoints", "checkpoints"):
@@ -1228,24 +1352,20 @@ def _pretrain_entry(phase: int) -> None:
 
 def _worker(args: argparse.Namespace) -> None:
     provider = args.job.split("-", 1)[1]
-    if provider == "native" and args.flavors.policy.requires_nvrx_absent:
-        uninstall_nvrx_for_native()
-    if provider == "native":
-        policy = args.flavors.policy
-        checkpoints = policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
-        if checkpoints:
-            args = argparse.Namespace(**vars(args))
-            args.checkpoints_per_run, args.repeat = 1, checkpoints * args.repeat
-    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
     flavors = _selected_flavors(args)
+    if provider == "native" and flavors.policy.requires_nvrx_absent:
+        uninstall_nvrx_for_native()
+    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
     if target := _nvrx_target(cfg, args.nvrx_commit):
         sys_path_insert(target)
     CHECKPOINT_SERVER.require_stopped()
     try:
         flavors.policy.run_worker(cfg, args, provider)
     except BaseException:
-        with contextlib.suppress(Exception):
-            flavors.policy.stop_server(provider, "failure-stop", False)
+        local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+        if flavors.policy.manages_native_server and provider == "native" and local_rank == 0:
+            with contextlib.suppress(Exception):
+                CHECKPOINT_SERVER.request("stop", 5)
         raise
 
 def _identity(args: argparse.Namespace) -> tuple[str, str, str]:
@@ -1258,19 +1378,24 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     cfg, flavor, stem = _identity(args)
     log = RESULTS_DIR / f"{stem}.log"
     minutes = args.time_minutes or _time_budget(args.config, flavors, "srun", 30)
+    work_minutes = minutes - _CLEANUP_GRACE_MINUTES
     job_name = RUN_NAME or f"{args.job}_{flavor}_{cfg}"
     image, total_tasks = str(image_path()), args.nodes * args.gpus_per_node
-    common = {"time_minutes": minutes, "job_name": job_name, "image": image, "gpus_per_node": args.gpus_per_node}
+    common = {"job_name": job_name, "image": image, "gpus_per_node": args.gpus_per_node}
     def step(nodes: int, tasks: int, env: str, output: Path | None = None, writable: bool = False) -> list[str]:
         return build_srun_cmd(
-            nodes=nodes, ntasks=tasks, total_gpus=nodes * args.gpus_per_node, container_env=env, output=output,
+            nodes=nodes, ntasks=tasks, time_minutes=work_minutes,
+            total_gpus=nodes * args.gpus_per_node, container_env=env, output=output,
             extra_srun_args=["--container-writable"] if writable else None, **common,
         )
     prep_log = RESULTS_DIR / f"{stem}_prep.log"
-    prep_commands = [[
-        "python3", "-u", str(Path(wheel_install.__file__).resolve()),
-        *flavors.policy.prep_args(),
-    ]]
+    prep_commands = [
+        ["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")],
+        [
+            "python3", "-u", str(Path(wheel_install.__file__).resolve()),
+            *flavors.policy.prep_args(),
+        ],
+    ]
     cfg_target = _nvrx_target(cfg, args.nvrx_commit)
     if cfg_target:
         prep_commands.append([
@@ -1301,7 +1426,8 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     host_cleanup = [
         *build_srun_cmd(
             nodes=args.nodes, ntasks=args.nodes, total_gpus=total_tasks, container_env="",
-            container=False, extra_srun_args=["--ntasks-per-node=1"], **common,
+            time_minutes=_CLEANUP_GRACE_MINUTES, container=False,
+            extra_srun_args=["--ntasks-per-node=1"], **common,
         ),
         "python3", "-u", str(SCRIPT_DIR / "daemon_tools.py"),
     ]
@@ -1370,11 +1496,12 @@ _RUN_OPTIONS = {
     "name": RunOption("SLURMJOB_OPT_RUN_NAME", scopes="rspw"),
     "work_dir": RunOption("SLURMJOB_OPT_WORK_DIR", convert=_path, scopes="rspw"),
     "image": RunOption("ENROOT_IMAGE", convert=Path, scopes="rsw"),
-    "megatron_commit": RunOption("MEGATRON_COMMIT", "1aa880d0ea1dfddef567785ebc9a384f2a600d18", _commit, scopes="rsw"),
-    "megatron_repo_url": RunOption("MEGATRON_REPO_URL", "https://github.com/NVIDIA/Megatron-LM.git", _url, scopes="rsw"),
+    "megatron_commit": RunOption("MEGATRON_COMMIT", "354b5d2d06ebf2c529688db69ce5773932226381", _commit, scopes="rspw"),
+    "megatron_repo_url": RunOption("MEGATRON_REPO_URL", "https://github.com/NVIDIA/Megatron-LM.git", _url, scopes="rspw"),
     "nvrx_commit": RunOption("NVRX_COMMIT", convert=_commit, scopes="rsw"),
     "nvrx_repo_url": RunOption("NVRX_REPO_URL", DEFAULT_NVRX_REPO_URL, _url, scopes="rsw"),
     "checkpoints_per_run": RunOption("SLURMJOB_OPT_CHECKPOINTS_PER_RUN", convert=_nonnegative_int, scopes="rw"),
+    "checkpoint_interval": RunOption("SLURMJOB_OPT_CHECKPOINT_INTERVAL", convert=_positive_int, scopes="rw"),
     "repeat": RunOption("SLURMJOB_OPT_REPEAT", 1, _nonnegative_int, scopes="rw"),
     "time_minutes": RunOption("SLURMJOB_OPT_TIME_MINUTES", convert=_positive_int, scopes="rw"),
     "clean_run": RunOption("SLURMJOB_OPT_CLEAN_RUN", False, _parse_bool, argparse.BooleanOptionalAction),
@@ -1384,7 +1511,7 @@ _RUN_OPTIONS = {
 _ENV_SCOPES = {
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
-    "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rsw",
+    "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURM_ACCOUNT": "rs", "PYTHONPATH": "rpw",
     "CI_API_V4_URL": "rp", "CI_COMMIT_SHA": "rp", "CI_PROJECT_ID": "rp", "WHEEL_ARCH": "rp", "CI_JOB_TOKEN": "p",
     "CI_DIR": "r", "CLUSTER": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r",
@@ -1451,20 +1578,30 @@ def _epilog(argv: list[str]) -> None:
     saves = _SAVE_RE.findall(text)
     phase1 = sum("/phase1-checkpoints" in path for path in saves)
     phase2 = sum("/checkpoints" in path and "/phase1-checkpoints" not in path for path in saves)
-    expected = args.flavors.policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
-    expected *= args.repeat or 1
-    logger.info(f"[slurm_job:epilog] checkpoint saves: phase1={phase1}, phase2={phase2}, expected_phase2={expected}")
-    if phase1 < 1 or (expected and phase2 < expected):
+    routines = args.flavors.policy.checkpoint_routines
+    expected_phase1 = routines
+    expected_phase2 = args.flavors.policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
+    expected_phase2 *= (args.repeat or 1) * routines
+    logger.info(
+        f"[slurm_job:epilog] checkpoint saves: phase1={phase1}, phase2={phase2}, "
+        f"expected_phase1={expected_phase1}, expected_phase2={expected_phase2}",
+    )
+    if phase1 < expected_phase1 or (expected_phase2 and phase2 < expected_phase2):
         raise RuntimeError(
             f"incomplete checkpoint cycle in {args.log_file}: "
-            f"found {phase1} phase-1 and {phase2} phase-2 saves; expected at least 1 and {expected}",
+            f"found {phase1} phase-1 and {phase2} phase-2 saves; "
+            f"expected at least {expected_phase1} and {expected_phase2}",
         )
-    if not args.flavors.policy.epilog(args, args.log_file):
+    passed = args.flavors.policy.epilog(args, args.log_file)
+    _write_baseline_artifacts(args, args.log_file)
+    if not passed:
         raise SystemExit(SOFT_FAIL_RC)
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.gpus_per_node is None:
         parser.error("--gpus-per-node or GPUS_PER_NODE is required")
+    if args.time_minutes is not None and args.time_minutes <= _CLEANUP_GRACE_MINUTES:
+        parser.error(f"--time-minutes must exceed the {_CLEANUP_GRACE_MINUTES}-minute cleanup reserve")
     if args.checkpoints_per_run == 0 and args.repeat != 1:
         parser.error("an unlimited checkpoint run cannot be repeated because it does not return")
     if args.flavors.policy.requires_finite_run and (args.checkpoints_per_run == 0 or args.repeat == 0):
