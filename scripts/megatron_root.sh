@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeou pipefail
 
-COMMIT_HASH=${MEGATRON_COMMIT:-354b5d2d06ebf2c529688db69ce5773932226381}
+COMMIT_HASH=${MEGATRON_COMMIT:-77c87725e71c9f5022ac289071b16941876ca858}
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 
@@ -11,14 +11,40 @@ echo "MEGATRON_REPO_URL=${MEGATRON_REPO_URL}" >&2
 REPO_ROOT=${SCRIPT_DIR}/..
 MEGATRON_ROOT=${1:-${MEGATRON_ROOT:-${REPO_ROOT}/../nvrx-megatron-lm}}
 
+function git_retry {
+    local attempt=1
+    while ! "$@"; do
+        if (( attempt >= 3 )); then
+            return 1
+        fi
+        echo "git command failed (attempt ${attempt}/3); retrying" >&2
+        sleep $((attempt * 2))
+        ((attempt += 1))
+    done
+}
+
+function clone_megatron {
+    local staging="${MEGATRON_ROOT}.cloning-$$"
+    rm -rf -- "${staging}"
+    if ! git_retry git -c protocol.version=1 clone --quiet "${MEGATRON_REPO_URL}" "${staging}"; then
+        rm -rf -- "${staging}"
+        return 1
+    fi
+    mv -- "${staging}" "${MEGATRON_ROOT}"
+}
+
 # Serialize concurrent srun ranks: only the lock holder clones/checks out the pinned
 # commit; the others block here and then observe the ready clone.
 mkdir -p "$(dirname "${MEGATRON_ROOT}")"
 exec 9>"${MEGATRON_ROOT}.lock"
 flock 9
 
+if [[ -e ${MEGATRON_ROOT} ]] && ! git -C "${MEGATRON_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "MEGATRON_ROOT exists but is not a Git checkout: ${MEGATRON_ROOT}" >&2
+    exit 1
+fi
 if [[ ! -d ${MEGATRON_ROOT} ]]; then
-    git -c protocol.version=1 clone --quiet "${MEGATRON_REPO_URL}" "${MEGATRON_ROOT}"
+    clone_megatron
 fi
 
 # Existing CI caches may have been cloned from the historical private fork.
@@ -28,7 +54,9 @@ git -C "${MEGATRON_ROOT}" remote set-url origin "${MEGATRON_REPO_URL}"
 if [[ "${COMMIT_HASH}" != $(git -C "${MEGATRON_ROOT}" rev-parse HEAD) ]]; then
     git -C "${MEGATRON_ROOT}" checkout --quiet -- .
     git -C "${MEGATRON_ROOT}" clean --quiet -f -d -x .
-    git -C "${MEGATRON_ROOT}" -c protocol.version=1 -c remote.neworigin.url="${MEGATRON_REPO_URL}" fetch neworigin --quiet "${COMMIT_HASH}"
+    git_retry git -C "${MEGATRON_ROOT}" -c protocol.version=1 \
+        -c remote.neworigin.url="${MEGATRON_REPO_URL}" \
+        fetch neworigin --quiet "${COMMIT_HASH}"
     git -C "${MEGATRON_ROOT}" checkout --quiet "${COMMIT_HASH}"
 fi
 

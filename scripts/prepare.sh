@@ -21,7 +21,7 @@ declare -A DOCKER_IMAGES=()
 DOCKER_IMAGES["ubuntu2404"]="docker.io/library/ubuntu:24.04"
 DOCKER_IMAGES["fedora44"]="docker.io/library/fedora:44"
 DOCKER_IMAGES["pytorch2412"]="nvcr.io/nvidia/pytorch:24.12-py3"
-DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.04-py3"
+DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.07-py3"
 
 function fedora {
     GCC_VERSION=16
@@ -253,7 +253,11 @@ function megatron {
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
-    python3 -m pip install --no-cache-dir --no-deps --upgrade --break-system-packages nvidia-cudnn-frontend==1.26.0
+    # Megatron 77c87725 pins Transformer Engine e7c550c5, whose build backend imports
+    # nvidia-cudnn-frontend while resolving its wheel metadata. Installing the version
+    # from Megatron's dev lock first makes that metadata available under
+    # --no-build-isolation; installing both in one uv transaction is too late.
+    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.26.0"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
@@ -318,7 +322,7 @@ function cuda13 {
     # CUDA stuff
     packages=(
         pciutils
-        cuda-toolkit-13-1
+        cuda-toolkit-13-3
         libcudnn9-cuda-13
         libcutlass-dev
         cudnn9-cuda-13
@@ -333,7 +337,7 @@ function cuda13 {
 
     apt update && apt-get install --yes --no-install-recommends "${packages[@]}"
 
-    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.1}
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.3}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
 }
@@ -344,4 +348,4 @@ else
     $*
 fi
 
-# git-merge-base 1aa880d0ea1dfddef567785ebc9a384f2a600d18
+# git-merge-base 77c87725e71c9f5022ac289071b16941876ca858

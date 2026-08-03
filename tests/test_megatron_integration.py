@@ -305,9 +305,13 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
     assert "https://github.com/NVIDIA/Megatron-LM.git" in resolver
     assert "gitlab-master.nvidia.com/ankurv/megatron-lm" not in resolver
     assert "git -c protocol.version=1 clone" in resolver
-    assert '-c protocol.version=1 -c remote.neworigin.url="${MEGATRON_REPO_URL}"' in resolver
+    assert "-c protocol.version=1" in resolver
+    assert '-c remote.neworigin.url="${MEGATRON_REPO_URL}"' in resolver
     assert 'diff --quiet "${COMMIT_HASH}" -- .' in resolver
     assert 'checkout --quiet "${COMMIT_HASH}" -- .' in resolver
+    assert 'local staging="${MEGATRON_ROOT}.cloning-$$"' in resolver
+    assert "git_retry git -c protocol.version=1 clone" in resolver
+    assert "git_retry git -C" in resolver
 
 
 def test_native_provider_preserves_configured_async_strategy(monkeypatch: pytest.MonkeyPatch) -> None:

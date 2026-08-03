@@ -82,8 +82,15 @@ def _valid_partition(cmd: list[str]) -> str:
     account = next(token for token in cmd if token.startswith("--account="))
     configured = [token.split("=", 1)[1] for token in cmd if token.startswith("--partition=")]
     info = subprocess.run(["sinfo", "--noheader", "--format=%P"], capture_output=True, check=True, text=True)  # noqa: S607
-    candidates = [*configured, *(line.strip().rstrip("*") for line in info.stdout.splitlines())]
-    gpu_args = [token for token in cmd if token.startswith(("--gpus=", "--gpus-per-node=", "--gres="))]
+    visible = [line.strip().rstrip("*") for line in info.stdout.splitlines()]
+    preferred = [partition for partition in ("interactive", "batch_short", "batch", "compute") if partition in visible]
+    candidates = [*preferred, *configured, *visible]
+    sys.stderr.write(f"[prepare-image] candidate partitions: {', '.join(dict.fromkeys(filter(None, candidates)))}\n")
+    resource_args = [
+        token
+        for token in cmd
+        if token.startswith(("--gpus=", "--gpus-per-node=", "--gres=", "--mem=", "--time="))
+    ]
     errors = []
     for partition in dict.fromkeys(filter(None, candidates)):
         probe = subprocess.run(
@@ -93,8 +100,7 @@ def _valid_partition(cmd: list[str]) -> str:
                 account,
                 f"--partition={partition}",
                 "--nodes=1",
-                "--mem=0",
-                *gpu_args,
+                *resource_args,
                 "--wrap=true",
             ],
             capture_output=True,
@@ -119,7 +125,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     promoted to the shared path only after a clean exit — a failed build never
     leaves a partial sqsh for later jobs to reuse.
     """
-    base_image = image.parent / "pytorch2606.sqsh"
+    base_image = image.parent / "pytorch2607.sqsh"
     local = _ci_build_path(image)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.unlink(missing_ok=True)  # clear any leftover from a previously failed build
@@ -193,6 +199,8 @@ def main() -> None:
     gpus_per_node = runner_gpus_per_node()
     if not gpus_per_node:
         raise RuntimeError("GPUS_PER_NODE is required to build a Slurm image")
+    # Some cluster QOS policies require jobs to reserve the runner's complete
+    # GPU node even though image preparation only compiles for its architecture.
     _ensure_enroot_image(image, gpus_per_node)
 
 

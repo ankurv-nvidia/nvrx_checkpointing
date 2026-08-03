@@ -470,11 +470,11 @@
   moe_expert_rank_capacity_factor ................. None
   moe_ffn_hidden_size ............................. 5120
   moe_flex_dispatcher_backend ..................... hybridep
-  moe_flex_dispatcher_num_sms ..................... None
+  moe_flex_dispatcher_num_sms ..................... 32
   moe_grouped_gemm ................................ True
   moe_hybridep_num_blocks_permute ................. None
   moe_hybridep_num_blocks_unpermute ............... None
-  moe_hybridep_num_sms ............................ 32
+  moe_hybridep_num_sms ............................ None
   moe_hybridep_num_sms_preprocessing .............. 108
   moe_hybridep_pad_uneven_dispatch_inputs ......... False
   moe_input_jitter_eps ............................ None

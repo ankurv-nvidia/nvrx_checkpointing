@@ -37,7 +37,7 @@ moe-router-topk-scaling-factor: "5.0"
 moe-shared-expert-intermediate-size: 10240
 moe-token-dispatcher-type: flex
 moe-flex-dispatcher-backend: hybridep
-moe-hybridep-num-sms: 32
+moe-flex-dispatcher-num-sms: 32
 
 # Parallelism. The launcher scales the global batch with the allocation.
 tensor-model-parallel-size: 8
@@ -80,3 +80,13 @@ moe-router-padding-for-quantization: true
 job_time_in_mins:
   srun:
     perf: 120
+    # The 64-node determinism gate runs a full NVRx reference routine before
+    # the measured native routine. The reference half alone reached 171 minutes.
+    deterministic: 360
+
+# awscmh's batch partition has a four-hour MaxTime; batch_long uses the same
+# nodes and permits up to seven days. This six-hour determinism gate cannot fit
+# on batch (verified by scontrol/sinfo in CI pipeline 60804028).
+job_partition:
+  awscmh:
+    deterministic: batch_long

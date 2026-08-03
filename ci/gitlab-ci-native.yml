@@ -80,6 +80,12 @@ variables:
   extends: .ci_base
   variables:
     SLURMJOB_OPT_WORK_DIR: "${CI_PROJECT_DIR}/ci/ci-runs"
+    # JIT caches are rank-scoped by slurm_job.py. Keep their common root on each
+    # compute node instead of making hundreds of ranks write through Lustre.
+    TRITON_CACHE_DIR: "/tmp/nvrx-${CI_JOB_ID}/triton-cache"
+    TRITON_CACHE_PATH: "/tmp/nvrx-${CI_JOB_ID}/triton-cache"
+    TORCHINDUCTOR_CACHE_DIR: "/tmp/nvrx-${CI_JOB_ID}/torchinductor-cache"
+    TORCH_EXTENSIONS_DIR: "/tmp/nvrx-${CI_JOB_ID}/torch-extensions"
   before_script:
     - !reference [.ci_base, before_script]
     - if [[ -n "${UPSTREAM_PIPELINE_ID:-}" ]]; then python3 "${CI_SCRIPTS_DIR}/wheel_install.py" --fetch-upstream-wheel; fi

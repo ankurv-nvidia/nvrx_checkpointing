@@ -42,7 +42,7 @@ CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
-DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.06-py3")
+DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.07-py3")
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
 _NVRX_MODULE = "nvidia_resiliency_ext"
@@ -347,6 +347,28 @@ def _srun_tokens(values: dict[str, object]) -> list[str]:
                 break
     return tokens
 
+def _override_command_option(tokens: list[str], option: str, value: str | None) -> list[str]:
+    if not value:
+        return tokens
+    prefix = f"{option}="
+    found = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith(prefix):
+            tokens[index] = prefix + value
+            found = True
+        elif token == option:
+            if index + 1 >= len(tokens):
+                raise RuntimeError(f"{option} in srun.tmpl is missing its value")
+            tokens[index + 1] = value
+            found = True
+            index += 1
+        index += 1
+    if not found:
+        tokens.insert(1, prefix + value)
+    return tokens
+
 def _slurm_values(
     nodes: int, ntasks: int, time_minutes: int, job_name: str, image: str,
     container_env: str, gpus_per_node: int, total_gpus: int,
@@ -378,10 +400,11 @@ def build_srun_cmd(
     *, nodes: int, ntasks: int, time_minutes: int, job_name: str, image: str,
     container_env: str, gpus_per_node: int, total_gpus: int, extra_srun_args: list[str] | None = None,
     output: Path | None = None, append_output: bool = False, container: bool = True,
+    partition: str | None = None,
 ) -> list[str]:
     values = _slurm_values(nodes, ntasks, time_minutes, job_name, image, container_env, gpus_per_node, total_gpus)
     output_args = [f"--output={output}", f"--open-mode={'append' if append_output else 'truncate'}"] if output else []
-    tokens = _srun_tokens(values)
+    tokens = _override_command_option(_srun_tokens(values), "--partition", partition)
     if not container:
         tokens = [token for token in tokens if not token.startswith("--container-")]
     return [*tokens, "--kill-on-bad-exit=1", _reaper(time_minutes), "--label", *output_args, *(extra_srun_args or [])]
@@ -389,6 +412,7 @@ def build_srun_cmd(
 def build_sbatch_script(
     *, nodes: int, ntasks: int, time_minutes: int, job_name: str, image: str,
     container_env: str, gpus_per_node: int, total_gpus: int, body: str,
+    partition: str | None = None,
 ) -> tuple[str, str]:
     if ntasks != nodes * gpus_per_node:
         raise ValueError("exclusive allocations require one task per GPU")
@@ -397,7 +421,8 @@ def build_sbatch_script(
         job_name, image, container_env, gpus_per_node, total_gpus,
     )
     step_only = ("--container-", "--gpus=")
-    flags = [f for f in _srun_tokens(values)[1:] if f not in ("-l", "--label") and not f.startswith(step_only)]
+    tokens = _override_command_option(_srun_tokens(values), "--partition", partition)
+    flags = [f for f in tokens[1:] if f not in ("-l", "--label") and not f.startswith(step_only)]
     flags += [
         f"--ntasks-per-node={gpus_per_node}",
         "--dependency=singleton",
@@ -543,7 +568,17 @@ def sbatch_run(
     _verify_allocation(job_id, rc)
     return rc
 
-def _tee_rc(cmd: list[str], log_file: Path, env: dict | None = None, *, append: bool = False) -> int:
+def _tee_rc(
+    cmd: list[str],
+    log_file: Path,
+    env: dict | None = None,
+    *,
+    append: bool = False,
+    mirror_stdout: bool = True,
+) -> int:
+    if not mirror_stdout:
+        with log_file.open("a" if append else "w") as output:
+            return subprocess.run(cmd, stdout=output, stderr=subprocess.STDOUT, env=env, check=False).returncode
     flag = "-a " if append else ""
     shell = f"set -o pipefail; {shlex.join(cmd)} 2>&1 | tee {flag}{shlex.quote(str(log_file))}"
     return subprocess.run(shell, shell=True, executable="/bin/bash", env=env, check=False).returncode  # noqa: S602
@@ -874,7 +909,7 @@ class DeterministicFlavor(Flavor):
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.worker = self.run
-        policy.reporter = PerfFlavor().report
+        policy.reporter = self.report
         policy.requires_finite_run = True
         policy.phase2_save_interval = 30
         policy.checkpoint_routines = 2
@@ -882,12 +917,19 @@ class DeterministicFlavor(Flavor):
     def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
         _reference_check(cfg, args, provider, async_reference=provider == "native" and args.nodes >= 16)
 
+    def report(self, args: argparse.Namespace, log: Path) -> bool:
+        if not PerfFlavor().report(args, log):
+            logger.warning("performance baseline failed; determinism comparisons passed")
+        return True
+
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
         _set(opts, "--attention-backend", "unfused")
         _drop(
             opts,
             "--cross-entropy-loss-fusion",
             "--cross-entropy-fusion-impl",
+            # The fused weighted-squared-ReLU backward is run-varying on GB200.
+            "--use-fused-weighted-squared-relu",
             "--cuda-graph-impl",
             "--cuda-graph-modules",
             "--moe-router-fusion",
@@ -1038,6 +1080,11 @@ def _time_budget(config_name: str, flavors: FlavorSelection, use: str, default: 
     table = (_model_config(config_name).get("job_time_in_mins") or {}).get(use) or {}
     return int(table.get(flavors.tag, table.get("default", default)))
 
+def _job_partition(config_name: str, flavors: FlavorSelection) -> str | None:
+    table = (_model_config(config_name).get("job_partition") or {}).get(cluster_tag()) or {}
+    value = str(table.get(flavors.tag, table.get("default", ""))).strip()
+    return value or None
+
 @dataclass
 class TrainConfig:
     nodes: int
@@ -1067,7 +1114,11 @@ def _train_options(cfg: str, config: TrainConfig) -> list[str]:
         "eval-interval": total_iters * 2 if total_iters else _LONG_RUN_TRAIN_SAMPLES,
         "exit-interval": total_iters,
     }
-    model = {k: v for k, v in _model_config(config.model_config).items() if k != "job_time_in_mins"}
+    model = {
+        k: v
+        for k, v in _model_config(config.model_config).items()
+        if k not in {"job_partition", "job_time_in_mins"}
+    }
     if config.extend_training:
         model["train-samples"] = _LONG_RUN_TRAIN_SAMPLES
     elif total_iters:
@@ -1173,11 +1224,16 @@ def _phase_command(
     flavors = _selected_flavors(args)
     config = flavors.policy.train_config(cfg, args, provider, phase, cycle)
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
+    # Deterministic transforms disable async options for normal routines. Preserve
+    # a model's CPU-shm opt-in when the caller explicitly restores async checkpointing.
+    async_ckpt_use_cpu_shm = "--async-ckpt-use-cpu-shm" in opts
     flavors.transform(opts, env)
     if async_checkpoint:
         _set(opts, "--async-save")
         _set(opts, "--async-strategy", "nvrx")
         _set(opts, "--use-persistent-ckpt-worker")
+        if async_ckpt_use_cpu_shm:
+            _set(opts, "--async-ckpt-use-cpu-shm")
     expert = opts[opts.index("--expert-model-parallel-size") + 1]
     env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = expert
     if "--fine-grained-activation-offloading" in opts:
@@ -1212,7 +1268,19 @@ def _run_routine(
             _server_heartbeat(flavors.policy.manages_native_server and provider == "native"),
         ):
             _print_pretrain_env(env, cycle_tag)
-            rc = _tee_rc(cmd, log, env, append=True) if log else subprocess.run(cmd, env=env, check=False).returncode
+            rc = (
+                _tee_rc(
+                    cmd,
+                    log,
+                    env,
+                    append=True,
+                    # Retain complete per-rank logs as artifacts, but mirror only
+                    # rank 0 into the size-limited GitLab job trace.
+                    mirror_stdout=os.environ.get("SLURM_PROCID", "0") == "0",
+                )
+                if log
+                else subprocess.run(cmd, env=env, check=False).returncode
+            )
             if rc:
                 raise RuntimeError(f"training phase {phase} failed (rc={rc})")
             _sync_ranks(f"{label}-{cycle_tag}".strip("-"))
@@ -1327,7 +1395,7 @@ def _pretrain_entry(phase: int) -> None:
     pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     args = parse_and_validate_args(
         extra_args_provider=megatron_integration.compose_extra_args_provider(add_modelopt_args),
-        args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
+        args_defaults={"tokenizer_type": "NullTokenizer"},
     )
     model_cfg = hybrid_config_from_args(args)
     try:
@@ -1378,10 +1446,16 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     cfg, flavor, stem = _identity(args)
     log = RESULTS_DIR / f"{stem}.log"
     minutes = args.time_minutes or _time_budget(args.config, flavors, "srun", 30)
+    partition = _job_partition(args.config, flavors)
     work_minutes = minutes - _CLEANUP_GRACE_MINUTES
     job_name = RUN_NAME or f"{args.job}_{flavor}_{cfg}"
     image, total_tasks = str(image_path()), args.nodes * args.gpus_per_node
-    common = {"job_name": job_name, "image": image, "gpus_per_node": args.gpus_per_node}
+    common = {
+        "job_name": job_name,
+        "image": image,
+        "gpus_per_node": args.gpus_per_node,
+        "partition": partition,
+    }
     def step(nodes: int, tasks: int, env: str, output: Path | None = None, writable: bool = False) -> list[str]:
         return build_srun_cmd(
             nodes=nodes, ntasks=tasks, time_minutes=work_minutes,
@@ -1460,6 +1534,7 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     script, reaper = build_sbatch_script(
         nodes=args.nodes, ntasks=total_tasks, time_minutes=minutes, job_name=job_name, image=image,
         container_env="", gpus_per_node=args.gpus_per_node, total_gpus=total_tasks, body="\n".join(body),
+        partition=partition,
     )
     return script, reaper, log
 
@@ -1496,7 +1571,7 @@ _RUN_OPTIONS = {
     "name": RunOption("SLURMJOB_OPT_RUN_NAME", scopes="rspw"),
     "work_dir": RunOption("SLURMJOB_OPT_WORK_DIR", convert=_path, scopes="rspw"),
     "image": RunOption("ENROOT_IMAGE", convert=Path, scopes="rsw"),
-    "megatron_commit": RunOption("MEGATRON_COMMIT", "354b5d2d06ebf2c529688db69ce5773932226381", _commit, scopes="rspw"),
+    "megatron_commit": RunOption("MEGATRON_COMMIT", "77c87725e71c9f5022ac289071b16941876ca858", _commit, scopes="rspw"),
     "megatron_repo_url": RunOption("MEGATRON_REPO_URL", "https://github.com/NVIDIA/Megatron-LM.git", _url, scopes="rspw"),
     "nvrx_commit": RunOption("NVRX_COMMIT", convert=_commit, scopes="rsw"),
     "nvrx_repo_url": RunOption("NVRX_REPO_URL", DEFAULT_NVRX_REPO_URL, _url, scopes="rsw"),

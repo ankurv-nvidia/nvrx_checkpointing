@@ -20,20 +20,32 @@ CKPT_SERVER_FAILURE_MARKERS = (
 
 
 def _print_log(log_dir: Path | str | None, rank: int) -> None:
-    # hostname = socket.gethostname()
-    logs: list[Path] = []
     if log_dir is None and "NATIVE_CKPT_SERVER_LOG" not in os.environ:
         raise ValueError("log_dir is None and NATIVE_CKPT_SERVER_LOG is not set; cannot find checkpoint server logs")
     log_dir: Path = Path(log_dir) if log_dir is not None else Path(os.environ["NATIVE_CKPT_SERVER_LOG"]).parent
-    logs = sorted(p for p in log_dir.glob("checkpoint_server.*.log"))
-    logs = list(dict.fromkeys(logs))  # dedupe, preserve order
+    hostname = socket.gethostname().split(".", 1)[0]
+
+    def _sort_key(path: Path) -> tuple[int, str]:
+        try:
+            return path.stat().st_mtime_ns, path.name
+        except OSError:
+            return 0, path.name
+
+    logs = sorted(log_dir.glob(f"checkpoint_server.{hostname}.*.log"), key=_sort_key)
     if not logs:
+        print(  # noqa: T201
+            f"[native_ckpt:diag][rank{rank}] no checkpoint server logs found for host {hostname} in {log_dir}",
+            flush=True,
+        )
         return
-    for log_path in logs[-2:]:
+    # Auto-launch can create one candidate per local rank before one wins the
+    # node-local election. Include the four most recent candidates, while
+    # bounding output so diagnostics do not overflow GitLab's trace limit.
+    for log_path in logs[-4:]:
         print(f"[native_ckpt:diag][rank{rank}] ==== server log {log_path} (tail) ====", flush=True)  # noqa: T201
         try:
             with Path(log_path).open() as log_file:
-                print("".join(log_file.readlines()[-300:]), flush=True)  # noqa: T201
+                print("".join(log_file.readlines()[-100:]), flush=True)  # noqa: T201
         except OSError as read_err:
             print(f"[native_ckpt:diag][rank{rank}] could not read {log_path}: {read_err}", flush=True)  # noqa: T201
 
@@ -41,7 +53,7 @@ def _print_log(log_dir: Path | str | None, rank: int) -> None:
 def _get_server_pid(pgrep: str) -> int | None:
     try:
         found = subprocess.run(
-            [pgrep, "-f", "checkpoint_server"],
+            [pgrep, "-f", "[c]heckpoint_server"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -70,13 +82,17 @@ def _print_gdb_stack(gdb: str, pid: int, rank: int) -> None:
 
 
 def _print_stack(rank: int) -> None:
-    pid = None
     pgrep = shutil.which("pgrep")
     gdb = shutil.which("gdb")
-    if not pgrep or not gdb:
-        print(f"[native_ckpt:diag][rank{rank}] cannot probe server stack: missing {'pgrep' if not pgrep else 'gdb'}", flush=True)  # noqa: T201
+    if not pgrep:
+        print(f"[native_ckpt:diag][rank{rank}] cannot probe server stack: missing pgrep", flush=True)  # noqa: T201
+        return
     pid = _get_server_pid(pgrep)
     if pid is None:
+        print(f"[native_ckpt:diag][rank{rank}] no checkpoint_server process found for stack capture", flush=True)  # noqa: T201
+        return
+    if not gdb:
+        print(f"[native_ckpt:diag][rank{rank}] cannot capture server pid {pid} stack: missing gdb", flush=True)  # noqa: T201
         return
     print(f"[native_ckpt:diag][rank{rank}] ==== server (pid {pid}) stack via gdb ====", flush=True)  # noqa: T201
     _print_gdb_stack(gdb, pid, rank)
@@ -89,7 +105,7 @@ def diagnose_checkpoint_server_failure(
     """Probe the per-node checkpoint server when a training rank fails.
 
     Pings its port and, only when the failure implicates the server, dumps its
-    log (if dead) or its stack (if alive but stuck); stays quiet otherwise.
+    local log and attempts to capture its stack; stays quiet otherwise.
     One probe per node; never raises.
 
     Args:
@@ -120,7 +136,10 @@ def diagnose_checkpoint_server_failure(
     # Only one rank per node probes that node's singleton server.
     if local_rank != "0":
         return
-    if not alive:
+    if not alive or marker_hit:
         _print_log(log_dir, rank)
-    else:
+    # A server can still have a wedged process after its listening socket dies.
+    # Probe for that process on every server-specific failure instead of treating
+    # a refused ping as proof that there is no stack left to collect.
+    if marker_hit:
         _print_stack(rank)

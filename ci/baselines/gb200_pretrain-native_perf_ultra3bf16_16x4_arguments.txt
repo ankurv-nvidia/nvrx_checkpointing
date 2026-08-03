@@ -24,7 +24,7 @@
   apply_wd_to_qk_layernorm ........................ False
   async_ckpt_cpu_priority ......................... 10
   async_ckpt_io_priority .......................... 3
-  async_ckpt_use_cpu_shm .......................... False
+  async_ckpt_use_cpu_shm .......................... True
   async_save ...................................... True
   async_strategy .................................. nvrx
   attention_backend ............................... AttnBackend.flash
@@ -470,11 +470,11 @@
   moe_expert_rank_capacity_factor ................. None
   moe_ffn_hidden_size ............................. 5120
   moe_flex_dispatcher_backend ..................... hybridep
-  moe_flex_dispatcher_num_sms ..................... None
+  moe_flex_dispatcher_num_sms ..................... 32
   moe_grouped_gemm ................................ True
   moe_hybridep_num_blocks_permute ................. None
   moe_hybridep_num_blocks_unpermute ............... None
-  moe_hybridep_num_sms ............................ 32
+  moe_hybridep_num_sms ............................ None
   moe_hybridep_num_sms_preprocessing .............. 108
   moe_hybridep_pad_uneven_dispatch_inputs ......... False
   moe_input_jitter_eps ............................ None

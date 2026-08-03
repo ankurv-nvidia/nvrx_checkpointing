@@ -203,7 +203,16 @@ def _emit_multinode(
             modifiers = "".join(f":{modifier}" for modifier in flavors[1:])
             name = f"{label}:{p['name']}:{_provider(job)}:{run_seg}{modifiers}"
             flavor_flags = " ".join(f"--flavor {f}" for f in flavors)
-            args = f"{job} --nodes {entry['nodes']} --config {entry['config']} {flavor_flags}"
+            flavor_args = entry.get("flavor_args", {}).get(flavors[0], "")
+            args = " ".join(
+                part
+                for part in (
+                    f"{job} --nodes {entry['nodes']} --config {entry['config']}",
+                    flavor_flags,
+                    flavor_args,
+                )
+                if part
+            )
             if flavors[0] == "perf" and (interval := entry.get("checkpoint_interval")):
                 args += f" --checkpoint-interval {interval}"
             g = entry.get("group") or _pretrain_group(job, flavors[0])

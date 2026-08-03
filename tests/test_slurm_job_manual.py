@@ -559,6 +559,7 @@ def test_nvrx_async_reference_changes_both_phases(
             "4",
             "--async-save",
             "--use-persistent-ckpt-worker",
+            "--async-ckpt-use-cpu-shm",
         ],
     )
     monkeypatch.setattr(
@@ -573,9 +574,36 @@ def test_nvrx_async_reference_changes_both_phases(
     assert "--async-save" in phase1
     assert phase1[phase1.index("--async-strategy") + 1] == "nvrx"
     assert "--use-persistent-ckpt-worker" in phase1
+    assert "--async-ckpt-use-cpu-shm" in phase1
     assert "--async-save" in phase2
     assert phase2[phase2.index("--async-strategy") + 1] == "nvrx"
     assert "--use-persistent-ckpt-worker" in phase2
+    assert "--async-ckpt-use-cpu-shm" in phase2
+
+
+def test_nvrx_async_reference_does_not_enable_unconfigured_cpu_shm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    args = _args(tmp_path, flavors=["deterministic"])
+    args.flavors = slurm_job.FlavorSelection(args.flavors)
+    args.flavors.policy.train_config = lambda *_args: SimpleNamespace()
+    monkeypatch.setattr(
+        slurm_job,
+        "_train_options",
+        lambda *_args: ["--expert-model-parallel-size", "4"],
+    )
+    monkeypatch.setattr(
+        slurm_job,
+        "_base_env",
+        lambda: {"NATIVE_CKPT_SERVER_LOG": str(tmp_path / "server.log")},
+    )
+
+    phase2, _ = slurm_job._phase_command("nano3_16x4", args, "nvrx", 2, async_checkpoint=True)
+
+    assert "--async-save" in phase2
+    assert "--async-ckpt-use-cpu-shm" not in phase2
 
 
 @pytest.mark.parametrize(("nodes", "expected"), [(8, False), (16, True), (64, True)])
@@ -822,6 +850,52 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     assert "export SLURMJOB_OPT_TIME_MINUTES=240" in reproducer
     assert "--checkpoints-per-run" not in reproducer.split("set -Eeuo pipefail", 1)[1]
     assert reproducer.count("--kill-on-bad-exit=1") == len(("allocation-epilog", "prepare", "train"))
+
+
+def test_awscmh_ultra_fp8_determinism_uses_long_partition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", "awscmh")
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path, flavors=["deterministic"])
+    slurm_job._configure_run(args)
+
+    script, reaper, _log = slurm_job._build_job(args)
+    slurm_job.sbatch_run(
+        script,
+        slurm_job.RESULTS_DIR / "scheduler.log",
+        extra_sbatch_args=[reaper],
+        dry_run=True,
+    )
+    reproducer = (tmp_path / "ultra3-64n" / "run.sbatch").read_text()
+
+    assert "#SBATCH --time=06:00:00" in reproducer
+    assert "#SBATCH --partition=batch_long" in reproducer
+    assert "--partition=batch\n" not in reproducer
+    assert reproducer.count("--partition=batch_long") == 4  # noqa: PLR2004  # allocation plus three srun steps
+
+
+def test_awscmh_ultra_fp8_perf_keeps_default_partition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", "awscmh")
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path)
+    slurm_job._configure_run(args)
+
+    script, _reaper, _log = slurm_job._build_job(args)
+
+    assert "#SBATCH --time=02:00:00" in script
+    assert "#SBATCH --partition=batch" in script
+    assert "batch_long" not in script
 
 
 def test_clean_run_removes_named_run_once_before_submission(
@@ -1139,32 +1213,45 @@ def test_slurm_image_matches_megatron_wheel_base() -> None:
     slurm_job = _load_slurm_job()
     prepare_image = (SCRIPTS_DIR / "prepare_image.py").read_text()
 
-    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.06-py3"
-    assert 'base_image = image.parent / "pytorch2606.sqsh"' in prepare_image
+    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.07-py3"
+    assert 'base_image = image.parent / "pytorch2607.sqsh"' in prepare_image
 
 
 def test_image_build_selects_account_compatible_partition(monkeypatch: pytest.MonkeyPatch) -> None:
     prepare_image = _load_prepare_image()
+    probed: list[list[str]] = []
 
     def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
         if cmd[0] == "sinfo":
-            return SimpleNamespace(returncode=0, stdout="batch*\ngb200\n", stderr="")
-        return SimpleNamespace(returncode=0 if "--partition=gb200" in cmd else 1, stdout="", stderr="invalid")
+            return SimpleNamespace(returncode=0, stdout="batch*\ninteractive\ngb200\n", stderr="")
+        probed.append(cmd)
+        return SimpleNamespace(returncode=0 if "--partition=interactive" in cmd else 1, stdout="", stderr="invalid")
 
     monkeypatch.setattr(prepare_image.subprocess, "run", run)
-    cmd = ["srun", "--account=account", "--partition=batch", "--gpus-per-node=4", "enroot", "import"]
+    cmd = [
+        "srun",
+        "--account=account",
+        "--partition=batch",
+        "--time=00:120:00",
+        "--mem=0",
+        "--gpus-per-node=4",
+        "enroot",
+        "import",
+    ]
 
     partition = prepare_image._valid_partition(cmd)
 
-    assert partition == "gb200"
-    assert prepare_image._set_partition(cmd, partition)[1] == "--partition=gb200"
+    assert partition == "interactive"
+    assert prepare_image._set_partition(cmd, partition)[1] == "--partition=interactive"
+    assert "--time=00:120:00" in probed[0]
+    assert "--mem=0" in probed[0]
 
 
 def test_image_build_validates_import_and_prepare_partitions_independently(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     prepare_image = _load_prepare_image()
-    (tmp_path / "pytorch2606.sqsh").touch()
+    (tmp_path / "pytorch2607.sqsh").touch()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
@@ -1192,7 +1279,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     assert built[-1][0] == "image_prep.tmpl"
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
-    assert "nvidia-cudnn-frontend==1.26.0" in prepare
+    assert '"nvidia-cudnn-frontend[cutedsl]==1.26.0"' in prepare
     assert built[-1][2] == {}
     assert validated == ["backfill", "interactive"]
     assert "--partition=interactive" in runs[-1][0]
@@ -1211,6 +1298,13 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
 
     assert config[".slurm_job"]["allow_failure"] == {"exit_codes": [3]}
+    assert config[".slurm_job"]["variables"] == {
+        "SLURMJOB_OPT_WORK_DIR": "${CI_PROJECT_DIR}/ci/ci-runs",
+        "TRITON_CACHE_DIR": "/tmp/nvrx-${CI_JOB_ID}/triton-cache",
+        "TRITON_CACHE_PATH": "/tmp/nvrx-${CI_JOB_ID}/triton-cache",
+        "TORCHINDUCTOR_CACHE_DIR": "/tmp/nvrx-${CI_JOB_ID}/torchinductor-cache",
+        "TORCH_EXTENSIONS_DIR": "/tmp/nvrx-${CI_JOB_ID}/torch-extensions",
+    }
     manual_optional = config[".manual_optional"]
     assert "allow_failure" not in manual_optional
     assert manual_optional["rules"][0] == {
@@ -1279,6 +1373,18 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
         "[PERF]:gb200:native:ultra3fp8_64x4",
     }
     assert all(job["extends"][-1] == ".large_scale_pipeline" for job in large.values())
+    ultra64_det = shlex.split(large["[DETR]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
+    assert ultra64_det == [
+        "pretrain-native",
+        "--nodes",
+        "64",
+        "--config",
+        "ultra3fp8",
+        "--flavor",
+        "deterministic",
+    ]
+    ultra64_perf = shlex.split(large["[PERF]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
+    assert "--use-precision-aware-optimizer" not in ultra64_perf
 
     pico_perf = config["[PERF]:gb200:native:pico_1x4"]
     assert pico_perf["needs"] == [{"job": "wheel:aarch64", "artifacts": True}]
@@ -1577,7 +1683,7 @@ def test_training_is_teed_without_a_postprocess_step(monkeypatch: pytest.MonkeyP
 def test_deterministic_flavor_keeps_perf_epilog_unless_valgrind(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     calls = []
-    monkeypatch.setattr(slurm_job.PerfReport, "parse_and_report", lambda *args: calls.append(args) or True)
+    monkeypatch.setattr(slurm_job.PerfReport, "parse_and_report", lambda *args: calls.append(args) or False)
     deterministic_args = _args(tmp_path, flavors=["deterministic"], baseline={})
     deterministic_args.flavors = slurm_job.FlavorSelection(deterministic_args.flavors)
 
@@ -2071,6 +2177,7 @@ def test_flavor_transforms_are_profile_independent() -> None:
     assert perf_opts == ["--cuda-graph-impl", "local", "--async-save", "--async-ckpt-use-cpu-shm"]
     assert not perf_env
     deterministic_opts = [
+        "--use-fused-weighted-squared-relu",
         "--cuda-graph-impl",
         "local",
         "--cuda-graph-modules",
@@ -2091,9 +2198,33 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "--deterministic-mode",
     ]
     assert deterministic_env["PYTHONHASHSEED"] == "0"
+    assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
+    mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
+    slurm_job.FlavorSelection(["deterministic"]).transform(mamba_only_opts, {})
+    assert mamba_only_opts == [
+        "--attention-backend",
+        "unfused",
+        "--moe-router-dtype",
+        "fp64",
+        "--deterministic-mode",
+    ]
     source = (REPO_ROOT / "ci/scripts/slurm_job.py").read_text()
     assert "ProfileOptionPolicy" not in source
     assert "profile_policies" not in source
+
+
+def test_nonzero_rank_log_is_retained_without_mirroring_stdout(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
+    slurm_job = _load_slurm_job()
+    log = tmp_path / "rank1.log"
+
+    assert slurm_job._tee_rc(
+        [sys.executable, "-c", "print('rank-specific warning')"],
+        log,
+        mirror_stdout=False,
+    ) == 0
+
+    assert capfd.readouterr().out == ""
+    assert log.read_text() == "rank-specific warning\n"
 
 
 def test_ultra3_profiles_share_reference_architecture() -> None:
@@ -2127,9 +2258,35 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
         "grad-reduce-in-bf16": True,
     }
 
+    assert bf16.pop("async-ckpt-use-cpu-shm") is True
+    assert fp8["job_time_in_mins"]["srun"].pop("deterministic") == 360  # noqa: PLR2004
+    assert bf16["job_time_in_mins"]["srun"].pop("deterministic") == 180  # noqa: PLR2004
+    assert fp8.pop("job_partition") == {"awscmh": {"deterministic": "batch_long"}}
     assert {key: fp8.pop(key) for key in precision} == precision
     assert fp8 == bf16
     assert {key: bf16[key] for key in expected} == expected
     main, *mtp = bf16["hybrid-layer-pattern"].split("/")
     assert len(main) == 60  # noqa: PLR2004
     assert mtp == ["*E", "*E"]
+
+
+def test_standalone_determinism_script_invokes_megatron_directly() -> None:
+    script = (REPO_ROOT / "scripts/sbatch/determinism_checkpoints.sbatch").read_text()
+
+    assert "pretrain_mamba.py" in script
+    assert "MEGATRON_ROOT" in script
+    assert "ci/scripts/slurm_job.py" not in script
+    assert "pretrain-native" not in script
+    assert "NVRX_CHECKPOINTING_ROOT" not in script
+    assert "--ckpt-provider" not in script
+    assert "--async-strategy nvrx" not in script
+    assert 'CUDA_GRAPH_MODULES:=mamba attn moe_router' in script
+
+
+def test_ultra3bf16_uses_cpu_shared_memory_for_async_checkpoints() -> None:
+    slurm_job = _load_slurm_job()
+
+    config = slurm_job._model_config("ultra3bf16")
+    assert config["async-ckpt-use-cpu-shm"] is True
+    flavors = slurm_job.FlavorSelection(["perf"])
+    assert slurm_job._time_budget("ultra3bf16", flavors, "srun", 30) == 120

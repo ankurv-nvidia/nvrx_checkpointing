@@ -4,7 +4,7 @@ For named Ultra v3 runs, background submission, per-run work directories, and
 custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
 
 Use the public Megatron-LM checkout pinned by this repository
-(`354b5d2d06ebf2c529688db69ce5773932226381`) and make sure the
+(`77c87725e71c9f5022ac289071b16941876ca858`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every
 node.
 

@@ -12,7 +12,7 @@ from slurm_job import PERF_TOLERANCE, PerfReport
 def test_each_platform_has_one_bandwidth_floor() -> None:
     assert PerfReport._platform_bandwidth_baseline("devbox") == 6800
     assert PerfReport._platform_bandwidth_baseline("h100") == 36000
-    assert PerfReport._platform_bandwidth_baseline("gb200") == 140000
+    assert PerfReport._platform_bandwidth_baseline("gb200") == 115000
 
 
 def test_native_bandwidth_is_reported_as_integer_mbps() -> None:

@@ -37,7 +37,7 @@ moe-router-topk-scaling-factor: "5.0"
 moe-shared-expert-intermediate-size: 10240
 moe-token-dispatcher-type: flex
 moe-flex-dispatcher-backend: hybridep
-moe-hybridep-num-sms: 32
+moe-flex-dispatcher-num-sms: 32
 
 # Parallelism. The launcher scales the global batch with the allocation.
 tensor-model-parallel-size: 8
@@ -71,6 +71,10 @@ main-grads-dtype: bf16
 exp-avg-dtype: bf16
 exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
+
+# Keep the persistent async checkpoint worker on CPU-backed shared memory.
+# Reopening this model's CUDA snapshot exhausts CUDA IPC mappings on CUDA 13.
+async-ckpt-use-cpu-shm: true
 
 job_time_in_mins:
   srun:
