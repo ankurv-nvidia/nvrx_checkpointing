@@ -283,9 +283,6 @@ def _save_checkpoint_impl(  # noqa: PLR0913
     Energon resume, one_logger/wandb hooks, fault tolerance, save_retain cleanup, ModelOpt.
     """
     args = get_args()
-    # Give the node-local daemon time to start and drain each large snapshot activation.
-    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
-    time.sleep(local_rank * 5)
     common = save_checkpoint.common
     if common is None:
         model = unwrap_model(model)
