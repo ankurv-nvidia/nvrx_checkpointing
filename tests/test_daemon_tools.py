@@ -23,7 +23,7 @@ def _load_daemon_tools():
 def test_checkpoint_server_uses_fixed_native_service_port() -> None:
     daemon_tools = _load_daemon_tools()
 
-    assert daemon_tools.CHECKPOINT_SERVER.base_url == "http://127.0.0.1:41000/api"
+    assert daemon_tools.CHECKPOINT_SERVER.base_url == "http://127.0.0.1:4100/api"
 
 
 def test_require_stopped_removes_configured_stale_files(monkeypatch, tmp_path: Path) -> None:

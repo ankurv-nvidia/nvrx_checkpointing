@@ -12,8 +12,8 @@ stages:
   - nvrx-deterministic
   - nvrx-perf
   - valgrind
-  - 16node-ultra3bf16
-  - 16node-ultra3fp8
+  - 16node-super3bf16
+  - 16node-super3fp4
   - 64node-ultra3bf16
   - 64node-ultra3fp8
   - 8node-nano3
@@ -625,41 +625,41 @@ wheel-publish:aarch64:
   variables:
     JOB_ARGS: "pretrain-native --config pico --flavor deterministic --flavor valgrind"
 
-# 16node-ultra3bf16
+# 16node-super3bf16
 
-"[DETR]:gb200:native:ultra3bf16_16x4":
+"[DETR]:gb200:native:super3bf16_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
-  stage: 16node-ultra3bf16
+  stage: 16node-super3bf16
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --config ultra3bf16 --flavor deterministic"
+    JOB_ARGS: "pretrain-native --nodes 16 --config super3bf16 --flavor deterministic"
 
-"[PERF]:gb200:native:ultra3bf16_16x4":
+"[PERF]:gb200:native:super3bf16_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
-  stage: 16node-ultra3bf16
+  stage: 16node-super3bf16
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --config ultra3bf16 --flavor perf --checkpoint-interval 125"
+    JOB_ARGS: "pretrain-native --nodes 16 --config super3bf16 --flavor perf --checkpoint-interval 125"
 
-"[PERF]:gb200:nvrx:ultra3bf16_16x4":
+"[PERF]:gb200:nvrx:super3bf16_16x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
-  stage: 16node-ultra3bf16
+  stage: 16node-super3bf16
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "pretrain-nvrx --nodes 16 --config ultra3bf16 --flavor perf --checkpoint-interval 125"
+    JOB_ARGS: "pretrain-nvrx --nodes 16 --config super3bf16 --flavor perf --checkpoint-interval 125"
 
-# 16node-ultra3fp8
+# 16node-super3fp4
 
-"[PERF]:gb200:native:ultra3fp8_16x4":
+"[PERF]:gb200:native:super3fp4_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
-  stage: 16node-ultra3fp8
+  stage: 16node-super3fp4
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "pretrain-native --nodes 16 --config ultra3fp8 --flavor perf --checkpoint-interval 125"
+    JOB_ARGS: "pretrain-native --nodes 16 --config super3fp4 --flavor perf --checkpoint-interval 125"
 
 # 64node-ultra3bf16
 
@@ -768,7 +768,7 @@ wheel-publish:aarch64:
     - "[PERF]:gb200:nvrx:pico_1x4"
     - "[DETR]:gb200:nvrx:nano3_8x4"
     - "[PERF]:gb200:nvrx:nano3_8x4"
-    - "[PERF]:gb200:nvrx:ultra3bf16_16x4"
+    - "[PERF]:gb200:nvrx:super3bf16_16x4"
     - "[PERF]:gb200:nvrx:ultra3fp8_64x4"
   rules:
     - if: '$PIPELINE_SUITE == "nvrx"'
@@ -779,9 +779,9 @@ wheel-publish:aarch64:
   extends: .baseline_bundle
   when: always
   dependencies:
-    - "[DETR]:gb200:native:ultra3bf16_16x4"
-    - "[PERF]:gb200:native:ultra3bf16_16x4"
-    - "[PERF]:gb200:native:ultra3fp8_16x4"
+    - "[DETR]:gb200:native:super3bf16_16x4"
+    - "[PERF]:gb200:native:super3bf16_16x4"
+    - "[PERF]:gb200:native:super3fp4_16x4"
     - "[PERF]:gb200:native:ultra3bf16_64x4"
     - "[DETR]:gb200:native:ultra3fp8_64x4"
     - "[PERF]:gb200:native:ultra3fp8_64x4"

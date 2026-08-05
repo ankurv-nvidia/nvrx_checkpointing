@@ -116,7 +116,7 @@ def diagnose_checkpoint_server_failure(
     """
     rank = os.environ.get("RANK", "?")
     local_rank = os.environ.get("LOCAL_RANK", "0")
-    host, port = "127.0.0.1", 41000  # checkpoint::ipc::Message::Port — per-node singleton
+    host, port = "127.0.0.1", 4100  # checkpoint::ipc::Message::Port — per-node singleton
     marker_hit = any(marker in str(exc) for marker in CKPT_SERVER_FAILURE_MARKERS)
 
     alive = False

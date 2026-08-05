@@ -1,0 +1,8 @@
+# NVFP4 precision profile for the shared Super3 architecture.
+inherits: super3
+
+# NVFP4 precision. The --bf16 base flag remains the model's storage precision.
+# The reference script's newer --keep-* controls are not present in pinned
+# Megatron 77c87725; the supported first/last BF16 boundary is in super3.yaml.
+fp4-format: e2m1
+fp4-recipe: nvfp4

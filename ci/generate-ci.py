@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 """Generate the complete static GitLab CI configuration.
 
 Run this script locally after changing the platform matrix or CI template.
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +19,7 @@ logger = logging.getLogger(__name__)
 HERE = Path(__file__).resolve().parent
 TEMPLATE_CI = HERE / "gitlab-ci-native.template.yml"
 OUTPUT_CI = HERE / "gitlab-ci-native.yml"
+BASELINES_DIR = HERE / "baselines"
 STAGE_MARKER = "# >>> generate-ci.py: workload stages <<<"
 JOB_MARKER = "# >>> generate-ci.py: workload jobs <<<"
 GENERATED_HEADER = """\
@@ -24,6 +27,9 @@ GENERATED_HEADER = """\
 # Edit the template or PLATFORMS matrix, then rerun the generator.
 
 """
+
+# Pattern that identifies obsolete multi-node pico baseline files.
+_MULTINODE_PICO_BASELINE_RE = re.compile(r"_pico_[2-9]\d*x\d+")
 
 
 # One dict per hardware platform; keys are consumed in _emit_platform / _emit_multinode.
@@ -50,11 +56,11 @@ PLATFORMS = [
                 ],
             },
             {
-                "key": "multinode-perf",
-                "config": "ultra3bf16",
+                "key": "multinode-super3-bf16",
+                "config": "super3bf16",
                 "nodes": 16,
                 "scale": "16x4",
-                "group": "16node-ultra3bf16",
+                "group": "16node-super3bf16",
                 "pipeline_suite": "large-scale",
                 "checkpoint_interval": 125,
                 "timeout": "1d",
@@ -65,11 +71,11 @@ PLATFORMS = [
                 ],
             },
             {
-                "key": "multinode-perf-fp8",
-                "config": "ultra3fp8",
+                "key": "multinode-super3-fp4",
+                "config": "super3fp4",
                 "nodes": 16,
                 "scale": "16x4",
-                "group": "16node-ultra3fp8",
+                "group": "16node-super3fp4",
                 "pipeline_suite": "large-scale",
                 "checkpoint_interval": 125,
                 "timeout": "1d",
@@ -146,8 +152,8 @@ GROUPS = (
     "nvrx-deterministic",
     "nvrx-perf",
     "valgrind",
-    "16node-ultra3bf16",
-    "16node-ultra3fp8",
+    "16node-super3bf16",
+    "16node-super3fp4",
     "64node-ultra3bf16",
     "64node-ultra3fp8",
     "8node-nano3",
@@ -315,7 +321,25 @@ def _baseline_bundle(suite: str, dependencies: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _validate_platforms() -> None:
+    """Raise SystemExit for known invalid platform-matrix configurations."""
+    for p in PLATFORMS:
+        for entry in p.get("multinode", []):
+            if entry.get("config") == "pico":
+                raise SystemExit(
+                    f"{p['name']}: pico must run on exactly 1 node; "
+                    f"entry {entry['key']!r} has nodes={entry.get('nodes')}",
+                )
+    for baseline in sorted(BASELINES_DIR.glob("*.yaml")):
+        if _MULTINODE_PICO_BASELINE_RE.search(baseline.stem):
+            raise SystemExit(
+                f"obsolete multi-node pico baseline: {baseline.name}; "
+                f"remove it or rename to 1-node form",
+            )
+
+
 def _render() -> str:
+    _validate_platforms()
     template = TEMPLATE_CI.read_text()
     for marker in (STAGE_MARKER, JOB_MARKER):
         if template.count(marker) != 1:

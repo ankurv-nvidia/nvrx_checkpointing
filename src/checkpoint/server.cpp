@@ -1207,10 +1207,11 @@ void Session::SendLocalShardedStateRegistryToPeerWithRetries_(cipc::Rank rank, s
         } catch (std::exception const& ex)
         {
             fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}][ERROR] Attempt {} SendLocalShardedStateRegistryToPeer_ rank={} peer={} failed sending "
+                       "[native_ckpt:svr][{}#{}][{}] Attempt {} SendLocalShardedStateRegistryToPeer_ rank={} peer={} failed sending "
                        "shards: {}\n",
                        *server,
                        sessionId,
+                       attempt < MaxRetries ? "WARN" : "ERROR",
                        attempt,
                        rank,
                        peer,
@@ -1249,9 +1250,10 @@ void Session::SendToPeerWithRetries_(std::string const& peer, std::string const&
         {
             lastError = ex.what();
             fmt::print(stderr,
-                       "[native_ckpt:svr][{}#{}][ERROR] Attempt {} peer={} failed target={} {}\n",
+                       "[native_ckpt:svr][{}#{}][{}] Attempt {} peer={} failed target={} {}\n",
                        *server,
                        sessionId,
+                       attempt < MaxRetries ? "WARN" : "ERROR",
                        attempt,
                        peer,
                        target,
@@ -1748,7 +1750,7 @@ bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
     }
     // Negative: 1-based index back from the newest known snapshot.
     std::scoped_lock lock(mutex);
-    auto const idx = static_cast<size_t>(-iteration);
+    auto const       idx = static_cast<size_t>(-iteration);
     if (idx <= snapshots.size())
     {
         auto it = snapshots.rbegin();
@@ -1768,7 +1770,7 @@ bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
 bool Session::IsSnapshotDurable(cipc::SnapshotId snapshotId) const
 {
     std::scoped_lock lock(mutex);
-    auto it = snapshots.find(snapshotId);
+    auto             it = snapshots.find(snapshotId);
     if (it != snapshots.end()) { return it->second->writeCkptCompletedRanks.size() >= ExpectedWriteCompletions(); }
     // Not resident: durable iff it completed and was evicted (snapshot ids are monotonic).
     return highestEvictedDurableSnapshot != cipc::SnapshotId::Invalid

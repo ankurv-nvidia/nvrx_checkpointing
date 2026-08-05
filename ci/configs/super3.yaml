@@ -1,0 +1,42 @@
+# Shared Super3 12B hybrid-MoE architecture from
+# scripts/sbatch/12B_hybrid_moe_25T_phase1_nvrx.sh. Precision profiles inherit
+# this file so BF16 and NVFP4 exercise the same model and parallelism.
+# The CI harness supplies mock data, run length, checkpoint cadence/paths, and
+# a node-scaled global batch size.
+
+# Architecture
+num-layers: 88
+hidden-size: 4096
+ffn-hidden-size: 2688
+mamba-num-heads: 128
+group-query-attention: true
+num-query-groups: 2
+hybrid-override-pattern: "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+seq-length: 8192
+max-position-embeddings: 8192
+num-layers-at-end-in-bf16: 14
+
+# MoE
+num-experts: 512
+moe-router-topk: 22
+moe-router-topk-scaling-factor: "5.0"
+moe-shared-expert-intermediate-size: 5376
+
+# Parallelism. The launcher scales the global batch with the allocation.
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 64
+no-gradient-accumulation-fusion: false
+
+# Runtime shape from the reference recipe.
+high-priority-stream-groups: ep
+manual-gc: true
+manual-gc-interval: 10
+disable-straggler-on-startup: true
+ddp-pad-buckets-for-high-nccl-busbw: true
+distributed-timeout-minutes: 10
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+
+job_time_in_mins:
+  srun:
+    perf: 120

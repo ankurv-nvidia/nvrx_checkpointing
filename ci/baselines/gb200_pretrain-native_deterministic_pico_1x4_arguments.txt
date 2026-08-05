@@ -80,8 +80,8 @@
   create_attention_mask_in_dataloader ............. False
   cross_entropy_fusion_impl ....................... native
   cross_entropy_loss_fusion ....................... False
-  cuda_graph_impl ................................. local
-  cuda_graph_modules .............................. [<CudaGraphModule.mamba: 6>, <CudaGraphModule.attn: 1>, <CudaGraphModule.moe_router: 4>]
+  cuda_graph_impl ................................. none
+  cuda_graph_modules .............................. []
   cuda_graph_warmup_steps ......................... 3
   data_args_path .................................. None
   data_parallel_random_init ....................... False

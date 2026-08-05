@@ -11,6 +11,7 @@ import importlib.metadata
 import importlib.util
 import json
 import logging
+import mmap
 import os
 import re
 import shlex
@@ -28,12 +29,27 @@ from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import wheel_install
 import yaml
-from daemon_tools import CHECKPOINT_SERVER
 
-# ruff: noqa: FBT003, PLR0913, PLR2004, TC003
+
+def _configure_worker_tmpdir() -> Path | None:
+    """Use the container-local short path required by AF_UNIX consumers."""
+    if "SLURM_PROCID" not in os.environ:
+        return None
+    tmpdir = Path("/tmp")  # noqa: S108 - writable container-local tmpfs
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(tmpdir)
+    return tmpdir
+
+
+_configure_worker_tmpdir()
+
+from daemon_tools import CHECKPOINT_SERVER  # noqa: E402
+
+# ruff: noqa: FBT003, PLR0913, PLR0917, PLR2004, TC003
 # fmt: off
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (SCRIPT_DIR / "../..").resolve()
@@ -58,6 +74,7 @@ _EPILOG_ENTRY_CMD = "__epilog__"
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
 _CLEANUP_GRACE_MINUTES = 5
+_TORCH_STORAGE_ALIGNMENT = 64
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _DEFAULT_NAME = (
@@ -126,6 +143,46 @@ def sys_path_insert(path: Path) -> None:
     entries = [entry for entry in os.environ.get("PYTHONPATH", "").split(":") if entry]
     if value not in entries:
         os.environ["PYTHONPATH"] = ":".join([value, *entries])
+
+
+def _install_torch_serialization_compat() -> bool:
+    """Supply config omitted by the PyTorch wheel in the 26.07 image.
+
+    PyTorch's own serialization.py imports torch.utils.serialization.config for
+    torch.save/load settings, but the nv26.7 wheel does not contain that package.
+    Preserve the upstream defaults and install the shim only for that exact
+    missing-module failure. Returns whether a shim was installed.
+    """
+    try:
+        importlib.import_module("torch.utils.serialization")
+    except ModuleNotFoundError as error:
+        if error.name != "torch.utils.serialization":
+            raise
+    else:
+        return False
+
+    torch_utils = importlib.import_module("torch.utils")
+    config = ModuleType("torch.utils.serialization.config")
+    config.load = SimpleNamespace(  # type: ignore[attr-defined]
+        mmap=False,
+        endianness=None,
+        mmap_flags=None if sys.platform == "win32" else mmap.MAP_PRIVATE,
+        calculate_storage_offsets=False,
+    )
+    config.save = SimpleNamespace(  # type: ignore[attr-defined]
+        compute_crc32=True,
+        use_pinned_memory_for_d2h=False,
+        storage_alignment=_TORCH_STORAGE_ALIGNMENT,
+    )
+    package = ModuleType("torch.utils.serialization")
+    package.__path__ = []  # type: ignore[attr-defined]
+    package.config = config  # type: ignore[attr-defined]
+    sys.modules[package.__name__] = package
+    sys.modules[config.__name__] = config
+    torch_utils.serialization = package
+    return True
+
+
 def shell_join(command: list[str]) -> str:
     refs = sorted(((v, n) for n in _SHELL_ENV_REFS if (v := os.environ.get(n))), key=lambda x: len(x[0]), reverse=True)
     words = []
@@ -911,7 +968,6 @@ class DeterministicFlavor(Flavor):
         policy.worker = self.run
         policy.reporter = self.report
         policy.requires_finite_run = True
-        policy.phase2_save_interval = 30
         policy.checkpoint_routines = 2
 
     def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
@@ -923,6 +979,9 @@ class DeterministicFlavor(Flavor):
         return True
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
+        # Megatron 77c87725 / TE in the 26.07 image fails while constructing
+        # deterministic backward graphs for Pico, Nano, and Ultra on GB200
+        # (`Could not infer dtype of _WeakRefTensor`). Perf retains full capture.
         _set(opts, "--attention-backend", "unfused")
         _drop(
             opts,
@@ -980,7 +1039,17 @@ class ValgrindFlavor(Flavor):
         _run_routine(cfg, args, provider)
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
-        _drop(opts, "--cuda-graph-impl", "--cuda-graph-modules", "--recompute-granularity", "--recompute-modules")
+        _drop(
+            opts,
+            "--cuda-graph-impl",
+            "--cuda-graph-modules",
+            "--recompute-granularity",
+            "--recompute-modules",
+        )
+        # Memcheck can perturb model numerics enough to trip Megatron's result
+        # validation and request a cross-GPU rerun (exit 16). This gate validates
+        # the checkpoint server's memory safety, not training numerics.
+        _set(opts, "--rerun-mode", "disabled")
         env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
 
     @contextlib.contextmanager
@@ -1069,12 +1138,27 @@ def _selected_flavors(args: argparse.Namespace) -> FlavorSelection:
         args.flavors = FlavorSelection(args.flavors)
     return args.flavors
 
+
+def _profile_config(name: str, parents: tuple[str, ...] = ()) -> dict:
+    if name in parents:
+        chain = " -> ".join((*parents, name))
+        raise ValueError(f"cyclic model config inheritance: {chain}")
+    path = CONFIGS_DIR / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"unknown model config {name!r}")
+    profile = _load_yaml(path)
+    parent = profile.pop("inherits", None)
+    if parent is None:
+        return profile
+    if not isinstance(parent, str) or not parent:
+        raise ValueError(f"model config {name!r} has invalid inherits value {parent!r}")
+    return _deep_merge(_profile_config(parent, (*parents, name)), profile)
+
+
 def _model_config(name: str) -> dict:
     base = _load_yaml(CONFIGS_DIR / "base.yaml")
-    override = CONFIGS_DIR / f"{name}.yaml"
-    if not override.exists():
-        raise FileNotFoundError(f"unknown model config {name!r}")
-    return _deep_merge(base, _load_yaml(override))
+    return _deep_merge(base, _profile_config(name))
+
 
 def _time_budget(config_name: str, flavors: FlavorSelection, use: str, default: int) -> int:
     table = (_model_config(config_name).get("job_time_in_mins") or {}).get(use) or {}
@@ -1293,6 +1377,7 @@ def _run_routine(
         else:
             cycle += 1
         flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-stop")
+        _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
 def _manifest(iter_dir: Path, baseline: Path | None = None) -> int:
     env = {**os.environ, "TORCHINDUCTOR_WORKER_START": "fork", "TORCHINDUCTOR_COMPILE_THREADS": "1"}
     return subprocess.run(
@@ -1311,33 +1396,96 @@ def _manifest(iter_dir: Path, baseline: Path | None = None) -> int:
         check=False,
     ).returncode
 
-def _reference_check(  # noqa: C901, PLR0912
+def _manifest_batch(  # noqa: C901
+    tag: str,
+    iterations: list[tuple[str, Path]],
+    baseline_root: Path | None,
+    stash_root: Path | None,
+    args: argparse.Namespace,
+) -> list[str]:
+    """Distribute manifest work across node leaders and synchronize all ranks.
+
+    Each iteration at index i is assigned to node leader i % nodes. Node
+    leaders run manifests concurrently; all ranks synchronize after via
+    _sync_ranks. Returns a sorted list of iteration paths that failed.
+
+    When baseline_root is set, each manifest is compared against the
+    baseline for that iteration. When stash_root is set, the produced
+    .info files are copied there (used during reference-manifest creation).
+    """
+    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+    node_index = rank // args.gpus_per_node
+    is_node_leader = local_rank == 0
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+
+    if is_node_leader and iterations:
+        mine = [c for i, c in enumerate(iterations) if i % args.nodes == node_index]
+        if mine:
+            done_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_index}.done"
+            fail_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_index}.failed"
+            try:
+                for group, iter_dir in mine:
+                    baseline = (baseline_root / group / iter_dir.name) if baseline_root else None
+                    if _manifest(iter_dir, baseline):
+                        raise RuntimeError(f"manifest failed for {iter_dir}")  # noqa: TRY301
+                    if stash_root is not None:
+                        target = stash_root / group / iter_dir.name
+                        target.mkdir(parents=True, exist_ok=True)
+                        for name in ("reference.metadata.info", "common_pt_dump.info"):
+                            shutil.copy2(iter_dir / name, target / name)
+                done_f.touch()
+            except Exception:  # noqa: BLE001
+                fail_f.touch()
+
+    _sync_ranks(tag)
+
+    failures: list[str] = []
+    for node_idx in range(min(args.nodes, len(iterations))):
+        assigned = [c for i, c in enumerate(iterations) if i % args.nodes == node_idx]
+        if not assigned:
+            continue
+        done_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_idx}.done"
+        fail_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_idx}.failed"
+        if fail_f.exists() or not done_f.exists():
+            failures.extend(str(c[1]) for c in assigned)
+    return sorted(failures)
+
+def _reference_check(  # noqa: C901
     cfg: str, args: argparse.Namespace, provider: str, *, async_reference: bool = False,
 ) -> None:
     run, reference = _run_dir(cfg), _run_dir(cfg) / "reference-run"
     ready, failed = run / "reference.ready", run / "reference.failed"
-    rank0 = os.environ.get("SLURM_PROCID", "0") == "0"
+    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+    rank0 = rank == 0
+
     if rank0:
         shutil.rmtree(reference, ignore_errors=True)
         ready.unlink(missing_ok=True)
         failed.unlink(missing_ok=True)
-    _run_routine(
-        cfg,
-        args,
-        "nvrx",
-        "reference",
-        async_checkpoint=async_reference,
-    )
+
+    _run_routine(cfg, args, "nvrx", "reference", async_checkpoint=async_reference)
+
+    ref_iters = [
+        (group, iter_dir)
+        for group in ("phase1-checkpoints", "checkpoints")
+        for iter_dir in sorted((run / group).glob("iter_*"))
+    ]
+
+    ref_failures = _manifest_batch("ref-manifest", ref_iters, None, reference, args)
+
+    if ref_failures:
+        if rank0:
+            failed.touch()
+        raise RuntimeError(f"manifest derivation failed: {', '.join(ref_failures)}")
+
     if rank0:
         try:
-            for group in ("phase1-checkpoints", "checkpoints"):
-                for iteration in sorted((run / group).glob("iter_*")):
-                    if _manifest(iteration):
-                        raise RuntimeError(f"manifest derivation failed for {iteration}")  # noqa: TRY301
-                    target = reference / group / iteration.name
-                    target.mkdir(parents=True)
-                    for name in ("reference.metadata.info", "common_pt_dump.info"):
-                        shutil.copy2(iteration / name, target / name)
+            for group, iter_dir in ref_iters:
+                target = reference / group / iter_dir.name
+                for name in ("reference.metadata.info", "common_pt_dump.info"):
+                    if not (target / name).exists():
+                        raise RuntimeError(f"missing reference file: {target / name}")  # noqa: TRY301
             for group in ("phase1-checkpoints", "checkpoints"):
                 shutil.rmtree(run / group)
             ready.touch()
@@ -1348,20 +1496,23 @@ def _reference_check(  # noqa: C901, PLR0912
         wait_for_file(run / "reference.*", 7200)
         if failed.exists():
             raise RuntimeError("reference routine failed")
+
     _run_routine(cfg, args, provider, f"measured-{provider}")
-    if not rank0:
-        return
-    failures = []
-    for group in ("phase1-checkpoints", "checkpoints"):
-        for iteration in sorted((run / group).glob("iter_*")):
-            baseline = reference / group / iteration.name
-            if _manifest(iteration, baseline):
-                failures.append(str(iteration))
-    if failures:
-        raise RuntimeError(f"reference check failed: {', '.join(failures)}")
+
+    meas_iters = [
+        (group, iter_dir)
+        for group in ("phase1-checkpoints", "checkpoints")
+        for iter_dir in sorted((run / group).glob("iter_*"))
+    ]
+
+    compare_failures = _manifest_batch("meas-manifest", meas_iters, reference, None, args)
+    if compare_failures:
+        raise RuntimeError(f"reference check failed: {', '.join(compare_failures)}")
 
 def _pretrain_entry(phase: int) -> None:
     sys_path_insert(megatron_root())
+    if _install_torch_serialization_compat() and os.environ.get("SLURM_PROCID", "0") == "0":
+        print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
 
     from nvrx_checkpointing import megatron_integration  # noqa: PLC0415
 

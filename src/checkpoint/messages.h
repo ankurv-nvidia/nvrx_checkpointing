@@ -38,7 +38,8 @@ Session (Common Across all ranks)
 */
 struct Message
 {
-    static constexpr uint16_t Port = 41000;
+    // Kept below ip_local_port_range (32768-60999 by default)
+    static constexpr uint16_t Port = 4100;
 
     static std::string RequestChannelName(uint16_t index, uint8_t rank) { return fmt::format("checkpoint_request_{}_{}", index, rank); }
 

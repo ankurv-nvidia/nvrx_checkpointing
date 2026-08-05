@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-# ruff: noqa: ANN202, INP001, PLR0915, S101, S607, SLF001
+# ruff: noqa: ANN202, INP001, PLR0915, S101, S108, S607, SLF001
 from __future__ import annotations
 
 import importlib.metadata
@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -57,6 +57,7 @@ _MUTATED_ENV = (
     "TORCHINDUCTOR_CACHE_DIR",
     "TORCHINDUCTOR_WORKER_START",
     "TORCH_EXTENSIONS_DIR",
+    "TMPDIR",
     "TRITON_CACHE_DIR",
     "TRITON_CACHE_PATH",
     "UCX_ERROR_SIGNALS",
@@ -344,6 +345,41 @@ def test_named_run_resolves_all_durable_paths_under_workdir(monkeypatch: pytest.
     assert Path(slurm_job.os.environ["MEGATRON_NATIVE_BUILD_DIR"]) == expected / "build" / "nvrx_checkpointing"
     assert Path(slurm_job.os.environ["SLURMJOB_OPT_PYTHON_INSTALL_DIR"]) == expected / "deps" / "python"
     assert Path(slurm_job.os.environ["VCPKG_ROOT"]) == expected / "deps" / "vcpkg"
+
+
+def test_worker_tmpdir_uses_short_container_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("SLURM_PROCID", "7")
+
+    configured = slurm_job._configure_worker_tmpdir()
+
+    assert configured == Path("/tmp")
+    assert configured.is_dir()
+    assert slurm_job.os.environ["TMPDIR"] == str(configured)
+
+
+def test_torch_serialization_compat_supplies_upstream_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    torch = ModuleType("torch")
+    torch.__path__ = []  # type: ignore[attr-defined]
+    torch_utils = ModuleType("torch.utils")
+    torch_utils.__path__ = []  # type: ignore[attr-defined]
+    torch.utils = torch_utils  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.utils", torch_utils)
+    monkeypatch.delitem(sys.modules, "torch.utils.serialization", raising=False)
+    monkeypatch.delitem(sys.modules, "torch.utils.serialization.config", raising=False)
+
+    assert slurm_job._install_torch_serialization_compat()
+    package = importlib.import_module("torch.utils.serialization")
+    config = importlib.import_module("torch.utils.serialization.config")
+    assert package.config is config
+    assert config.save.compute_crc32 is True
+    assert config.save.storage_alignment == slurm_job._TORCH_STORAGE_ALIGNMENT
+    assert config.save.use_pinned_memory_for_d2h is False
+    assert config.load.mmap is False
+    assert config.load.calculate_storage_offsets is False
+    assert not slurm_job._install_torch_serialization_compat()
 
 
 def test_unnamed_runs_generate_commit_keyed_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -997,6 +1033,7 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     assert 'export TRITON_CACHE_PATH="${SLURMJOB_OPT_RUN_DIR}/triton-cache"' in reproducer
     assert 'export TORCHINDUCTOR_CACHE_DIR="${SLURMJOB_OPT_RUN_DIR}/torchinductor-cache"' in reproducer
     assert 'export TORCH_EXTENSIONS_DIR="${SLURMJOB_OPT_RUN_DIR}/torch-extensions"' in reproducer
+    assert "export TMPDIR=" not in reproducer
     assert 'export NATIVE_CKPT_SERVER_LOG="${SLURMJOB_OPT_RUN_DIR}/logs/checkpoint_server.%h.%p.log"' in reproducer
     assert 'export SLURMJOB_OPT_RUN_DIR="${SLURMJOB_OPT_WORK_DIR}/${SLURMJOB_OPT_RUN_NAME}"' in reproducer
     assert 'export MEGATRON_NATIVE_BUILD_DIR="${SLURMJOB_OPT_RUN_DIR}/build/nvrx_checkpointing"' in reproducer
@@ -1344,7 +1381,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert ".run_ckpt_stress" not in config
 
     nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
-    assert any(":ultra3bf16_16x4" in name for name in nvrx)
+    assert any(":super3bf16_16x4" in name for name in nvrx)
     assert any(":ultra3fp8_64x4" in name for name in nvrx)
     assert all(job["extends"][-1] == ".nvrx_pipeline" for job in nvrx.values())
 
@@ -1358,16 +1395,16 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     large = {
         name: job for name, job in workloads.items()
         if (
-            ":native:ultra3bf16_16x4" in name
-            or ":native:ultra3fp8_16x4" in name
+            ":native:super3bf16_16x4" in name
+            or ":native:super3fp4_16x4" in name
             or ":native:ultra3bf16_64x4" in name
             or ":native:ultra3fp8_64x4" in name
         )
     }
     assert set(large) == {
-        "[DETR]:gb200:native:ultra3bf16_16x4",
-        "[PERF]:gb200:native:ultra3bf16_16x4",
-        "[PERF]:gb200:native:ultra3fp8_16x4",
+        "[DETR]:gb200:native:super3bf16_16x4",
+        "[PERF]:gb200:native:super3bf16_16x4",
+        "[PERF]:gb200:native:super3fp4_16x4",
         "[PERF]:gb200:native:ultra3bf16_64x4",
         "[DETR]:gb200:native:ultra3fp8_64x4",
         "[PERF]:gb200:native:ultra3fp8_64x4",
@@ -1611,9 +1648,9 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
         for suite in ("default", "nvrx", "large-scale", "main-branch-runs")
     }
     assert all(bundle["rules"][0]["when"] in {"always", "never"} for bundle in bundles.values())
-    assert "[PERF]:gb200:native:ultra3bf16_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb200:native:ultra3fp8_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb200:nvrx:ultra3bf16_16x4" in bundles["nvrx"]["dependencies"]
+    assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
+    assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
+    assert "[PERF]:gb200:nvrx:super3bf16_16x4" in bundles["nvrx"]["dependencies"]
     assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
 
 
@@ -1627,7 +1664,7 @@ def test_default_native_jobs_use_wheel_artifacts() -> None:
         "[PERF]:gb200:native:nano3_8x4",
     ):
         assert config[name]["needs"] == [{"job": "wheel:aarch64", "artifacts": True}]
-    assert "needs" not in config["[PERF]:gb200:native:ultra3bf16_16x4"]
+    assert "needs" not in config["[PERF]:gb200:native:super3bf16_16x4"]
 
 
 def test_wheel_test_matches_main_and_ctest_is_isolated() -> None:
@@ -1703,7 +1740,7 @@ def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
 
     assert flavors.names == ("deterministic", "valgrind")
     assert flavors.tag == "deterministic-valgrind"
-    assert flavors.policy.phase2_save_interval == 30  # noqa: PLR2004
+    assert flavors.policy.phase2_save_interval == 250  # noqa: PLR2004
     assert flavors.policy.phase2_checkpoints == slurm_job.FlavorPolicy.phase2_checkpoints
     assert flavors.policy.checkpoint_routines == 1
     assert not flavors.policy.manages_native_server
@@ -1722,7 +1759,7 @@ def test_deterministic_cadence_keeps_three_phase2_saves() -> None:
     exit_iteration = (slurm_job._PHASE1_TRAIN_ITERS // exit_interval + 1) * exit_interval
     first_save = (slurm_job._PHASE1_TRAIN_ITERS // interval + 1) * interval
 
-    assert list(range(first_save, exit_iteration + 1, interval)) == [120, 150, 180]
+    assert list(range(first_save, exit_iteration + 1, interval)) == [250, 500, 750]
     assert policy.checkpoint_routines == 2  # noqa: PLR2004
 
 
@@ -2160,11 +2197,15 @@ def test_failed_nvrx_phase_does_not_retry_one_rank(monkeypatch: pytest.MonkeyPat
     assert len(calls) == 2  # noqa: PLR2004
 
 
-def test_flavor_transforms_are_profile_independent() -> None:
+def test_flavor_transforms() -> None:
     slurm_job = _load_slurm_job()
     perf_opts = [
         "--cuda-graph-impl",
         "local",
+        "--cuda-graph-modules",
+        "mamba",
+        "attn",
+        "moe_router",
         "--recompute-granularity",
         "selective",
         "--recompute-modules",
@@ -2174,7 +2215,16 @@ def test_flavor_transforms_are_profile_independent() -> None:
     perf_env = {}
     slurm_job.FlavorSelection(["perf"]).transform(perf_opts, perf_env)
 
-    assert perf_opts == ["--cuda-graph-impl", "local", "--async-save", "--async-ckpt-use-cpu-shm"]
+    assert perf_opts == [
+        "--cuda-graph-impl",
+        "local",
+        "--cuda-graph-modules",
+        "mamba",
+        "attn",
+        "moe_router",
+        "--async-save",
+        "--async-ckpt-use-cpu-shm",
+    ]
     assert not perf_env
     deterministic_opts = [
         "--use-fused-weighted-squared-relu",
@@ -2199,6 +2249,20 @@ def test_flavor_transforms_are_profile_independent() -> None:
     ]
     assert deterministic_env["PYTHONHASHSEED"] == "0"
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
+
+    valgrind_opts = [
+        "--cuda-graph-impl",
+        "local",
+        "--cuda-graph-modules",
+        "attn",
+        "--rerun-mode",
+        "validate_results",
+    ]
+    valgrind_env = {}
+    slurm_job.ValgrindFlavor().transform(valgrind_opts, valgrind_env)
+    assert valgrind_opts == ["--rerun-mode", "disabled"]
+    assert valgrind_env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] == "1"
+
     mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
     slurm_job.FlavorSelection(["deterministic"]).transform(mamba_only_opts, {})
     assert mamba_only_opts == [
@@ -2270,6 +2334,58 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
     assert mtp == ["*E", "*E"]
 
 
+def test_super3_profiles_share_reference_architecture() -> None:
+    slurm_job = _load_slurm_job()
+    common = slurm_job._model_config("super3")
+    bf16 = slurm_job._model_config("super3bf16")
+    fp4 = slurm_job._model_config("super3fp4")
+    precision = {
+        "fp4-format": "e2m1",
+        "fp4-recipe": "nvfp4",
+    }
+    expected = {
+        "num-layers": 88,
+        "hidden-size": 4096,
+        "ffn-hidden-size": 2688,
+        "mamba-num-heads": 128,
+        "num-attention-heads": 32,
+        "num-query-groups": 2,
+        "num-experts": 512,
+        "moe-latent-size": 1024,
+        "moe-shared-expert-intermediate-size": 5376,
+        "tensor-model-parallel-size": 2,
+        "expert-model-parallel-size": 64,
+        "micro-batch-size": 1,
+        "num-layers-at-end-in-bf16": 14,
+    }
+
+    assert {key: fp4.pop(key) for key in precision} == precision
+    assert common == bf16
+    assert fp4 == bf16
+    assert {key: bf16[key] for key in expected} == expected
+    assert len(bf16["hybrid-override-pattern"]) == 88  # noqa: PLR2004
+
+
+def test_cuda_graph_selection_is_profile_scoped() -> None:
+    slurm_job = _load_slurm_job()
+
+    pico = slurm_job._model_config("pico")
+    assert pico["cuda-graph-impl"] == "local"
+    assert pico["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+
+    ultra3bf16 = slurm_job._model_config("ultra3bf16")
+    assert ultra3bf16["cuda-graph-impl"] == "local"
+    assert ultra3bf16["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+
+    nano3 = slurm_job._model_config("nano3")
+    assert nano3["cuda-graph-impl"] == "local"
+    assert nano3["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+
+    ultra3fp8 = slurm_job._model_config("ultra3fp8")
+    assert ultra3fp8["cuda-graph-impl"] == "local"
+    assert ultra3fp8["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+
+
 def test_standalone_determinism_script_invokes_megatron_directly() -> None:
     script = (REPO_ROOT / "scripts/sbatch/determinism_checkpoints.sbatch").read_text()
 
@@ -2280,7 +2396,7 @@ def test_standalone_determinism_script_invokes_megatron_directly() -> None:
     assert "NVRX_CHECKPOINTING_ROOT" not in script
     assert "--ckpt-provider" not in script
     assert "--async-strategy nvrx" not in script
-    assert 'CUDA_GRAPH_MODULES:=mamba attn moe_router' in script
+    assert "CUDA_GRAPH_MODULES:=mamba attn moe_router" in script
 
 
 def test_ultra3bf16_uses_cpu_shared_memory_for_async_checkpoints() -> None:
@@ -2289,4 +2405,367 @@ def test_ultra3bf16_uses_cpu_shared_memory_for_async_checkpoints() -> None:
     config = slurm_job._model_config("ultra3bf16")
     assert config["async-ckpt-use-cpu-shm"] is True
     flavors = slurm_job.FlavorSelection(["perf"])
-    assert slurm_job._time_budget("ultra3bf16", flavors, "srun", 30) == 120
+    assert slurm_job._time_budget("ultra3bf16", flavors, "srun", 30) == 120  # noqa: PLR2004
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Daemon lifecycle: allocation-wide synchronization after shutdown
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def test_run_routine_syncs_all_ranks_after_daemon_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", results_dir)
+    monkeypatch.setenv("SLURM_JOB_ID", "1")
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.setenv("SLURM_NTASKS", "1")
+    monkeypatch.setenv("SLURM_LOCALID", "0")
+    monkeypatch.setenv("SLURM_TASKS_PER_NODE", "1")
+
+    events: list[str] = []
+
+    def fake_stop_server(_provider: str, tag: str, _graceful: bool = True) -> None:
+        events.append(f"stop:{tag}")
+
+    def fake_sync(tag: str) -> None:
+        events.append(f"sync:{tag}")
+
+    monkeypatch.setattr(slurm_job, "_phase_command", lambda *_a, **_k: (["true"], {}))
+    monkeypatch.setattr(slurm_job, "wait_for_file", lambda *_: None)
+    monkeypatch.setattr(slurm_job.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(slurm_job, "_sync_ranks", fake_sync)
+
+    args = SimpleNamespace(
+        job="pretrain-native",
+        flavors=slurm_job.FlavorSelection(["perf"]),
+        nodes=1,
+        gpus_per_node=4,
+        config="pico",
+        checkpoints_per_run=None,
+        repeat=1,
+        extra_args=[],
+    )
+    args.flavors.policy.manages_native_server = False
+    args.flavors.policy.stop_server = fake_stop_server
+
+    slurm_job._run_routine("pico_1x4", args, "native")
+
+    stop_events = [e for e in events if e.startswith("stop:")]
+    assert stop_events, "stop_server must be called at least once"
+    for _i, stop_ev in enumerate(stop_events):
+        # The next event after each stop must be a sync containing "stopped"
+        next_ev = next((e for e in events[events.index(stop_ev) + 1:] if e.startswith("sync:")), "")
+        assert "stopped" in next_ev, (
+            f"_sync_ranks must follow stop_server immediately; "
+            f"stop={stop_ev!r}, next sync={next_ev!r}"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Deterministic manifest: parallel distribution across node leaders
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _manifest_batch_env(  # noqa: PLR0913
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    rank: int = 0,
+    local_rank: int = 0,
+    nodes: int = 4,
+    gpus_per_node: int = 4,
+    job_id: str = "99",
+) -> tuple[object, Path]:
+    slurm_job = _load_slurm_job()
+    results = tmp_path / "results"
+    results.mkdir(exist_ok=True)
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", results)
+    monkeypatch.setenv("SLURM_PROCID", str(rank))
+    monkeypatch.setenv("SLURM_LOCALID", str(local_rank))
+    monkeypatch.setenv("SLURM_NTASKS", str(nodes * gpus_per_node))
+    monkeypatch.setenv("SLURM_JOB_ID", job_id)
+    # _sync_ranks waits for all ranks; mock it since tests run single-process.
+    monkeypatch.setattr(slurm_job, "_sync_ranks", lambda _tag: None)
+    return slurm_job, results
+
+
+def _make_iter_dirs(parent: Path, groups_iters: list[tuple[str, str]]) -> list[tuple[str, Path]]:
+    iterations = []
+    for group, iter_name in groups_iters:
+        d = parent / group / iter_name
+        d.mkdir(parents=True)
+        for name in ("reference.metadata.info", "common_pt_dump.info"):
+            (d / name).write_text(f"{iter_name}\n")
+        iterations.append((group, d))
+    return iterations
+
+
+def test_manifest_batch_distributes_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=0, local_rank=0, nodes=4, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+    stash = tmp_path / "reference-run"
+    manifest_calls: list[str] = []
+
+    def fake_manifest(iter_dir: Path, _baseline: object = None) -> int:
+        manifest_calls.append(str(iter_dir))
+        return 0
+
+    monkeypatch.setattr(slurm_job, "_manifest", fake_manifest)
+    # Pre-create done markers for the other 3 node leaders
+    for node_idx in (1, 2, 3):
+        (results / f".99-ref-node{node_idx}.done").touch()
+    args = SimpleNamespace(nodes=4, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("ref", iterations, None, stash, args)
+
+    assert failures == []
+    # Node leader 0 processes index 0 only (4 checkpoints / 4 nodes = 1 each)
+    assert manifest_calls == [str(iterations[0][1])]
+    stashed = stash / iterations[0][0] / iterations[0][1].name
+    assert (stashed / "reference.metadata.info").exists()
+    assert (results / ".99-ref-node0.done").exists()
+
+
+def test_manifest_batch_no_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=4, local_rank=0, nodes=4, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+    manifest_calls: list[str] = []
+
+    def fake_manifest(iter_dir: Path, _baseline: object = None) -> int:
+        manifest_calls.append(str(iter_dir))
+        return 0
+
+    monkeypatch.setattr(slurm_job, "_manifest", fake_manifest)
+    for node_idx in (0, 2, 3):
+        (results / f".99-ref-node{node_idx}.done").touch()
+    args = SimpleNamespace(nodes=4, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("ref", iterations, None, None, args)
+
+    # Node leader 1 (rank 4 // 4 == 1) processes only index 1
+    assert manifest_calls == [str(iterations[1][1])]
+    assert failures == []
+
+
+def test_manifest_batch_more_nodes_than_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=0, local_rank=0, nodes=16, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+    manifest_calls: list[str] = []
+
+    def fake_manifest(iter_dir: Path, _baseline: object = None) -> int:
+        manifest_calls.append(str(iter_dir))
+        return 0
+
+    monkeypatch.setattr(slurm_job, "_manifest", fake_manifest)
+    for node_idx in (1, 2, 3):
+        (results / f".99-ref-node{node_idx}.done").touch()
+    args = SimpleNamespace(nodes=16, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("ref", iterations, None, None, args)
+
+    assert manifest_calls == [str(iterations[0][1])]
+    assert failures == []
+
+
+def test_manifest_batch_fewer_nodes_than_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=0, local_rank=0, nodes=2, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+    manifest_calls: list[str] = []
+
+    def fake_manifest(iter_dir: Path, _baseline: object = None) -> int:
+        manifest_calls.append(str(iter_dir))
+        return 0
+
+    monkeypatch.setattr(slurm_job, "_manifest", fake_manifest)
+    (results / ".99-ref-node1.done").touch()
+    args = SimpleNamespace(nodes=2, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("ref", iterations, None, None, args)
+
+    # Node leader 0 processes indices 0 and 2 (i % 2 == 0)
+    assert manifest_calls == [str(iterations[0][1]), str(iterations[2][1])]
+    assert failures == []
+
+
+def test_manifest_batch_worker_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=0, local_rank=0, nodes=4, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+
+    def fail_manifest(_iter_dir: Path, _baseline: object = None) -> int:
+        return 1
+
+    monkeypatch.setattr(slurm_job, "_manifest", fail_manifest)
+    for node_idx in (1, 2, 3):
+        (results / f".99-wb-node{node_idx}.done").touch()
+    args = SimpleNamespace(nodes=4, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("wb", iterations, None, None, args)
+
+    assert (results / ".99-wb-node0.failed").exists()
+    assert not (results / ".99-wb-node0.done").exists()
+    assert str(iterations[0][1]) in failures
+
+
+def test_manifest_batch_missing_output_is_hard_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job, results = _manifest_batch_env(monkeypatch, tmp_path, rank=4, local_rank=0, nodes=4, gpus_per_node=4)
+    run = tmp_path / "run"
+    run.mkdir()
+    iterations = _make_iter_dirs(
+        run,
+        [
+            ("phase1-checkpoints", "iter_0000100"),
+            ("checkpoints", "iter_0000250"),
+            ("checkpoints", "iter_0000500"),
+            ("checkpoints", "iter_0000750"),
+        ],
+    )
+    monkeypatch.setattr(slurm_job, "_manifest", lambda *_a, **_k: 0)
+    # Nodes 1, 2, 3 write done; node 0 writes nothing (simulates crash)
+    for node_idx in (1, 2, 3):
+        (results / f".99-mb-node{node_idx}.done").touch()
+    args = SimpleNamespace(nodes=4, gpus_per_node=4)
+
+    failures = slurm_job._manifest_batch("mb", iterations, None, None, args)
+
+    assert str(iterations[0][1]) in failures
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CI generation: pico must be single-node; validation rejects violations
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _load_generate_ci() -> object:
+    spec = importlib.util.spec_from_file_location(
+        "generate_ci_test", REPO_ROOT / "ci" / "generate-ci.py",
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_generate_ci_rejects_multinode_pico_in_matrix() -> None:
+    gen = _load_generate_ci()
+    original = gen.PLATFORMS
+
+    bad_platform = {
+        "name": "test",
+        "gpus": "1x4",
+        "has_image": True,
+        "multinode": [{"key": "bad", "config": "pico", "nodes": 2, "scale": "2x4", "jobs": []}],
+    }
+    gen.PLATFORMS = [bad_platform]
+    try:
+        with pytest.raises(SystemExit, match="pico must run on exactly 1 node"):
+            gen._validate_platforms()
+    finally:
+        gen.PLATFORMS = original
+
+
+def test_generate_ci_rejects_multinode_pico_baseline_file(tmp_path: Path) -> None:
+    gen = _load_generate_ci()
+    original_dir = gen.BASELINES_DIR
+
+    fake_baselines = tmp_path / "baselines"
+    fake_baselines.mkdir()
+    (fake_baselines / "gb200_pretrain-native_deterministic_pico_2x4.yaml").touch()
+    gen.BASELINES_DIR = fake_baselines
+    try:
+        with pytest.raises(SystemExit, match="obsolete multi-node pico baseline"):
+            gen._validate_platforms()
+    finally:
+        gen.BASELINES_DIR = original_dir
+
+
+def test_generate_ci_pico_jobs_are_single_node() -> None:
+    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
+    workloads = {
+        name: job
+        for name, job in config.items()
+        if isinstance(job, dict)
+        and isinstance(job.get("variables"), dict)
+        and "JOB_ARGS" in job["variables"]
+        and ":pico_" in name
+    }
+
+    assert workloads, "expected pico jobs in the CI config"
+    for name, job in workloads.items():
+        args = shlex.split(job["variables"]["JOB_ARGS"])
+        nodes = int(args[args.index("--nodes") + 1]) if "--nodes" in args else 1
+        assert nodes == 1, f"pico job {name!r} has {nodes} nodes; pico must be single-node only"

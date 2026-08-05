@@ -1,0 +1,2 @@
+# Explicit BF16 precision profile for the shared Super3 architecture.
+inherits: super3

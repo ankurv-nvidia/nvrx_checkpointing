@@ -86,7 +86,7 @@ class LocalDaemon:
         self.require_stopped()
 
 
-_SERVICE_PORT = "41000"
+_SERVICE_PORT = "4100"
 CHECKPOINT_SERVER = LocalDaemon(
     name="checkpoint_server",
     process_pattern="[c]heckpoint_server",

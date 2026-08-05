@@ -404,7 +404,7 @@ try
         ("max-inflight", bpo::value<uint32_t>(&cfg.maxInflight), "cap on simultaneous connections; default 20480")               //
         ("endpoint", bpo::value<std::string>(&endpointStr), "ping | shardedstate; default ping")                                 //
         ("host", bpo::value<std::string>(&cfg.host), "coordinator host; default 127.0.0.1")                                      //
-        ("port", bpo::value<uint16_t>(&cfg.port), "coordinator port; default 41000")                                             //
+        ("port", bpo::value<uint16_t>(&cfg.port), "coordinator port; default 4100")                                             //
         ("connect-timeout-ms", bpo::value<uint32_t>()->default_value(5000), "per-request deadline in ms")                        //
         ("io-threads", bpo::value<unsigned>(&ioThreads), "client io_context worker threads")                                     //
         ("external", bpo::bool_switch(&external), "do not start an in-process server; stress a running one at --host/--port")    //
