@@ -1,2 +1,8 @@
 # Explicit BF16 precision profile for the shared Super3 architecture.
 inherits: super3
+
+# Mamba + attention + MoE-router capture consumes 32.77 GiB of private graph
+# pools on GB200, and attention + router still leaves 17.54 GiB. Preserve the
+# proven attention capture while keeping Mamba and the MoE router eager.
+cuda-graph-impl: local
+cuda-graph-modules: [attn]

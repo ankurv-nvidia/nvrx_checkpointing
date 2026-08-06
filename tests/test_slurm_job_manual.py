@@ -1381,7 +1381,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert ".run_ckpt_stress" not in config
 
     nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
-    assert any(":super3bf16_16x4" in name for name in nvrx)
+    assert any(":super3fp4_16x4" in name for name in nvrx)
     assert any(":ultra3fp8_64x4" in name for name in nvrx)
     assert all(job["extends"][-1] == ".nvrx_pipeline" for job in nvrx.values())
 
@@ -1650,7 +1650,7 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert all(bundle["rules"][0]["when"] in {"always", "never"} for bundle in bundles.values())
     assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb200:nvrx:super3bf16_16x4" in bundles["nvrx"]["dependencies"]
+    assert "[PERF]:gb200:nvrx:super3fp4_16x4" in bundles["nvrx"]["dependencies"]
     assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
 
 
@@ -1740,7 +1740,8 @@ def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
 
     assert flavors.names == ("deterministic", "valgrind")
     assert flavors.tag == "deterministic-valgrind"
-    assert flavors.policy.phase2_save_interval == 250  # noqa: PLR2004
+    assert flavors.policy.phase1_train_iters == 25  # noqa: PLR2004
+    assert flavors.policy.phase2_save_interval == 25  # noqa: PLR2004
     assert flavors.policy.phase2_checkpoints == slurm_job.FlavorPolicy.phase2_checkpoints
     assert flavors.policy.checkpoint_routines == 1
     assert not flavors.policy.manages_native_server
@@ -1751,15 +1752,22 @@ def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
     assert flavors.policy.reporter is None
 
 
-def test_deterministic_cadence_keeps_three_phase2_saves() -> None:
+def test_deterministic_cadence_keeps_three_phase2_saves(tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     policy = slurm_job.FlavorSelection(["deterministic"]).policy
+    phase1 = policy.train_config("pico", _args(tmp_path), "native", 1)
     interval = policy.phase2_save_interval
-    exit_interval = interval * policy.phase2_checkpoints
-    exit_iteration = (slurm_job._PHASE1_TRAIN_ITERS // exit_interval + 1) * exit_interval
-    first_save = (slurm_job._PHASE1_TRAIN_ITERS // interval + 1) * interval
+    phase1_iteration = policy.phase1_train_iters
+    phase2 = policy.train_config("pico", _args(tmp_path), "native", 2)
+    opts = slurm_job._train_options("pico", phase2)
+    exit_iteration = int(opts[opts.index("--exit-interval") + 1])
+    first_save = (phase1_iteration // interval + 1) * interval
 
-    assert list(range(first_save, exit_iteration + 1, interval)) == [250, 500, 750]
+    assert phase1_iteration == 25  # noqa: PLR2004
+    assert phase1.save_interval == phase1_iteration
+    assert phase1.checkpoints == 1
+    assert interval == phase1_iteration
+    assert list(range(first_save, exit_iteration + 1, interval)) == [50, 75, 100]
     assert policy.checkpoint_routines == 2  # noqa: PLR2004
 
 
@@ -1881,10 +1889,10 @@ def test_batch_epilog_requires_both_deterministic_checkpoint_routines(tmp_path: 
     slurm_job = _load_slurm_job()
     log = tmp_path / "run.log"
     log.write_text(
-        "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
-        "successfully saved checkpoint from iteration 120 to /run/checkpoints\n"
-        "successfully saved checkpoint from iteration 150 to /run/checkpoints\n"
-        "successfully saved checkpoint from iteration 180 to /run/checkpoints",
+        "successfully saved checkpoint from iteration 25 to /run/phase1-checkpoints\n"
+        "successfully saved checkpoint from iteration 30 to /run/checkpoints\n"
+        "successfully saved checkpoint from iteration 60 to /run/checkpoints\n"
+        "successfully saved checkpoint from iteration 90 to /run/checkpoints",
     )
 
     with pytest.raises(RuntimeError, match=r"expected at least 2 and 6"):
@@ -2357,9 +2365,22 @@ def test_super3_profiles_share_reference_architecture() -> None:
         "expert-model-parallel-size": 64,
         "micro-batch-size": 1,
         "num-layers-at-end-in-bf16": 14,
+        "async-ckpt-use-cpu-shm": True,
     }
 
     assert {key: fp4.pop(key) for key in precision} == precision
+    graph_keys = ("cuda-graph-impl", "cuda-graph-modules")
+    common_graphs = {key: common.pop(key) for key in graph_keys}
+    bf16_graphs = {key: bf16.pop(key) for key in graph_keys}
+    fp4_graphs = {key: fp4.pop(key) for key in graph_keys}
+    assert common_graphs == {
+        "cuda-graph-impl": "local",
+        "cuda-graph-modules": ["mamba", "attn", "moe_router"],
+    }
+    assert bf16_graphs == fp4_graphs == {
+        "cuda-graph-impl": "local",
+        "cuda-graph-modules": ["attn"],
+    }
     assert common == bf16
     assert fp4 == bf16
     assert {key: bf16[key] for key in expected} == expected

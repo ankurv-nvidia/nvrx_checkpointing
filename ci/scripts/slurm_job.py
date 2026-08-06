@@ -855,6 +855,7 @@ def _base_env() -> dict[str, str]:
 
 @dataclass
 class FlavorPolicy:
+    phase1_train_iters: int = _PHASE1_TRAIN_ITERS
     phase2_save_interval: int = 250
     phase2_checkpoints: int = 3
     checkpoint_routines: int = 1
@@ -874,10 +875,13 @@ class FlavorPolicy:
         if phase == 1:
             return TrainConfig(
                 args.nodes, args.gpus_per_node, phase1, None, args.config, provider,
-                1, _PHASE1_TRAIN_ITERS, 1, extend_training,
+                1, self.phase1_train_iters, 1, extend_training,
             )
         checkpoints = self.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
         interval = self.phase2_save_interval if args.checkpoint_interval is None else args.checkpoint_interval
+        start_iteration = self.phase1_train_iters
+        if cycle:
+            start_iteration = (self.phase1_train_iters // interval + cycle * checkpoints) * interval
         return TrainConfig(
             args.nodes,
             args.gpus_per_node,
@@ -889,6 +893,7 @@ class FlavorPolicy:
             interval,
             checkpoints,
             extend_training,
+            start_iteration,
         )
 
     def server_context(self, stem: str, phase: int) -> contextlib.AbstractContextManager:
@@ -968,6 +973,12 @@ class DeterministicFlavor(Flavor):
         policy.worker = self.run
         policy.reporter = self.report
         policy.requires_finite_run = True
+        policy.phase1_train_iters = 25
+        # Determinism compares checkpoint contents, so retain three phase-2
+        # checkpoints while shortening the training between them. Large
+        # models run the routine twice (reference + measured), and the former
+        # 250-iteration cadence exceeded Ultra3's six-hour allocation.
+        policy.phase2_save_interval = 25
         policy.checkpoint_routines = 2
 
     def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
@@ -1181,11 +1192,16 @@ class TrainConfig:
     save_interval: int = 250
     checkpoints: int = 3
     extend_training: bool = False
+    start_iteration: int = 0
 
 def _train_options(cfg: str, config: TrainConfig) -> list[str]:
     run = _run_dir(cfg)
     phase1 = run / "phase1-checkpoints"
-    total_iters = config.save_interval * config.checkpoints if config.checkpoints else None
+    total_iters = (
+        (config.start_iteration // config.save_interval + config.checkpoints) * config.save_interval
+        if config.checkpoints
+        else None
+    )
     dynamic = {
         "tensor-model-parallel-size": config.gpus,
         "expert-model-parallel-size": config.gpus,
@@ -1370,7 +1386,7 @@ def _run_routine(
             _sync_ranks(f"{label}-{cycle_tag}".strip("-"))
         if phase == 1:
             wait_for_file(
-                _run_dir(cfg) / f"phase1-checkpoints/iter_{_PHASE1_TRAIN_ITERS:07d}/.metadata",
+                _run_dir(cfg) / f"phase1-checkpoints/iter_{flavors.policy.phase1_train_iters:07d}/.metadata",
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
             phase = 2

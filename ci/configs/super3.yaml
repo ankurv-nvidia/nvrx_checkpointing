@@ -37,6 +37,12 @@ distributed-timeout-minutes: 10
 ckpt-fully-parallel-save: true
 ckpt-fully-parallel-load: true
 
+# Keep the NVRx persistent checkpoint worker off CUDA IPC.  Super3 leaves too
+# little free HBM for the worker to reopen the phase-1 CUDA snapshot; staging
+# through CPU shared memory avoids the extra GPU mapping without reducing the
+# checkpoint service's shared-memory ring.
+async-ckpt-use-cpu-shm: true
+
 job_time_in_mins:
   srun:
     perf: 120

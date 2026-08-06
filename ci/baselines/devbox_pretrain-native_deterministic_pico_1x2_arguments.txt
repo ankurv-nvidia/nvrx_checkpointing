@@ -176,7 +176,7 @@
   eval_micro_batch_size ........................... 1
   evidence_data_path .............................. None
   exit_duration_in_mins ........................... None
-  exit_interval ................................... 90
+  exit_interval ................................... 100
   exit_on_missing_checkpoint ...................... False
   exit_signal ..................................... 15
   exit_signal_handler ............................. False
@@ -703,7 +703,7 @@
   sample_rate ..................................... 1.0
   save_activations_interval ....................... None
   save_dgrads_interval ............................ None
-  save_interval ................................... 30
+  save_interval ................................... 25
   save_params_interval ............................ None
   save_retain_interval ............................ 30
   save_tokens_per_expert_interval ................. None

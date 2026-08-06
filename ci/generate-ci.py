@@ -67,7 +67,6 @@ PLATFORMS = [
                 "jobs": [
                     ("pretrain-native", "deterministic"),
                     ("pretrain-native", "perf"),
-                    ("pretrain-nvrx", "perf"),
                 ],
             },
             {
@@ -79,7 +78,10 @@ PLATFORMS = [
                 "pipeline_suite": "large-scale",
                 "checkpoint_interval": 125,
                 "timeout": "1d",
-                "jobs": [("pretrain-native", "perf")],
+                "jobs": [
+                    ("pretrain-native", "perf"),
+                    ("pretrain-nvrx", "perf"),
+                ],
             },
             {
                 "key": "multinode-perf-bf16-64",

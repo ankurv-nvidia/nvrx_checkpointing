@@ -2,7 +2,7 @@
   _is_global_batch_size_explicitly_specified ...... True
   account_for_embedding_in_pipeline_split ......... False
   account_for_loss_in_pipeline_split .............. False
-  accumulate_allreduce_grads_in_fp32 .............. True
+  accumulate_allreduce_grads_in_fp32 .............. False
   activation_func_clamp_value ..................... None
   activation_offload_fraction ..................... 1.0
   adam_beta1 ...................................... 0.9
@@ -24,7 +24,7 @@
   apply_wd_to_qk_layernorm ........................ False
   async_ckpt_cpu_priority ......................... 10
   async_ckpt_io_priority .......................... 3
-  async_ckpt_use_cpu_shm .......................... False
+  async_ckpt_use_cpu_shm .......................... True
   async_save ...................................... True
   async_strategy .................................. nvrx
   attention_backend ............................... AttnBackend.flash
@@ -163,14 +163,14 @@
   enable_gpt_oss .................................. False
   enable_msc ...................................... False
   enable_one_logger ............................... True
-  encoder_num_layers .............................. 108
+  encoder_num_layers .............................. 60
   encoder_seq_length .............................. 8192
   end_weight_decay ................................ 0.1
   eod_mask_loss ................................... False
   ep_overlap_early_attn_memory_release ............ False
   error_injection_rate ............................ 0
   error_injection_type ............................ transient_error
-  eval_global_batch_size .......................... 64
+  eval_global_batch_size .......................... 256
   eval_interval ................................... 750
   eval_iters ...................................... 100
   eval_micro_batch_size ........................... 1
