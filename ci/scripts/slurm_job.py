@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+"""Slurm CI launcher.
+
+LLM/agent maintenance constraints:
+
+1. Training environment variables must not depend on model configuration or scale. Set
+   them globally for every run, or let a flavor add/remove them uniformly.
+2. Flavors must not inspect model configuration. Do not branch training policy on node
+   count, GPU count, or model name without explicit user approval.
+3. Model YAML is flavor-agnostic. Keep it focused on architecture and the full-performance
+   recipe, including performance features such as CUDA graphs; do not put environment or
+   flavor policy in model configs.
+4. Cluster and scale may select unavoidable scheduler mechanics (allocation topology,
+   partition, timeout, and paths), but must not silently change training semantics.
+5. Do not inject model options into GitLab ``JOB_ARGS``. Put architecture/precision options
+   in model YAML and uniform execution-policy transforms in the owning flavor.
+6. Keep generated GitLab CI files synchronized with their template/matrix, and update
+   argument baselines whenever an intentional option change affects them.
+7. Keep experiment-only runner tags and pipeline scoping on ``expr/*`` branches.
+8. Explain and obtain approval before changing Python or C++ checkpointing implementation.
+9. Existing scale/config policy exceptions are legacy behavior. Do not copy or extend them
+   without explicit approval; migrate them separately when their ownership is clarified.
+"""
+
 from __future__ import annotations
 
 import argparse

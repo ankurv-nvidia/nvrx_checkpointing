@@ -888,7 +888,7 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     assert reproducer.count("--kill-on-bad-exit=1") == len(("allocation-epilog", "prepare", "train"))
 
 
-def test_awscmh_ultra_fp8_determinism_uses_long_partition(
+def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -909,10 +909,9 @@ def test_awscmh_ultra_fp8_determinism_uses_long_partition(
     )
     reproducer = (tmp_path / "ultra3-64n" / "run.sbatch").read_text()
 
-    assert "#SBATCH --time=06:00:00" in reproducer
-    assert "#SBATCH --partition=batch_long" in reproducer
-    assert "--partition=batch\n" not in reproducer
-    assert reproducer.count("--partition=batch_long") == 4  # noqa: PLR2004  # allocation plus three srun steps
+    assert "#SBATCH --time=03:00:00" in reproducer
+    assert "#SBATCH --partition=batch" in reproducer
+    assert "batch_long" not in reproducer
 
 
 def test_awscmh_ultra_fp8_perf_keeps_default_partition(
@@ -2331,9 +2330,8 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
     }
 
     assert bf16.pop("async-ckpt-use-cpu-shm") is True
-    assert fp8["job_time_in_mins"]["srun"].pop("deterministic") == 360  # noqa: PLR2004
+    assert fp8["job_time_in_mins"]["srun"].pop("deterministic") == 180  # noqa: PLR2004
     assert bf16["job_time_in_mins"]["srun"].pop("deterministic") == 180  # noqa: PLR2004
-    assert fp8.pop("job_partition") == {"awscmh": {"deterministic": "batch_long"}}
     assert {key: fp8.pop(key) for key in precision} == precision
     assert fp8 == bf16
     assert {key: bf16[key] for key in expected} == expected
@@ -2350,6 +2348,13 @@ def test_super3_profiles_share_reference_architecture() -> None:
     precision = {
         "fp4-format": "e2m1",
         "fp4-recipe": "nvfp4",
+    }
+    optimizer_precision = {
+        "use-precision-aware-optimizer": True,
+        "main-grads-dtype": "bf16",
+        "exp-avg-dtype": "bf16",
+        "exp-avg-sq-dtype": "bf16",
+        "grad-reduce-in-bf16": True,
     }
     expected = {
         "num-layers": 88,
@@ -2369,6 +2374,7 @@ def test_super3_profiles_share_reference_architecture() -> None:
     }
 
     assert {key: fp4.pop(key) for key in precision} == precision
+    assert {key: fp4.pop(key) for key in optimizer_precision} == optimizer_precision
     graph_keys = ("cuda-graph-impl", "cuda-graph-modules")
     common_graphs = {key: common.pop(key) for key in graph_keys}
     bf16_graphs = {key: bf16.pop(key) for key in graph_keys}

@@ -133,9 +133,11 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
         world_size = torch.distributed.get_world_size()
         root = checkpoint.model_state.create_root(rank, world_size, **detect_peers(rank, world_size))
         root.register_state_dict(sharded_state_dict)
+        if rank == 0:
+            register_state_dict.snapshot_state = {_DCP_COMMON_STATE_KEY: b""}
+            root.register_state_dict(register_state_dict.snapshot_state)
         root.finalize_registry()
         register_state_dict.root = root
-        register_state_dict.snapshot_state = sharded_state_dict if _DCP_COMMON_STATE_KEY in sharded_state_dict else None
     return register_state_dict.root
 
 
@@ -303,8 +305,6 @@ def _save_checkpoint_impl(  # noqa: PLR0913
         state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
         # validate_access_integrity off: nvrx runs its own cross-rank validation on the same dict.
         sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
-        if torch.distributed.get_rank() == 0:
-            sharded_part[_DCP_COMMON_STATE_KEY] = b""
         register_state_dict(sharded_part)
         if torch.distributed.get_rank() == 0:
             # content_metadata lets load pick the matching optimizer sharding type; only rank 0
