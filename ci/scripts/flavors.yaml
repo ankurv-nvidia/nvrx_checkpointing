@@ -1,0 +1,97 @@
+# Checkpoint variants a run mixes into its execution mode.
+#
+# Each entry names one axis a comparison puts under test. A run carries the
+# variants it names and records what its checkpoints contain; diffing two runs'
+# digests is the comparison. Select them with `--flavor detr+shm` for every run,
+# or `--run=cmp:shm` for one. The execution modes (perf, detr, vg) live in
+# slurm_job.py because each owns a routine, a reporter or a server.
+#
+# Keys per entry:
+#   summary   one line naming the axis under test
+#   priority  configure order, low first; equal priorities order by name
+#   <scope>   `add` and `drop` lists of Megatron options
+#
+# A scope is `all`, `phase1` or `phase2`. Phase 1 trains from scratch and phase
+# 2 resumes from it, both inside one run, so a feature that writes state on one
+# and reads it on the next takes a different option each time.
+# `@PG_CACHE_DIR@` resolves to a directory on the run's storage that outlives
+# the phase creating it.
+#
+# Options a flavor drops are removed before the ones it adds are appended, so a
+# flavor replaces an option by naming it in both lists. Two variants where one
+# adds what the other drops contradict, and a run naming both is refused —
+# that is deduced from these lists, not declared.
+
+nvrx:
+  summary: Write checkpoints through the NVIDIA Resiliency Extension.
+  # The extension supplies the writer as well as the provider, so the run names
+  # the strategy it stages through rather than inheriting the configuration's.
+  all:
+    drop: [--ckpt-provider, --async-strategy]
+    add: [--ckpt-provider=nvrx, --async-strategy=nvrx]
+
+native:
+  summary: Write checkpoints through the native provider.
+  all:
+    drop: [--ckpt-provider]
+    add: [--ckpt-provider=native]
+
+async:
+  summary: Save asynchronously, staging wherever the model configuration says.
+  all:
+    add: [--async-save, --use-persistent-ckpt-worker]
+
+shm:
+  summary: Save asynchronously, staging through shared memory.
+  all:
+    add: [--async-save, --use-persistent-ckpt-worker, --async-ckpt-use-cpu-shm]
+
+ipc:
+  summary: Save asynchronously, staging through CUDA IPC.
+  all:
+    drop: [--async-ckpt-use-cpu-shm]
+    add: [--async-save, --use-persistent-ckpt-worker]
+
+serial:
+  summary: Write one save from one rank instead of spreading it across the group.
+  all:
+    drop: [--ckpt-fully-parallel-save]
+    add: [--no-ckpt-fully-parallel-save]
+
+no-cnst-strct:
+  summary: Re-resolve the checkpoint structure on every save.
+  # A cached structure is resolved on the first save and reused, so a run that
+  # drops it is the control a run that keeps it is measured against.
+  all:
+    drop: [--ckpt-assume-constant-structure]
+
+pt-async:
+  summary: Stage through Megatron's own asynchronous writer.
+  # validate_pytorch_async_config requires shared-memory staging and rejects a
+  # fully parallel save, so selecting this writer settles both.
+  all:
+    drop: [--async-strategy, --ckpt-fully-parallel-save]
+    add:
+      - --async-save
+      - --use-persistent-ckpt-worker
+      - --async-ckpt-use-cpu-shm
+      - --no-ckpt-fully-parallel-save
+      - --async-strategy=pytorch-async
+
+pg-cache:
+  summary: Reuse a recorded process-group distribution instead of computing one.
+  all:
+    add:
+      - --no-ckpt-load-validate-sharding-integrity
+      - --ckpt-fully-parallel-load-per-rank-objects
+      - --ckpt-pg-tensors-cache-path=@PG_CACHE_DIR@
+  # The cache is filled by the phase that creates it and read by the next.
+  phase1:
+    add: [--ckpt-pg-tensors-cache-create]
+
+drop-xstate:
+  summary: Omit the extra-state artifacts that carry no irreplaceable state.
+  # This writes a smaller checkpoint that is equally correct, so a comparison
+  # against a run without it compares two different shapes on purpose.
+  all:
+    add: [--drop-redundant-extra-state]

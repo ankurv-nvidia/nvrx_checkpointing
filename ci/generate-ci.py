@@ -9,6 +9,7 @@ GitLab consumes the committed output and does not run this generator.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import sys
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 HERE = Path(__file__).resolve().parent
 TEMPLATE_CI = HERE / "gitlab-ci-native.template.yml"
 OUTPUT_CI = HERE / "gitlab-ci-native.yml"
+# The job matrix: one entry per hardware platform, consumed by _emit_platform
+# and _emit_multinode. Editing which jobs exist needs no change to this script.
+JOBS_FILE = HERE / "jobs.json"
 BASELINES_DIR = HERE / "baselines"
 STAGE_MARKER = "# >>> generate-ci.py: workload stages <<<"
 JOB_MARKER = "# >>> generate-ci.py: workload jobs <<<"
@@ -33,92 +37,7 @@ _MULTINODE_PICO_BASELINE_RE = re.compile(r"_pico_[2-9]\d*x\d+")
 
 
 # One dict per hardware platform; keys are consumed in _emit_platform / _emit_multinode.
-PLATFORMS = [
-    {
-        "name": "gb200",
-        "gpus": "1x4",
-        "has_image": True,
-        "native_wheel_needs": (("wheel:aarch64", True),),
-        "multinode": [
-            {
-                "key": "nano3",
-                "config": "nano3",
-                "nodes": 8,
-                "scale": "8x4",
-                "group": "8node-nano3",
-                "timeout": "1d",
-                "jobs": [
-                    ("pretrain-native", "deterministic"),
-                    ("pretrain-native", "perf"),
-                    ("pretrain-nvrx", "deterministic"),
-                    ("pretrain-nvrx", "perf"),
-                    ("pretrain-native", ["deterministic", "valgrind"]),
-                ],
-            },
-            {
-                "key": "multinode-super3-bf16",
-                "config": "super3bf16",
-                "nodes": 16,
-                "scale": "16x4",
-                "group": "16node-super3bf16",
-                "pipeline_suite": "large-scale",
-                "checkpoint_interval": 125,
-                "timeout": "1d",
-                "jobs": [
-                    ("pretrain-native", "deterministic"),
-                    ("pretrain-native", "perf"),
-                ],
-            },
-            {
-                "key": "multinode-super3-fp4",
-                "config": "super3fp4",
-                "nodes": 16,
-                "scale": "16x4",
-                "group": "16node-super3fp4",
-                "pipeline_suite": "large-scale",
-                "checkpoint_interval": 125,
-                "timeout": "1d",
-                "jobs": [
-                    ("pretrain-native", "perf"),
-                    ("pretrain-nvrx", "perf"),
-                ],
-            },
-            {
-                "key": "multinode-perf-bf16-64",
-                "config": "ultra3bf16",
-                "nodes": 64,
-                "scale": "64x4",
-                "group": "64node-ultra3bf16",
-                "pipeline_suite": "large-scale",
-                "checkpoint_interval": 125,
-                "timeout": "1d",
-                "jobs": [("pretrain-native", "perf")],
-            },
-            {
-                "key": "multinode-perf-64",
-                "config": "ultra3fp8",
-                "nodes": 64,
-                "scale": "64x4",
-                "group": "64node-ultra3fp8",
-                "pipeline_suite": "large-scale",
-                "checkpoint_interval": 125,
-                "timeout": "1d",
-                "jobs": [
-                    ("pretrain-native", "deterministic"),
-                    ("pretrain-native", "perf"),
-                    ("pretrain-nvrx", "perf"),
-                ],
-            },
-        ],
-    },
-    {
-        "name": "h100",
-        "gpus": "1x8",
-        "has_image": True,
-        "pipeline_suite": "main-branch-runs",
-        "multinode": [],
-    },
-]
+PLATFORMS = json.loads(JOBS_FILE.read_text())["platforms"]
 
 
 def _job(  # noqa: PLR0913
@@ -148,6 +67,9 @@ def _job(  # noqa: PLR0913
     return "\n".join(lines)
 
 
+# Above eight nodes a synchronous save costs more than a run can afford.
+ASYNC_FROM_NODES = 16
+
 GROUPS = (
     "native-deterministic",
     "native-perf",
@@ -161,18 +83,20 @@ GROUPS = (
     "8node-nano3",
 )
 
-FLAVOR_LABEL = {"deterministic": "[DETR]", "perf": "[PERF]"}
+FLAVOR_LABEL = {"detr": "[DETR]", "perf": "[PERF]"}
+# Pipeline stages spell out what a terse flavor name abbreviates.
+GROUP_FLAVOR = {"detr": "deterministic"}
 OPTIONAL_GROUPS = frozenset(GROUPS) - {"native-deterministic", "native-perf"}
 
 
 def _provider(job: str) -> str:
-    """'pretrain-native' -> 'native', 'pretrain-nvrx' -> 'nvrx'."""
-    return job.split("-", 1)[1]
+    """The provider a job writes through; the job is named for it."""
+    return job
 
 
 def _pretrain_group(job: str, flavor: str) -> str:
     """Default group for a single-node or 2-node pretrain job: <provider>-<flavor>."""
-    return f"{_provider(job)}-{flavor}"
+    return f"{_provider(job)}-{GROUP_FLAVOR.get(flavor, flavor)}"
 
 
 def _add_job(  # noqa: PLR0913
@@ -210,12 +134,22 @@ def _emit_multinode(
             label = FLAVOR_LABEL.get(flavors[0], flavors[0])
             modifiers = "".join(f":{modifier}" for modifier in flavors[1:])
             name = f"{label}:{p['name']}:{_provider(job)}:{run_seg}{modifiers}"
-            flavor_flags = " ".join(f"--flavor {f}" for f in flavors)
+            provider, common = job, "+".join(flavors)
+            # Those jobs name the asynchronous writer outright. An entry names
+            # the staging a given flavor wants when the default does not suit
+            # it, so one flavor's staging changes without moving the other's.
+            if entry["nodes"] >= ASYNC_FROM_NODES:
+                common += "+" + entry.get("staging", {}).get(flavors[0], "async")
+            flavor_flags = (
+                f"--flavor {common} --run=ref:nvrx --run=cmp:{provider}"
+                if flavors[0] == "detr" and "vg" not in flavors
+                else f"--flavor {common}+{provider}"
+            )
             flavor_args = entry.get("flavor_args", {}).get(flavors[0], "")
             args = " ".join(
                 part
                 for part in (
-                    f"{job} --nodes {entry['nodes']} --config {entry['config']}",
+                    f"--nodes {entry['nodes']} --config {entry['config']}",
                     flavor_flags,
                     flavor_args,
                 )
@@ -227,7 +161,7 @@ def _emit_multinode(
             provider = _provider(job)
             suite = (
                 "main-branch-runs"
-                if "valgrind" in flavors
+                if "vg" in flavors
                 else p.get("pipeline_suite") or ("nvrx" if provider == "nvrx" else entry.get("pipeline_suite"))
             )
             _add_job(
@@ -239,7 +173,7 @@ def _emit_multinode(
                 pipeline_suite=suite,
                 job_args=args,
                 needs=p.get("native_wheel_needs", ())
-                if suite is None and provider == "native" and "valgrind" not in flavors
+                if suite is None and provider == "native" and "vg" not in flavors
                 else (),
                 tags=(p["name"], f"{entry['nodes']}n"),
                 timeout=timeout,
@@ -254,13 +188,17 @@ def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str,
         return
 
     standard = [
-        ("pretrain-native", "deterministic"),
-        ("pretrain-native", "perf"),
-        ("pretrain-nvrx", "deterministic"),
+        ("native", "detr"),
+        ("native", "perf"),
+        ("nvrx", "detr"),
     ]
     for job, flavor in standard:
         jname = f"{FLAVOR_LABEL.get(flavor, flavor)}:{name}:{_provider(job)}:pico_{gpus}"
-        args = f"{job} --config pico --flavor {flavor}"
+        args = (
+            f"--config pico --flavor {flavor} --run=ref:nvrx --run=cmp:{job}"
+            if flavor == "detr"
+            else f"--config pico --flavor {flavor}+{job}"
+        )
         g = _pretrain_group(job, flavor)
         provider = _provider(job)
         _add_job(
@@ -283,7 +221,7 @@ def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str,
         "valgrind",
         vg,
         [".slurm_job", runner],
-        job_args="pretrain-native --config pico --flavor deterministic --flavor valgrind",
+        job_args="--config pico --flavor detr+vg+native",
         tags=(name, "1n"),
     )
 
@@ -296,7 +234,7 @@ def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str,
         nvrx_perf,
         [".slurm_job", runner],
         pipeline_suite=p.get("pipeline_suite") or "nvrx",
-        job_args="pretrain-nvrx --config pico --flavor perf",
+        job_args="--config pico --flavor perf+nvrx",
         tags=(name, "1n"),
     )
 

@@ -12,6 +12,22 @@ variables:
     value: default
     options: [default, nvrx, large-scale, main-branch-runs]
     description: "Workloads to run; non-default suites can be launched separately."
+  # Sources every job trains on. Set these to run a candidate Megatron-LM /
+  # NVIDIA Resiliency Extension; the digest each run writes is what a later
+  # comparison against another run's digest reads. slurm_job.py reads them
+  # straight from the environment.
+  MEGATRON_REPO_URL:
+    value: ""
+    description: "Megatron-LM repository the run trains on."
+  MEGATRON_COMMIT:
+    value: ""
+    description: "Megatron-LM commit the run trains on."
+  NVRX_REPO_URL:
+    value: ""
+    description: "NVIDIA Resiliency Extension repository the run trains on."
+  NVRX_COMMIT:
+    value: ""
+    description: "NVIDIA Resiliency Extension commit the run trains on."
 
 .default_pipeline:
   rules:
@@ -96,35 +112,55 @@ variables:
           scancel -- "${job_id}" || true
         done < <(find ci/ci-runs -mindepth 2 -maxdepth 2 -name gitlab_job_id -print0 2>/dev/null)
       fi
-    - du -h ci/ci-runs/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+    - du -h ci/ci-runs/*/checkpoints/iter_*/*.distcp ci/ci-runs/*/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
   artifacts:
     paths:
       - ci/ci-results/*.log
       - ci/ci-results/*_report.json
       - ci/ci-runs/*/logs/*.log
+      - ci/ci-runs/*/*/logs/*.log
       - ci/ci-runs/*/logs/*_report.json
+      - ci/ci-runs/*/*/logs/*_report.json
       # The submitted sbatch script; its header records the exact submit command, so it
       # doubles as a reproducer for re-running the SLURM job by hand.
       - ci/ci-results/*.sbatch
       - ci/ci-runs/*/run.sbatch
+      - ci/ci-runs/*/*/run.sbatch
+      # What every run's checkpoints contain, and how they compared. Merged
+      # back as the baseline a later run is diffed against.
+      - ci/ci-runs/*/logs/*_checkpoint_digest.xz
+      - ci/ci-runs/*/*/logs/*_checkpoint_digest.xz
+      - ci/ci-runs/*/logs/*_checkpoint_summary.log
+      - ci/ci-runs/*/*/logs/*_checkpoint_summary.log
       # Drop-in candidate baseline files generated from this job's final
       # Megatron argument block and measured checkpoint metrics.
       - ci/ci-runs/*/logs/baselines/*
+      - ci/ci-runs/*/*/logs/baselines/*
       # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
       - ci/ci-runs/*/checkpoints/iter_*/registry.bin
+      - ci/ci-runs/*/*/checkpoints/iter_*/registry.bin
       - ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/*/checkpoints/iter_*/reference.metadata.info
       - ci/ci-runs/*/checkpoints/iter_*/*.txt
+      - ci/ci-runs/*/*/checkpoints/iter_*/*.txt
       # Raw .metadata pickles — the only survivor if the trace raises before writing.
       - ci/ci-runs/*/checkpoints/iter_*/.metadata
+      - ci/ci-runs/*/*/checkpoints/iter_*/.metadata
       # nvrx run-1 reference, parked for an offline cross-run diff on mismatch.
       - ci/ci-runs/*/run1-references/iter_*/reference.metadata.info
+      - ci/ci-runs/*/*/run1-references/iter_*/reference.metadata.info
       # In-allocation reference check (>2 nodes): both sides of the manifest diff — the
       # stashed reference-routine manifests and the measured routine's, per checkpoint.
       - ci/ci-runs/*/checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/*/checkpoints/iter_*/common_pt_dump.info
       - ci/ci-runs/*/phase1-checkpoints/iter_*/reference.metadata.info
+      - ci/ci-runs/*/*/phase1-checkpoints/iter_*/reference.metadata.info
       - ci/ci-runs/*/phase1-checkpoints/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/*/phase1-checkpoints/iter_*/common_pt_dump.info
       - ci/ci-runs/*/reference-run/*/iter_*/reference.metadata.info
+      - ci/ci-runs/*/*/reference-run/*/iter_*/reference.metadata.info
       - ci/ci-runs/*/reference-run/*/iter_*/common_pt_dump.info
+      - ci/ci-runs/*/*/reference-run/*/iter_*/common_pt_dump.info
     expire_in: 30 days
     when: always
 
@@ -148,7 +184,11 @@ variables:
     expire_in: 30 days
     when: always
 
-# Optional workload jobs do not block the pipeline when left unplayed.
+# Optional workload jobs are not started unless the pipeline asks for them.
+# A rule's allow_failure replaces the job's own, so setting it here would
+# tolerate every failure of a job somebody chose to start, not just the
+# perf-drift exit the job allows. Left unset, an unplayed job blocks nothing
+# and a played one reports what it did.
 .manual_optional:
   rules:
     - if: '$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale" || $PIPELINE_SUITE == "main-branch-runs"'
@@ -156,7 +196,6 @@ variables:
     - if: '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
     - when: manual
-      allow_failure: true
 
 .nvrx_pipeline:
   rules:
@@ -214,6 +253,10 @@ variables:
         --form "variables[UPSTREAM_PIPELINE_ID]=${CI_PIPELINE_ID}" \
         --form "variables[UPSTREAM_WHEEL_X86_64_JOB_ID]=${UPSTREAM_WHEEL_X86_64_JOB_ID}" \
         --form "variables[UPSTREAM_WHEEL_AARCH64_JOB_ID]=${UPSTREAM_WHEEL_AARCH64_JOB_ID}" \
+        --form "variables[MEGATRON_REPO_URL]=${MEGATRON_REPO_URL}" \
+        --form "variables[MEGATRON_COMMIT]=${MEGATRON_COMMIT}" \
+        --form "variables[NVRX_REPO_URL]=${NVRX_REPO_URL}" \
+        --form "variables[NVRX_COMMIT]=${NVRX_COMMIT}" \
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/trigger/pipeline")"
       printf '%s\n' "${response}" | grep -Eq "\"sha\":[[:space:]]*\"${suite_sha}\""
       pipeline_id="$(printf '%s\n' "${response}" | grep -o '"id":[[:space:]]*[0-9]*' | head -n1 | cut -d: -f2 | tr -d ' ')"

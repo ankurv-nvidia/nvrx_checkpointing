@@ -34,6 +34,7 @@ import importlib.metadata
 import importlib.util
 import json
 import logging
+import lzma
 import mmap
 import os
 import re
@@ -78,10 +79,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (SCRIPT_DIR / "../..").resolve()
 BASELINES_DIR = (SCRIPT_DIR / "../baselines").resolve()
 CONFIGS_DIR = (SCRIPT_DIR / "../configs").resolve()
+# One entry per hardware platform, shared with the pipeline generator.
+JOBS_FILE = (SCRIPT_DIR / "../jobs.json").resolve()
+FLAVORS_FILE = SCRIPT_DIR / "flavors.yaml"
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
 DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.07-py3")
+DEFAULT_MEGATRON_REPO_URL = "https://github.com/NVIDIA/Megatron-LM.git"
+DEFAULT_MEGATRON_COMMIT = "77c87725e71c9f5022ac289071b16941876ca858"
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
 _NVRX_MODULE = "nvidia_resiliency_ext"
@@ -90,6 +96,10 @@ PERF_TOLERANCE = 0.05
 MAX_BW_SOCKET_IMBALANCE = 1.30
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
+# Parent of every run directory. Holds what runs share: the dependency
+# checkouts, the native build and the compiler caches, none of which depend on
+# what a run is testing.
+WORK_ROOT: Path | None = None
 RUN_NAME: str | None = None
 logger = logging.getLogger("native_ci")
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
@@ -97,13 +107,17 @@ _EPILOG_ENTRY_CMD = "__epilog__"
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
 _CLEANUP_GRACE_MINUTES = 5
+# Ranks coordinate through files under this directory of a run, never beside
+# its logs.
+SYNC_DIR_NAME = ".sync"
 _TORCH_STORAGE_ALIGNMENT = 64
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_DEFAULT_NAME = (
-    "{job_name}_{config}_{nodes}n_mlm.{mlm_abbreviated_sha_commit}_"
-    "nvrx.{nvrx_abbreviated_sha_commit}_nckpt.{native_checkpointing_abbreviated_sha_commit}"
-)
+# A run directory is named for what it holds: the model it trained, the sources
+# it trained on, and the variants it carried. Two runs differing in any of those
+# keep their own checkpoints and logs; two runs alike in all of them share a
+# directory and the later one supersedes the earlier.
+_DEFAULT_NAME = "{run}{config}_{nodes}n-{flavors}{sources}"
 _TRAIN_ENV_DEFAULTS = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     "NCCL_IB_TIMEOUT": "24",
@@ -258,6 +272,19 @@ def megatron_root() -> Path:
     return Path(out.strip()).resolve()
 def platform_tag() -> str:
     return os.environ.get("PLATFORM", "").strip() or socket.gethostname().split(".")[0]
+def platform_gpus_per_node() -> int | None:
+    """How many GPUs a node of this platform has, from the platform matrix.
+
+    The count is a property of the hardware, so naming the platform is enough
+    and a run only states it to deviate.
+    """
+    if not (platform := platform_tag()):
+        return None
+    for entry in json.loads(JOBS_FILE.read_text())["platforms"]:
+        if entry["name"] == platform:
+            return int(str(entry["gpus"]).rpartition("x")[2])
+    return None
+
 def cluster_tag() -> str:
     return os.environ.get("CLUSTER", "").strip()
 def _run_dir(cfg: str) -> Path:
@@ -270,24 +297,101 @@ def _nvrx_target(cfg: str, commit: str | None) -> Path | None:
         return None
     suffix = f"-{commit}" if commit else ""
     return _run_dir(cfg) / f"deps/nvidia-resiliency-ext{suffix}"
+
+@dataclass(frozen=True)
+class Toolchain:
+    """Megatron-LM and NVIDIA Resiliency Extension coordinates a run trains on.
+
+    The checkout is keyed by commit, so runs of different sources keep their own
+    directories and a training subprocess is pointed at one through its
+    environment.
+    """
+
+    megatron_url: str
+    megatron_commit: str | None
+    megatron_root: Path
+    nvrx_url: str
+    nvrx_commit: str | None
+    nvrx_target: Path | None
+
+    def describe(self, label: str) -> str:
+        nvrx = f"{self.nvrx_url}@{self.nvrx_commit}" if self.nvrx_commit else "image"
+        return f"{label}: megatron={self.megatron_url}@{self.megatron_commit or 'HEAD'} nvrx={nvrx}"
+
+    def apply(self, env: dict[str, str]) -> None:
+        """Point one training subprocess at this toolchain."""
+        env["MEGATRON_ROOT"] = self.megatron_root.as_posix()
+        env["MEGATRON_REPO_URL"] = self.megatron_url
+        if self.megatron_commit:
+            env["MEGATRON_COMMIT"] = self.megatron_commit
+        env["NVRX_REPO_URL"] = self.nvrx_url
+        if self.nvrx_commit:
+            env["NVRX_COMMIT"] = self.nvrx_commit
+        entries = [entry for entry in env.get("PYTHONPATH", "").split(":") if entry]
+        if self.nvrx_target is not None:
+            head = self.nvrx_target.as_posix()
+            entries = [head, *(entry for entry in entries if entry != head)]
+        if entries:
+            env["PYTHONPATH"] = ":".join(entries)
+        else:
+            env.pop("PYTHONPATH", None)
+
+def _toolchain(cfg: str, args: argparse.Namespace) -> Toolchain:
+    """Resolve the Megatron-LM and extension sources this run trains on.
+
+    A run trains on one toolchain. Comparing two of them is comparing the
+    digests two runs wrote, which needs neither to know about the other.
+    """
+    return Toolchain(
+        args.megatron_repo_url or DEFAULT_MEGATRON_REPO_URL,
+        args.megatron_commit,
+        Path(os.environ.get("MEGATRON_ROOT") or _megatron_checkout(args)).expanduser(),
+        args.nvrx_repo_url or DEFAULT_NVRX_REPO_URL,
+        args.nvrx_commit,
+        _nvrx_target(cfg, args.nvrx_commit),
+    )
 def _load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text()) or {}
-def _run_name(template: str | None, args: argparse.Namespace) -> str:
+def _repo_sha() -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],  # noqa: S607
+        text=True,
+    ).strip()[:8]
+
+def _megatron_checkout(args: argparse.Namespace) -> Path:
+    """Where this run's Megatron-LM lives, keyed so runs of one commit share it."""
+    root = WORK_ROOT if WORK_ROOT is not None else REPO_ROOT / "workdir"
+    return root / f"deps/megatron-lm-{(args.megatron_commit or 'head')[:8]}"
+
+def _source_suffix(args: argparse.Namespace) -> str:
+    """Name only the sources this run was told to deviate on.
+
+    A run on the pinned Megatron-LM and the extension in the image is the
+    common case and says nothing; a run given either explicitly carries it, so
+    two runs of different sources never share a directory.
+    """
+    parts = []
+    if args.megatron_commit and args.megatron_commit != DEFAULT_MEGATRON_COMMIT:
+        parts.append(f"-mlm-{args.megatron_commit[:8]}")
+    if args.nvrx_commit:
+        parts.append(f"-nvrx-{args.nvrx_commit[:8]}")
+    return "".join(parts)
+
+def _run_name(template: str | None, args: argparse.Namespace, run: str = "") -> str:
     job_id = os.environ.get("CI_JOB_ID", "").strip()
-    template = (template or ("{gitlab_pipeline_jobid}_" if job_id else "") + _DEFAULT_NAME).strip()
+    default = _DEFAULT_NAME
+    template = (template or ("{gitlab_pipeline_jobid}_" if job_id else "") + default).strip()
     if not job_id:
         template = template.replace("{gitlab_pipeline_jobid}_", "")
     values = {
         "gitlab_pipeline_jobid": job_id,
-        "job_name": f"{args.job}_{_selected_flavors(args).tag}",
+        "flavors": _selected_flavors(args).tag,
         "config": args.config,
         "nodes": args.nodes,
         "mlm_abbreviated_sha_commit": (args.megatron_commit or "image")[:8],
         "nvrx_abbreviated_sha_commit": (args.nvrx_commit or "image")[:8],
-        "native_checkpointing_abbreviated_sha_commit": subprocess.check_output(
-            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],  # noqa: S607
-            text=True,
-        ).strip()[:8],
+        "sources": _source_suffix(args),
+        "run": f"{run}." if run else "",
     }
     try:
         name = template.format_map(values)
@@ -299,7 +403,7 @@ def _run_name(template: str | None, args: argparse.Namespace) -> str:
         )
     return name
 def _configure_run(args: argparse.Namespace) -> None:
-    global RESULTS_DIR, RUN_NAME, RUN_ROOT
+    global RESULTS_DIR, RUN_NAME, RUN_ROOT, WORK_ROOT  # noqa: PLW0603
     if value := os.environ.get("NVRX_REPO_ROOT"):
         resolved = Path(value).expanduser().resolve()
         if any(c in resolved.as_posix() for c in ",:"):
@@ -308,7 +412,11 @@ def _configure_run(args: argparse.Namespace) -> None:
     os.environ["SLURMJOB_OPT_LAUNCHER_ROOT"] = REPO_ROOT.as_posix()
     name = _run_name(args.name, args)
     root = (args.work_dir or REPO_ROOT / "workdir").expanduser().resolve()
+    WORK_ROOT = root
     RUN_NAME, RUN_ROOT, RESULTS_DIR = name, root / name, root / name / "logs"
+    # Every run writes inside this directory, so removing it removes the whole
+    # job. Cleaning happens on the launcher because the runs themselves are
+    # performed by every rank of an allocation at once.
     if args.clean_run and not in_srun() and RUN_ROOT.exists():
         if RUN_ROOT.is_symlink():
             raise SystemExit(f"--clean-run refuses to remove a symlink: {RUN_ROOT}")
@@ -320,28 +428,38 @@ def _configure_run(args: argparse.Namespace) -> None:
     args.image = args.image.expanduser().resolve() if args.image else image_path()
     for dest, option in _RUN_OPTIONS.items():
         value = getattr(args, dest, None)
-        if value is not None:
-            os.environ[option.env] = ",".join(value) if option.action == "append" else str(int(value) if isinstance(value, bool) else value)
+        if value is None:
+            continue
+        if option.action in ("append", "extend"):
+            os.environ[option.env] = ",".join(value)
+        else:
+            os.environ[option.env] = str(int(value) if isinstance(value, bool) else value)
     os.environ.update(
         SLURMJOB_OPT_RUN_DIR=str(RUN_ROOT),
-        SLURMJOB_OPT_PYTHON_INSTALL_DIR=str(RUN_ROOT / "deps/python"),
-        MEGATRON_ROOT=os.environ.get("MEGATRON_ROOT", str(RUN_ROOT / "deps/megatron-lm")),
-        MEGATRON_NATIVE_BUILD_DIR=str(RUN_ROOT / "build/nvrx_checkpointing"),
+        SLURMJOB_OPT_WORK_ROOT=str(WORK_ROOT),
+        SLURMJOB_OPT_PYTHON_INSTALL_DIR=str(WORK_ROOT / "deps/python"),
+        MEGATRON_ROOT=os.environ.get("MEGATRON_ROOT", str(_megatron_checkout(args))),
+        MEGATRON_NATIVE_BUILD_DIR=str(WORK_ROOT / f"build/nvrx_checkpointing-{_repo_sha()}"),
         ENROOT_IMAGE_DIR=str(args.image.parent),
     )
     for name, default in _TRAIN_ENV_DEFAULTS.items():
         os.environ.setdefault(name, default)
-    os.environ.setdefault("TRITON_CACHE_DIR", str(RUN_ROOT / "triton-cache"))
+    # Compiler and dataset caches are keyed by their own contents, so every run
+    # reads the one another run filled instead of paying the first compile again.
+    for name, directory in (
+        ("TRITON_CACHE_DIR", "caches/triton"),
+        ("TORCHINDUCTOR_CACHE_DIR", "caches/torchinductor"),
+        ("TORCH_EXTENSIONS_DIR", "caches/torch-extensions"),
+    ):
+        os.environ.setdefault(name, str(WORK_ROOT / directory))
     os.environ.setdefault("TRITON_CACHE_PATH", os.environ["TRITON_CACHE_DIR"])
-    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(RUN_ROOT / "torchinductor-cache"))
-    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(RUN_ROOT / "torch-extensions"))
     os.environ.setdefault("NATIVE_CKPT_SERVER_LOG", str(RESULTS_DIR / "checkpoint_server.%h.%p.log"))
 
 def ensure_vcpkg_root() -> None:
-    os.environ.setdefault("VCPKG_ROOT", str(RUN_ROOT / "deps/vcpkg" if RUN_ROOT else REPO_ROOT.parent / "vcpkg"))
+    os.environ.setdefault("VCPKG_ROOT", str(WORK_ROOT / "deps/vcpkg" if WORK_ROOT else REPO_ROOT.parent / "vcpkg"))
     os.environ.setdefault(
         "SLURMJOB_OPT_PYTHON_INSTALL_DIR",
-        str(RUN_ROOT / "deps/python" if RUN_ROOT else REPO_ROOT / "build/wheel-install"),
+        str(WORK_ROOT / "deps/python" if WORK_ROOT else REPO_ROOT / "build/wheel-install"),
     )
     sys_path_insert(Path(os.environ["SLURMJOB_OPT_PYTHON_INSTALL_DIR"]))
 
@@ -526,19 +644,24 @@ def _materialize(script: str, path: Path, args: list[str], env: dict[str, str] |
     run_dir = source.get("SLURMJOB_OPT_RUN_DIR")
     if run_dir and source.get("SLURMJOB_OPT_WORK_DIR") and source.get("SLURMJOB_OPT_RUN_NAME"):
         derived["SLURMJOB_OPT_RUN_DIR"] = '"${SLURMJOB_OPT_WORK_DIR}/${SLURMJOB_OPT_RUN_NAME}"'
-        for key, suffix in (
-            ("MEGATRON_NATIVE_BUILD_DIR", "/build/nvrx_checkpointing"),
-            ("MEGATRON_ROOT", "/deps/megatron-lm"),
+        if source.get("SLURMJOB_OPT_WORK_ROOT") == source["SLURMJOB_OPT_WORK_DIR"]:
+            derived["SLURMJOB_OPT_WORK_ROOT"] = '"${SLURMJOB_OPT_WORK_DIR}"'
+    for parent, keys in (
+        ("SLURMJOB_OPT_RUN_DIR", (("NATIVE_CKPT_SERVER_LOG", "/logs/checkpoint_server.%h.%p.log"),)),
+        ("SLURMJOB_OPT_WORK_ROOT", (
             ("SLURMJOB_OPT_PYTHON_INSTALL_DIR", "/deps/python"),
-            ("TRITON_CACHE_DIR", "/triton-cache"),
-            ("TRITON_CACHE_PATH", "/triton-cache"),
-            ("TORCHINDUCTOR_CACHE_DIR", "/torchinductor-cache"),
-            ("TORCH_EXTENSIONS_DIR", "/torch-extensions"),
+            ("TRITON_CACHE_DIR", "/caches/triton"),
+            ("TRITON_CACHE_PATH", "/caches/triton"),
+            ("TORCHINDUCTOR_CACHE_DIR", "/caches/torchinductor"),
+            ("TORCH_EXTENSIONS_DIR", "/caches/torch-extensions"),
             ("VCPKG_ROOT", "/deps/vcpkg"),
-            ("NATIVE_CKPT_SERVER_LOG", "/logs/checkpoint_server.%h.%p.log"),
-        ):
-            if source.get(key) == run_dir + suffix:
-                derived[key] = f'"${{SLURMJOB_OPT_RUN_DIR}}{suffix}"'
+        )),
+    ):
+        if not (base := source.get(parent)):
+            continue
+        for key, suffix in keys:
+            if source.get(key) == base + suffix:
+                derived[key] = f'"${{{parent}}}{suffix}"'
     exports = [
         *(f"export {key}={shlex.quote(source[key])}" for key in sorted(names - derived.keys()) if source.get(key) is not None),
         *(f"export {key}={value}" for key, value in derived.items()),
@@ -674,7 +797,14 @@ class PerfReport:
     def _platform_bandwidth_baseline(platform: str) -> int:
         values = _load_yaml(BANDWIDTH_BASELINE_FILE)
         if platform not in values:
-            raise RuntimeError(f"missing bw_mbps baseline for {platform!r}")
+            known = ", ".join(sorted(values))
+            hint = (
+                " PLATFORM is unset, so this is the hostname; set it to the hardware "
+                f"the run is on ({known})."
+                if not os.environ.get("PLATFORM", "").strip()
+                else f" Known platforms: {known}."
+            )
+            raise RuntimeError(f"no bandwidth baseline for platform {platform!r}.{hint}")
         return round(float(values[platform]))
 
     @staticmethod
@@ -762,7 +892,9 @@ class PerfReport:
             if "save-checkpoint" in line or "load-checkpoint" in line:
                 logger.info(line)
         metrics = PerfReport._parse_metrics(text, gpus)
-        if not metrics and job == "pretrain-nvrx":
+        # The extension's own writer emits checkpoint times rather than the
+        # bandwidth counters a baseline is made of, so it has nothing to compare.
+        if not metrics and "native" not in flavor.split("-"):
             return True
         if not metrics:
             raise RuntimeError(f"no perf metrics found in {log}")
@@ -781,6 +913,67 @@ class PerfReport:
         report_path.write_text(json.dumps(report, indent=2))
         return passed
 
+def _argument_values(text: str) -> dict[str, str]:
+    """The options an arguments file records, by name.
+
+    The block a run prints is delimited by rules of dashes, which carry no
+    option, so a comparison reads the named settings and not the decoration.
+    """
+    values = {}
+    for line in text.splitlines():
+        name, _, value = line.strip().partition(" ")
+        if re.fullmatch(r"[A-Za-z_]\w*", name):
+            values[name] = value.strip().strip(".").strip()
+    return values
+
+def _arguments_stem(args: argparse.Namespace) -> str:
+    """The name the options a job trains on are recorded under.
+
+    A job reports the options of the last run it trained, so two jobs that
+    differ only in that run train on different options and cannot share a
+    name. The variants that run adds are what tells them apart.
+    """
+    stem = _identity(args)[2]
+    variants = next((spec.variants for spec in reversed(_run_specs(args)) if spec.variants), ())
+    return f"{stem}-{'-'.join(variants)}" if variants else stem
+
+def _compare_arguments(args: argparse.Namespace, log: Path) -> bool:
+    """Report how the options this run trained on differ from the recorded ones.
+
+    An option that changes changes what the run's checkpoints mean, so a run
+    that no longer trains on what was recorded reports every difference and
+    marks the job. The candidate beside this run's logs is what a reviewer
+    adopts to accept the change.
+    """
+    stem = _arguments_stem(args)
+    candidate = log.parent / "baselines" / f"{stem}_arguments.txt"
+    recorded = BASELINES_DIR / f"{stem}_arguments.txt"
+    if not candidate.exists():
+        logger.info(f"[slurm_job:args] {stem}: this run recorded no arguments")
+        return False
+    if not recorded.exists():
+        logger.info(
+            f"[slurm_job:args] {stem}: nothing to compare against; adopt "
+            f"{candidate.name} from this job's baseline artifacts into {BASELINES_DIR.name}/",
+        )
+        return False
+    produced, expected = (_argument_values(path.read_text(errors="replace")) for path in (candidate, recorded))
+    # Two files that yield no options agree on nothing, not on everything. A
+    # run whose arguments could not be read has compared nothing and says so.
+    for name, values, path in (("recorded", expected, recorded), ("produced", produced, candidate)):
+        if not values:
+            logger.info(f"[slurm_job:args] {stem}: no options read from the {name} arguments in {path}")
+            return False
+    differences = [
+        f"{name}: {expected.get(name, '<unset>')} -> {produced.get(name, '<unset>')}"
+        for name in sorted(expected.keys() | produced.keys())
+        if expected.get(name) != produced.get(name)
+    ]
+    for difference in differences:
+        logger.info(f"[slurm_job:args] {stem} {difference}")
+    logger.info(f"[slurm_job:args] {stem}: {len(differences)} of {len(expected)} options differ from the recorded run")
+    return not differences
+
 def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
     _cfg, _flavor, stem = _identity(args)
     output = log.parent / "baselines"
@@ -794,7 +987,10 @@ def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
         if line.startswith("-") or re.match(r"^  [A-Za-z_]\w*(?: \.+ | {2})", line)
     ]
     volatile = re.compile(r"^  (?:data_cache_path|load|save|tensorboard_dir) ")
-    (output / f"{stem}_arguments.txt").write_text("\n".join(line for line in lines if not volatile.match(line)) + "\n")
+    # The options come from the last run the job trained, so the candidate is
+    # named for that run rather than for the job as a whole.
+    arguments = output / f"{_arguments_stem(args)}_arguments.txt"
+    arguments.write_text("\n".join(line for line in lines if not volatile.match(line)) + "\n")
 
     report_path = log.with_name(f"{stem}_report.json")
     if not report_path.exists():
@@ -831,12 +1027,19 @@ def _flatten(config: dict) -> list[str]:
     return output
 
 def _drop(opts: list[str], *flags: str) -> None:
+    """Remove each flag and the value it carries, however that value is spelled.
+
+    An option states its value either as the token after the flag or joined to
+    it by '=', so a flag is matched both ways.
+    """
     for flag in flags:
-        if flag not in opts:
+        start = next((i for i, opt in enumerate(opts) if opt == flag or opt.startswith(f"{flag}=")), None)
+        if start is None:
             continue
-        start, end = opts.index(flag), opts.index(flag) + 1
-        while end < len(opts) and not opts[end].startswith("--"):
-            end += 1
+        end = start + 1
+        if "=" not in opts[start]:
+            while end < len(opts) and not opts[end].startswith("--"):
+                end += 1
         del opts[start:end]
 
 def _set(opts: list[str], flag: str, value: str | None = None) -> None:
@@ -876,6 +1079,21 @@ def _base_env() -> dict[str, str]:
         ),
     }
 
+# A run trains phase 1 from scratch and phase 2 resuming from it. A variant
+# applies to both unless it names the phase it belongs to.
+_SCOPES = ("all", "phase1", "phase2")
+OptionEdit = namedtuple("OptionEdit", "scope add drop")  # noqa: PYI024
+
+def _scope_matches(scope: str, phase: int) -> bool:
+    return scope in ("all", f"phase{phase}")
+
+def _scopes_overlap(left: str, right: str) -> bool:
+    return "all" in (left, right) or left == right
+
+def _flag(option: str) -> str:
+    """The option a token names, whether or not it carries a joined value."""
+    return option.partition("=")[0]
+
 @dataclass
 class FlavorPolicy:
     phase1_train_iters: int = _PHASE1_TRAIN_ITERS
@@ -884,6 +1102,12 @@ class FlavorPolicy:
     checkpoint_routines: int = 1
     manages_native_server: bool = True
     requires_nvrx_absent: bool = False
+    compares_routines: bool = False
+    # The variant a single-routine run trains as, so its options are the
+    # ones a comparison would have applied to the routine under test.
+    routine_variant: str = "reference"
+    # Contributed by the mixin flavors; an explicit run option still wins.
+    option_edits: tuple[OptionEdit, ...] = ()
     wheel_prep_mode: str = "--ensure-prebuilt"
     wheel_defines: tuple[str, ...] = ()
     install_prebuilt: bool = True
@@ -922,8 +1146,8 @@ class FlavorPolicy:
     def server_context(self, stem: str, phase: int) -> contextlib.AbstractContextManager:
         return self.server(stem, phase) if self.server else contextlib.nullcontext()
 
-    def run_worker(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
-        (self.worker or _run_routine)(cfg, args, provider)
+    def run_worker(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
+        (self.worker or _run_routine)(cfg, args, provider, label)
 
     def stop_server(self, provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server and provider == "native":
@@ -938,6 +1162,22 @@ class FlavorPolicy:
 
             _node_once(tag, stop)
 
+    def apply_options(self, opts: list[str], cfg: str, phase: int) -> list[str]:
+        """Add and drop the options the selected variants ask of this phase.
+
+        Returns each change as ``add <option>`` or ``drop <option>`` so a run
+        evidences the variants it carried.
+        """
+        applied = []
+        for edit in self.option_edits:
+            if not _scope_matches(edit.scope, phase):
+                continue
+            _drop(opts, *edit.drop)
+            added = _extra_options(cfg, [shlex.join(edit.add)]) if edit.add else []
+            opts += added
+            applied += [f"drop {flag}" for flag in edit.drop] + [f"add {token}" for token in added]
+        return applied
+
     def prep_args(self) -> list[str]:
         return [self.wheel_prep_mode, *(arg for define in self.wheel_defines for arg in ("--define", define))]
 
@@ -947,8 +1187,12 @@ class FlavorPolicy:
 
 class Flavor:
     name = ""
+    summary = ""
     priority = 0
-    exclusive_groups: tuple[str, ...] = ()
+    # An execution mode owns the routine a run performs and what it reports.
+    # A variant only edits the options that routine trains with.
+    execution_mode = False
+    edits: tuple[OptionEdit, ...] = ()
 
     def configure(self, _policy: FlavorPolicy) -> None:
         pass
@@ -958,21 +1202,18 @@ class Flavor:
 
 
 class PerfFlavor(Flavor):
+    execution_mode = True
     name = "perf"
-    exclusive_groups = ("execution-mode",)
+    summary = "Measure one routine against a recorded throughput baseline."
 
     def configure(self, policy: FlavorPolicy) -> None:
-        policy.worker = self.run
         policy.requires_nvrx_absent = True
         policy.reporter = self.report
-
-    def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
-        _run_routine(cfg, args, provider, async_checkpoint=args.nodes >= 16)
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
         return PerfReport.parse_and_report(
-            args.job,
+            _selected_flavors(args).tag,
             cfg,
             tag,
             log,
@@ -982,6 +1223,9 @@ class PerfFlavor(Flavor):
         )
 
     def transform(self, opts: list[str], _env: dict[str, str]) -> None:
+        # A measured run reports the steady-state save path, which resolves the
+        # checkpoint structure on the first save and reuses it after that.
+        _set(opts, "--ckpt-assume-constant-structure")
         if "--cuda-graph-impl" in opts and "--recompute-granularity" in opts:
             _drop(opts, "--recompute-granularity", "--recompute-modules")
             if "--async-save" in opts:
@@ -989,23 +1233,20 @@ class PerfFlavor(Flavor):
 
 
 class DeterministicFlavor(Flavor):
-    name = "deterministic"
-    exclusive_groups = ("execution-mode",)
+    execution_mode = True
+    name = "detr"
+    summary = "Compare a reference routine's checkpoints against a second routine's, byte for byte."
 
     def configure(self, policy: FlavorPolicy) -> None:
-        policy.worker = self.run
         policy.reporter = self.report
         policy.requires_finite_run = True
         policy.phase1_train_iters = 25
         # Determinism compares checkpoint contents, so retain three phase-2
-        # checkpoints while shortening the training between them. Large
-        # models run the routine twice (reference + measured), and the former
-        # 250-iteration cadence exceeded Ultra3's six-hour allocation.
+        # checkpoints while shortening the training between them. A job that
+        # names two runs trains both, and the former 250-iteration cadence
+        # exceeded Ultra3's six-hour allocation.
         policy.phase2_save_interval = 25
-        policy.checkpoint_routines = 2
-
-    def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
-        _reference_check(cfg, args, provider, async_reference=provider == "native" and args.nodes >= 16)
+        policy.compares_routines = True
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         if not PerfFlavor().report(args, log):
@@ -1028,9 +1269,10 @@ class DeterministicFlavor(Flavor):
             "--moe-router-fusion",
             "--overlap-grad-reduce",
             "--overlap-param-gather",
-            "--recompute-granularity",
-            "--recompute-modules",
         )
+        # Recomputation reproduces the forward it replaces rather than altering
+        # it, so a deterministic run keeps whatever its configuration asks for
+        # and spends the memory on unfused attention and an FP64 router.
         _set(opts, "--moe-router-dtype", "fp64")
         _set(opts, "--deterministic-mode")
         _drop(opts, "--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
@@ -1047,7 +1289,9 @@ class DeterministicFlavor(Flavor):
 
 
 class ValgrindFlavor(Flavor):
-    name = "valgrind"
+    execution_mode = True
+    name = "vg"
+    summary = "Run the checkpoint server under memcheck."
     priority = 100
 
     def configure(self, policy: FlavorPolicy) -> None:
@@ -1060,7 +1304,7 @@ class ValgrindFlavor(Flavor):
         policy.server = self.server
         policy.reporter = None
 
-    def run(self, cfg: str, args: argparse.Namespace, provider: str) -> None:
+    def run(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
         if provider == "native":
             checkpoints = (
                 _selected_flavors(args).policy.phase2_checkpoints
@@ -1070,7 +1314,7 @@ class ValgrindFlavor(Flavor):
             if checkpoints:
                 args = argparse.Namespace(**vars(args))
                 args.checkpoints_per_run, args.repeat = 1, checkpoints * args.repeat
-        _run_routine(cfg, args, provider)
+        _run_routine(cfg, args, provider, label)
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
         _drop(
@@ -1089,7 +1333,7 @@ class ValgrindFlavor(Flavor):
     @contextlib.contextmanager
     def server(self, stem: str, phase: int) -> Generator[None, None, None]:
         host = socket.gethostname().split(".")[0]
-        marker = RESULTS_DIR / f".{os.environ.get('SLURM_JOB_ID', 'local')}-{stem}-{host}"
+        marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{stem}-{host}"
         if os.environ.get("SLURM_LOCALID", "0") != "0":
             wait_for_file(marker.with_suffix(".ready"), 600)
             yield
@@ -1136,23 +1380,116 @@ class ValgrindFlavor(Flavor):
                 marker.with_suffix(".done").touch()
 
 
-_FLAVORS = {flavor.name: flavor for flavor in (PerfFlavor(), DeterministicFlavor(), ValgrindFlavor())}
+_FLAVOR_KEYS = ("summary", "priority", *_SCOPES)
+
+
+class DeclaredFlavor(Flavor):
+    """A checkpoint variant declared in ``ci/flavors.yaml``.
+
+    A variant that only adds or drops options, or settles a run option, needs no
+    code: it names the axis it puts under test and the options that express it.
+    """
+
+    def __init__(self, name: str, spec: dict):
+        if unknown := sorted(set(spec) - set(_FLAVOR_KEYS)):
+            raise ValueError(f"flavor {name} in {FLAVORS_FILE.name} has unknown keys: {', '.join(unknown)}")
+        self.name = name
+        self.summary = str(spec.get("summary", ""))
+        self.priority = int(spec.get("priority", 0))
+        self.edits = tuple(
+            OptionEdit(scope, tuple(spec[scope].get("add") or ()), tuple(spec[scope].get("drop") or ()))
+            for scope in _SCOPES
+            if scope in spec
+        )
+
+    def configure(self, policy: FlavorPolicy) -> None:
+        policy.option_edits += self.edits
+
+
+def _flavor_index(flavors: Iterable[Flavor]) -> dict[str, Flavor]:
+    """Index every flavor by the one name it answers to."""
+    index: dict[str, Flavor] = {}
+    for flavor in flavors:
+        if index.setdefault(flavor.name, flavor) is not flavor:
+            raise ValueError(f"{flavor.name} is declared twice")
+    return index
+
+
+_EXECUTION_MODES = (PerfFlavor(), DeterministicFlavor(), ValgrindFlavor())
+_FLAVOR_LIST = (
+    *_EXECUTION_MODES,
+    *(DeclaredFlavor(name, spec or {}) for name, spec in _load_yaml(FLAVORS_FILE).items()),
+)
+_FLAVORS = _flavor_index(_FLAVOR_LIST)
+_FLAVOR_NAMES = tuple(flavor.name for flavor in _FLAVOR_LIST)
 _DEFAULT_FLAVOR = _FLAVORS[PerfFlavor.name]
+# The checkpoint server exists only for the native provider, so the run loop
+# and the daemon lifecycle ask which one a run named. Everything else about a
+# provider is the `--ckpt-provider` option its flavor carries.
+_DEFAULT_PROVIDER = "nvrx"
+
+def _provider(flavors: FlavorSelection) -> str:
+    return next((name for name in flavors.names if name in ("native", "nvrx")), _DEFAULT_PROVIDER)
+
+
+_RUN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+def _run_entry(value: str) -> list[str]:
+    """Validate one --run argument: a name, optionally with '+'-joined variants."""
+    entries = []
+    for item in value.split(","):
+        name, _, variants = item.strip().partition(":")
+        if not _RUN_NAME_RE.fullmatch(name):
+            raise argparse.ArgumentTypeError(f"run name {name!r} must be letters, digits, '_' or '-'")
+        _flavor_names(variants)
+        entries.append(item.strip())
+    return entries
+
+def _flavor_names(value: str) -> list[str]:
+    """Resolve one ``--flavor`` argument, which may name several joined by '+'."""
+    names = [name.strip() for name in re.split(r"[+,]", value) if name.strip()]
+    if unknown := [name for name in names if name not in _FLAVORS]:
+        raise argparse.ArgumentTypeError(
+            f"unknown flavor: {', '.join(unknown)}; choose from {', '.join(_FLAVOR_NAMES)}",
+        )
+    return [_FLAVORS[name].name for name in names]
 
 
 class FlavorSelection:
     def __init__(self, names: list[str] | tuple[str, ...] | None = None):
         selected = [_FLAVORS[name] for name in names] if names else [_DEFAULT_FLAVOR]
-        self.items = tuple(sorted({flavor.name: flavor for flavor in selected}.values(), key=lambda flavor: (flavor.priority, flavor.name)))
-        owners: dict[str, Flavor] = {}
-        for flavor in self.items:
-            for group in flavor.exclusive_groups:
-                if previous := owners.get(group):
-                    raise ValueError(f"{previous.name} and {flavor.name} are mutually exclusive")
-                owners[group] = flavor
+        # Named order is kept, so a run directory reads the way the run was
+        # asked for. What a combination does is settled in priority order, so
+        # it never depends on how it was typed.
+        self.items = tuple({flavor.name: flavor for flavor in selected}.values())
+        self.settled = tuple(sorted(self.items, key=lambda flavor: (flavor.priority, flavor.name)))
+        self._reject_contradictions()
         self.policy = FlavorPolicy()
-        for flavor in self.items:
+        for flavor in self.settled:
             flavor.configure(self.policy)
+
+    def _reject_contradictions(self) -> None:
+        """Refuse a combination where one variant undoes another.
+
+        Two variants contradict when one adds an option the other drops in a
+        scope they share, which is what a run cannot carry both of. A variant
+        replacing its own option is not a contradiction.
+        """
+        for adder in self.items:
+            for dropper in self.items:
+                if adder is dropper:
+                    continue
+                clash = {
+                    flag
+                    for added in adder.edits
+                    for dropped in dropper.edits
+                    if _scopes_overlap(added.scope, dropped.scope)
+                    for flag in {_flag(option) for option in added.add} & set(dropped.drop)
+                }
+                if clash:
+                    raise ValueError(
+                        f"{adder.name} adds {', '.join(sorted(clash))}, which {dropper.name} drops",
+                    )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -1160,12 +1497,68 @@ class FlavorSelection:
 
     @property
     def tag(self) -> str:
+        """How the run named this combination, in the order it named it."""
         return "-".join(self.names)
 
+    @property
+    def settled_tag(self) -> str:
+        """One spelling per combination, whatever order it was named in.
+
+        A baseline, a report and a digest identify a configuration, so they
+        must not move when the same combination is typed another way.
+        """
+        return "-".join(flavor.name for flavor in self.settled)
+
+    @property
+    def table_keys(self) -> tuple[str, ...]:
+        """Names a per-flavor table is looked up by, most specific first.
+
+        A checkpoint variant mixed into a run changes the tag but not what the
+        run costs or where it belongs, so the execution mode answers for the
+        combinations no table names.
+        """
+        mode = next(
+            (flavor.name for flavor in self.settled if flavor.execution_mode),
+            self.items[0].name,
+        )
+        # A table names a combination, not the order it was typed in, so the
+        # settled spelling is looked up alongside the one the run named.
+        return tuple(dict.fromkeys((self.tag, self.settled_tag, mode)))
+
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
-        for flavor in self.items:
+        for flavor in self.settled:
             flavor.transform(opts, env)
 
+
+RunSpec = namedtuple("RunSpec", "name variants flavors")  # noqa: PYI024
+
+def _run_dir_name(spec: RunSpec) -> str:
+    """The directory one run writes to, inside the job's own directory.
+
+    The variants a run adds lead the name and the run's own name follows, so
+    two runs of one job read as what distinguishes them.
+    """
+    return f"{'-'.join(spec.variants)}.{spec.name}" if spec.variants else spec.name
+
+def _run_specs(args: argparse.Namespace) -> tuple[RunSpec, ...]:
+    """The runs this job performs, each with the variants it adds to the common set.
+
+    A run is a full two-phase training that records what its checkpoints
+    contain. Two runs differ by the variants they name, and the diff between
+    their digests is the comparison.
+    """
+    common = list(args.flavor or [])
+    specs = tuple(
+        RunSpec(name, tuple(variants), FlavorSelection(list(variants) + common))
+        for name, variants in (
+            (entry.partition(":")[0], _flavor_names(entry.partition(":")[2]))
+            for entry in (args.run or [""])
+        )
+    )
+    names = [spec.name for spec in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"--run names must be unique: {', '.join(names)}")
+    return specs
 
 def _selected_flavors(args: argparse.Namespace) -> FlavorSelection:
     if not isinstance(args.flavors, FlavorSelection):
@@ -1196,12 +1589,13 @@ def _model_config(name: str) -> dict:
 
 def _time_budget(config_name: str, flavors: FlavorSelection, use: str, default: int) -> int:
     table = (_model_config(config_name).get("job_time_in_mins") or {}).get(use) or {}
-    return int(table.get(flavors.tag, table.get("default", default)))
+    selected = next((table[key] for key in flavors.table_keys if key in table), table.get("default", default))
+    return int(selected)
 
 def _job_partition(config_name: str, flavors: FlavorSelection) -> str | None:
     table = (_model_config(config_name).get("job_partition") or {}).get(cluster_tag()) or {}
-    value = str(table.get(flavors.tag, table.get("default", ""))).strip()
-    return value or None
+    selected = next((table[key] for key in flavors.table_keys if key in table), table.get("default", ""))
+    return str(selected).strip() or None
 
 @dataclass
 class TrainConfig:
@@ -1251,7 +1645,6 @@ def _train_options(cfg: str, config: TrainConfig) -> list[str]:
         for key in ("async-save", "async-strategy", "use-persistent-ckpt-worker"):
             model.pop(key, None)
     checkpoint = {
-        "ckpt-provider": config.provider,
         "ckpt-format": "torch_dist",
         "ckpt-assume-constant-structure": True,
         "save": str(config.save),
@@ -1265,9 +1658,24 @@ def _train_options(cfg: str, config: TrainConfig) -> list[str]:
         path.mkdir(parents=True, exist_ok=True)
     return _flatten({**dynamic, **model, **checkpoint})
 
+def _sync_root() -> Path:
+    """Where ranks leave the files they hand off to each other through.
+
+    A rank per checkpoint per barrier is thousands of empty files, and they
+    are handshakes rather than results, so they stay out of the directory a
+    run's logs are read from. The launcher removes this directory once the
+    allocation it coordinated has exited.
+
+    A run directory holds them once one is configured. Before that they belong
+    under the results directory, which is a place the repository ignores.
+    """
+    root = (RUN_ROOT or RESULTS_DIR) / SYNC_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
 def _node_once(tag: str, action: Callable[[], None]) -> None:
     host = socket.gethostname().split(".")[0]
-    marker = RESULTS_DIR / f".{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}-{host}"
+    marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}-{host}"
     local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
     tasks_spec = (
         os.environ.get("SLURM_NTASKS_PER_NODE")
@@ -1296,7 +1704,7 @@ def _node_once(tag: str, action: Callable[[], None]) -> None:
             raise RuntimeError(f"node-local action {tag} failed")
 
 def _sync_ranks(tag: str) -> None:
-    marker = RESULTS_DIR / f".{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}"
+    marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}"
     rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
     world = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1335,34 +1743,48 @@ def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
         stopped.set()
         thread.join()
 
+def _extra_options(cfg: str, selected: list[str]) -> list[str]:
+    """Split option text, resolving the run-scoped cache directory in it."""
+    if not any(selected):
+        return []
+    cache = _run_dir(cfg) / "pg-tensors-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    return [
+        token
+        for text in selected
+        for token in shlex.split(
+            string.Template(text.replace("@PG_CACHE_DIR@", "$PG_CACHE_DIR")).safe_substitute(
+                PG_CACHE_DIR=cache.as_posix(),
+            ),
+        )
+    ]
+
 def _phase_command(
     cfg: str,
     args: argparse.Namespace,
     provider: str,
     phase: int,
     cycle: int = 0,
-    *,
-    async_checkpoint: bool = False,
 ) -> tuple[list[str], dict]:
     flavors = _selected_flavors(args)
     config = flavors.policy.train_config(cfg, args, provider, phase, cycle)
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
-    # Deterministic transforms disable async options for normal routines. Preserve
-    # a model's CPU-shm opt-in when the caller explicitly restores async checkpointing.
-    async_ckpt_use_cpu_shm = "--async-ckpt-use-cpu-shm" in opts
+    _toolchain(cfg, args).apply(env)
     flavors.transform(opts, env)
-    if async_checkpoint:
-        _set(opts, "--async-save")
-        _set(opts, "--async-strategy", "nvrx")
-        _set(opts, "--use-persistent-ckpt-worker")
-        if async_ckpt_use_cpu_shm:
-            _set(opts, "--async-ckpt-use-cpu-shm")
+    applied = flavors.policy.apply_options(opts, cfg, phase)
+    _print_flavor_options(flavors, phase, applied)
     expert = opts[opts.index("--expert-model-parallel-size") + 1]
     env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = expert
     if "--fine-grained-activation-offloading" in opts:
         env["NVTE_CPU_OFFLOAD_V1"] = "1"
     os.environ["NATIVE_CKPT_SERVER_LOG"] = env["NATIVE_CKPT_SERVER_LOG"]
     return ["python3", "-u", str(Path(__file__).resolve()), _PRETRAIN_ENTRY_CMD, str(phase), *opts, *args.extra_args], env
+def _print_flavor_options(flavors: FlavorSelection, phase: int, applied: list[str]) -> None:
+    """Record what the selected variants changed about this phase's command."""
+    if os.environ.get("SLURM_PROCID", "0") != "0" or not applied:
+        return
+    print(f"[slurm_job:flavor] {flavors.tag} phase{phase} {' '.join(applied)}", flush=True)  # noqa: T201
+
 def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
     if os.environ.get("SLURM_PROCID", "0") != "0":
         return
@@ -1370,18 +1792,12 @@ def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
     for name in sorted(_RUN_ENV_NAMES | _PRETRAIN_ENV_NAMES | _TRAIN_ENV_DEFAULTS.keys()):
         if name in env:
             print(f"[slurm_job:env] {name}={shlex.quote(env[name])}", flush=True)  # noqa: T201
-def _run_routine(
-    cfg: str,
-    args: argparse.Namespace,
-    provider: str,
-    label: str = "",
-    async_checkpoint: bool = False,
-) -> None:
+def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
     flavors = _selected_flavors(args)
-    stem = f"{platform_tag()}_{args.job}_{flavors.tag}_{cfg}"
+    stem = f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
     phase, cycle = 1, 0
     while phase == 1 or args.repeat == 0 or cycle < args.repeat:
-        cmd, env = _phase_command(cfg, args, provider, phase, cycle, async_checkpoint=async_checkpoint)
+        cmd, env = _phase_command(cfg, args, provider, phase, cycle)
         log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{os.environ.get('SLURM_PROCID', '0')}.log" if label else None
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
         if os.environ.get("SLURM_PROCID", "0") == "0":
@@ -1418,7 +1834,20 @@ def _run_routine(
         flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
 def _manifest(iter_dir: Path, baseline: Path | None = None) -> int:
-    env = {**os.environ, "TORCHINDUCTOR_WORKER_START": "fork", "TORCHINDUCTOR_COMPILE_THREADS": "1"}
+    """Record what one checkpoint holds, and diff it against a baseline if given.
+
+    Reading a checkpoint means importing what wrote it, so the tool is given
+    the Megatron-LM checkout rather than relying on it being importable
+    already. This package comes from the installed wheel: putting the checkout
+    on the path ahead of it makes the import build from source instead.
+    """
+    entries = [megatron_root().as_posix(), *os.environ.get("PYTHONPATH", "").split(":")]
+    env = {
+        **os.environ,
+        "PYTHONPATH": ":".join(dict.fromkeys(entry for entry in entries if entry)),
+        "TORCHINDUCTOR_WORKER_START": "fork",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    }
     return subprocess.run(
         [
             sys.executable,
@@ -1461,8 +1890,8 @@ def _manifest_batch(  # noqa: C901
     if is_node_leader and iterations:
         mine = [c for i, c in enumerate(iterations) if i % args.nodes == node_index]
         if mine:
-            done_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_index}.done"
-            fail_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_index}.failed"
+            done_f = _sync_root() / f"{job_id}-{tag}-node{node_index}.done"
+            fail_f = _sync_root() / f"{job_id}-{tag}-node{node_index}.failed"
             try:
                 for group, iter_dir in mine:
                     baseline = (baseline_root / group / iter_dir.name) if baseline_root else None
@@ -1484,69 +1913,259 @@ def _manifest_batch(  # noqa: C901
         assigned = [c for i, c in enumerate(iterations) if i % args.nodes == node_idx]
         if not assigned:
             continue
-        done_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_idx}.done"
-        fail_f = RESULTS_DIR / f".{job_id}-{tag}-node{node_idx}.failed"
+        done_f = _sync_root() / f"{job_id}-{tag}-node{node_idx}.done"
+        fail_f = _sync_root() / f"{job_id}-{tag}-node{node_idx}.failed"
         if fail_f.exists() or not done_f.exists():
             failures.extend(str(c[1]) for c in assigned)
     return sorted(failures)
 
-def _reference_check(  # noqa: C901
-    cfg: str, args: argparse.Namespace, provider: str, *, async_reference: bool = False,
-) -> None:
-    run, reference = _run_dir(cfg), _run_dir(cfg) / "reference-run"
-    ready, failed = run / "reference.ready", run / "reference.failed"
-    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
-    rank0 = rank == 0
+# Everything a checkpoint records about itself: the per-chunk tensor manifest
+# and the dump of the common state beside it, both `key=value` text.
+_MANIFESTS = (("tensor", "reference.metadata.info"), ("common", "common_pt_dump.info"))
 
-    if rank0:
-        shutil.rmtree(reference, ignore_errors=True)
-        ready.unlink(missing_ok=True)
-        failed.unlink(missing_ok=True)
+def _write_checkpoint_digest(run: Path, stem: str, baseline_for: Callable[[str, str], Path] | None = None) -> None:
+    """Write everything this run's checkpoints recorded, and how it compares.
 
-    _run_routine(cfg, args, "nvrx", "reference", async_checkpoint=async_reference)
+    The digest lists one ``<group>/<iter> <source>/<key>=<value>`` line per
+    entry, sorted, so the digests of two runs diff directly and a run needs no
+    second routine beside it to be comparable. It is compressed because a
+    manifest of every tensor runs to tens of megabytes. The summary beside it
+    stays plain text: it counts what each checkpoint holds, which is what a
+    reader needs before deciding whether to open the digest at all.
+    """
+    lines, summary = [], []
+    for group in ("phase1-checkpoints", "checkpoints"):
+        for iteration in sorted((run / group).glob("iter_*")):
+            produced = _checkpoint_entries(iteration, run)
+            if produced is None:
+                continue
+            label = f"{group}/{iteration.name}"
+            lines += [f"{label} {key}={value}\n" for key, value in sorted(produced.items())]
+            recorded = _checkpoint_entries(baseline_for(group, iteration.name)) if baseline_for else None
+            if recorded is None:
+                summary.append(f"{label}: entries={len(produced)}")
+                continue
+            summary.append(f"{label}: entries={len(produced)} {_compare_entries(produced, recorded)}")
+    if not lines:
+        return
+    (RESULTS_DIR / f"{stem}_checkpoint_summary.log").write_text("\n".join(summary) + "\n")
+    with lzma.open(RESULTS_DIR / f"{stem}_checkpoint_digest.xz", "wt") as digest:
+        digest.writelines(lines)
+    for line in summary:
+        logger.info(f"[slurm_job:digest] {stem} {line}")
 
-    ref_iters = [
-        (group, iter_dir)
+def _compare_entries(produced: dict[str, str], recorded: dict[str, str]) -> str:
+    """Count how one checkpoint's entries differ from what it is compared against.
+
+    A recorded baseline holds the tensor manifest alone, so only the sources
+    both sides recorded are counted; a source one side never wrote is reported
+    as unrecorded rather than as every one of its entries going missing.
+    """
+    sources = {key.partition("/")[0] for key in recorded}
+    scoped = {key: value for key, value in produced.items() if key.partition("/")[0] in sources}
+    missing = sum(key not in scoped for key in recorded)
+    extra = sum(key not in recorded for key in scoped)
+    changed = sum(scoped[key] != recorded[key] for key in scoped.keys() & recorded.keys())
+    unrecorded = sorted({key.partition("/")[0] for key in produced} - sources)
+    counted = f"baseline={len(recorded)} missing={missing} extra={extra} changed={changed}"
+    return f"{counted} unrecorded={','.join(unrecorded)}" if unrecorded else counted
+
+# Recorded state that names where a run ran rather than what it computed. Runs
+# keep their own directories and name their own provider, so comparing these
+# would report every pair of runs as different.
+_RUN_SCOPED_KEYS = frozenset({"common/args.ckpt_provider"})
+
+_CHUNK_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<index>\d+)\.(?P<field>[a-z0-9_]+)$")
+
+def _by_chunk_identity(entries: dict[str, str]) -> dict[str, str]:
+    """Key each chunk by where it sits in the tensor, not by where it was listed.
+
+    Two writers may enumerate or replicate the same chunks in their own orders,
+    which is not a difference in what they wrote. Keying by the offsets a chunk
+    covers compares like with like; a chunk one side never wrote is still
+    absent from the other.
+    """
+    offsets = {
+        (m["fqn"], m["index"]): value
+        for key, value in entries.items()
+        if (m := _CHUNK_RE.match(key)) and m["field"] == "offsets"
+    }
+    rekeyed = {}
+    for key, value in entries.items():
+        match = _CHUNK_RE.match(key)
+        where = offsets.get((match["fqn"], match["index"])) if match else None
+        rekeyed[f"{match['fqn']}.chunk{where}.{match['field']}" if where else key] = value
+    return rekeyed
+
+def _checkpoint_entries(path: Path, run: Path | None = None) -> dict[str, str] | None:
+    """Read everything one checkpoint recorded, keyed by the source that holds it."""
+    entries: dict[str, str] = {}
+    for source, name in _MANIFESTS:
+        text = _manifest_text(path / name)
+        if text is None:
+            continue
+        entries.update(
+            (f"{source}/{key}", value)
+            for key, value in _by_chunk_identity(
+                {
+                    key: value
+                    for key, _, value in (line.partition("=") for line in text.splitlines() if "=" in line)
+                },
+            ).items()
+        )
+    located = run.as_posix() if run else None
+    return {
+        key: value
+        for key, value in entries.items()
+        if key not in _RUN_SCOPED_KEYS and not (located and located in value)
+    } or None
+
+def _manifest_text(path: Path) -> str | None:
+    """Read one manifest, or the compressed form a recorded baseline keeps."""
+    compressed = path.with_suffix(f"{path.suffix}.xz")
+    if path.is_file():
+        return path.read_text(errors="replace")
+    if compressed.is_file():
+        with lzma.open(compressed, "rt", errors="replace") as handle:
+            return handle.read()
+    return None
+
+def _report_comparison(run: Path, baseline_for: Callable[[str, str], Path], stem: str = "run") -> None:
+    """Diff every checkpoint the measured routine wrote against its baseline."""
+    _write_checkpoint_digest(run, f"{stem}_compare", baseline_for)
+    failures = [
+        str(iteration)
         for group in ("phase1-checkpoints", "checkpoints")
-        for iter_dir in sorted((run / group).glob("iter_*"))
+        for iteration in sorted((run / group).glob("iter_*"))
+        if _manifest(iteration, baseline_for(group, iteration.name))
     ]
+    if failures:
+        raise RuntimeError(f"reference check failed: {', '.join(failures)}")
 
-    ref_failures = _manifest_batch("ref-manifest", ref_iters, None, reference, args)
+@contextlib.contextmanager
+def _in_run(spec: RunSpec, args: argparse.Namespace) -> Generator[None, None, None]:
+    """Point the run-scoped paths and variants at one run for its duration."""
+    global RESULTS_DIR, RUN_ROOT  # noqa: PLW0603
+    previous = (RUN_ROOT, RESULTS_DIR, args.flavors)
+    args.flavors = spec.flavors
+    # A run writes inside the job that owns it, in a directory named for the
+    # variants it adds, so the job directory holds the whole comparison and
+    # one path says which side of it this is.
+    if spec.name:
+        RUN_ROOT = previous[0] / _run_dir_name(spec)
+        RESULTS_DIR = RUN_ROOT / "logs"
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["SLURMJOB_OPT_RUN_DIR"] = str(RUN_ROOT)
+    os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / "checkpoint_server.%h.%p.log")
+    try:
+        yield
+    finally:
+        RUN_ROOT, RESULTS_DIR, args.flavors = previous
 
-    if ref_failures:
-        if rank0:
-            failed.touch()
-        raise RuntimeError(f"manifest derivation failed: {', '.join(ref_failures)}")
 
+def _perform_runs(cfg: str, args: argparse.Namespace) -> None:
+    """Train every run this job names, then compare what they wrote.
+
+    Each run is independent: its own variants, its own directory, its own
+    digest. Nothing one run writes is read by another, so the comparison is a
+    diff of digests rather than a second routine checking the first.
+    """
+    rank0 = os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")) == "0"
+    specs, digests = _run_specs(args), []
+    comparable = len(specs) > 1 or args.baseline is not None or any(
+        spec.flavors.policy.compares_routines for spec in specs
+    )
+    for spec in specs:
+        with _in_run(spec, args):
+            flavors = spec.flavors
+            if rank0:
+                logger.info(f"[slurm_job:run] {spec.name or 'run'} {flavors.tag} "
+                            f"{_toolchain(cfg, args).describe('sources')}")
+            # Naming the routine keeps every rank's output in a per-rank file
+            # and mirrors only rank 0 into the job trace. Without it 256 ranks
+            # write straight to the trace and bury the run in its own logs.
+            flavors.policy.run_worker(cfg, args, _provider(flavors), spec.name or "run")
+            run = _run_dir(cfg)
+            # Recording what a checkpoint holds costs a pass over every tensor,
+            # which only earns its place when something will read it: another
+            # run to diff against, a baseline to diff against, or a flavor whose
+            # whole purpose is the comparison.
+            iterations = [
+                (group, iter_dir)
+                for group in ("phase1-checkpoints", "checkpoints")
+                for iter_dir in sorted((run / group).glob("iter_*"))
+            ] if comparable else []
+            # Node leaders share the manifest work, so a run's digest costs the
+            # same whether it wrote four checkpoints or sixty-four.
+            if failures := _manifest_batch(f"{spec.name or 'run'}-manifest", iterations, None, None, args):
+                raise RuntimeError(f"manifest derivation failed: {', '.join(failures)}")
+            if not rank0 or not comparable:
+                continue
+            stem = _identity(args)[2]
+            _write_checkpoint_digest(run, stem)
+            digests.append(RESULTS_DIR / f"{stem}_checkpoint_digest.xz")
     if rank0:
-        try:
-            for group, iter_dir in ref_iters:
-                target = reference / group / iter_dir.name
-                for name in ("reference.metadata.info", "common_pt_dump.info"):
-                    if not (target / name).exists():
-                        raise RuntimeError(f"missing reference file: {target / name}")  # noqa: TRY301
-            for group in ("phase1-checkpoints", "checkpoints"):
-                shutil.rmtree(run / group)
-            ready.touch()
-        except BaseException:
-            failed.touch()
-            raise
-    else:
-        wait_for_file(run / "reference.*", 7200)
-        if failed.exists():
-            raise RuntimeError("reference routine failed")
+        _compare_runs(args, specs, digests)
 
-    _run_routine(cfg, args, provider, f"measured-{provider}")
 
-    meas_iters = [
-        (group, iter_dir)
-        for group in ("phase1-checkpoints", "checkpoints")
-        for iter_dir in sorted((run / group).glob("iter_*"))
+def _compare_runs(args: argparse.Namespace, specs: tuple[RunSpec, ...], digests: list[Path]) -> None:
+    """Diff every run against the baseline, which is the first run by default.
+
+    A single run with nothing named to compare against has nothing to diff, so
+    it records its digest and stops.
+    """
+    baseline = _baseline_digest(args.baseline) if args.baseline else None
+    if baseline is None and len(digests) < 2:
+        return
+    against = baseline or digests[0]
+    failures = [
+        spec.name or "run"
+        for spec, digest in zip(specs, digests, strict=True)
+        if digest != against and _digest_differences(against, digest)
     ]
+    if failures:
+        raise RuntimeError(f"checkpoints differ from {against.name}: {', '.join(failures)}")
 
-    compare_failures = _manifest_batch("meas-manifest", meas_iters, reference, None, args)
-    if compare_failures:
-        raise RuntimeError(f"reference check failed: {', '.join(compare_failures)}")
+
+def _baseline_digest(path: Path) -> Path:
+    """Resolve a baseline to the digest it holds, given either the file or its run."""
+    if path.is_file():
+        return path
+    found = sorted(path.glob("**/*_checkpoint_digest.xz"))
+    if not found:
+        raise SystemExit(f"no checkpoint digest under {path}")
+    return found[0]
+
+
+def _print_source_provenance() -> None:
+    """Record the Megatron-LM and NVIDIA Resiliency Extension this phase loaded.
+
+    Each routine of a cross-source comparison selects its own checkouts through
+    ``MEGATRON_ROOT`` and ``PYTHONPATH``. Resolving them from inside the
+    training process, after every import has bound, is what makes a comparison
+    self-evidencing: the log names the revisions that ran rather than the ones
+    that were requested.
+    """
+    root = megatron_root()
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    print(f"[native_ckpt:sources] megatron={root}@{revision or 'unknown'}", flush=True)  # noqa: T201
+    try:
+        import nvidia_resiliency_ext  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    except ImportError:
+        # pretrain-native's perf flavor verifies the provider works with the
+        # extension uninstalled, so its absence is a result, not a failure.
+        print("[native_ckpt:sources] nvidia_resiliency_ext=absent", flush=True)  # noqa: T201
+        return
+    try:
+        version = importlib.metadata.version(_NVRX_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+    print(f"[native_ckpt:sources] nvidia_resiliency_ext={nvidia_resiliency_ext.__file__}@{version}", flush=True)  # noqa: T201
 
 def _pretrain_entry(phase: int) -> None:
     sys_path_insert(megatron_root())
@@ -1579,6 +2198,7 @@ def _pretrain_entry(phase: int) -> None:
     rank0 = os.environ.get("RANK", "0") == "0"
     if rank0:
         print(f"[native_ckpt:phase] phase={phase}", flush=True)  # noqa: T201
+        _print_source_provenance()
     start = time.time()
     set_startup_timestamps(program_start=start, main_entry=start)
     ph.train_valid_test_datasets_provider.is_distributed = True
@@ -1609,8 +2229,8 @@ def _pretrain_entry(phase: int) -> None:
             )
 
 def _worker(args: argparse.Namespace) -> None:
-    provider = args.job.split("-", 1)[1]
     flavors = _selected_flavors(args)
+    provider = _provider(flavors)
     if provider == "native" and flavors.policy.requires_nvrx_absent:
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
@@ -1618,7 +2238,7 @@ def _worker(args: argparse.Namespace) -> None:
         sys_path_insert(target)
     CHECKPOINT_SERVER.require_stopped()
     try:
-        flavors.policy.run_worker(cfg, args, provider)
+        _perform_runs(cfg, args)
     except BaseException:
         local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
         if flavors.policy.manages_native_server and provider == "native" and local_rank == 0:
@@ -1627,9 +2247,10 @@ def _worker(args: argparse.Namespace) -> None:
         raise
 
 def _identity(args: argparse.Namespace) -> tuple[str, str, str]:
+    """The profile, the combination and the stem a run reports under."""
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    flavor = _selected_flavors(args).tag
-    return cfg, flavor, f"{platform_tag()}_{args.job}_{flavor}_{cfg}"
+    flavors = _selected_flavors(args)
+    return cfg, flavors.tag, f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
 
 def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     flavors = _selected_flavors(args)
@@ -1638,7 +2259,7 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     minutes = args.time_minutes or _time_budget(args.config, flavors, "srun", 30)
     partition = _job_partition(args.config, flavors)
     work_minutes = minutes - _CLEANUP_GRACE_MINUTES
-    job_name = RUN_NAME or f"{args.job}_{flavor}_{cfg}"
+    job_name = RUN_NAME or f"{flavor}_{cfg}"
     image, total_tasks = str(image_path()), args.nodes * args.gpus_per_node
     common = {
         "job_name": job_name,
@@ -1653,20 +2274,18 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
             extra_srun_args=["--container-writable"] if writable else None, **common,
         )
     prep_log = RESULTS_DIR / f"{stem}_prep.log"
-    prep_commands = [
-        ["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")],
-        [
-            "python3", "-u", str(Path(wheel_install.__file__).resolve()),
-            *flavors.policy.prep_args(),
-        ],
-    ]
-    cfg_target = _nvrx_target(cfg, args.nvrx_commit)
-    if cfg_target:
+    toolchain = _toolchain(cfg, args)
+    prep_commands = [["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")]]
+    prep_commands.append([
+        "python3", "-u", str(Path(wheel_install.__file__).resolve()),
+        *flavors.policy.prep_args(),
+    ])
+    if toolchain.nvrx_target:
         prep_commands.append([
             "python3", "-u", str(SCRIPT_DIR / "install_run_dependency.py"),
             "--repo-url", args.nvrx_repo_url,
             *(("--commit", args.nvrx_commit) if args.nvrx_commit else ()),
-            "--target", str(cfg_target),
+            "--target", str(toolchain.nvrx_target),
             *(("--repo-root", str(nvrx_repo_root())) if nvrx_repo_root() else ()),
         ])
     prep_commands.append(["python3", "-m", "pip", "list"])
@@ -1674,13 +2293,14 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     prep = [*step(1, 1, ",".join(_env_names("p")), prep_log, writable=True),
             "/bin/bash", "-c", " && ".join(shell_join(command) for command in prep_commands)]
     worker_args = [
-        args.job, "--nodes", str(args.nodes), "--gpus-per-node", str(args.gpus_per_node), "--config", args.config,
-        *(token for name in flavors.names for token in ("--flavor", name)),
+        "--nodes", str(args.nodes), "--gpus-per-node", str(args.gpus_per_node), "--config", args.config,
+        "--flavor", "+".join(flavors.names),
+        *(token for entry in (args.run or []) for token in ("--run", entry)),
     ]
     epilog_args = [*worker_args]
     worker_args.extend(args.extra_args)
     container_env = ",".join(_env_names("w"))
-    native_perf_verification = args.job == "pretrain-native" and flavors.policy.requires_nvrx_absent
+    native_perf_verification = _provider(flavors) == "native" and flavors.policy.requires_nvrx_absent
     run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification),
            "python3", "-u", str(Path(__file__).resolve()), *worker_args]
     epilog = [
@@ -1754,15 +2374,27 @@ _url = partial(_validated, convert=str, valid=lambda value: not re.match(r"https
 RunOption = namedtuple("RunOption", "env default convert action choices scopes", defaults=(None, str, None, (), "r"))  # noqa: PYI024
 _CONFIGS = tuple(sorted(path.stem for path in CONFIGS_DIR.glob("*.yaml") if path.stem != "base"))
 _RUN_OPTIONS = {
+    # The hardware, the cluster and the account to charge. Each keeps its
+    # environment name, so a shell that already exports it needs no argument.
+    "platform": RunOption("PLATFORM", scopes="rspw"),
+    "cluster": RunOption("CLUSTER", scopes="rspw"),
+    "slurm_account": RunOption("SLURM_ACCOUNT", scopes="rsp"),
     "nodes": RunOption("SLURMJOB_OPT_NODES", 1, _positive_int),
     "config": RunOption("SLURMJOB_OPT_CONFIG", "pico", choices=_CONFIGS),
     "gpus_per_node": RunOption("GPUS_PER_NODE", None, _positive_int),
-    "flavor": RunOption("SLURMJOB_OPT_FLAVOR", choices=tuple(sorted(_FLAVORS)), action="append"),
+    # Variants every run carries, joined by '+' or given one option at a time.
+    "flavor": RunOption("SLURMJOB_OPT_FLAVOR", convert=_flavor_names, action="extend"),
+    # A run this job performs, as <name> or <name>:<variants>. Repeat for more
+    # than one; without any, the job performs a single unnamed run.
+    "run": RunOption("SLURMJOB_OPT_RUN", convert=_run_entry, action="extend", scopes="rw"),
+    # Digest, or run directory holding one, every run is compared against. The
+    # first run is the baseline when this names nothing.
+    "baseline": RunOption("SLURMJOB_OPT_BASELINE", convert=_path, scopes="rw"),
     "name": RunOption("SLURMJOB_OPT_RUN_NAME", scopes="rspw"),
     "work_dir": RunOption("SLURMJOB_OPT_WORK_DIR", convert=_path, scopes="rspw"),
     "image": RunOption("ENROOT_IMAGE", convert=Path, scopes="rsw"),
-    "megatron_commit": RunOption("MEGATRON_COMMIT", "77c87725e71c9f5022ac289071b16941876ca858", _commit, scopes="rspw"),
-    "megatron_repo_url": RunOption("MEGATRON_REPO_URL", "https://github.com/NVIDIA/Megatron-LM.git", _url, scopes="rspw"),
+    "megatron_commit": RunOption("MEGATRON_COMMIT", DEFAULT_MEGATRON_COMMIT, _commit, scopes="rspw"),
+    "megatron_repo_url": RunOption("MEGATRON_REPO_URL", DEFAULT_MEGATRON_REPO_URL, _url, scopes="rspw"),
     "nvrx_commit": RunOption("NVRX_COMMIT", convert=_commit, scopes="rsw"),
     "nvrx_repo_url": RunOption("NVRX_REPO_URL", DEFAULT_NVRX_REPO_URL, _url, scopes="rsw"),
     "checkpoints_per_run": RunOption("SLURMJOB_OPT_CHECKPOINTS_PER_RUN", convert=_nonnegative_int, scopes="rw"),
@@ -1777,10 +2409,10 @@ _ENV_SCOPES = {
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
-    "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURM_ACCOUNT": "rs", "PYTHONPATH": "rpw",
+    "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",
+    "PYTHONPATH": "rpw",
     "CI_API_V4_URL": "rp", "CI_COMMIT_SHA": "rp", "CI_PROJECT_ID": "rp", "WHEEL_ARCH": "rp", "CI_JOB_TOKEN": "p",
-    "CI_DIR": "r", "CLUSTER": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r",
-    "PATH": "r", "PLATFORM": "r",
+    "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
 }
@@ -1805,10 +2437,11 @@ def _parser() -> argparse.ArgumentParser:
     --clean-run --repeat 0 --time-minutes 240 --background
 """,
     )
-    parser.add_argument("job", choices=["pretrain-native", "pretrain-nvrx"])
     for dest, option in _RUN_OPTIONS.items():
         kwargs: dict[str, object] = {"dest": dest, "default": argparse.SUPPRESS}
         kwargs["action" if option.action else "type"] = option.action or option.convert
+        if option.action == "extend":
+            kwargs["type"] = option.convert
         if option.choices:
             kwargs["choices"] = option.choices
         parser.add_argument("--" + dest.replace("_", "-"), **kwargs)
@@ -1820,13 +2453,17 @@ def _parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) 
         if hasattr(args, dest):
             continue
         raw = os.environ.get(option.env)
+        multi = option.action in ("append", "extend")
         values = raw.split(",") if raw and option.action == "append" else [raw]
         try:
             converted = [option.convert(value.strip()) for value in values if value and value.strip()]
         except (argparse.ArgumentTypeError, TypeError, ValueError) as error:
             parser.error(f"{option.env} has invalid value: {error}")
-        value = converted if option.action == "append" and converted else converted[0] if converted else option.default
-        if option.choices and any(item not in option.choices for item in ((value or []) if option.action == "append" else [value])):
+        if option.action == "extend":
+            converted = [item for group in converted for item in group]
+        value = converted if multi and converted else converted[0] if converted else option.default
+        candidates = (value or []) if multi else ([] if value is None else [value])
+        if option.choices and any(item not in option.choices for item in candidates):
             parser.error(f"{option.env} must be one of: {', '.join(option.choices)}")
         setattr(args, dest, value)
     return args, extra
@@ -1838,12 +2475,15 @@ def _epilog(argv: list[str]) -> None:
     parser.add_argument("--baseline-json", required=True)
     args, _extra = _parse_args(parser, argv)
     args.flavors = FlavorSelection(args.flavor)
+    _selected_flavors(args)
     args.baseline = json.loads(args.baseline_json)
     text = args.log_file.read_text(errors="replace")
     saves = _SAVE_RE.findall(text)
     phase1 = sum("/phase1-checkpoints" in path for path in saves)
     phase2 = sum("/checkpoints" in path and "/phase1-checkpoints" not in path for path in saves)
-    routines = args.flavors.policy.checkpoint_routines
+    # A recorded baseline stands in for the reference routine, so only the
+    # compare routine writes checkpoints.
+    routines = len(args.run or [""])
     expected_phase1 = routines
     expected_phase2 = args.flavors.policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
     expected_phase2 *= (args.repeat or 1) * routines
@@ -1859,18 +2499,55 @@ def _epilog(argv: list[str]) -> None:
         )
     passed = args.flavors.policy.epilog(args, args.log_file)
     _write_baseline_artifacts(args, args.log_file)
+    # The arguments a run trained on are part of what its result means, so they
+    # are compared with the same standing as the numbers it produced.
+    passed = _compare_arguments(args, args.log_file) and passed
     if not passed:
         raise SystemExit(SOFT_FAIL_RC)
 
+# Options that named a second toolchain for one run to hold. Unrecognized
+# options reach Megatron, so naming one here fails on the launcher rather than
+# in phase 1 with an allocation already held.
+_RETIRED_OPTIONS = {
+    f"--{dependency}-{field}-compare" for dependency in ("megatron", "nvrx") for field in ("commit", "repo-url")
+}
+
+def _validate_comparison_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject comparison settings that cannot hold, before the allocation."""
+    if retired := sorted(_RETIRED_OPTIONS.intersection(args.extra_args)):
+        parser.error(
+            f"{', '.join(retired)}: a run trains on one toolchain. Run it once per toolchain and compare the "
+            "digests with --diff-digests.",
+        )
+    if args.baseline and not args.baseline.exists():
+        parser.error(f"--baseline {args.baseline} does not exist")
+
+def _export_settings(args: argparse.Namespace) -> None:
+    """Publish the settings the rest of the run reads from the environment.
+
+    The hardware, the cluster and the account are read wherever they are
+    needed rather than threaded through, so an argument for one has to reach
+    the environment before anything asks.
+    """
+    for dest in ("platform", "cluster", "slurm_account"):
+        if value := getattr(args, dest, None):
+            os.environ[_RUN_OPTIONS[dest].env] = str(value)
+
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.gpus_per_node is None:
-        parser.error("--gpus-per-node or GPUS_PER_NODE is required")
+        args.gpus_per_node = platform_gpus_per_node()
+    if args.gpus_per_node is None:
+        parser.error(
+            "--gpus-per-node or GPUS_PER_NODE is required; PLATFORM names it for "
+            f"{', '.join(sorted(e['name'] for e in json.loads(JOBS_FILE.read_text())['platforms']))}",
+        )
     if args.time_minutes is not None and args.time_minutes <= _CLEANUP_GRACE_MINUTES:
         parser.error(f"--time-minutes must exceed the {_CLEANUP_GRACE_MINUTES}-minute cleanup reserve")
     if args.checkpoints_per_run == 0 and args.repeat != 1:
         parser.error("an unlimited checkpoint run cannot be repeated because it does not return")
     if args.flavors.policy.requires_finite_run and (args.checkpoints_per_run == 0 or args.repeat == 0):
         parser.error("the selected flavor requires finite checkpoint and repeat counts")
+    _validate_comparison_options(parser, args)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -1880,6 +2557,8 @@ def main() -> None:
         args.flavors = FlavorSelection(args.flavor)
     except ValueError as error:
         parser.error(str(error))
+    _selected_flavors(args)
+    _export_settings(args)
     _validate_args(parser, args)
     _configure_run(args)
     ensure_vcpkg_root()
@@ -1898,9 +2577,64 @@ def main() -> None:
         background=args.background,
         dry_run=args.dry_run,
     )
+    if not args.background and not args.dry_run:
+        _drop_sync_files()
     if rc == SOFT_FAIL_RC:
         raise SystemExit(rc)
+def _drop_sync_files() -> None:
+    """Remove what the ranks coordinated through, now that they have exited.
+
+    A backgrounded job is still running when the launcher returns, so its
+    handshakes are left for the next run of the same job to clear.
+    """
+    for path in sorted(RUN_ROOT.glob(f"**/{SYNC_DIR_NAME}")):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+def _digest_differences(left: Path, right: Path) -> int:
+    """Count how the checkpoints two digests describe differ, reporting each."""
+    sides = [_digest_entries(path) for path in (left, right)]
+    differences = 0
+    for label in sorted(sides[0].keys() | sides[1].keys()):
+        produced, recorded = sides[1].get(label), sides[0].get(label)
+        if produced is None or recorded is None:
+            logger.info(f"[slurm_job:diff] {label}: only in {(left if recorded else right).name}")
+            differences += 1
+            continue
+        counts = _compare_entries(produced, recorded)
+        logger.info(f"[slurm_job:diff] {label}: entries={len(produced)} {counts}")
+        differences += sum(
+            int(field.split("=")[1])
+            for field in counts.split()
+            if field.startswith(("missing", "extra", "changed"))
+        )
+    return differences
+
+def _diff_digests(left: Path, right: Path) -> None:
+    """Report how two runs' checkpoints differ, from their digests alone.
+
+    Each digest names the run that wrote it, so a comparison needs neither run
+    to still exist and neither to have been configured against the other.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    differences = _digest_differences(left, right)
+    logger.info(f"[slurm_job:diff] {'PASS: 0 differences' if not differences else f'FAIL: {differences} differences'}")
+    raise SystemExit(1 if differences else 0)
+
+def _digest_entries(path: Path) -> dict[str, dict[str, str]]:
+    """Read one digest back into per-checkpoint entries."""
+    opener = lzma.open if path.suffix == ".xz" else open
+    entries: dict[str, dict[str, str]] = {}
+    with opener(path, "rt", errors="replace") as handle:  # type: ignore[operator]
+        for line in handle:
+            label, _, entry = line.rstrip("\n").partition(" ")
+            key, _, value = entry.partition("=")
+            if key:
+                entries.setdefault(label, {})[key] = value
+    return entries
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--diff-digests":
+        _diff_digests(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) > 1 and sys.argv[1] == _PRETRAIN_ENTRY_CMD:
         phase = int(sys.argv.pop(2))
         sys.argv = ["pretrain_hybrid.py", *sys.argv[2:]]

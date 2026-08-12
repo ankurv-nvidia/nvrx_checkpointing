@@ -123,6 +123,10 @@ train-samples: 51200
 # CI job time budgets (minutes). Each use-case maps the job's sorted flavor chain
 # (with a "default" fallback) to its budget; profiles override entries through the
 # usual deep merge.
+# Overridden by the nvrx / native flavors; a run naming neither writes
+# through the extension.
+ckpt-provider: nvrx
+
 job_time_in_mins:
   # srun --time ceiling — jobs finish early — sized for the heaviest scale that
   # runs the flavor (the first Triton compile can take close to an hour; the
@@ -130,11 +134,11 @@ job_time_in_mins:
   srun:
     default: 30
     perf: 120
-    deterministic: 180
-    deterministic-valgrind: 180
+    detr: 180
+    detr-vg: 180
   # Budget for the phase-1 checkpoint to become durable before phase 2 loads it.
   # Memcheck serializes the server's fragment pipeline ~30x, so the valgrind
   # flavor legitimately needs most of an hour.
   phase1-flush:
     default: 30
-    deterministic-valgrind: 60
+    detr-vg: 60

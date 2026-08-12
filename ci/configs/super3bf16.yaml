@@ -1,6 +1,25 @@
 # Explicit BF16 precision profile for the shared Super3 architecture.
 inherits: super3
 
+# Keep optimizer state in BF16 so the 88-layer model retains enough HBM for
+# the fused cross-entropy temporary, as the NVFP4 profile of the same
+# architecture already does. Without it the deterministic gate exhausts the
+# device at sixteen nodes.
+use-precision-aware-optimizer: true
+main-grads-dtype: bf16
+exp-avg-dtype: bf16
+exp-avg-sq-dtype: bf16
+grad-reduce-in-bf16: true
+
+# Recompute the MoE block rather than holding it. The deterministic gate
+# spends its device memory on unfused attention and an FP64 router, and the
+# experts are distributed unevenly, so the rank holding the most of them
+# reaches the 184 GiB device during the backward pass while rank 0 sits at
+# 115.56. Recomputing the activations alone leaves that rank 11.79 GiB short.
+# The measured run drops this again for graph capture.
+recompute-granularity: selective
+recompute-modules: moe
+
 # Mamba + attention + MoE-router capture consumes 32.77 GiB of private graph
 # pools on GB200, and attention + router still leaves 17.54 GiB. Preserve the
 # proven attention capture while keeping Mamba and the MoE router eager.

@@ -84,7 +84,7 @@ allocated node.
 Foreground submission waits and streams the training log:
 
 ```bash
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config ultra3fp8 \
   --nodes 64 \
   --name ultra3-64n
@@ -94,7 +94,7 @@ Background submission returns as soon as `sbatch` accepts the exclusive
 allocation:
 
 ```bash
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config ultra3fp8 \
   --nodes 128 \
   --name ultra3-128n \
@@ -106,7 +106,7 @@ command line:
 
 ```bash
 SLURMJOB_OPT_RUN_NAME=ultra3-256n SLURMJOB_OPT_BACKGROUND=1 \
-  python3 ci/scripts/slurm_job.py pretrain-native \
+  python3 ci/scripts/slurm_job.py \
     --config ultra3fp8 \
     --nodes 256
 ```
@@ -114,27 +114,50 @@ SLURMJOB_OPT_RUN_NAME=ultra3-256n SLURMJOB_OPT_BACKGROUND=1 \
 When no name is supplied, the launcher generates:
 
 ```text
-[{gitlab_pipeline_jobid}_]{job_name}_{config}_{nodes}n_mlm.{mlm_abbreviated_sha_commit}_nvrx.{nvrx_abbreviated_sha_commit}_nckpt.{native_checkpointing_abbreviated_sha_commit}
+[{gitlab_pipeline_jobid}_][{run}.]{config}_{nodes}n-{flavors}{sources}
 ```
 
 The bracketed prefix is included only when GitLab supplies `CI_JOB_ID`. It
 gives every job and retry its own run directory. Manual runs omit it without
 leaving a leading underscore.
-For example, a run may be named
-`pretrain-native_perf_nano3_4n_mlm.7b7eef9a_nvrx.ae97937a_nckpt.5e674dbd`.
-`job_name` includes the selected flavor so concurrent performance,
-deterministic, and valgrind jobs do not share a directory.
+
+`{sources}` names only what the run was told to deviate on: `-mlm-<sha>` when a
+Megatron-LM commit is given other than the pinned one, and `-nvrx-<sha>` when a
+commit is given for the extension instead of the one in the image. A run on the
+pinned sources says nothing, so `--config nano3 --nodes 8 --flavor detr` writes
+to `nano3_8n-detr`, and the same run on a candidate extension writes to
+`nano3_8n-detr-nvrx-c2b970d3`.
+
+A job that names its runs holds them inside its own directory, each named for
+the variants it adds and the name it was given, so
+`--flavor detr --run=ref:nvrx --run=cmp:native` writes:
+
+```
+nano3_8n-detr/nvrx.ref
+nano3_8n-detr/native.cmp
+```
+
+Under GitLab the job's id leads the directory holding them, so a retry keeps
+its own copy of the whole comparison. Each run directory holds that run's
+logs, checkpoints and digest, and `--clean-run` removes the job directory with
+every run inside it.
+
+Ranks coordinate through empty files, one per rank per barrier. Those are
+handshakes rather than results, so they sit in a `.sync` directory of the run
+rather than beside its logs, and the launcher removes them once the allocation
+has exited. A backgrounded job is still running when the launcher returns, so
+its handshakes are cleared by the next run of the same job instead.
+
 An explicit `--name` or `SLURMJOB_OPT_RUN_NAME` may use any of the fields in the
-default template, so `--name '{gitlab_pipeline_jobid}_{config}_{nodes}n_nckpt.{native_checkpointing_abbreviated_sha_commit}'`
-is expanded before the run directory and Slurm job are created. If a Megatron
-or NVRx commit is not selected explicitly, its field expands to `image`.
+default template, so `--name '{gitlab_pipeline_jobid}_{config}_{nodes}n'` is
+expanded before the run directory and Slurm job are created.
 
 Use `--dry-run` to generate and inspect `<work-dir>/<name>/run.sbatch` without
 submitting:
 
 ```bash
 SLURMJOB_OPT_RUN_NAME=ultra3-64n-check \
-  python3 ci/scripts/slurm_job.py pretrain-native \
+  python3 ci/scripts/slurm_job.py \
     --config ultra3fp8 \
     --nodes 64 \
     --dry-run
@@ -148,7 +171,7 @@ training process running and checkpointing every 250 iterations until it
 finishes or Slurm reaches the allocation limit:
 
 ```bash
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config nano3 --nodes 4 --name native-main-long \
   --checkpoints-per-run 0 --time-minutes 240 --background
 ```
@@ -161,7 +184,7 @@ three-checkpoint cycle, cycle 1 writes
 250/500/750, cycle 2 writes 1000/1250/1500, and cycle 3 starts at 1750:
 
 ```bash
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config nano3 --nodes 4 --name native-main-repeated \
   --repeat 4 --time-minutes 240 --background
 ```
@@ -178,12 +201,12 @@ allocation:
 
 ```bash
 # One training process keeps checkpointing indefinitely.
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config nano3 --nodes 4 --work-dir /lustre/runs \
   --clean-run --checkpoints-per-run 0 --time-minutes 240 --background
 
 # Repeat the default three-checkpoint cycle indefinitely on that allocation.
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config nano3 --nodes 4 --work-dir /lustre/runs \
   --clean-run --repeat 0 --time-minutes 240 --background
 ```
@@ -205,7 +228,7 @@ submitted directly, while preserving itself and its currently open scheduler
 log. The cleanup is not repeated by worker ranks:
 
 ```bash
-python3 ci/scripts/slurm_job.py pretrain-native \
+python3 ci/scripts/slurm_job.py \
   --config nano3 --nodes 4 --name native-main-repeated \
   --repeat 4 --time-minutes 240 --clean-run --background
 ```
@@ -251,7 +274,7 @@ export MEGATRON_COMMIT=<40-character-megatron-lm-commit>
 export NVRX_COMMIT=<40-character-nvidia-resiliency-ext-commit>
 
 SLURMJOB_OPT_RUN_NAME=ultra3-source-test SLURMJOB_OPT_BACKGROUND=1 \
-  python3 ci/scripts/slurm_job.py pretrain-native \
+  python3 ci/scripts/slurm_job.py \
     --config ultra3fp8 \
     --nodes 64
 ```
@@ -286,14 +309,202 @@ The requested NVIDIA Resiliency Extension commit is installed with
 `PYTHONPATH`, so it replaces the version pre-installed in the custom image
 without changing the image's dependency set.
 
+## Comparing checkpoints across source commits
+
+A job performs the runs it names. Each run trains phase 1 from scratch and
+phase 2 resuming from it, records what its checkpoints contain, and the job
+diffs those digests. Two runs differing only in their provider answer whether
+the two writers agree:
+
+```bash
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
+  --flavor detr --run=ref:nvrx --run=cmp:native
+```
+
+Comparing two sets of sources is comparing two jobs, because a job trains on
+one toolchain. Each writes a digest, and the digests are diffed afterwards:
+
+```bash
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 --flavor detr+nvrx
+
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 --flavor detr+nvrx \
+  --megatron-repo-url https://gitlab-master.nvidia.com/you/megatron-lm.git \
+  --megatron-commit <40-character-megatron-lm-commit> \
+  --nvrx-commit <40-character-nvidia-resiliency-ext-commit>
+
+python3 ci/scripts/slurm_job.py --diff-digests <runA> <runB>
+```
+
+`--diff-digests` takes either a digest or the run directory holding one. A job
+with more than one run diffs them itself, against `--baseline` when given and
+against its first run otherwise, and fails on any difference. A run that fails
+stops the job.
+
+The run directory is keyed by the sources it trains on, so two such jobs never
+collide and neither has to still exist when the digests are diffed. Setting
+only `--megatron-commit` holds the extension fixed, and the reverse holds
+Megatron-LM fixed.
+
+Every run trains its own phase 1 from scratch and resumes its own phase 2
+from it, so `phase1-checkpoints` and `checkpoints` are both compared and a divergence introduced anywhere in training surfaces at the
+first checkpoint that follows it.
+
+Every phase resolves its sources from inside the training process, once all
+imports have bound, and records them:
+
+```text
+[native_ckpt:sources] megatron=<checkout>@<revision>
+[native_ckpt:sources] nvidia_resiliency_ext=<module path>@<version>
+```
+
+A comparison is therefore self-evidencing: the log names the revisions that
+ran, not the ones that were requested. Two runs reporting the same pair did
+not compare anything. The extension reports `absent` under the flavor that
+verifies the native provider works without it installed.
+
+Give both runs the same provider for this comparison — `--run=a:nvrx
+--run=b:nvrx` — so the sources are the only variable. Naming a different
+provider per run compares the providers instead, which is what the
+determinism gate does.
+
+The `detr` flavor drops `--async-save`, `--use-persistent-ckpt-worker` and
+`--async-ckpt-use-cpu-shm`, so a run stages synchronously unless a variant says
+otherwise. `async` restores the first two and leaves the staging path to the
+model configuration; `shm` adds shared-memory staging; `ipc` removes it, which
+leaves CUDA IPC. Giving one run a staging variant and another none puts the two
+paths on opposite sides of the equality contract, and the difference between
+their digests is what the comparison reports.
+
+`pt-async` selects Megatron's own writer. It requires shared-memory staging and
+rejects a fully parallel save, so it settles both. `serial` turns the parallel
+save off on its own, which is what measures that axis apart from the writer.
+
+`no-cnst-strct` drops `--ckpt-assume-constant-structure`. A cached structure is
+resolved on the first save and reused, so a run without it re-resolves every
+save and is the control a run with it is measured against. The cache only takes
+effect from the second save onwards, so a defect confined to it shows as a
+difference at the later iterations while the first checkpoint still matches.
+
+`pg-cache` records a process-group distribution on phase 1 and reads it on
+phase 2. `@PG_CACHE_DIR@` expands to a directory on the run's storage that
+outlives the phase creating it. `$PG_CACHE_DIR` resolves too, but GitLab
+expands a dollar-spelled placeholder in a pipeline variable before the job sees
+it, which leaves the option without its argument.
+
+Two variants where one adds what the other drops contradict, and a job naming
+both is refused before the allocation:
+
+```
+--flavor detr+shm+ipc
+  ValueError: shm adds --async-ckpt-use-cpu-shm, which ipc drops
+```
+
+Nothing declares that conflict — it follows from the option lists.
+
+## Checkpoint variant flavors
+
+These flavors select a checkpoint variant for the comparison. They mix with
+`detr` and with each other, so one command names a combination:
+
+| Flavor | Effect |
+| --- | --- |
+| `nvrx` | Write checkpoints through the NVIDIA Resiliency Extension |
+| `native` | Write checkpoints through the native provider |
+| `async` | Save asynchronously, staging wherever the model configuration says |
+| `shm` | Save asynchronously, staging through shared memory |
+| `ipc` | Save asynchronously, staging through CUDA IPC |
+| `serial` | Write one save from one rank instead of spreading it across the group |
+| `no-cnst-strct` | Re-resolve the checkpoint structure on every save |
+| `pt-async` | Stage through Megatron's own async writer, which settles the staging and the parallel save because it requires both |
+| `pg-cache` | Record a process-group distribution on phase 1 and reuse it on phase 2, with per-rank object load and no sharding-integrity validation |
+| `drop-xstate` | Omit the redundant extra-state artifacts, writing a smaller checkpoint that is equally correct |
+
+A job naming two variants where one adds what the other drops is refused
+before the allocation. That follows from the option lists, so nothing declares
+it.
+
+Join several to one `--flavor`, or repeat the option; both name the same
+combination. The order is kept, so a run directory reads the way the run was
+asked for; what the combination does never depends on it:
+
+```bash
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
+  --flavor detr+pg-cache+drop-xstate
+```
+
+`--flavor` carries what every run shares; `--run=<name>:<variants>` adds what
+makes one run differ:
+
+```bash
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
+  --flavor detr --run=ref:nvrx --run=cmp:native+shm
+```
+
+### Declaring a variant
+
+Every flavor above lives in [`scripts/flavors.yaml`](scripts/flavors.yaml),
+beside the script that loads it. It lists the options each variant adds and
+drops per phase. A variant needs no code:
+
+```yaml
+pg-cache:
+  summary: Reuse a recorded process-group distribution instead of computing one.
+  all:
+    add: [--ckpt-fully-parallel-load-per-rank-objects]
+  phase1:
+    add: [--ckpt-pg-tensors-cache-create]
+```
+
+A scope is `all`, `phase1` or `phase2`. An option carries its value as the next
+token or joined by `=`; a flavor replaces one by naming it in both `drop` and
+`add`. Each phase logs what its variants changed as
+`[slurm_job:flavor] <tag> phase<N> drop <option> add <option>`.
+
+The three execution modes — `perf`, `detr` and `vg` — stay in
+`slurm_job.py`, because each owns behaviour rather than a list of options:
+`perf` and `detr` choose the routine a run executes and the report it
+writes, and `vg` also replaces the server lifecycle and builds the wheel from
+source. A variant that needs to run something cannot be declared.
+
+## Comparing two runs by their digests
+
+Each run writes `<stem>_checkpoint_digest.xz`, one sorted
+`<group>/<iter> <source>/<key>=<value>` line for every entry in every
+checkpoint it wrote. `<source>` is `tensor` for the per-chunk manifest and
+`common` for the state stored beside it, so the digest holds everything a
+checkpoint records rather than the tensors alone.
+
+A digest names only the run that wrote it, so two runs compare after the fact
+without either having been configured against the other:
+
+```bash
+python3 ci/scripts/slurm_job.py --diff-digests \
+  <runA>/logs/<stem>_compare_checkpoint_digest.xz \
+  <runB>/logs/<stem>_compare_checkpoint_digest.xz
+```
+
+It reports `entries / baseline / missing / extra / changed` per checkpoint and
+exits non-zero on any difference. The digest is plain sorted text under the
+compression, so `diff <(xzcat a.xz) <(xzcat b.xz)` names the entries themselves.
+
+`<stem>_checkpoint_summary.log` holds the same counts as text beside
+the digest. A recorded baseline keeps the tensor manifest alone, so a
+comparison against one reports `unrecorded=common` rather than counting every
+common-state key as missing.
+
 ## Environment reference
 
 | CLI | Environment | Meaning |
 | --- | --- | --- |
+| `--platform` | `PLATFORM` | Hardware the run is on; names its GPUs per node and its baselines |
+| `--cluster` | `CLUSTER` | Cluster whose Slurm templates, partitions and budgets apply |
+| `--slurm-account` | `SLURM_ACCOUNT` | Account the allocation is charged to |
 | `--nodes` | `SLURMJOB_OPT_NODES` | Number of allocated nodes |
 | `--config` | `SLURMJOB_OPT_CONFIG` | Model configuration |
 | `--gpus-per-node` | `GPUS_PER_NODE` | GPUs and tasks per allocated node |
-| `--flavor` | `SLURMJOB_OPT_FLAVOR` | Comma-separated flavors when set through the environment |
+| `--flavor` | `SLURMJOB_OPT_FLAVOR` | Variants every run carries, joined by `+` |
+| `--run` | `SLURMJOB_OPT_RUN` | A run this job performs, as `<name>` or `<name>:<variants>`; repeat for more |
+| `--baseline` | `SLURMJOB_OPT_BASELINE` | Digest, or run directory holding one, every run is compared against |
 | `--name` | `SLURMJOB_OPT_RUN_NAME` | Run and scheduler job name |
 | `--work-dir` | `SLURMJOB_OPT_WORK_DIR` | Parent of the named run directory |
 | `--image` | `ENROOT_IMAGE` | Custom `.sqsh` image |
@@ -311,4 +522,5 @@ without changing the image's dependency set.
 
 For every row, the resolved value follows `built-in default < environment <
 command-line argument`. Command-line arguments therefore replace rather than
-combine with environment values, including repeated `--flavor` arguments.
+combine with environment values, including repeated and `+`-joined `--flavor`
+arguments.

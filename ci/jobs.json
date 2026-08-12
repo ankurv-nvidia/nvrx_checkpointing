@@ -1,0 +1,140 @@
+{
+  "platforms": [
+    {
+      "name": "gb200",
+      "gpus": "1x4",
+      "has_image": true,
+      "native_wheel_needs": [
+        [
+          "wheel:aarch64",
+          true
+        ]
+      ],
+      "multinode": [
+        {
+          "key": "nano3",
+          "config": "nano3",
+          "nodes": 8,
+          "scale": "8x4",
+          "group": "8node-nano3",
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ],
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "nvrx",
+              "detr"
+            ],
+            [
+              "nvrx",
+              "perf"
+            ],
+            [
+              "native",
+              [
+                "detr",
+                "vg"
+              ]
+            ]
+          ]
+        },
+        {
+          "key": "multinode-super3-bf16",
+          "config": "super3bf16",
+          "nodes": 16,
+          "scale": "16x4",
+          "group": "16node-super3bf16",
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 125,
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ],
+            [
+              "native",
+              "perf"
+            ]
+          ],
+          "staging": {
+            "detr": "shm"
+          }
+        },
+        {
+          "key": "multinode-super3-fp4",
+          "config": "super3fp4",
+          "nodes": 16,
+          "scale": "16x4",
+          "group": "16node-super3fp4",
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 125,
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "nvrx",
+              "perf"
+            ]
+          ]
+        },
+        {
+          "key": "multinode-perf-bf16-64",
+          "config": "ultra3bf16",
+          "nodes": 64,
+          "scale": "64x4",
+          "group": "64node-ultra3bf16",
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 125,
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "perf"
+            ]
+          ]
+        },
+        {
+          "key": "multinode-perf-64",
+          "config": "ultra3fp8",
+          "nodes": 64,
+          "scale": "64x4",
+          "group": "64node-ultra3fp8",
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 125,
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ],
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "nvrx",
+              "perf"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "h100",
+      "gpus": "1x8",
+      "has_image": true,
+      "pipeline_suite": "main-branch-runs",
+      "multinode": []
+    }
+  ]
+}
