@@ -126,7 +126,7 @@ struct Session
     bool IsSnapshotEvictable(Snapshot const& snapshot) const
     {
         return snapshot.writeCkptCompletedRanks.size() >= ExpectedWriteCompletions()
-               && snapshot.finalizedRanks.size() >= static_cast<size_t>(topo.worldSize);
+               && snapshot.finalizedRanks.size() >= ExpectedWriteCompletions();
     }
     bool AllSnapshotsComplete() const
     {
@@ -166,7 +166,10 @@ struct Session
     // Materialize the exact per-save Blob layout into the snapshot-owned views.
     void PrepareBlobState_(Snapshot& snapshot, LocalState& localState, checkpoint::ipc::Rank rank) const;
 
-    void SendToPeerWithRetries_(std::string const& peer, std::string const& body, std::string const& target) const;
+    void SendToPeerWithRetries_(std::string const& peer,
+                                std::string const& body,
+                                std::string const& target,
+                                std::string_view   contentEncoding) const;
 
     void SendPeerFinalizeSnapshotComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
     void SendPeerWriteCkptComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
@@ -174,9 +177,7 @@ struct Session
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
 
-    // Coordinator-only: push the complete non-deduped registry to the other
-    // daemons. Each receiving daemon derives one shared local storage plan.
-    void BroadcastGlobalRegistryToPeers_(checkpoint::ipc::SnapshotId snapshotId, StateTree const& registry) const;
+    void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
 
     void WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const;
 };

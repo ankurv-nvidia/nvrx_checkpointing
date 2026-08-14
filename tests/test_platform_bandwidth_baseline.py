@@ -19,7 +19,7 @@ def test_each_platform_has_one_bandwidth_floor() -> None:
 
 
 def test_native_bandwidth_is_reported_as_integer_mbps() -> None:
-    log = "[native_ckpt:cli][0][INFO][perf] Finished bw_mbps=94000.4 wr_tnsr_us=10 total_written_bytes=100"
+    log = "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=94000.4 wr_tnsr_us=10 total_written_bytes=100"
 
     metrics = PerfReport._parse_metrics(log, 4)
 
@@ -58,7 +58,7 @@ def test_lower_is_better_metric_is_a_ceiling_not_a_floor() -> None:
 
 def test_timing_baselines_use_steady_state_median() -> None:
     log = "\n".join(
-        f"[native_ckpt:cli][0][INFO][perf] Finished bw_mbps={bw} wr_tnsr_us={write} total_written_bytes=100"
+        f"[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps={bw} wr_tnsr_us={write} total_written_bytes=100"
         for bw, write in ((80000, 38000), (145000, 20500), (150000, 19500))
     )
     metrics = PerfReport._parse_metrics(log, 4)

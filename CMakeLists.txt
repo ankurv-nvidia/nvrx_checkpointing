@@ -290,11 +290,9 @@ if (PHOENIX_BUILD_TESTS)
             PHOENIX_VENV_PYTHON="${PYTHON_VIRTUAL_ENV_PATH}/bin/python"
         )
     endif()
-    # The `[round-trip]` test reads its state registry from `--registry`. ctest
-    # gets it via EXTRA_ARGS; hand-runs need `ckpttest --registry <path>`.
     catch_discover_tests(ckpttest
-        EXTRA_ARGS
-            --registry "${CMAKE_CURRENT_SOURCE_DIR}/metadata/1x2_checkpoints_iter_0000250/registry.bin"
+        #EXTRA_ARGS
+        #    --registry "${CMAKE_CURRENT_SOURCE_DIR}/metadata/1x2_checkpoints_iter_0000250/registry.bin"
     )
 
     if (PHOENIX_BUILD_PYTHON_BINDINGS)

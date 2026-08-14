@@ -164,7 +164,7 @@ struct StateTreeBytesHandler : StateTree::StateHandler<StateTree::StateType::Blo
         container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
     {}
 
-    void Update() override {}
+    void               Update() override {}
     [[nodiscard]] bool IsSnapshotScoped() const override { return true; }
 
     StateNode::Blob GetBlob() override

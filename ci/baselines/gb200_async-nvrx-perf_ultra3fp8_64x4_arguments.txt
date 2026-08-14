@@ -645,9 +645,9 @@
   quick_geglu ..................................... False
   rampup_batch_size ............................... None
   rank ............................................ 0
-  recompute_granularity ........................... None
+  recompute_granularity ........................... selective
   recompute_method ................................ None
-  recompute_modules ............................... None
+  recompute_modules ............................... ['moe_act']
   recompute_num_layers ............................ None
   record_memory_history ........................... False
   record_shapes ................................... False

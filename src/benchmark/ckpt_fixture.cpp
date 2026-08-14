@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <queue>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -33,60 +34,83 @@ Rank InferWorldSize(StateTree const& tree)
     return Rank{maxRankPlus1};
 }
 
-std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo)
+std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo, std::vector<char>& buffer)
 {
     std::unique_ptr<StateTree> tree = std::make_unique<StateTree>(std::move(topo));
     ctx.globalRegistry->CloneInto(*tree);
     std::unordered_map<DeviceId, std::unique_ptr<DeviceContext>> devCtxMap;
 
-    auto allocAndCopy = [&](DS4Tensor& tnsr, std::string_view shardFqn) {
+    size_t totalAllocSize = 0;
+
+    auto calculateSize
+        = [&](DS4Tensor& tnsr, std::string_view /* shardFqn */) { totalAllocSize += static_cast<size_t>(tnsr.ShardSizeBytes()); };
+
+    size_t currentOffset = 0;
+
+    auto allocAndCopy = [&](DS4Tensor& tnsr, [[maybe_unused]] std::string_view shardFqn) {
         tnsr.handle = 0;
         if (tnsr.ShardSizeBytes() == 0) { return; }
         auto it = devCtxMap.find(tnsr.device);
-        if (it == devCtxMap.end()) { it = devCtxMap.insert({tnsr.device, DeviceContext::CreateDeviceContext(tnsr.device, 0)}).first; }
-        auto&             devCtx  = *it->second;
-        auto              devAddr = devCtx.Allocate(tnsr.ShardSizeBytes());
-        auto              bufSize = static_cast<size_t>(tnsr.ShardSizeBytes());
-        auto              patLen  = shardFqn.size();
-        std::vector<char> pattern(bufSize);
-        std::memcpy(pattern.data(), shardFqn.data(), std::min(shardFqn.size(), bufSize));
+        if (it == devCtxMap.end())
+        {
+            it = devCtxMap.insert({tnsr.device, DeviceContext::CreateDeviceContext(tnsr.device, 0)}).first;
+            it->second->StreamAcquire();
+        }
+
+        auto& devCtx  = *it->second;
+        auto  bufSize = static_cast<size_t>(tnsr.ShardSizeBytes());
+        auto  devAddr = devCtx.Allocate(bufSize);
+        auto* dataptr = buffer.data() + currentOffset;
+#ifdef NDEBUG
+        auto patLen = shardFqn.size();
+
+        std::memcpy(dataptr, shardFqn.data(), std::min(shardFqn.size(), bufSize));
         for (size_t filled = std::min(patLen, bufSize); filled < bufSize;)
         {
             auto chunk = std::min(filled, bufSize - filled);
-            std::memcpy(&pattern[filled], pattern.data(), chunk);
+            std::memcpy(dataptr + filled, dataptr, chunk);
             filled += chunk;
         }
-        devCtx.StreamAcquire();
-        devCtx.AddH2D(pattern.data(), devAddr, pattern.size());
-        devCtx.Flush();
+#endif
+        devCtx.AddH2D(dataptr, devAddr, bufSize);
+        currentOffset += bufSize;
         tnsr.handle = devAddr;
     };
 
-    tree->WalkNodes([&](StateNode& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
-        {
-            allocAndCopy(std::get<StateNode::TensorShard>(node.data), tree->GetNodeId(node.handle));
-        }
-        else if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
-        {
-            auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            tree->AssertShardedTensorHasNoHoles(node.handle);
-            StateNode::ShardedTensor newTnsr{tnsr.dtype, tnsr.fulldim};
-            for (auto rshard : tnsr.shards)
+    auto pass = [&](auto execFn) {
+        tree->WalkNodes([&](StateNode& node) {
+            if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
             {
-                if (tree->Topo().rank != rshard.rank) { continue; }
-                DS4Tensor shardTnsr = {.sharddim = rshard.sharddim, .fulldim = tnsr.fulldim, .dtype = tnsr.dtype, .device = rshard.device};
-                allocAndCopy(shardTnsr, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim));
-                rshard.handle = shardTnsr.handle;
-                newTnsr.AddShard(rshard);
+                execFn(std::get<StateNode::TensorShard>(node.data), tree->GetNodeId(node.handle));
             }
-            if (newTnsr.shards.empty()) { tree->RemoveNode(node.handle); }
-            else
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
             {
-                node.data = std::move(newTnsr);
+                auto&                    tnsr = std::get<StateNode::ShardedTensor>(node.data);
+                StateNode::ShardedTensor newTnsr{tnsr.dtype, tnsr.fulldim};
+                for (auto rshard : tnsr.shards)
+                {
+                    if (tree->Topo().rank != rshard.rank) { continue; }
+                    DS4Tensor shardTnsr
+                        = {.sharddim = rshard.sharddim, .fulldim = tnsr.fulldim, .dtype = tnsr.dtype, .device = rshard.device};
+                    execFn(shardTnsr, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim));
+                    rshard.handle = shardTnsr.handle;
+                    newTnsr.AddShard(rshard);
+                }
+                if (newTnsr.shards.empty()) { tree->RemoveNode(node.handle); }
+                else
+                {
+                    node.data = std::move(newTnsr);
+                }
             }
-        }
-    });
+        });
+    };
+
+    pass(calculateSize);
+    if (totalAllocSize > buffer.size()) { buffer.resize(totalAllocSize); }
+    pass(allocAndCopy);
+
+    for (auto& [device, devCtx] : devCtxMap) { devCtx->Flush(); }
+
     tree->WalkNodes([&](StateNode& node) {
         if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
         {
@@ -103,6 +127,7 @@ std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, Ran
             }
         }
     });
+    fmt::print(stderr, "BuildPerRankStateTree: rank {} allocated {} bytes of device memory\n", tree->Topo().rank, totalAllocSize);
     return tree;
 }
 
@@ -113,6 +138,82 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     ctx.globalRegistry = std::make_unique<StateTree>(
         RankTopology{.rank = Rank{0}, .worldSize = Rank{1}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost"}});
     auto registry = StateSerDes::Read(ifs);
+
+    // Adjust tensors sizes till we are below the limit.
+    std::priority_queue<std::pair<uint64_t, StateNode::Handle>> tensorSizes;
+    std::priority_queue<std::pair<uint64_t, StateNode::Handle>> blobSizes;
+    uint64_t                                                    totalBlobSize   = 0;
+    uint64_t                                                    totalTensorSize = 0;
+
+    registry->WalkNodes([&](StateNode& node) {
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        {
+            throw std::runtime_error("LoadStateRegistryFromPath: unexpected TensorShard in global registry");
+        }
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        {
+            auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto  size = tnsr.FullDimSizeBytes();
+            totalTensorSize += size;
+            tensorSizes.emplace(size, node.handle);
+        }
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::Blob))
+        {
+            auto& blob = std::get<StateNode::Blob>(node.data);
+            auto  size = blob.size();
+            totalBlobSize += size;
+            blobSizes.emplace(size, node.handle);
+        }
+    });
+
+    // uint32_t ranks = ranksPerNode * nodes;
+    //
+    // uint64_t maxAvailableRam             = 64ull * 1024 * 1024 * 1024;
+    // uint64_t targetProcessRamUtilization = maxAvailableRam * 3 / 4;
+    uint64_t snapshots       = 4;
+    auto     maxSnapshotSize = ctx.memLimit / snapshots;
+    auto     maxBlobSize     = maxSnapshotSize / 32;
+    auto     maxTensorSize   = maxSnapshotSize - maxBlobSize;
+
+    // Keep halving the largest dimension of the largest tensor until we are below the limit.
+    while (totalTensorSize > maxTensorSize && !tensorSizes.empty())
+    {
+        auto [size, handle] = tensorSizes.top();
+        tensorSizes.pop();
+        registry->AssertShardedTensorHasNoHoles(handle);
+        auto& tnsr     = std::get<StateNode::ShardedTensor>(registry->GetNode(handle).data);
+        auto  olddim   = tnsr.fulldim;
+        auto* maxDimIt = std::ranges::max_element(tnsr.fulldim);
+        auto  index    = static_cast<size_t>(std::distance(tnsr.fulldim.begin(), maxDimIt));
+        if (*maxDimIt <= 1) { throw std::runtime_error("LoadStateRegistryFromPath: ShardedTensor has no dimension > 1 to halve"); }
+        *maxDimIt /= 2;
+        std::set<StateNode::ShardedTensor::RankedTensorShard> oldShards{};
+        std::swap(tnsr.shards, oldShards);
+        for (auto const& shard : oldShards)
+        {
+            auto newShard = shard;
+            newShard.sharddim[index].end /= 2;
+            newShard.sharddim[index].begin /= 2;
+            tnsr.AddShard(newShard);
+        }
+        registry->AssertShardedTensorHasNoHoles(handle);
+        auto newSize    = tnsr.FullDimSizeBytes();
+        totalTensorSize = totalTensorSize - size + newSize;
+        fmt::print(stderr, "fqn={}: dim={}->{} size={}->{}\n", registry->GetNodeId(handle), olddim, tnsr.fulldim, size, newSize);
+        tensorSizes.emplace(newSize, handle);
+    }
+
+    while (totalBlobSize > maxBlobSize && !blobSizes.empty())
+    {
+        auto [size, handle] = blobSizes.top();
+        blobSizes.pop();
+        auto& blob = std::get<StateNode::Blob>(registry->GetNode(handle).data);
+        blob.resize(size / 2);
+        totalBlobSize = totalBlobSize - size + blob.size();
+        fmt::print(stderr, "fqn={}: blob size={}->{}\n", registry->GetNodeId(handle), size, blob.size());
+        blobSizes.emplace(blob.size(), handle);
+    }
+
     registry->CloneInto(*ctx.globalRegistry);
     if (!ifs.eof())
     {
@@ -126,21 +227,26 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     }
     ctx.worldSize = InferWorldSize(*ctx.globalRegistry);
 
-    ctx.nodes = std::min(ctx.nodes, static_cast<uint16_t>(ctx.worldSize));
+    if (ctx.worldSize == Rank{0} || static_cast<uint32_t>(ctx.worldSize) % ctx.ranksPerNode != 0)
+    {
+        throw std::runtime_error(fmt::format("LoadStateRegistryFromPath: worldSize={} is not a multiple of ranksPerNode={}",
+                                             static_cast<uint32_t>(ctx.worldSize),
+                                             ctx.ranksPerNode));
+    }
 
-    if (!ctx.outofproc) { RunInprocServer(ctx.nodes); }
+    auto const requestedNodes = static_cast<uint16_t>(static_cast<uint32_t>(ctx.worldSize) / ctx.ranksPerNode);
+
+    if (!ctx.outofproc) { RunInprocServer(requestedNodes); }
     std::vector<std::string> peers;
-    peers.reserve(ctx.nodes);
-    for (uint16_t i = 0; i < ctx.nodes; ++i) { peers.emplace_back(fmt::format("localhost:{}", cipc::Message::Port + i)); }
-
+    peers.reserve(requestedNodes);
+    for (uint16_t i = 0; i < requestedNodes; ++i) { peers.emplace_back(fmt::format("localhost:{}", cipc::Message::Port + i)); }
+    std::vector<char> buffer;
     for (uint32_t r = 0; r < static_cast<uint32_t>(ctx.worldSize); ++r)
     {
-        RankTopology topo{.rank         = Rank{r},
-                          .worldSize    = ctx.worldSize,
-                          .ranksPerPeer = static_cast<uint32_t>(ctx.worldSize) / ctx.nodes,
-                          .peersPerNode = ctx.nodes,
-                          .peers        = peers};
-        ctx.localRegistries.insert(BuildPerRankStateTree(ctx, std::move(topo)));
+        RankTopology topo{
+            .rank = Rank{r}, .worldSize = ctx.worldSize, .ranksPerPeer = ctx.ranksPerNode, .peersPerNode = requestedNodes, .peers = peers};
+
+        ctx.localRegistries.insert(BuildPerRankStateTree(ctx, std::move(topo), buffer));
     }
 }
 
@@ -188,8 +294,11 @@ void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorSto
 
 void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
 {
-    SaveCheckpoint(tree, cipc::SnapshotId{1}, ckptDir);
-    WaitForCheckpointSave(tree.Topo());
+    for (uint32_t i = 1; i < 6; i++)
+    {
+        SaveCheckpoint(tree, cipc::SnapshotId{i}, ckptDir);
+        WaitForCheckpointSave(tree.Topo());
+    }
 }
 
 static void RoundTripCallback(void*                             cbData,

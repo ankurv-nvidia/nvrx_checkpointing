@@ -42,13 +42,11 @@ int main(int argc, char** argv)
 try
 {
     bpo::options_description desc("Allowed options");
-    bool                     outofproc = false;
     std::filesystem::path    stateRegistry;
-    uint16_t                 nodes = 2;
 
     desc.add_options()("help", "produce help message")                                                         //
-        ("nodes", bpo::value<uint16_t>(&nodes), "number of nodes")                                             //
-        ("outproc", bpo::bool_switch(&outofproc), "run the checkpoint server out-of-process")                  //
+        ("ranks-per-node", bpo::value<uint16_t>(&Ctx.ranksPerNode), "number of ranks per node")                //
+        ("outproc", bpo::bool_switch(&Ctx.outofproc), "run the checkpoint server out-of-process")              //
         ("stateregistry", bpo::value<std::filesystem::path>(&stateRegistry), "path to the state registry");    //
 
     bpo::variables_map vm;
@@ -73,8 +71,6 @@ try
     }
 
     if (!vm.contains("stateregistry")) { throw std::runtime_error("State registry path must be provided with --stateregistry"); }
-    Ctx.nodes     = nodes;
-    Ctx.outofproc = outofproc;
 
     LoadStateRegistryFromPath(Ctx, stateRegistry);
 
@@ -89,7 +85,7 @@ try
     benchmark::Shutdown();
 
     JoinClientThreads(Ctx, tasks);
-    if (!outofproc)
+    if (!Ctx.outofproc)
     {
         // Keep disk I/O outside BM_SaveCheckpoint while ensuring the in-process
         // daemon is not torn down with background DCP writes still in flight.

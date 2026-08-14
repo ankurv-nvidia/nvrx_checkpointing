@@ -249,6 +249,12 @@ and preparation `srun` steps redirect their output to separate files below
 (`#SBATCH --gpus=...`); GPU placement is expressed by
 `#SBATCH --gpus-per-node=4`.
 
+While a foreground submission waits, the launcher prints an `squeue` heartbeat
+every five minutes with state, elapsed time, time limit, expected start time and
+nodes or pending reason. Once the allocation exits, it prints the allocation and
+step rows from `sacct`, including exit codes and peak RSS. These diagnostics are
+best-effort and never replace the allocation's actual result.
+
 At a training-phase boundary, every task on a node rendezvous before local rank
 0 spins down that node's checkpoint server. Shutdown verifies the service is no
 longer reachable and removes its shared-memory queues and election lock before

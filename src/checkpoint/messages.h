@@ -108,6 +108,12 @@ struct Message
         SessionId  sessionId;
         Rank       globalRank;
         SnapshotId snapshotId;
+
+        // Perf metrics
+        std::chrono::nanoseconds snapshotDuration{};
+        std::chrono::nanoseconds d2hDuration{};
+        uint32_t                 d2hRequests{};
+        uint64_t                 totalSnapshotBytes{};
     };
 
     // Combination of Replicated and Sharded State Registry

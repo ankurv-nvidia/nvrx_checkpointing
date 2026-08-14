@@ -405,6 +405,14 @@ template <ConceptTensorTraits Traits> struct TensorShardMapT
         holes.erase(std::remove_if(holes.begin(), holes.end(), [](auto const& h) { return h.size() == 0; }), holes.end());
         holes.insert(holes.end(), newHoles.begin(), newHoles.end());
     }
+
+    [[nodiscard]] uint64_t FullDimSizeBytes() const
+    {
+        if (fulldim.size() == 0) { return 0; }
+        uint64_t size = 1;
+        for (auto const& r : fulldim) { size *= r; }
+        return size * static_cast<uint64_t>(Traits::GetDTypeSize(dtype));
+    }
 };
 
 template <ConceptTensorTraits Traits> struct std::hash<RankedTensorShardT<Traits>>

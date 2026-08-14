@@ -918,40 +918,39 @@ def test_uninstall_nvrx_for_native_is_serialized_and_verified(
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
-    installed = True
-    commands: list[list[str]] = []
+    site = tmp_path / "site-packages"
+    package = site / "nvidia_resiliency_ext"
+    metadata = site / "nvidia_resiliency_ext-0.6.0.dist-info"
+    package.mkdir(parents=True)
+    metadata.mkdir()
     monkeypatch.setattr(slurm_job, "RUN_ROOT", tmp_path)
     monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node.example")
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
 
     def distribution(name: str) -> object:
         assert name == "nvidia-resiliency-ext"
-        if installed:
-            return object()
+        if metadata.exists():
+            return SimpleNamespace(_path=metadata)
         raise importlib.metadata.PackageNotFoundError(name)
 
-    def run(command: list[str], *, check: bool) -> SimpleNamespace:
-        nonlocal installed
-        commands.append(command)
-        assert check is True
-        installed = False
-        return SimpleNamespace(returncode=0)
-
     monkeypatch.setattr(slurm_job.importlib.metadata, "distribution", distribution)
-    monkeypatch.setattr(slurm_job.importlib.util, "find_spec", lambda _name: None)
-    monkeypatch.setattr(slurm_job.subprocess, "run", run)
+    monkeypatch.setattr(
+        slurm_job.importlib.util,
+        "find_spec",
+        lambda _name: (
+            SimpleNamespace(submodule_search_locations=[str(package)], origin=None)
+            if package.exists()
+            else None
+        ),
+    )
 
     slurm_job.uninstall_nvrx_for_native()
 
     assert (tmp_path / ".nvrx-uninstall-node.lock").exists()
-    assert commands == [[
-        sys.executable,
-        "-m",
-        "pip",
-        "uninstall",
-        "--yes",
-        "--break-system-packages",
-        "nvidia-resiliency-ext",
-    ]]
+    assert not package.exists()
+    assert not metadata.exists()
+    assert (site / ".nvidia_resiliency_ext.ci-disabled-123-node").is_dir()
+    assert (site / ".nvidia_resiliency_ext-0.6.0.dist-info.ci-disabled-123-node").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -2058,6 +2057,113 @@ def test_foreground_submission_records_job_id_and_uses_wait(
     assert (run / "gitlab_job_id").read_text() == "456\n"
 
 
+def test_foreground_submission_reports_scheduler_status_every_five_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slurm_job = _load_slurm_job()
+    waits = []
+
+    class Process:
+        def wait(self, timeout: int | None = None) -> int:
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("sbatch", timeout)
+            return 0
+
+    reports = []
+    monkeypatch.setattr(slurm_job, "_report_queue_status", reports.append)
+
+    assert slurm_job._wait_for_submission(Process(), "123") == 0
+    assert waits == [5 * 60, 5 * 60]
+    assert reports == ["123"]
+
+
+def test_only_nccl_ib_proxy_segfault_gets_one_clean_allocation_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    run = tmp_path / "run"
+    log = run / "logs" / "run.log"
+    log.parent.mkdir(parents=True)
+    (run / "partial-checkpoint").mkdir()
+    monkeypatch.setattr(slurm_job, "WORK_ROOT", tmp_path)
+    monkeypatch.setattr(slurm_job, "RUN_ROOT", run)
+    monkeypatch.setattr(slurm_job, "RUN_NAME", "run")
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", log.parent)
+    calls = []
+
+    def submit(*_args: object, **kwargs: object) -> int:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            log.write_text("!!!!!!! Segfault encountered !!!!!!! ncclIbMultiSend sendProxyProgress")
+            raise RuntimeError("allocation failed")
+        assert not (run / "partial-checkpoint").exists()
+        return 0
+
+    monkeypatch.setattr(slurm_job, "sbatch_run", submit)
+
+    assert slurm_job._sbatch_run_with_retry(
+        "script", log, extra_sbatch_args=["reaper"], background=False, dry_run=False,
+    ) == 0
+    assert calls == [
+        {"extra_sbatch_args": ["reaper"], "background": False, "dry_run": False},
+        {"extra_sbatch_args": ["reaper"]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "torch.OutOfMemoryError: CUDA out of memory",
+        "Unexpected result nan",
+        "!!!!!!! Segfault encountered !!!!!!! unrelated crash",
+    ],
+)
+def test_oom_nan_and_unrelated_crashes_are_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    slurm_job = _load_slurm_job()
+    log = tmp_path / "run.log"
+    log.write_text(failure)
+    calls = []
+    monkeypatch.setattr(
+        slurm_job,
+        "sbatch_run",
+        lambda *_args, **_kwargs: calls.append(True) or (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="failed"):
+        slurm_job._sbatch_run_with_retry(
+            "script", log, extra_sbatch_args=[], background=False, dry_run=False,
+        )
+
+    assert calls == [True]
+
+
+def test_scheduler_status_and_accounting_are_nonfatal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    outputs = iter(
+        (
+            SimpleNamespace(returncode=0, stdout="123|RUNNING|05:00|01:00:00|now|n[1-4]\n", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr="accounting database unavailable"),
+        ),
+    )
+    monkeypatch.setattr(slurm_job.subprocess, "run", lambda *_args, **_kwargs: next(outputs))
+
+    with caplog.at_level("INFO"):
+        slurm_job._report_queue_status("123")
+        slurm_job._report_allocation_accounting("123")
+
+    assert "123|RUNNING|05:00" in caplog.text
+    assert "accounting database unavailable" in caplog.text
+
+
 def test_background_submission_uses_only_the_streamed_log(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2155,6 +2261,10 @@ def test_default_pipeline_has_manual_suite_launchers() -> None:
         "if": '$CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"',
         "when": "never",
     }
+    assert launcher["rules"][2] == {
+        "if": '$RUN_ALL_SUITES == "true"',
+        "when": "on_success",
+    }
     assert launcher["rules"][-1] == {"when": "manual", "allow_failure": True}
     assert launcher["image"] == "curlimages/curl:8.15.0"
     assert launcher["tags"] == ["perflab", "type/docker", "os/linux"]
@@ -2185,6 +2295,7 @@ def test_default_pipeline_has_manual_suite_launchers() -> None:
     assert main_runs["rules"] == [
         {"if": '$PIPELINE_SUITE != "default"', "when": "never"},
         {"if": '$CI_COMMIT_BRANCH == "main"', "when": "on_success"},
+        {"if": '$RUN_ALL_SUITES == "true"', "when": "on_success"},
         {"when": "manual", "allow_failure": True},
     ]
     assert config[".wheel_publish"]["rules"] == [
@@ -2385,8 +2496,11 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         " 0:   data_cache_path ................................. /run/data-cache\n"
         " 0: WARNING: unrelated output inside the argument block\n"
         "0:   micro_batch_size ................................ 1\n"
-        "0: -------------------- end of arguments ---------------------\n"
-        "[native_ckpt:cli][0][INFO][perf] Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100",
+        "0: -------------------- end of arguments ---------------------\n",
+    )
+    # The daemon carries the perf counters, in its own per-host log for the measured cycle.
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
+        "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100\n",
     )
     baseline = '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}'
     # The epilog compares the options the run trained on as well as its
@@ -2430,8 +2544,34 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     assert "inference_dynamic_batching_unified_memory_level . 0" in arguments
     assert yaml.safe_load(next((tmp_path / "baselines").glob("*.yaml")).read_text()) == {
         "description": "auto-generated by CI",
-        "metrics": {"wr_tnsr_us": 10, "total_written_bytes": 100},
+        "metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100},
     }
+
+
+def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavor=["perf", "nvrx"],
+        flavors=slurm_job.FlavorSelection(["perf", "nvrx"]),
+    )
+    _cfg, _flavor, stem = slurm_job._identity(args)
+    log = tmp_path / "logs" / f"{stem}.log"
+    log.parent.mkdir()
+    log.write_text("")
+    log.with_name(f"{stem}_report.json").write_text('{"metrics":{"gpu_hbm_peak_pct":{"max":90}}}')
+
+    slurm_job._write_performance_baseline(args, log)
+
+    assert not (log.parent / "baselines").exists()
 
 
 def test_batch_epilog_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2525,6 +2665,52 @@ def test_two_jobs_comparing_different_providers_record_separately(
     assert stem("nvrx").endswith("-nvrx")
 
 
+def test_each_run_writes_and_compares_its_own_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+    )
+    run_root = tmp_path / "job"
+    batch_log = run_root / "logs" / "job.log"
+    batch_log.parent.mkdir(parents=True)
+    batch_log.write_text("")
+    recorded = tmp_path / "recorded"
+    recorded.mkdir()
+    monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
+
+    for spec in slurm_job._run_specs(args):
+        log = slurm_job._argument_log(args, batch_log, spec)
+        log.parent.mkdir(parents=True)
+        provider = spec.variants[0]
+        block = (
+            "------------------------ arguments ------------------------\n"
+            f"  ckpt_provider ................................... {provider}\n"
+            "  micro_batch_size ................................ 1\n"
+            "-------------------- end of arguments ---------------------\n"
+        )
+        log.write_text(block)
+        stem = slurm_job._arguments_stem(args, spec.variants)
+        (recorded / f"{stem}_arguments.txt").write_text(block)
+
+    assert slurm_job._write_and_compare_arguments(args, batch_log) is True
+    for spec in slurm_job._run_specs(args):
+        log = slurm_job._argument_log(args, batch_log, spec)
+        candidate = log.parent / "baselines" / f"{slurm_job._arguments_stem(args, spec.variants)}_arguments.txt"
+        assert candidate.exists()
+        assert f"ckpt_provider ................................... {spec.variants[0]}" in candidate.read_text()
+
+
 def test_arguments_with_nothing_recorded_do_not_pass_uncompared(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2542,6 +2728,70 @@ def test_arguments_with_nothing_recorded_do_not_pass_uncompared(
     rule = "------------------------ arguments ------------------------\n"
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "empty-produced", rule, arguments) is False
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "empty-recorded", arguments, rule) is False
+
+
+def test_the_rank_that_failed_is_named_and_shown_from_a_nested_run(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    run_root = tmp_path / "job"
+    run_log = run_root / "logs" / "job.log"
+    run_log.parent.mkdir(parents=True)
+    # srun terminates every other rank after one exits. A log reader may prefix
+    # the line before what srun wrote.
+    run_log.write_text(
+        "2026-08-12T18:00:00Z 01O srun: error: n51: task 58: Exited with exit code 1\n"
+        "2026-08-12T18:00:00Z 01O srun: error: n51: tasks 56-57,59: Terminated\n"
+        "2026-08-12T18:00:00Z 01O srun: error: n37: tasks 0-3: Terminated\n",
+    )
+    rank_log = run_root / "native.cmp" / "logs" / "super3bf16_16x4_cmp-routine_rank58.log"
+    rank_log.parent.mkdir(parents=True)
+    rank_log.write_text(
+        "starting\n[rank58]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 3.91 GiB\n",
+    )
+
+    with caplog.at_level("INFO"):
+        slurm_job._report_failing_rank_logs(run_log)
+
+    assert "rank(s) 58 exited" in caplog.text
+    assert "native.cmp/logs/super3bf16_16x4_cmp-routine_rank58.log" in caplog.text
+    assert "torch.OutOfMemoryError" in caplog.text
+    # The ranks srun merely terminated are consequences, not the cause.
+    assert "rank0" not in caplog.text
+
+
+def test_ranks_srun_only_terminated_implicate_nobody() -> None:
+    slurm_job = _load_slurm_job()
+
+    assert slurm_job._failing_ranks("srun: error: n1: tasks 0-3: Terminated") == []
+    assert slurm_job._failing_ranks("srun: error: n1: task 58: Exited with exit code 1") == [58]
+    # A step can lose several ranks at once, named as a range and a list.
+    assert slurm_job._failing_ranks(
+        "srun: error: n1: tasks 56-57,59: Exited with exit code 2",
+    ) == [56, 57, 59]
+
+
+def test_failing_rank_log_output_is_bounded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    run_root = tmp_path / "job"
+    run_log = run_root / "logs" / "job.log"
+    run_log.parent.mkdir(parents=True)
+    run_log.write_text("srun: error: n1: tasks 1-3: Exited with exit code 1\n")
+    for rank in (1, 2, 3):
+        rank_log = run_root / "logs" / f"routine_rank{rank}.log"
+        rank_log.write_text("old line\nexception tail\n")
+
+    with caplog.at_level("INFO"):
+        slurm_job._report_failing_rank_logs(run_log, rank_limit=2, tail_lines=1)
+
+    assert "rank1] exception tail" in caplog.text
+    assert "rank2] exception tail" in caplog.text
+    assert "rank3]" not in caplog.text
+    assert "1 additional exited rank(s)" in caplog.text
 
 
 def test_batch_epilog_requires_both_deterministic_checkpoint_routines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2582,7 +2832,7 @@ def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.Monk
     builtin_zip = zip
     monkeypatch.setattr(slurm_job, "zip", builtin_zip, raising=False)
     text = "\n".join(
-        f"[native_ckpt:cli][{rank}][INFO][perf] Finished bw_mbps={bandwidth} wr_tnsr_us=10 total_written_bytes=100"
+        f"[native_ckpt:svr][75d0#0][PERF] Rank={rank} Finished bw_mbps={bandwidth} wr_tnsr_us=10 total_written_bytes=100"
         for rank, bandwidth in enumerate((100, 100, 80, 80))
     )
 
@@ -2590,6 +2840,46 @@ def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.Monk
 
     assert metrics["bw_mbps"]["median"] == 90  # noqa: PLR2004
     assert metrics["bw_socket_imbalance"]["mean"] == 1.25  # noqa: PLR2004
+
+
+def test_perf_report_uses_the_largest_rank_hbm_peak() -> None:
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        (
+            "[native_ckpt:mem] rank=0 gpu_peak_bytes=80 gpu_hbm_peak_bytes=90 "
+            "gpu_total_bytes=100 cpu_rss_bytes=10",
+            "[native_ckpt:mem] rank=58 gpu_peak_bytes=85 gpu_hbm_peak_bytes=98 "
+            "gpu_total_bytes=100 cpu_rss_bytes=10",
+        ),
+    )
+
+    metrics = slurm_job.PerfReport._parse_metrics(text, 4)
+
+    assert metrics["gpu_hbm_peak_bytes"]["max"] == 98  # noqa: PLR2004
+    assert metrics["gpu_hbm_peak_pct"]["max"] == 98  # noqa: PLR2004
+    assert metrics["gpu_hbm_peak_pct"]["ranks"] == [0, 58]
+    assert slurm_job.PerfReport._statistic("gpu_hbm_peak_pct", metrics["gpu_hbm_peak_pct"]) == "max"
+
+
+def test_hbm_sampler_tracks_whole_device_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    samples = iter(((20, 100), (5, 100)))
+    devices = []
+    cuda = SimpleNamespace(
+        is_initialized=lambda: True,
+        device_count=lambda: 4,
+        current_device=lambda: pytest.fail("LOCAL_RANK is a visible CUDA device"),
+        mem_get_info=lambda device: devices.append(device) or next(samples),
+    )
+    sampler = slurm_job._PeakHbmSampler(SimpleNamespace(cuda=cuda))
+
+    sampler._sample_once()
+    sampler._sample_once()
+
+    assert devices == [2, 2]
+    assert sampler.peak_bytes == 95  # noqa: PLR2004
+    assert sampler.total_bytes == 100  # noqa: PLR2004
 
 
 def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
@@ -2880,7 +3170,9 @@ def test_flavor_transforms_are_profile_independent() -> None:
     slurm_job.FlavorSelection(["perf"]).transform(perf_opts, perf_env)
 
     assert perf_opts == [
-        "--cuda-graph-impl", "local", "--async-save",
+        "--cuda-graph-impl", "local",
+        "--recompute-granularity", "selective", "--recompute-modules", "moe",
+        "--async-save",
         "--ckpt-assume-constant-structure", "--async-ckpt-use-cpu-shm",
     ]
     assert not perf_env
@@ -2919,6 +3211,25 @@ def test_flavor_transforms_are_profile_independent() -> None:
     source = (REPO_ROOT / "ci/scripts/slurm_job.py").read_text()
     assert "ProfileOptionPolicy" not in source
     assert "profile_policies" not in source
+
+
+def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
+    slurm_job = _load_slurm_job()
+    opts = [
+        "--check-for-nan-in-loss-and-grad",
+        "--cuda-graph-impl",
+        "local",
+        "--recompute-granularity",
+        "selective",
+        "--recompute-modules",
+        "moe",
+    ]
+
+    slurm_job.FlavorSelection(["vg"]).transform(opts, {})
+
+    assert "--check-for-nan-in-loss-and-grad" in opts
+    assert "--no-check-for-nan-in-loss-and-grad" not in opts
+    assert opts[-2:] == ["--rerun-mode", "disabled"]
 
 
 def test_nonzero_rank_log_is_retained_without_mirroring_stdout(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
@@ -3015,8 +3326,8 @@ def test_super3_profiles_share_reference_architecture() -> None:
     # Both precision profiles of this architecture hold the optimizer's moments
     # in BF16, which is what leaves the device room for the MoE temporaries.
     assert {key: bf16.pop(key) for key in optimizer_precision} == optimizer_precision
-    # The BF16 profile also recomputes its MoE activations, which only the
-    # deterministic gate keeps; graph capture drops it again for the measured run.
+    # The BF16 profile also recomputes its MoE activations. Attention-only graph
+    # capture supports it, so both deterministic and measured runs retain it.
     recompute = {"recompute-granularity": "selective", "recompute-modules": "moe"}
     assert {key: bf16.pop(key) for key in recompute} == recompute
     graph_keys = ("cuda-graph-impl", "cuda-graph-modules")

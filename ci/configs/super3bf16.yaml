@@ -16,7 +16,8 @@ grad-reduce-in-bf16: true
 # experts are distributed unevenly, so the rank holding the most of them
 # reaches the 184 GiB device during the backward pass while rank 0 sits at
 # 115.56. Recomputing the activations alone leaves that rank 11.79 GiB short.
-# The measured run drops this again for graph capture.
+# Attention-only graph capture has completed with this policy, so measured and
+# deterministic runs both retain it.
 recompute-granularity: selective
 recompute-modules: moe
 

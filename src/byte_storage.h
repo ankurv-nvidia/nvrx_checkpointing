@@ -10,8 +10,15 @@ struct ByteStorage
     void*  data{nullptr};
     size_t size{0};
 
+    static void* PadAlignedAlloc(size_t alignment, size_t size)
+    {
+        if (size == 0) { return nullptr; }
+        auto paddedSize = (size + alignment - 1) / alignment * alignment;
+        return std::aligned_alloc(alignment, paddedSize);    // NOLINT
+    }
+
     ByteStorage() = default;
-    ByteStorage(size_t sizeIn) : data(sizeIn == 0 ? nullptr : std::aligned_alloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
+    ByteStorage(size_t sizeIn) : data(PadAlignedAlloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
     {
         if (sizeIn != 0 && data == nullptr)
         {

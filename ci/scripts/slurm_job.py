@@ -104,6 +104,13 @@ RUN_NAME: str | None = None
 logger = logging.getLogger("native_ci")
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
 _EPILOG_ENTRY_CMD = "__epilog__"
+_RANK_LOGS_ENTRY_CMD = "__rank_logs__"
+# GitLab traces are size limited. Rank 0 is already mirrored in full while the
+# run is active, so retain the failure and traceback tail for the ranks that
+# Slurm reports exiting.
+_RANK_LOG_TAIL_LINES = 120
+_RANK_LOG_LIMIT = 4
+_SLURM_STATUS_PERIOD_SECONDS = 5 * 60
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
 _CLEANUP_GRACE_MINUTES = 5
@@ -160,12 +167,16 @@ _PRETRAIN_ENV_NAMES = {
     "SLURM_TASKS_PER_NODE",
     "WORLD_SIZE",
 }
+# The daemon emits the perf counters, one line per rank per save, into its own
+# per-host log rather than the trainer's output.
 _BW_RE = re.compile(
-    r"\[native_ckpt:cli\]\[(\d+)\]\[INFO\]\[perf\] Finished "
-    r"bw_mbps=([0-9.]+).*?wr_tnsr_us=([0-9]+).*?total_written_bytes=([0-9]+)",
-    re.DOTALL,
+    r"\[native_ckpt:svr\]\[[^\]]*\]\[PERF\] Rank=(\d+) Finished "
+    r"bw_mbps=([0-9.]+)[^\n]*?wr_tnsr_us=([0-9]+)[^\n]*?total_written_bytes=([0-9]+)",
 )
-_MEM_RE = re.compile(r"\[native_ckpt:mem\] gpu_peak_bytes=(\d+) cpu_rss_bytes=(\d+)")
+_MEM_RE = re.compile(
+    r"\[native_ckpt:mem\](?: rank=(\d+))? gpu_peak_bytes=(\d+)"
+    r"(?: gpu_hbm_peak_bytes=(\d+) gpu_total_bytes=(\d+))? cpu_rss_bytes=(\d+)",
+)
 _PHASE2_MARKER = "[native_ckpt:phase] phase=2"
 _SAVE_RE = re.compile(r"successfully saved (?:async )?checkpoint from iteration\s+\d+\s+to\s+(\S+)")
 _ARGUMENTS_RE = re.compile(
@@ -464,7 +475,13 @@ def ensure_vcpkg_root() -> None:
     sys_path_insert(Path(os.environ["SLURMJOB_OPT_PYTHON_INSTALL_DIR"]))
 
 def uninstall_nvrx_for_native() -> None:
-    """Remove NVRx inside a marked native worker container and prove it is absent."""
+    """Hide NVRx inside a marked native worker container and prove it is absent.
+
+    ``pip uninstall`` can block indefinitely when several allocated nodes
+    mutate their writable container overlays together. Renaming the package
+    and its metadata on the same filesystem is atomic, bounded, and reversible
+    until the ephemeral container exits.
+    """
     if RUN_ROOT is None:
         raise RuntimeError("run directory is not configured")
     host = socket.gethostname().split(".", 1)[0]
@@ -475,23 +492,26 @@ def uninstall_nvrx_for_native() -> None:
         # package inspection/removal while retaining one lock per node at large scale.
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            importlib.metadata.distribution(_NVRX_DISTRIBUTION)
+            distribution = importlib.metadata.distribution(_NVRX_DISTRIBUTION)
         except importlib.metadata.PackageNotFoundError:
             logger.info(f"[slurm_job] {_NVRX_DISTRIBUTION} is already uninstalled")
         else:
-            logger.info(f"[slurm_job] uninstalling {_NVRX_DISTRIBUTION} for native perf verification")
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "uninstall",
-                    "--yes",
-                    "--break-system-packages",
-                    _NVRX_DISTRIBUTION,
-                ],
-                check=True,
-            )
+            spec = importlib.util.find_spec(_NVRX_MODULE)
+            locations = list(spec.submodule_search_locations or ()) if spec is not None else []
+            module_path = Path(locations[0] if locations else spec.origin or "") if spec is not None else None
+            metadata_path = Path(getattr(distribution, "_path", ""))
+            if module_path is None or module_path.name != _NVRX_MODULE:
+                raise RuntimeError(f"cannot safely locate {_NVRX_MODULE} for native perf verification")
+            if not metadata_path.name.endswith((".dist-info", ".egg-info")):
+                raise RuntimeError(f"cannot safely locate {_NVRX_DISTRIBUTION} metadata: {metadata_path}")
+            quarantine = f"ci-disabled-{os.environ.get('SLURM_JOB_ID', 'allocation')}-{host}"
+            logger.info(f"[slurm_job] quarantining {_NVRX_DISTRIBUTION} for native perf verification")
+            for source in (module_path, metadata_path):
+                target = source.with_name(f".{source.name}.{quarantine}")
+                if target.exists():
+                    raise RuntimeError(f"native perf quarantine already exists: {target}")
+                source.rename(target)
+                logger.info(f"[slurm_job] quarantined {source} as {target}")
         importlib.invalidate_caches()
         try:
             importlib.metadata.distribution(_NVRX_DISTRIBUTION)
@@ -692,6 +712,60 @@ def _cancel_slurm_job(job_id: str) -> None:
     if proc.returncode:
         logger.warning(f"[slurm_job] scancel exited with code {proc.returncode} for job {job_id}")
 
+def _report_queue_status(job_id: str) -> None:
+    """Print a non-fatal scheduler heartbeat for a submitted allocation."""
+    command = [
+        "squeue", "--noheader", "--jobs", job_id,
+        "--format=%i|%T|%M|%l|%S|%R",
+    ]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S607
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if proc.returncode:
+        logger.warning(
+            f"[slurm_job:status] {timestamp} squeue failed for job {job_id}: "
+            f"{proc.stderr.strip() or f'exit {proc.returncode}'}",
+        )
+        return
+    rows = proc.stdout.strip().splitlines()
+    if not rows:
+        logger.info(f"[slurm_job:status] {timestamp} job {job_id} is no longer listed by squeue")
+        return
+    logger.info("[slurm_job:status] JobID|State|Elapsed|TimeLimit|StartTime|Nodes/Reason")
+    for row in rows:
+        logger.info(f"[slurm_job:status] {timestamp}|{row}")
+
+def _wait_for_submission(
+    submit: subprocess.Popen,
+    job_id: str,
+    period_seconds: int = _SLURM_STATUS_PERIOD_SECONDS,
+) -> int:
+    """Wait for sbatch while reporting scheduler state at a bounded cadence."""
+    while True:
+        try:
+            return submit.wait(timeout=period_seconds)
+        except subprocess.TimeoutExpired:
+            _report_queue_status(job_id)
+
+def _report_allocation_accounting(job_id: str) -> None:
+    """Print allocation and step accounting without changing job outcome."""
+    command = [
+        "sacct", "-n", "-P", "--local", "-j", job_id,
+        "-o", "JobIDRaw,JobName%30,State,Elapsed,Timelimit,ExitCode,DerivedExitCode,NodeList%40,MaxRSS",
+    ]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S607
+    if proc.returncode:
+        logger.warning(
+            f"[slurm_job:sacct] accounting unavailable for job {job_id}: "
+            f"{proc.stderr.strip() or f'exit {proc.returncode}'}",
+        )
+        return
+    logger.info(
+        "[slurm_job:sacct] JobID|JobName|State|Elapsed|TimeLimit|ExitCode|"
+        "DerivedExitCode|NodeList|MaxRSS",
+    )
+    for row in proc.stdout.strip().splitlines():
+        logger.info(f"[slurm_job:sacct] {row}")
+
 def _verify_allocation(job_id: str, rc: int) -> None:
     command = ["sacct", "-X", "-n", "-P", "--local", "-j", job_id, "-o", "JobIDRaw,State,ExitCode,DerivedExitCode"]
     for _attempt in range(30):
@@ -705,6 +779,7 @@ def _verify_allocation(job_id: str, rc: int) -> None:
         time.sleep(1)
     else:
         raise RuntimeError(f"sacct did not report Slurm allocation {job_id}")
+    _report_allocation_accounting(job_id)
     codes = row[2:]
     clean = all(code == "0:0" for code in codes)
     soft = rc == SOFT_FAIL_RC and state == "FAILED" and all(code.endswith(":0") for code in codes) and any(
@@ -759,7 +834,7 @@ def sbatch_run(
             raise RuntimeError("failed to capture sbatch submission output")
         job_id = _record_submission(submit.stdout.readline(), script_path)
         with _cancel_on_signal(job_id):
-            rc = submit.wait()
+            rc = _wait_for_submission(submit, job_id)
     finally:
         if submit.poll() is None:
             submit.terminate()
@@ -770,6 +845,49 @@ def sbatch_run(
             tail.wait(timeout=5)
     _verify_allocation(job_id, rc)
     return rc
+
+def _transient_nccl_proxy_failure(log: Path) -> bool:
+    """Recognize the recurrent NCCL InfiniBand proxy crash, and only that crash."""
+    if not log.exists():
+        return False
+    text = log.read_text(errors="replace")
+    return all(marker in text for marker in ("Segfault encountered", "ncclIbMultiSend", "sendProxyProgress"))
+
+def _clean_run_for_retry() -> None:
+    """Remove one failed job's outputs while retaining its shared build caches."""
+    if RUN_ROOT is None or RESULTS_DIR is None or WORK_ROOT is None or RUN_NAME is None:
+        raise RuntimeError("run directory is not configured")
+    if RUN_ROOT.is_symlink() or RUN_ROOT.parent != WORK_ROOT or RUN_ROOT.name != RUN_NAME:
+        raise RuntimeError(f"refusing to clean unsafe retry directory: {RUN_ROOT}")
+    logger.warning(f"[slurm_job:retry] cleaning failed run before retry: {RUN_ROOT}")
+    shutil.rmtree(RUN_ROOT)
+    RESULTS_DIR.mkdir(parents=True)
+
+def _sbatch_run_with_retry(
+    script: str,
+    log: Path,
+    *,
+    extra_sbatch_args: list[str],
+    background: bool,
+    dry_run: bool,
+) -> int:
+    """Retry one clean allocation only for the known transient NCCL proxy crash."""
+    try:
+        return sbatch_run(
+            script, log,
+            extra_sbatch_args=extra_sbatch_args,
+            background=background,
+            dry_run=dry_run,
+        )
+    except RuntimeError:
+        if background or dry_run or not _transient_nccl_proxy_failure(log):
+            raise
+        logger.warning(
+            "[slurm_job:retry] NCCL InfiniBand proxy segfault detected; "
+            "retrying once on a clean allocation",
+        )
+        _clean_run_for_retry()
+        return sbatch_run(script, log, extra_sbatch_args=extra_sbatch_args)
 
 def _tee_rc(
     cmd: list[str],
@@ -791,6 +909,16 @@ def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: 
     if rc not in (0, SOFT_FAIL_RC):
         raise RuntimeError(f"job failed with exit code {rc}; log: {log_file}")
     return rc
+
+def _rank_memory_measurements(job_log: Path) -> str:
+    """Collect final memory records from every rank log belonging to a job."""
+    if job_log.parent.name != "logs":
+        return ""
+    run_root = job_log.parent.parent
+    records = []
+    for path in sorted(run_root.glob("**/logs/*-routine_rank*.log")):
+        records.extend(match.group(0) for match in _MEM_RE.finditer(path.read_text(errors="replace")))
+    return "\n".join(records)
 
 class PerfReport:
     @staticmethod
@@ -828,9 +956,27 @@ class PerfReport:
         }
 
     @staticmethod
-    def _parse_metrics(text: str, gpus_per_node: int | None = None) -> dict:
+    def _daemon_text(results_dir: Path) -> str:
+        """Concatenate the daemon logs of the newest measured cycle.
+
+        Every host writes its own log and the daemon restarts each cycle, so the newest
+        cycle is the routine a baseline is made of — the same routine the trainer log's
+        last phase-2 marker selects.
+        """
+        by_cycle: dict[int, list[Path]] = {}
+        for path in results_dir.glob("checkpoint_server.cycle*.log"):
+            tag = path.name.split(".")[1]
+            if tag.startswith("cycle") and tag[5:].isdigit():
+                by_cycle.setdefault(int(tag[5:]), []).append(path)
+        if not by_cycle:
+            return ""
+        return "\n".join(p.read_text(errors="replace") for p in sorted(by_cycle[max(by_cycle)]))
+
+    @staticmethod
+    def _parse_metrics(text: str, gpus_per_node: int | None = None, daemon_text: str | None = None) -> dict:
         text = text[text.rfind(_PHASE2_MARKER) :] if _PHASE2_MARKER in text else text
-        matches = list(_BW_RE.finditer(text))
+        # The memory records come from the ranks; the bandwidth counters from the daemon.
+        matches = list(_BW_RE.finditer(text if daemon_text is None else daemon_text))
         metrics: dict = {}
         if matches:
             ranks = [int(m[1]) for m in matches]
@@ -849,15 +995,36 @@ class PerfReport:
                 metrics["bw_socket_imbalance"] = PerfReport._metric([max(means) / min(means)], "ratio", None)
         memory = list(_MEM_RE.finditer(text))
         if memory:
-            metrics["gpu_peak_bytes"] = PerfReport._metric([int(m[1]) for m in memory], "B", False)
+            ranks = [int(m[1]) for m in memory if m[1] is not None]
+            memory_ranks = ranks if len(ranks) == len(memory) else None
+            metrics["gpu_peak_bytes"] = PerfReport._metric(
+                [int(m[2]) for m in memory], "B", False, memory_ranks,
+            )
+            hbm = [(int(m[3]), int(m[4])) for m in memory if m[3] is not None and m[4] is not None]
+            if hbm:
+                hbm_ranks = ranks if len(ranks) == len(hbm) else None
+                metrics["gpu_hbm_peak_bytes"] = PerfReport._metric(
+                    [used for used, _total in hbm], "B", False, hbm_ranks,
+                )
+                metrics["gpu_hbm_peak_pct"] = PerfReport._metric(
+                    [used * 100 / total for used, total in hbm], "%", False, hbm_ranks,
+                )
         return metrics
+
+    @staticmethod
+    def _statistic(name: str, measured: dict) -> str:
+        if name in {"gpu_hbm_peak_bytes", "gpu_hbm_peak_pct"} and "max" in measured:
+            return "max"
+        if name in {"bw_mbps", "wr_tnsr_us"} and "median" in measured:
+            return "median"
+        return "mean"
 
     @staticmethod
     def _compare_to_baseline(metrics: dict, baseline: dict, default_tolerance: float) -> tuple[dict, bool]:
         expected, tolerances = baseline.get("metrics", {}), baseline.get("tolerances", {})
         result, passed = {}, True
         for name, measured in metrics.items():
-            statistic = "median" if name in {"bw_mbps", "wr_tnsr_us"} and "median" in measured else "mean"
+            statistic = PerfReport._statistic(name, measured)
             value, higher = measured[statistic], measured["higher_is_better"]
             if name == "bw_socket_imbalance":
                 ok, target, tolerance = value <= MAX_BW_SOCKET_IMBALANCE, MAX_BW_SOCKET_IMBALANCE, 0
@@ -891,13 +1058,18 @@ class PerfReport:
         for line in text.splitlines():
             if "save-checkpoint" in line or "load-checkpoint" in line:
                 logger.info(line)
-        metrics = PerfReport._parse_metrics(text, gpus)
+        # Rank 0 is the only routine log mirrored into the combined job log.
+        # Read the short per-rank memory records so the HBM peak describes the
+        # most heavily loaded GPU rather than whichever GPU owns global rank 0.
+        memory = _rank_memory_measurements(log)
+        metric_text = f"{_MEM_RE.sub('', text)}\n{memory}" if memory else text
+        metrics = PerfReport._parse_metrics(metric_text, gpus, PerfReport._daemon_text(log.parent))
         # The extension's own writer emits checkpoint times rather than the
         # bandwidth counters a baseline is made of, so it has nothing to compare.
         if not metrics and "native" not in flavor.split("-"):
             return True
         if not metrics:
-            raise RuntimeError(f"no perf metrics found in {log}")
+            raise RuntimeError(f"no perf metrics found in {log} or the daemon logs beside it")
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
         for name, value in comparison.items():
             logger.info(f"[{value['status']}] {name}: {value['measured']}")
@@ -926,18 +1098,14 @@ def _argument_values(text: str) -> dict[str, str]:
             values[name] = value.strip().strip(".").strip()
     return values
 
-def _arguments_stem(args: argparse.Namespace) -> str:
-    """The name the options a job trains on are recorded under.
-
-    A job reports the options of the last run it trained, so two jobs that
-    differ only in that run train on different options and cannot share a
-    name. The variants that run adds are what tells them apart.
-    """
+def _arguments_stem(args: argparse.Namespace, variants: tuple[str, ...] | None = None) -> str:
+    """The baseline name for one run's resolved Megatron options."""
     stem = _identity(args)[2]
-    variants = next((spec.variants for spec in reversed(_run_specs(args)) if spec.variants), ())
+    if variants is None:
+        variants = next((spec.variants for spec in reversed(_run_specs(args)) if spec.variants), ())
     return f"{stem}-{'-'.join(variants)}" if variants else stem
 
-def _compare_arguments(args: argparse.Namespace, log: Path) -> bool:
+def _compare_arguments(args: argparse.Namespace, log: Path, variants: tuple[str, ...] = ()) -> bool:
     """Report how the options this run trained on differ from the recorded ones.
 
     An option that changes changes what the run's checkpoints mean, so a run
@@ -945,16 +1113,16 @@ def _compare_arguments(args: argparse.Namespace, log: Path) -> bool:
     marks the job. The candidate beside this run's logs is what a reviewer
     adopts to accept the change.
     """
-    stem = _arguments_stem(args)
+    stem = _arguments_stem(args, variants)
     candidate = log.parent / "baselines" / f"{stem}_arguments.txt"
     recorded = BASELINES_DIR / f"{stem}_arguments.txt"
     if not candidate.exists():
-        logger.info(f"[slurm_job:args] {stem}: this run recorded no arguments")
+        logger.warning(f"[slurm_job:args] WARNING {stem}: this run recorded no arguments")
         return False
     if not recorded.exists():
-        logger.info(
-            f"[slurm_job:args] {stem}: nothing to compare against; adopt "
-            f"{candidate.name} from this job's baseline artifacts into {BASELINES_DIR.name}/",
+        logger.warning(
+            f"[slurm_job:args] WARNING {stem}: no recorded arguments to compare against; "
+            f"adopt {candidate.name} from this job's artifacts into {BASELINES_DIR.name}/",
         )
         return False
     produced, expected = (_argument_values(path.read_text(errors="replace")) for path in (candidate, recorded))
@@ -962,7 +1130,7 @@ def _compare_arguments(args: argparse.Namespace, log: Path) -> bool:
     # run whose arguments could not be read has compared nothing and says so.
     for name, values, path in (("recorded", expected, recorded), ("produced", produced, candidate)):
         if not values:
-            logger.info(f"[slurm_job:args] {stem}: no options read from the {name} arguments in {path}")
+            logger.warning(f"[slurm_job:args] WARNING {stem}: no options read from the {name} arguments in {path}")
             return False
     differences = [
         f"{name}: {expected.get(name, '<unset>')} -> {produced.get(name, '<unset>')}"
@@ -970,12 +1138,63 @@ def _compare_arguments(args: argparse.Namespace, log: Path) -> bool:
         if expected.get(name) != produced.get(name)
     ]
     for difference in differences:
-        logger.info(f"[slurm_job:args] {stem} {difference}")
-    logger.info(f"[slurm_job:args] {stem}: {len(differences)} of {len(expected)} options differ from the recorded run")
+        logger.warning(f"[slurm_job:args] WARNING {stem} {difference}")
+    report = logger.warning if differences else logger.info
+    report(f"[slurm_job:args] {stem}: {len(differences)} of {len(expected)} options differ from the recorded run")
     return not differences
 
-def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
-    _cfg, _flavor, stem = _identity(args)
+# The line may carry a timestamp or stream prefix from the log reader, so
+# match the srun diagnostic anywhere within it. Ranks reported as Terminated
+# are consequences of another task failing and deliberately do not match.
+_SRUN_EXITED_RE = re.compile(r"srun: error: \S+: tasks? ([\d,-]+): Exited with exit code \d+")
+
+def _failing_ranks(text: str) -> list[int]:
+    """Return the ranks that srun reports exiting before it terminates the step."""
+    ranks: list[int] = []
+    for spec in _SRUN_EXITED_RE.findall(text):
+        for part in spec.split(","):
+            first, separator, last = part.partition("-")
+            ranks.extend(range(int(first), int(last if separator else first) + 1))
+    return sorted(dict.fromkeys(ranks))
+
+def _rank_logs(run_log: Path, rank: int) -> list[Path]:
+    """Find a rank's logs in both single-run and nested multi-run layouts."""
+    run_root = run_log.parent.parent
+    return sorted(path for path in run_root.glob(f"**/logs/*_rank{rank}.log") if path.is_file())
+
+def _report_failing_rank_logs(
+    run_log: Path,
+    *,
+    rank_limit: int = _RANK_LOG_LIMIT,
+    tail_lines: int = _RANK_LOG_TAIL_LINES,
+) -> None:
+    """Mirror failing ranks' log tails into the Slurm and GitLab job trace."""
+    ranks = _failing_ranks(run_log.read_text(errors="replace")) if run_log.exists() else []
+    if not ranks:
+        return
+    logger.info(
+        f"[slurm_job:rank] srun reports rank(s) {', '.join(map(str, ranks))} exited; "
+        "the remaining ranks were terminated",
+    )
+    for rank in ranks[:rank_limit]:
+        paths = _rank_logs(run_log, rank)
+        if not paths:
+            logger.warning(f"[slurm_job:rank] no rank log found for exited rank {rank}")
+            continue
+        for path in paths:
+            tail = path.read_text(errors="replace").splitlines()[-tail_lines:]
+            display = path.relative_to(run_log.parent.parent)
+            logger.info(f"[slurm_job:rank] ---- last {len(tail)} lines of {display} ----")
+            for line in tail:
+                logger.info(f"[slurm_job:rank{rank}] {line}")
+    if len(ranks) > rank_limit:
+        logger.info(
+            f"[slurm_job:rank] {len(ranks) - rank_limit} additional exited rank(s) "
+            "remain available in the job artifacts",
+        )
+
+def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tuple[str, ...] = ()) -> Path:
+    """Write the stable argument block from one run beside that run's logs."""
     output = log.parent / "baselines"
     output.mkdir(parents=True, exist_ok=True)
     text = re.sub(r"(?m)^\s*\d+:\s?", "", log.read_text(errors="replace"))
@@ -987,10 +1206,54 @@ def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
         if line.startswith("-") or re.match(r"^  [A-Za-z_]\w*(?: \.+ | {2})", line)
     ]
     volatile = re.compile(r"^  (?:data_cache_path|load|save|tensorboard_dir) ")
-    # The options come from the last run the job trained, so the candidate is
-    # named for that run rather than for the job as a whole.
-    arguments = output / f"{_arguments_stem(args)}_arguments.txt"
+    arguments = output / f"{_arguments_stem(args, variants)}_arguments.txt"
     arguments.write_text("\n".join(line for line in lines if not volatile.match(line)) + "\n")
+    return arguments
+
+def _argument_log(args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
+    """Return the rank-0 log containing a particular run's argument blocks."""
+    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
+    run_root = batch_log.parent.parent
+    run = run_root / _run_dir_name(spec) if spec.name else run_root
+    return run / "logs" / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
+
+def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, strict: bool = True) -> bool:
+    """Generate, compare and retain arguments for every run the job executed."""
+    results = []
+    specs = _run_specs(args)
+    for spec in specs:
+        log = _argument_log(args, batch_log, spec)
+        # A unit/local epilog may only have the combined log. Real multi-run
+        # jobs always have one rank-0 log per run and must not fall back.
+        if not log.exists() and len(specs) == 1:
+            log = batch_log
+        if not log.exists():
+            message = f"argument log for run {spec.name!r} does not exist: {log}"
+            if strict:
+                raise RuntimeError(message)
+            logger.warning(f"[slurm_job:args] WARNING {message}")
+            continue
+        try:
+            _write_arguments_artifact(args, log, spec.variants)
+        except RuntimeError:
+            if strict:
+                raise
+            logger.warning(f"[slurm_job:args] WARNING no complete arguments in {log}")
+            continue
+        results.append(_compare_arguments(args, log, spec.variants))
+    return len(results) == len(specs) and all(results)
+
+def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
+    """Write measured metrics from the job-level report as a candidate baseline."""
+    flavors = _selected_flavors(args)
+    # NVRX does not expose the native writer's bandwidth counters. Keep its
+    # report as raw diagnostic output without pretending the memory-only data
+    # is a comparable checkpoint-performance baseline.
+    if "perf" not in flavors.names or "nvrx" in flavors.names:
+        return
+    _cfg, _flavor, stem = _identity(args)
+    output = log.parent / "baselines"
+    output.mkdir(parents=True, exist_ok=True)
 
     report_path = log.with_name(f"{stem}_report.json")
     if not report_path.exists():
@@ -998,11 +1261,15 @@ def _write_baseline_artifacts(args: argparse.Namespace, log: Path) -> None:
     measured = json.loads(report_path.read_text()).get("metrics", {})
     metrics = {}
     for name, value in measured.items():
-        if name in {"bw_mbps", "bw_socket_imbalance"}:
+        # Socket imbalance is an in-job topology diagnostic rather than a
+        # workload baseline. The measured bandwidth belongs in the candidate
+        # even though the shared platform floor remains the enforced gate.
+        if name == "bw_socket_imbalance":
             continue
-        statistic = "median" if name == "wr_tnsr_us" else "mean"
+        statistic = PerfReport._statistic(name, value)
         if statistic in value:
-            metrics[name] = round(value[statistic])
+            measured_value = value[statistic]
+            metrics[name] = round(measured_value, 2) if name.endswith("_pct") else round(measured_value)
     if metrics:
         baseline = {"description": "auto-generated by CI", "metrics": metrics}
         (output / f"{stem}.yaml").write_text(yaml.safe_dump(baseline, sort_keys=False))
@@ -1212,12 +1479,15 @@ class PerfFlavor(Flavor):
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
+        baseline = args.baseline if hasattr(args, "baseline") else PerfReport.baseline(stem)
+        if "nvrx" in _selected_flavors(args).names:
+            baseline = {}
         return PerfReport.parse_and_report(
             _selected_flavors(args).tag,
             cfg,
             tag,
             log,
-            args.baseline if hasattr(args, "baseline") else PerfReport.baseline(stem),
+            baseline,
             log.with_name(f"{stem}_report.json"),
             args.gpus_per_node,
         )
@@ -1227,7 +1497,10 @@ class PerfFlavor(Flavor):
         # checkpoint structure on the first save and reuses it after that.
         _set(opts, "--ckpt-assume-constant-structure")
         if "--cuda-graph-impl" in opts and "--recompute-granularity" in opts:
-            _drop(opts, "--recompute-granularity", "--recompute-modules")
+            # Attention-only graph capture and selective MoE recomputation have
+            # completed the 16-node Super3 BF16 workload together. Retain the
+            # profile's memory policy: dropping it leaves less free HBM than
+            # fused cross entropy's single 3.91 GiB allocation requires.
             if "--async-save" in opts:
                 _set(opts, "--async-ckpt-use-cpu-shm")
 
@@ -1324,9 +1597,10 @@ class ValgrindFlavor(Flavor):
             "--recompute-granularity",
             "--recompute-modules",
         )
-        # Memcheck can perturb model numerics enough to trip Megatron's result
-        # validation and request a cross-GPU rerun (exit 16). This gate validates
-        # the checkpoint server's memory safety, not training numerics.
+        # Memcheck can perturb model numerics enough to request Megatron's
+        # cross-GPU rerun (exit 16), which is not useful for this gate. Keep the
+        # independent training NaN abort enabled: corruption may surface there
+        # even when memcheck does not diagnose it.
         _set(opts, "--rerun-mode", "disabled")
         env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
 
@@ -1800,6 +2074,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         cmd, env = _phase_command(cfg, args, provider, phase, cycle)
         log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{os.environ.get('SLURM_PROCID', '0')}.log" if label else None
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
+        # The daemon carries the perf counters now, and it is restarted per cycle. Name its
+        # log for the cycle so the report can tell the measured routine from the reference.
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
         if os.environ.get("SLURM_PROCID", "0") == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
         with (
@@ -2167,6 +2444,43 @@ def _print_source_provenance() -> None:
         version = "unknown"
     print(f"[native_ckpt:sources] nvidia_resiliency_ext={nvidia_resiliency_ext.__file__}@{version}", flush=True)  # noqa: T201
 
+class _PeakHbmSampler:
+    """Sample whole-device HBM use after training initializes its CUDA device."""
+
+    def __init__(self, torch_module: ModuleType, interval_seconds: float = 1.0):
+        self.torch = torch_module
+        self.interval_seconds = interval_seconds
+        self.peak_bytes = 0
+        self.total_bytes = 0
+        self.device: int | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="peak-hbm-sampler", daemon=True)
+
+    def _sample_once(self) -> None:
+        if not self.torch.cuda.is_initialized():
+            return
+        if self.device is None:
+            requested = int(os.environ.get("LOCAL_RANK", "0"))
+            count = self.torch.cuda.device_count()
+            self.device = requested if requested < count else self.torch.cuda.current_device()
+        free, total = self.torch.cuda.mem_get_info(self.device)
+        self.peak_bytes = max(self.peak_bytes, total - free)
+        self.total_bytes = total
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            with contextlib.suppress(Exception):
+                self._sample_once()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+        with contextlib.suppress(Exception):
+            self._sample_once()
+
 def _pretrain_entry(phase: int) -> None:
     sys_path_insert(megatron_root())
     if _install_torch_serialization_compat() and os.environ.get("SLURM_PROCID", "0") == "0":
@@ -2208,6 +2522,10 @@ def _pretrain_entry(phase: int) -> None:
         args_defaults={"tokenizer_type": "NullTokenizer"},
     )
     model_cfg = hybrid_config_from_args(args)
+    import torch  # noqa: PLC0415
+
+    hbm = _PeakHbmSampler(torch)
+    hbm.start()
     try:
         pretrain_fn(
             pretrain_cfg_container_from_args(args, model_cfg),
@@ -2218,15 +2536,16 @@ def _pretrain_entry(phase: int) -> None:
             store=store,
         )
     finally:
-        if rank0:
-            import resource  # noqa: I001, PLC0415
-            import torch  # noqa: PLC0415
+        import resource  # noqa: I001, PLC0415
 
-            print(  # noqa: T201
-                f"[native_ckpt:mem] gpu_peak_bytes={torch.cuda.max_memory_allocated()} "
-                f"cpu_rss_bytes={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}",
-                flush=True,
-            )
+        hbm.close()
+        gpu_peak = torch.cuda.max_memory_allocated(hbm.device) if torch.cuda.is_initialized() else 0
+        print(  # noqa: T201
+            f"[native_ckpt:mem] rank={os.environ.get('RANK', '0')} gpu_peak_bytes={gpu_peak} "
+            f"gpu_hbm_peak_bytes={hbm.peak_bytes} gpu_total_bytes={hbm.total_bytes} "
+            f"cpu_rss_bytes={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}",
+            flush=True,
+        )
 
 def _worker(args: argparse.Namespace) -> None:
     flavors = _selected_flavors(args)
@@ -2307,6 +2626,10 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
         "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *epilog_args,
         "--log-file", str(log), "--baseline-json", json.dumps(PerfReport.baseline(stem), separators=(",", ":")),
     ]
+    rank_logs = [
+        "python3", "-u", str(Path(__file__).resolve()), _RANK_LOGS_ENTRY_CMD, *epilog_args,
+        "--log-file", str(log),
+    ]
     host_cleanup = [
         *build_srun_cmd(
             nodes=args.nodes, ntasks=args.nodes, total_gpus=total_tasks, container_env="",
@@ -2338,7 +2661,13 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
         f"exec > >({shell_join(['tee', str(log)])}) 2>&1",
         'printf "%s\\n" "${SLURM_JOB_ID:?}" > "${SLURMJOB_OPT_RUN_DIR:?}/job_id"',
         shell_join(prep),
-        shell_join(run),
+        # Only rank 0 is streamed during a run. If srun fails, show the logs of
+        # the ranks it says exited before propagating the original return code.
+        f"{shell_join(run)} && run_rc=0 || run_rc=$?",
+        "if (( run_rc != 0 )); then",
+        f"  {shell_join(rank_logs)} || true",
+        '  exit "${run_rc}"',
+        "fi",
         shell_join(epilog),
     ]
     script, reaper = build_sbatch_script(
@@ -2468,6 +2797,20 @@ def _parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) 
         setattr(args, dest, value)
     return args, extra
 
+def _rank_logs_entry(argv: list[str]) -> None:
+    """Preserve available arguments and show logs of ranks named by srun."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    parser = _parser()
+    parser.add_argument("--log-file", type=Path, required=True)
+    args, _extra = _parse_args(parser, argv)
+    args.flavors = FlavorSelection(args.flavor)
+    _selected_flavors(args)
+    _report_failing_rank_logs(args.log_file)
+    # The regular epilog is not reached after srun fails. Retain and compare
+    # every argument block that was completed before the failure so failed jobs
+    # provide the same diagnostic artifacts as successful jobs.
+    _write_and_compare_arguments(args, args.log_file, strict=False)
+
 def _epilog(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = _parser()
@@ -2498,10 +2841,10 @@ def _epilog(argv: list[str]) -> None:
             f"expected at least {expected_phase1} and {expected_phase2}",
         )
     passed = args.flavors.policy.epilog(args, args.log_file)
-    _write_baseline_artifacts(args, args.log_file)
+    _write_performance_baseline(args, args.log_file)
     # The arguments a run trained on are part of what its result means, so they
     # are compared with the same standing as the numbers it produced.
-    passed = _compare_arguments(args, args.log_file) and passed
+    passed = _write_and_compare_arguments(args, args.log_file) and passed
     if not passed:
         raise SystemExit(SOFT_FAIL_RC)
 
@@ -2571,7 +2914,7 @@ def main() -> None:
     if not args.dry_run and args.flavors.policy.install_prebuilt:
         wheel_install.install_prebuilt_wheel(probe=False)
     script, reaper, log = _build_job(args)
-    rc = sbatch_run(
+    rc = _sbatch_run_with_retry(
         script, log,
         extra_sbatch_args=[reaper],
         background=args.background,
@@ -2641,5 +2984,7 @@ if __name__ == "__main__":
         _pretrain_entry(phase)
     elif len(sys.argv) > 1 and sys.argv[1] == _EPILOG_ENTRY_CMD:
         _epilog(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == _RANK_LOGS_ENTRY_CMD:
+        _rank_logs_entry(sys.argv[2:])
     else:
         main()

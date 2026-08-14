@@ -2,6 +2,7 @@ import io
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -202,6 +203,19 @@ def _wait_for_ckpt_finalize(session_id: int, iteration: int) -> None:
     checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 
 
+def _timestamp() -> str:
+    """Megatron stamps its checkpoint lines with this, so ours read the same in a job log."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  # noqa: DTZ005
+
+
+def _parallel_ranks() -> str:
+    """Megatron's `[ t x/y, p a/b ]` suffix, naming the writer's tensor and pipeline rank."""
+    return (
+        f"[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, "
+        f"p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]"
+    )
+
+
 def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
     """Advance the tracker file so the loader resolves ``iteration`` as the latest checkpoint."""
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -224,7 +238,10 @@ def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
 
         def finalize_fn() -> None:
             _write_checkpoint_tracker(args, iteration)
-            print_rank_0(f"  successfully saved async checkpoint from iteration {iteration:7d} to {args.save}")
+            print_rank_0(
+                f"  [{_timestamp()}] successfully saved "
+                f"checkpoint from iteration {iteration:7d} to {args.save} {_parallel_ranks()}",
+            )
 
         schedule_async_save(
             AsyncRequest(
@@ -233,13 +250,19 @@ def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
                 finalize_fns=[finalize_fn],
             ),
         )
-        print_rank_0(f"  scheduled async checkpoint finalize from iteration {iteration:7d} to {args.save}")
+        print_rank_0(
+            f"  [{_timestamp()}] scheduled "
+            f"an async checkpoint save at iteration {iteration:7d} to {args.save}",
+        )
         return
 
     _write_checkpoint_tracker(args, iteration)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    print_rank_0(f"  successfully saved checkpoint from iteration {iteration:7d} to {args.save}")
+    print_rank_0(
+        f"  [{_timestamp()}] successfully saved "
+        f"checkpoint from iteration {iteration:7d} to {args.save} {_parallel_ranks()}",
+    )
 
 
 def save_checkpoint(  # noqa: PLR0913
@@ -327,7 +350,11 @@ def _save_checkpoint_impl(  # noqa: PLR0913
         fresh = _fresh_sharded_tensors(model, optimizer, _build_sharded_state_dict_metadata(args))
         register_state_dict.root.refresh_sharded_tensors(fresh)
 
-    print_rank_0(f"saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format")
+    # The writer emits torch_dist whatever --ckpt-format asks for, so name what it writes.
+    print_rank_0(
+        f"[{_timestamp()}] saving checkpoint "
+        f"at iteration {iteration:7d} to {args.save} in torch_dist format",
+    )
     save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
     _finalize_checkpoint(args, iteration)
 

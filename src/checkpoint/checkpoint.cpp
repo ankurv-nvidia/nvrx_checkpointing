@@ -70,26 +70,26 @@ void SvcPing()
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }
-    
-            try
-        {
-            boost::asio::io_context    ctx;
-            boost::asio::readable_pipe output(ctx);
-            boost::process::process    proc(ctx, svcExeLoc, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
-            std::string                line;
-            boost::system::error_code  ec;
-            boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
-            proc.detach();
-        } catch (std::exception const& ex)
-        {
-            fmt::print(stderr,
-                       "[native_ckpt:cli][ERROR] Exception in SvcPing from {} svcbin={}: {}\n",
-                       selfLoc.string(),
-                       svcExeLoc.string(),
-                       ex.what());
-            throw;
-        }
-   
+
+    try
+    {
+        boost::asio::io_context    ctx;
+        boost::asio::readable_pipe output(ctx);
+        boost::process::process    proc(ctx, svcExeLoc, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
+        std::string                line;
+        boost::system::error_code  ec;
+        boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
+        proc.detach();
+    } catch (std::exception const& ex)
+    {
+        fmt::print(stderr,
+                   "[native_ckpt:cli][ERROR] Exception in SvcPing from {} svcbin={}: {}\n",
+                   selfLoc.string(),
+                   svcExeLoc.string(),
+                   ex.what());
+        throw;
+    }
+
     // Both the elected daemon and losing candidates write READY only after the
     // elected service answers a ping. The two short attempts inside TryConnect
     // cover a final scheduling edge without a second readiness policy here.
@@ -211,7 +211,7 @@ void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
     // The server holds the connection open with chunked heartbeats and only completes the response
     // once the snapshot is durable. No stream timeout is set, so the read blocks across heartbeats
     // for the full (possibly long) finalize rather than timing out.
-    boost::beast::flat_buffer                                           buffer;
+    boost::beast::flat_buffer                                            buffer;
     boost::beast::http::response_parser<boost::beast::http::string_body> parser;
     parser.body_limit(std::numeric_limits<std::uint64_t>::max());
     boost::beast::http::read(stream, buffer, parser, ec);
@@ -329,9 +329,9 @@ struct CheckpointWriter
     cipc::MsgQueue&             msgQueue   = *queueState->queue;
     int const                   numaNode   = queueState->numaNode;
     size_t const                slotSize   = msgQueue.SlotSize();    // runtime shm slot capacity, set by the server
-    std::atomic<size_t>         totalD2HRequests{0};
-    std::atomic<size_t>         smallD2HRequests{0};
-    std::atomic<size_t>         totalWrittenBytes{0};
+    std::atomic<uint32_t>       totalD2HRequests{0};
+    std::atomic<uint32_t>       smallD2HRequests{0};
+    std::atomic<uint64_t>       totalWrittenBytes{0};
 
     TimePoint const start = Clock::now();
 
@@ -595,35 +595,38 @@ struct CheckpointWriter
                           msg.size());
         }
         WriteTensors(snapshotId);
-        auto stop2  = Clock::now();
-        auto wrTime = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(stop2 - stop1).count()) / 1e9;    // NOLINT
-        auto       bandwidth   = static_cast<double>(totalTensorStateSizeInBytes) / (1024 * 1024) / wrTime;
+        auto const stop2       = Clock::now();
         auto const d2hRequests = totalD2HRequests.load();
-        fmt::print(stderr,
-                   "[native_ckpt:cli][{}][INFO][perf] Finished bw_mbps={:.2f} "
-                   "| Time(us): dev_buf_init_us={} wr_tnsr_us={} total_us={} "
-                   "| Count: num_tensors={} small_d2h={} total_d2h={} "
-                   "| Bytes: total_written_bytes={} avg_d2h_rq={} avg_tnsr={}\n",
-                   root.GlobalRank(),
-                   bandwidth,
-                   std::chrono::duration_cast<std::chrono::microseconds>(stop1 - start).count(),
-                   std::chrono::duration_cast<std::chrono::microseconds>(stop2 - stop1).count(),
-                   std::chrono::duration_cast<std::chrono::microseconds>(stop2 - start).count(),
-                   numTensors,
-                   smallD2HRequests.load(),
-                   d2hRequests,
-                   totalWrittenBytes.load(),
-                   d2hRequests == 0 ? 0 : totalTensorStateSizeInBytes / d2hRequests,
-                   totalTensorStateSizeInBytes / std::max(numTensors, size_t{1u}));
+        auto const smallD2H    = smallD2HRequests.load();
+
+        if (smallD2H > 16)
+        {
+            throw std::runtime_error(
+                fmt::format("[native_ckpt:cli][{}][ERROR] Too many small d2h requests={} for total tensors={} total_d2h={}",
+                            root.GlobalRank(),
+                            smallD2H,
+                            numTensors,
+                            d2hRequests));
+        }
 
         if (totalWrittenBytes.load() != totalTensorStateSizeInBytes)
         {
-            throw std::runtime_error("Total written bytes does not match total tensor size");
+            throw std::runtime_error(
+                fmt::format("[native_ckpt:cli][{}][ERROR] Total written bytes does not match total tensor size: written={} expected={}",
+                            root.GlobalRank(),
+                            totalWrittenBytes.load(),
+                            totalTensorStateSizeInBytes));
         }
-        msgQueue.Push(
-            {cipc::Message::FinalizeSnapshot{.sessionId = cipc::SessionId{0}, .globalRank = root.GlobalRank(), .snapshotId = snapshotId}},
-            nullptr,
-            0);
+
+        msgQueue.Push({cipc::Message::FinalizeSnapshot{.sessionId          = cipc::SessionId{0},
+                                                       .globalRank         = root.GlobalRank(),
+                                                       .snapshotId         = snapshotId,
+                                                       .snapshotDuration   = stop2 - start,
+                                                       .d2hDuration        = stop2 - stop1,
+                                                       .d2hRequests        = totalD2HRequests.load(),
+                                                       .totalSnapshotBytes = totalWrittenBytes.load()}},
+                      nullptr,
+                      0);
     }
 };
 }    // namespace
@@ -633,7 +636,6 @@ void SaveCheckpoint(StateTree const&                         root,
                     std::filesystem::path const&             ckptPath,
                     std::span<StateTree::SnapshotBlob const> snapshotBlobs)
 {
-    fmt::print(stderr, "[native_ckpt:cli][{}][INFO] Saving Checkpoint to dir {}\n", root.GlobalRank(), ckptPath.string());
     CheckpointWriter writer{root};
     writer.SendToServer(snapshotId, ckptPath, snapshotBlobs);
 }
@@ -732,6 +734,9 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
 #endif
 #ifdef PHOENIX_HAVE_METAL
     if (device.IsType("mps"sv)) { return DeviceContext::CreateDeviceContextMTL(device, streamIdx); }
+#endif
+#if !defined(PHOENIX_HAVE_CUDA) && defined(PHOENIX_HAVE_METAL)
+    if (device.IsType("cuda"sv)) { return DeviceContext::CreateDeviceContextMTL(device, streamIdx); }
 #endif
     // Falling through to CPU on an unmatched device type silently maps a
     // CUDA / MPS device address to CPUContext::AddD2H, which does

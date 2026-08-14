@@ -233,8 +233,11 @@ expanded `ci/gitlab-ci-native.yml`; `--check` verifies that it is current.
 Each optional group has its own stage, where GitLab's **Run all manual**
 action launches the full group.
 
-Every workload also uploads a candidate `<stem>_arguments.txt` and, when
-checkpoint metrics are available, a candidate `<stem>.yaml`. The final
+Every run also uploads and compares its own candidate `<stem>_arguments.txt`.
+Native perf jobs also upload a candidate `<stem>.yaml` containing measured
+bandwidth and the maximum whole-device HBM use in bytes and percent across all
+ranks. NVRX perf jobs retain raw reports but do not produce or enforce performance
+baselines. The final
 `baseline-artifacts:<suite>` job collects the candidates from that suite into
 a single `ci/baselines/` artifact that can be downloaded and overlaid on the
 checkout for review. `platform_bw_mbps.yaml` remains the shared, explicitly

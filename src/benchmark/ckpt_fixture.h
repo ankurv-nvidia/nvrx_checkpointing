@@ -18,8 +18,10 @@ using FixtureFunc = void (*)(StateTree& tree, std::filesystem::path const& ckptD
 
 struct CheckpointTestContext
 {
-    bool                                           outofproc{false};
-    uint16_t                                       nodes{};
+    bool     outofproc{false};
+    uint16_t ranksPerNode{4};
+    uint64_t memLimit{4ull * 1024 * 1024 * 1024};    // 16GB default limit for testing
+
     std::unique_ptr<StateTree>                     globalRegistry;
     std::unordered_set<std::unique_ptr<StateTree>> localRegistries;
 
@@ -39,7 +41,7 @@ Rank InferWorldSize(StateTree const& tree);
 
 // Builds a per-rank StateTree from `ctx.globalRegistry`, allocating zero-filled
 // device memory and tiling each shard with its FQN as the test pattern.
-std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo);
+std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo, std::vector<char>& buffer);
 
 // Loads a serialized state registry from `path` and stores it in `ctx.globalRegistry`,
 // then sets `ctx.worldSize` via InferWorldSize and populates `ctx.localRegistries`.

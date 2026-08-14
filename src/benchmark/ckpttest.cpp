@@ -892,8 +892,9 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 
     try
     {
-        RunInprocServer(1);
-        serverRunning = true;
+        // LoadStateRegistryFromPath stands up ctx.nodes in-process servers.
+        ctx.ranksPerNode = 4;
+        serverRunning    = true;
 
         LoadStateRegistryFromPath(ctx, registryPath);
         tasks = StartClientThreads(ctx);

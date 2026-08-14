@@ -2,7 +2,7 @@
   _is_global_batch_size_explicitly_specified ...... True
   account_for_embedding_in_pipeline_split ......... False
   account_for_loss_in_pipeline_split .............. False
-  accumulate_allreduce_grads_in_fp32 .............. True
+  accumulate_allreduce_grads_in_fp32 .............. False
   activation_func_clamp_value ..................... None
   activation_offload_fraction ..................... 1.0
   adam_beta1 ...................................... 0.9
@@ -182,8 +182,8 @@
   exit_signal_handler ............................. False
   exit_signal_handler_for_dataloader .............. False
   exit_signal_handler_for_training ................ False
-  exp_avg_dtype ................................... torch.float32
-  exp_avg_sq_dtype ................................ torch.float32
+  exp_avg_dtype ................................... torch.bfloat16
+  exp_avg_sq_dtype ................................ torch.bfloat16
   experimental_attention_variant .................. None
   expert_gtp_weight_remat_size .................... 1
   expert_model_parallel_size ...................... 64
@@ -269,7 +269,7 @@
   global_batch_size ............................... 64
   glu_linear_offset ............................... 0.0
   gpu_sniff_test_interval ......................... None
-  grad_reduce_in_bf16 ............................. False
+  grad_reduce_in_bf16 ............................. True
   gradient_accumulation_fusion .................... True
   gradient_reduce_div_fusion ...................... True
   group_query_attention ........................... True
@@ -421,7 +421,7 @@
   lr_wsd_decay_iters .............................. None
   lr_wsd_decay_samples ............................ 40000
   lr_wsd_decay_style .............................. minus_sqrt
-  main_grads_dtype ................................ torch.float32
+  main_grads_dtype ................................ torch.bfloat16
   main_params_dtype ............................... torch.float32
   make_vocab_size_divisible_by .................... 128
   mamba_head_dim .................................. 64
@@ -645,9 +645,9 @@
   quick_geglu ..................................... False
   rampup_batch_size ............................... None
   rank ............................................ 0
-  recompute_granularity ........................... None
+  recompute_granularity ........................... selective
   recompute_method ................................ None
-  recompute_modules ............................... None
+  recompute_modules ............................... ['moe']
   recompute_num_layers ............................ None
   record_memory_history ........................... False
   record_shapes ................................... False
@@ -793,7 +793,7 @@
   use_mup ......................................... False
   use_one_sent_docs ............................... False
   use_persistent_ckpt_worker ...................... True
-  use_precision_aware_optimizer ................... False
+  use_precision_aware_optimizer ................... True
   use_pytorch_profiler ............................ False
   use_ring_exchange_p2p ........................... False
   use_rope_scaling ................................ False

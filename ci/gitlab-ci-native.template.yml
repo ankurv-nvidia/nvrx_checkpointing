@@ -28,6 +28,10 @@ variables:
   NVRX_COMMIT:
     value: ""
     description: "NVIDIA Resiliency Extension commit the run trains on."
+  RUN_ALL_SUITES:
+    value: "false"
+    options: ["false", "true"]
+    description: "After the default gates, launch every optional downstream suite."
 
 .default_pipeline:
   rules:
@@ -132,8 +136,8 @@ variables:
       - ci/ci-runs/*/*/logs/*_checkpoint_digest.xz
       - ci/ci-runs/*/logs/*_checkpoint_summary.log
       - ci/ci-runs/*/*/logs/*_checkpoint_summary.log
-      # Drop-in candidate baseline files generated from this job's final
-      # Megatron argument block and measured checkpoint metrics.
+      # Drop-in candidates generated from every run's Megatron argument block
+      # and from the job's measured checkpoint metrics.
       - ci/ci-runs/*/logs/baselines/*
       - ci/ci-runs/*/*/logs/baselines/*
       # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
@@ -237,6 +241,8 @@ variables:
       when: never
     - if: '$CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"'
       when: never
+    - if: '$RUN_ALL_SUITES == "true"'
+      when: on_success
     - when: manual
       allow_failure: true
   variables:
@@ -278,6 +284,8 @@ launch:main-branch-runs:
     - if: '$PIPELINE_SUITE != "default"'
       when: never
     - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - if: '$RUN_ALL_SUITES == "true"'
       when: on_success
     - when: manual
       allow_failure: true

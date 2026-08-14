@@ -84,7 +84,7 @@
       "args": [
         "--inproc",
         "--stateregistry",
-        "${workspaceFolder}/metadata/1x4_checkpoints_iter_0000250/registry.bin"
+        "${command:cmake.getLaunchTargetDirectory}/../../registry.bin"
       ],
       "disableASLR": false
     },
