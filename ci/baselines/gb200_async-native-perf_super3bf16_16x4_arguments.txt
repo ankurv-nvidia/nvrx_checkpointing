@@ -86,7 +86,7 @@
   data_args_path .................................. None
   data_parallel_random_init ....................... False
   data_parallel_sharding_strategy ................. optim_grads_params
-  data_parallel_size .............................. 32
+  data_parallel_size .............................. 16
   data_path ....................................... None
   data_per_class_fraction ......................... 1.0
   data_sharding ................................... True
@@ -736,8 +736,8 @@
   symmetric_ar_type ............................... None
   te_precision_config_file ........................ None
   te_rng_tracker .................................. True
-  tensor_model_parallel_size ...................... 2
-  tensor_parallel_num_weight_shards ............... 2
+  tensor_model_parallel_size ...................... 4
+  tensor_parallel_num_weight_shards ............... 4
   tensorboard_log_interval ........................ 1
   tensorboard_queue_size .......................... 1000
   test_data_path .................................. None

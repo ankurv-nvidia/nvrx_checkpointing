@@ -1,6 +1,6 @@
 # Shared Super3 12B hybrid-MoE architecture from
 # scripts/sbatch/12B_hybrid_moe_25T_phase1_nvrx.sh. Precision profiles inherit
-# this file so BF16 and NVFP4 exercise the same model and parallelism.
+# this file so BF16 and NVFP4 exercise the same model shape and parallelism.
 # The CI harness supplies mock data, run length, checkpoint cadence/paths, and
 # a node-scaled global batch size.
 
@@ -22,8 +22,11 @@ moe-router-topk: 22
 moe-router-topk-scaling-factor: "5.0"
 moe-shared-expert-intermediate-size: 5376
 
-# Parallelism. The launcher scales the global batch with the allocation.
-tensor-model-parallel-size: 2
+# Parallelism. TP4 halves the per-rank 256K-vocabulary logits from 128K to 64K,
+# avoiding a 3.91 GiB FP32 fused-loss temporary on the most-loaded expert rank.
+# The launcher scales the global batch with the allocation; on 64 GPUs this is
+# TP4/DP16 for both precision profiles.
+tensor-model-parallel-size: 4
 expert-model-parallel-size: 64
 no-gradient-accumulation-fusion: false
 

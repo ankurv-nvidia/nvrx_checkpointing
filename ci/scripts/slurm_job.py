@@ -2247,10 +2247,24 @@ def _compare_entries(produced: dict[str, str], recorded: dict[str, str]) -> str:
     counted = f"baseline={len(recorded)} missing={missing} extra={extra} changed={changed}"
     return f"{counted} unrecorded={','.join(unrecorded)}" if unrecorded else counted
 
-# Recorded state that names where a run ran rather than what it computed. Runs
-# keep their own directories and name their own provider, so comparing these
-# would report every pair of runs as different.
-_RUN_SCOPED_KEYS = frozenset({"common/args.ckpt_provider"})
+# Recorded state that names where or how a run wrote its checkpoint rather than
+# what it computed. DCP may also select a different rank's copy of replicated
+# common state. Comparing these fields would report equivalent checkpoints as
+# different while model and training arguments remain fully checked.
+_RUN_SCOPED_KEYS = frozenset(
+    {
+        "common/args.async_ckpt_use_cpu_shm",
+        "common/args.async_save",
+        "common/args.async_strategy",
+        "common/args.ckpt_fully_parallel_save",
+        "common/args.ckpt_fully_parallel_save_deprecated",
+        "common/args.ckpt_load_validate_sharding_integrity",
+        "common/args.ckpt_provider",
+        "common/args.local_rank",
+        "common/args.rank",
+        "common/args.use_persistent_ckpt_worker",
+    }
+)
 
 _CHUNK_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<index>\d+)\.(?P<field>[a-z0-9_]+)$")
 
@@ -2971,7 +2985,9 @@ def _digest_entries(path: Path) -> dict[str, dict[str, str]]:
         for line in handle:
             label, _, entry = line.rstrip("\n").partition(" ")
             key, _, value = entry.partition("=")
-            if key:
+            # Filter here as well as while generating a digest so comparisons
+            # against already-recorded runs get the same normalization.
+            if key and key not in _RUN_SCOPED_KEYS:
                 entries.setdefault(label, {})[key] = value
     return entries
 

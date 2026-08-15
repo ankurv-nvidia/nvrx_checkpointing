@@ -7,16 +7,16 @@ inherits: super3
 fp4-format: e2m1
 fp4-recipe: nvfp4
 
-# Keep optimizer state in BF16 so the 88-layer model retains enough HBM for
-# the 3.91 GiB fused cross-entropy temporary on 184 GiB GB200 GPUs.
+# Keep optimizer state in BF16 so the 88-layer model retains additional HBM
+# headroom for fused cross-entropy and MTP temporaries on GB200 GPUs.
 use-precision-aware-optimizer: true
 main-grads-dtype: bf16
 exp-avg-dtype: bf16
 exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
 
-# Mamba capture faults on replay, while adding MoE-router capture leaves too
-# little HBM for the 3.91 GiB MTP loss temporary. Attention-only capture has
-# completed both training phases and checkpoint rollover with ample headroom.
+# Mamba capture faults on replay, while adding MoE-router capture consumes too
+# much HBM. Attention-only capture has completed both training phases and
+# checkpoint rollover while preserving useful headroom.
 cuda-graph-impl: local
 cuda-graph-modules: [attn]

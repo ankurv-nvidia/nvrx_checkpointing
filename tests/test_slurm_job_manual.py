@@ -1233,18 +1233,42 @@ def test_checkpoint_digest_is_diffable_and_summarised(
         "checkpoints/iter_0000120: entries=4"
     )
 
-    # What names where a run ran is not what it computed. Runs keep their own
-    # directories and name their own provider, so recording those would report
-    # every pair of runs as different at every checkpoint.
+    # What names where or how a run wrote is not what it computed. Runs keep
+    # their own directories and checkpoint implementation, and DCP may select
+    # any rank's replicated common state.
     (produced / "common_pt_dump.info").write_text(
-        f"iteration=120\nargs.ckpt_provider=native\nargs.save={produced}/checkpoints\n",
+        f"iteration=120\nargs.ckpt_provider=native\nargs.async_save=True\n"
+        f"args.async_strategy=pytorch-async\nargs.async_ckpt_use_cpu_shm=True\n"
+        f"args.use_persistent_ckpt_worker=True\nargs.ckpt_fully_parallel_save=False\n"
+        f"args.ckpt_fully_parallel_save_deprecated=False\n"
+        f"args.ckpt_load_validate_sharding_integrity=False\n"
+        f"args.rank=2\nargs.local_rank=2\nargs.num_layers=52\n"
+        f"args.save={produced}/checkpoints\n",
     )
     slurm_job._write_checkpoint_digest(run, "scoped")
     with lzma.open(tmp_path / "logs/scoped_checkpoint_digest.xz", "rt") as handle:
         scoped = handle.read()
     assert "common/iteration=120" in scoped
-    assert "ckpt_provider" not in scoped
+    assert "common/args.num_layers=52" in scoped
+    for key in slurm_job._RUN_SCOPED_KEYS:
+        assert key not in scoped
     assert "args.save" not in scoped
+
+
+def test_existing_digests_ignore_run_scoped_entries(tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    label = "checkpoints/iter_0000120"
+    digests = []
+    for name, value in (("ref", "False"), ("cmp", "True")):
+        path = tmp_path / f"{name}.xz"
+        with lzma.open(path, "wt") as handle:
+            handle.write(f"{label} common/args.async_save={value}\n")
+            handle.write(f"{label} common/args.rank={'0' if name == 'ref' else '2'}\n")
+            handle.write(f"{label} common/args.num_layers=52\n")
+            handle.write(f"{label} tensor/weight.md5sum=abc\n")
+        digests.append(path)
+
+    assert slurm_job._digest_differences(*digests) == 0
 
 
 def test_a_chunk_is_compared_by_where_it_sits_not_where_it_was_listed(
@@ -1291,11 +1315,11 @@ def test_two_runs_compare_through_their_digests(
     slurm_job = _load_slurm_job()
     monkeypatch.setattr(slurm_job, "RESULTS_DIR", tmp_path / "logs")
     (tmp_path / "logs").mkdir()
-    for name, tensor, common in (("a", "1", "0"), ("b", "CHANGED", "0"), ("c", "1", "9")):
+    for name, tensor, common in (("a", "1", "52"), ("b", "CHANGED", "52"), ("c", "1", "9")):
         iteration = tmp_path / name / "checkpoints/iter_0000120"
         iteration.mkdir(parents=True)
         (iteration / "reference.metadata.info").write_text(f"w.md5sum={tensor}\n")
-        (iteration / "common_pt_dump.info").write_text(f"args.rank={common}\n")
+        (iteration / "common_pt_dump.info").write_text(f"args.num_layers={common}\n")
         slurm_job._write_checkpoint_digest(tmp_path / name, name)
 
     def diff(left: str, right: str) -> str:
@@ -3314,7 +3338,6 @@ def test_super3_profiles_share_reference_architecture() -> None:
         "num-experts": 512,
         "moe-latent-size": 1024,
         "moe-shared-expert-intermediate-size": 5376,
-        "tensor-model-parallel-size": 2,
         "expert-model-parallel-size": 64,
         "micro-batch-size": 1,
         "num-layers-at-end-in-bf16": 14,
@@ -3326,6 +3349,10 @@ def test_super3_profiles_share_reference_architecture() -> None:
     # Both precision profiles of this architecture hold the optimizer's moments
     # in BF16, which is what leaves the device room for the MoE temporaries.
     assert {key: bf16.pop(key) for key in optimizer_precision} == optimizer_precision
+    # Both profiles need TP4 to halve the native fused-loss temporary while
+    # retaining identical model topology.
+    tp_key = "tensor-model-parallel-size"
+    assert common.pop(tp_key) == bf16.pop(tp_key) == fp4.pop(tp_key) == 4  # noqa: PLR2004
     # The BF16 profile also recomputes its MoE activations. Attention-only graph
     # capture supports it, so both deterministic and measured runs retain it.
     recompute = {"recompute-granularity": "selective", "recompute-modules": "moe"}
