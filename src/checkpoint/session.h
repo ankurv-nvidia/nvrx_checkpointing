@@ -58,6 +58,8 @@ struct Session
         std::string                 name;
         std::filesystem::path       path;
 
+        std::chrono::high_resolution_clock::time_point activatedAt = std::chrono::high_resolution_clock::now();
+
         // Rank 0 attaches updated values for Blob fields whose contents are
         // snapshot-scoped rather than fixed by the session registry.
         StateTree::SnapshotBlobs snapshotBlobs;

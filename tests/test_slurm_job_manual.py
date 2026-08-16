@@ -2866,6 +2866,177 @@ def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.Monk
     assert metrics["bw_socket_imbalance"]["mean"] == 1.25  # noqa: PLR2004
 
 
+def test_durability_pairs_async_saves_by_iteration() -> None:
+    """An async save completes out of order, so the pair is matched on the iteration."""
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        (
+            "[2026-08-15 10:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
+            "[2026-08-15 10:01:00.000000] saving checkpoint at iteration     200 to /ckpt in torch_dist format",
+            "  [2026-08-15 10:00:12.250000] successfully saved checkpoint from iteration     100 to /ckpt",
+            "  [2026-08-15 10:01:09.750000] successfully saved local checkpoint from iteration     200 to /ckpt",
+        ),
+    )
+
+    assert slurm_job.PerfReport._durability_ms(text) == [12250.0, 9750.0]
+
+
+def test_durability_pairs_within_a_cycle_when_iterations_repeat() -> None:
+    """A determinism run saves the same iterations every cycle; spans must stay positive."""
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        (
+            "[2026-08-15 10:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
+            "  [2026-08-15 10:00:10.000000] successfully saved checkpoint from iteration     100 to /ckpt",
+            "[2026-08-15 11:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
+            "  [2026-08-15 11:00:12.000000] successfully saved checkpoint from iteration     100 to /ckpt",
+        ),
+    )
+
+    assert slurm_job.PerfReport._durability_ms(text) == [10000.0, 12000.0]
+
+
+def test_durability_skips_a_save_that_began_before_the_measured_phase() -> None:
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        (
+            "  [2026-08-15 12:00:05.000000] successfully saved checkpoint from iteration      50 to /ckpt",
+            "[2026-08-15 12:00:10.000000] saving checkpoint at iteration     500 to /ckpt in torch_dist format",
+            "  [2026-08-15 12:00:41.000000] successfully saved checkpoint from iteration     500 to /ckpt",
+        ),
+    )
+
+    assert slurm_job.PerfReport._durability_ms(text) == [31000.0]
+
+
+def test_durability_is_reported_for_both_providers() -> None:
+    """The trainer-log metric works without a daemon; the daemon metric is native-only."""
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        (
+            "[2026-08-15 11:00:00.000000] saving checkpoint at iteration     300 to /ckpt in torch_dist format",
+            "  [2026-08-15 11:00:20.000000] successfully saved checkpoint from iteration     300 to /ckpt",
+        ),
+    )
+    daemon = (
+        "[native_ckpt:svr][abc123#0][PERF] Snapshot=3 Durable ranks=6144 | "
+        "Time(us): activate_to_durable_us=11500000"
+    )
+
+    without_daemon = slurm_job.PerfReport._parse_metrics(text)
+    assert without_daemon["ckpt_durable_ms"]["mean"] == 20000.0  # noqa: PLR2004
+    assert without_daemon["ckpt_durable_ms"]["higher_is_better"] is False
+    assert "ckpt_daemon_durable_ms" not in without_daemon
+
+    with_daemon = slurm_job.PerfReport._parse_metrics(text, None, daemon)
+    assert with_daemon["ckpt_daemon_durable_ms"]["mean"] == 11500.0  # noqa: PLR2004
+
+
+def test_checkpoint_timers_are_read_from_the_rank_that_records_them(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Megatron logs its timers on the last rank, not the rank everything else is read from."""
+    slurm_job = _load_slurm_job()
+    # The report is handed the job log, not a rank log: RESULTS_DIR is <run>/logs.
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    job_log = logs / "gb200_async-native-perf_cfg.log"
+    job_log.write_text("no timers here\n")
+    (logs / "cfg_run-routine_rank0.log").write_text("rank 0 never holds them\n")
+    (logs / "cfg_run-routine_rank9.log").write_text("    save-checkpoint ....: (9.0, 9.0)\n")
+    last = logs / "cfg_run-routine_rank10.log"
+    last.write_text(
+        "    save-checkpoint ....: (601.13, 2848.37)\n"
+        "    load-checkpoint ....: (36220.47, 36220.69)\n"
+        "    save-checkpoint ....: (575.53, 2874.46)\n",
+    )
+
+    assert slurm_job.PerfReport._routine_rank_logs(job_log)["cfg_run"][10] == last
+
+    with caplog.at_level("INFO"):
+        slurm_job.PerfReport._log_checkpoint_timings(job_log)
+
+    # Rank 10 wins over rank 9: the comparison is numeric, not lexical.
+    assert "(601.13, 2848.37)" in caplog.text
+    assert "(575.53, 2874.46)" in caplog.text
+    assert "(36220.47, 36220.69)" in caplog.text
+    assert "(9.0, 9.0)" not in caplog.text
+
+
+def test_checkpoint_timers_are_silent_when_a_run_recorded_none(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    job_log = logs / "cfg.log"
+    job_log.write_text("nothing interesting\n")
+    (logs / "cfg_run-routine_rank0.log").write_text("no timers either\n")
+
+    with caplog.at_level("INFO"):
+        slurm_job.PerfReport._log_checkpoint_timings(job_log)
+
+    assert "checkpoint timers" not in caplog.text
+
+    # A job log that is not inside a logs/ directory has no rank logs to find.
+    stray = tmp_path / "stray.log"
+    stray.write_text("x\n")
+    assert slurm_job.PerfReport._routine_rank_logs(stray) == {}
+
+
+def test_durability_is_summarised_beside_the_save_timings(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {"ckpt_daemon_durable_ms": slurm_job.PerfReport._metric([11000.0, 12000.0], "ms", False)}
+
+    with caplog.at_level("INFO"):
+        slurm_job.PerfReport._log_daemon_durability(metrics)
+
+    assert "daemon activate -> durable" in caplog.text
+    assert "(11000.00, 12000.00)  mean 11500.00  over 2 save(s)" in caplog.text
+
+
+def test_durability_summary_is_silent_without_checkpoints(caplog: pytest.LogCaptureFixture) -> None:
+    """An nvrx run with no daemon must not claim a daemon measurement."""
+    slurm_job = _load_slurm_job()
+
+    with caplog.at_level("INFO"):
+        slurm_job.PerfReport._log_daemon_durability({})
+        slurm_job.PerfReport._log_daemon_durability(
+            {"ckpt_durable_ms": slurm_job.PerfReport._metric([9000.0], "ms", False)},
+        )
+
+    assert "daemon activate" not in caplog.text
+
+
+def test_durability_carries_a_wide_tolerance() -> None:
+    """Lustre variance must not fail a job, but an order-of-magnitude change still should."""
+    slurm_job = _load_slurm_job()
+
+    def compare(measured: float, tolerances: dict | None = None) -> tuple[dict, bool]:
+        metrics = {"ckpt_durable_ms": slurm_job.PerfReport._metric([measured], "ms", False)}
+        baseline = {"metrics": {"ckpt_durable_ms": 20000}, "tolerances": tolerances or {}}
+        return slurm_job.PerfReport._compare_to_baseline(metrics, baseline, slurm_job.PERF_TOLERANCE)
+
+    result, passed = compare(58000.0)
+    assert passed
+    assert result["ckpt_durable_ms"]["tolerance_pct"] == 200.0  # noqa: PLR2004
+    assert not compare(62000.0)[1]
+    # A baseline that states its own tolerance still wins.
+    assert not compare(40000.0, {"ckpt_durable_ms": 0.1})[1]
+
+
+def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {"ckpt_durable_ms": slurm_job.PerfReport._metric([20000.0], "ms", False)}
+
+    result, passed = slurm_job.PerfReport._compare_to_baseline(metrics, {"metrics": {}}, 0.1)
+
+    assert passed
+    assert result["ckpt_durable_ms"]["status"] == "no_baseline"
+
+
 def test_perf_report_uses_the_largest_rank_hbm_peak() -> None:
     slurm_job = _load_slurm_job()
     text = "\n".join(

@@ -51,6 +51,7 @@ import time
 from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -94,6 +95,14 @@ _NVRX_MODULE = "nvidia_resiliency_ext"
 SOFT_FAIL_RC = 3
 PERF_TOLERANCE = 0.05
 MAX_BW_SOCKET_IMBALANCE = 1.30
+# Durability spans the whole distributed write, so it carries the shared filesystem's
+# variance rather than the checkpointer's: on a busy Lustre the same job can differ
+# several-fold. Track the number, but only fail on a change too large for that to
+# explain. A baseline's own `tolerances` entry still wins over this.
+WIDE_TOLERANCE_METRICS = {
+    "ckpt_durable_ms": 2.0,
+    "ckpt_daemon_durable_ms": 2.0,
+}
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
 # Parent of every run directory. Holds what runs share: the dependency
@@ -179,6 +188,19 @@ _MEM_RE = re.compile(
 )
 _PHASE2_MARKER = "[native_ckpt:phase] phase=2"
 _SAVE_RE = re.compile(r"successfully saved (?:async )?checkpoint from iteration\s+\d+\s+to\s+(\S+)")
+# The coordinator daemon reports a checkpoint durable once every shard and the metadata
+# are on disk. Native-only: the nvrx provider never starts this daemon.
+_DAEMON_DURABLE_RE = re.compile(
+    r"\[native_ckpt:svr\]\[[^\]]*\]\[PERF\] Snapshot=(\d+) Durable[^\n]*?activate_to_durable_us=(\d+)",
+)
+# Megatron prints this pair around every save, and the native writer mirrors it
+# byte-for-byte, so the gap measures durability the same way whichever provider ran.
+# Matched as one alternation so the two events stay in the order the run emitted them.
+_CKPT_EVENT_RE = re.compile(
+    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\] "
+    r"(saving checkpoint at iteration|successfully saved (?:\S+ )?checkpoint from iteration)"
+    r"\s+(\d+)",
+)
 _ARGUMENTS_RE = re.compile(
     r"-{24} arguments -{24}.*?-{20} end of arguments -{21}",
     re.DOTALL,
@@ -956,6 +978,107 @@ class PerfReport:
         }
 
     @staticmethod
+    def _routine_rank_logs(job_log: Path) -> dict[str, dict[int, Path]]:
+        """The per-rank routine logs a job wrote, grouped by the routine that wrote them.
+
+        A determinism job runs two routines, `--run=ref:... --run=cmp:...`, each into its
+        own directory. They are what the job exists to compare, so both are reported. The
+        report is handed the job log, so the rank logs are found beside it the way the
+        per-rank memory records are.
+        """
+        if job_log.parent.name != "logs":
+            return {}
+        grouped: dict[str, dict[int, Path]] = {}
+        for path in job_log.parent.parent.glob("**/logs/*-routine_rank*.log"):
+            if match := re.fullmatch(r"(?P<label>.+)-routine_rank(?P<rank>\d+)", path.stem):
+                grouped.setdefault(match["label"], {})[int(match["rank"])] = path
+        return dict(sorted(grouped.items()))
+
+    @staticmethod
+    def _read(path: Path) -> str:
+        try:
+            return path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _log_checkpoint_timings(job_log: Path) -> None:
+        """Report what each routine a job ran cost to checkpoint.
+
+        Megatron's Timers.log writes to the last rank, while the save/saved pair a
+        durability span is measured from is printed by rank 0, so each routine is read
+        from both ends of its own rank set.
+        """
+        for label, ranks in PerfReport._routine_rank_logs(job_log).items():
+            last = ranks[max(ranks)]
+            timers = [
+                line.rstrip()
+                for line in PerfReport._read(last).splitlines()
+                if "save-checkpoint" in line or "load-checkpoint" in line
+            ]
+            if timers:
+                logger.info(f"{label}: checkpoint timers from {last.name} (min, max ms across ranks)")
+                for line in timers:
+                    logger.info(line)
+            spans = PerfReport._durability_ms(PerfReport._read(ranks[min(ranks)]))
+            if spans:
+                samples = ", ".join(f"{value:.2f}" for value in spans)
+                logger.info(f"{label}: checkpoint durability (min, max ms across saves)")
+                logger.info(
+                    "    save -> durable ".ljust(52, ".")
+                    + f": ({min(spans):.2f}, {max(spans):.2f})  mean {statistics.mean(spans):.2f}"
+                    + f"  over {len(spans)} save(s) [{samples}]",
+                )
+
+    @staticmethod
+    def _log_daemon_durability(metrics: dict) -> None:
+        """Report the coordinator's own view of durability.
+
+        Reported apart from the per-routine spans above because the daemon measures the
+        job's writes rather than one routine's, and only the native provider runs one.
+        """
+        metric = metrics.get("ckpt_daemon_durable_ms")
+        if not metric:
+            return
+        samples = ", ".join(f"{value:.2f}" for value in metric["samples"])
+        logger.info("checkpoint durability, coordinator daemon (min, max ms across saves)")
+        logger.info(
+            "    daemon activate -> durable ".ljust(52, ".")
+            + f": ({metric['min']:.2f}, {metric['max']:.2f})  mean {metric['mean']:.2f}"
+            + f"  over {len(metric['samples'])} save(s) [{samples}]",
+        )
+
+    @staticmethod
+    def _durability_ms(text: str) -> list[float]:
+        """Milliseconds from each save starting to its checkpoint being durable.
+
+        Reported in the same unit as Megatron's checkpoint timers so a job log can be read
+        without converting between the two.
+
+        Measured in the trainer rather than the daemon, because that is the only side both
+        providers share: the nvrx provider never starts the checkpoint daemon. Covers the
+        whole save, staging included, so it is the number a training run feels.
+
+        Read in document order and consumed on use, because a determinism run saves the same
+        iteration once per cycle: keyed only by iteration, an early save would pair with a
+        later cycle's start and report a negative span.
+        """
+        fmt = "%Y-%m-%d %H:%M:%S.%f"
+        started: dict[int, str] = {}
+        elapsed = []
+        for match in _CKPT_EVENT_RE.finditer(text):
+            timestamp, event, iteration = match[1], match[2], int(match[3])
+            if event.startswith("saving"):
+                started[iteration] = timestamp
+                continue
+            start = started.pop(iteration, None)
+            if start is None:
+                continue  # save began before the measured phase; its start is not in `text`
+            span = datetime.strptime(timestamp, fmt) - datetime.strptime(start, fmt)
+            elapsed.append(round(span.total_seconds() * 1000, 2))
+        return elapsed
+
+    @staticmethod
     def _daemon_text(results_dir: Path) -> str:
         """Concatenate the daemon logs of the newest measured cycle.
 
@@ -993,6 +1116,13 @@ class PerfReport:
                 half = len(per_rank) // 2
                 means = statistics.mean(per_rank[:half]), statistics.mean(per_rank[half:])
                 metrics["bw_socket_imbalance"] = PerfReport._metric([max(means) / min(means)], "ratio", None)
+        durable = PerfReport._durability_ms(text)
+        if durable:
+            metrics["ckpt_durable_ms"] = PerfReport._metric(durable, "ms", False)
+        if daemon_text:
+            daemon_durable = [int(m[2]) / 1e3 for m in _DAEMON_DURABLE_RE.finditer(daemon_text)]
+            if daemon_durable:
+                metrics["ckpt_daemon_durable_ms"] = PerfReport._metric(daemon_durable, "ms", False)
         memory = list(_MEM_RE.finditer(text))
         if memory:
             ranks = [int(m[1]) for m in memory if m[1] is not None]
@@ -1033,7 +1163,8 @@ class PerfReport:
                 continue
             else:
                 target = float(expected[name])
-                tolerance = tolerances.get(name, 0 if higher is None else default_tolerance)
+                fallback = WIDE_TOLERANCE_METRICS.get(name, 0 if higher is None else default_tolerance)
+                tolerance = tolerances.get(name, fallback)
                 low, high = target * (1 - tolerance), target * (1 + tolerance)
                 if higher is True:
                     ok = value >= low
@@ -1055,15 +1186,16 @@ class PerfReport:
     @staticmethod
     def parse_and_report(job: str, config: str, flavor: str, log: Path, baseline: dict, report_path: Path, gpus: int) -> bool:
         text = log.read_text(errors="replace")
-        for line in text.splitlines():
-            if "save-checkpoint" in line or "load-checkpoint" in line:
-                logger.info(line)
         # Rank 0 is the only routine log mirrored into the combined job log.
         # Read the short per-rank memory records so the HBM peak describes the
         # most heavily loaded GPU rather than whichever GPU owns global rank 0.
         memory = _rank_memory_measurements(log)
         metric_text = f"{_MEM_RE.sub('', text)}\n{memory}" if memory else text
         metrics = PerfReport._parse_metrics(metric_text, gpus, PerfReport._daemon_text(log.parent))
+        # What the run cost to checkpoint, gathered in one place once it is over: the
+        # per-rank timers Megatron kept, then how long each save took to become durable.
+        PerfReport._log_checkpoint_timings(log)
+        PerfReport._log_daemon_durability(metrics)
         # The extension's own writer emits checkpoint times rather than the
         # bandwidth counters a baseline is made of, so it has nothing to compare.
         if not metrics and "native" not in flavor.split("-"):

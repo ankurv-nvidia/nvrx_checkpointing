@@ -861,9 +861,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 
     auto totalTensorStateSizeInBytes = localState.localRegistry->GetTotalTensorStateSizeInBytes();
 
-    auto snapshotDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(hdr.snapshotDuration);
-    auto d2hDurationUs      = std::chrono::duration_cast<std::chrono::microseconds>(hdr.d2hDuration);
-    auto const writeSeconds = static_cast<double>(d2hDurationUs.count()) / 1e6;    // NOLINT
+    auto       snapshotDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(hdr.snapshotDuration);
+    auto       d2hDurationUs      = std::chrono::duration_cast<std::chrono::microseconds>(hdr.d2hDuration);
+    auto const writeSeconds       = static_cast<double>(d2hDurationUs.count()) / 1e6;    // NOLINT
     fmt::print(stderr,
                "[native_ckpt:svr][{}#{}][PERF] Rank={} Finished bw_mbps={:.2f} "
                "| Time(us):  wr_tnsr_us={} total_us={} "
@@ -1037,10 +1037,21 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                        ex.what());
             throw;
         }
+        std::chrono::microseconds durableUs{};
         {
             std::scoped_lock lock(mutex);
             snapshot.writeCkptCompletedRanks.insert(Rank{0});
+            durableUs = std::chrono::duration_cast<std::chrono::microseconds>(PerfClock::now() - snapshot.activatedAt);
         }
+        // Rank 0 joins last, so the set is now world-size: every shard and the metadata
+        // are on disk and the checkpoint is loadable.
+        fmt::print(stderr,
+                   "[native_ckpt:svr][{}#{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
+                   *server,
+                   sessionId,
+                   hdr.snapshotId,
+                   static_cast<size_t>(topo.worldSize),
+                   durableUs.count());
     }
 
     // A daemon's snapshot data has no use once its local shards are written: the
