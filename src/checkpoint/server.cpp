@@ -38,7 +38,6 @@
 #include <boost/iostreams/stream.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/url.hpp>
-#include <functional>
 #include <hwloc.h>
 #include <openssl/evp.h>
 
@@ -116,7 +115,7 @@ struct Server
 
     void NotifyFinalizeComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank);
     void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank);
-    void ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view body);
+    void ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd);
 
     void RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
                                         cipc::Rank                                                           fromRank,
@@ -532,7 +531,7 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
     });
 }
 
-static auto ResolvePeerEndpoint(boost::asio::io_context& ioc, std::string const& peer)
+static auto ResolvePeerEndpoint(boost::asio::io_context& ioc, std::string_view const& peer)
 {
     // For some weird reason resolver does not like quering the same peer multiple times
     // Ends up giving host not found. So just cache the results to avoid duplicate work
@@ -568,7 +567,7 @@ static auto ResolvePeerEndpoint(boost::asio::io_context& ioc, std::string const&
 
 [[nodiscard]] static auto CreateRequestForPeer(boost::asio::io_context&  ioc,
                                                boost::beast::tcp_stream& stream,
-                                               std::string const&        peer,
+                                               std::string_view const&   peer,
                                                std::string_view const&   target)
 {
     auto [peerAddr, resolveResults] = ResolvePeerEndpoint(ioc, peer);
@@ -1180,10 +1179,10 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 }
 
 // TODO_MULTILOCAL_CKPT
-void Session::SendPeerFinalizeSnapshotComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
+void Session::SendPeerFinalizeSnapshotComplete_(std::string_view const& peer, cipc::Message::FinalizeSnapshot const& msg) const
 { SendToPeerWithRetries_(peer, "", fmt::format("/api/peer/finalizecomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId), {}); }
 
-void Session::SendPeerWriteCkptComplete_(std::string const& peer, cipc::Message::FinalizeSnapshot const& msg) const
+void Session::SendPeerWriteCkptComplete_(std::string_view const& peer, cipc::Message::FinalizeSnapshot const& msg) const
 { SendToPeerWithRetries_(peer, "", fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId), {}); }
 
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
@@ -1305,10 +1304,10 @@ void Session::SendLocalShardedStateRegistryToPeerWithRetries_(cipc::Rank rank, s
     }
 }
 
-void Session::SendToPeerWithRetries_(std::string const& peer,
-                                     std::string const& body,
-                                     std::string const& target,
-                                     std::string_view   contentEncoding) const
+void Session::SendToPeerWithRetries_(std::string_view const& peer,
+                                     std::string_view const& body,
+                                     std::string_view const& target,
+                                     std::string_view const& contentEncoding) const
 {
     std::string lastError;
     for (int attempt = 1; attempt <= MaxRetries; ++attempt)
@@ -1325,6 +1324,33 @@ void Session::SendToPeerWithRetries_(std::string const& peer,
             req.prepare_payload();
             boost::beast::http::write(stream, req);
 
+#ifdef USE_EXPECT_CONTINUE
+            if (expectContinue) { req.set(boost::beast::http::field::expect, "100-continue"); }
+
+            boost::beast::flat_buffer                                               buffer;
+            boost::beast::http::request_serializer<boost::beast::http::buffer_body> serializer{req};
+
+            // Offer the body rather than upload it. A peer that already holds the registry
+            // answers 204 here and the payload never goes on the wire. Declining mid-upload
+            // instead would race a connection reset against the response.
+            if (expectContinue)
+            {
+                boost::beast::http::write_header(stream, serializer);
+                boost::beast::http::response_parser<boost::beast::http::empty_body> interim;
+                boost::beast::http::read_header(stream, buffer, interim);
+                auto const offerResult = interim.get().result();
+                if (offerResult == boost::beast::http::status::no_content)
+                {
+                    TryCleanShutdown(stream);
+                    return false;
+                }
+                if (offerResult != boost::beast::http::status::continue_)
+                {
+                    throw std::runtime_error(fmt::format("peer answered the body offer with HTTP {}", interim.get().result_int()));
+                }
+            }
+            boost::beast::http::write(stream, serializer);
+#endif
             boost::beast::flat_buffer                                     buffer;
             boost::beast::http::response<boost::beast::http::string_body> res;
             boost::beast::http::read(stream, buffer, res);
@@ -1372,13 +1398,20 @@ void Session::BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) c
                body.size(),
                static_cast<double>(rawSize) / static_cast<double>(body.size()));
 
-    for (size_t p = 1; p < topo.peers.size(); ++p)
-    {
-        SendToPeerWithRetries_(topo.peers[p], body, fmt::format("/api/peer/globalregistry/{}", sessionId), RegistryContentEncoding);
-    }
+    SendGlobalRegistryToPeers(body, 1, topo.peers.size());
 
     fmt::print(
         stderr, "[native_ckpt:svr][{}#{}][INFO] Broadcast global registry to {} peer(s)\n", *server, sessionId, topo.peers.size() - 1);
+}
+
+void Session::SendGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const
+{
+    if (startPeerIndex >= endPeerIndex) { return; }
+    auto        delegateStart = (startPeerIndex + endPeerIndex) / 2;
+    auto const& peer          = topo.peers[delegateStart];
+    auto const  postTarget    = fmt::format("/api/peer/globalregistry/{}?fwd={}:{}", sessionId, delegateStart, endPeerIndex);
+    SendToPeerWithRetries_(peer, registry, postTarget, RegistryContentEncoding);
+    SendGlobalRegistryToPeers(registry, startPeerIndex, delegateStart);
 }
 
 void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const
@@ -1477,10 +1510,7 @@ void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesys
 }
 
 void Session::Activate()
-{
-    start = PerfClock::now();
-    // noop
-}
+{ start = PerfClock::now(); }
 
 void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf)
 {
@@ -1743,7 +1773,7 @@ void Session::HandleStateRegistryFragment(Rank                                  
                fmt::join(CalculateWaitingFor(recievedFrom, Rank{0}, topo.worldSize), ","));
 }
 
-void Session::RecordBlobMetasLocked_(Rank rank, StateTree const& localRegistry)
+void Session::RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& /* lock */, Rank rank, StateTree const& localRegistry)
 {
     localRegistry.WalkNodes([&](StateNode const& node) {
         if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
@@ -2261,9 +2291,19 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotI
         [&](Session& /* session */, Session::Snapshot& snapshot) { snapshot.writeCkptCompletedRanks.insert(fromRank); });
 }
 
-void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view body)
+void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd)
 {
     FindOrWaitForSession_("ReceiveGlobalRegistry", sessionId, [&](Session& session) {
+        if (session.PeerIndex() != fwdStart)
+        {
+            throw std::logic_error(fmt::format("[native_ckpt:svr][{}#{}] ReceiveGlobalRegistry expected fwdStart={} but got PeerIndex()={}",
+                                               *this,
+                                               sessionId,
+                                               fwdStart,
+                                               session.PeerIndex()));
+        }
+
+        session.SendGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
         std::shared_ptr<StateTree> globalRegistry = InflateRegistry(body);
         auto             dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(globalRegistry->GlobalWorldSize()));
         std::scoped_lock lock2(session.mutex);
@@ -2620,7 +2660,22 @@ void Server::HandleRequest_(tcp_stream& stream)
     else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint"); }
+        if (it != segs.end())
+        {
+            throw std::invalid_argument(
+                "Unexpected extra URL segments in globalregistry endpoint; globalregistry requires a /{sessionId}?fwd=<start>:<end> path");
+        }
+        auto [fwdRangeStart, fwdRangeEnd] = [&]() -> std::pair<size_t, size_t> {
+            auto const fwdParam = url.params().find("fwd");
+            if (fwdParam == url.params().end()) { return {0, 0}; }
+            auto const fwdValue = (*fwdParam).value;
+            auto const sepPos   = fwdValue.find(':');
+            if (sepPos == std::string::npos)
+            {
+                throw std::invalid_argument(fmt::format("Malformed fwd query parameter '{}', expected '<start>:<end>'", fwdValue));
+            }
+            return {boost::lexical_cast<size_t>(fwdValue.substr(0, sepPos)), boost::lexical_cast<size_t>(fwdValue.substr(sepPos + 1))};
+        }();
 
         auto const encoding = headers[boost::beast::http::field::content_encoding];
         if (encoding != RegistryContentEncoding)
@@ -2639,7 +2694,7 @@ void Server::HandleRequest_(tcp_stream& stream)
         res.prepare_payload();
         boost::beast::http::write(stream, res);
 
-        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body());
+        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
     }
     else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
     {
@@ -2868,7 +2923,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
         // Blobs are written per-rank rather than gathered onto the coordinator.
         // Record only lengths here; rank 0's own and snapshot-scoped values are
         // assembled once their fresh per-save bytes are known.
-        if (IsCoordinatorPeer() && rank != Rank{0}) { RecordBlobMetasLocked_(rank, *localState.localRegistry); }
+        if (IsCoordinatorPeer() && rank != Rank{0}) { RecordBlobMetasLocked_(lock, rank, *localState.localRegistry); }
 #ifdef NATIVE_CKPT_TRACE_NODE
         if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))
         {

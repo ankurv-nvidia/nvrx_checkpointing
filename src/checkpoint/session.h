@@ -6,7 +6,6 @@
 #include "tensor.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -60,23 +59,15 @@ struct Session
 
         std::chrono::high_resolution_clock::time_point activatedAt = std::chrono::high_resolution_clock::now();
 
-        // Rank 0 attaches updated values for Blob fields whose contents are
-        // snapshot-scoped rather than fixed by the session registry.
         StateTree::SnapshotBlobs snapshotBlobs;
 
         checkpoint::distcp::BlobMetadataByFqn blobMetadata;
-        // Complete merged registry, including every data-parallel replica. Rank
-        // 0 writes this view to registry.bin and broadcasts it unchanged.
-        std::shared_ptr<StateTree> globalRegistry;
-        // Locally derived storage plan. Its non-null publication is also the
-        // readiness gate for every local rank writer.
-        std::shared_ptr<StateTree>                                             dedupedGlobalRegistry;
+        std::shared_ptr<StateTree>            globalRegistry;
+        std::shared_ptr<StateTree>            dedupedGlobalRegistry;
+
         std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>> localStates;
-        // Ranks that have sent FinalizeSnapshot for this snapshot
+
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
-        // On peers, ranks whose shard is durable and whose completion notification
-        // the coordinator acknowledged. On the coordinator, rank 0 joins only after
-        // metadata is durable, so a world-size set means the checkpoint is loadable.
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
     };
 
@@ -94,16 +85,10 @@ struct Session
     std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
     std::unordered_set<checkpoint::ipc::Rank>                recievedFrom;    // Ranks from which data has been recieved.
 
-    // Coordinator-only template of registered Blob lengths, keyed first by FQN
-    // and then by the rank whose distcp file stores the value. Rank 0's own
-    // Blobs and snapshot-scoped common state are added to each snapshot.
     checkpoint::distcp::BlobMetadataByFqn blobMetas;
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
-    // Highest snapshotId that reached durability before eviction dropped it from `snapshots`.
-    // A wait for an already-evicted snapshot (id <= this) reports durable: ids are monotonic,
-    // and a snapshot is only evicted once write-complete.
     checkpoint::ipc::SnapshotId highestEvictedDurableSnapshot{checkpoint::ipc::SnapshotId::Invalid};
 
     std::vector<std::future<void>> asyncTasks;
@@ -122,7 +107,11 @@ struct Session
     void   HandleStateRegistryFragment(checkpoint::ipc::Rank                                recvRank,
                                        std::vector<TensorShardInfo> const&                  tensorShards,
                                        std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn);
-    bool   IsCoordinatorPeer() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer == 0; }
+    bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
+    size_t PeerIndex() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer; }
+
+    void SendGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
+
     size_t ExpectedWriteCompletions() const
     { return IsCoordinatorPeer() ? static_cast<size_t>(topo.worldSize) : static_cast<size_t>(topo.ranksPerPeer); }
     bool IsSnapshotEvictable(Snapshot const& snapshot) const
@@ -141,9 +130,6 @@ struct Session
     // (-1 = latest, -2 = second-latest, ...), resolved against the ordered `snapshots` map (or the
     // evicted-durable highwater when nothing is resident). Returns false if not yet resolvable.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
-
-    // True once `snapshotId` is durable on this daemon: its shard writes are complete
-    // (writeCkptCompletedRanks reaches ExpectedWriteCompletions), or it completed and was evicted.
     bool IsSnapshotDurable(checkpoint::ipc::SnapshotId snapshotId) const;
 
     private:
@@ -160,21 +146,16 @@ struct Session
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
-
-    // Record every Blob in `localRegistry` under its owning rank.
-    // Caller must hold `mutex`.
-    void RecordBlobMetasLocked_(checkpoint::ipc::Rank rank, StateTree const& localRegistry);
-
-    // Materialize the exact per-save Blob layout into the snapshot-owned views.
+    void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
     void PrepareBlobState_(Snapshot& snapshot, LocalState& localState, checkpoint::ipc::Rank rank) const;
 
-    void SendToPeerWithRetries_(std::string const& peer,
-                                std::string const& body,
-                                std::string const& target,
-                                std::string_view   contentEncoding) const;
+    void SendToPeerWithRetries_(std::string_view const& peer,
+                                std::string_view const& body,
+                                std::string_view const& target,
+                                std::string_view const& contentEncoding) const;
 
-    void SendPeerFinalizeSnapshotComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
-    void SendPeerWriteCkptComplete_(std::string const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
+    void SendPeerFinalizeSnapshotComplete_(std::string_view const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
+    void SendPeerWriteCkptComplete_(std::string_view const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
