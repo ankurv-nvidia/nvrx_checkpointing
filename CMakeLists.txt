@@ -78,6 +78,7 @@ include(fmt)
 include(Boost)
 include(hwloc)
 include(miniz)
+include(zlib)
 
 #find_package(Boost CONFIG REQUIRED OPTIONAL_COMPONENTS interprocess)
 
@@ -252,7 +253,8 @@ add_library(phoenix_checkpoint_distcp OBJECT src/checkpoint/distcp.cpp)
 target_link_libraries(phoenix_checkpoint_distcp PUBLIC
     phoenix_checkpoint
     fmt::fmt-header-only
-    miniz::miniz)
+    miniz::miniz
+    ZLIB::ZLIB)
 
 add_library(phoenix_checkpoint_server OBJECT
     src/checkpoint/server.cpp)

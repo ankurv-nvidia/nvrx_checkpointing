@@ -2,7 +2,9 @@
 #include "distcp_internal.h"
 #include "state.h"
 
+#define MINIZ_NO_ZLIB_APIS
 #include <miniz/miniz.h>
+#include <zlib.h>
 
 #include <fmt/format.h>
 
@@ -32,9 +34,9 @@ static_assert(std::endian::native == std::endian::little,
 // `__<rank>_0.distcp` is the concatenation of one self-contained `torch.save`
 // ZIP per shard. We emit those ZIPs directly in C++:
 //   - pickle stream: hand-built from primitives (proto-2 _rebuild_tensor_v2/v3)
-//   - ZIP container: miniz `mz_zip_writer_add_mem_ex_v2`, exactly what
-//     PyTorchStreamWriter calls into. This gets us CRC32 + standard headers
-//     for free.
+//   - ZIP container: miniz `mz_zip_writer_add_mem_ex_v2`, the same container
+//     API used by PyTorchStreamWriter. zlib supplies the CRC32 so the archive
+//     has standard headers without miniz's scalar CRC pass.
 //   - 64-byte alignment of `archive/data/N` body: replicate
 //     PyTorchStreamWriter::writeRecord's FB extra-field padding so byte-parity
 //     with `dcp.save` output holds.
@@ -46,7 +48,7 @@ static_assert(std::endian::native == std::endian::little,
 //     stdlib torch was built against (gcc-14 libstdc++).
 //
 // The on-disk layout is byte-identical to the output of
-// `torch.distributed.checkpoint.save`; `tests/test_distcp_parity.py` is the
+// `torch.distributed.checkpoint.save`; `tests/test_distcp_roundtrip.py` is the
 // gating check.
 
 namespace checkpoint::distcp
@@ -325,15 +327,18 @@ constexpr uint64_t SerializationIdSize = 40;
 constexpr uint64_t   DataDescriptorSize             = 16;
 constexpr size_t     LocalTimestampOffset           = 10;
 constexpr size_t     CentralDirTimestampOffset      = 12;
+constexpr size_t     LocalVersionNeededOffset       = 4;
+constexpr size_t     CentralVersionNeededOffset     = 6;
+constexpr size_t     LocalCompressionMethodOffset   = 8;
+constexpr size_t     CentralCompressionMethodOffset = 10;
+constexpr size_t     ZipHeaderFieldBytes            = sizeof(uint16_t);
 constexpr size_t     TimestampFieldBytes            = sizeof(uint16_t) * 2;
-constexpr size_t     EocdCentralDirSizeOffset       = 12;
-constexpr size_t     EocdCentralDirOffsetOffset     = 16;
 constexpr size_t     CentralDirFilenameLengthOffset = 28;
 constexpr size_t     CentralDirExtraLengthOffset    = 30;
 constexpr size_t     CentralDirCommentLengthOffset  = 32;
-constexpr uint32_t   Zip32Sentinel                  = std::numeric_limits<uint32_t>::max();
-constexpr std::array EocdSignature{'P', 'K', '\x05', '\x06'};
 constexpr std::array CentralDirSignature{'P', 'K', '\x01', '\x02'};
+constexpr std::array LocalFileHeaderSignature{'P', 'K', '\x03', '\x04'};
+constexpr std::array DataDescriptorSignature{'P', 'K', '\x07', '\x08'};
 
 // Per-entry extra-field length needed to push the entry's data body onto a
 // `kFieldAlignment` boundary. Replicates `caffe2::serialize::detail::getOffset`
@@ -490,6 +495,83 @@ static void WriteBytes(std::ostream& output, char const* data, size_t size, std:
     }
 }
 
+// A miniz user writer streams the already-CRC'd ZIP bytes directly to the rank
+// file and captures the supplied CRC from each emitted data descriptor. The
+// descriptor value is the same one PyTorchStreamWriter uses for serialization_id.
+struct StreamingZipOutput
+{
+    std::ostream&    output;
+    std::string_view contextName;
+    uint64_t         nextOffset{};
+    uint32_t         lastDescriptorCrc{};
+    bool             sawDescriptor{};
+};
+
+static size_t StreamZipWrite(void* opaque, mz_uint64 fileOffset, void const* buffer, size_t size)
+{
+    auto& state = *static_cast<StreamingZipOutput*>(opaque);
+    // WriteShardArchive uses a new miniz writer per concatenated archive. Its
+    // callback offsets therefore begin at zero even though the outer stream is
+    // already positioned at the next archive. miniz's create path is strictly
+    // append-only; reject a future behavior change instead of silently seeking.
+    if (fileOffset != state.nextOffset) { return 0; }
+
+    auto const* bytes = static_cast<char const*>(buffer);
+    if (size == DataDescriptorSize && std::equal(DataDescriptorSignature.begin(), DataDescriptorSignature.end(), bytes))
+    {
+        std::memcpy(&state.lastDescriptorCrc, bytes + sizeof(uint32_t), sizeof(state.lastDescriptorCrc));
+        state.sawDescriptor = true;
+    }
+
+    // PyTorch's vendored miniz is built with MINIZ_NO_TIME. Patch timestamps
+    // as the small headers pass through rather than materializing and walking
+    // a tensor-sized archive after finalization. We give miniz raw bytes under
+    // its "already compressed" API to bypass its slow internal CRC; patch the
+    // method back from DEFLATED to STORED in both header forms.
+    char const* writeData = bytes;
+    ByteBuffer  patched;
+    if (size == LocalFileHeaderSize && std::equal(LocalFileHeaderSignature.begin(), LocalFileHeaderSignature.end(), bytes))
+    {
+        patched.assign(bytes, bytes + size);
+        std::memset(patched.data() + LocalVersionNeededOffset, 0, ZipHeaderFieldBytes);
+        std::memset(patched.data() + LocalCompressionMethodOffset, 0, ZipHeaderFieldBytes);
+        std::memset(patched.data() + LocalTimestampOffset, 0, TimestampFieldBytes);
+        writeData = patched.data();
+    }
+    else if (size >= CentralDirHeaderSize && std::equal(CentralDirSignature.begin(), CentralDirSignature.end(), bytes))
+    {
+        patched.assign(bytes, bytes + size);
+        size_t cursor = 0;
+        while (cursor + CentralDirHeaderSize <= patched.size()
+               && std::equal(CentralDirSignature.begin(), CentralDirSignature.end(), patched.data() + cursor))
+        {
+            std::memset(patched.data() + cursor + CentralVersionNeededOffset, 0, ZipHeaderFieldBytes);
+            std::memset(patched.data() + cursor + CentralCompressionMethodOffset, 0, ZipHeaderFieldBytes);
+            std::memset(patched.data() + cursor + CentralDirTimestampOffset, 0, TimestampFieldBytes);
+            uint16_t filenameLength{};
+            uint16_t extraLength{};
+            uint16_t commentLength{};
+            std::memcpy(&filenameLength, patched.data() + cursor + CentralDirFilenameLengthOffset, sizeof(filenameLength));
+            std::memcpy(&extraLength, patched.data() + cursor + CentralDirExtraLengthOffset, sizeof(extraLength));
+            std::memcpy(&commentLength, patched.data() + cursor + CentralDirCommentLengthOffset, sizeof(commentLength));
+            cursor += CentralDirHeaderSize + filenameLength + extraLength + commentLength;
+        }
+        writeData = patched.data();
+    }
+
+    try
+    {
+        WriteBytes(state.output, writeData, size, state.contextName);
+    } catch (...)
+    {
+        // Exceptions cannot cross miniz's C callback boundary. A short return
+        // makes miniz report MZ_ZIP_FILE_WRITE_FAILED to the C++ caller.
+        return 0;
+    }
+    state.nextOffset += size;
+    return size;
+}
+
 static void FinishOutputFile(std::ofstream& output, std::filesystem::path const& path)
 {
     output.flush();
@@ -506,10 +588,11 @@ static void FinishOutputFile(std::ofstream& output, std::filesystem::path const&
 // `archive/.data/serialization_id`. The data/0 entry is FB-padded to 64-byte
 // alignment so zero-copy mmap downstream lines up.
 //
-// The archive is built in-memory via miniz's heap writer, then dumped to `output`
-// in one shot. Memory cost = ZIP container overhead + tensor body (the
-// tensor body is the only large field). For multi-gigabyte tensors this is
-// the same RSS hit `dcp.save` takes; revisit if it shows up in a profile.
+// zlib computes each entry CRC once using its architecture-optimized routine.
+// We pass that CRC and the raw bytes to miniz's pre-compressed-data path, which
+// avoids miniz's much slower scalar CRC while still streaming directly to
+// `output`. StreamZipWrite changes miniz's DEFLATED method marker back to
+// STORED, so the resulting archive remains byte-identical to PyTorch's.
 static uint64_t WriteShardArchive(std::ostream&         output,
                                   DS4Tensor::DType      dtype,
                                   DS4Tensor::Dim const& shape,
@@ -566,18 +649,17 @@ static uint64_t WriteShardArchive(std::ostream&         output,
                   .padding  = {}},
     };
 
-    // Set up miniz heap writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD
+    // Set up a streaming miniz writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD
     // + locator at finalize time — matches PyTorchStreamWriter's "universally
     // ZIP64" guarantee. Per-entry LFH/CD records stay ZIP32 unless their size
     // or offset overflow 32 bits.
-    mz_zip_archive zip{};
-    if (mz_zip_writer_init_heap_v2(&zip,
-                                   /*size_to_reserve_at_beginning=*/0,
-                                   /*initial_allocation_size=*/std::max<size_t>(1024, length),
-                                   MZ_ZIP_FLAG_WRITE_ZIP64)
-        != MZ_TRUE)
+    mz_zip_archive     zip{};
+    StreamingZipOutput streamOutput{.output = output, .contextName = contextName};
+    zip.m_pWrite     = &StreamZipWrite;
+    zip.m_pIO_opaque = &streamOutput;
+    if (mz_zip_writer_init_v2(&zip, /*existing_size=*/0, MZ_ZIP_FLAG_WRITE_ZIP64) != MZ_TRUE)
     {
-        throw std::runtime_error(fmt::format("distcp: mz_zip_writer_init_heap_v2 failed for '{}'", contextName));
+        throw std::runtime_error(fmt::format("distcp: mz_zip_writer_init_v2 failed for '{}'", contextName));
     }
 
     // `combined_uncomp_crc32_` from PyTorchStreamWriter is hash_combine'd across
@@ -587,21 +669,25 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     // with the un-prefixed argument.
     uint64_t                        combinedCrc = 0;
     std::unordered_set<std::string> bareNamesWritten;
-    std::vector<size_t>             lfhOffsets;
-    lfhOffsets.reserve(entries.size() + 1);
 
     auto addEntry = [&](EntryPlan& plan, std::string_view bareName) {
-        plan.padding = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
-        lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
+        plan.padding               = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
+        streamOutput.sawDescriptor = false;
+        auto const entryCrc
+            = static_cast<mz_uint32>(::crc32_z(/*crc=*/0L, reinterpret_cast<Bytef const*>(plan.data), static_cast<z_size_t>(plan.size)));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         plan.fullName.c_str(),
                                         plan.data,
                                         plan.size,
                                         /*pComment=*/nullptr,
                                         /*comment_size=*/0,
-                                        /*level_and_flags=*/0,    // STORED, no compression
-                                        /*uncomp_size=*/0,
-                                        /*uncomp_crc32=*/0,    // miniz computes CRC32 itself
+                                        // The bytes are raw, not compressed. This flag is
+                                        // deliberately used only to make miniz accept our
+                                        // precomputed CRC and skip its internal CRC pass;
+                                        // StreamZipWrite patches method 8 back to STORED (0).
+                                        /*level_and_flags=*/MZ_ZIP_FLAG_COMPRESSED_DATA,
+                                        /*uncomp_size=*/plan.size,
+                                        /*uncomp_crc32=*/entryCrc,
                                         /*last_modified=*/nullptr,
                                         /*user_extra_data=*/plan.padding.data(),
                                         /*user_extra_data_len=*/static_cast<mz_uint16>(plan.padding.size()),
@@ -614,14 +700,17 @@ static uint64_t WriteShardArchive(std::ostream&         output,
         }
 
         // Track contributions to serialization_id: see comment block at file top.
-        // Upstream reads the CRC out of miniz's data-descriptor block; we
-        // recompute it directly (same CRC32 of the same bytes) and feed
-        // hash_combine in write order — matches upstream's accumulator path
-        // (caffe2/serialize/inline_container.cc::ostream_write_func).
-        // mz_crc32 returns mz_ulong (64-bit on x86_64). CRC32 fits in 32 bits
-        // by definition; the static_cast is just to silence -Wconversion.
-        auto const entryCrc = static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, static_cast<uint8_t const*>(plan.data), plan.size));
-        combinedCrc         = HashCombine(combinedCrc, entryCrc);
+        // Verify the CRC that miniz placed in its trailing data descriptor,
+        // then combine the value exactly like upstream does.
+        if (!streamOutput.sawDescriptor)
+        {
+            throw std::runtime_error(fmt::format("distcp: miniz omitted data descriptor for '{}'", plan.fullName));
+        }
+        if (streamOutput.lastDescriptorCrc != entryCrc)
+        {
+            throw std::runtime_error(fmt::format("distcp: data descriptor CRC mismatch for '{}'", plan.fullName));
+        }
+        combinedCrc = HashCombine(combinedCrc, entryCrc);
         bareNamesWritten.insert(std::string{bareName});
     };
 
@@ -651,7 +740,6 @@ static uint64_t WriteShardArchive(std::ostream&         output,
         // checks `files_written_.find(kSerializationIdRecordName) == end()` before
         // computing).
         idPlan.padding = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
-        lfhOffsets.push_back(static_cast<size_t>(zip.m_archive_size));
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         idPlan.fullName.c_str(),
                                         idPlan.data,
@@ -677,79 +765,13 @@ static uint64_t WriteShardArchive(std::ostream&         output,
         throw;
     }
 
-    // Flush the in-memory ZIP to the output stream. `mz_zip_writer_finalize_heap_archive`
-    // internally finalizes and detaches the heap buffer in one shot — calling
-    // `mz_zip_writer_finalize_archive` first would put the state machine in
-    // "already finalized" and the detach call would fail.
-    void*  archiveBufRaw = nullptr;
-    size_t archiveSize   = 0;
-    if (mz_zip_writer_finalize_heap_archive(&zip, &archiveBufRaw, &archiveSize) != MZ_TRUE)
+    if (mz_zip_writer_finalize_archive(&zip) != MZ_TRUE)
     {
         mz_zip_writer_end(&zip);
-        throw std::runtime_error(fmt::format("distcp: mz_zip_writer_finalize_heap_archive failed for '{}'", contextName));
+        throw std::runtime_error(fmt::format("distcp: mz_zip_writer_finalize_archive failed for '{}'", contextName));
     }
+    size_t const archiveSize = static_cast<size_t>(zip.m_archive_size);
     mz_zip_writer_end(&zip);
-
-    // Own the heap buffer for the rest of this scope. mz_free is the documented
-    // counterpart to the malloc performed by `finalize_heap_archive`.
-    std::unique_ptr<char, decltype(&::mz_free)> archiveBuf{static_cast<char*>(archiveBufRaw), &::mz_free};
-
-    // Zero last-mod time/date in every LFH and CD record. PyTorchStreamWriter is
-    // built against a vendored miniz with MINIZ_NO_TIME, which makes those
-    // fields stable zeros. Our vcpkg miniz lacks that knob (it would require
-    // a source rebuild), so we patch the finalized buffer to match.
-    char* const bytes = archiveBuf.get();
-    for (size_t off : lfhOffsets)
-    {
-        // LFH: time at +10 (2B), date at +12 (2B). Zero 4 contiguous bytes.
-        std::memset(bytes + off + LocalTimestampOffset, 0, TimestampFieldBytes);
-    }
-    // Walk the central directory: EOCD lives in the last 22 bytes (we emit no
-    // comment), CD offset/size in EOCD bytes [12..20). With MZ_ZIP_FLAG_WRITE_ZIP64
-    // the EOCD CD fields hold 0xFFFFFFFF sentinels iff the real values overflow
-    // 32 bits; in that case the truthy values live in the ZIP64 EOCD record. The
-    // upstream `s.length < MZ_UINT32_MAX` guard at the call-site means we don't
-    // hit that branch today — but the parser asserts it anyway, since walking
-    // garbage would otherwise be a buffer-overrun surface.
-    if (archiveSize >= EocdSize)
-    {
-        char const* eocd = bytes + archiveSize - EocdSize;
-        if (std::equal(EocdSignature.begin(), EocdSignature.end(), eocd))
-        {
-            uint32_t cdSize{};
-            uint32_t cdOffset{};
-            std::memcpy(&cdSize, eocd + EocdCentralDirSizeOffset, sizeof(cdSize));
-            std::memcpy(&cdOffset, eocd + EocdCentralDirOffsetOffset, sizeof(cdOffset));
-
-            if (cdSize == Zip32Sentinel || cdOffset == Zip32Sentinel)
-            {
-                throw std::runtime_error(fmt::format("distcp: ZIP64 sentinel in EOCD cd_offset/cd_size for '{}'; this means a "
-                                                     "shard crossed the 4 GiB boundary that ZIP64 support hasn't been wired in for yet",
-                                                     contextName));
-            }
-
-            size_t       cursor = cdOffset;
-            size_t const cdEnd  = static_cast<size_t>(cdOffset) + static_cast<size_t>(cdSize);
-            while (cursor + CentralDirHeaderSize <= cdEnd)
-            {
-                if (!std::equal(CentralDirSignature.begin(), CentralDirSignature.end(), bytes + cursor))
-                {
-                    break;    // not a CD entry; stop defensively
-                }
-                // CD record: time at +12 (2B), date at +14 (2B). Zero 4 bytes.
-                std::memset(bytes + cursor + CentralDirTimestampOffset, 0, TimestampFieldBytes);
-                uint16_t fnlen{};
-                uint16_t extlen{};
-                uint16_t cmtlen{};
-                std::memcpy(&fnlen, bytes + cursor + CentralDirFilenameLengthOffset, sizeof(fnlen));
-                std::memcpy(&extlen, bytes + cursor + CentralDirExtraLengthOffset, sizeof(extlen));
-                std::memcpy(&cmtlen, bytes + cursor + CentralDirCommentLengthOffset, sizeof(cmtlen));
-                cursor += CentralDirHeaderSize + fnlen + extlen + cmtlen;
-            }
-        }
-    }
-
-    WriteBytes(output, bytes, archiveSize, contextName);
 
     return archiveSize;
 }

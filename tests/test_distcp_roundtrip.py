@@ -106,3 +106,18 @@ def test_smoke_single_float32_tensor_roundtrip(tmp_path):
     _fqn, _sharddim, offset, length = write_log[0]
     loaded = torch.load(BytesIO(file_bytes[offset:offset + length]), weights_only=True)
     assert torch.equal(loaded, state_dict["weight"])
+
+
+def test_single_tensor_archive_is_byte_identical_to_torch_save(tmp_path):
+    tensor = torch.arange(4096, dtype=torch.float32).reshape(64, 64)
+    entries = [("weight", "float32", tuple(tensor.shape), _tensor_bytes(tensor))]
+
+    _distcp_shim.write_rank_shard(str(tmp_path), 0, entries)
+    native_bytes = (tmp_path / "__0_0.distcp").read_bytes()
+
+    reference = BytesIO()
+    torch.save(tensor, reference)
+
+    # This covers more than loadability: timestamp normalization, the captured
+    # miniz CRC used by serialization_id, and all ZIP headers must match too.
+    assert native_bytes == reference.getvalue()
