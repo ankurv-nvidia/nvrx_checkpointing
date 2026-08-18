@@ -370,6 +370,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             megatron_integration.py
             metadata_compare.py
             native_async.py
+            peers.py
             tools.py
     )
 

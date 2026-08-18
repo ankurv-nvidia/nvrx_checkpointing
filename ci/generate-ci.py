@@ -157,6 +157,10 @@ def _emit_multinode(
             )
             if flavors[0] == "perf" and (interval := entry.get("checkpoint_interval")):
                 args += f" --checkpoint-interval {interval}"
+            # Per-entry job-array override: NVLink-domain nodes per array task;
+            # 0 keeps the classic single-allocation launch for a wide job.
+            if (segment := entry.get("job_array_segment")) is not None:
+                args += f" --job-array-segment {segment}"
             g = entry.get("group") or _pretrain_group(job, flavors[0])
             provider = _provider(job)
             suite = (

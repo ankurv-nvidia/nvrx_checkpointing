@@ -123,6 +123,11 @@ _SLURM_STATUS_PERIOD_SECONDS = 5 * 60
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
 _CLEANUP_GRACE_MINUTES = 5
+
+# One array task owns one NVLink domain: TP/EP collectives stay on NVLink and
+# --ft-segment can evict and replace a whole domain at once. Any job wider than
+# one domain launches as a shared-rendezvous job array of domain-sized tasks.
+_JOB_ARRAY_SEGMENT_DEFAULT = 16
 # Ranks coordinate through files under this directory of a run, never beside
 # its logs.
 SYNC_DIR_NAME = ".sync"
@@ -154,7 +159,9 @@ _PRETRAIN_ENV_NAMES = {
     "CUBLAS_WORKSPACE_CONFIG",
     "ENROOT_IMAGE",
     "GPUS_PER_NODE",
+    "GROUP_RANK",
     "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
     "MAMBA_DETERMINISTIC",
     "MASTER_ADDR",
     "NATIVE_CKPT_SERVER_LOG",
@@ -163,6 +170,7 @@ _PRETRAIN_ENV_NAMES = {
     "NCCL_PROTO",
     "NCCL_TUNER_PLUGIN",
     "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
+    "NVRX_CURRENT_CYCLE_INFO",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
     "NVTE_CPU_OFFLOAD_V1",
     "RANK",
@@ -174,6 +182,7 @@ _PRETRAIN_ENV_NAMES = {
     "SLURM_PROCID",
     "SLURM_STEP_NODELIST",
     "SLURM_TASKS_PER_NODE",
+    "TORCHELASTIC_RESTART_COUNT",
     "WORLD_SIZE",
 }
 # The daemon emits the perf counters, one line per rank per save, into its own
@@ -213,6 +222,53 @@ def sys_path_insert(path: Path) -> None:
     entries = [entry for entry in os.environ.get("PYTHONPATH", "").split(":") if entry]
     if value not in entries:
         os.environ["PYTHONPATH"] = ":".join([value, *entries])
+
+
+def _job_array_segment(args: argparse.Namespace) -> int:
+    """Nodes per job-array task; 0 keeps the classic single-allocation launch.
+
+    Unset (no --job-array-segment and no SLURMJOB_OPT_JOB_ARRAY_SEGMENT) launches
+    any job wider than one 16-node NVLink domain as a shared-rendezvous array of
+    16-node tasks.
+    """
+    value = getattr(args, "job_array_segment", None)
+    if value is not None:
+        return value
+    return _JOB_ARRAY_SEGMENT_DEFAULT if args.nodes > _JOB_ARRAY_SEGMENT_DEFAULT else 0
+
+
+def _in_job_array() -> bool:
+    """Whether the run trains under ft_launcher across a Slurm job-array shared rendezvous."""
+    return int(os.environ.get("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "") or 0) > 0
+
+
+def _rank_env(primary: str, fallback: str, default: str) -> str:
+    """Read a distributed-rank variable, preferring the launcher's names in job-array mode.
+
+    The ft_launcher srun step runs one Slurm task per node, so the SLURM_* rank
+    variables describe launcher agents — they repeat on every node and count nodes,
+    not ranks. The launcher sets RANK, LOCAL_RANK, WORLD_SIZE and LOCAL_WORLD_SIZE
+    for the worker processes it spawns, so those win when it drives the launch.
+    """
+    if _in_job_array():
+        primary, fallback = fallback, primary
+    return os.environ.get(primary, os.environ.get(fallback, default))
+
+
+def _sync_job_id() -> str:
+    """The job id every rank of this run shares, for file-based synchronization.
+
+    Array tasks carry distinct SLURM_JOB_IDs, so the shared-rendezvous world keys
+    its markers by the array id instead.
+    """
+    if not _in_job_array():
+        return os.environ.get("SLURM_JOB_ID", "local")
+    job_id = os.environ.get("SLURM_ARRAY_JOB_ID", os.environ.get("SLURM_JOB_ID", "local"))
+    # ft_launcher re-executes the worker entrypoint on every elastic cycle.
+    # Markers from a previous cycle must not satisfy the new cycle's barriers
+    # (and a stale .failed marker must not poison it permanently).
+    restart = os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
+    return f"{job_id}-restart{restart}"
 
 
 def _install_torch_serialization_compat() -> bool:
@@ -474,6 +530,10 @@ def _configure_run(args: argparse.Namespace) -> None:
         MEGATRON_ROOT=os.environ.get("MEGATRON_ROOT", str(_megatron_checkout(args))),
         MEGATRON_NATIVE_BUILD_DIR=str(WORK_ROOT / f"build/nvrx_checkpointing-{_repo_sha()}"),
         ENROOT_IMAGE_DIR=str(args.image.parent),
+        # Publish the resolved array segment so workers and the materialized
+        # script see the value the launcher was generated with, not the unset
+        # (auto) form.
+        SLURMJOB_OPT_JOB_ARRAY_SEGMENT=str(_job_array_segment(args)),
     )
     for name, default in _TRAIN_ENV_DEFAULTS.items():
         os.environ.setdefault(name, default)
@@ -640,20 +700,33 @@ def build_srun_cmd(
     *, nodes: int, ntasks: int, time_minutes: int, job_name: str, image: str,
     container_env: str, gpus_per_node: int, total_gpus: int, extra_srun_args: list[str] | None = None,
     output: Path | None = None, append_output: bool = False, container: bool = True,
-    partition: str | None = None,
+    partition: str | None = None, kill_on_bad_exit: bool = True,
 ) -> list[str]:
     values = _slurm_values(nodes, ntasks, time_minutes, job_name, image, container_env, gpus_per_node, total_gpus)
     output_args = [f"--output={output}", f"--open-mode={'append' if append_output else 'truncate'}"] if output else []
     tokens = _override_command_option(_srun_tokens(values), "--partition", partition)
     if not container:
         tokens = [token for token in tokens if not token.startswith("--container-")]
-    return [*tokens, "--kill-on-bad-exit=1", _reaper(time_minutes), "--label", *output_args, *(extra_srun_args or [])]
+    return [
+        *tokens,
+        f"--kill-on-bad-exit={int(kill_on_bad_exit)}",
+        _reaper(time_minutes),
+        "--label",
+        *output_args,
+        *(extra_srun_args or []),
+    ]
 
 def build_sbatch_script(
     *, nodes: int, ntasks: int, time_minutes: int, job_name: str, image: str,
     container_env: str, gpus_per_node: int, total_gpus: int, body: str,
-    partition: str | None = None,
+    partition: str | None = None, nodes_per_task: int = 0,
 ) -> tuple[str, str]:
+    active_tasks = 0
+    if nodes_per_task:
+        # One NVLink domain per task; the extra active task is the hot
+        # spare and the rest of the array backfills consumed tasks.
+        active_tasks = nodes // nodes_per_task + 1
+        nodes, ntasks = nodes_per_task, nodes_per_task * gpus_per_node
     if ntasks != nodes * gpus_per_node:
         raise ValueError("exclusive allocations require one task per GPU")
     values = _slurm_values(
@@ -668,14 +741,19 @@ def build_sbatch_script(
         "--dependency=singleton",
         f"--signal=TERM@{_CLEANUP_GRACE_MINUTES * 60}",
     ]
-    if segment := os.environ.get("SLURM_SEGMENT", "16" if nodes >= 16 else "").strip():
+    if nodes_per_task:
+        flags += [f"--array=0-{2 * active_tasks - 1}%{active_tasks}", "--no-requeue"]
+    segment = os.environ.get("SLURM_SEGMENT", "").strip() or (
+        str(nodes_per_task) if nodes_per_task else ("16" if nodes >= 16 else "")
+    )
+    if segment:
         flags.append(f"--segment={segment}")
     flags.append("--exclusive")
     reaper_flag, reaper_json = _reaper(time_minutes).split("=", 1)
     reaper = f"{reaper_flag}={shlex.quote(reaper_json)}"
     return "#!/bin/bash\n" + "\n".join(f"#SBATCH {flag}" for flag in flags) + f"\n\n{body.rstrip()}\n", reaper
 
-def _materialize(script: str, path: Path, args: list[str], env: dict[str, str] | None) -> None:
+def _materialize(script: str, path: Path, args: list[str], env: dict[str, str] | None, batch_output: Path | None = None) -> None:
     head, body = script.split("\n\n", 1)
     source = env or os.environ
     names = _RUN_ENV_NAMES | {key for key in source if key.startswith(("CUDA_", "NCCL_", "NVTE_", "TORCHINDUCTOR_", "UCX_"))}
@@ -709,7 +787,7 @@ def _materialize(script: str, path: Path, args: list[str], env: dict[str, str] |
         *(f"export {key}={value}" for key, value in derived.items()),
     ]
     export_text = "\n".join(exports)
-    directives = "\n".join([*(f"#SBATCH {arg}" for arg in args), f"#SBATCH --output={os.devnull}"])
+    directives = "\n".join([*(f"#SBATCH {arg}" for arg in args), f"#SBATCH --output={batch_output or os.devnull}"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"{head}\n# Generated by ci/scripts/slurm_job.py; submit with: sbatch {shlex.quote(path.name)}\n"
@@ -788,30 +866,125 @@ def _report_allocation_accounting(job_id: str) -> None:
     for row in proc.stdout.strip().splitlines():
         logger.info(f"[slurm_job:sacct] {row}")
 
-def _verify_allocation(job_id: str, rc: int) -> None:
-    command = ["sacct", "-X", "-n", "-P", "--local", "-j", job_id, "-o", "JobIDRaw,State,ExitCode,DerivedExitCode"]
+
+_SACCT_ACTIVE_STATES = {"PENDING", "RUNNING", "COMPLETING", "CONFIGURING"}
+
+
+def _terminal_state(row: list[str]) -> bool:
+    return bool(row[1].strip()) and row[1].split()[0].rstrip("+") not in _SACCT_ACTIVE_STATES
+
+
+def _clean(row: list[str]) -> bool:
+    return row[1].split()[0].rstrip("+") == "COMPLETED" and all(code == "0:0" for code in row[2:])
+
+
+def _soft_failed(row: list[str]) -> bool:
+    return (
+        row[1].split()[0].rstrip("+") == "FAILED"
+        and all(code.endswith(":0") for code in row[2:])
+        and any(code.startswith(f"{SOFT_FAIL_RC}:") for code in row[2:])
+    )
+
+
+def _drained(row: list[str]) -> bool:
+    """A replaced/drained peer or a cancelled cold spare.
+
+    Slurm owns the state when infrastructure removes a task, so a launcher
+    successfully replaced by a hot spare can finish as NODE_FAIL or PREEMPTED
+    instead of reaching the wrapper's ordinary exit-1 path.
+    """
+    state = row[1].split()[0].rstrip("+")
+    return state in {"CANCELLED", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "REVOKED"} or (
+        state == "FAILED"
+        and all(code.endswith(":0") for code in row[2:])
+        and any(code.startswith("1:") for code in row[2:])
+    )
+
+
+def _verify_job_array(job_id: str, rows: list[list[str]]) -> int:
+    """Verdict for a finished job array: task 0 carries it; peers only drain."""
+    lead = next((r for r in rows if r[0] == f"{job_id}_0"), None)
+    if lead is None:
+        # No indexed task rows at all: every row belongs to this array but none
+        # names task 0, and a task-0 failure reads exactly like a drained peer,
+        # so the verdict passes only when every task is clean or cancelled.
+        if all(_clean(r) or r[1].split()[0].rstrip("+") == "CANCELLED" for r in rows):
+            return 0
+        raise RuntimeError(
+            f"Slurm job array {job_id} has no identifiable task 0 and a failed task: "
+            + ", ".join(f"{r[0]} state={r[1]} exit={r[2]}" for r in rows),
+        )
+    if not (_clean(lead) or _soft_failed(lead)):
+        raise RuntimeError(
+            f"Slurm job array {job_id} task 0 was not successful: state={lead[1]} exit={lead[2]} derived_exit={lead[3]}",
+        )
+    if bad := [r for r in rows if r is not lead and not _clean(r) and not _drained(r)]:
+        raise RuntimeError(
+            f"Slurm job array {job_id} peer tasks failed: "
+            + ", ".join(f"{r[0]} state={r[1]} exit={r[2]}" for r in bad),
+        )
+    return SOFT_FAIL_RC if _soft_failed(lead) else 0
+
+
+def _sacct_rows(job_id: str, job_array: bool) -> list[list[str]]:
+    """Poll sacct until the allocation — every task, for an array — reports terminal.
+
+    Queries the display JobID column rather than JobIDRaw: array tasks always show
+    the indexed 123_0 form there, while JobIDRaw is a bare per-task numeric on some
+    Slurm versions, which cannot name task 0.
+    """
+    command = ["sacct", "-X", "-n", "-P", "--local", "-j", job_id, "-o", "JobID,State,ExitCode,DerivedExitCode"]
+
+    rows: list[list[str]] = []
     for _attempt in range(30):
         proc = subprocess.run(command, capture_output=True, text=True, check=False)
         if proc.returncode:
             raise RuntimeError(f"sacct failed for Slurm job {job_id}: {proc.stderr.strip()}")
-        row = next((line.split("|") for line in proc.stdout.splitlines() if line.split("|", 1)[0] == job_id), None)
-        state = row[1].split()[0].rstrip("+") if row and len(row) == 4 else ""
-        if state and state not in {"PENDING", "RUNNING", "COMPLETING", "CONFIGURING"}:
+        rows = [r for r in (line.split("|") for line in proc.stdout.splitlines() if line.strip()) if len(r) == 4]
+        if job_array:
+            key = next((r for r in rows if r[0] == f"{job_id}_0"), None)
+            if any(r[0].startswith(f"{job_id}_") for r in rows):
+                rows = [r for r in rows if r[0].startswith(f"{job_id}_")]
+                if key is not None and all(_terminal_state(r) for r in rows):
+                    break
+            elif rows and all(_terminal_state(r) for r in rows):
+                # No indexed rows at all: every row returned by -j is this array's.
+                break
+        elif (row := next((r for r in rows if r[0] == job_id), None)) is not None and _terminal_state(row):
             break
         time.sleep(1)
-    else:
+    return rows
+
+
+def _verify_allocation(job_id: str, rc: int, job_array: bool = False) -> int | None:
+    """Check the finished Slurm allocation; returns the verdict rc in job-array mode.
+
+    A job array's verdict lives on task 0: peers exit 1 when task 0's RDZV_CLOSED
+    drains the generation and cold spares are cancelled, so their rows carry no
+    signal. sbatch --wait does not propagate a per-task exit code for arrays, so
+    the sacct verdict replaces rc. The display JobID column carries the indexed
+    123_0 task form on every Slurm version; a version whose JobIDRaw is a bare
+    per-task numeric cannot name task 0, so an unindexed row set only passes when
+    every task is clean or cancelled — a drained peer reads exactly like a failed
+    task 0 there.
+    """
+    rows = _sacct_rows(job_id, job_array)
+    if job_array:
+        if not rows or not all(_terminal_state(r) for r in rows):
+            raise RuntimeError(f"sacct did not report a finished Slurm job array {job_id}")
+        return _verify_job_array(job_id, rows)
+
+    row = next((r for r in rows if r[0] == job_id), None)
+    if row is None or not _terminal_state(row):
         raise RuntimeError(f"sacct did not report Slurm allocation {job_id}")
     _report_allocation_accounting(job_id)
-    codes = row[2:]
-    clean = all(code == "0:0" for code in codes)
-    soft = rc == SOFT_FAIL_RC and state == "FAILED" and all(code.endswith(":0") for code in codes) and any(
-        code.startswith(f"{SOFT_FAIL_RC}:") for code in codes
-    )
-    if not ((rc == 0 and state == "COMPLETED" and clean) or soft):
+    soft_rc = rc == SOFT_FAIL_RC and _soft_failed(row)
+    if not ((rc == 0 and _clean(row)) or soft_rc):
         raise RuntimeError(
             f"Slurm allocation {job_id} was not successful: state={row[1]} "
             f"exit={row[2]} derived_exit={row[3]} sbatch_rc={rc}",
         )
+    return None
 
 @contextlib.contextmanager
 def _cancel_on_signal(job_id: str) -> Generator[None, None, None]:
@@ -832,12 +1005,24 @@ def _cancel_on_signal(job_id: str) -> Generator[None, None, None]:
 def sbatch_run(
     script: str, stream_log: Path, *, extra_sbatch_args: list[str] | None = None,
     env: dict[str, str] | None = None, background: bool = False, dry_run: bool = False,
+    job_array: bool = False,
 ) -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     script_path = RUN_ROOT / "run.sbatch" if RUN_ROOT else stream_log.with_suffix(".sbatch")
     stream_log.parent.mkdir(parents=True, exist_ok=True)
     stream_log.write_text("")
-    _materialize(script, script_path, list(extra_sbatch_args or []), env)
+    if job_array:
+        # A named run can be submitted again without --clean-run. Its primary
+        # stream is truncated above; do the same for the peer streams so the
+        # new epilog cannot count checkpoints or metrics from an older array.
+        for stale in stream_log.parent.glob(f"{stream_log.stem}.task*.log"):
+            stale.unlink()
+        stream_log.with_suffix(".combined.log").unlink(missing_ok=True)
+    # Array tasks need a real batch output on the run directory: anything a task
+    # writes before its exec redirect — including a failing redirect — otherwise
+    # lands in /dev/null.
+    batch_output = RESULTS_DIR / "slurm_batch.%A_%a.log" if job_array else None
+    _materialize(script, script_path, list(extra_sbatch_args or []), env, batch_output=batch_output)
     if dry_run:
         logger.info(f"[slurm_job] wrote sbatch reproducer: {script_path}")
         return 0
@@ -865,14 +1050,21 @@ def sbatch_run(
         tail.terminate()
         with contextlib.suppress(subprocess.TimeoutExpired):
             tail.wait(timeout=5)
-    _verify_allocation(job_id, rc)
-    return rc
+    verdict = _verify_allocation(job_id, rc, job_array=job_array)
+    return rc if verdict is None else verdict
 
 def _transient_nccl_proxy_failure(log: Path) -> bool:
-    """Recognize the recurrent NCCL InfiniBand proxy crash, and only that crash."""
+    """Recognize the recurrent NCCL InfiniBand proxy crash, and only that crash.
+
+    Reads the task logs as well when they exist: under a job array the failing
+    rank's output lands in the log of the task that hosted it, not the one the
+    launcher tails.
+    """
     if not log.exists():
         return False
     text = log.read_text(errors="replace")
+    for task_log in sorted(log.parent.glob(f"{log.stem}.task*.log")):
+        text += task_log.read_text(errors="replace")
     return all(marker in text for marker in ("Segfault encountered", "ncclIbMultiSend", "sendProxyProgress"))
 
 def _clean_run_for_retry() -> None:
@@ -892,6 +1084,7 @@ def _sbatch_run_with_retry(
     extra_sbatch_args: list[str],
     background: bool,
     dry_run: bool,
+    job_array: bool = False,
 ) -> int:
     """Retry one clean allocation only for the known transient NCCL proxy crash."""
     try:
@@ -900,6 +1093,7 @@ def _sbatch_run_with_retry(
             extra_sbatch_args=extra_sbatch_args,
             background=background,
             dry_run=dry_run,
+            job_array=job_array,
         )
     except RuntimeError:
         if background or dry_run or not _transient_nccl_proxy_failure(log):
@@ -909,7 +1103,7 @@ def _sbatch_run_with_retry(
             "retrying once on a clean allocation",
         )
         _clean_run_for_retry()
-        return sbatch_run(script, log, extra_sbatch_args=extra_sbatch_args)
+        return sbatch_run(script, log, extra_sbatch_args=extra_sbatch_args, job_array=job_array)
 
 def _tee_rc(
     cmd: list[str],
@@ -1446,7 +1640,7 @@ def _set(opts: list[str], flag: str, value: str | None = None) -> None:
     opts.extend([flag, value] if value is not None else [flag])
 
 def _base_env() -> dict[str, str]:
-    rank = os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0"))
+    rank = _rank_env("SLURM_PROCID", "RANK", "0")
     caches = {
         name: str(Path(os.environ.get(name, default)) / f"rank-{rank}")
         for name, default in (
@@ -1458,8 +1652,8 @@ def _base_env() -> dict[str, str]:
     }
     for cache in caches.values():
         Path(cache).mkdir(parents=True, exist_ok=True)
-    local_rank = os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0"))
-    world = os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1"))
+    local_rank = _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0")
+    world = _rank_env("SLURM_NTASKS", "WORLD_SIZE", "1")
     nodes = os.environ.get("SLURM_STEP_NODELIST") or os.environ["SLURM_JOB_NODELIST"]
     if "MASTER_ADDR" not in os.environ:
         hosts = subprocess.check_output(["scontrol", "show", "hostnames", nodes], text=True)  # noqa: S607
@@ -1515,7 +1709,17 @@ class FlavorPolicy:
     server: Callable[[str, int], contextlib.AbstractContextManager] | None = None
     reporter: Callable[[argparse.Namespace, Path], bool] | None = None
 
-    def train_config(self, cfg: str, args: argparse.Namespace, provider: str, phase: int, cycle: int = 0) -> TrainConfig:
+    def train_config(
+        self,
+        cfg: str,
+        args: argparse.Namespace,
+        provider: str,
+        phase: int,
+        cycle: int = 0,
+        *,
+        resume_iteration: int | None = None,
+        checkpoints_override: int | None = None,
+    ) -> TrainConfig:
         run, phase1 = _run_dir(cfg), _run_dir(cfg) / "phase1-checkpoints"
         extend_training = args.checkpoints_per_run is not None or args.repeat != 1
         if phase == 1:
@@ -1524,15 +1728,21 @@ class FlavorPolicy:
                 1, self.phase1_train_iters, 1, extend_training,
             )
         checkpoints = self.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
+        if checkpoints_override is not None:
+            checkpoints = checkpoints_override
         interval = self.phase2_save_interval if args.checkpoint_interval is None else args.checkpoint_interval
         start_iteration = self.phase1_train_iters
         if cycle:
             start_iteration = (self.phase1_train_iters // interval + cycle * checkpoints) * interval
+        load = phase1 if cycle == 0 else run / "checkpoints"
+        if resume_iteration is not None:
+            start_iteration = resume_iteration
+            load = run / "checkpoints"
         return TrainConfig(
             args.nodes,
             args.gpus_per_node,
             run / "checkpoints",
-            phase1 if cycle == 0 else run / "checkpoints",
+            load,
             args.config,
             provider,
             2,
@@ -1739,8 +1949,8 @@ class ValgrindFlavor(Flavor):
     @contextlib.contextmanager
     def server(self, stem: str, phase: int) -> Generator[None, None, None]:
         host = socket.gethostname().split(".")[0]
-        marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{stem}-{host}"
-        if os.environ.get("SLURM_LOCALID", "0") != "0":
+        marker = _sync_root() / f"{_sync_job_id()}-{stem}-{host}"
+        if _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") != "0":
             wait_for_file(marker.with_suffix(".ready"), 600)
             yield
             wait_for_file(marker.with_suffix(".done"), 3600)
@@ -2017,6 +2227,58 @@ class TrainConfig:
     extend_training: bool = False
     start_iteration: int = 0
 
+
+@dataclass(frozen=True)
+class RoutineStart:
+    phase: int = 1
+    cycle: int = 0
+    resume_iteration: int | None = None
+    checkpoints: int | None = None
+    complete: bool = False
+
+
+def _complete_checkpoint_iterations(root: Path) -> list[int]:
+    """Iterations whose distributed checkpoint metadata was committed."""
+    complete = []
+    for path in root.glob("iter_*"):
+        match = re.fullmatch(r"iter_(\d+)", path.name)
+        if match and (path / ".metadata").is_file():
+            complete.append(int(match[1]))
+    return sorted(complete)
+
+
+def _routine_start(cfg: str, args: argparse.Namespace, policy: FlavorPolicy) -> RoutineStart:
+    """Resume the current routine after an ft_launcher worker restart.
+
+    A fresh Slurm submission intentionally starts a fresh validation even when
+    its named run directory already exists. Only a launcher-owned restart may
+    consume checkpoints written by the preceding elastic cycle.
+    """
+    if not _in_job_array() or int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")) == 0:
+        return RoutineStart()
+
+    run = _run_dir(cfg)
+    phase1 = run / f"phase1-checkpoints/iter_{policy.phase1_train_iters:07d}/.metadata"
+    if not phase1.is_file():
+        return RoutineStart()
+
+    iterations = _complete_checkpoint_iterations(run / "checkpoints")
+    checkpoints = policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
+    if checkpoints == 0:
+        return RoutineStart(phase=2, resume_iteration=iterations[-1] if iterations else None, checkpoints=0)
+
+    completed = len(iterations)
+    cycle, within_cycle = divmod(completed, checkpoints)
+    if args.repeat and cycle >= args.repeat:
+        return RoutineStart(phase=2, cycle=cycle, complete=True)
+    remaining = checkpoints - within_cycle if within_cycle else None
+    return RoutineStart(
+        phase=2,
+        cycle=cycle,
+        resume_iteration=iterations[-1] if iterations else None,
+        checkpoints=remaining,
+    )
+
 def _train_options(cfg: str, config: TrainConfig) -> list[str]:
     run = _run_dir(cfg)
     phase1 = run / "phase1-checkpoints"
@@ -2081,10 +2343,11 @@ def _sync_root() -> Path:
 
 def _node_once(tag: str, action: Callable[[], None]) -> None:
     host = socket.gethostname().split(".")[0]
-    marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}-{host}"
-    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+    marker = _sync_root() / f"{_sync_job_id()}-{tag}-{host}"
+    local_rank = int(_rank_env("SLURM_LOCALID", "LOCAL_RANK", "0"))
     tasks_spec = (
-        os.environ.get("SLURM_NTASKS_PER_NODE")
+        (os.environ.get("LOCAL_WORLD_SIZE") if _in_job_array() else None)
+        or os.environ.get("SLURM_NTASKS_PER_NODE")
         or os.environ.get("SLURM_TASKS_PER_NODE")
         or os.environ.get("LOCAL_WORLD_SIZE", "1")
     )
@@ -2110,9 +2373,9 @@ def _node_once(tag: str, action: Callable[[], None]) -> None:
             raise RuntimeError(f"node-local action {tag} failed")
 
 def _sync_ranks(tag: str) -> None:
-    marker = _sync_root() / f"{os.environ.get('SLURM_JOB_ID', 'local')}-{tag}"
-    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
-    world = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", "1")))
+    marker = _sync_root() / f"{_sync_job_id()}-{tag}"
+    rank = int(_rank_env("SLURM_PROCID", "RANK", "0"))
+    world = int(_rank_env("SLURM_NTASKS", "WORLD_SIZE", "1"))
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.with_name(f"{marker.name}.ready-{rank}").touch()
     deadline = time.monotonic() + 3600
@@ -2137,7 +2400,7 @@ def _heartbeat_server(stopped: threading.Event) -> None:
 
 @contextlib.contextmanager
 def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
-    if not enabled or os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")) != "0":
+    if not enabled or _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") != "0":
         yield
         return
     stopped = threading.Event()
@@ -2171,9 +2434,20 @@ def _phase_command(
     provider: str,
     phase: int,
     cycle: int = 0,
+    *,
+    resume_iteration: int | None = None,
+    checkpoints_override: int | None = None,
 ) -> tuple[list[str], dict]:
     flavors = _selected_flavors(args)
-    config = flavors.policy.train_config(cfg, args, provider, phase, cycle)
+    config = flavors.policy.train_config(
+        cfg,
+        args,
+        provider,
+        phase,
+        cycle,
+        resume_iteration=resume_iteration,
+        checkpoints_override=checkpoints_override,
+    )
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
     _toolchain(cfg, args).apply(env)
     flavors.transform(opts, env)
@@ -2187,12 +2461,12 @@ def _phase_command(
     return ["python3", "-u", str(Path(__file__).resolve()), _PRETRAIN_ENTRY_CMD, str(phase), *opts, *args.extra_args], env
 def _print_flavor_options(flavors: FlavorSelection, phase: int, applied: list[str]) -> None:
     """Record what the selected variants changed about this phase's command."""
-    if os.environ.get("SLURM_PROCID", "0") != "0" or not applied:
+    if _rank_env("SLURM_PROCID", "RANK", "0") != "0" or not applied:
         return
     print(f"[slurm_job:flavor] {flavors.tag} phase{phase} {' '.join(applied)}", flush=True)  # noqa: T201
 
 def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
-    if os.environ.get("SLURM_PROCID", "0") != "0":
+    if _rank_env("SLURM_PROCID", "RANK", "0") != "0":
         return
     print(f"[slurm_job:env] {cycle_tag} rank0 environment", flush=True)  # noqa: T201
     for name in sorted(_RUN_ENV_NAMES | _PRETRAIN_ENV_NAMES | _TRAIN_ENV_DEFAULTS.keys()):
@@ -2201,15 +2475,35 @@ def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
 def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
     flavors = _selected_flavors(args)
     stem = f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
-    phase, cycle = 1, 0
+    start = _routine_start(cfg, args, flavors.policy)
+    phase, cycle = start.phase, start.cycle
+    if start.complete:
+        if _rank_env("SLURM_PROCID", "RANK", "0") == "0":
+            logger.info(f"[slurm_job:restart] {label or 'run'} already completed; reusing durable checkpoints")
+        return
+    resume_iteration, checkpoints_override = start.resume_iteration, start.checkpoints
+    if resume_iteration is not None and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
+        logger.info(
+            f"[slurm_job:restart] {label or 'run'} resuming phase 2 from iteration {resume_iteration}",
+        )
     while phase == 1 or args.repeat == 0 or cycle < args.repeat:
-        cmd, env = _phase_command(cfg, args, provider, phase, cycle)
-        log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{os.environ.get('SLURM_PROCID', '0')}.log" if label else None
+        cmd, env = _phase_command(
+            cfg,
+            args,
+            provider,
+            phase,
+            cycle,
+            resume_iteration=resume_iteration,
+            checkpoints_override=checkpoints_override,
+        )
+        resume_iteration = checkpoints_override = None
+        rank = _rank_env("SLURM_PROCID", "RANK", "0")
+        log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{rank}.log" if label else None
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
         # The daemon carries the perf counters now, and it is restarted per cycle. Name its
         # log for the cycle so the report can tell the measured routine from the reference.
         os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
-        if os.environ.get("SLURM_PROCID", "0") == "0":
+        if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
         with (
             flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
@@ -2224,7 +2518,7 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                     append=True,
                     # Retain complete per-rank logs as artifacts, but mirror only
                     # rank 0 into the size-limited GitLab job trace.
-                    mirror_stdout=os.environ.get("SLURM_PROCID", "0") == "0",
+                    mirror_stdout=rank == "0",
                 )
                 if log
                 else subprocess.run(cmd, env=env, check=False).returncode
@@ -2290,11 +2584,11 @@ def _manifest_batch(  # noqa: C901
     baseline for that iteration. When stash_root is set, the produced
     .info files are copied there (used during reference-manifest creation).
     """
-    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
-    local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+    rank = int(_rank_env("SLURM_PROCID", "RANK", "0"))
+    local_rank = int(_rank_env("SLURM_LOCALID", "LOCAL_RANK", "0"))
     node_index = rank // args.gpus_per_node
     is_node_leader = local_rank == 0
-    job_id = os.environ.get("SLURM_JOB_ID", "local")
+    job_id = _sync_job_id()
 
     if is_node_leader and iterations:
         mine = [c for i, c in enumerate(iterations) if i % args.nodes == node_index]
@@ -2493,7 +2787,7 @@ def _perform_runs(cfg: str, args: argparse.Namespace) -> None:
     digest. Nothing one run writes is read by another, so the comparison is a
     diff of digests rather than a second routine checking the first.
     """
-    rank0 = os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")) == "0"
+    rank0 = _rank_env("SLURM_PROCID", "RANK", "0") == "0"
     specs, digests = _run_specs(args), []
     comparable = len(specs) > 1 or args.baseline is not None or any(
         spec.flavors.policy.compares_routines for spec in specs
@@ -2629,7 +2923,7 @@ class _PeakHbmSampler:
 
 def _pretrain_entry(phase: int) -> None:
     sys_path_insert(megatron_root())
-    if _install_torch_serialization_compat() and os.environ.get("SLURM_PROCID", "0") == "0":
+    if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
 
     from nvrx_checkpointing import megatron_integration  # noqa: PLC0415
@@ -2696,16 +2990,24 @@ def _pretrain_entry(phase: int) -> None:
 def _worker(args: argparse.Namespace) -> None:
     flavors = _selected_flavors(args)
     provider = _provider(flavors)
-    if provider == "native" and flavors.policy.requires_nvrx_absent:
+    if provider == "native" and flavors.policy.requires_nvrx_absent and not _in_job_array():
+        # The array's ft_launcher is itself an NVRx entry point; a mid-run
+        # uninstall would pull its modules from under the launcher agents.
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
     if target := _nvrx_target(cfg, args.nvrx_commit):
         sys_path_insert(target)
-    CHECKPOINT_SERVER.require_stopped()
+    if _in_job_array():
+        # A launcher restart re-runs this worker on nodes whose previous attempt
+        # auto-launched the checkpoint daemon; the leftover belongs to this run,
+        # so terminate it instead of refusing to start.
+        CHECKPOINT_SERVER.terminate()
+    else:
+        CHECKPOINT_SERVER.require_stopped()
     try:
         _perform_runs(cfg, args)
     except BaseException:
-        local_rank = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", "0")))
+        local_rank = int(_rank_env("SLURM_LOCALID", "LOCAL_RANK", "0"))
         if flavors.policy.manages_native_server and provider == "native" and local_rank == 0:
             with contextlib.suppress(Exception):
                 CHECKPOINT_SERVER.request("stop", 5)
@@ -2716,6 +3018,233 @@ def _identity(args: argparse.Namespace) -> tuple[str, str, str]:
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
     flavors = _selected_flavors(args)
     return cfg, flavors.tag, f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
+
+
+def _clean_run_lines(*, lead_only: bool) -> list[str]:
+    """Shell lines that safely clear one run before any shared writes begin."""
+    condition = '"${SLURMJOB_OPT_CLEAN_RUN:-0}" == 1'
+    if lead_only:
+        condition += ' && "${SLURM_ARRAY_TASK_ID}" == "0"'
+    return [
+        f"if [[ {condition} ]]; then",
+        '  [[ "${SLURMJOB_OPT_RUN_DIR:?}" != / && "${SLURMJOB_OPT_RUN_DIR##*/}" == '
+        '"${SLURMJOB_OPT_RUN_NAME:?}" ]] || exit 2',
+        ('  find "${SLURMJOB_OPT_RUN_DIR}" -mindepth 1 -maxdepth 1 '
+         '! -path "${SLURMJOB_OPT_RUN_DIR}/run.sbatch" '
+         '! -path "${SLURMJOB_OPT_RUN_DIR}/job_id" '
+         '! -path "${SLURMJOB_OPT_RUN_DIR}/gitlab_job_id" '
+         '! -path "${SLURMJOB_OPT_RUN_DIR}/logs" -exec rm -rf -- {} +'),
+        '  mkdir -p "${SLURMJOB_OPT_RUN_DIR}/logs"',
+        '  find "${SLURMJOB_OPT_RUN_DIR}/logs" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
+        "fi",
+    ]
+
+
+def _classic_job_body(
+    *, prep: list[str], run: list[str], epilog: list[str], rank_logs: list[str],
+    host_cleanup: list[str], log: Path,
+) -> list[str]:
+    """Build the ordinary single-allocation batch lifecycle."""
+    return [
+        "set -Eeuo pipefail",
+        "allocation_epilog() {",
+        "  local rc=$?",
+        "  trap - EXIT",
+        "  set +e",
+        f"  {shell_join(host_cleanup)}",
+        "  local cleanup_rc=$?",
+        '  (( rc != 0 )) && exit "${rc}"',
+        '  exit "${cleanup_rc}"',
+        "}",
+        "trap allocation_epilog EXIT",
+        *_clean_run_lines(lead_only=False),
+        f"exec > >({shell_join(['tee', str(log)])}) 2>&1",
+        'printf "%s\\n" "${SLURM_JOB_ID:?}" > "${SLURMJOB_OPT_RUN_DIR:?}/job_id"',
+        shell_join(prep),
+        # Only rank 0 is streamed during a run. If srun fails, show the logs of
+        # the ranks it says exited before propagating the original return code.
+        f"{shell_join(run)} && run_rc=0 || run_rc=$?",
+        "if (( run_rc != 0 )); then",
+        f"  {shell_join(rank_logs)} || true",
+        '  exit "${run_rc}"',
+        "fi",
+        shell_join(epilog),
+    ]
+
+
+def _job_array_body(
+    args: argparse.Namespace,
+    *,
+    segment: int,
+    work_minutes: int,
+    common: dict[str, object],
+    container_env: str,
+    writable: bool,
+    prep: list[str],
+    worker_args: list[str],
+    epilog: list[str],
+    rank_logs: list[str],
+    host_cleanup: list[str],
+    log: Path,
+) -> list[str]:
+    """Build one task's shared-rendezvous array lifecycle.
+
+    Task 0 owns preparation, the rendezvous store, final verification and the
+    generation drain. Every task owns one NVLink domain; additional queued
+    tasks provide replacement domains to ``ft_launcher``.
+    """
+
+    def launcher_step(*, lead: bool) -> list[str]:
+        return build_srun_cmd(
+            nodes=segment,
+            ntasks=segment,
+            time_minutes=work_minutes,
+            total_gpus=segment * args.gpus_per_node,
+            container_env=f"{container_env},RDZV_HOST",
+            extra_srun_args=["--ntasks-per-node=1", *(["--container-writable"] if writable else [])],
+            kill_on_bad_exit=not lead,
+            **common,
+        )
+
+    launcher_options = " ".join([
+        f"--nnodes {args.nodes}:{args.nodes + segment}",
+        f"--nproc-per-node {args.gpus_per_node}",
+        '--rdzv-id "${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"',
+        "--rdzv-backend c10d",
+        '--rdzv-endpoint "${RDZV_HOST}:29400"',
+        "--rdzv-conf join_timeout=1200,store_connect_wait_seconds=600",
+        "--max-restarts 8",
+        "--ft-restart-policy any-failed",
+        f"--ft-segment {segment}",
+        "--ft-rank-section-timeouts setup:1800,step:600,checkpointing:420",
+        "--ft-rank-out-of-section-timeout 3600",
+        '--ft-cycle-info-dir "${SLURMJOB_OPT_RUN_DIR}/nvrx/'
+        '${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}/cycle_infos"',
+    ])
+    # ft_launcher invokes the first positional argument with Python. Passing
+    # ``python3`` would instead make it look for /workspace/python3.
+    worker_command = shlex.join([str(Path(__file__).resolve()), *worker_args])
+    launch_command = f"ft_launcher {launcher_options} {worker_command}"
+    lead_launch = f"{shell_join(launcher_step(lead=True))} sh -c {shlex.quote(launch_command)}"
+    peer_launch = f"{shell_join(launcher_step(lead=False))} sh -c {shlex.quote(launch_command)}"
+
+    return [
+        "set -Eeuo pipefail",
+        'SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"',
+        'NVRX_ARRAY_DIR="${SLURMJOB_OPT_RUN_DIR:?}/nvrx/${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"',
+        'RDZV_FILE="${NVRX_ARRAY_DIR}/control/rdzv_host"',
+        'RDZV_CLOSED="${NVRX_ARRAY_DIR}/control/rdzv_closed"',
+        'CLEAN_DONE="${NVRX_ARRAY_DIR}/control/clean_done"',
+        'PREP_DONE="${NVRX_ARRAY_DIR}/control/prep_done"',
+        "cancel_generation() {",
+        '  echo "Cancelling all remaining tasks of array ${SLURM_ARRAY_JOB_ID}."',
+        '  scancel "${SLURM_ARRAY_JOB_ID}" 2>/dev/null || true',
+        "}",
+        "job_array_exit() {",
+        "  local rc=$?",
+        "  trap - EXIT",
+        "  set +e",
+        f"  {shell_join(host_cleanup)}",
+        "  local cleanup_rc=$?",
+        '  if (( cleanup_rc != 0 )); then echo "WARNING: host cleanup exited '
+        '${cleanup_rc}; continuing array drain"; fi',
+        '  if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        '    mkdir -p "${NVRX_ARRAY_DIR}/control"',
+        '    echo "Task 0 exiting (rc=${rc}), creating RDZV_CLOSED file"',
+        '    touch "${RDZV_CLOSED}"',
+        "    if (( rc != 0 )); then",
+        "      cancel_generation",
+        "    else",
+        '      scancel --state=PENDING "${SLURM_ARRAY_JOB_ID}" 2>/dev/null || true',
+        "    fi",
+        "  fi",
+        '  exit "${rc}"',
+        "}",
+        "trap job_array_exit EXIT",
+        *_clean_run_lines(lead_only=True),
+        # Clean-run removal includes shared state and logs. Hold peer tasks here
+        # until task 0 has finished, then let every task create its output.
+        'if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        '  mkdir -p "${NVRX_ARRAY_DIR}/control"',
+        '  touch "${CLEAN_DONE}"',
+        "else",
+        "  CLEAN_WAIT=0",
+        '  while [[ ! -f "${CLEAN_DONE}" ]]; do',
+        '    if [[ -f "${RDZV_CLOSED}" ]]; then',
+        '      echo "RDZV_CLOSED while waiting for cleanup. Exiting task ${SLURM_ARRAY_TASK_ID}."',
+        "      exit 1",
+        "    fi",
+        "    if (( CLEAN_WAIT >= 600 )); then",
+        '      echo "cleanup not done after ${CLEAN_WAIT}s. Exiting task ${SLURM_ARRAY_TASK_ID}."',
+        "      exit 1",
+        "    fi",
+        "    sleep 1",
+        "    CLEAN_WAIT=$(( CLEAN_WAIT + 1 ))",
+        "  done",
+        "fi",
+        # Task 0 is the streamed control log; peer tasks retain separate logs.
+        'if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        f"  exec > >({shell_join(['tee', str(log)])}) 2>&1",
+        "else",
+        f"  exec >>{shell_join([str(log.with_suffix(''))])}.task${{SLURM_ARRAY_TASK_ID}}.log 2>&1",
+        "fi",
+        'printf "%s\\n" "${SLURM_ARRAY_JOB_ID}" > "${SLURMJOB_OPT_RUN_DIR:?}/job_id"',
+        # Publish atomically so peers see either no endpoint or a complete one.
+        'if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        '  RDZV_HOST="$(scontrol show hostnames "${SLURM_NODELIST}" 2>/dev/null | head -n1 || true)"',
+        '  if [[ -z "${RDZV_HOST}" ]]; then RDZV_HOST="$(hostname)"; fi',
+        '  if [[ -z "${RDZV_HOST}" ]]; then echo "FATAL: cannot determine rendezvous host" >&2; exit 1; fi',
+        '  printf \'%s\\n\' "${RDZV_HOST}" > "${RDZV_FILE}.tmp" && mv -f "${RDZV_FILE}.tmp" "${RDZV_FILE}"',
+        "fi",
+        "RH_WAIT=0",
+        "while true; do",
+        '  if [[ -f "${RDZV_CLOSED}" ]]; then',
+        '    echo "RDZV_CLOSED present on task ${SLURM_ARRAY_TASK_ID}: task 0 exited. Exiting."',
+        "    exit 1",
+        "  fi",
+        '  if [[ -s "${RDZV_FILE}" ]]; then break; fi',
+        "  if (( RH_WAIT >= 600 )); then",
+        '    echo "rdzv_host not published after ${RH_WAIT}s. Exiting task ${SLURM_ARRAY_TASK_ID}."',
+        "    exit 1",
+        "  fi",
+        "  sleep 1",
+        "  RH_WAIT=$(( RH_WAIT + 1 ))",
+        "done",
+        'export RDZV_HOST="$(cat "${RDZV_FILE}")"',
+        # Preparation writes shared dependencies, so peers wait for task 0.
+        'if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        f"  {shell_join(prep)}",
+        '  touch "${PREP_DONE}"',
+        "else",
+        "  PREP_WAIT=0",
+        '  while [[ ! -f "${PREP_DONE}" ]]; do',
+        '    if [[ -f "${RDZV_CLOSED}" ]]; then',
+        '      echo "RDZV_CLOSED while waiting for prep. Exiting task ${SLURM_ARRAY_TASK_ID}."',
+        "      exit 1",
+        "    fi",
+        "    if (( PREP_WAIT >= 3600 )); then",
+        '      echo "prep not done after ${PREP_WAIT}s. Exiting task ${SLURM_ARRAY_TASK_ID}."',
+        "      exit 1",
+        "    fi",
+        "    sleep 5",
+        "    PREP_WAIT=$(( PREP_WAIT + 5 ))",
+        "  done",
+        "fi",
+        'if [[ "${SLURM_ARRAY_TASK_ID}" == "0" ]]; then',
+        f"  {lead_launch} && run_rc=0 || run_rc=$?",
+        "  if (( run_rc != 0 )); then",
+        f"    {shell_join(rank_logs)} || true",
+        "  fi",
+        # Task 0 owns the result. Its launcher may lose a local agent while a
+        # spare replaces that domain, so the checkpoint epilog is authoritative.
+        f"  {shell_join(epilog)} && epilog_rc=0 || epilog_rc=$?",
+        '  if (( epilog_rc != 0 )); then exit "${epilog_rc}"; fi',
+        "else",
+        f"  {peer_launch} && run_rc=0 || run_rc=$?",
+        '  if (( run_rc != 0 )); then exit "${run_rc}"; fi',
+        "fi",
+    ]
+
 
 def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     flavors = _selected_flavors(args)
@@ -2764,6 +3293,8 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
     ]
     epilog_args = [*worker_args]
     worker_args.extend(args.extra_args)
+    segment = _job_array_segment(args)
+    job_array = segment > 0
     container_env = ",".join(_env_names("w"))
     native_perf_verification = _provider(flavors) == "native" and flavors.policy.requires_nvrx_absent
     run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification),
@@ -2776,50 +3307,45 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
         "python3", "-u", str(Path(__file__).resolve()), _RANK_LOGS_ENTRY_CMD, *epilog_args,
         "--log-file", str(log),
     ]
+    cleanup_nodes = segment if job_array else args.nodes
+
     host_cleanup = [
         *build_srun_cmd(
-            nodes=args.nodes, ntasks=args.nodes, total_gpus=total_tasks, container_env="",
+            nodes=cleanup_nodes, ntasks=cleanup_nodes,
+            total_gpus=cleanup_nodes * args.gpus_per_node, container_env="",
             time_minutes=_CLEANUP_GRACE_MINUTES, container=False,
             extra_srun_args=["--ntasks-per-node=1"], **common,
         ),
         "python3", "-u", str(SCRIPT_DIR / "daemon_tools.py"),
     ]
-    body = [
-        "set -Eeuo pipefail",
-        "allocation_epilog() {",
-        "  local rc=$?",
-        "  trap - EXIT",
-        "  set +e",
-        f"  {shell_join(host_cleanup)}",
-        "  local cleanup_rc=$?",
-        '  (( rc != 0 )) && exit "${rc}"',
-        '  exit "${cleanup_rc}"',
-        "}",
-        "trap allocation_epilog EXIT",
-        'if [[ "${SLURMJOB_OPT_CLEAN_RUN:-0}" == 1 ]]; then',
-        '  [[ "${SLURMJOB_OPT_RUN_DIR:?}" != / && "${SLURMJOB_OPT_RUN_DIR##*/}" == "${SLURMJOB_OPT_RUN_NAME:?}" ]] || exit 2',
-        ('  find "${SLURMJOB_OPT_RUN_DIR}" -mindepth 1 -maxdepth 1 ! -path "${SLURMJOB_OPT_RUN_DIR}/run.sbatch" '
-        '! -path "${SLURMJOB_OPT_RUN_DIR}/job_id" ! -path "${SLURMJOB_OPT_RUN_DIR}/gitlab_job_id" '
-        '! -path "${SLURMJOB_OPT_RUN_DIR}/logs" -exec rm -rf -- {} +'),
-        '  mkdir -p "${SLURMJOB_OPT_RUN_DIR}/logs"',
-        '  find "${SLURMJOB_OPT_RUN_DIR}/logs" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
-        "fi",
-        f"exec > >({shell_join(['tee', str(log)])}) 2>&1",
-        'printf "%s\\n" "${SLURM_JOB_ID:?}" > "${SLURMJOB_OPT_RUN_DIR:?}/job_id"',
-        shell_join(prep),
-        # Only rank 0 is streamed during a run. If srun fails, show the logs of
-        # the ranks it says exited before propagating the original return code.
-        f"{shell_join(run)} && run_rc=0 || run_rc=$?",
-        "if (( run_rc != 0 )); then",
-        f"  {shell_join(rank_logs)} || true",
-        '  exit "${run_rc}"',
-        "fi",
-        shell_join(epilog),
-    ]
+    if job_array:
+        body = _job_array_body(
+            args,
+            segment=segment,
+            work_minutes=work_minutes,
+            common=common,
+            container_env=container_env,
+            writable=native_perf_verification,
+            prep=prep,
+            worker_args=worker_args,
+            epilog=epilog,
+            rank_logs=rank_logs,
+            host_cleanup=host_cleanup,
+            log=log,
+        )
+    else:
+        body = _classic_job_body(
+            prep=prep,
+            run=run,
+            epilog=epilog,
+            rank_logs=rank_logs,
+            host_cleanup=host_cleanup,
+            log=log,
+        )
     script, reaper = build_sbatch_script(
         nodes=args.nodes, ntasks=total_tasks, time_minutes=minutes, job_name=job_name, image=image,
         container_env="", gpus_per_node=args.gpus_per_node, total_gpus=total_tasks, body="\n".join(body),
-        partition=partition,
+        partition=partition, nodes_per_task=segment,
     )
     return script, reaper, log
 
@@ -2878,6 +3404,10 @@ _RUN_OPTIONS = {
     "time_minutes": RunOption("SLURMJOB_OPT_TIME_MINUTES", convert=_positive_int, scopes="rw"),
     "clean_run": RunOption("SLURMJOB_OPT_CLEAN_RUN", False, _parse_bool, argparse.BooleanOptionalAction),
     "background": RunOption("SLURMJOB_OPT_BACKGROUND", False, _parse_bool, argparse.BooleanOptionalAction),
+    # Shared-rendezvous job array segment size in nodes; 0 keeps the classic
+    # single-allocation launch. Unset: jobs wider than one 16-node NVLink
+    # domain run as arrays of 16-node tasks.
+    "job_array_segment": RunOption("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", None, _nonnegative_int, None, (), "rw"),
     "dry_run": RunOption("SLURMJOB_OPT_DRY_RUN", False, _parse_bool, argparse.BooleanOptionalAction),
 }
 _ENV_SCOPES = {
@@ -2966,7 +3496,16 @@ def _epilog(argv: list[str]) -> None:
     args.flavors = FlavorSelection(args.flavor)
     _selected_flavors(args)
     args.baseline = json.loads(args.baseline_json)
-    text = args.log_file.read_text(errors="replace")
+    log_file = args.log_file
+    if _in_job_array():
+        # The launcher's rank 0 lands on whichever array task joins the rendezvous
+        # first, so the training stream the report reads lives in that task's log,
+        # not necessarily in the one task 0 tees. The combined view is the job's log.
+        task_logs = sorted(log_file.parent.glob(f"{log_file.stem}.task*.log"))
+        combined = log_file.with_suffix(".combined.log")
+        combined.write_text(log_file.read_text(errors="replace") + "".join(p.read_text(errors="replace") for p in task_logs))
+        log_file = combined
+    text = log_file.read_text(errors="replace")
     saves = _SAVE_RE.findall(text)
     phase1 = sum("/phase1-checkpoints" in path for path in saves)
     phase2 = sum("/checkpoints" in path and "/phase1-checkpoints" not in path for path in saves)
@@ -2986,11 +3525,11 @@ def _epilog(argv: list[str]) -> None:
             f"found {phase1} phase-1 and {phase2} phase-2 saves; "
             f"expected at least {expected_phase1} and {expected_phase2}",
         )
-    passed = args.flavors.policy.epilog(args, args.log_file)
-    _write_performance_baseline(args, args.log_file)
+    passed = args.flavors.policy.epilog(args, log_file)
+    _write_performance_baseline(args, log_file)
     # The arguments a run trained on are part of what its result means, so they
     # are compared with the same standing as the numbers it produced.
-    passed = _write_and_compare_arguments(args, args.log_file) and passed
+    passed = _write_and_compare_arguments(args, log_file) and passed
     if not passed:
         raise SystemExit(SOFT_FAIL_RC)
 
@@ -3032,6 +3571,12 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
     if args.time_minutes is not None and args.time_minutes <= _CLEANUP_GRACE_MINUTES:
         parser.error(f"--time-minutes must exceed the {_CLEANUP_GRACE_MINUTES}-minute cleanup reserve")
+    segment = _job_array_segment(args)
+    if segment and (segment > args.nodes or args.nodes % segment):
+        parser.error(
+            f"--job-array allocates {segment}-node NVLink domains per array task; "
+            "--nodes must be a positive multiple of --job-array-segment",
+        )
     if args.checkpoints_per_run == 0 and args.repeat != 1:
         parser.error("an unlimited checkpoint run cannot be repeated because it does not return")
     if args.flavors.policy.requires_finite_run and (args.checkpoints_per_run == 0 or args.repeat == 0):
@@ -3065,6 +3610,7 @@ def main() -> None:
         extra_sbatch_args=[reaper],
         background=args.background,
         dry_run=args.dry_run,
+        job_array=_job_array_segment(args) > 0,
     )
     if not args.background and not args.dry_run:
         _drop_sync_files()

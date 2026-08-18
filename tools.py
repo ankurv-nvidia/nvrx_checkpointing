@@ -1,7 +1,5 @@
 import io
 import os
-import re
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -27,97 +25,24 @@ from megatron.training.utils import print_rank_0
 
 from . import checkpoint, mapping
 from .ckpt_diag import diagnose_checkpoint_server_failure
+from .peers import OrderedPeers, detect_environment_peers
 
 _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 
 
-def _expand_slurm_nodelist(nodelistspec: str) -> list[str]:
-    """Expand a SLURM nodelist specification into a list of hostnames.
-
-    Handles formats like node1, node[1-3], node[001,003,005-007],
-    and comma-separated groups like node[1-3],other[4-5].
-    """
-
-    def expand_range(prefix: str, suffix: str, part: str) -> list[str]:
-        return (
-            [f"{prefix}{str(n).zfill(len(s))}{suffix}" for s, e in [part.split("-", 1)] for n in range(int(s), int(e) + 1)]
-            if "-" in part
-            else [f"{prefix}{part}{suffix}"]
-        )
-
-    def expand_token(token: str) -> list[str]:
-        return [
-            h
-            for m in [re.match(r"(.*?)\[([^\]]+)\](.*)", token)]
-            if m
-            for prefix, ranges, suffix in [m.groups()]
-            for part in ranges.split(",")
-            for h in expand_range(prefix, suffix, part)
-        ] or [token]
-
-    return [h for token in re.findall(r"[^,\[]+(?:\[[^\]]+\])?", nodelistspec) for h in expand_token(token)]
-
-
-def _expand_tasks_per_node(tasks_per_node_spec: str) -> list[int]:
-    """Expand a SLURM_TASKS_PER_NODE specification into a per-node task count list.
-
-    Handles the SLURM format where consecutive equal counts are compressed, e.g.
-    "2(x3),1" -> [2, 2, 2, 1].
-    """
-    result = []
-    for token in tasks_per_node_spec.split(","):
-        m = re.match(r"^(\d+)\(x(\d+)\)$", token.strip())
-        if m:
-            count, repeat = int(m.group(1)), int(m.group(2))
-            result.extend([count] * repeat)
-        else:
-            result.append(int(token.strip()))
-    return result
-
-
-def get_slurm_nodelist(_rank: int, world_size: int) -> list[str]:
-    if "SLURM_JOB_NODELIST" not in os.environ:
-        raise RuntimeError("SLURM_JOB_NODELIST environment variable not found")
-    if "SLURM_TASKS_PER_NODE" not in os.environ:
-        raise RuntimeError("SLURM_TASKS_PER_NODE environment variable not found")
-    if "SLURM_NTASKS" not in os.environ:
-        raise RuntimeError("SLURM_NTASKS environment variable not found")
-    if int(os.environ["SLURM_NTASKS"]) != world_size:
-        raise RuntimeError(f"SLURM_NTASKS {os.environ['SLURM_NTASKS']} does not match world size {world_size}")
-    nodelistspec = os.environ["SLURM_JOB_NODELIST"]
-    ntasks_per_node_spec = os.environ.get("SLURM_TASKS_PER_NODE")
-    expanded_nodelist = _expand_slurm_nodelist(nodelistspec)
-    ntasks_per_node = _expand_tasks_per_node(ntasks_per_node_spec)
-    if len(expanded_nodelist) != len(ntasks_per_node):
-        raise RuntimeError(
-            f"SLURM_JOB_NODELIST {nodelistspec!r} expands to "
-            f"{len(expanded_nodelist)} nodes, but SLURM_TASKS_PER_NODE {ntasks_per_node_spec!r} "
-            f"specifies {len(ntasks_per_node)} entries.",
-        )
-
-    rank_expanded_nodelist = [node for node, ntasks in zip(expanded_nodelist, ntasks_per_node) for _ in range(ntasks)]  # noqa: B905
-    # sys.stdout.write(
-    #    f"SLURM_JOB_NODELIST: {nodelistspec}\n"
-    #    f"SLURM_TASKS_PER_NODE: {ntasks_per_node_spec}\n"
-    #    f"Expanded SLURM_JOB_NODELIST: {', '.join(expanded_nodelist)}\n"
-    #    f"Expanded SLURM_TASKS_PER_NODE: {', '.join(map(str, ntasks_per_node))}\n"
-    #    f"Rank-expanded SLURM_JOB_NODELIST: {', '.join(rank_expanded_nodelist)}\n"
-    #    f"World size = {world_size}\n"
-    #    f"Rank = {rank}\n",
-    # )
-    if len(rank_expanded_nodelist) != world_size:
-        raise RuntimeError(f"SLURM_JOB_NODELIST {nodelistspec!r} expands to {len(rank_expanded_nodelist)} ranks, expected {world_size}.")
-
-    return {"peers": expanded_nodelist, "ranks_per_peer": ntasks_per_node[0]}
-
-
-def detect_peers(rank: int, world_size: int) -> dict[str, list[str] | int]:
-    if "SLURM_JOB_NODELIST" in os.environ:
-        return get_slurm_nodelist(rank, world_size)
+def detect_peers(rank: int, world_size: int) -> OrderedPeers:
+    ordered_peers = detect_environment_peers(rank, world_size)
+    if ordered_peers is not None:
+        if cycle_info := os.environ.get("NVRX_CURRENT_CYCLE_INFO"):
+            print_rank_0(
+                f"[native_ckpt] ordered peers from launcher cycle info {cycle_info}: "
+                f"{len(ordered_peers.peers)} nodes x {ordered_peers.ranks_per_peer} ranks per node",
+            )
+        return ordered_peers
     if world_size == 1:
-        return {"peers": ["localhost"], "ranks_per_peer": 1}
+        return OrderedPeers(("localhost",), 1)
     if torch.distributed.get_backend() == "nccl" and world_size <= torch.cuda.device_count():
-        return {"peers": ["localhost"], "ranks_per_peer": world_size}
+        return OrderedPeers(("localhost",), world_size)
     raise RuntimeError("Unable to detect peers for distributed run")
 
 
@@ -132,7 +57,8 @@ def register_state_dict(sharded_state_dict: mapping.ShardedStateDict) -> checkpo
     if register_state_dict.root is None:
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        root = checkpoint.model_state.create_root(rank, world_size, **detect_peers(rank, world_size))
+        ordered_peers = detect_peers(rank, world_size)
+        root = checkpoint.model_state.create_root(rank, world_size, **ordered_peers.checkpoint_args())
         root.register_state_dict(sharded_state_dict)
         if rank == 0:
             register_state_dict.snapshot_state = {_DCP_COMMON_STATE_KEY: b""}
@@ -171,7 +97,8 @@ def warmup() -> None:
     """Warm up the pinned buffers used for D2H transfers in checkpointing to avoid first save penalty"""
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    checkpoint.model_state.warmup(rank, world_size, **detect_peers(rank, world_size))
+    ordered_peers = detect_peers(rank, world_size)
+    checkpoint.model_state.warmup(rank, world_size, **ordered_peers.checkpoint_args())
 
 
 def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:

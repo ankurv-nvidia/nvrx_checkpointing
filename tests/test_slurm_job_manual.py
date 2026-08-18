@@ -42,6 +42,7 @@ _MUTATED_ENV = (
     "PYTORCH_CUDA_ALLOC_CONF",
     "QUANTIZATION_TYPE_DEBUG",
     "SLURMJOB_OPT_BACKGROUND",
+    "SLURMJOB_OPT_JOB_ARRAY_SEGMENT",
     "SLURMJOB_OPT_CHECKPOINTS_PER_RUN",
     "SLURMJOB_OPT_CLEAN_RUN",
     "SLURMJOB_OPT_CONFIG",
@@ -158,6 +159,17 @@ def test_sync_ranks_waits_for_global_peers(monkeypatch: pytest.MonkeyPatch, tmp_
     slurm_job._sync_ranks("phase1")
 
     assert marker.with_name(f"{marker.name}.ready-0").exists()
+
+
+def test_array_sync_markers_are_scoped_to_launcher_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "16")
+    monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "123")
+
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "0")
+    assert slurm_job._sync_job_id() == "123-restart0"
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "2")
+    assert slurm_job._sync_job_id() == "123-restart2"
 
 
 def test_a_run_writes_its_handshakes_beside_its_own_logs(tmp_path: Path) -> None:
@@ -828,6 +840,39 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     assert calls == expected
 
 
+def test_launcher_restart_resumes_latest_complete_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    args = _args(tmp_path, checkpoints_per_run=3, repeat=1)
+    args.flavors = slurm_job.FlavorSelection(["perf", "native"])
+    slurm_job._configure_run(args)
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "16")
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "1")
+    run = slurm_job._run_dir("ultra3fp8_64x4")
+    phase1 = run / "phase1-checkpoints/iter_0000100"
+    phase1.mkdir(parents=True)
+    (phase1 / ".metadata").touch()
+    for iteration in (250, 500):
+        checkpoint = run / f"checkpoints/iter_{iteration:07d}"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / ".metadata").touch()
+    incomplete = run / "checkpoints/iter_0000750"
+    incomplete.mkdir(parents=True)
+
+    start = slurm_job._routine_start("ultra3fp8_64x4", args, args.flavors.policy)
+
+    assert start == slurm_job.RoutineStart(
+        phase=2,
+        cycle=0,
+        resume_iteration=500,
+        checkpoints=1,
+    )
+    (incomplete / ".metadata").touch()
+    assert slurm_job._routine_start("ultra3fp8_64x4", args, args.flavors.policy).complete
+
+
 @pytest.mark.parametrize(
     "case",
     [(["perf", "native"], None, 3), (["detr"], 1, 1), (["detr"], None, 3)],
@@ -839,8 +884,9 @@ def test_worker_preserves_checkpoint_cycle_arguments(
 ) -> None:
     slurm_job = _load_slurm_job()
     flavors, checkpoints, repeat = case
-    args = _args(tmp_path, checkpoints_per_run=checkpoints, repeat=repeat, flavor=flavors)
+    args = _args(tmp_path, checkpoints_per_run=checkpoints, repeat=repeat, flavor=flavors, job_array_segment=0)
     args.flavors = slurm_job.FlavorSelection(flavors)
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     calls = []
     monkeypatch.setattr(slurm_job, "_run_routine",
                         lambda _cfg, run_args, _provider, _label="": calls.append(
@@ -866,6 +912,7 @@ def test_worker_failure_requests_nonblocking_local_server_stop(
     slurm_job = _load_slurm_job()
     args = _args(tmp_path, flavors=["perf", "native"])
     args.job = "pretrain-native"
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     args.flavors = slurm_job.FlavorSelection(args.flavors)
     monkeypatch.setattr(
         slurm_job, "_run_routine",
@@ -893,6 +940,7 @@ def test_worker_failure_preserves_original_error_when_local_stop_fails(
     slurm_job = _load_slurm_job()
     args = _args(tmp_path, flavors=["perf", "native"])
     args.job = "pretrain-native"
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     args.flavors = slurm_job.FlavorSelection(args.flavors)
     monkeypatch.setattr(
         slurm_job, "_run_routine",
@@ -1399,7 +1447,9 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     reproducer = (tmp_path / "ultra3-64n" / "run.sbatch").read_text()
 
     assert "#SBATCH --time=04:00:00" in reproducer
-    assert reproducer.count("--time=03:55:00") == 2  # noqa: PLR2004
+    # The array emits one prep step plus separate task-0 and peer launcher
+    # steps because task 0 must preserve its rendezvous store on node loss.
+    assert reproducer.count("--time=03:55:00") == 3  # noqa: PLR2004
     assert reproducer.count("--time=00:05:00") == 1
     assert "#SBATCH --signal=TERM@300" in reproducer
     assert '#SBATCH --comment=\'{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240"' in reproducer
@@ -1539,9 +1589,10 @@ def test_clean_run_intent_is_reproducible_from_sbatch(
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CLUSTER", "cwdfw")
     monkeypatch.setenv("PLATFORM", "gb200")
-    args = _args(tmp_path, clean_run=True)
+    args = _args(tmp_path, clean_run=True, job_array_segment=0)
     slurm_job._configure_run(args)
     script, _reaper, run_log = slurm_job._build_job(args)
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
     slurm_job.sbatch_run(script, run_log, dry_run=True)
     run = tmp_path / "ultra3-64n"
     reproducer = (run / "run.sbatch").read_text()
@@ -1575,7 +1626,7 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     monkeypatch.setenv("NVRX_COMMIT", "a" * 40)
     monkeypatch.setenv("CI_PIPELINE_ID", "98765")
     monkeypatch.setenv("CI_JOB_TOKEN", "must-not-be-written")
-    args = _args(tmp_path, nvrx_commit="a" * 40)
+    args = _args(tmp_path, nvrx_commit="a" * 40, job_array_segment=0)
     slurm_job._configure_run(args)
     script, reaper, run_log = slurm_job._build_job(args)
 
@@ -1648,6 +1699,87 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     assert reproducer.index("trap allocation_epilog EXIT") < reproducer.index(prep_step)
     assert '(( rc != 0 )) && exit "${rc}"' in reproducer
     assert "__epilog__" in reproducer
+
+
+def test_job_array_passes_the_worker_script_directly_to_ft_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", "ocihsg")
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
+    slurm_job._configure_run(args)
+
+    script, _reaper, _log = slurm_job._build_job(args)
+
+    launcher_line = next(line for line in script.splitlines() if "ft_launcher " in line)
+    worker_script = str(Path(slurm_job.__file__).resolve())
+    assert worker_script in launcher_line
+    assert f"ft_launcher python3 -u {worker_script}" not in launcher_line
+
+
+def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+
+    assert slurm_job._job_array_segment(_args(tmp_path, nodes=64)) == 16  # noqa: PLR2004
+    assert slurm_job._job_array_segment(_args(tmp_path, nodes=16)) == 0
+    assert slurm_job._job_array_segment(_args(tmp_path, nodes=64, job_array_segment=0)) == 0
+    assert slurm_job._job_array_segment(_args(tmp_path, nodes=48, job_array_segment=8)) == 8  # noqa: PLR2004
+
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", "ocihsg")
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path, config="ultra3bf16")
+    slurm_job._configure_run(args)
+
+    script, _reaper, _log = slurm_job._build_job(args)
+
+    assert "#SBATCH --nodes=16" in script
+    assert "#SBATCH --array=0-9%5" in script
+    assert "#SBATCH --no-requeue" in script
+    assert "#SBATCH --segment=16" in script
+    assert "--nnodes 64:80" in script
+    assert "--ft-segment 16" in script
+    assert "--ft-cycle-info-dir" in script
+    assert "--kill-on-bad-exit=0" in script
+    assert "--kill-on-bad-exit=1" in script
+    clean = script.index('if [[ "${SLURMJOB_OPT_CLEAN_RUN:-0}"')
+    control_dir = script.index('mkdir -p "${NVRX_ARRAY_DIR}/control"', clean)
+    assert clean < control_dir
+    assert 'while [[ ! -f "${CLEAN_DONE}" ]]' in script
+    assert "no_restart" not in script
+    assert "rc == 93" not in script
+
+    classic, _reaper, _log = slurm_job._build_job(_args(tmp_path, config="ultra3bf16", job_array_segment=0))
+    assert "#SBATCH --nodes=64" in classic
+    assert "#SBATCH --array=" not in classic
+
+
+@pytest.mark.parametrize("cluster", ["cwdfw", "cwpdx"])
+def test_job_array_steps_request_only_segment_gpus(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cluster: str,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", cluster)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
+    slurm_job._configure_run(args)
+
+    script, _reaper, _log = slurm_job._build_job(args)
+
+    assert "--gpus=64" in script
+    assert "--gpus=256" not in script
 
 
 def test_megatron_root_reuses_prepared_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1926,14 +2058,18 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
         "when": "never",
     }
     assert manual_optional["rules"][1] == {
+        "if": '$CI_COMMIT_BRANCH == "main"',
+        "when": "on_success",
+    }
+    assert manual_optional["rules"][2] == {
         "if": '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"',
         "when": "on_success",
     }
     # A rule's allow_failure replaces the job's own, so leaving it unset keeps
     # the job's exit_codes: a played job that fails reports a failure, and only
     # the perf-drift exit is tolerated.
-    assert manual_optional["rules"][2] == {"when": "manual"}
-    assert "allow_failure" not in manual_optional["rules"][2]
+    assert manual_optional["rules"][3] == {"when": "manual"}
+    assert "allow_failure" not in manual_optional["rules"][3]
     for suite in ("nvrx", "large_scale", "main_branch_runs"):
         policy = config[f".{suite}_pipeline"]
         assert "allow_failure" not in policy
@@ -2072,7 +2208,7 @@ def test_foreground_submission_records_job_id_and_uses_wait(
 
     monkeypatch.setattr(slurm_job.subprocess, "Popen", popen)
     verified = []
-    monkeypatch.setattr(slurm_job, "_verify_allocation", lambda job_id, rc: verified.append((job_id, rc)))
+    monkeypatch.setattr(slurm_job, "_verify_allocation", lambda job_id, rc, **_kwargs: verified.append((job_id, rc)))
 
     assert slurm_job.sbatch_run("#!/bin/bash\n\necho test\n", run / "scheduler.log") == 0
     assert ["sbatch", "--parsable", "--wait", "--export=ALL", str(run / "run.sbatch")] in commands
@@ -2131,8 +2267,8 @@ def test_only_nccl_ib_proxy_segfault_gets_one_clean_allocation_retry(
         "script", log, extra_sbatch_args=["reaper"], background=False, dry_run=False,
     ) == 0
     assert calls == [
-        {"extra_sbatch_args": ["reaper"], "background": False, "dry_run": False},
-        {"extra_sbatch_args": ["reaper"]},
+        {"extra_sbatch_args": ["reaper"], "background": False, "dry_run": False, "job_array": False},
+        {"extra_sbatch_args": ["reaper"], "job_array": False},
     ]
 
 
@@ -2214,6 +2350,31 @@ def test_background_submission_uses_only_the_streamed_log(
     assert "_sbatch.log" not in reproducer
 
 
+def test_array_submission_drops_stale_peer_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    run = tmp_path / "run"
+    logs = run / "logs"
+    logs.mkdir(parents=True)
+    log = logs / "train.log"
+    stale = [logs / "train.task1.log", logs / "train.task9.log", logs / "train.combined.log"]
+    for path in stale:
+        path.write_text("old run")
+    monkeypatch.setattr(slurm_job, "RUN_ROOT", run)
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", logs)
+    monkeypatch.setattr(
+        slurm_job.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="123\n", stderr=""),
+    )
+
+    assert slurm_job.sbatch_run("#!/bin/bash\n\necho test\n", log, background=True, job_array=True) == 0
+
+    assert not any(path.exists() for path in stale)
+
+
 def test_signal_cancellation_calls_scancel(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     commands: list[list[str]] = []
@@ -2253,6 +2414,60 @@ def test_sacct_accepts_only_the_perf_soft_failure(monkeypatch: pytest.MonkeyPatc
     )
 
     slurm_job._verify_allocation("123", slurm_job.SOFT_FAIL_RC)
+
+
+def test_sacct_job_array_reads_task_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(
+        slurm_job.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "123_0|COMPLETED|0:0|0:0\n"
+                "123_1|COMPLETED|0:0|0:0\n"
+                "123_2|CANCELLED by 456|0:0|0:0\n"
+                "123_3|FAILED|1:0|0:0\n"  # drained by task 0's RDZV_CLOSED
+                "123_4|NODE_FAIL|0:0|0:0\n"  # replaced infrastructure failure
+            ),
+            stderr="",
+        ),
+    )
+
+    assert slurm_job._verify_allocation("123", 0, job_array=True) == 0
+
+
+def test_sacct_job_array_rejects_a_failed_task_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(
+        slurm_job.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="123_0|FAILED|1:0|0:0\n123_1|COMPLETED|0:0|0:0\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"task 0 was not successful: state=FAILED exit=1:0"):
+        slurm_job._verify_allocation("123", 0, job_array=True)
+
+
+def test_sacct_job_array_without_indexed_rows_fails_on_any_failed_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bare per-task ids cannot name task 0: a clean peer must not carry the verdict."""
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(
+        slurm_job.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="124|FAILED|1:0|0:0\n125|COMPLETED|0:0|0:0\n126|CANCELLED|0:0|0:0\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"no identifiable task 0"):
+        slurm_job._verify_allocation("123", 0, job_array=True)
 
 
 def test_workflow_runs_mr_updates_but_not_ordinary_pushes() -> None:
@@ -2570,6 +2785,60 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "description": "auto-generated by CI",
         "metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100},
     }
+
+
+def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Rank 0's stream lives in the task log of whichever array task hosted it."""
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "16")
+    log = tmp_path / "run.log"
+    log.write_text("")  # task 0's stream carries no training output this time
+    (tmp_path / "run.task4.log").write_text(
+        "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
+        "[native_ckpt:phase] phase=2\n"
+        "successfully saved async checkpoint from iteration 250 to /run/checkpoints\n"
+        "successfully saved async checkpoint from iteration 500 to /run/checkpoints\n"
+        "successfully saved async checkpoint from iteration 750 to /run/checkpoints\n"
+        "0: ------------------------ arguments ------------------------\n"
+        " 0:   ckpt_provider ................................... native\n"
+        "0:   micro_batch_size ................................ 1\n"
+        "0: -------------------- end of arguments ---------------------\n",
+    )
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
+        "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100\n",
+    )
+    monkeypatch.setenv("PLATFORM", "devbox")
+    recorded = tmp_path / "recorded"
+    recorded.mkdir()
+    (recorded / "devbox_perf_pico_1x1_arguments.txt").write_text(
+        "  ckpt_provider ................................... native\n"
+        "  micro_batch_size ................................ 1\n",
+    )
+    monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
+
+    slurm_job._epilog(
+        ["--nodes",
+            "1",
+            "--gpus-per-node",
+            "1",
+            "--config",
+            "pico",
+            "--flavor",
+            "perf",
+            "--checkpoints-per-run",
+            "3",
+            "--log-file",
+            str(log),
+            "--baseline-json",
+            '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}',
+        ],
+    )
+
+    combined = (tmp_path / "run.combined.log").read_text()
+    assert "successfully saved async checkpoint from iteration 750 to /run/checkpoints" in combined
+    assert "end of arguments" in combined
+    assert list(tmp_path.glob("*_report.json"))
 
 
 def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
@@ -3230,6 +3499,7 @@ def test_wheel_packages_only_required_metadata_compare() -> None:
     template = (REPO_ROOT / "ci/gitlab-ci-native.template.yml").read_text()
 
     assert "metadata_compare.py" in cmake
+    assert "peers.py" in cmake
     assert "scripts@scripts" not in cmake
     assert "python -m nvrx_checkpointing.metadata_compare --help" in template
 

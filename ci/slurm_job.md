@@ -101,6 +101,39 @@ python3 ci/scripts/slurm_job.py \
   --background
 ```
 
+## Job-array runs with ft_launcher
+
+Any job wider than one 16-node NVLink domain (`--nodes > 16`) launches as a
+shared-rendezvous Slurm job array rather than one allocation: every array task
+owns one 16-node domain and `ft_launcher` joins the active tasks into one
+elastic world over `--nnodes NODES:NODES+16` with `--ft-segment 16`, so the
+extra active task waits as a hot spare and the queued tasks backfill evicted
+domains. Task 0 publishes the rendezvous host on the run directory, runs the
+preparation step alone, and owns the drain: its exit drops an `rdzv_closed`
+marker that ends every peer task. Task 0 keeps its healthy launcher agents
+alive when another node in its domain is evicted, allowing the hot-spare domain
+to finish the world without losing the rendezvous store. The launcher records
+the world's rank-to-node map in a cycle-info file (`--ft-cycle-info-dir` under
+the run directory); `nvrx_checkpointing.tools` reads it via
+`NVRX_CURRENT_CYCLE_INFO` to build the rank-ordered checkpoint peer list.
+Each elastic cycle uses its own synchronization markers. If `ft_launcher`
+restarts the worker, phase 1 is reused only after its checkpoint is durable,
+and phase 2 resumes from the latest checkpoint containing committed metadata.
+`sbatch --wait` covers the whole array; the verdict is read from task 0's
+`sacct` row.
+
+`--job-array-segment N` sets the domain size in nodes (0 restores the classic
+single-allocation launch); a `job_array_segment` field per jobs.json entry does
+the same for generated pipeline jobs.
+
+```bash
+python3 ci/scripts/slurm_job.py \
+  --config ultra3bf16 \
+  --nodes 64 \
+  --name ultra3-64n-array \
+  --job-array-segment 16
+```
+
 The name can also come from the environment, leaving only the scale on the
 command line:
 
@@ -515,6 +548,7 @@ common-state key as missing.
 | `--work-dir` | `SLURMJOB_OPT_WORK_DIR` | Parent of the named run directory |
 | `--image` | `ENROOT_IMAGE` | Custom `.sqsh` image |
 | `--background` | `SLURMJOB_OPT_BACKGROUND=1` | Nonblocking `sbatch` submission |
+| `--job-array-segment` | `SLURMJOB_OPT_JOB_ARRAY_SEGMENT` | NVLink-domain nodes per array task; `0` disables; default 16 for jobs wider than 16 nodes |
 | `--megatron-commit` | `MEGATRON_COMMIT` | Exact Megatron-LM commit |
 | `--megatron-repo-url` | `MEGATRON_REPO_URL` | Megatron-LM repository |
 | `--nvrx-commit` | `NVRX_COMMIT` | Exact NVIDIA Resiliency Extension commit |
