@@ -33,10 +33,14 @@ separate setup process will not work because the patches are process-local.
 
 Keep the existing `--ckpt-format torch_dist`, `--save`, `--load`, and
 `--save-interval` arguments. The launcher adds `--ckpt-provider`; it defaults
-to `native`, which selects this repository's checkpoint writer. With
-`--async-save`, the native provider stages each checkpoint synchronously and
-finalizes it—waiting for the checkpoint daemon to persist it, then advancing
-the tracker file—off the training thread through Megatron's async queue.
+to `native`, which selects this repository's checkpoint writer. The native
+provider stages each checkpoint synchronously and lets the checkpoint daemon
+persist it. Saves are chained back-to-back: a later checkpoint waits for the
+previous one to become durable before taking its next snapshot. With
+`--async-save`, the durability wait and tracker-file update run off the
+training thread through Megatron's async queue. If the previous save is still
+running when the next one starts, the native provider emits a flushed warning
+and appends the time spent waiting in milliseconds on the same log line.
 
 For an explicit provider selection, add:
 

@@ -18,6 +18,9 @@
           "scale": "8x4",
           "group": "8node-nano3",
           "timeout": "1d",
+          "flavor_args": {
+            "detr+vg": "--checkpoint-interval 1"
+          },
           "jobs": [
             [
               "native",

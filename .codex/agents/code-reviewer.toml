@@ -1,0 +1,6 @@
+name = "code_reviewer"
+description = "Read-only reviewer for pending changes, test quality, scope, correctness, and project style."
+sandbox_mode = "read-only"
+developer_instructions = """
+Read `.claude/agents/code-reviewer.md` from the repository root before reviewing. Ignore its YAML front matter and Claude-specific tool and model settings. Follow its review instructions and output format. Do not modify files.
+"""

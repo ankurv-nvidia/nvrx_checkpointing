@@ -796,7 +796,7 @@ wheel-publish:aarch64:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --flavor detr+vg+native"
+    JOB_ARGS: "--nodes 8 --config nano3 --flavor detr+vg+native --checkpoint-interval 1"
 
 # baseline artifacts
 

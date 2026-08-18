@@ -163,6 +163,16 @@ def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -
         _executor = None
 
 
+def wait_for_previous_save() -> None:
+    """Finish prior native saves before the caller starts another snapshot."""
+    maybe_finalize_async_save(blocking=True)
+
+
+def is_previous_save_in_progress() -> bool:
+    """Return consistently whether any rank's previous save is still running."""
+    return bool(_pending) and _all_ranks(not _pending[0].future.done(), require_all=False)
+
+
 def is_empty_async_queue() -> bool:
     """Return whether this rank has no native requests awaiting finalization."""
     return not _pending

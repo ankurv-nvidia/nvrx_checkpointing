@@ -1915,21 +1915,8 @@ class ValgrindFlavor(Flavor):
         policy.wheel_prep_mode = "--build-from-source"
         policy.wheel_defines = ("PHOENIX_BUILD_FOR_VALGRIND=1",)
         policy.install_prebuilt = False
-        policy.worker = self.run
         policy.server = self.server
         policy.reporter = None
-
-    def run(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
-        if provider == "native":
-            checkpoints = (
-                _selected_flavors(args).policy.phase2_checkpoints
-                if args.checkpoints_per_run is None
-                else args.checkpoints_per_run
-            )
-            if checkpoints:
-                args = argparse.Namespace(**vars(args))
-                args.checkpoints_per_run, args.repeat = 1, checkpoints * args.repeat
-        _run_routine(cfg, args, provider, label)
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
         _drop(

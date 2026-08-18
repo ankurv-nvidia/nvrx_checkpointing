@@ -145,7 +145,8 @@ def _emit_multinode(
                 if flavors[0] == "detr" and "vg" not in flavors
                 else f"--flavor {common}+{provider}"
             )
-            flavor_args = entry.get("flavor_args", {}).get(flavors[0], "")
+            flavor_arg_table = entry.get("flavor_args", {})
+            flavor_args = flavor_arg_table.get("+".join(flavors), flavor_arg_table.get(flavors[0], ""))
             args = " ".join(
                 part
                 for part in (

@@ -44,6 +44,7 @@ _MUTATED_ENV = (
     "SLURMJOB_OPT_BACKGROUND",
     "SLURMJOB_OPT_JOB_ARRAY_SEGMENT",
     "SLURMJOB_OPT_CHECKPOINTS_PER_RUN",
+    "SLURMJOB_OPT_CHECKPOINT_INTERVAL",
     "SLURMJOB_OPT_CLEAN_RUN",
     "SLURMJOB_OPT_CONFIG",
     "SLURMJOB_OPT_DRY_RUN",
@@ -1001,25 +1002,13 @@ def test_uninstall_nvrx_for_native_is_serialized_and_verified(
     assert (site / ".nvidia_resiliency_ext-0.6.0.dist-info.ci-disabled-123-node").is_dir()
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        ("native", None, 2, (1, 6)),
-        ("native", 0, 2, (0, 2)),
-        ("nvrx", None, 2, (None, 2)),
-    ],
-)
-def test_valgrind_restarts_native_daemon_for_each_finite_checkpoint(
+def test_valgrind_keeps_checkpoints_in_one_training_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    case: tuple[str, int | None, int, tuple[int | None, int]],
 ) -> None:
     slurm_job = _load_slurm_job()
-    provider, checkpoints, repeat, expected = case
     args = _args(
         tmp_path,
-        checkpoints_per_run=checkpoints,
-        repeat=repeat,
         flavors=["detr", "vg"],
     )
     args.flavors = slurm_job.FlavorSelection(args.flavors)
@@ -1030,10 +1019,9 @@ def test_valgrind_restarts_native_daemon_for_each_finite_checkpoint(
         lambda _cfg, run_args, _provider, _label="": calls.append((run_args.checkpoints_per_run, run_args.repeat)),
     )
 
-    slurm_job.ValgrindFlavor().run("nano3_8x4", args, provider)
+    args.flavors.policy.run_worker("nano3_8x4", args, "native")
 
-    assert calls == [expected]
-    assert (args.checkpoints_per_run, args.repeat) == (checkpoints, repeat)
+    assert calls == [(None, 1)]
 
 
 def _validated_args(slurm_job, argv: list[str]):  # noqa: ANN001
@@ -2143,6 +2131,17 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert pico_perf["needs"] == [{"job": "wheel:aarch64", "artifacts": True}]
     assert all("wheel-publish" not in need["job"] for need in pico_perf["needs"])
 
+    pico_detr_args = shlex.split(config["[DETR]:gb200:native:pico_1x4"]["variables"]["JOB_ARGS"])
+    assert "--checkpoint-interval" not in pico_detr_args
+    nano_valgrind_args = shlex.split(config["[DETR]:gb200:native:nano3_8x4:vg"]["variables"]["JOB_ARGS"])
+    assert nano_valgrind_args[-2:] == ["--checkpoint-interval", "1"]
+    assert "--checkpoint-interval" not in shlex.split(
+        config["gb200:valgrind:pico_1x4"]["variables"]["JOB_ARGS"],
+    )
+    assert "--checkpoint-interval" not in shlex.split(
+        config["[DETR]:gb200:native:nano3_8x4"]["variables"]["JOB_ARGS"],
+    )
+
 
 def test_canceled_ci_job_cancels_only_its_recorded_slurm_job(tmp_path: Path) -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
@@ -2657,7 +2656,7 @@ def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
     assert not flavors.policy.manages_native_server
     assert not flavors.policy.install_prebuilt
     assert flavors.policy.prep_args() == ["--build-from-source", "--define", "PHOENIX_BUILD_FOR_VALGRIND=1"]
-    assert flavors.policy.worker.__self__.__class__ is slurm_job.ValgrindFlavor
+    assert flavors.policy.worker is None
     assert flavors.policy.server.__self__.__class__ is slurm_job.ValgrindFlavor
     assert flavors.policy.reporter is None
 
@@ -2692,6 +2691,21 @@ def test_checkpoint_interval_override_only_changes_phase2(tmp_path: Path) -> Non
     assert phase1.save_interval == slurm_job._PHASE1_TRAIN_ITERS
     assert phase2.save_interval == 125  # noqa: PLR2004
     assert phase2.checkpoints == 3  # noqa: PLR2004
+
+
+def test_one_iteration_deterministic_cadence_keeps_three_phase2_saves(tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    args = _args(tmp_path, checkpoint_interval=1)
+    policy = slurm_job.FlavorSelection(["detr"]).policy
+
+    phase1 = policy.train_config("pico", args, "native", 1)
+    phase2 = policy.train_config("pico", args, "native", 2)
+    opts = slurm_job._train_options("pico", phase2)
+
+    assert phase1.save_interval == 25  # noqa: PLR2004
+    assert phase2.save_interval == 1
+    assert phase2.checkpoints == 3  # noqa: PLR2004
+    assert int(opts[opts.index("--exit-interval") + 1]) == 28  # noqa: PLR2004
 
 
 def test_deterministic_flavor_uses_the_pipeline_wheel() -> None:

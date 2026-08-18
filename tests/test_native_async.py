@@ -33,6 +33,63 @@ def test_native_async_request_runs_and_finalizes_without_external_strategy(
     assert native_async.is_empty_async_queue()
 
 
+def test_next_save_waits_for_previous_save_to_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_async.torch.distributed, "is_initialized", lambda: False)
+    previous_started = threading.Event()
+    release_previous = threading.Event()
+    next_started = threading.Event()
+    events: list[str] = []
+
+    def previous_save() -> None:
+        previous_started.set()
+        if not release_previous.wait(timeout=5):
+            raise TimeoutError("test did not release previous save")
+        events.append("previous durable")
+
+    native_async.schedule_async_save(
+        native_async.AsyncRequest(
+            async_fn=previous_save,
+            finalize_fns=[lambda: events.append("previous finalized")],
+        ),
+    )
+    assert previous_started.wait(timeout=1)
+    assert native_async.is_previous_save_in_progress()
+
+    def start_next_save() -> None:
+        native_async.wait_for_previous_save()
+        events.append("next started")
+        next_started.set()
+
+    next_thread = threading.Thread(target=start_next_save)
+    next_thread.start()
+    try:
+        assert not next_started.wait(timeout=0.05)
+        release_previous.set()
+        assert next_started.wait(timeout=1)
+        assert events == ["previous durable", "previous finalized", "next started"]
+        assert native_async.is_empty_async_queue()
+        assert not native_async.is_previous_save_in_progress()
+    finally:
+        release_previous.set()
+        next_thread.join(timeout=1)
+        native_async.maybe_finalize_async_save(blocking=True, terminate=True)
+
+
+def test_completed_previous_save_is_not_reported_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native_async.torch.distributed, "is_initialized", lambda: False)
+    native_async.schedule_async_save(
+        native_async.AsyncRequest(async_fn=lambda: None),
+    )
+    native_async._pending[0].future.result(timeout=1)
+
+    assert not native_async.is_previous_save_in_progress()
+    native_async.maybe_finalize_async_save(blocking=True, terminate=True)
+
+
 def test_native_async_request_propagates_background_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

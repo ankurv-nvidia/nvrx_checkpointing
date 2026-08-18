@@ -766,7 +766,7 @@
   tp_comm_split_rs ................................ True
   train_data_path ................................. None
   train_iters ..................................... None
-  train_samples ................................... 1000000000
+  train_samples ................................... 51200
   train_sync_interval ............................. None
   transformer_impl ................................ transformer_engine
   transformer_pipeline_model_parallel_size ........ 1

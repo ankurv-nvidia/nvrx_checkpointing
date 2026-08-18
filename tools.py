@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -135,6 +136,12 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  # noqa: DTZ005
 
 
+def _print_rank_0_inline(message: str) -> None:
+    """Print and flush a rank-zero message fragment without ending its line."""
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(message, end="", flush=True)  # noqa: T201
+
+
 def _parallel_ranks() -> str:
     """Megatron's `[ t x/y, p a/b ]` suffix, naming the writer's tensor and pipeline rank."""
     return (
@@ -151,17 +158,18 @@ def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
 
 
 def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
-    """Finalize a staged checkpoint, deferring the durability wait + tracker update when async.
+    """Chain a staged checkpoint's daemon-durability wait into the native async queue.
 
-    With ``--async-save`` the daemon-durability wait and tracker update are scheduled on Megatron's
-    async queue so they overlap training: the request's ``async_fn`` blocks a worker process (not the
-    trainer) on the daemon write, and its ``finalize_fns`` advance the tracker on all ranks once every
-    rank's wait returns — so the tracker never names a not-yet-durable checkpoint. The sync path
-    matches the historical writer: it advances the tracker optimistically (the daemon writes in the
-    background, made durable at spin-down) and barriers.
+    Every save schedules a wait so the next ``save_checkpoint`` can join it before taking another
+    snapshot. With ``--async-save`` the tracker update is also deferred until every rank's wait
+    returns. The sync path retains its historical optimistic tracker update and barrier, while the
+    queued wait propagates daemon errors and provides the next save's chain point.
     """
-    if getattr(args, "async_save", False):
-        from .native_async import AsyncRequest, schedule_async_save  # noqa: PLC0415
+    from .native_async import AsyncRequest, schedule_async_save  # noqa: PLC0415
+
+    async_save = getattr(args, "async_save", False)
+    finalize_fns = []
+    if async_save:
 
         def finalize_fn() -> None:
             _write_checkpoint_tracker(args, iteration)
@@ -170,13 +178,17 @@ def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
                 f"checkpoint from iteration {iteration:7d} to {args.save} {_parallel_ranks()}",
             )
 
-        schedule_async_save(
-            AsyncRequest(
-                async_fn=_wait_for_ckpt_finalize,
-                async_fn_args=(_SESSION_ID, iteration),
-                finalize_fns=[finalize_fn],
-            ),
-        )
+        finalize_fns.append(finalize_fn)
+
+    schedule_async_save(
+        AsyncRequest(
+            async_fn=_wait_for_ckpt_finalize,
+            async_fn_args=(_SESSION_ID, iteration),
+            finalize_fns=finalize_fns,
+        ),
+    )
+
+    if async_save:
         print_rank_0(
             f"  [{_timestamp()}] scheduled "
             f"an async checkpoint save at iteration {iteration:7d} to {args.save}",
@@ -201,6 +213,21 @@ def save_checkpoint(  # noqa: PLR0913
     train_data_iterator=None,  # noqa: ANN001
 ) -> None:
     try:
+        # The preceding call returned after transferring its snapshot to the daemon. Join its
+        # durability request before reading any live model or optimizer state for this snapshot.
+        from .native_async import is_previous_save_in_progress, wait_for_previous_save  # noqa: PLC0415
+
+        serialize_start = None
+        if is_previous_save_in_progress():
+            serialize_start = time.monotonic()
+            _print_rank_0_inline(
+                f"  [{_timestamp()}] WARNING: checkpoint save at iteration {iteration:7d} "
+                "waiting for prev save ... ",
+            )
+        wait_for_previous_save()
+        if serialize_start is not None:
+            serialized_milliseconds = (time.monotonic() - serialize_start) * 1000
+            print_rank_0(f"Took {serialized_milliseconds:.3f} ms")
         _save_checkpoint_impl(
             iteration,
             model,
