@@ -406,6 +406,7 @@ wheel-image:aarch64:
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DPython3_EXECUTABLE=/opt/venv/bin/python \
         -DPHOENIX_BUILD_WHEEL=ON \
+        -DPHOENIX_WHEEL_VERSION="0.0.1.dev${CI_PIPELINE_IID}+g${CI_COMMIT_SHORT_SHA}" \
         -DPHOENIX_REQUIRE_CUDA=ON \
         -DPHOENIX_BUILD_BENCHMARK=OFF \
         -DPHOENIX_BUILD_TESTS=OFF \
@@ -540,8 +541,7 @@ ctest:aarch64:
   variables:
     WHEEL_ARCH: aarch64
 
-# Publish main's tested wheel to the generic package registry for manual runs.
-# MR/private-branch suites consume the exact parent-pipeline job artifacts.
+# Publish main's tested wheels to the project PyPI registry.
 .wheel_publish:
   extends: .default_pipeline
   stage: test
@@ -554,45 +554,32 @@ ctest:aarch64:
     - when: never
   script:
     - |
-      WHEEL=$(find dist -maxdepth 1 -type f -name "*-linux_${WHEEL_ARCH}.whl" -print -quit)
-      WHEEL_NAME=$(basename "${WHEEL}")
-      WHEEL_URL=$(python3 ci/scripts/wheel_install.py --registry-url "${WHEEL_NAME}")
-      POINTER_URL=$(python3 ci/scripts/wheel_install.py --registry-url)
-      curl --fail --silent --show-error -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "${WHEEL}" "${WHEEL_URL}"
-      printf '%s\n' "${WHEEL_NAME}" | curl --fail --silent --show-error -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file - "${POINTER_URL}"
-      echo "published ${WHEEL_URL}"
+      export TWINE_USERNAME=gitlab-ci-token
+      export TWINE_PASSWORD="${CI_JOB_TOKEN}"
+      /opt/venv/bin/python -m twine check dist/*.whl
+      /opt/venv/bin/python -m twine upload \
+        --non-interactive \
+        --skip-existing \
+        --repository-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" \
+        dist/*.whl
 
-wheel-publish:x86_64:
+wheel-publish:pypi:
   extends: .wheel_publish
   needs:
-    - job: wheel-image:x86_64
-      artifacts: false
     - job: wheel:x86_64
+      artifacts: true
+    - job: wheel:aarch64
       artifacts: true
     - job: wheel-pytest:x86_64
       artifacts: false
-    - job: ctest:x86_64
-      artifacts: false
-  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
-  tags: [perflab, type/docker, os/linux]
-  variables:
-    WHEEL_ARCH: x86_64
-
-wheel-publish:aarch64:
-  extends: .wheel_publish
-  needs:
-    - job: wheel-image:aarch64
-      artifacts: false
-    - job: wheel:aarch64
-      artifacts: true
     - job: wheel-pytest:aarch64
+      artifacts: false
+    - job: ctest:x86_64
       artifacts: false
     - job: ctest:aarch64
       artifacts: false
-  image: $CI_REGISTRY_IMAGE:builder-aarch64-$CI_COMMIT_SHA
-  tags: [perflab-arm, type/docker, os/linux-arm]
-  variables:
-    WHEEL_ARCH: aarch64
+  image: $CI_REGISTRY_IMAGE:builder-x86_64-$CI_COMMIT_SHA
+  tags: [perflab, type/docker, os/linux]
 
 # >>> generate-ci.py: workload jobs <<<
 

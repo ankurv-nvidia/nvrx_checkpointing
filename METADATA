@@ -1,0 +1,10 @@
+Metadata-Version: 2.1
+Name: ${name}
+Version: ${version}
+Summary: Native asynchronous checkpointing for Megatron-LM
+Description-Content-Type: text/markdown
+Requires-Python: >=3.12
+
+# nvrx_checkpointing
+
+Native asynchronous checkpoint persistence and Megatron-LM integration.

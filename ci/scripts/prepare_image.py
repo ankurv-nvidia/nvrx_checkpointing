@@ -129,7 +129,10 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     local = _ci_build_path(image)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.unlink(missing_ok=True)  # clear any leftover from a previously failed build
-    sys.stderr.write(f"[prepare-image] image not found: {image} — building into per-job path {local} (this may take ~30 min)\n")
+    sys.stderr.write(
+        f"[prepare-image] image not found: {image} — building into per-job path {local} "
+        "(a cold build may take several hours)\n"
+    )
 
     account = os.environ.get("SLURM_ACCOUNT", "").strip()
     if not account:
@@ -163,9 +166,8 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     prep_cmd = build_cmd_from_template(
         "image_prep.tmpl",
         # Building DeepEP's HybridEP CUDA kernels for three arches (sm90/sm100/sm120)
-        # roughly doubles the image-build time over the toolchain+megatron+flash-attn
-        # baseline, which overran the previous 60-minute window.
-        {**srun_values, "time_minutes": 120},
+        # plus the Megatron smoke test can exceed two hours on cold shared storage.
+        {**srun_values, "time_minutes": 240},
         ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
     prep_cmd = _set_partition(prep_cmd, _valid_partition(prep_cmd))

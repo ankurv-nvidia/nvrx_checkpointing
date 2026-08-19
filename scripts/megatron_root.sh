@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeou pipefail
 
-COMMIT_HASH=${MEGATRON_COMMIT:-77c87725e71c9f5022ac289071b16941876ca858}
+COMMIT_HASH=${MEGATRON_COMMIT:-6c344290e54aa58a8be26d6af5ca2d46a3b00948}
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 
@@ -10,6 +10,16 @@ echo "MEGATRON_REPO_URL=${MEGATRON_REPO_URL}" >&2
 
 REPO_ROOT=${SCRIPT_DIR}/..
 MEGATRON_ROOT=${1:-${MEGATRON_ROOT:-${REPO_ROOT}/../nvrx-megatron-lm}}
+
+# HEAD preserves the existing checkout and local modifications without repository mutation.
+if [[ "${COMMIT_HASH}" == HEAD ]]; then
+    if [[ ! -d ${MEGATRON_ROOT} ]] || ! git -C "${MEGATRON_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "MEGATRON_COMMIT=HEAD requires an existing Git checkout at MEGATRON_ROOT=${MEGATRON_ROOT}" >&2
+        exit 1
+    fi
+    realpath "${MEGATRON_ROOT}"
+    exit 0
+fi
 
 function git_retry {
     local attempt=1

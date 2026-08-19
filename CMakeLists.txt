@@ -30,6 +30,7 @@ endif()
 
 option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"      ON)
 option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         OFF)
+set(PHOENIX_WHEEL_VERSION "0.0.1" CACHE STRING "Python wheel version")
 
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"      OFF)
@@ -375,7 +376,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
     )
 
     add_pywhl_package(nvrx_checkpointing
-        VERSION "${PROJECT_VERSION}"
+        VERSION "${PHOENIX_WHEEL_VERSION}"
         MODULES nvrx_checkpointing
         LICENSE_FILE LICENSE
         WHL_FILE_OUTVAR PHOENIX_WHEEL_FILE

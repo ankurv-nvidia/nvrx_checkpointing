@@ -7,8 +7,8 @@
 #   - toolchain via scripts/prepare.sh ubuntu2404 (clang-22, Kitware cmake,
 #     mold, ninja, python3.12 + dev headers, patchelf, vcpkg host deps)
 #   - /opt/venv with the packages the CMake configure pip_install()s
-#     (nanobind, cmake-pywhl) and the wheel test jobs run with (pytest,
-#     hypothesis, CPU torch)
+#     (nanobind, cmake-pywhl), the wheel test jobs run with (pytest,
+#     hypothesis, CPU torch), and the publish job runs with (twine)
 #   - /opt/vcpkg pinned clone, bootstrapped, no ports installed
 #
 # Build:
@@ -31,7 +31,7 @@ ENV PATH=/root/.local/bin:${PATH}
 
 RUN python3.12 -m venv --system-site-packages /opt/venv \
         && uv pip install --python /opt/venv/bin/python \
-        nanobind 'cmake-pywhl>=0.0.4' pytest pytest-cmake hypothesis numpy pyyaml
+        nanobind 'cmake-pywhl>=0.0.4' pytest pytest-cmake hypothesis numpy pyyaml twine
 # && uv pip install --python /opt/venv/bin/python \
 #        --index-url https://download.pytorch.org/whl/cpu torch
 

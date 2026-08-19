@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 """Install a selected NVIDIA Resiliency Extension checkout into an isolated run target."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import os
 import re
@@ -11,6 +13,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -59,17 +65,49 @@ def _source_requirement(repo_url: str, commit: str | None, repo_root: Path | Non
     return f"git+{root.as_uri()}@{commit}" if commit else str(root)
 
 
+def _head_root(repo_root: Path | None) -> Path:
+    if repo_root is None:
+        raise SystemExit("--commit HEAD requires --repo-root")
+    root = repo_root.expanduser().resolve()
+    valid = root.is_dir() and subprocess.run(
+        [_git(), "-C", str(root), "rev-parse", "--git-dir"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    if not valid:
+        raise SystemExit(f"--commit HEAD requires an existing Git checkout at --repo-root: {root}")
+    return root
+
+
+@contextlib.contextmanager
+def _snapshot(root: Path | None, target: Path) -> Generator[Path | None, None, None]:
+    """Yields a disposable source tree for a HEAD working checkout."""
+    if root is None:
+        yield None
+        return
+    snapshot = target.with_name(f".{target.name}.source-{os.getpid()}")
+    shutil.rmtree(snapshot, ignore_errors=True)
+    try:
+        shutil.copytree(root, snapshot, ignore=shutil.ignore_patterns(".git"))
+        yield snapshot
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+
+
 def install_nvrx(repo_url: str, commit: str | None, target: Path, repo_root: Path | None = None) -> None:
     """Install without dependencies, then verify this target wins over the image package."""
-    if commit and not _COMMIT_RE.fullmatch(commit):
-        raise SystemExit("--commit must be a 7-40 character hexadecimal commit")
+    worktree = commit == "HEAD"
+    if commit and not worktree and not _COMMIT_RE.fullmatch(commit):
+        raise SystemExit("--commit must be HEAD or a 7-40 character hexadecimal commit")
     if not commit and repo_root is None:
         raise SystemExit("--commit or --repo-root is required")
+    root = _head_root(repo_root) if worktree else None
 
     target = target.expanduser().resolve()
     marker = target / ".nvrx-commit"
-    requirement = _source_requirement(repo_url, commit, repo_root)
-    if commit and marker.is_file() and marker.read_text().strip() == commit:
+    source_commit = None if worktree else commit
+    if source_commit and marker.is_file() and marker.read_text().strip() == source_commit:
         return
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -77,24 +115,26 @@ def install_nvrx(repo_url: str, commit: str | None, target: Path, repo_root: Pat
     if staging.exists():
         shutil.rmtree(staging)
     try:
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--no-cache-dir",
-                "--no-deps",
-                "--upgrade",
-                "--force-reinstall",
-                "--target",
-                str(staging),
-                requirement,
-            ],
-            check=True,
-        )
-        if commit:
-            (staging / marker.name).write_text(f"{commit}\n")
+        with _snapshot(root, target) as snapshot:
+            requirement = str(snapshot) if snapshot else _source_requirement(repo_url, source_commit, repo_root)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-cache-dir",
+                    "--no-deps",
+                    "--upgrade",
+                    "--force-reinstall",
+                    "--target",
+                    str(staging),
+                    requirement,
+                ],
+                check=True,
+            )
+        if source_commit:
+            (staging / marker.name).write_text(f"{source_commit}\n")
         if target.exists():
             shutil.rmtree(target)
         staging.replace(target)

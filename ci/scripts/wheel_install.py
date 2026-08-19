@@ -2,9 +2,9 @@
 """Install an nvrx_checkpointing wheel for CI and Slurm runs.
 
 CI pipelines consume ``dist/*.whl`` from the exact parent wheel-build job.
-Main additionally publishes its tested wheels to the generic package registry
-for manual runs. Other Slurm runs can probe that registry and fall back to an
-import-triggered source build when no matching wheel exists.
+Main publishes its tested wheels to the project PyPI registry for users.
+Slurm runs without wheel artifacts fall back to an import-triggered source
+build.
 
 Slurm runs use ``pip install --target`` below the named run directory, which
 keeps the package visible on every node without modifying the source checkout
@@ -13,13 +13,11 @@ or the container image.
 CLI:
   wheel_install.py --from-dist DIR   install from a local artifacts dir
   wheel_install.py --fetch-upstream-wheel
-  wheel_install.py --registry-url    print the registry URL for this commit+arch
 """
 
 from __future__ import annotations
 
 import argparse
-import http.client
 import importlib.metadata
 import importlib.util
 import logging
@@ -28,8 +26,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -40,20 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _WHEEL_BINARIES = ("checkpoint.abi3.so", "checkpoint_server")
 
-# Generic package registry coordinates. The upload side (the wheel job's
-# curl) uses the same URL via --registry-url so the two sides can't drift.
-_REGISTRY_PACKAGE = "ci-wheels"
 _FETCH_TIMEOUT_S = 120
-
-
-def _registry_file_url(filename: str) -> str | None:
-    api = os.environ.get("CI_API_V4_URL")
-    project = os.environ.get("CI_PROJECT_ID")
-    sha = os.environ.get("CI_COMMIT_SHA")
-    if not (api and project and sha):
-        return None
-    filename = urllib.parse.quote(filename, safe="")
-    return f"{api}/projects/{project}/packages/generic/{_REGISTRY_PACKAGE}/{sha}/{filename}"
 
 
 def wheel_arch() -> str:
@@ -66,11 +49,6 @@ def wheel_arch() -> str:
     return os.environ.get("WHEEL_ARCH") or platform.machine()
 
 
-def registry_wheel_url(filename: str | None = None) -> str | None:
-    """Registry URL for a wheel, or its canonical-filename pointer."""
-    return _registry_file_url(filename or f"nvrx_checkpointing-linux_{wheel_arch()}.txt")
-
-
 def _find_local_wheel(dist_dir: Path) -> Path | None:
     """Newest wheel in dist_dir whose platform tag matches this arch."""
     if not dist_dir.is_dir():
@@ -78,35 +56,6 @@ def _find_local_wheel(dist_dir: Path) -> Path | None:
     tag = f"linux_{wheel_arch()}"
     wheels = sorted((p for p in dist_dir.glob("*.whl") if tag in p.name), key=lambda p: p.stat().st_mtime)
     return wheels[-1] if wheels else None
-
-
-def _fetch_registry_wheel(dest_dir: Path) -> Path | None:
-    """Download this commit's wheel from the package registry, if published."""
-    pointer_url = registry_wheel_url()
-    token = os.environ.get("CI_JOB_TOKEN")
-    if not (pointer_url and token):
-        return None
-    headers = {"JOB-TOKEN": token}
-    result = None
-    try:
-        request = urllib.request.Request(pointer_url, headers=headers)
-        with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as resp:
-            filename = resp.read().decode().strip()
-        if Path(filename).name != filename or not filename.endswith(f"-linux_{wheel_arch()}.whl"):
-            logger.warning(f"[wheel] invalid registry wheel filename: {filename!r}")
-        elif url := registry_wheel_url(filename):
-            dest = dest_dir / filename
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as resp, dest.open("wb") as out:
-                while chunk := resp.read(1 << 20):
-                    out.write(chunk)
-            result = dest
-    except urllib.error.HTTPError as e:
-        level = logging.INFO if e.code == http.HTTPStatus.NOT_FOUND else logging.WARNING
-        logger.log(level, f"[wheel] no registry wheel at {pointer_url} (HTTP {e.code})")
-    except (OSError, ValueError, UnicodeDecodeError, http.client.HTTPException) as e:
-        logger.warning(f"[wheel] registry fetch failed: {e}")
-    return result
 
 
 def fetch_upstream_wheel(dest_dir: Path | None = None) -> Path:
@@ -229,21 +178,18 @@ def _binaries_load() -> bool:
     return True
 
 
-def install_prebuilt_wheel(dist_dir: Path | None = None, *, fetch_remote: bool = True, probe: bool = True) -> bool:
+def install_prebuilt_wheel(dist_dir: Path | None = None, *, probe: bool = True) -> bool:
     """Resolve and install a perf wheel; False means build from source."""
     if _install_dir() is not None and _binaries_installed():
         logger.info("[wheel] requested nvrx_checkpointing wheel is already installed")
         return True
     try:
-        with tempfile.TemporaryDirectory(prefix="ci-wheel-") as tmp:
-            whl = _find_local_wheel(dist_dir or REPO_ROOT / "dist")
-            if whl is None and fetch_remote:
-                whl = _fetch_registry_wheel(Path(tmp))
-            if whl is None:
-                logger.info("[wheel] no prebuilt wheel found — building from source")
-                _remove_installed()
-                return False
-            _pip_install(whl)
+        whl = _find_local_wheel(dist_dir or REPO_ROOT / "dist")
+        if whl is None:
+            logger.info("[wheel] no prebuilt wheel found — building from source")
+            _remove_installed()
+            return False
+        _pip_install(whl)
     except (OSError, subprocess.CalledProcessError) as e:
         logger.warning(f"[wheel] install failed ({e}) — building from source")
         _remove_installed()
@@ -323,16 +269,15 @@ def build_and_install_from_source() -> None:
 def ensure_prebuilt() -> None:
     """Guarantee installed binaries for a perf-flavor run.
 
-    The launcher normally installs the published wheel before submitting the
-    srun, so this is a fast no-op in the prep step; the fallbacks cover runs
-    outside a full pipeline (manual branches, wheel jobs skipped).
+    The launcher normally installs the pipeline wheel artifact before
+    submitting the srun. Runs without an artifact build from source.
     """
     if _binaries_installed():
         logger.info("[wheel] prebuilt binaries already installed")
         return
     if install_prebuilt_wheel():
         return
-    logger.warning("[wheel] no published wheel for this commit — building from source")
+    logger.warning("[wheel] no wheel artifact for this commit — building from source")
     build_and_install_from_source()
 
 
@@ -367,16 +312,9 @@ def main() -> None:
         help="Download this architecture's wheel artifact from the upstream CI wheel job",
     )
     p.add_argument(
-        "--registry-url",
-        nargs="?",
-        const="",
-        metavar="WHEEL",
-        help="Print the registry pointer URL, or the URL for canonical WHEEL, and exit",
-    )
-    p.add_argument(
         "--ensure-prebuilt",
         action="store_true",
-        help="Prep step, perf flavor: no-op when binaries are installed; else fetch the published wheel, else build from source",
+        help="Prep step, perf flavor: use installed or local wheel binaries, else build from source",
     )
     p.add_argument(
         "--build-from-source",
@@ -398,12 +336,6 @@ def main() -> None:
     if args.fetch_upstream_wheel:
         fetch_upstream_wheel()
         return
-    if args.registry_url is not None:
-        url = registry_wheel_url(args.registry_url or None)
-        if url is None:
-            raise SystemExit("CI_API_V4_URL / CI_PROJECT_ID / CI_COMMIT_SHA not set")
-        sys.stdout.write(f"{url}\n")
-        return
     if args.ensure_prebuilt:
         ensure_prebuilt()
         return
@@ -413,7 +345,7 @@ def main() -> None:
     if args.report_install:
         report_install()
         return
-    if not install_prebuilt_wheel(args.from_dist, fetch_remote=args.from_dist is None):
+    if not install_prebuilt_wheel(args.from_dist):
         raise SystemExit(1)
 
 

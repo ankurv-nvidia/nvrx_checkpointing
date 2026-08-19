@@ -88,8 +88,9 @@ ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
 DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.07-py3")
 DEFAULT_MEGATRON_REPO_URL = "https://github.com/NVIDIA/Megatron-LM.git"
-DEFAULT_MEGATRON_COMMIT = "77c87725e71c9f5022ac289071b16941876ca858"
+DEFAULT_MEGATRON_COMMIT = "6c344290e54aa58a8be26d6af5ca2d46a3b00948"
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
+DEFAULT_NVRX_COMMIT = "7f64c5d5ae9408cf75d893d6d03416d4ab5aeaf5"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
 _NVRX_MODULE = "nvidia_resiliency_ext"
 SOFT_FAIL_RC = 3
@@ -105,6 +106,8 @@ WIDE_TOLERANCE_METRICS = {
 }
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
+# The allocation directory owns every named run.
+JOB_ROOT: Path | None = None
 # Parent of every run directory. Holds what runs share: the dependency
 # checkouts, the native build and the compiler caches, none of which depend on
 # what a run is testing.
@@ -134,6 +137,7 @@ SYNC_DIR_NAME = ".sync"
 _TORCH_STORAGE_ALIGNMENT = 64
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_WORKTREE_REVISION = "HEAD"
 # A run directory is named for what it holds: the model it trained, the sources
 # it trained on, and the variants it carried. Two runs differing in any of those
 # keep their own checkpoints and logs; two runs alike in all of them share a
@@ -174,6 +178,7 @@ _PRETRAIN_ENV_NAMES = {
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
     "NVTE_CPU_OFFLOAD_V1",
     "RANK",
+    "PYTHONDONTWRITEBYTECODE",
     "SLURM_JOB_ID",
     "SLURM_JOB_NODELIST",
     "SLURM_LOCALID",
@@ -381,11 +386,19 @@ def _run_dir(cfg: str) -> Path:
 def nvrx_repo_root() -> Path | None:
     value = os.environ.get("NVRX_REPO_ROOT")
     return Path(value).expanduser().resolve() if value else None
-def _nvrx_target(cfg: str, commit: str | None) -> Path | None:
-    if not commit and nvrx_repo_root() is None:
-        return None
-    suffix = f"-{commit}" if commit else ""
-    return _run_dir(cfg) / f"deps/nvidia-resiliency-ext{suffix}"
+
+def _normalize_nvrx_repo_root() -> None:
+    if (resolved := nvrx_repo_root()) is None:
+        return
+    if any(c in resolved.as_posix() for c in ",:"):
+        raise SystemExit("NVRX_REPO_ROOT may not contain ',' or ':'")
+    os.environ["NVRX_REPO_ROOT"] = resolved.as_posix()
+
+def _nvrx_target_root(cfg: str) -> Path:
+    return (JOB_ROOT or _run_dir(cfg)) / "deps"
+
+def _nvrx_target(cfg: str, commit: str) -> Path:
+    return _nvrx_target_root(cfg) / f"nvidia-resiliency-ext-{commit}"
 
 @dataclass(frozen=True)
 class Toolchain:
@@ -402,22 +415,37 @@ class Toolchain:
     nvrx_url: str
     nvrx_commit: str | None
     nvrx_target: Path | None
+    nvrx_target_root: Path
 
     def describe(self, label: str) -> str:
-        nvrx = f"{self.nvrx_url}@{self.nvrx_commit}" if self.nvrx_commit else "image"
+        nvrx = f"{nvrx_repo_root()}@HEAD" if self.nvrx_commit == _WORKTREE_REVISION else f"{self.nvrx_url}@{self.nvrx_commit}"
         return f"{label}: megatron={self.megatron_url}@{self.megatron_commit or 'HEAD'} nvrx={nvrx}"
 
-    def apply(self, env: dict[str, str]) -> None:
+    def apply(self, env: dict[str, str], *, include_nvrx: bool = True) -> None:
         """Point one training subprocess at this toolchain."""
         env["MEGATRON_ROOT"] = self.megatron_root.as_posix()
         env["MEGATRON_REPO_URL"] = self.megatron_url
         if self.megatron_commit:
             env["MEGATRON_COMMIT"] = self.megatron_commit
+        else:
+            env.pop("MEGATRON_COMMIT", None)
+        if self.megatron_commit == _WORKTREE_REVISION:
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["NVRX_REPO_URL"] = self.nvrx_url
-        if self.nvrx_commit:
+        if include_nvrx and self.nvrx_commit:
             env["NVRX_COMMIT"] = self.nvrx_commit
+        else:
+            env.pop("NVRX_COMMIT", None)
         entries = [entry for entry in env.get("PYTHONPATH", "").split(":") if entry]
-        if self.nvrx_target is not None:
+        entries = [
+            entry
+            for entry in entries
+            if not (
+                Path(entry).parent == self.nvrx_target_root
+                and Path(entry).name.startswith("nvidia-resiliency-ext")
+            )
+        ]
+        if include_nvrx and self.nvrx_target is not None:
             head = self.nvrx_target.as_posix()
             entries = [head, *(entry for entry in entries if entry != head)]
         if entries:
@@ -431,13 +459,21 @@ def _toolchain(cfg: str, args: argparse.Namespace) -> Toolchain:
     A run trains on one toolchain. Comparing two of them is comparing the
     digests two runs wrote, which needs neither to know about the other.
     """
+    megatron_commit = args.megatron_commit or DEFAULT_MEGATRON_COMMIT
+    nvrx_commit = args.nvrx_commit or DEFAULT_NVRX_COMMIT
+    megatron_checkout = (
+        Path(os.environ["MEGATRON_ROOT"]).expanduser().resolve()
+        if megatron_commit == _WORKTREE_REVISION
+        else _megatron_checkout(args, megatron_commit)
+    )
     return Toolchain(
         args.megatron_repo_url or DEFAULT_MEGATRON_REPO_URL,
-        args.megatron_commit,
-        Path(os.environ.get("MEGATRON_ROOT") or _megatron_checkout(args)).expanduser(),
+        megatron_commit,
+        megatron_checkout,
         args.nvrx_repo_url or DEFAULT_NVRX_REPO_URL,
-        args.nvrx_commit,
-        _nvrx_target(cfg, args.nvrx_commit),
+        nvrx_commit,
+        _nvrx_target(cfg, nvrx_commit),
+        _nvrx_target_root(cfg),
     )
 def _load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text()) or {}
@@ -447,22 +483,23 @@ def _repo_sha() -> str:
         text=True,
     ).strip()[:8]
 
-def _megatron_checkout(args: argparse.Namespace) -> Path:
+def _megatron_checkout(args: argparse.Namespace, commit: str | None = None) -> Path:
     """Where this run's Megatron-LM lives, keyed so runs of one commit share it."""
     root = WORK_ROOT if WORK_ROOT is not None else REPO_ROOT / "workdir"
-    return root / f"deps/megatron-lm-{(args.megatron_commit or 'head')[:8]}"
+    revision = commit or args.megatron_commit or DEFAULT_MEGATRON_COMMIT
+    return root / f"deps/megatron-lm-{revision[:8]}"
 
 def _source_suffix(args: argparse.Namespace) -> str:
-    """Name only the sources this run was told to deviate on.
+    """Names only source deviations common to every run in the job.
 
-    A run on the pinned Megatron-LM and the extension in the image is the
-    common case and says nothing; a run given either explicitly carries it, so
-    two runs of different sources never share a directory.
+    A job on the pinned sources says nothing. Per-run deviations belong to the
+    child directory for that run rather than making the allocation directory
+    read as though it represents only one side of the comparison.
     """
     parts = []
     if args.megatron_commit and args.megatron_commit != DEFAULT_MEGATRON_COMMIT:
         parts.append(f"-mlm-{args.megatron_commit[:8]}")
-    if args.nvrx_commit:
+    if args.nvrx_commit and args.nvrx_commit != DEFAULT_NVRX_COMMIT:
         parts.append(f"-nvrx-{args.nvrx_commit[:8]}")
     return "".join(parts)
 
@@ -492,17 +529,14 @@ def _run_name(template: str | None, args: argparse.Namespace, run: str = "") -> 
         )
     return name
 def _configure_run(args: argparse.Namespace) -> None:
-    global RESULTS_DIR, RUN_NAME, RUN_ROOT, WORK_ROOT  # noqa: PLW0603
-    if value := os.environ.get("NVRX_REPO_ROOT"):
-        resolved = Path(value).expanduser().resolve()
-        if any(c in resolved.as_posix() for c in ",:"):
-            raise SystemExit("NVRX_REPO_ROOT may not contain ',' or ':'")
-        os.environ["NVRX_REPO_ROOT"] = resolved.as_posix()
+    global JOB_ROOT, RESULTS_DIR, RUN_NAME, RUN_ROOT, WORK_ROOT  # noqa: PLW0603
+    _normalize_nvrx_repo_root()
     os.environ["SLURMJOB_OPT_LAUNCHER_ROOT"] = REPO_ROOT.as_posix()
     name = _run_name(args.name, args)
     root = (args.work_dir or REPO_ROOT / "workdir").expanduser().resolve()
     WORK_ROOT = root
-    RUN_NAME, RUN_ROOT, RESULTS_DIR = name, root / name, root / name / "logs"
+    RUN_NAME, JOB_ROOT = name, root / name
+    RUN_ROOT, RESULTS_DIR = JOB_ROOT, JOB_ROOT / "logs"
     # Every run writes inside this directory, so removing it removes the whole
     # job. Cleaning happens on the launcher because the runs themselves are
     # performed by every rank of an allocation at once.
@@ -513,6 +547,8 @@ def _configure_run(args: argparse.Namespace) -> None:
         shutil.rmtree(RUN_ROOT)
     RUN_ROOT.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not in_srun():
+        logger.info(f"[slurm_job] run directory: {RUN_ROOT}")
     args.name, args.work_dir = name, root
     args.image = args.image.expanduser().resolve() if args.image else image_path()
     for dest, option in _RUN_OPTIONS.items():
@@ -1533,12 +1569,12 @@ def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tup
     ]
     volatile = re.compile(r"^  (?:data_cache_path|load|save|tensorboard_dir) ")
     arguments = output / f"{_arguments_stem(args, variants)}_arguments.txt"
-    arguments.write_text("\n".join(line for line in lines if not volatile.match(line)) + "\n")
+    arguments.write_text("\n".join(line.rstrip() for line in lines if not volatile.match(line)) + "\n")
     return arguments
 
-def _argument_log(args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
+def _argument_log(_args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
     """Return the rank-0 log containing a particular run's argument blocks."""
-    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
+    cfg = f"{spec.args.config}_{spec.args.nodes}x{spec.args.gpus_per_node}"
     run_root = batch_log.parent.parent
     run = run_root / _run_dir_name(spec) if spec.name else run_root
     return run / "logs" / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
@@ -1560,13 +1596,14 @@ def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, s
             logger.warning(f"[slurm_job:args] WARNING {message}")
             continue
         try:
-            _write_arguments_artifact(args, log, spec.variants)
+            # Run-scoped variants already participate in the artifact identity.
+            _write_arguments_artifact(spec.args, log, ())
         except RuntimeError:
             if strict:
                 raise
             logger.warning(f"[slurm_job:args] WARNING no complete arguments in {log}")
             continue
-        results.append(_compare_arguments(args, log, spec.variants))
+        results.append(_compare_arguments(spec.args, log, ()))
     return len(results) == len(specs) and all(results)
 
 def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
@@ -1869,9 +1906,7 @@ class DeterministicFlavor(Flavor):
         return True
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
-        # Megatron 77c87725 / TE in the 26.07 image fails while constructing
-        # deterministic backward graphs for Pico, Nano, and Ultra on GB200
-        # (`Could not infer dtype of _WeakRefTensor`). Perf retains full capture.
+        # Deterministic backward graph construction fails with the pinned Megatron and Transformer Engine versions.
         _set(opts, "--attention-backend", "unfused")
         _drop(
             opts,
@@ -2133,15 +2168,83 @@ class FlavorSelection:
             flavor.transform(opts, env)
 
 
-RunSpec = namedtuple("RunSpec", "name variants flavors")  # noqa: PYI024
+@dataclass(frozen=True)
+class RunBlock:
+    """Represents one ``--run`` header and the arguments scoped beneath it."""
+
+    entry: str
+    argv: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    name: str
+    variants: tuple[str, ...]
+    flavors: FlavorSelection
+    args: argparse.Namespace
+    directory_tags: tuple[str, ...]
+
+
+_RUN_SCOPED_OPTIONS = frozenset(
+    {
+        "flavor",
+        "megatron_commit",
+        "megatron_repo_url",
+        "nvrx_commit",
+        "nvrx_repo_url",
+        "checkpoints_per_run",
+        "checkpoint_interval",
+        "repeat",
+    },
+)
 
 def _run_dir_name(spec: RunSpec) -> str:
     """The directory one run writes to, inside the job's own directory.
 
-    The variants a run adds lead the name and the run's own name follows, so
-    two runs of one job read as what distinguishes them.
+    Run-specific flavors and overrides lead the name, while common options stay
+    in the parent job directory. This keeps the parent compact without allowing
+    two materially different children to share a path.
     """
-    return f"{'-'.join(spec.variants)}.{spec.name}" if spec.variants else spec.name
+    return f"{'-'.join(spec.directory_tags)}.{spec.name}" if spec.directory_tags else spec.name
+
+def _run_directory_tags(common: argparse.Namespace, resolved: argparse.Namespace) -> tuple[str, ...]:
+    """Identifies only what one run adds to the common job options."""
+    common_flavors = set(_selected_flavors(common).names)
+    tags = [name for name in resolved.flavors.names if name not in common_flavors]
+    for field, label in (("megatron_commit", "mlm"), ("nvrx_commit", "nvrx")):
+        value = getattr(resolved, field)
+        if value != getattr(common, field):
+            tags.append(f"{label}-{value[:8]}")
+    for field, label in (
+        ("checkpoints_per_run", "ckpts"),
+        ("checkpoint_interval", "interval"),
+        ("repeat", "repeat"),
+    ):
+        value = getattr(resolved, field)
+        if value != getattr(common, field):
+            tags.append(f"{label}-{value if value is not None else 'default'}")
+    scoped_extra = resolved.extra_args[len(common.extra_args):]
+    if scoped_extra:
+        digest = hashlib.sha256("\0".join(scoped_extra).encode()).hexdigest()[:8]
+        tags.append(f"opts-{digest}")
+    return tuple(tags)
+
+def _run_arguments(args: argparse.Namespace, variants: tuple[str, ...], argv: tuple[str, ...]) -> argparse.Namespace:
+    """Overlays one run block on the fully resolved common arguments."""
+    overrides, extra = _parser().parse_known_args(list(argv))
+    if disallowed := sorted(set(vars(overrides)) - _RUN_SCOPED_OPTIONS):
+        rendered = ", ".join("--" + name.replace("_", "-") for name in disallowed)
+        raise ValueError(f"allocation option(s) must precede the first --run: {rendered}")
+    resolved = argparse.Namespace(**vars(args))
+    common_flavors = list(args.flavor or [])
+    run_flavors = list(getattr(overrides, "flavor", None) or [])
+    resolved.flavor = [*common_flavors, *variants, *run_flavors]
+    for name, value in vars(overrides).items():
+        if name != "flavor":
+            setattr(resolved, name, value)
+    resolved.flavors = FlavorSelection(resolved.flavor)
+    resolved.extra_args = [*args.extra_args, *extra]
+    return resolved
 
 def _run_specs(args: argparse.Namespace) -> tuple[RunSpec, ...]:
     """The runs this job performs, each with the variants it adds to the common set.
@@ -2150,13 +2253,16 @@ def _run_specs(args: argparse.Namespace) -> tuple[RunSpec, ...]:
     contain. Two runs differ by the variants they name, and the diff between
     their digests is the comparison.
     """
-    common = list(args.flavor or [])
+    blocks = getattr(args, "run_blocks", None)
+    if not blocks:
+        blocks = tuple(RunBlock(entry) for entry in (args.run or [""]))
     specs = tuple(
-        RunSpec(name, tuple(variants), FlavorSelection(list(variants) + common))
+        RunSpec(name, tuple(variants), run_args.flavors, run_args, _run_directory_tags(args, run_args))
+        for block in blocks
         for name, variants in (
-            (entry.partition(":")[0], _flavor_names(entry.partition(":")[2]))
-            for entry in (args.run or [""])
+            (block.entry.partition(":")[0], _flavor_names(block.entry.partition(":")[2])),
         )
+        for run_args in (_run_arguments(args, tuple(variants), block.argv),)
     )
     names = [spec.name for spec in specs]
     if len(set(names)) != len(names):
@@ -2436,7 +2542,8 @@ def _phase_command(
         checkpoints_override=checkpoints_override,
     )
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
-    _toolchain(cfg, args).apply(env)
+    include_nvrx = not (provider == "native" and flavors.policy.requires_nvrx_absent)
+    _toolchain(cfg, args).apply(env, include_nvrx=include_nvrx)
     flavors.transform(opts, env)
     applied = flavors.policy.apply_options(opts, cfg, phase)
     _print_flavor_options(flavors, phase, applied)
@@ -2613,7 +2720,11 @@ def _manifest_batch(  # noqa: C901
 # and the dump of the common state beside it, both `key=value` text.
 _MANIFESTS = (("tensor", "reference.metadata.info"), ("common", "common_pt_dump.info"))
 
-def _write_checkpoint_digest(run: Path, stem: str, baseline_for: Callable[[str, str], Path] | None = None) -> None:
+def _write_checkpoint_digest(
+    run: Path,
+    stem: str,
+    baseline_for: Callable[[str, str], Path] | None = None,
+) -> Path:
     """Write everything this run's checkpoints recorded, and how it compares.
 
     The digest lists one ``<group>/<iter> <source>/<key>=<value>`` line per
@@ -2637,12 +2748,15 @@ def _write_checkpoint_digest(run: Path, stem: str, baseline_for: Callable[[str, 
                 continue
             summary.append(f"{label}: entries={len(produced)} {_compare_entries(produced, recorded)}")
     if not lines:
-        return
+        raise RuntimeError(f"no checkpoint metadata found under {run}; digest was not written")
     (RESULTS_DIR / f"{stem}_checkpoint_summary.log").write_text("\n".join(summary) + "\n")
-    with lzma.open(RESULTS_DIR / f"{stem}_checkpoint_digest.xz", "wt") as digest:
+    output = RESULTS_DIR / f"{stem}_checkpoint_digest.xz"
+    with lzma.open(output, "wt") as digest:
         digest.writelines(lines)
     for line in summary:
         logger.info(f"[slurm_job:digest] {stem} {line}")
+    logger.info(f"[slurm_job:digest] wrote {output}")
+    return output
 
 def _compare_entries(produced: dict[str, str], recorded: dict[str, str]) -> str:
     """Count how one checkpoint's entries differ from what it is compared against.
@@ -2676,7 +2790,7 @@ _RUN_SCOPED_KEYS = frozenset(
         "common/args.local_rank",
         "common/args.rank",
         "common/args.use_persistent_ckpt_worker",
-    }
+    },
 )
 
 _CHUNK_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<index>\d+)\.(?P<field>[a-z0-9_]+)$")
@@ -2747,11 +2861,20 @@ def _report_comparison(run: Path, baseline_for: Callable[[str, str], Path], stem
         raise RuntimeError(f"reference check failed: {', '.join(failures)}")
 
 @contextlib.contextmanager
-def _in_run(spec: RunSpec, args: argparse.Namespace) -> Generator[None, None, None]:
+def _in_run(spec: RunSpec, _args: argparse.Namespace) -> Generator[None, None, None]:
     """Point the run-scoped paths and variants at one run for its duration."""
     global RESULTS_DIR, RUN_ROOT  # noqa: PLW0603
-    previous = (RUN_ROOT, RESULTS_DIR, args.flavors)
-    args.flavors = spec.flavors
+    previous = (RUN_ROOT, RESULTS_DIR)
+    scoped_env = (
+        "MEGATRON_ROOT",
+        "MEGATRON_REPO_URL",
+        "MEGATRON_COMMIT",
+        "NVRX_REPO_URL",
+        "NVRX_COMMIT",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+    )
+    previous_env = {name: os.environ.get(name) for name in scoped_env}
     # A run writes inside the job that owns it, in a directory named for the
     # variants it adds, so the job directory holds the whole comparison and
     # one path says which side of it this is.
@@ -2761,10 +2884,21 @@ def _in_run(spec: RunSpec, args: argparse.Namespace) -> Generator[None, None, No
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["SLURMJOB_OPT_RUN_DIR"] = str(RUN_ROOT)
     os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / "checkpoint_server.%h.%p.log")
+    cfg = f"{spec.args.config}_{spec.args.nodes}x{spec.args.gpus_per_node}"
+    provider = _provider(spec.flavors)
+    include_nvrx = not (provider == "native" and spec.flavors.policy.requires_nvrx_absent)
+    _toolchain(cfg, spec.args).apply(os.environ, include_nvrx=include_nvrx)
     try:
         yield
     finally:
-        RUN_ROOT, RESULTS_DIR, args.flavors = previous
+        RUN_ROOT, RESULTS_DIR = previous
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        os.environ["SLURMJOB_OPT_RUN_DIR"] = str(RUN_ROOT)
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / "checkpoint_server.%h.%p.log")
 
 
 def _perform_runs(cfg: str, args: argparse.Namespace) -> None:
@@ -2781,14 +2915,14 @@ def _perform_runs(cfg: str, args: argparse.Namespace) -> None:
     )
     for spec in specs:
         with _in_run(spec, args):
-            flavors = spec.flavors
+            run_args, flavors = spec.args, spec.flavors
             if rank0:
                 logger.info(f"[slurm_job:run] {spec.name or 'run'} {flavors.tag} "
-                            f"{_toolchain(cfg, args).describe('sources')}")
+                            f"{_toolchain(cfg, run_args).describe('sources')}")
             # Naming the routine keeps every rank's output in a per-rank file
             # and mirrors only rank 0 into the job trace. Without it 256 ranks
             # write straight to the trace and bury the run in its own logs.
-            flavors.policy.run_worker(cfg, args, _provider(flavors), spec.name or "run")
+            flavors.policy.run_worker(cfg, run_args, _provider(flavors), spec.name or "run")
             run = _run_dir(cfg)
             # Recording what a checkpoint holds costs a pass over every tensor,
             # which only earns its place when something will read it: another
@@ -2801,13 +2935,12 @@ def _perform_runs(cfg: str, args: argparse.Namespace) -> None:
             ] if comparable else []
             # Node leaders share the manifest work, so a run's digest costs the
             # same whether it wrote four checkpoints or sixty-four.
-            if failures := _manifest_batch(f"{spec.name or 'run'}-manifest", iterations, None, None, args):
+            if failures := _manifest_batch(f"{spec.name or 'run'}-manifest", iterations, None, None, run_args):
                 raise RuntimeError(f"manifest derivation failed: {', '.join(failures)}")
             if not rank0 or not comparable:
                 continue
-            stem = _identity(args)[2]
-            _write_checkpoint_digest(run, stem)
-            digests.append(RESULTS_DIR / f"{stem}_checkpoint_digest.xz")
+            stem = _identity(run_args)[2]
+            digests.append(_write_checkpoint_digest(run, stem))
     if rank0:
         _compare_runs(args, specs, digests)
 
@@ -2841,6 +2974,21 @@ def _baseline_digest(path: Path) -> Path:
     return found[0]
 
 
+def _checkout_revision(root: Path) -> str:
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return f"{revision or 'unknown'}{'+dirty' if dirty else ''}"
+
 def _print_source_provenance() -> None:
     """Record the Megatron-LM and NVIDIA Resiliency Extension this phase loaded.
 
@@ -2851,13 +2999,7 @@ def _print_source_provenance() -> None:
     that were requested.
     """
     root = megatron_root()
-    revision = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    print(f"[native_ckpt:sources] megatron={root}@{revision or 'unknown'}", flush=True)  # noqa: T201
+    print(f"[native_ckpt:sources] megatron={root}@{_checkout_revision(root)}", flush=True)  # noqa: T201
     try:
         import nvidia_resiliency_ext  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     except ImportError:
@@ -2869,7 +3011,15 @@ def _print_source_provenance() -> None:
         version = importlib.metadata.version(_NVRX_DISTRIBUTION)
     except importlib.metadata.PackageNotFoundError:
         version = "unknown"
-    print(f"[native_ckpt:sources] nvidia_resiliency_ext={nvidia_resiliency_ext.__file__}@{version}", flush=True)  # noqa: T201
+    source = ""
+    if os.environ.get("NVRX_COMMIT") == _WORKTREE_REVISION and (nvrx_root := nvrx_repo_root()) is not None:
+        source = f" source={nvrx_root}@{_checkout_revision(nvrx_root)}"
+    elif requested := os.environ.get("NVRX_COMMIT"):
+        source = f" requested={requested}"
+    print(  # noqa: T201
+        f"[native_ckpt:sources] nvidia_resiliency_ext={nvidia_resiliency_ext.__file__}@{version}{source}",
+        flush=True,
+    )
 
 class _PeakHbmSampler:
     """Sample whole-device HBM use after training initializes its CUDA device."""
@@ -2977,13 +3127,14 @@ def _pretrain_entry(phase: int) -> None:
 def _worker(args: argparse.Namespace) -> None:
     flavors = _selected_flavors(args)
     provider = _provider(flavors)
-    if provider == "native" and flavors.policy.requires_nvrx_absent and not _in_job_array():
+    if any(
+        _provider(spec.flavors) == "native" and spec.flavors.policy.requires_nvrx_absent
+        for spec in _run_specs(args)
+    ) and not _in_job_array():
         # The array's ft_launcher is itself an NVRx entry point; a mid-run
         # uninstall would pull its modules from under the launcher agents.
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    if target := _nvrx_target(cfg, args.nvrx_commit):
-        sys_path_insert(target)
     if _in_job_array():
         # A launcher restart re-runs this worker on nodes whose previous attempt
         # auto-launched the checkpoint daemon; the leftover belongs to this run,
@@ -3124,8 +3275,8 @@ def _job_array_body(
         'CLEAN_DONE="${NVRX_ARRAY_DIR}/control/clean_done"',
         'PREP_DONE="${NVRX_ARRAY_DIR}/control/prep_done"',
         "cancel_generation() {",
-        '  echo "Cancelling all remaining tasks of array ${SLURM_ARRAY_JOB_ID}."',
-        '  scancel "${SLURM_ARRAY_JOB_ID}" 2>/dev/null || true',
+        '  echo "Cancelling peer tasks of array ${SLURM_ARRAY_JOB_ID}."',
+        '  scancel "${SLURM_ARRAY_JOB_ID}_[1-${SLURM_ARRAY_TASK_MAX}]" 2>/dev/null || true',
         "}",
         "job_array_exit() {",
         "  local rc=$?",
@@ -3255,44 +3406,79 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
             extra_srun_args=["--container-writable"] if writable else None, **common,
         )
     prep_log = RESULTS_DIR / f"{stem}_prep.log"
-    toolchain = _toolchain(cfg, args)
-    prep_commands = [["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")]]
+    spec_toolchains = [(spec, _toolchain(cfg, spec.args)) for spec in _run_specs(args)]
+    toolchains = list(dict.fromkeys(toolchain for _spec, toolchain in spec_toolchains))
+    megatron_sources = {
+        (toolchain.megatron_root, toolchain.megatron_commit, toolchain.megatron_url): toolchain
+        for toolchain in toolchains
+    }
+    prep_commands = [
+        [
+            "env",
+            f"MEGATRON_COMMIT={toolchain.megatron_commit}",
+            f"MEGATRON_REPO_URL={toolchain.megatron_url}",
+            "bash",
+            str(ENROOT_SCRIPTS_DIR / "megatron_root.sh"),
+            str(toolchain.megatron_root),
+        ]
+        for toolchain in megatron_sources.values()
+        if toolchain.megatron_commit != _WORKTREE_REVISION
+    ]
     prep_commands.append([
         "python3", "-u", str(Path(wheel_install.__file__).resolve()),
         *flavors.policy.prep_args(),
     ])
-    if toolchain.nvrx_target:
-        prep_commands.append([
+    nvrx_sources = {
+        toolchain.nvrx_target: toolchain
+        for spec, toolchain in spec_toolchains
+        if not (_provider(spec.flavors) == "native" and spec.flavors.policy.requires_nvrx_absent)
+    }
+    prep_commands.extend(
+        [
             "python3", "-u", str(SCRIPT_DIR / "install_run_dependency.py"),
-            "--repo-url", args.nvrx_repo_url,
-            *(("--commit", args.nvrx_commit) if args.nvrx_commit else ()),
-            "--target", str(toolchain.nvrx_target),
+            "--repo-url", selected.nvrx_url,
+            "--commit", selected.nvrx_commit,
+            "--target", str(selected.nvrx_target),
             *(("--repo-root", str(nvrx_repo_root())) if nvrx_repo_root() else ()),
-        ])
+        ]
+        for selected in nvrx_sources.values()
+    )
     prep_commands.append(["python3", "-m", "pip", "list"])
     prep_commands.append(["python3", "-u", str(Path(wheel_install.__file__).resolve()), "--report-install"])
     prep = [*step(1, 1, ",".join(_env_names("p")), prep_log, writable=True),
             "/bin/bash", "-c", " && ".join(shell_join(command) for command in prep_commands)]
-    worker_args = [
+    common_worker_args = [
         "--nodes", str(args.nodes), "--gpus-per-node", str(args.gpus_per_node), "--config", args.config,
         "--flavor", "+".join(flavors.names),
-        *(token for entry in (args.run or []) for token in ("--run", entry)),
+        *args.extra_args,
     ]
-    epilog_args = [*worker_args]
-    worker_args.extend(args.extra_args)
+    run_blocks = getattr(args, "run_blocks", None)
+    if run_blocks is None:
+        run_blocks = tuple(RunBlock(entry) for entry in (args.run or []))
+    run_args = [
+        token
+        for block in run_blocks
+        for token in ("--run", block.entry, *block.argv)
+    ]
+    worker_args = [*common_worker_args, *run_args]
     segment = _job_array_segment(args)
     job_array = segment > 0
     container_env = ",".join(_env_names("w"))
-    native_perf_verification = _provider(flavors) == "native" and flavors.policy.requires_nvrx_absent
+    native_perf_verification = any(
+        _provider(spec.flavors) == "native" and spec.flavors.policy.requires_nvrx_absent
+        for spec, _toolchain_ in spec_toolchains
+    )
     run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification),
            "python3", "-u", str(Path(__file__).resolve()), *worker_args]
     epilog = [
-        "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *epilog_args,
+        "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *common_worker_args,
         "--log-file", str(log), "--baseline-json", json.dumps(PerfReport.baseline(stem), separators=(",", ":")),
+        *run_args,
     ]
     rank_logs = [
-        "python3", "-u", str(Path(__file__).resolve()), _RANK_LOGS_ENTRY_CMD, *epilog_args,
+        "python3", "-u", str(Path(__file__).resolve()), _RANK_LOGS_ENTRY_CMD, *common_worker_args,
         "--log-file", str(log),
+        *run_args,
     ]
     cleanup_nodes = segment if job_array else args.nodes
 
@@ -3355,7 +3541,11 @@ def _path(value: str) -> Path:
     return path
 _positive_int = partial(_validated, convert=int, valid=lambda value: value >= 1, error="must be at least 1")
 _nonnegative_int = partial(_validated, convert=int, valid=lambda value: value >= 0, error="must be at least 0")
-_commit = partial(_validated, convert=str, valid=_COMMIT_RE.fullmatch, error="must be a 7-40 character hexadecimal commit")
+def _commit(value: str) -> str:
+    if value == _WORKTREE_REVISION or _COMMIT_RE.fullmatch(value):
+        return value
+    raise argparse.ArgumentTypeError("must be HEAD or a 7-40 character hexadecimal commit")
+
 _url = partial(_validated, convert=str, valid=lambda value: not re.match(r"https?://[^/@]+@", value),
                error="may not contain credentials because it is written to the reproducer")
 
@@ -3383,7 +3573,7 @@ _RUN_OPTIONS = {
     "image": RunOption("ENROOT_IMAGE", convert=Path, scopes="rsw"),
     "megatron_commit": RunOption("MEGATRON_COMMIT", DEFAULT_MEGATRON_COMMIT, _commit, scopes="rspw"),
     "megatron_repo_url": RunOption("MEGATRON_REPO_URL", DEFAULT_MEGATRON_REPO_URL, _url, scopes="rspw"),
-    "nvrx_commit": RunOption("NVRX_COMMIT", convert=_commit, scopes="rsw"),
+    "nvrx_commit": RunOption("NVRX_COMMIT", DEFAULT_NVRX_COMMIT, _commit, scopes="rsw"),
     "nvrx_repo_url": RunOption("NVRX_REPO_URL", DEFAULT_NVRX_REPO_URL, _url, scopes="rsw"),
     "checkpoints_per_run": RunOption("SLURMJOB_OPT_CHECKPOINTS_PER_RUN", convert=_nonnegative_int, scopes="rw"),
     "checkpoint_interval": RunOption("SLURMJOB_OPT_CHECKPOINT_INTERVAL", convert=_positive_int, scopes="rw"),
@@ -3439,8 +3629,39 @@ def _parser() -> argparse.ArgumentParser:
         parser.add_argument("--" + dest.replace("_", "-"), **kwargs)
     return parser
 
+def _split_run_blocks(argv: list[str]) -> tuple[list[str], tuple[RunBlock, ...]]:
+    """Splits arguments into common options and ordered run blocks."""
+    common: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    active: list[str] | None = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--run" or argument.startswith("--run="):
+            if argument == "--run":
+                index += 1
+                if index == len(argv):
+                    raise argparse.ArgumentTypeError("--run requires a name")
+                entry = argv[index]
+            else:
+                entry = argument.partition("=")[2]
+            parsed = _run_entry(entry)
+            if len(parsed) != 1:
+                raise argparse.ArgumentTypeError("each scoped --run must name exactly one run")
+            active = []
+            blocks.append((parsed[0], active))
+        else:
+            (active if active is not None else common).append(argument)
+        index += 1
+    return common, tuple(RunBlock(entry, tuple(tokens)) for entry, tokens in blocks)
+
 def _parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
-    args, extra = parser.parse_known_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    try:
+        common, cli_blocks = _split_run_blocks(raw)
+    except argparse.ArgumentTypeError as error:
+        parser.error(str(error))
+    args, extra = parser.parse_known_args(common)
     for dest, option in _RUN_OPTIONS.items():
         if hasattr(args, dest):
             continue
@@ -3458,6 +3679,11 @@ def _parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) 
         if option.choices and any(item not in option.choices for item in candidates):
             parser.error(f"{option.env} must be one of: {', '.join(option.choices)}")
         setattr(args, dest, value)
+    if cli_blocks:
+        args.run = [block.entry for block in cli_blocks]
+        args.run_blocks = cli_blocks
+    else:
+        args.run_blocks = tuple(RunBlock(entry) for entry in (args.run or []))
     return args, extra
 
 def _rank_logs_entry(argv: list[str]) -> None:
@@ -3465,7 +3691,7 @@ def _rank_logs_entry(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = _parser()
     parser.add_argument("--log-file", type=Path, required=True)
-    args, _extra = _parse_args(parser, argv)
+    args, args.extra_args = _parse_args(parser, argv)
     args.flavors = FlavorSelection(args.flavor)
     _selected_flavors(args)
     _report_failing_rank_logs(args.log_file)
@@ -3479,7 +3705,7 @@ def _epilog(argv: list[str]) -> None:
     parser = _parser()
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--baseline-json", required=True)
-    args, _extra = _parse_args(parser, argv)
+    args, args.extra_args = _parse_args(parser, argv)
     args.flavors = FlavorSelection(args.flavor)
     _selected_flavors(args)
     args.baseline = json.loads(args.baseline_json)
@@ -3498,10 +3724,17 @@ def _epilog(argv: list[str]) -> None:
     phase2 = sum("/checkpoints" in path and "/phase1-checkpoints" not in path for path in saves)
     # A recorded baseline stands in for the reference routine, so only the
     # compare routine writes checkpoints.
-    routines = len(args.run or [""])
-    expected_phase1 = routines
-    expected_phase2 = args.flavors.policy.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
-    expected_phase2 *= (args.repeat or 1) * routines
+    specs = _run_specs(args)
+    expected_phase1 = len(specs)
+    expected_phase2 = sum(
+        (
+            spec.flavors.policy.phase2_checkpoints
+            if spec.args.checkpoints_per_run is None
+            else spec.args.checkpoints_per_run
+        )
+        * (spec.args.repeat or 1)
+        for spec in specs
+    )
     logger.info(
         f"[slurm_job:epilog] checkpoint saves: phase1={phase1}, phase2={phase2}, "
         f"expected_phase1={expected_phase1}, expected_phase2={expected_phase2}",
@@ -3537,6 +3770,14 @@ def _validate_comparison_options(parser: argparse.ArgumentParser, args: argparse
     if args.baseline and not args.baseline.exists():
         parser.error(f"--baseline {args.baseline} does not exist")
 
+def _checkout_for_head(parser: argparse.ArgumentParser, option: str, env_name: str) -> None:
+    value = os.environ.get(env_name)
+    if not value:
+        parser.error(f"{option}=HEAD requires {env_name}")
+    root = Path(value).expanduser().resolve()
+    if not (root / ".git").exists():
+        parser.error(f"{option}=HEAD requires {env_name} to be a Git checkout: {root}")
+
 def _export_settings(args: argparse.Namespace) -> None:
     """Publish the settings the rest of the run reads from the environment.
 
@@ -3547,6 +3788,25 @@ def _export_settings(args: argparse.Namespace) -> None:
     for dest in ("platform", "cluster", "slurm_account"):
         if value := getattr(args, dest, None):
             os.environ[_RUN_OPTIONS[dest].env] = str(value)
+
+def _validate_run_spec(
+    parser: argparse.ArgumentParser,
+    spec: RunSpec,
+    common_modes: set[str],
+) -> None:
+    run_args = spec.args
+    run_modes = {flavor.name for flavor in spec.flavors.items if flavor.execution_mode}
+    if run_modes != common_modes:
+        parser.error(f"run {spec.name or 'run'}: execution flavors must be common options before the first --run")
+    if run_args.checkpoints_per_run == 0 and run_args.repeat != 1:
+        parser.error(f"run {spec.name or 'run'}: an unlimited checkpoint run cannot be repeated")
+    if spec.flavors.policy.requires_finite_run and (run_args.checkpoints_per_run == 0 or run_args.repeat == 0):
+        parser.error(f"run {spec.name or 'run'}: the selected flavor requires finite checkpoint and repeat counts")
+    if run_args.nvrx_commit == _WORKTREE_REVISION:
+        _checkout_for_head(parser, "--nvrx-commit", "NVRX_REPO_ROOT")
+    if run_args.megatron_commit == _WORKTREE_REVISION:
+        _checkout_for_head(parser, "--megatron-commit", "MEGATRON_ROOT")
+    _validate_comparison_options(parser, run_args)
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.gpus_per_node is None:
@@ -3564,11 +3824,14 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             f"--job-array allocates {segment}-node NVLink domains per array task; "
             "--nodes must be a positive multiple of --job-array-segment",
         )
-    if args.checkpoints_per_run == 0 and args.repeat != 1:
-        parser.error("an unlimited checkpoint run cannot be repeated because it does not return")
-    if args.flavors.policy.requires_finite_run and (args.checkpoints_per_run == 0 or args.repeat == 0):
-        parser.error("the selected flavor requires finite checkpoint and repeat counts")
     _validate_comparison_options(parser, args)
+    try:
+        specs = _run_specs(args)
+    except (argparse.ArgumentTypeError, ValueError) as error:
+        parser.error(str(error))
+    common_modes = {flavor.name for flavor in args.flavors.items if flavor.execution_mode}
+    for spec in specs:
+        _validate_run_spec(parser, spec, common_modes)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -3586,9 +3849,6 @@ def main() -> None:
     if in_srun():
         _worker(args)
         return
-    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    if target := _nvrx_target(cfg, args.nvrx_commit):
-        sys_path_insert(target)
     if not args.dry_run and args.flavors.policy.install_prebuilt:
         wheel_install.install_prebuilt_wheel(probe=False)
     script, reaper, log = _build_job(args)

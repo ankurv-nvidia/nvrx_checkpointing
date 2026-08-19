@@ -253,10 +253,7 @@ function megatron {
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
-    # Megatron 77c87725 pins Transformer Engine e7c550c5, whose build backend imports
-    # nvidia-cudnn-frontend while resolving its wheel metadata. Installing the version
-    # from Megatron's dev lock first makes that metadata available under
-    # --no-build-isolation; installing both in one uv transaction is too late.
+    # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
     uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.26.0"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
@@ -347,5 +344,3 @@ if [ "$#" -eq 0 ]; then
 else
     $*
 fi
-
-# git-merge-base 77c87725e71c9f5022ac289071b16941876ca858

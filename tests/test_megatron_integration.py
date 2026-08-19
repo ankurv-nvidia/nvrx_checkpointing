@@ -297,6 +297,24 @@ def test_module_launcher_installs_before_running_entrypoint(monkeypatch: pytest.
     assert sys.path[0] == str(tmp_path)
 
 
+def test_module_launcher_isolates_compiler_caches_by_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    integration, _ = _load_integration(monkeypatch)
+    monkeypatch.setenv("RANK", "7")
+    for name in ("TRITON_CACHE_DIR", "TRITON_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / name.lower()))
+
+    integration._isolate_compiler_caches()
+    integration._isolate_compiler_caches()
+
+    for name in ("TRITON_CACHE_DIR", "TRITON_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
+        cache = Path(integration.os.environ[name])
+        assert cache == tmp_path / name.lower() / "rank-7"
+        assert cache.is_dir()
+
+
 def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     integration, _ = _load_integration(monkeypatch)
     resolver = (REPO_ROOT / "scripts/megatron_root.sh").read_text()

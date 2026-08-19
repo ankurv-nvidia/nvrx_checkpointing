@@ -154,11 +154,11 @@ The bracketed prefix is included only when GitLab supplies `CI_JOB_ID`. It
 gives every job and retry its own run directory. Manual runs omit it without
 leaving a leading underscore.
 
-`{sources}` names only what the run was told to deviate on: `-mlm-<sha>` when a
-Megatron-LM commit is given other than the pinned one, and `-nvrx-<sha>` when a
-commit is given for the extension instead of the one in the image. A run on the
-pinned sources says nothing, so `--config nano3 --nodes 8 --flavor detr` writes
-to `nano3_8n-detr`, and the same run on a candidate extension writes to
+`{sources}` names only common source options: `-mlm-<sha>` when a common
+Megatron-LM commit differs from the pinned one, and `-nvrx-<sha>` when a common
+extension commit differs from the pinned default. A job on the pinned sources
+says nothing, so `--config nano3 --nodes 8 --flavor detr` writes to
+`nano3_8n-detr`, and the same job with a common candidate extension writes to
 `nano3_8n-detr-nvrx-c2b970d3`.
 
 A job that names its runs holds them inside its own directory, each named for
@@ -174,6 +174,28 @@ Under GitLab the job's id leads the directory holding them, so a retry keeps
 its own copy of the whole comparison. Each run directory holds that run's
 logs, checkpoints and digest, and `--clean-run` removes the job directory with
 every run inside it.
+
+`--run=<name>` also starts an argument scope. Options after it belong to that
+run until the next `--run`; options before the first run are common and are
+inherited by every run. Scalar run options override the common value, while a
+run's `--flavor` extends the common flavors. Allocation options such as nodes,
+cluster, work directory, time and background mode must precede the first run.
+
+```bash
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
+  --flavor detr+nvrx --background \
+  --run=ref \
+  --run=cmp --nvrx-commit=<candidate-commit>
+```
+
+Three or more runs work the same way. Every later digest is compared with the
+first run's digest.
+
+Run-specific flavors and overrides name only their child directory. The example
+above writes `ref/` and `nvrx-<candidate>.cmp/` below the common
+`nano3_8n-detr-nvrx/` job directory. Checkpoint cadence overrides are rendered
+directly; arbitrary run-specific Megatron arguments use a compact `opts-<hash>`
+tag so distinct commands cannot silently share a child directory.
 
 Ranks coordinate through empty files, one per rank per barrier. Those are
 handshakes rather than results, so they sit in a `.sync` directory of the run
@@ -325,18 +347,24 @@ The `NVRX_*` source variables are reserved for NVIDIA Resiliency Extension:
 in particular, `NVRX_COMMIT` always identifies its commit, never the
 nvrx_checkpointing commit.
 
-`NVRX_REPO_ROOT` selects the source checkout for NVIDIA Resiliency Extension.
-If it does not exist, the preparation step clones `NVRX_REPO_URL` there. If it
-already exists, it is reused without switching or cleaning its working tree.
-With `NVRX_COMMIT`, the requested Git object is fetched into that checkout when
-needed and installed exactly; without a commit, the existing checkout contents
-are installed.
+NVIDIA Resiliency Extension defaults to commit
+`7f64c5d5ae9408cf75d893d6d03416d4ab5aeaf5`. `NVRX_REPO_ROOT` selects the
+source checkout used to fetch and install that commit. The requested Git object
+is fetched when needed and installed into an isolated, commit-keyed target;
+the checkout's branch and working tree are not switched or cleaned.
 
-The nvrx_checkpointing source is always the repository containing
-`ci/scripts/slurm_job.py`. Native wheels are built from that checkout and
-pip-installed under the named run directory. To select a different native
-revision, invoke that revision's copy of the launcher. NVIDIA Resiliency
-Extension remains independently selectable:
+`--nvrx-commit=HEAD` instead snapshots the current contents of
+`NVRX_REPO_ROOT`, including local modifications, and installs the snapshot
+without fetching or modifying the source checkout. `NVRX_REPO_ROOT` must name
+an existing Git checkout in this mode.
+
+`--megatron-commit=HEAD` gives `MEGATRON_ROOT` the same working-tree meaning:
+training reads the checkout exactly as it exists, without fetch, checkout,
+reset or clean. Exact Megatron commits use isolated commit-keyed checkouts, so
+several revisions can run in one allocation without changing
+`MEGATRON_ROOT`. The nvrx_checkpointing source is always the repository
+containing `ci/scripts/slurm_job.py`; to select a different native revision,
+invoke that revision's launcher.
 
 ```bash
 export NVRX_REPO_ROOT=/lustre/checkouts/nvrx-b
@@ -360,18 +388,15 @@ python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
   --flavor detr --run=ref:nvrx --run=cmp:native
 ```
 
-Comparing two sets of sources is comparing two jobs, because a job trains on
-one toolchain. Each writes a digest, and the digests are diffed afterwards:
+Run-scoped source options compare two toolchains in one allocation. Here `ref`
+uses the default extension commit and `cmp` overrides only that source:
 
 ```bash
-python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 --flavor detr+nvrx
-
-python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 --flavor detr+nvrx \
-  --megatron-repo-url https://gitlab-master.nvidia.com/you/megatron-lm.git \
-  --megatron-commit <40-character-megatron-lm-commit> \
-  --nvrx-commit <40-character-nvidia-resiliency-ext-commit>
-
-python3 ci/scripts/slurm_job.py --diff-digests <runA> <runB>
+NVRX_REPO_ROOT=/lustre/checkouts/nvidia-resiliency-ext \
+python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
+  --flavor detr+nvrx \
+  --run=ref \
+  --run=cmp --nvrx-commit <candidate-nvrx-commit>
 ```
 
 `--diff-digests` takes either a digest or the run directory holding one. A job
@@ -379,10 +404,11 @@ with more than one run diffs them itself, against `--baseline` when given and
 against its first run otherwise, and fails on any difference. A run that fails
 stops the job.
 
-The run directory is keyed by the sources it trains on, so two such jobs never
-collide and neither has to still exist when the digests are diffed. Setting
-only `--megatron-commit` holds the extension fixed, and the reverse holds
-Megatron-LM fixed.
+The job directory is keyed only by common options. Each child directory is
+keyed by its run-specific flavors, source revisions, checkpoint cadence and
+extra Megatron arguments. Setting only a run's `--megatron-commit` holds the
+extension fixed, and the reverse holds Megatron-LM fixed. Separate jobs can
+still be compared later with `--diff-digests`.
 
 Every run trains its own phase 1 from scratch and resumes its own phase 2
 from it, so `phase1-checkpoints` and `checkpoints` are both compared and a divergence introduced anywhere in training surfaces at the
@@ -513,13 +539,21 @@ checkpoint it wrote. `<source>` is `tensor` for the per-chunk manifest and
 `common` for the state stored beside it, so the digest holds everything a
 checkpoint records rather than the tensors alone.
 
+The digest is an end-of-run artifact: training must finish and checkpoint
+manifests must be derived before it appears. `--background` returns as soon as
+Slurm accepts the job, so the digest will not exist when that command returns.
+For named runs it is written below `<job>/<run>/logs/`, not the job-level
+`logs/` directory. If training produced no readable checkpoint metadata, the
+job now fails with `no checkpoint metadata found` instead of silently omitting
+the digest.
+
 A digest names only the run that wrote it, so two runs compare after the fact
 without either having been configured against the other:
 
 ```bash
 python3 ci/scripts/slurm_job.py --diff-digests \
-  <runA>/logs/<stem>_compare_checkpoint_digest.xz \
-  <runB>/logs/<stem>_compare_checkpoint_digest.xz
+  <runA>/logs/<stem>_checkpoint_digest.xz \
+  <runB>/logs/<stem>_checkpoint_digest.xz
 ```
 
 It reports `entries / baseline / missing / extra / changed` per checkpoint and
@@ -549,9 +583,9 @@ common-state key as missing.
 | `--image` | `ENROOT_IMAGE` | Custom `.sqsh` image |
 | `--background` | `SLURMJOB_OPT_BACKGROUND=1` | Nonblocking `sbatch` submission |
 | `--job-array-segment` | `SLURMJOB_OPT_JOB_ARRAY_SEGMENT` | NVLink-domain nodes per array task; `0` disables; default 16 for jobs wider than 16 nodes |
-| `--megatron-commit` | `MEGATRON_COMMIT` | Exact Megatron-LM commit |
+| `--megatron-commit` | `MEGATRON_COMMIT` | Exact Megatron-LM commit, or `HEAD` for the unchanged `MEGATRON_ROOT` working tree |
 | `--megatron-repo-url` | `MEGATRON_REPO_URL` | Megatron-LM repository |
-| `--nvrx-commit` | `NVRX_COMMIT` | Exact NVIDIA Resiliency Extension commit |
+| `--nvrx-commit` | `NVRX_COMMIT` | Exact NVIDIA Resiliency Extension commit (default `7f64c5d5…`), or `HEAD` for an `NVRX_REPO_ROOT` snapshot |
 | `--nvrx-repo-url` | `NVRX_REPO_URL` | NVIDIA Resiliency Extension repository |
 | `--checkpoints-per-run` | `SLURMJOB_OPT_CHECKPOINTS_PER_RUN` | Checkpoints per training process; `0` is unlimited |
 | `--repeat` | `SLURMJOB_OPT_REPEAT` | Checkpoint cycles to run; `0` repeats indefinitely |

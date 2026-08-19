@@ -15,6 +15,7 @@ writes to the Megatron-LM source tree.
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 from functools import wraps
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SUPPORTED_MEGATRON_COMMIT = "77c87725e71c9f5022ac289071b16941876ca858"
+SUPPORTED_MEGATRON_COMMIT = "6c344290e54aa58a8be26d6af5ca2d46a3b00948"
 
 _NATIVE_PROVIDER = "native"
 _REFERENCE_PROVIDER = "nvrx"
@@ -32,6 +33,23 @@ _SUPPORTED_PROVIDERS = (_NATIVE_PROVIDER, _REFERENCE_PROVIDER)
 _INSTALL_MARKER = "_nvrx_checkpointing_integration_installed"
 _NATIVE_ASYNC_MARKER = "_nvrx_checkpointing_native_async_installed"
 _NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
+
+
+def _isolate_compiler_caches() -> None:
+    """Give each distributed Python process its own compiler cache directory."""
+    rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID")
+    if rank is None:
+        return
+    suffix = f"rank-{rank}"
+    for name in ("TRITON_CACHE_DIR", "TRITON_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
+        configured = os.environ.get(name)
+        if not configured:
+            continue
+        cache = Path(configured)
+        if cache.name != suffix:
+            cache /= suffix
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ[name] = str(cache)
 
 
 def add_arguments(parser: Any) -> Any:
@@ -373,6 +391,7 @@ def main(argv: list[str] | None = None) -> None:
 
     sys.path.insert(0, str(entrypoint.parent))
     sys.argv = [str(entrypoint), *args[1:]]
+    _isolate_compiler_caches()
     install()
     runpy.run_path(str(entrypoint), run_name="__main__")
 

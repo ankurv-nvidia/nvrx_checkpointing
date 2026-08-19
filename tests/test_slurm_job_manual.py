@@ -18,6 +18,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
+DEFAULT_MEGATRON_COMMIT = "6c344290e54aa58a8be26d6af5ca2d46a3b00948"
+DEFAULT_NVRX_COMMIT = "7f64c5d5ae9408cf75d893d6d03416d4ab5aeaf5"
 # A cross-source determinism run materializes one checkout of each dependency
 # per routine.
 _MUTATED_ENV = (
@@ -296,9 +298,9 @@ def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
         "name": "ultra3-64n",
         "work_dir": tmp_path,
         "image": None,
-        "megatron_commit": None,
+        "megatron_commit": DEFAULT_MEGATRON_COMMIT,
         "megatron_repo_url": None,
-        "nvrx_commit": None,
+        "nvrx_commit": DEFAULT_NVRX_COMMIT,
         "nvrx_repo_url": "https://github.com/NVIDIA/nvidia-resiliency-ext.git",
         "async_compare": None,
         "recorded_baseline": False,
@@ -376,6 +378,7 @@ def test_run_options_apply_default_env_cli_precedence(monkeypatch: pytest.Monkey
     defaults, _ = slurm_job._parse_args(slurm_job._parser(), ["pretrain-native"])
     assert (defaults.nodes, defaults.config, defaults.repeat, defaults.background) == (1, "pico", 1, False)
     assert defaults.flavor is None
+    assert defaults.nvrx_commit == DEFAULT_NVRX_COMMIT
 
     monkeypatch.setenv("SLURMJOB_OPT_NODES", "8")
     monkeypatch.setenv("SLURMJOB_OPT_CONFIG", "nano3")
@@ -449,7 +452,7 @@ def test_named_run_resolves_all_durable_paths_under_workdir(monkeypatch: pytest.
     assert tmp_path == slurm_job.WORK_ROOT
     assert Path(slurm_job.os.environ["SLURMJOB_OPT_WORK_ROOT"]) == tmp_path
     for name, relative in (
-        ("MEGATRON_ROOT", "deps/megatron-lm-head"),
+        ("MEGATRON_ROOT", f"deps/megatron-lm-{DEFAULT_MEGATRON_COMMIT[:8]}"),
         ("SLURMJOB_OPT_PYTHON_INSTALL_DIR", "deps/python"),
         ("VCPKG_ROOT", "deps/vcpkg"),
         ("TRITON_CACHE_DIR", "caches/triton"),
@@ -568,6 +571,54 @@ def test_the_run_settings_can_be_argued_or_exported(monkeypatch: pytest.MonkeyPa
     }
 
 
+def test_scoped_runs_inherit_common_options_and_override_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    candidate = "735068d5df9b450f32f33b4f42e449bf126c3683"
+    args, args.extra_args = slurm_job._parse_args(
+        slurm_job._parser(),
+        [
+            "--nodes=8",
+            "--config=nano3",
+            "--flavor=detr+nvrx",
+            "--micro-batch-size=2",
+            "--run=ref",
+            "--run=cmp",
+            f"--nvrx-commit={candidate}",
+            "--micro-batch-size=4",
+            "--run=working-tree",
+            "--nvrx-commit=HEAD",
+        ],
+    )
+    args.flavors = slurm_job.FlavorSelection(args.flavor)
+
+    ref, cmp, working_tree = slurm_job._run_specs(args)
+
+    assert [spec.name for spec in (ref, cmp, working_tree)] == ["ref", "cmp", "working-tree"]
+    assert [spec.flavors.names for spec in (ref, cmp, working_tree)] == [
+        ("detr", "nvrx"),
+        ("detr", "nvrx"),
+        ("detr", "nvrx"),
+    ]
+    assert [spec.args.nvrx_commit for spec in (ref, cmp, working_tree)] == [
+        DEFAULT_NVRX_COMMIT,
+        candidate,
+        "HEAD",
+    ]
+    assert ref.args.extra_args == ["--micro-batch-size=2"]
+    assert cmp.args.extra_args == ["--micro-batch-size=2", "--micro-batch-size=4"]
+
+
+def test_allocation_options_must_precede_scoped_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    args, args.extra_args = slurm_job._parse_args(slurm_job._parser(), ["--run=ref", "--background"])
+    args.flavors = slurm_job.FlavorSelection(args.flavor)
+
+    with pytest.raises(ValueError, match=r"allocation option.*--background"):
+        slurm_job._run_specs(args)
+
+
 def test_the_platform_names_its_gpus_per_node(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
@@ -645,6 +696,23 @@ def test_a_ci_job_holds_the_runs_it_owns(
     with slurm_job._in_run(slurm_job._run_specs(manual)[0], manual):
         assert slurm_job.RUN_ROOT.relative_to(tmp_path).as_posix() == "nano3_8n-detr/nvrx.ref"
 
+    # Scoped revisions identify child directories while common options identify the allocation directory.
+    candidate = "735068d5df9b450f32f33b4f42e449bf126c3683"
+    scoped = _args(
+        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr", "nvrx"],
+        flavor=["detr", "nvrx"], run=["ref", "cmp"],
+    )
+    scoped.run_blocks = (
+        slurm_job.RunBlock("ref"),
+        slurm_job.RunBlock("cmp", (f"--nvrx-commit={candidate}",)),
+    )
+    slurm_job._configure_run(scoped)
+    assert slurm_job.RUN_ROOT.name == "nano3_8n-detr-nvrx"
+    assert [slurm_job._run_dir_name(spec) for spec in slurm_job._run_specs(scoped)] == [
+        "ref",
+        "nvrx-735068d5.cmp",
+    ]
+
 
 def test_a_run_on_pinned_sources_names_only_what_it_is(
     monkeypatch: pytest.MonkeyPatch,
@@ -713,7 +781,7 @@ def test_nvrx_repo_root_selects_source_checkout(monkeypatch: pytest.MonkeyPatch,
     assert "SLURMJOB_OPT_NATIVE_CKPT_REPO_ROOT" not in reproducer
     assert "export NVRX_REPO_ROOT=" + str(nvrx) in reproducer
     assert '--repo-root "${NVRX_REPO_ROOT}"' in reproducer
-    assert '--target "${SLURMJOB_OPT_RUN_DIR}/deps/nvidia-resiliency-ext"' in reproducer
+    assert '--target "${SLURMJOB_OPT_RUN_DIR}/deps/nvidia-resiliency-ext-${NVRX_COMMIT}"' in reproducer
 
 def test_nvrx_repo_root_reuses_existing_checkout_without_switching_it(tmp_path: Path) -> None:
     installer = _load_run_dependency()
@@ -738,6 +806,89 @@ def test_nvrx_repo_root_reuses_existing_checkout_without_switching_it(tmp_path: 
 
     installer._source_requirement(str(source), second, checkout)
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip() == first
+
+
+def test_nvrx_head_installs_a_snapshot_without_modifying_the_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = _load_run_dependency()
+    source = tmp_path / "nvrx"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
+    tracked = source / "tracked"
+    tracked.write_text("committed\n")
+    subprocess.run(["git", "add", "tracked"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=source, check=True)
+    tracked.write_text("locally modified\n")
+    (source / "untracked").write_text("also included\n")
+    before_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True)
+    before_status = subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True)
+    target = tmp_path / "installed"
+    commands: list[list[str]] = []
+    real_run = subprocess.run
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        command = [str(item) for item in command]
+        commands.append(command)
+        if "rev-parse" in command:
+            return SimpleNamespace(returncode=0, stdout=".git\n", stderr="")
+        if "pip" in command:
+            staging = Path(command[command.index("--target") + 1])
+            snapshot = Path(command[-1])
+            assert snapshot != source
+            assert (snapshot / "tracked").read_text() == "locally modified\n"
+            assert (snapshot / "untracked").read_text() == "also included\n"
+            package = staging / "nvidia_resiliency_ext"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=str(target / "nvidia_resiliency_ext/__init__.py") + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(installer.subprocess, "run", run)
+
+    installer.install_nvrx("https://example.invalid/nvrx.git", "HEAD", target, source)
+
+    after_head = real_run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True, check=True).stdout
+    after_status = real_run(["git", "status", "--porcelain"], cwd=source, capture_output=True, text=True, check=True).stdout
+    assert after_head == before_head
+    assert after_status == before_status
+    git_commands = [command for command in commands if command[0].endswith("git")]
+    assert len(git_commands) == 1
+    assert "rev-parse" in git_commands[0]
+
+
+def test_megatron_head_does_not_modify_the_checkout(tmp_path: Path) -> None:
+    source = tmp_path / "megatron"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
+    tracked = source / "tracked"
+    tracked.write_text("committed\n")
+    subprocess.run(["git", "add", "tracked"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=source, check=True)
+    tracked.write_text("locally modified\n")
+    before_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True)
+    before_status = subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/megatron_root.sh"), str(source)],
+        env={"PATH": "/usr/bin:/bin", "MEGATRON_COMMIT": "HEAD"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert Path(result.stdout.strip()) == source.resolve()
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True) == before_head
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True) == before_status
 
 
 def test_named_run_rejects_path_traversal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1291,6 +1442,20 @@ def test_checkpoint_digest_is_diffable_and_summarised(
     assert "args.save" not in scoped
 
 
+def test_checkpoint_digest_fails_explicitly_when_no_metadata_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", tmp_path / "logs")
+    (tmp_path / "logs").mkdir()
+
+    with pytest.raises(RuntimeError, match="no checkpoint metadata found"):
+        slurm_job._write_checkpoint_digest(tmp_path / "run", "empty")
+
+    assert not (tmp_path / "logs/empty_checkpoint_digest.xz").exists()
+
+
 def test_existing_digests_ignore_run_scoped_entries(tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     label = "checkpoints/iter_0000120"
@@ -1742,6 +1907,8 @@ def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
     control_dir = script.index('mkdir -p "${NVRX_ARRAY_DIR}/control"', clean)
     assert clean < control_dir
     assert 'while [[ ! -f "${CLEAN_DONE}" ]]' in script
+    assert 'scancel "${SLURM_ARRAY_JOB_ID}_[1-${SLURM_ARRAY_TASK_MAX}]"' in script
+    assert 'scancel "${SLURM_ARRAY_JOB_ID}" 2>/dev/null || true' not in script
     assert "no_restart" not in script
     assert "rc == 93" not in script
 
@@ -1926,9 +2093,17 @@ def test_missing_cluster_template_has_no_default_fallback(monkeypatch: pytest.Mo
         slurm_job._load_template("srun.tmpl")
 
 
-def test_enroot_import_requests_runner_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "cluster,partition",
+    [("awscmh", "batch"), ("cwdfw", "interactive")],
+)
+def test_enroot_import_requests_runner_gpus(
+    monkeypatch: pytest.MonkeyPatch,
+    cluster: str,
+    partition: str,
+) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    monkeypatch.setenv("CLUSTER", cluster)
 
     cmd = slurm_job.build_cmd_from_template(
         "enroot_import.tmpl",
@@ -1937,7 +2112,7 @@ def test_enroot_import_requests_runner_gpus(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
     assert "--gpus-per-node=4" in cmd
-    assert "--partition=interactive" in cmd
+    assert f"--partition={partition}" in cmd
 
 
 def test_slurm_image_matches_megatron_wheel_base() -> None:
@@ -1986,10 +2161,12 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
+    build_values: list[dict[str, object]] = []
     validated: list[str] = []
     runs: list[tuple[list[str], dict[str, object]]] = []
 
-    def build(name: str, _values: dict[str, object], payload: list[str], **kwargs: object) -> list[str]:
+    def build(name: str, values: dict[str, object], payload: list[str], **kwargs: object) -> list[str]:
+        build_values.append(values)
         built.append((name, payload, kwargs))
         partition = "interactive" if name == "image_prep.tmpl" else "backfill"
         return ["srun", f"--partition={partition}", *payload]
@@ -2008,6 +2185,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     prepare_image._ensure_enroot_image(tmp_path / "native.sqsh", 8)
 
     assert built[-1][0] == "image_prep.tmpl"
+    assert build_values[-1]["time_minutes"] == 240  # noqa: PLR2004
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
     assert '"nvidia-cudnn-frontend[cutedsl]==1.26.0"' in prepare
@@ -2436,6 +2614,21 @@ def test_sacct_job_array_reads_task_zero(monkeypatch: pytest.MonkeyPatch) -> Non
     assert slurm_job._verify_allocation("123", 0, job_array=True) == 0
 
 
+def test_sacct_job_array_preserves_task_zero_soft_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(
+        slurm_job.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="123_0|FAILED|3:0|0:0\n123_1|CANCELLED by 456|0:0|0:0\n",
+            stderr="",
+        ),
+    )
+
+    assert slurm_job._verify_allocation("123", 0, job_array=True) == slurm_job.SOFT_FAIL_RC
+
+
 def test_sacct_job_array_rejects_a_failed_task_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setattr(
@@ -2599,8 +2792,31 @@ def test_wheel_test_matches_main_and_ctest_is_isolated() -> None:
     assert "--target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip" in ctest_script
     assert set(config["ctest:x86_64"]["needs"]) == {"wheel-image:x86_64", "wheel:x86_64"}
     assert set(config["ctest:aarch64"]["needs"]) == {"wheel-image:aarch64", "wheel:aarch64"}
-    assert any(need["job"] == "ctest:x86_64" for need in config["wheel-publish:x86_64"]["needs"])
-    assert any(need["job"] == "ctest:aarch64" for need in config["wheel-publish:aarch64"]["needs"])
+    assert 'PHOENIX_WHEEL_VERSION="0.0.1.dev${CI_PIPELINE_IID}+g${CI_COMMIT_SHORT_SHA}"' in build_script
+    publish = config["wheel-publish:pypi"]
+    assert {need["job"] for need in publish["needs"]} == {
+        "wheel:x86_64",
+        "wheel:aarch64",
+        "wheel-pytest:x86_64",
+        "wheel-pytest:aarch64",
+        "ctest:x86_64",
+        "ctest:aarch64",
+    }
+    assert {need["job"] for need in publish["needs"] if need["artifacts"]} == {
+        "wheel:x86_64",
+        "wheel:aarch64",
+    }
+    publish_script = "\n".join(config[".wheel_publish"]["script"])
+    assert "TWINE_USERNAME=gitlab-ci-token" in publish_script
+    assert 'TWINE_PASSWORD="${CI_JOB_TOKEN}"' in publish_script
+    assert "python -m twine check dist/*.whl" in publish_script
+    assert "python -m twine upload" in publish_script
+    assert "--skip-existing" in publish_script
+    assert "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" in publish_script
+    assert "packages/generic" not in publish_script
+    assert config[".wheel_publish"]["rules"][1]["if"] == '$CI_COMMIT_BRANCH == "main"'
+    assert "pyyaml twine" in (REPO_ROOT / "Dockerfile.ci").read_text()
+    assert "Description-Content-Type: text/markdown" in (REPO_ROOT / "METADATA").read_text()
     cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
     assert "PHOENIX_INSTALL_TEST_TORCH" not in cmake
 
@@ -2746,6 +2962,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         " 0:   ckpt_provider ................................... native\n"
         " 0:   inference_dynamic_batching_enable_prefix_caching  False\n"
         " 0:   inference_dynamic_batching_unified_memory_level . 0\n"
+        " 0:   config_logger_dir ............................... \n"
         " 0:   data_cache_path ................................. /run/data-cache\n"
         " 0: WARNING: unrelated output inside the argument block\n"
         "0:   micro_batch_size ................................ 1\n"
@@ -2765,6 +2982,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "  ckpt_provider ................................... native\n"
         "  inference_dynamic_batching_enable_prefix_caching  False\n"
         "  inference_dynamic_batching_unified_memory_level . 0\n"
+        "  config_logger_dir ...............................\n"
         "  micro_batch_size ................................ 1\n",
     )
     monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
@@ -2793,6 +3011,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     assert "\n0:" not in arguments
     assert "data_cache_path" not in arguments
     assert "WARNING" not in arguments
+    assert all(line == line.rstrip() for line in arguments.splitlines())
     assert "inference_dynamic_batching_enable_prefix_caching  False" in arguments
     assert "inference_dynamic_batching_unified_memory_level . 0" in arguments
     assert yaml.safe_load(next((tmp_path / "baselines").glob("*.yaml")).read_text()) == {
@@ -3007,13 +3226,13 @@ def test_each_run_writes_and_compares_its_own_arguments(
             "-------------------- end of arguments ---------------------\n"
         )
         log.write_text(block)
-        stem = slurm_job._arguments_stem(args, spec.variants)
+        stem = slurm_job._arguments_stem(spec.args, ())
         (recorded / f"{stem}_arguments.txt").write_text(block)
 
     assert slurm_job._write_and_compare_arguments(args, batch_log) is True
     for spec in slurm_job._run_specs(args):
         log = slurm_job._argument_log(args, batch_log, spec)
-        candidate = log.parent / "baselines" / f"{slurm_job._arguments_stem(args, spec.variants)}_arguments.txt"
+        candidate = log.parent / "baselines" / f"{slurm_job._arguments_stem(spec.args, ())}_arguments.txt"
         assert candidate.exists()
         assert f"ckpt_provider ................................... {spec.variants[0]}" in candidate.read_text()
 
@@ -3122,14 +3341,14 @@ def test_batch_epilog_requires_both_deterministic_checkpoint_routines(monkeypatc
                 "pico",
                 "--flavor",
                 "detr",
-                "--run=ref",
-                "--run=cmp",
                 "--checkpoints-per-run",
                 "3",
                 "--log-file",
                 str(log),
                 "--baseline-json",
                 '{"metrics":{"bw_mbps":140000}}',
+                "--run=ref",
+                "--run=cmp",
             ],
         )
 
@@ -3460,37 +3679,6 @@ def test_upstream_job_artifact_downloads_wheel_without_extracting_it(
     assert requests[0].headers["Job-token"] == "secret"
 
 
-def test_registry_wheel_downloads_canonical_filename(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    wheel_install = _load_slurm_job().wheel_install
-    filename = "nvrx_checkpointing-0.0.1-cp312-abi3-linux_aarch64.whl"
-    monkeypatch.setenv("CI_JOB_TOKEN", "test-token")
-    monkeypatch.setenv("WHEEL_ARCH", "aarch64")
-    monkeypatch.setattr(
-        wheel_install,
-        "registry_wheel_url",
-        lambda name=None: f"https://example.invalid/{name or 'nvrx_checkpointing-linux_aarch64.txt'}",
-    )
-
-    def response(request: object, **_kwargs: object) -> io.BytesIO:
-        if str(request.full_url).endswith(".txt"):
-            return io.BytesIO(f"{filename}\n".encode())
-        return io.BytesIO(b"wheel contents")
-
-    monkeypatch.setattr(
-        wheel_install.urllib.request,
-        "urlopen",
-        response,
-    )
-
-    downloaded = wheel_install._fetch_registry_wheel(tmp_path)
-
-    assert downloaded == tmp_path / filename
-    assert downloaded.read_bytes() == b"wheel contents"
-    template = (REPO_ROOT / "ci/gitlab-ci-native.template.yml").read_text()
-    assert '--upload-file "${WHEEL}" "${WHEEL_URL}"' in template
-    assert "printf '%s\\n' \"${WHEEL_NAME}\"" in template
-
-
 def test_wheel_install_does_not_trust_an_untracked_site_package(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3504,8 +3692,22 @@ def test_wheel_install_does_not_trust_an_untracked_site_package(
     monkeypatch.setattr(wheel_install, "_find_local_wheel", lambda _directory: wheel)
     monkeypatch.setattr(wheel_install, "_pip_install", installed.append)
 
-    assert wheel_install.install_prebuilt_wheel(tmp_path, fetch_remote=False, probe=False)
+    assert wheel_install.install_prebuilt_wheel(tmp_path, probe=False)
     assert installed == [wheel]
+
+
+def test_wheel_install_main_installs_from_explicit_dist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wheel_install = _load_slurm_job().wheel_install
+    installed_from: list[Path | None] = []
+    monkeypatch.setattr(sys, "argv", ["wheel_install.py", "--from-dist", str(tmp_path)])
+    monkeypatch.setattr(wheel_install, "install_prebuilt_wheel", lambda dist: installed_from.append(dist) or True)
+
+    wheel_install.main()
+
+    assert installed_from == [tmp_path]
 
 
 def test_wheel_packages_only_required_metadata_compare() -> None:

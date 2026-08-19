@@ -332,8 +332,8 @@ fi
 # [CUDABoolType [TOKENS, EXPERTS]] is at version 1; expected version 0"
 # at iteration 1's backward pass.
 #
-# Nano's default (post-commit 799415d) is HYBRIDEP=0 to match
-# Deepak's nano.sh, but that recipe runs bf16-only so the combo never
+# Nano defaults HYBRIDEP=0 to match Deepak's nano.sh, but that recipe runs
+# bf16-only so the combo never
 # arose in production.  Auto-flip to HYBRIDEP=1 (flex+hybridep) when
 # MXFP8=1; emit a stderr notice so the deviation is visible in the
 # step2 log.  User-set HYBRIDEP=0 + MXFP8=1 still gets the flip --

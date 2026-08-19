@@ -9,10 +9,10 @@
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
 #
-# Add --nodes=2 to both submissions for the two-node case. With Megatron-LM
-# 77c87725, the decomposed weighted-squared-ReLU path is exact at both one and
-# two nodes with Mamba, attention, and MoE-router CUDA graphs enabled. Enabling
-# the fused weighted-squared-ReLU path reproduces the observed run-to-run drift.
+# Add --nodes=2 to both submissions for the two-node case. The decomposed
+# weighted-squared-ReLU path is exact at both one and two nodes with Mamba,
+# attention, and MoE-router CUDA graphs enabled. Enabling the fused path
+# reproduces the observed run-to-run drift.
 #
 # For module isolation, set CUDA_GRAPH_MODULES to a space-separated subset, for
 # example CUDA_GRAPH_MODULES="mamba attn moe_router". Set CUDA_GRAPH_IMPL=none
@@ -44,7 +44,7 @@ set -Eeuo pipefail
 : "${MEGATRON_ROOT:?set MEGATRON_ROOT to a Megatron-LM checkout}"
 : "${ENROOT_IMAGE:?set ENROOT_IMAGE to an image containing Megatron-LM dependencies}"
 : "${RUN_TAG:=det-cudagraph-${SLURM_JOB_ID}}"
-: "${MEGATRON_COMMIT:=77c87725e71c9f5022ac289071b16941876ca858}"
+: "${MEGATRON_COMMIT:=6c344290e54aa58a8be26d6af5ca2d46a3b00948}"
 : "${GPUS_PER_NODE:=4}"
 : "${SAVE_INTERVAL:=250}"
 : "${CHECKPOINTS:=3}"
