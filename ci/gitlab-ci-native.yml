@@ -559,7 +559,6 @@ ctest:aarch64:
       /opt/venv/bin/python -m twine check dist/*.whl
       /opt/venv/bin/python -m twine upload \
         --non-interactive \
-        --skip-existing \
         --repository-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" \
         dist/*.whl
 

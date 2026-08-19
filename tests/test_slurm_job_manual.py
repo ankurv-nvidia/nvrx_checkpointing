@@ -2811,7 +2811,7 @@ def test_wheel_test_matches_main_and_ctest_is_isolated() -> None:
     assert 'TWINE_PASSWORD="${CI_JOB_TOKEN}"' in publish_script
     assert "python -m twine check dist/*.whl" in publish_script
     assert "python -m twine upload" in publish_script
-    assert "--skip-existing" in publish_script
+    assert "--skip-existing" not in publish_script
     assert "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" in publish_script
     assert "packages/generic" not in publish_script
     assert config[".wheel_publish"]["rules"][1]["if"] == '$CI_COMMIT_BRANCH == "main"'
