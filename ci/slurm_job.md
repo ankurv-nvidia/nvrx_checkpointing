@@ -348,7 +348,7 @@ in particular, `NVRX_COMMIT` always identifies its commit, never the
 nvrx_checkpointing commit.
 
 NVIDIA Resiliency Extension defaults to commit
-`7f64c5d5ae9408cf75d893d6d03416d4ab5aeaf5`. `NVRX_REPO_ROOT` selects the
+`73b17d9bcff543a0a5f64e95d64f26899d730653`. `NVRX_REPO_ROOT` selects the
 source checkout used to fetch and install that commit. The requested Git object
 is fetched when needed and installed into an isolated, commit-keyed target;
 the checkout's branch and working tree are not switched or cleaned.
@@ -585,7 +585,7 @@ common-state key as missing.
 | `--job-array-segment` | `SLURMJOB_OPT_JOB_ARRAY_SEGMENT` | NVLink-domain nodes per array task; `0` disables; default 16 for jobs wider than 16 nodes |
 | `--megatron-commit` | `MEGATRON_COMMIT` | Exact Megatron-LM commit, or `HEAD` for the unchanged `MEGATRON_ROOT` working tree |
 | `--megatron-repo-url` | `MEGATRON_REPO_URL` | Megatron-LM repository |
-| `--nvrx-commit` | `NVRX_COMMIT` | Exact NVIDIA Resiliency Extension commit (default `7f64c5d5…`), or `HEAD` for an `NVRX_REPO_ROOT` snapshot |
+| `--nvrx-commit` | `NVRX_COMMIT` | Exact NVIDIA Resiliency Extension commit (default `73b17d9b…`), or `HEAD` for an `NVRX_REPO_ROOT` snapshot |
 | `--nvrx-repo-url` | `NVRX_REPO_URL` | NVIDIA Resiliency Extension repository |
 | `--checkpoints-per-run` | `SLURMJOB_OPT_CHECKPOINTS_PER_RUN` | Checkpoints per training process; `0` is unlimited |
 | `--repeat` | `SLURMJOB_OPT_REPEAT` | Checkpoint cycles to run; `0` repeats indefinitely |

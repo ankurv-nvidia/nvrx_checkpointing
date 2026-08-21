@@ -66,6 +66,8 @@
   ckpt_fully_parallel_save_deprecated ............. True
   ckpt_fully_parallel_save_process_group .......... ep_dp
   ckpt_load_validate_sharding_integrity ........... True
+  ckpt_pg_tensors_cache_create .................... False
+  ckpt_pg_tensors_cache_path ...................... None
   ckpt_provider ................................... nvrx
   ckpt_step ....................................... None
   classes_fraction ................................ 1.0
@@ -163,6 +165,7 @@
   enable_ft_package ............................... False
   enable_full_sharding_in_hsdp .................... False
   enable_gpt_oss .................................. False
+  enable_mhc_connections .......................... False
   enable_msc ...................................... False
   enable_one_logger ............................... True
   encoder_num_layers .............................. 52
@@ -269,6 +272,8 @@
   ft_num_warmup_iters ............................. 5
   full_validation ................................. False
   fused_residual_rmsnorm .......................... False
+  gdp_cutedsl_kernel .............................. False
+  gdp_num_chunk_states_to_recompute ............... 2
   gdp_num_householder ............................. 3
   global_batch_size ............................... 32
   glu_linear_offset ............................... 0.0
@@ -457,6 +462,10 @@
   memory_snapshot_path ............................ snapshot.pickle
   merge_file ...................................... None
   metadata_path ................................... None
+  mhc_init_gating_factor .......................... 0.01
+  mhc_num_residual_streams ........................ 4
+  mhc_recompute_layer_num ......................... None
+  mhc_sinkhorn_iterations ......................... 20
   micro_batch_size ................................ 1
   microbatch_group_size_per_vp_stage .............. None
   mid_level_dataset_surplus ....................... 0.005
@@ -530,6 +539,7 @@
   moe_token_dispatcher_type ....................... alltoall
   moe_token_drop_policy ........................... probs
   moe_upcycling_granularity ....................... 1
+  moe_use_grouped_tensor .......................... False
   moe_use_upcycling ............................... False
   moe_z_loss_coeff ................................ None
   mrope_section ................................... None
@@ -605,6 +615,9 @@
   optimizer_cpu_offload ........................... False
   optimizer_cuda_graph ............................ False
   optimizer_offload_fraction ...................... 1.0
+  otel_enabled .................................... False
+  otel_service_name ............................... None
+  otel_span_groups ................................ None
   outer_dp_sharding_strategy ...................... no_shard
   output_bert_embeddings .......................... False
   overlap_cpu_optimizer_d2h_h2d ................... False
@@ -676,7 +689,7 @@
   rl_default_temperature .......................... 1.0
   rl_default_top_k ................................ -1
   rl_default_top_p ................................ 0
-  rl_generation_lag ............................... 0
+  rl_generation_lag ............................... None
   rl_importance_sampling_truncation_coef .......... None
   rl_inference_expert_model_parallel_size ......... None
   rl_inference_expert_tensor_model_parallel_size .. None
@@ -686,6 +699,7 @@
   rl_inference_pipeline_model_parallel_size ....... None
   rl_inference_tensor_model_parallel_size ......... None
   rl_kv_cache_management_mode ..................... persist
+  rl_max_inflight_requests ........................ None
   rl_offload_inference_model_weights_when_idle .... False
   rl_offload_optimizer_during_inference ........... False
   rl_partial_rollouts ............................. False

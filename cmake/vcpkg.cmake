@@ -240,8 +240,8 @@ macro(vcpkg_init)
         execute_process(COMMAND ${CMAKE_COMMAND} -E remove_directory "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND git init "${VCPKG_ROOT}.tmp" COMMAND_ERROR_IS_FATAL ANY)
-        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" remote add origin1 "${VCPKG_AUTOCLONE_URL}" COMMAND_ERROR_IS_FATAL ANY)
-        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" fetch --depth 1 origin1 "${VCPKG_AUTOCLONE_COMMIT}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" remote add origin "${VCPKG_AUTOCLONE_URL}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" fetch --depth 1 origin "${VCPKG_AUTOCLONE_COMMIT}" COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND git -C "${VCPKG_ROOT}.tmp" checkout ${VCPKG_AUTOCLONE_COMMIT} COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND ${CMAKE_COMMAND} -E rename "${VCPKG_ROOT}.tmp" "${VCPKG_ROOT}" COMMAND_ERROR_IS_FATAL ANY)
     else()
@@ -285,6 +285,17 @@ function(_vcpkg_ensure_min_commit root min_commit)
         return()
     endif()
     message(STATUS "vcpkg at ${root} does not contain ${min_commit}; fetching and checking it out")
+    execute_process(
+        COMMAND git -C "${root}" remote get-url origin
+        RESULT_VARIABLE origin_missing
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if (origin_missing)
+        execute_process(
+            COMMAND_ERROR_IS_FATAL ANY
+            COMMAND git -C "${root}" remote add origin "${VCPKG_AUTOCLONE_URL}"
+        )
+    endif()
     if (EXISTS "${root}/.git/shallow")
         execute_process(COMMAND_ERROR_IS_FATAL ANY COMMAND git -C "${root}" fetch --unshallow --tags origin)
     else()

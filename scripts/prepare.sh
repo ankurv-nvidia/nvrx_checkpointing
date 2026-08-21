@@ -277,7 +277,9 @@ function megatron {
     ln -sfn /usr/include "${RDMA_CORE_HOME}/include"
     ln -sfn "/usr/lib/${ARCH_LIB}" "${RDMA_CORE_HOME}/lib"
 
-    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.4.5
+    # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
+    # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
+    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.7.2
     NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
     pushd "${NVSHMEM_LIB_DIR}"
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so

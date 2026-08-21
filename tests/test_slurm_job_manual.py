@@ -18,8 +18,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
-DEFAULT_MEGATRON_COMMIT = "6c344290e54aa58a8be26d6af5ca2d46a3b00948"
-DEFAULT_NVRX_COMMIT = "7f64c5d5ae9408cf75d893d6d03416d4ab5aeaf5"
+DEFAULT_MEGATRON_COMMIT = "3126ff2e3c73c18a52130bf73f51fb9dba252b4c"
+DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
 # A cross-source determinism run materializes one checkout of each dependency
 # per routine.
 _MUTATED_ENV = (
@@ -2189,6 +2189,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
     assert '"nvidia-cudnn-frontend[cutedsl]==1.26.0"' in prepare
+    assert "nvidia-nvshmem-cu13==3.7.2" in prepare
     assert built[-1][2] == {}
     assert validated == ["backfill", "interactive"]
     assert "--partition=interactive" in runs[-1][0]
@@ -3752,6 +3753,15 @@ def test_vcpkg_bootstrap_invalidates_cached_executable() -> None:
     required_lookup = cmake.index("find_program(VCPKG_EXE vcpkg REQUIRED", bootstrap)
 
     assert bootstrap < cache_reset < required_lookup
+
+
+def test_vcpkg_bootstrap_uses_and_restores_canonical_origin() -> None:
+    cmake = (REPO_ROOT / "cmake" / "vcpkg.cmake").read_text()
+
+    assert 'remote add origin "${VCPKG_AUTOCLONE_URL}"' in cmake
+    assert 'fetch --depth 1 origin "${VCPKG_AUTOCLONE_COMMIT}"' in cmake
+    assert 'remote get-url origin' in cmake
+    assert "origin1" not in cmake
 
 
 def test_native_auto_build_passes_vcpkg_root_explicitly() -> None:

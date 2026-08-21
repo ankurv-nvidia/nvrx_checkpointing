@@ -56,14 +56,18 @@
   ckpt_convert_format ............................. None
   ckpt_convert_save ............................... None
   ckpt_convert_update_legacy_dist_opt_format ...... False
+  ckpt_drop_redundant_extra_state ................. False
   ckpt_format ..................................... torch_dist
   ckpt_fully_parallel_load ........................ False
   ckpt_fully_parallel_load_exchange_algo .......... broadcast
+  ckpt_fully_parallel_load_per_rank_objects ....... False
   ckpt_fully_parallel_load_process_group .......... dp
   ckpt_fully_parallel_save ........................ True
   ckpt_fully_parallel_save_deprecated ............. False
   ckpt_fully_parallel_save_process_group .......... dp
   ckpt_load_validate_sharding_integrity ........... True
+  ckpt_pg_tensors_cache_create .................... False
+  ckpt_pg_tensors_cache_path ...................... None
   ckpt_provider ................................... native
   ckpt_step ....................................... None
   classes_fraction ................................ 1.0
@@ -161,6 +165,7 @@
   enable_ft_package ............................... False
   enable_full_sharding_in_hsdp .................... False
   enable_gpt_oss .................................. False
+  enable_mhc_connections .......................... False
   enable_msc ...................................... False
   enable_one_logger ............................... True
   encoder_num_layers .............................. 3
@@ -266,6 +271,9 @@
   ft_num_warmup_iters ............................. 5
   full_validation ................................. False
   fused_residual_rmsnorm .......................... False
+  gdp_cutedsl_kernel .............................. False
+  gdp_num_chunk_states_to_recompute ............... 2
+  gdp_num_householder ............................. 3
   global_batch_size ............................... 2
   glu_linear_offset ............................... 0.0
   gpu_sniff_test_interval ......................... None
@@ -281,6 +289,8 @@
   grpo_iterations ................................. 2
   grpo_kl_beta .................................... 0.001
   grpo_prompts_per_step ........................... 32
+  gtp_remat_opt_in_modules ........................ []
+  gtp_remat_reduce_scatter_with_fp32_accumulation . False
   gtp_weight_remat_size ........................... 1
   head_lr_mult .................................... 1.0
   heterogeneous_layers_config_encoded_json ........ None
@@ -397,6 +407,7 @@
   log_validation_ppl_to_tensorboard ............... False
   log_world_size_to_tensorboard ................... False
   logging_level ................................... 20
+  logit_dtype ..................................... None
   logits_load_decode_threads ...................... 4
   logits_load_dir ................................. None
   logits_load_ignore_errors ....................... False
@@ -446,9 +457,14 @@
   megatron_fsdp_main_grads_dtype .................. None
   megatron_fsdp_main_params_dtype ................. torch.float32
   megatron_fsdp_max_pool_double_buffer ............ False
+  megatron_fsdp_version ........................... 1
   memory_snapshot_path ............................ snapshot.pickle
   merge_file ...................................... None
   metadata_path ................................... None
+  mhc_init_gating_factor .......................... 0.01
+  mhc_num_residual_streams ........................ 4
+  mhc_recompute_layer_num ......................... None
+  mhc_sinkhorn_iterations ......................... 20
   micro_batch_size ................................ 1
   microbatch_group_size_per_vp_stage .............. None
   mid_level_dataset_surplus ....................... 0.005
@@ -482,7 +498,6 @@
   moe_layer_freq .................................. 1
   moe_layer_recompute ............................. False
   moe_mlp_glu_interleave_size ..................... None
-  moe_ncclep_static_shape ......................... False
   moe_ncclep_zero_copy ............................ False
   moe_pad_expert_input_to_capacity ................ False
   moe_pad_experts_for_cuda_graph_inference ........ False
@@ -523,6 +538,7 @@
   moe_token_dispatcher_type ....................... alltoall
   moe_token_drop_policy ........................... probs
   moe_upcycling_granularity ....................... 1
+  moe_use_grouped_tensor .......................... False
   moe_use_upcycling ............................... False
   moe_z_loss_coeff ................................ None
   mrope_section ................................... None
@@ -546,6 +562,7 @@
   muon_scale_mode ................................. spectral
   muon_split_qkv .................................. True
   muon_tp_mode .................................... blockwise
+  muon_use_syrk ................................... False
   mup_attn_scale_power ............................ 1.0
   mup_base_head_dim ............................... None
   mup_base_hidden_size ............................ None
@@ -597,6 +614,9 @@
   optimizer_cpu_offload ........................... False
   optimizer_cuda_graph ............................ False
   optimizer_offload_fraction ...................... 1.0
+  otel_enabled .................................... False
+  otel_service_name ............................... None
+  otel_span_groups ................................ None
   outer_dp_sharding_strategy ...................... no_shard
   output_bert_embeddings .......................... False
   overlap_cpu_optimizer_d2h_h2d ................... False
@@ -668,7 +688,7 @@
   rl_default_temperature .......................... 1.0
   rl_default_top_k ................................ -1
   rl_default_top_p ................................ 0
-  rl_generation_lag ............................... 0
+  rl_generation_lag ............................... None
   rl_importance_sampling_truncation_coef .......... None
   rl_inference_expert_model_parallel_size ......... None
   rl_inference_expert_tensor_model_parallel_size .. None
@@ -678,6 +698,7 @@
   rl_inference_pipeline_model_parallel_size ....... None
   rl_inference_tensor_model_parallel_size ......... None
   rl_kv_cache_management_mode ..................... persist
+  rl_max_inflight_requests ........................ None
   rl_offload_inference_model_weights_when_idle .... False
   rl_offload_optimizer_during_inference ........... False
   rl_partial_rollouts ............................. False
@@ -706,6 +727,7 @@
   save_interval ................................... 250
   save_params_interval ............................ None
   save_retain_interval ............................ 250
+  save_tokenizer_assets ........................... True
   save_tokens_per_expert_interval ................. None
   save_wgrads_interval ............................ None
   seed ............................................ 1234
@@ -728,7 +750,6 @@
   step_batch_size_schedule ........................ None
   straggler_ctrlr_port ............................ 65535
   straggler_minmax_count .......................... 16
-  stream_ckpt_dequant ............................. True
   strict_fsdp_dtensor_load ........................ True
   suggested_communication_unit_size ............... None
   swiglu .......................................... False

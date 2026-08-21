@@ -44,7 +44,7 @@ set -Eeuo pipefail
 : "${MEGATRON_ROOT:?set MEGATRON_ROOT to a Megatron-LM checkout}"
 : "${ENROOT_IMAGE:?set ENROOT_IMAGE to an image containing Megatron-LM dependencies}"
 : "${RUN_TAG:=det-cudagraph-${SLURM_JOB_ID}}"
-: "${MEGATRON_COMMIT:=6c344290e54aa58a8be26d6af5ca2d46a3b00948}"
+: "${MEGATRON_COMMIT:=3126ff2e3c73c18a52130bf73f51fb9dba252b4c}"
 : "${GPUS_PER_NODE:=4}"
 : "${SAVE_INTERVAL:=250}"
 : "${CHECKPOINTS:=3}"
