@@ -2,9 +2,7 @@
 #
 # Flattened to CLI args by the pretrain job: `key: value` -> `--key value`,
 # `key: true` -> `--key`, `key: [a, b]` -> `--key a b`, `key: false`/null drops
-# the flag. A profile (pico.yaml / nano3.yaml / ultra3bf16.yaml /
-# ultra3fp8.yaml / super3.yaml / super3bf16.yaml / super3fp4.yaml, selected by
-# `--config <profile>`) deep-merges over this; the profile pins model size,
+# the flag. A profile (selected `--config <profile>`) deep-merges over this; the profile pins model size,
 # routing top-k, and parallelism. Runtime values are supplied in code, not here:
 # checkpoint provider/format/save-load, save/log/eval/exit intervals and
 # train-iters, the data cache and tensorboard paths, and the default

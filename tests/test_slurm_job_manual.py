@@ -41,6 +41,7 @@ _MUTATED_ENV = (
     "NCCL_IB_TIMEOUT",
     "NVTE_BWD_LAYERNORM_SM_MARGIN",
     "NVTE_FWD_LAYERNORM_SM_MARGIN",
+    "NVTE_FUSED_ATTN",
     "PYTORCH_CUDA_ALLOC_CONF",
     "QUANTIZATION_TYPE_DEBUG",
     "SLURMJOB_OPT_BACKGROUND",
@@ -629,6 +630,8 @@ def test_the_platform_names_its_gpus_per_node(monkeypatch: pytest.MonkeyPatch) -
     assert slurm_job.platform_gpus_per_node() == 4  # noqa: PLR2004
     monkeypatch.setenv("PLATFORM", "h100")
     assert slurm_job.platform_gpus_per_node() == 8  # noqa: PLR2004
+    monkeypatch.setenv("PLATFORM", "gb300")
+    assert slurm_job.platform_gpus_per_node() == 4  # noqa: PLR2004
     monkeypatch.setenv("PLATFORM", "gb200")
     assert _validated_args(slurm_job, ["--config", "pico", "--nodes", "1"]).gpus_per_node == 4  # noqa: PLR2004
     assert _validated_args(
@@ -636,7 +639,7 @@ def test_the_platform_names_its_gpus_per_node(monkeypatch: pytest.MonkeyPatch) -
     ).gpus_per_node == 2  # noqa: PLR2004
 
     # A platform the matrix does not name cannot supply one.
-    monkeypatch.setenv("PLATFORM", "gb300")
+    monkeypatch.setenv("PLATFORM", "unknown")
     assert slurm_job.platform_gpus_per_node() is None
 
 
@@ -650,8 +653,8 @@ def test_an_unset_platform_names_itself_not_the_hostname(monkeypatch: pytest.Mon
     with pytest.raises(RuntimeError, match=r"PLATFORM is unset"):
         slurm_job.PerfReport._platform_bandwidth_baseline(slurm_job.platform_tag())
 
-    monkeypatch.setenv("PLATFORM", "gb300")
-    with pytest.raises(RuntimeError, match=r"Known platforms: devbox, gb200, h100"):
+    monkeypatch.setenv("PLATFORM", "unknown")
+    with pytest.raises(RuntimeError, match=r"Known platforms: devbox, gb200, gb300, h100"):
         slurm_job.PerfReport._platform_bandwidth_baseline(slurm_job.platform_tag())
 
     monkeypatch.setenv("PLATFORM", "gb200")
@@ -2007,6 +2010,30 @@ def test_srun_output_is_redirected(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert "--open-mode=truncate" in cmd
 
 
+@pytest.mark.parametrize("platform", ["gb200", "gb300"])
+def test_lyris_templates_select_the_platform_partition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    monkeypatch.setenv("CLUSTER", "lyris")
+    monkeypatch.setenv("PLATFORM", platform)
+
+    values = slurm_job._slurm_values(
+        1, 4, 30, "partition-test", str(tmp_path / "image.sqsh"), "", 4, 4,
+    )
+    values.update(
+        image_base=str(tmp_path / "base.sqsh"),
+        image_out=str(tmp_path / "output.sqsh"),
+    )
+
+    for name in ("srun.tmpl", "enroot_import.tmpl", "image_prep.tmpl"):
+        command = slurm_job.build_cmd_from_template(name, values, [])
+        assert f"--partition={platform}" in command
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -2207,6 +2234,7 @@ def test_slurm_job_consumers_import() -> None:
 def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
 
+    assert 'export PLATFORM="${PLATFORM_OVERRIDE:-${PLATFORM:-${CLUSTER}}}"' in config[".ci_base"]["before_script"]
     assert config[".slurm_job"]["allow_failure"] == {"exit_codes": [3]}
     assert config[".slurm_job"]["variables"] == {
         "SLURMJOB_OPT_WORK_DIR": "${CI_PROJECT_DIR}/ci/ci-runs",
@@ -2245,6 +2273,11 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
 
 
 def test_generated_pipeline_suites_and_node_tags() -> None:
+    matrix = yaml.safe_load((REPO_ROOT / "ci/jobs.json").read_text())
+    assert all("jobs" in platform for platform in matrix["platforms"])
+    platform_jobs = {platform["name"]: platform["jobs"] for platform in matrix["platforms"]}
+    assert platform_jobs["gb300"] == []
+
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
     workloads = {
         name: job for name, job in config.items()
@@ -2254,12 +2287,46 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     for name, job in workloads.items():
         args = shlex.split(job["variables"]["JOB_ARGS"])
         nodes = int(args[args.index("--nodes") + 1]) if "--nodes" in args else 1
-        platform = next(tag for tag in ("devbox", "gb200", "h100") if f":{tag}:" in f":{name}:")
-        assert job["tags"] == [platform, f"{nodes}n"]
+        platform = next(tag for tag in ("devbox", "gb200", "gb300", "h100") if f":{tag}:" in f":{name}:")
+        expected_tags = [platform, f"{nodes}n"]
+        assert job["tags"] == expected_tags
 
     assert all("pico_2x" not in name for name in workloads)
-    assert all("nano4" not in name for name in workloads)
+    assert all(":gb300:" not in name or ":nano4_32x4" in name for name in workloads)
     assert ".run_ckpt_stress" not in config
+
+    nano4 = {name: job for name, job in workloads.items() if ":gb300:" in name}
+    assert config[".runner_gb300"]["tags"] == ["gb300"]
+    assert config[".runner_gb300"]["variables"] == {
+        "PLATFORM_OVERRIDE": "gb300",
+        "GPUS_PER_NODE": "4",
+        "WHEEL_ARCH": "aarch64",
+        "NVTE_FUSED_ATTN": "0",
+    }
+    assert set(nano4) == {
+        "[DETR]:gb300:native:nano4_32x4",
+        "[PERF]:gb300:native:nano4_32x4",
+        "[DETR]:gb300:nvrx:nano4_32x4",
+        "[PERF]:gb300:nvrx:nano4_32x4",
+    }
+    for name, job in nano4.items():
+        expected_suite = ".nvrx_pipeline" if ":nvrx:" in name else ".large_scale_pipeline"
+        assert job["extends"] == [".slurm_job", ".runner_gb300", expected_suite]
+        args = shlex.split(job["variables"]["JOB_ARGS"])
+        assert args[:4] == ["--nodes", "32", "--config", "nano4"]
+        assert "--megatron-commit" not in args
+        assert "--flavor" in args
+        assert "async" in args[args.index("--flavor") + 1]
+        segment_index = args.index("--job-array-segment")
+        assert args[segment_index + 1] == "8"
+        run_indexes = [index for index, arg in enumerate(args) if arg.startswith("--run=")]
+        assert not run_indexes or segment_index < min(run_indexes)
+        if "[PERF]" in name:
+            interval_index = args.index("--checkpoint-interval")
+            assert args[interval_index + 1] == "125"
+        else:
+            assert "--lr-decay-style" not in args
+            assert "--lr-warmup-samples" not in args
 
     nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
     assert any(":super3fp4_16x4" in name for name in nvrx)
@@ -2313,13 +2380,29 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     pico_detr_args = shlex.split(config["[DETR]:gb200:native:pico_1x4"]["variables"]["JOB_ARGS"])
     assert "--checkpoint-interval" not in pico_detr_args
     nano_valgrind_args = shlex.split(config["[DETR]:gb200:native:nano3_8x4:vg"]["variables"]["JOB_ARGS"])
-    assert nano_valgrind_args[-2:] == ["--checkpoint-interval", "1"]
+    interval_index = nano_valgrind_args.index("--checkpoint-interval")
+    assert nano_valgrind_args[interval_index + 1] == "1"
+    assert interval_index < nano_valgrind_args.index("--flavor")
     assert "--checkpoint-interval" not in shlex.split(
         config["gb200:valgrind:pico_1x4"]["variables"]["JOB_ARGS"],
     )
     assert "--checkpoint-interval" not in shlex.split(
         config["[DETR]:gb200:native:nano3_8x4"]["variables"]["JOB_ARGS"],
     )
+
+
+def test_generated_nano4_determinism_options_are_common() -> None:
+    slurm_job = _load_slurm_job()
+    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
+    argv = shlex.split(config["[DETR]:gb300:nvrx:nano4_32x4"]["variables"]["JOB_ARGS"])
+
+    common, runs = slurm_job._split_run_blocks(argv)
+
+    assert common[common.index("--muon-fp32-matmul-prec") + 1] == "high"
+    assert common[common.index("--checkpoint-interval") + 1] == "1"
+    assert "--drop-config-option" not in common
+    assert "--no-moe-permute-fusion" not in common
+    assert all("--muon-fp32-matmul-prec" not in run.argv for run in runs)
 
 
 def test_canceled_ci_job_cancels_only_its_recorded_slurm_job(tmp_path: Path) -> None:
@@ -2751,6 +2834,10 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:nvrx:super3fp4_16x4" in bundles["nvrx"]["dependencies"]
+    assert "[DETR]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
+    assert "[PERF]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
+    assert "[DETR]:gb300:native:nano4_32x4" in bundles["large-scale"]["dependencies"]
+    assert "[PERF]:gb300:native:nano4_32x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
 
 
@@ -3876,12 +3963,14 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "attn",
         "moe_router",
         "--moe-router-fusion",
+        "--moe-permute-fusion",
         "--overlap-grad-reduce",
         "--overlap-param-gather",
     ]
     deterministic_env = {}
     slurm_job.FlavorSelection(["detr"]).transform(deterministic_opts, deterministic_env)
     assert deterministic_opts == [
+        "--moe-permute-fusion",
         "--attention-backend",
         "unfused",
         "--moe-router-dtype",
@@ -3889,6 +3978,7 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "--deterministic-mode",
     ]
     assert deterministic_env["PYTHONHASHSEED"] == "0"
+    assert deterministic_env["FLA_TILELANG"] == "0"
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
     mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
     slurm_job.FlavorSelection(["detr"]).transform(mamba_only_opts, {})
@@ -3979,6 +4069,54 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
     assert mtp == ["*E", "*E"]
 
 
+def test_nano4_matches_the_30b_gdp_reference_architecture() -> None:
+    slurm_job = _load_slurm_job()
+    nano4 = slurm_job._model_config("nano4")
+    expected = {
+        "spec": [
+            "megatron.core.models.hybrid.hybrid_layer_specs",
+            "gated_delta_product_stack_spec",
+        ],
+        "hidden-size": 2688,
+        "ffn-hidden-size": 1856,
+        "num-attention-heads": 32,
+        "num-query-groups": 2,
+        "mamba-num-heads": 16,
+        "mamba-num-groups": 16,
+        "mamba-head-dim": 64,
+        "mamba-state-dim": 128,
+        "num-experts": 512,
+        "moe-latent-size": 672,
+        "moe-router-topk": 22,
+        "moe-ffn-hidden-size": 1856,
+        "moe-shared-expert-intermediate-size": 3712,
+        "tensor-model-parallel-size": 2,
+        "expert-model-parallel-size": 32,
+        "global-batch-size": 768,
+        "optimizer": "dist_muon",
+        "muon-num-ns-steps": 16,
+        "muon-coefficient-type": "polar_express",
+        "muon-scalar-optimizer": "lion",
+        "seq-length": 8192,
+        "max-position-embeddings": 8192,
+        "vocab-size": 204800,
+        "padded-vocab-size": 204800,
+        "mtp-use-repeated-layer": True,
+        "mtp-loss-scaling-factor": "0.1",
+    }
+
+    assert {key: nano4[key] for key in expected} == expected
+    assert nano4["first-last-layers-bf16"] is False
+    assert nano4["moe-permute-fusion"] is False
+    assert nano4["no-gradient-accumulation-fusion"] is False
+    assert nano4["cuda-graph-impl"] is None
+    assert nano4["cuda-graph-modules"] is None
+    assert nano4["mock-data"] is True
+    main, *mtp = nano4["hybrid-layer-pattern"].split("/")
+    assert len(main) == 52  # noqa: PLR2004
+    assert mtp == ["*E", "*E"]
+
+
 def test_super3_profiles_share_reference_architecture() -> None:
     slurm_job = _load_slurm_job()
     common = slurm_job._model_config("super3")
@@ -4056,6 +4194,10 @@ def test_cuda_graph_selection_is_profile_scoped() -> None:
     nano3 = slurm_job._model_config("nano3")
     assert nano3["cuda-graph-impl"] == "local"
     assert nano3["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+
+    nano4 = slurm_job._model_config("nano4")
+    assert nano4["cuda-graph-impl"] is None
+    assert nano4["cuda-graph-modules"] is None
 
     ultra3fp8 = slurm_job._model_config("ultra3fp8")
     assert ultra3fp8["cuda-graph-impl"] == "local"

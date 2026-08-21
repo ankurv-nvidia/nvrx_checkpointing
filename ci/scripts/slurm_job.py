@@ -721,6 +721,9 @@ def _slurm_values(
         "job_name": job_name,
         "image": image,
         "container_env": container_env,
+        # Lyris names its hardware partitions after the platform. Other
+        # cluster templates do not consume this value.
+        "partition": platform_tag(),
         "gpus_per_node": gpus_per_node,
         "total_gpus": total_gpus,
         "home": Path.home(),
@@ -1935,6 +1938,7 @@ class DeterministicFlavor(Flavor):
             CUBLAS_WORKSPACE_CONFIG=":4096:8",
             NVTE_ALLOW_NONDETERMINISTIC_ALGO="0",
             MAMBA_DETERMINISTIC="1",
+            FLA_TILELANG="0",
         )
 
 
@@ -3593,6 +3597,9 @@ _ENV_SCOPES = {
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",
     "PYTHONPATH": "rpw",
+    # Set by the GB300 runner for the Nano4 production recipe. Keep it scoped
+    # to the training worker instead of changing every profile's defaults.
+    "NVTE_FUSED_ATTN": "rw",
     "CI_API_V4_URL": "rp", "CI_COMMIT_SHA": "rp", "CI_PROJECT_ID": "rp", "WHEEL_ARCH": "rp", "CI_JOB_TOKEN": "p",
     "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",

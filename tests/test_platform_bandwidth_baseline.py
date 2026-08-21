@@ -13,9 +13,13 @@ def test_each_platform_has_one_bandwidth_floor() -> None:
     # The floors themselves move with the hardware and are recorded in
     # ci/baselines/platform_bw_mbps.yaml; what this asserts is that every
     # platform has exactly one, and that it is a usable number.
-    floors = {name: PerfReport._platform_bandwidth_baseline(name) for name in ("devbox", "h100", "gb200")}
+    floors = {
+        name: PerfReport._platform_bandwidth_baseline(name)
+        for name in ("devbox", "h100", "gb200", "gb300")
+    }
     assert all(isinstance(floor, int) and floor > 0 for floor in floors.values())
     assert floors["devbox"] < floors["h100"] < floors["gb200"]
+    assert floors["gb300"] >= floors["gb200"]
 
 
 def test_native_bandwidth_is_reported_as_integer_mbps() -> None:

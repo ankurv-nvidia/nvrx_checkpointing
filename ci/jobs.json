@@ -10,6 +10,31 @@
           true
         ]
       ],
+      "jobs": [
+        [
+          "native",
+          "detr"
+        ],
+        [
+          "native",
+          "perf"
+        ],
+        [
+          "nvrx",
+          "detr"
+        ],
+        [
+          "native",
+          [
+            "detr",
+            "vg"
+          ]
+        ],
+        [
+          "nvrx",
+          "perf"
+        ]
+      ],
       "multinode": [
         {
           "key": "nano3",
@@ -133,10 +158,81 @@
       ]
     },
     {
+      "name": "gb300",
+      "gpus": "1x4",
+      "has_image": true,
+      "native_wheel_needs": [
+        [
+          "wheel:aarch64",
+          true
+        ]
+      ],
+      "jobs": [],
+      "multinode": [
+        {
+          "key": "nano4",
+          "config": "nano4",
+          "nodes": 32,
+          "scale": "32x4",
+          "group": "32node-nano4",
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 125,
+          "job_array_segment": 8,
+          "flavor_args": {
+            "detr": "--muon-fp32-matmul-prec high --checkpoint-interval 1"
+          },
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ],
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "nvrx",
+              "detr"
+            ],
+            [
+              "nvrx",
+              "perf"
+            ]
+          ]
+        }
+      ]
+    },
+    {
       "name": "h100",
       "gpus": "1x8",
       "has_image": true,
       "pipeline_suite": "main-branch-runs",
+      "jobs": [
+        [
+          "native",
+          "detr"
+        ],
+        [
+          "native",
+          "perf"
+        ],
+        [
+          "nvrx",
+          "detr"
+        ],
+        [
+          "native",
+          [
+            "detr",
+            "vg"
+          ]
+        ],
+        [
+          "nvrx",
+          "perf"
+        ]
+      ],
       "multinode": []
     }
   ]

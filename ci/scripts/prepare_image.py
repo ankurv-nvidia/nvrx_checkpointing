@@ -29,6 +29,7 @@ from slurm_job import (
     build_cmd_from_template,
     ensure_vcpkg_root,
     image_path,
+    platform_tag,
     runner_gpus_per_node,
 )
 
@@ -84,7 +85,9 @@ def _valid_partition(cmd: list[str]) -> str:
     info = subprocess.run(["sinfo", "--noheader", "--format=%P"], capture_output=True, check=True, text=True)  # noqa: S607
     visible = [line.strip().rstrip("*") for line in info.stdout.splitlines()]
     preferred = [partition for partition in ("interactive", "batch_short", "batch", "compute") if partition in visible]
-    candidates = [*preferred, *configured, *visible]
+    # Honor a platform-specific template partition first. Fall back to the
+    # conventional short queues only when that partition rejects the account.
+    candidates = [*configured, *preferred, *visible]
     sys.stderr.write(f"[prepare-image] candidate partitions: {', '.join(dict.fromkeys(filter(None, candidates)))}\n")
     resource_args = [
         token
@@ -144,6 +147,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         "root": container_root.as_posix(),
         "image_base": base_image.as_posix(),
         "image_out": local.as_posix(),
+        "partition": platform_tag(),
         "gpus_per_node": gpus_per_node,
     }
 

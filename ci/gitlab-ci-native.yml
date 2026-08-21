@@ -14,6 +14,7 @@ stages:
   - valgrind
   - 16node-super3bf16
   - 16node-super3fp4
+  - 32node-nano4
   - 64node-ultra3bf16
   - 64node-ultra3fp8
   - 8node-nano3
@@ -66,10 +67,12 @@ variables:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
     # Load runner config; export the platform tag (baseline namespace) and cluster (selects
-    # srun templates), with fallbacks for local runs.
+    # srun templates), with fallbacks for local runs. A job-scoped override lets one
+    # shared cluster runner target a different hardware partition without its sourced
+    # PLATFORM value winning over the CI matrix.
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
     - export CLUSTER="${CLUSTER:-devbox}"
-    - export PLATFORM="${PLATFORM:-${CLUSTER}}"
+    - export PLATFORM="${PLATFORM_OVERRIDE:-${PLATFORM:-${CLUSTER}}}"
     - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
 
 # Per-runner tag, GPU topology, and CPU arch. Platform and cluster are configured per
@@ -81,6 +84,16 @@ variables:
   variables:
     GPUS_PER_NODE: "4"
     WHEEL_ARCH: aarch64
+
+.runner_gb300:
+  tags: [gb300]
+  variables:
+    PLATFORM_OVERRIDE: gb300
+    GPUS_PER_NODE: "4"
+    WHEEL_ARCH: aarch64
+    # The Nano4 reference explicitly disables cuDNN fused attention while
+    # selecting Megatron's flash attention backend.
+    NVTE_FUSED_ATTN: "0"
 
 .runner_h100:
   tags: [h100]
@@ -700,6 +713,40 @@ wheel-publish:pypi:
   variables:
     JOB_ARGS: "--nodes 16 --config super3fp4 --flavor perf+async+nvrx --checkpoint-interval 125"
 
+# 32node-nano4
+
+"[DETR]:gb300:native:nano4_32x4":
+  extends: [.slurm_job, .runner_gb300, .large_scale_pipeline]
+  stage: 32node-nano4
+  timeout: 1d
+  tags: [gb300, 32n]
+  variables:
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --muon-fp32-matmul-prec high --checkpoint-interval 1 --flavor detr+async --run=ref:nvrx --run=cmp:native"
+
+"[PERF]:gb300:native:nano4_32x4":
+  extends: [.slurm_job, .runner_gb300, .large_scale_pipeline]
+  stage: 32node-nano4
+  timeout: 1d
+  tags: [gb300, 32n]
+  variables:
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --flavor perf+async+native --checkpoint-interval 125"
+
+"[DETR]:gb300:nvrx:nano4_32x4":
+  extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
+  stage: 32node-nano4
+  timeout: 1d
+  tags: [gb300, 32n]
+  variables:
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --muon-fp32-matmul-prec high --checkpoint-interval 1 --flavor detr+async --run=ref:nvrx --run=cmp:nvrx"
+
+"[PERF]:gb300:nvrx:nano4_32x4":
+  extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
+  stage: 32node-nano4
+  timeout: 1d
+  tags: [gb300, 32n]
+  variables:
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --flavor perf+async+nvrx --checkpoint-interval 125"
+
 # 64node-ultra3bf16
 
 "[PERF]:gb200:native:ultra3bf16_64x4":
@@ -782,7 +829,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --flavor detr+vg+native --checkpoint-interval 1"
+    JOB_ARGS: "--nodes 8 --config nano3 --checkpoint-interval 1 --flavor detr+vg+native"
 
 # baseline artifacts
 
@@ -809,6 +856,8 @@ wheel-publish:pypi:
     - "[PERF]:gb200:nvrx:nano3_8x4"
     - "[PERF]:gb200:nvrx:super3fp4_16x4"
     - "[PERF]:gb200:nvrx:ultra3fp8_64x4"
+    - "[DETR]:gb300:nvrx:nano4_32x4"
+    - "[PERF]:gb300:nvrx:nano4_32x4"
   rules:
     - if: '$PIPELINE_SUITE == "nvrx"'
       when: always
@@ -824,6 +873,8 @@ wheel-publish:pypi:
     - "[PERF]:gb200:native:ultra3bf16_64x4"
     - "[DETR]:gb200:native:ultra3fp8_64x4"
     - "[PERF]:gb200:native:ultra3fp8_64x4"
+    - "[DETR]:gb300:native:nano4_32x4"
+    - "[PERF]:gb300:native:nano4_32x4"
   rules:
     - if: '$PIPELINE_SUITE == "large-scale"'
       when: always

@@ -54,10 +54,12 @@ variables:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
     # Load runner config; export the platform tag (baseline namespace) and cluster (selects
-    # srun templates), with fallbacks for local runs.
+    # srun templates), with fallbacks for local runs. A job-scoped override lets one
+    # shared cluster runner target a different hardware partition without its sourced
+    # PLATFORM value winning over the CI matrix.
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
     - export CLUSTER="${CLUSTER:-devbox}"
-    - export PLATFORM="${PLATFORM:-${CLUSTER}}"
+    - export PLATFORM="${PLATFORM_OVERRIDE:-${PLATFORM:-${CLUSTER}}}"
     - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
 
 # Per-runner tag, GPU topology, and CPU arch. Platform and cluster are configured per
@@ -69,6 +71,16 @@ variables:
   variables:
     GPUS_PER_NODE: "4"
     WHEEL_ARCH: aarch64
+
+.runner_gb300:
+  tags: [gb300]
+  variables:
+    PLATFORM_OVERRIDE: gb300
+    GPUS_PER_NODE: "4"
+    WHEEL_ARCH: aarch64
+    # The Nano4 reference explicitly disables cuDNN fused attention while
+    # selecting Megatron's flash attention backend.
+    NVTE_FUSED_ATTN: "0"
 
 .runner_h100:
   tags: [h100]

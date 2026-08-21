@@ -78,6 +78,7 @@ GROUPS = (
     "valgrind",
     "16node-super3bf16",
     "16node-super3fp4",
+    "32node-nano4",
     "64node-ultra3bf16",
     "64node-ultra3fp8",
     "8node-nano3",
@@ -147,21 +148,22 @@ def _emit_multinode(
             )
             flavor_arg_table = entry.get("flavor_args", {})
             flavor_args = flavor_arg_table.get("+".join(flavors), flavor_arg_table.get(flavors[0], ""))
+            # Common options must precede the first run-scoped option.
+            # A zero segment keeps the classic single-allocation wide launch.
+            segment = entry.get("job_array_segment")
             args = " ".join(
                 part
                 for part in (
                     f"--nodes {entry['nodes']} --config {entry['config']}",
-                    flavor_flags,
+                    f"--megatron-commit {entry['megatron_commit']}" if entry.get("megatron_commit") else "",
+                    f"--job-array-segment {segment}" if segment is not None else "",
                     flavor_args,
+                    flavor_flags,
                 )
                 if part
             )
             if flavors[0] == "perf" and (interval := entry.get("checkpoint_interval")):
                 args += f" --checkpoint-interval {interval}"
-            # Per-entry job-array override: NVLink-domain nodes per array task;
-            # 0 keeps the classic single-allocation launch for a wide job.
-            if (segment := entry.get("job_array_segment")) is not None:
-                args += f" --job-array-segment {segment}"
             g = entry.get("group") or _pretrain_group(job, flavors[0])
             provider = _provider(job)
             suite = (
@@ -177,10 +179,8 @@ def _emit_multinode(
                 [".slurm_job", runner],
                 pipeline_suite=suite,
                 job_args=args,
-                needs=p.get("native_wheel_needs", ())
-                if suite is None and provider == "native" and "vg" not in flavors
-                else (),
-                tags=(p["name"], f"{entry['nodes']}n"),
+                needs=p.get("native_wheel_needs", ()) if suite is None and provider == "native" and "vg" not in flavors else (),
+                tags=(p["name"], f"{entry['nodes']}n", *entry.get("runner_tags", ())),
                 timeout=timeout,
             )
 
@@ -192,56 +192,37 @@ def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str,
     if not p["has_image"]:
         return
 
-    standard = [
-        ("native", "detr"),
-        ("native", "perf"),
-        ("nvrx", "detr"),
-    ]
-    for job, flavor in standard:
-        jname = f"{FLAVOR_LABEL.get(flavor, flavor)}:{name}:{_provider(job)}:pico_{gpus}"
-        args = (
-            f"--config pico --flavor {flavor} --run=ref:nvrx --run=cmp:{job}"
-            if flavor == "detr"
-            else f"--config pico --flavor {flavor}+{job}"
-        )
-        g = _pretrain_group(job, flavor)
+    for job, flavor in p["jobs"]:
+        flavors = [flavor] if isinstance(flavor, str) else list(flavor)
         provider = _provider(job)
+        if "vg" in flavors:
+            jname = f"{name}:valgrind:pico_{gpus}"
+        else:
+            modifiers = "".join(f":{modifier}" for modifier in flavors[1:])
+            jname = f"{FLAVOR_LABEL.get(flavors[0], flavors[0])}:{name}:{provider}:pico_{gpus}{modifiers}"
+        common = "+".join(flavors)
+        args = (
+            f"--config pico --flavor {common} --run=ref:nvrx --run=cmp:{provider}"
+            if flavors[0] == "detr" and "vg" not in flavors
+            else f"--config pico --flavor {common}+{provider}"
+        )
+        group = "valgrind" if "vg" in flavors else _pretrain_group(job, flavors[0])
+        suite = (
+            "main-branch-runs"
+            if "vg" in flavors
+            else p.get("pipeline_suite") or ("nvrx" if provider == "nvrx" else None)
+        )
         _add_job(
             groups,
             bundle_jobs,
-            g,
+            group,
             jname,
             [".slurm_job", runner],
-            pipeline_suite=p.get("pipeline_suite") or ("nvrx" if provider == "nvrx" else None),
+            pipeline_suite=suite,
             job_args=args,
-            needs=p.get("native_wheel_needs", ()) if provider == "native" else (),
+            needs=p.get("native_wheel_needs", ()) if suite is None and provider == "native" else (),
             tags=(name, "1n"),
         )
-
-    # Valgrind is a correctness gate, not a performance baseline.
-    vg = f"{name}:valgrind:pico_{gpus}"
-    _add_job(
-        groups,
-        bundle_jobs,
-        "valgrind",
-        vg,
-        [".slurm_job", runner],
-        job_args="--config pico --flavor detr+vg+native",
-        tags=(name, "1n"),
-    )
-
-    # nvrx perf smoke; no baseline (emits checkpoint times, not parseable bw metrics).
-    nvrx_perf = f"{FLAVOR_LABEL['perf']}:{name}:nvrx:pico_{gpus}"
-    _add_job(
-        groups,
-        bundle_jobs,
-        "nvrx-perf",
-        nvrx_perf,
-        [".slurm_job", runner],
-        pipeline_suite=p.get("pipeline_suite") or "nvrx",
-        job_args="--config pico --flavor perf+nvrx",
-        tags=(name, "1n"),
-    )
 
     _emit_multinode(p, runner, groups, bundle_jobs)
 
@@ -259,7 +240,7 @@ def _baseline_bundle(suite: str, dependencies: list[str]) -> str:
         ]
     else:
         lines += [
-            f'    - if: \'$PIPELINE_SUITE == "{suite}"\'',
+            f"    - if: '$PIPELINE_SUITE == \"{suite}\"'",
             "      when: always",
             "    - when: never",
         ]
@@ -269,17 +250,17 @@ def _baseline_bundle(suite: str, dependencies: list[str]) -> str:
 def _validate_platforms() -> None:
     """Raise SystemExit for known invalid platform-matrix configurations."""
     for p in PLATFORMS:
+        if "jobs" not in p:
+            raise SystemExit(f"{p['name']}: jobs must explicitly list the platform's single-node jobs")
         for entry in p.get("multinode", []):
             if entry.get("config") == "pico":
                 raise SystemExit(
-                    f"{p['name']}: pico must run on exactly 1 node; "
-                    f"entry {entry['key']!r} has nodes={entry.get('nodes')}",
+                    f"{p['name']}: pico must run on exactly 1 node; entry {entry['key']!r} has nodes={entry.get('nodes')}",
                 )
     for baseline in sorted(BASELINES_DIR.glob("*.yaml")):
         if _MULTINODE_PICO_BASELINE_RE.search(baseline.stem):
             raise SystemExit(
-                f"obsolete multi-node pico baseline: {baseline.name}; "
-                f"remove it or rename to 1-node form",
+                f"obsolete multi-node pico baseline: {baseline.name}; remove it or rename to 1-node form",
             )
 
 
@@ -291,16 +272,13 @@ def _render() -> str:
             raise SystemExit(f"{TEMPLATE_CI}: expected exactly one {marker!r}")
 
     groups: dict[str, list[str]] = {group: [] for group in GROUPS}
-    bundle_jobs: dict[str, list[str]] = {
-        suite: [] for suite in ("default", "nvrx", "large-scale", "main-branch-runs")
-    }
+    bundle_jobs: dict[str, list[str]] = {suite: [] for suite in ("default", "nvrx", "large-scale", "main-branch-runs")}
     for platform in PLATFORMS:
         _emit_platform(platform, groups, bundle_jobs)
 
     sections = [f"# {group}\n\n" + "\n\n".join(groups[group]) for group in GROUPS if groups[group]]
     sections.append(
-        "# baseline artifacts\n\n"
-        + "\n\n".join(_baseline_bundle(suite, dependencies) for suite, dependencies in bundle_jobs.items()),
+        "# baseline artifacts\n\n" + "\n\n".join(_baseline_bundle(suite, dependencies) for suite, dependencies in bundle_jobs.items()),
     )
     jobs = "\n\n".join(sections)
     stages = "\n".join([*(f"  - {group}" for group in GROUPS if group in OPTIONAL_GROUPS), "  - baseline-artifacts"])
