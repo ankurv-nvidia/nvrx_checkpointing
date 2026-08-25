@@ -212,6 +212,8 @@ def save_checkpoint(  # noqa: PLR0913
     num_floating_point_operations_so_far: int,
     train_data_iterator=None,  # noqa: ANN001
 ) -> None:
+    if register_state_dict.root is not None:
+        register_state_dict.root.startedAt = time.time_ns()
     try:
         # The preceding call returned after transferring its snapshot to the daemon. Join its
         # durability request before reading any live model or optimizer state for this snapshot.

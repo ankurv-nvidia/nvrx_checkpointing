@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "messages.h"
 #include "server.h"
 #include "service_client.h"
@@ -252,6 +253,7 @@ try
     fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon started pid={} sid={} ppid={}\n", ::getpid(), ::getsid(0), ::getppid());
     RunServer();
     fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon exiting normally pid={}\n", ::getpid());
+    checkpoint::logging::Shutdown();
     return 0;
 } catch (checkpoint::ipc::ErrorAlreadyRunning const& e)
 {
@@ -265,12 +267,14 @@ try
         return 1;
     }
     fmt::print(stdout, "READY\n");
-    std::fflush(stdout);
     std::error_code ec;
     std::filesystem::remove(GetLogPath(), ec);
+    checkpoint::logging::Shutdown();
+
     return 0;
 } catch (std::exception const& e)
 {
     fmt::print(stderr, "[native_ckpt:svr][ERROR] Fatal error: {}\n", e.what());
+    checkpoint::logging::Shutdown();
     return 1;
 }

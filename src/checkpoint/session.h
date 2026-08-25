@@ -45,6 +45,7 @@ struct Session
         std::shared_ptr<StateTree>     localRegistry;
         ByteStorage                    tensorStorage;
         checkpoint::distcp::BlobsByFqn blobs;
+        std::chrono::nanoseconds       startedAt{};
 
         uint64_t writtenTensorRangeBegin{0};
         uint64_t writtenTensorRangeEnd{0};
@@ -57,7 +58,7 @@ struct Session
         std::string                 name;
         std::filesystem::path       path;
 
-        std::chrono::high_resolution_clock::time_point activatedAt = std::chrono::high_resolution_clock::now();
+        std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
         StateTree::SnapshotBlobs snapshotBlobs;
 
@@ -71,11 +72,11 @@ struct Session
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
     };
 
-    Server* const                                  server;
-    checkpoint::ipc::SessionId const               sessionId{checkpoint::ipc::SessionId::Invalid};
-    RankTopology const                             topo;
-    std::filesystem::path const                    workDir;
-    std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+    Server* const                         server;
+    checkpoint::ipc::SessionId const      sessionId{checkpoint::ipc::SessionId::Invalid};
+    RankTopology const                    topo;
+    std::filesystem::path const           workDir;
+    std::chrono::system_clock::time_point start = std::chrono::system_clock::now();
 
     uint32_t           numActiveSnapshots{0};
     mutable std::mutex mutex;

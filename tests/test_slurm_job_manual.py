@@ -88,6 +88,22 @@ yaml.SafeLoader.add_constructor("!reference", lambda loader, node: loader.constr
 _SCRATCH_RESULTS = Path(tempfile.mkdtemp(prefix="slurm-job-tests-"))
 
 
+def _perf_finished(rank: int = 0, bandwidth: float = 150000, write_us: int = 10, written_bytes: int = 100, snapshot: int = 1) -> str:
+    return (
+        f"[native_ckpt:svr][0][PERF] Rank={rank} Finished bw_mbps={bandwidth:.2f} "
+        f"| Time(us):  wr_tnsr_us={write_us}us snapshot_us=11us total_us=12us "
+        f"| Count: num_tensors=2 total_d2h=2 | Bytes: total_written_bytes={written_bytes} "
+        f"avg_d2h_rq=50 avg_tnsr=50 snapshot={snapshot}"
+    )
+
+
+def _perf_span(rank: int = 0, bandwidth: float = 150000, write_us: int = 10, written_bytes: int = 100, snapshot: int = 1) -> str:
+    return (
+        f"[native_ckpt:svr][0][PERF] Rank={rank} Begin span=ckpt.save started_at_ns=123456 snapshot={snapshot}\n"
+        f"{_perf_finished(rank, bandwidth, write_us, written_bytes, snapshot)}\n"
+    )
+
+
 def _load_slurm_job():
     sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location("slurm_job_manual_test", SCRIPTS_DIR / "slurm_job.py")
@@ -980,12 +996,18 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     args = _args(tmp_path, repeat=repeat)
     args.flavors = slurm_job.FlavorSelection(["perf", "native"])
     calls = []
+    child_envs = []
+
+    def phase_command(_cfg: str, _args: object, _provider: str, phase: int, cycle: int = 0, **_kwargs: object):
+        env = {}
+        child_envs.append(env)
+        calls.append((phase, cycle))
+        return ["true"], env
+
     monkeypatch.setattr(
         slurm_job,
         "_phase_command",
-        lambda _cfg, _args, _provider, phase, cycle=0, **_kwargs: (
-            calls.append((phase, cycle)) or (["true"], {})
-        ),
+        phase_command,
     )
     monkeypatch.setattr(slurm_job, "wait_for_file", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(slurm_job.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
@@ -993,6 +1015,10 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     slurm_job._run_routine("nano3_4x4", args, "nvrx")
 
     assert calls == expected
+    expected_tags = ["phase1", *(f"cycle{cycle + 1}" for _phase, cycle in expected[1:])]
+    assert [Path(env["NATIVE_CKPT_SERVER_LOG"]).name for env in child_envs] == [
+        f"checkpoint_server.{tag}.%h.%p.log" for tag in expected_tags
+    ]
 
 
 def test_launcher_restart_resumes_latest_complete_checkpoint(
@@ -3057,9 +3083,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "0: -------------------- end of arguments ---------------------\n",
     )
     # The daemon carries the perf counters, in its own per-host log for the measured cycle.
-    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
-        "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100\n",
-    )
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
     baseline = '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}'
     # The epilog compares the options the run trained on as well as its
     # numbers, so record the ones this log carries.
@@ -3126,9 +3150,7 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
         "0:   micro_batch_size ................................ 1\n"
         "0: -------------------- end of arguments ---------------------\n",
     )
-    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
-        "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=150000 wr_tnsr_us=10 total_written_bytes=100\n",
-    )
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
     monkeypatch.setenv("PLATFORM", "devbox")
     recorded = tmp_path / "recorded"
     recorded.mkdir()
@@ -3186,6 +3208,38 @@ def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
     slurm_job._write_performance_baseline(args, log)
 
     assert not (log.parent / "baselines").exists()
+
+
+def test_native_perf_refuses_an_incomplete_baseline_candidate(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavor=["perf", "native"],
+        flavors=slurm_job.FlavorSelection(["perf", "native"]),
+    )
+    _cfg, _flavor, stem = slurm_job._identity(args)
+    log = tmp_path / "logs" / f"{stem}.log"
+    log.parent.mkdir()
+    log.write_text("")
+    log.with_name(f"{stem}_report.json").write_text(
+        '{"ckpt_save_markers_valid":false,"metrics":{"gpu_peak_bytes":{"mean":100}}}',
+    )
+
+    with caplog.at_level("WARNING"):
+        slurm_job._write_performance_baseline(args, log)
+
+    assert not list((log.parent / "baselines").glob("*.yaml"))
+    assert "refusing to write an incomplete baseline candidate" in caplog.text
+    assert "required metrics were absent" in caplog.text
 
 
 def test_batch_epilog_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3446,7 +3500,7 @@ def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.Monk
     builtin_zip = zip
     monkeypatch.setattr(slurm_job, "zip", builtin_zip, raising=False)
     text = "\n".join(
-        f"[native_ckpt:svr][75d0#0][PERF] Rank={rank} Finished bw_mbps={bandwidth} wr_tnsr_us=10 total_written_bytes=100"
+        _perf_finished(rank, bandwidth)
         for rank, bandwidth in enumerate((100, 100, 80, 80))
     )
 
@@ -3454,6 +3508,67 @@ def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.Monk
 
     assert metrics["bw_mbps"]["median"] == 90  # noqa: PLR2004
     assert metrics["bw_socket_imbalance"]["mean"] == 1.25  # noqa: PLR2004
+
+
+def test_perf_markers_require_the_complete_schema_and_matching_span_ids(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+
+    assert slurm_job.PerfReport._validate_daemon_markers(_perf_span(rank=2, snapshot=7))
+    for suffix in ("us", "µs"):
+        one_second = _perf_span(write_us=1_000_000).replace("1000000us", f"1000000{suffix}")
+        assert slurm_job.PerfReport._validate_daemon_markers(one_second)
+        assert slurm_job.PerfReport._parse_metrics("", daemon_text=one_second)["wr_tnsr_us"]["mean"] == 1_000_000
+
+    malformed = _perf_span(rank=2, snapshot=7).replace(" snapshot_us=11us", "")
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.PerfReport._validate_daemon_markers(malformed)
+    assert "did not match the required schema" in caplog.text
+
+    caplog.clear()
+    mismatched = _perf_span(rank=2, snapshot=7).replace("snapshot=7\n", "snapshot=8\n", 1)
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.PerfReport._validate_daemon_markers(mismatched)
+    assert "without Finished" in caplog.text
+    assert "without Begin" in caplog.text
+
+
+def test_perf_markers_warn_when_the_measured_daemon_cycle_is_missing(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.PerfReport._validate_daemon_markers("")
+
+    assert "no schema-valid ckpt.save Begin markers" in caplog.text
+    assert "no schema-valid ckpt.save Finished markers" in caplog.text
+
+
+def test_native_perf_report_cannot_pass_on_memory_metrics_alone(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    log = tmp_path / "run.log"
+    report_path = tmp_path / "report.json"
+    log.write_text("[native_ckpt:mem] rank=0 gpu_peak_bytes=100 cpu_rss_bytes=10\n")
+
+    with caplog.at_level("WARNING"):
+        passed = slurm_job.PerfReport.parse_and_report(
+            "perf-native",
+            "pico_1x1",
+            "perf-native",
+            log,
+            {"metrics": {"bw_mbps": 100, "wr_tnsr_us": 10, "total_written_bytes": 100, "gpu_peak_bytes": 100}},
+            report_path,
+            1,
+        )
+
+    report = yaml.safe_load(report_path.read_text())
+    assert not passed
+    assert not report["passed"]
+    assert not report["ckpt_save_markers_valid"]
+    assert report["comparison"]["bw_mbps"]["reason"] == "missing_metric"
+    assert report["comparison"]["ckpt_save_markers"]["status"] == "FAIL"
+    assert "required baseline metric 'wr_tnsr_us' was not measured" in caplog.text
 
 
 def test_durability_pairs_async_saves_by_iteration() -> None:
@@ -3625,6 +3740,27 @@ def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
 
     assert passed
     assert result["ckpt_durable_ms"]["status"] == "no_baseline"
+
+
+def test_a_required_baseline_metric_missing_from_the_run_fails_the_job(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {"gpu_peak_bytes": slurm_job.PerfReport._metric([100], "B", False)}  # noqa: FBT003
+
+    with caplog.at_level("WARNING"):
+        result, passed = slurm_job.PerfReport._compare_to_baseline(
+            metrics,
+            {"metrics": {"gpu_peak_bytes": 100, "wr_tnsr_us": 10}},
+            0.1,
+        )
+
+    assert not passed
+    assert result["wr_tnsr_us"] == {
+        "status": "FAIL",
+        "measured": None,
+        "baseline": 10,
+        "reason": "missing_metric",
+    }
+    assert "required baseline metric 'wr_tnsr_us' was not measured" in caplog.text
 
 
 def test_perf_report_uses_the_largest_rank_hbm_peak() -> None:

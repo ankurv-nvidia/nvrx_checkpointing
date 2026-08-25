@@ -4,6 +4,7 @@
 #include "primitives64bit.h"
 #include "tensor.h"
 
+#include <chrono>
 #include <fmt/std.h>
 
 #include <algorithm>
@@ -681,6 +682,11 @@ struct StateTree
     mutable std::mutex _mutex;
     std::future<void>  _async;
     friend struct StateSerDes;
+
+    public:
+    // TODO: Better time tracking.
+    std::chrono::nanoseconds startedAt /*NOLINT*/
+        = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
 };
 
 template <> struct StateTree::StateHandler<StateTree::StateType::Scalar> : StateTree::IStateHandler

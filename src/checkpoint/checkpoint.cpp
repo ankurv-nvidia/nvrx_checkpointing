@@ -590,7 +590,8 @@ struct CheckpointWriter
                                                            .globalRank   = root.GlobalRank(),
                                                            .snapshotSize = totalTensorStateSizeInBytes,
                                                            .messageSize  = static_cast<uint32_t>(msg.size()),
-                                                           .numaNode     = numaNode}},
+                                                           .numaNode     = numaNode,
+                                                           .startedAt    = root.startedAt}},
                           msg.data(),
                           msg.size());
         }

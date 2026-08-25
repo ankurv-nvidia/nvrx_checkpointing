@@ -752,6 +752,10 @@ NB_MODULE(checkpoint, m)    // NOLINT
         .def("add_child", &StateTree::AddChild, nb::rv_policy::reference)
         .def_prop_ro("globalRank", &StateTree::GlobalRank)
         .def_prop_ro("globalWorldSize", &StateTree::GlobalWorldSize)
+        .def_prop_rw(
+            "startedAt",
+            [](StateTree const& self) { return self.startedAt.count(); },
+            [](StateTree& self, int64_t startedAt) { self.startedAt = std::chrono::nanoseconds{startedAt}; })
         .def("register", &Register)
         .def("register_state_dict", &RegisterStateDict)
         .def("refresh_sharded_tensors", &RefreshShardedTensors, nb::arg("fresh_list"))

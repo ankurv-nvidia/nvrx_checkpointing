@@ -9,6 +9,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci" / "scripts"))
 from slurm_job import PERF_TOLERANCE, PerfReport
 
 
+def _perf_finished(bandwidth: float, write_us: int) -> str:
+    return (
+        f"[native_ckpt:svr][0][PERF] Rank=0 Finished bw_mbps={bandwidth:.2f} "
+        f"| Time(us):  wr_tnsr_us={write_us}us snapshot_us=11us total_us=12us "
+        "| Count: num_tensors=2 total_d2h=2 | Bytes: total_written_bytes=100 "
+        "avg_d2h_rq=50 avg_tnsr=50 snapshot=1"
+    )
+
+
 def test_each_platform_has_one_bandwidth_floor() -> None:
     # The floors themselves move with the hardware and are recorded in
     # ci/baselines/platform_bw_mbps.yaml; what this asserts is that every
@@ -23,7 +32,7 @@ def test_each_platform_has_one_bandwidth_floor() -> None:
 
 
 def test_native_bandwidth_is_reported_as_integer_mbps() -> None:
-    log = "[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps=94000.4 wr_tnsr_us=10 total_written_bytes=100"
+    log = _perf_finished(94000.4, 10)
 
     metrics = PerfReport._parse_metrics(log, 4)
 
@@ -62,7 +71,7 @@ def test_lower_is_better_metric_is_a_ceiling_not_a_floor() -> None:
 
 def test_timing_baselines_use_steady_state_median() -> None:
     log = "\n".join(
-        f"[native_ckpt:svr][75d0#0][PERF] Rank=0 Finished bw_mbps={bw} wr_tnsr_us={write} total_written_bytes=100"
+        _perf_finished(bw, write)
         for bw, write in ((80000, 38000), (145000, 20500), (150000, 19500))
     )
     metrics = PerfReport._parse_metrics(log, 4)

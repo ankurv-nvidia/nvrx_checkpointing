@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 
+#include <chrono>
 #include <cstdint>
 #include <variant>
 
@@ -97,6 +98,8 @@ struct Message
         uint64_t   snapshotSize;
         uint32_t   messageSize;
         int32_t    numaNode = -1;    // this rank's GPU-local NUMA node, or -1 if unknown
+
+        std::chrono::nanoseconds startedAt{};
         /*Message Format
         std::string ckptPath;
         std::vector<StateTree::SnapshotBlob> snapshotBlobs; // rank 0 only
@@ -121,10 +124,6 @@ struct Message
     {
         SessionId sessionId;
         uint32_t  messageSize;
-        /*Message Format
-        TODO : What if the state is larger than the message size limit (16Mb)
-        StateSerDes ostream;
-        */
     };
 
     struct StateRegistryFragment

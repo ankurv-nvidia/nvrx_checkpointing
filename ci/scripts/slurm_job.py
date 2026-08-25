@@ -48,7 +48,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -96,6 +96,7 @@ _NVRX_MODULE = "nvidia_resiliency_ext"
 SOFT_FAIL_RC = 3
 PERF_TOLERANCE = 0.05
 MAX_BW_SOCKET_IMBALANCE = 1.30
+REQUIRED_NATIVE_PERF_METRICS = frozenset({"bw_mbps", "wr_tnsr_us", "total_written_bytes"})
 # Durability spans the whole distributed write, so it carries the shared filesystem's
 # variance rather than the checkpointer's: on a busy Lustre the same job can differ
 # several-fold. Track the number, but only fail on a change too large for that to
@@ -190,11 +191,24 @@ _PRETRAIN_ENV_NAMES = {
     "TORCHELASTIC_RESTART_COUNT",
     "WORLD_SIZE",
 }
-# The daemon emits the perf counters, one line per rank per save, into its own
-# per-host log rather than the trainer's output.
+# The daemon emits one strictly-shaped Begin/Finished pair per rank and save into
+# its own per-host log rather than the trainer's output. Matching the whole line
+# makes a telemetry schema change visible instead of silently dropping metrics.
+_PERF_BEGIN_RE = re.compile(
+    r"^\[native_ckpt:svr\]\[(?P<session>\d+)\]\[PERF\] Rank=(?P<rank>\d+) "
+    r"Begin span=ckpt\.save started_at_ns=(?P<started_at_ns>\d+) snapshot=(?P<snapshot>\d+)$",
+    re.MULTILINE,
+)
 _BW_RE = re.compile(
-    r"\[native_ckpt:svr\]\[[^\]]*\]\[PERF\] Rank=(\d+) Finished "
-    r"bw_mbps=([0-9.]+)[^\n]*?wr_tnsr_us=([0-9]+)[^\n]*?total_written_bytes=([0-9]+)",
+    r"^\[native_ckpt:svr\]\[(?P<session>\d+)\]\[PERF\] Rank=(?P<rank>\d+) Finished "
+    r"bw_mbps=(?P<bw_mbps>\d+(?:\.\d+)?) \| Time\(us\):  "
+    r"wr_tnsr_us=(?P<wr_tnsr_us>\d+)[uµ]s "
+    r"snapshot_us=(?P<snapshot_us>\d+)[uµ]s total_us=(?P<total_us>\d+)[uµ]s \| "
+    r"Count: num_tensors=(?P<num_tensors>\d+) total_d2h=(?P<total_d2h>\d+) \| "
+    r"Bytes: total_written_bytes=(?P<total_written_bytes>\d+) "
+    r"avg_d2h_rq=(?P<avg_d2h_rq>\d+) avg_tnsr=(?P<avg_tnsr>\d+) "
+    r"snapshot=(?P<snapshot>\d+)$",
+    re.MULTILINE,
 )
 _MEM_RE = re.compile(
     r"\[native_ckpt:mem\](?: rank=(\d+))? gpu_peak_bytes=(\d+)"
@@ -1329,19 +1343,66 @@ class PerfReport:
         return "\n".join(p.read_text(errors="replace") for p in sorted(by_cycle[max(by_cycle)]))
 
     @staticmethod
+    def _validate_daemon_markers(daemon_text: str) -> bool:
+        """Require complete, schema-valid Begin/Finished pairs from the measured daemon cycle."""
+        marker_lines = [
+            line for line in daemon_text.splitlines()
+            if "[PERF]" in line and ("Begin span=ckpt.save" in line or " Finished " in line)
+        ]
+        invalid = [line for line in marker_lines if not (_PERF_BEGIN_RE.fullmatch(line) or _BW_RE.fullmatch(line))]
+        begins = Counter(
+            (match["session"], int(match["rank"]), int(match["snapshot"]))
+            for match in _PERF_BEGIN_RE.finditer(daemon_text)
+        )
+        finished = Counter(
+            (match["session"], int(match["rank"]), int(match["snapshot"]))
+            for match in _BW_RE.finditer(daemon_text)
+        )
+
+        valid = True
+        if invalid:
+            logger.warning(
+                f"[slurm_job:perf] WARNING {len(invalid)} ckpt.save PERF marker(s) did not match the required schema; "
+                f"first mismatch: {invalid[0]}",
+            )
+            valid = False
+        if not begins:
+            logger.warning("[slurm_job:perf] WARNING no schema-valid ckpt.save Begin markers found in measured-cycle daemon logs")
+            valid = False
+        if not finished:
+            logger.warning("[slurm_job:perf] WARNING no schema-valid ckpt.save Finished markers found in measured-cycle daemon logs")
+            valid = False
+
+        missing_finished = begins - finished
+        missing_begins = finished - begins
+        if missing_finished or missing_begins:
+            def describe(records: Counter) -> str:
+                return ", ".join(
+                    f"session={session}/rank={rank}/snapshot={snapshot} x{count}"
+                    for (session, rank, snapshot), count in records.items()
+                )
+
+            if missing_finished:
+                logger.warning(f"[slurm_job:perf] WARNING ckpt.save Begin marker(s) without Finished: {describe(missing_finished)}")
+            if missing_begins:
+                logger.warning(f"[slurm_job:perf] WARNING ckpt.save Finished marker(s) without Begin: {describe(missing_begins)}")
+            valid = False
+        return valid
+
+    @staticmethod
     def _parse_metrics(text: str, gpus_per_node: int | None = None, daemon_text: str | None = None) -> dict:
         text = text[text.rfind(_PHASE2_MARKER) :] if _PHASE2_MARKER in text else text
         # The memory records come from the ranks; the bandwidth counters from the daemon.
         matches = list(_BW_RE.finditer(text if daemon_text is None else daemon_text))
         metrics: dict = {}
         if matches:
-            ranks = [int(m[1]) for m in matches]
-            bw = [round(float(m[2])) for m in matches]
-            write = [int(m[3]) for m in matches]
+            ranks = [int(m["rank"]) for m in matches]
+            bw = [round(float(m["bw_mbps"])) for m in matches]
+            write = [int(m["wr_tnsr_us"]) for m in matches]
             metrics = {
                 "bw_mbps": PerfReport._metric(bw, "MB/s", True, ranks),
                 "wr_tnsr_us": PerfReport._metric(write, "us", False, ranks),
-                "total_written_bytes": PerfReport._metric([int(m[4]) for m in matches], "B", None, ranks),
+                "total_written_bytes": PerfReport._metric([int(m["total_written_bytes"]) for m in matches], "B", None, ranks),
             }
             unique = sorted(set(ranks))
             per_rank = [statistics.mean(v for r, v in zip(ranks, bw) if r == rank) for rank in unique]
@@ -1386,6 +1447,15 @@ class PerfReport:
     def _compare_to_baseline(metrics: dict, baseline: dict, default_tolerance: float) -> tuple[dict, bool]:
         expected, tolerances = baseline.get("metrics", {}), baseline.get("tolerances", {})
         result, passed = {}, True
+        for name in sorted(expected.keys() - metrics.keys()):
+            logger.warning(f"[slurm_job:perf] WARNING required baseline metric {name!r} was not measured")
+            result[name] = {
+                "status": "FAIL",
+                "measured": None,
+                "baseline": expected[name],
+                "reason": "missing_metric",
+            }
+            passed = False
         for name, measured in metrics.items():
             statistic = PerfReport._statistic(name, measured)
             value, higher = measured[statistic], measured["higher_is_better"]
@@ -1424,18 +1494,29 @@ class PerfReport:
         # most heavily loaded GPU rather than whichever GPU owns global rank 0.
         memory = _rank_memory_measurements(log)
         metric_text = f"{_MEM_RE.sub('', text)}\n{memory}" if memory else text
-        metrics = PerfReport._parse_metrics(metric_text, gpus, PerfReport._daemon_text(log.parent))
+        daemon_text = PerfReport._daemon_text(log.parent)
+        flavor_names = flavor.split("-")
+        native = "nvrx" not in flavor_names and ("native" in flavor_names or bool(daemon_text))
+        markers_valid = PerfReport._validate_daemon_markers(daemon_text) if native else True
+        metrics = PerfReport._parse_metrics(metric_text, gpus, daemon_text)
         # What the run cost to checkpoint, gathered in one place once it is over: the
         # per-rank timers Megatron kept, then how long each save took to become durable.
         PerfReport._log_checkpoint_timings(log)
         PerfReport._log_daemon_durability(metrics)
         # The extension's own writer emits checkpoint times rather than the
         # bandwidth counters a baseline is made of, so it has nothing to compare.
-        if not metrics and "native" not in flavor.split("-"):
+        if not metrics and not native:
             return True
         if not metrics:
             raise RuntimeError(f"no perf metrics found in {log} or the daemon logs beside it")
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
+        if native:
+            comparison["ckpt_save_markers"] = {
+                "status": "PASS" if markers_valid else "FAIL",
+                "measured": "paired" if markers_valid else "missing_or_mismatched",
+                "baseline": "paired",
+            }
+            passed &= markers_valid
         for name, value in comparison.items():
             logger.info(f"[{value['status']}] {name}: {value['measured']}")
         report = {
@@ -1444,6 +1525,7 @@ class PerfReport:
             "flavor_tag": flavor,
             "cluster": cluster_tag(),
             "passed": passed,
+            "ckpt_save_markers_valid": markers_valid if native else None,
             "metrics": {name: {k: v for k, v in metric.items() if k not in ("samples", "ranks")} for name, metric in metrics.items()},
             "comparison": comparison,
         }
@@ -1624,7 +1706,17 @@ def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
     report_path = log.with_name(f"{stem}_report.json")
     if not report_path.exists():
         return
-    measured = json.loads(report_path.read_text()).get("metrics", {})
+    report = json.loads(report_path.read_text())
+    measured = report.get("metrics", {})
+    missing = REQUIRED_NATIVE_PERF_METRICS - measured.keys()
+    if report.get("ckpt_save_markers_valid") is not True or missing:
+        details = []
+        if report.get("ckpt_save_markers_valid") is not True:
+            details.append("ckpt.save markers were missing or mismatched")
+        if missing:
+            details.append(f"required metrics were absent: {', '.join(sorted(missing))}")
+        logger.warning(f"[slurm_job:perf] WARNING refusing to write an incomplete baseline candidate: {'; '.join(details)}")
+        return
     metrics = {}
     for name, value in measured.items():
         # Socket imbalance is an in-job topology diagnostic rather than a
@@ -2600,7 +2692,11 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
         # The daemon carries the perf counters now, and it is restarted per cycle. Name its
         # log for the cycle so the report can tell the measured routine from the reference.
-        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
+        server_log = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
+        # The trainer auto-launches the daemon, so both the parent-side server context and
+        # the already-materialized child environment must name the same measured cycle.
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = server_log
+        env["NATIVE_CKPT_SERVER_LOG"] = server_log
         if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
         with (

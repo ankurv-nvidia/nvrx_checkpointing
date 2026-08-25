@@ -7,6 +7,7 @@
 #include "server.h"
 #include "session.h"
 #include "state.h"
+#include "telemetry.h"
 #include "tensor.h"
 
 #include <fmt/format.h>
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -172,6 +174,36 @@ void AddShardedTensorLeaf(StateTree&                 tree,
 
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
+
+TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
+{
+    auto const beginRecord
+        = fmt::format("{}",
+                      checkpoint::telemetry::span::CkptSave::Begin{
+                          .id = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+                          .startedAt = std::chrono::nanoseconds{123456},
+                      });
+    auto const endRecord
+        = fmt::format("{}",
+                      checkpoint::telemetry::span::CkptSave::End{
+                          .id = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+                          .d2hDuration       = std::chrono::seconds{1},
+                          .snapshotDuration  = std::chrono::microseconds{15},
+                          .totalDuration     = std::chrono::microseconds{20},
+                          .numTensors        = 2,
+                          .d2hRequestCount   = 4,
+                          .totalTensorBytes  = 1024 * 1024,
+                          .totalWrittenBytes = 2048,
+                      });
+
+    REQUIRE(beginRecord == "[native_ckpt:svr][3][PERF] Rank=1 Begin span=ckpt.save started_at_ns=123456 snapshot=2\n");
+    auto const durationSuffix = std::string{R"((?:u|µ)s)"};
+    auto const endPattern     = std::regex{
+        R"(\[native_ckpt:svr\]\[3\]\[PERF\] Rank=1 Finished bw_mbps=1\.00 \| Time\(us\):  wr_tnsr_us=1000000)" + durationSuffix
+        + R"( snapshot_us=15)" + durationSuffix + R"( total_us=20)" + durationSuffix
+        + R"( \| Count: num_tensors=2 total_d2h=4 \| Bytes: total_written_bytes=2048 avg_d2h_rq=262144 avg_tnsr=524288 snapshot=2\n)"};
+    REQUIRE(std::regex_match(endRecord, endPattern));
+}
 
 TEST_CASE("snapshot completion is global on the coordinator and local on peers", "[server][completion]")
 {
