@@ -57,7 +57,7 @@ null-tokenizer-pad-id: 11
 num-workers: 4
 
 # Optimizer and sample schedule
-global-batch-size: 768
+global-batch-size: 128
 micro-batch-size: 1
 train-samples: 122016000
 lr-decay-style: WSD
@@ -81,11 +81,11 @@ muon-scalar-optimizer: lion
 lion-beta1: "0.95"
 lion-beta2: "0.98"
 
-# Parallelism: 32 GB300 nodes x 4 GPUs. TP=2 and EP=32 preserve the production
-# topology; the 768 global batch gives two expert-data replicas and twelve
-# microbatches per dense data-parallel rank per optimizer step.
+# Adapt the production TP2/PP1 topology to 32 GPUs. EP16 keeps expert state
+# sharded without introducing expert-tensor or pipeline-parallel communication;
+# the static batch is divisible by dense DP at both 8 and 32 GB300 nodes.
 tensor-model-parallel-size: 2
-expert-model-parallel-size: 32
+expert-model-parallel-size: 16
 expert-tensor-parallel-size: 1
 pipeline-model-parallel-size: 1
 sequence-parallel: true
@@ -96,12 +96,17 @@ no-gradient-accumulation-fusion: false
 high-priority-stream-groups: ep
 ddp-num-buckets: 8
 
-# Match the production eager execution recipe. In particular, do not inherit
-# base.yaml's CUDA graphs; the attached run does not enable them. Deterministic
-# flavor changes remain confined to kernels, collectives, and router precision.
+# Activation offload and recomputation bound the MoE backward workspace.
+fine-grained-activation-offloading: true
+offload-modules: moe_act
+recompute-granularity: selective
+recompute-modules: moe_act
+
+# The full-performance profile captures the modules validated by the Nano4
+# performance run. The deterministic flavor removes graph capture uniformly.
 attention-backend: flash
-cuda-graph-impl: null
-cuda-graph-modules: null
+cuda-graph-impl: local
+cuda-graph-modules: [mamba, attn]
 use-fused-weighted-squared-relu: true
 te-rng-tracker: true
 no-load-rng: true

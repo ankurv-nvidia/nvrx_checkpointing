@@ -28,6 +28,53 @@ def test_native_save_retains_only_common_checkpoint_state() -> None:
     assert retained == {"common"}
 
 
+def test_warm_save_refreshes_mutable_common_optimizer_state() -> None:
+    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_refresh_optimizer_state"
+    )
+
+    class FakeShardedTensor:
+        pass
+
+    tensor = FakeShardedTensor()
+    fresh_optimizer = [{"optimizer": {"param_groups": [{"lr": 2.025e-6}]}}]
+
+    class ModelChunk:
+        def sharded_state_dict(self, *, metadata: dict) -> dict:
+            assert metadata == {"sharding": "test"}
+            return {"weight": tensor}
+
+    class Optimizer:
+        def sharded_state_dict(self, state_dict: dict, *, metadata: dict) -> dict:
+            assert state_dict["model"] == {"weight": tensor}
+            assert metadata == {"sharding": "test"}
+            return {"state": tensor}
+
+    def save_preprocess(state_dict: dict, *, validate_access_integrity: bool) -> tuple[dict, dict]:
+        assert state_dict["optimizer"] == {"state": tensor}
+        assert not validate_access_integrity
+        return {"state": tensor}, {"optimizer": fresh_optimizer}
+
+    namespace = {
+        "ShardedTensor": FakeShardedTensor,
+        "nested_values": lambda state: state.values(),
+        "save_preprocess": save_preprocess,
+        "unwrap_model": lambda model: model,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "tools.py", "exec"), namespace)
+
+    common = {"optimizer": [{"optimizer": {"param_groups": [{"lr": 1.35e-6}]}}]}
+    refreshed = namespace["_refresh_optimizer_state"](
+        [ModelChunk()], Optimizer(), {"sharding": "test"}, common,
+    )
+
+    assert refreshed == [tensor]
+    assert common["optimizer"] is fresh_optimizer
+
+
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:
     calls = SimpleNamespace(
         empty_cache=0,

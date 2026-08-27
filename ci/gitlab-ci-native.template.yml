@@ -53,11 +53,15 @@ variables:
   before_script:
     - echo "=== Pipeline ${CI_PIPELINE_ID} | Job ${CI_JOB_ID} | Commit ${CI_COMMIT_SHORT_SHA} ==="
     - echo "=== Running on $(hostname) ==="
-    # Load runner config; export the platform tag (baseline namespace) and cluster (selects
-    # srun templates), with fallbacks for local runs. A job-scoped override lets one
-    # shared cluster runner target a different hardware partition without its sourced
-    # PLATFORM value winning over the CI matrix.
+    # Load and export every runner-config assignment so entries such as NCCL_NET=IB
+    # reach child processes without requiring each line to carry an export. Then export
+    # the platform tag (baseline namespace) and cluster (selects srun templates), with
+    # fallbacks for local runs. A job-scoped override lets one shared cluster runner
+    # target a different hardware partition without its sourced PLATFORM value winning
+    # over the CI matrix.
+    - set -a
     - source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true
+    - set +a
     - export CLUSTER="${CLUSTER:-devbox}"
     - export PLATFORM="${PLATFORM_OVERRIDE:-${PLATFORM:-${CLUSTER}}}"
     - echo "=== PLATFORM=${PLATFORM} CLUSTER=${CLUSTER} ==="
@@ -128,7 +132,8 @@ variables:
           scancel -- "${job_id}" || true
         done < <(find ci/ci-runs -mindepth 2 -maxdepth 2 -name gitlab_job_id -print0 2>/dev/null)
       fi
-    - du -h ci/ci-runs/*/checkpoints/iter_*/*.distcp ci/ci-runs/*/*/checkpoints/iter_*/*.distcp 2>/dev/null || true
+    - du -ch ci/ci-runs/*/checkpoints/iter_*/*.distcp ci/ci-runs/*/*/checkpoints/iter_*/*.distcp 2>/dev/null | tail -n 1 || true
+    - if [[ "${CI_JOB_STATUS:-}" == failed ]]; then python3 "${CI_SCRIPTS_DIR}/slurm_job.py" __failure_summary__ ci/ci-runs || true; fi
   artifacts:
     paths:
       - ci/ci-results/*.log

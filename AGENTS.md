@@ -22,6 +22,15 @@
 - Use an imperative subject of at most 50 characters, followed by a blank line and a body wrapped at 72 characters that explains what changed and why.
 - Never mention planning files, phase numbers, or other AI-internal scaffolding.
 
+## Review Before Every Push
+
+- Review the complete final diff against the latest target branch and the user's explicit intent before pushing.
+- Verify that every changed hunk is necessary and evidence-based, and remove speculative workarounds that did not affect the observed result.
+- Check `git status`, `git diff --check`, the staged diff, generated CI, configuration intent, and baseline changes.
+- Keep experiment-only pruning, overrides, and scaffolding out of merge-request branches.
+- Run all available relevant tests, and state clearly before pushing when a required test cannot run.
+- Never rewrite or overwrite published history unless the user explicitly authorizes it.
+
 ## Task Setup
 
 - Always start each task in a separate worktree.

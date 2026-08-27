@@ -175,13 +175,13 @@
   ep_overlap_early_attn_memory_release ............ False
   error_injection_rate ............................ 0
   error_injection_type ............................ transient_error
-  eval_global_batch_size .......................... 768
+  eval_global_batch_size .......................... 128
   eval_interval ................................... 1000
   eval_iters ...................................... 0
   eval_micro_batch_size ........................... 1
   evidence_data_path .............................. None
   exit_duration_in_mins ........................... 235
-  exit_interval ................................... 28
+  exit_interval ................................... 100
   exit_on_missing_checkpoint ...................... False
   exit_signal ..................................... 15
   exit_signal_handler ............................. False
@@ -191,7 +191,7 @@
   exp_avg_sq_dtype ................................ torch.float32
   experimental_attention_variant .................. None
   expert_gtp_weight_remat_size .................... 1
-  expert_model_parallel_size ...................... 32
+  expert_model_parallel_size ...................... 16
   expert_tensor_parallel_num_weight_shards ........ 1
   expert_tensor_parallel_size ..................... 1
   export_default_te_spec .......................... False
@@ -232,7 +232,7 @@
   fim_split_sample ................................ None
   fim_spm_rate .................................... 0.5
   fim_suffix_token ................................ <fim_suffix>
-  fine_grained_activation_offloading .............. False
+  fine_grained_activation_offloading .............. True
   fine_grained_offloading_max_inflight_offloads ... None
   finetune ........................................ False
   finetune_data_files ............................. None
@@ -275,7 +275,7 @@
   gdp_cutedsl_kernel .............................. False
   gdp_num_chunk_states_to_recompute ............... 2
   gdp_num_householder ............................. 3
-  global_batch_size ............................... 768
+  global_batch_size ............................... 128
   glu_linear_offset ............................... 0.0
   gpu_sniff_test_interval ......................... None
   grad_reduce_in_bf16 ............................. False
@@ -555,7 +555,7 @@
   multiple_validation_sets ........................ False
   muon_coefficient_type ........................... polar_express
   muon_extra_scale_factor ......................... 1.0
-  muon_fp32_matmul_prec ........................... high
+  muon_fp32_matmul_prec ........................... medium
   muon_momentum ................................... 0.9
   muon_nesterov ................................... False
   muon_num_ns_steps ............................... 16
@@ -604,7 +604,7 @@
   num_workers ..................................... 4
   nvtx_ranges ..................................... False
   object_storage_cache_path ....................... None
-  offload_modules ................................. []
+  offload_modules ................................. ['moe_act']
   offset_sampling_seed_by_dp_rank ................. True
   one_logger_async ................................ False
   one_logger_project .............................. megatron-lm
@@ -666,9 +666,9 @@
   quick_geglu ..................................... False
   rampup_batch_size ............................... None
   rank ............................................ 0
-  recompute_granularity ........................... None
+  recompute_granularity ........................... selective
   recompute_method ................................ None
-  recompute_modules ............................... None
+  recompute_modules ............................... ['moe_act']
   recompute_num_layers ............................ None
   record_memory_history ........................... False
   record_shapes ................................... False
@@ -725,9 +725,9 @@
   sample_rate ..................................... 1.0
   save_activations_interval ....................... None
   save_dgrads_interval ............................ None
-  save_interval ................................... 1
+  save_interval ................................... 25
   save_params_interval ............................ None
-  save_retain_interval ............................ 1
+  save_retain_interval ............................ 25
   save_tokenizer_assets ........................... True
   save_tokens_per_expert_interval ................. None
   save_wgrads_interval ............................ None

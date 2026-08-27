@@ -118,11 +118,15 @@ logger = logging.getLogger("native_ci")
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
 _EPILOG_ENTRY_CMD = "__epilog__"
 _RANK_LOGS_ENTRY_CMD = "__rank_logs__"
+_FAILURE_SUMMARY_ENTRY_CMD = "__failure_summary__"
 # GitLab traces are size limited. Rank 0 is already mirrored in full while the
 # run is active, so retain the failure and traceback tail for the ranks that
 # Slurm reports exiting.
 _RANK_LOG_TAIL_LINES = 120
 _RANK_LOG_LIMIT = 4
+_DIGEST_DIFF_DETAIL_LIMIT = 12
+_FAILURE_SUMMARY_LIMIT = 12
+_FAILURE_SUMMARY_TAIL_BYTES = 512 * 1024
 _SLURM_STATUS_PERIOD_SECONDS = 5 * 60
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
@@ -171,6 +175,7 @@ _PRETRAIN_ENV_NAMES = {
     "MASTER_ADDR",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
+    "NCCL_NET",
     "NCCL_NVLS_ENABLE",
     "NCCL_PROTO",
     "NCCL_TUNER_PLUGIN",
@@ -865,8 +870,8 @@ def _cancel_slurm_job(job_id: str) -> None:
     if proc.returncode:
         logger.warning(f"[slurm_job] scancel exited with code {proc.returncode} for job {job_id}")
 
-def _report_queue_status(job_id: str) -> None:
-    """Print a non-fatal scheduler heartbeat for a submitted allocation."""
+def _report_queue_status(job_id: str) -> bool:
+    """Print pending scheduler state; return whether queue polling should continue."""
     command = [
         "squeue", "--noheader", "--jobs", job_id,
         "--format=%i|%T|%M|%l|%S|%R",
@@ -878,26 +883,28 @@ def _report_queue_status(job_id: str) -> None:
             f"[slurm_job:status] {timestamp} squeue failed for job {job_id}: "
             f"{proc.stderr.strip() or f'exit {proc.returncode}'}",
         )
-        return
+        return True
     rows = proc.stdout.strip().splitlines()
     if not rows:
         logger.info(f"[slurm_job:status] {timestamp} job {job_id} is no longer listed by squeue")
-        return
+        return False
     logger.info("[slurm_job:status] JobID|State|Elapsed|TimeLimit|StartTime|Nodes/Reason")
     for row in rows:
         logger.info(f"[slurm_job:status] {timestamp}|{row}")
+    return all(len(parts := row.split("|", 2)) > 1 and parts[1] == "PENDING" for row in rows)
 
 def _wait_for_submission(
     submit: subprocess.Popen,
     job_id: str,
     period_seconds: int = _SLURM_STATUS_PERIOD_SECONDS,
 ) -> int:
-    """Wait for sbatch while reporting scheduler state at a bounded cadence."""
+    """Wait for sbatch, reporting scheduler state only while the job is pending."""
     while True:
         try:
             return submit.wait(timeout=period_seconds)
         except subprocess.TimeoutExpired:
-            _report_queue_status(job_id)
+            if not _report_queue_status(job_id):
+                return submit.wait()
 
 def _report_allocation_accounting(job_id: str) -> None:
     """Print allocation and step accounting without changing job outcome."""
@@ -1010,7 +1017,7 @@ def _sacct_rows(job_id: str, job_array: bool) -> list[list[str]]:
 
 
 def _verify_allocation(job_id: str, rc: int, job_array: bool = False) -> int | None:
-    """Check the finished Slurm allocation; returns the verdict rc in job-array mode.
+    """Check the finished Slurm job; returns the verdict rc in job-array mode.
 
     A job array's verdict lives on task 0: peers exit 1 when task 0's RDZV_CLOSED
     drains the generation and cold spares are cancelled, so their rows carry no
@@ -1029,12 +1036,12 @@ def _verify_allocation(job_id: str, rc: int, job_array: bool = False) -> int | N
 
     row = next((r for r in rows if r[0] == job_id), None)
     if row is None or not _terminal_state(row):
-        raise RuntimeError(f"sacct did not report Slurm allocation {job_id}")
+        raise RuntimeError(f"sacct did not report a finished Slurm job {job_id}")
     _report_allocation_accounting(job_id)
     soft_rc = rc == SOFT_FAIL_RC and _soft_failed(row)
     if not ((rc == 0 and _clean(row)) or soft_rc):
         raise RuntimeError(
-            f"Slurm allocation {job_id} was not successful: state={row[1]} "
+            f"Slurm job {job_id} finished unsuccessfully: state={row[1]} "
             f"exit={row[2]} derived_exit={row[3]} sbatch_rc={rc}",
         )
     return None
@@ -1487,14 +1494,24 @@ class PerfReport:
         return result, passed
 
     @staticmethod
-    def parse_and_report(job: str, config: str, flavor: str, log: Path, baseline: dict, report_path: Path, gpus: int) -> bool:
+    def parse_and_report(
+        job: str,
+        config: str,
+        flavor: str,
+        log: Path,
+        baseline: dict,
+        report_path: Path,
+        gpus: int,
+        *,
+        daemon_dir: Path | None = None,
+    ) -> bool:
         text = log.read_text(errors="replace")
         # Rank 0 is the only routine log mirrored into the combined job log.
         # Read the short per-rank memory records so the HBM peak describes the
         # most heavily loaded GPU rather than whichever GPU owns global rank 0.
         memory = _rank_memory_measurements(log)
         metric_text = f"{_MEM_RE.sub('', text)}\n{memory}" if memory else text
-        daemon_text = PerfReport._daemon_text(log.parent)
+        daemon_text = PerfReport._daemon_text(daemon_dir or log.parent)
         flavor_names = flavor.split("-")
         native = "nvrx" not in flavor_names and ("native" in flavor_names or bool(daemon_text))
         markers_valid = PerfReport._validate_daemon_markers(daemon_text) if native else True
@@ -1639,6 +1656,65 @@ def _report_failing_rank_logs(
             f"[slurm_job:rank] {len(ranks) - rank_limit} additional exited rank(s) "
             "remain available in the job artifacts",
         )
+
+
+_PRIMARY_FAILURE_RE = re.compile(
+    r"(?:RuntimeError: (?:checkpoints differ|reference check failed|manifest derivation failed)|"
+    r"Unexpected result nan|found NaN|CUDA out of memory|OutOfMemoryError|"
+    r"Fatal Python error|Segmentation fault|AssertionError:|ValueError:)",
+    re.IGNORECASE,
+)
+_FAILURE_DETAIL_RE = re.compile(
+    r"(?:\[slurm_job:diff\].*(?:only in|missing=[1-9]\d*|extra=[1-9]\d*|changed=[1-9]\d*|"
+    r":\s+(?:changed|missing|extra)\s+\S)|ncclIbMultiSend|sendProxyProgress)",
+    re.IGNORECASE,
+)
+_FALLBACK_FAILURE_RE = re.compile(r"(?:RuntimeError:|srun: error:.*Exited with exit code|FAILED.*exit)", re.IGNORECASE)
+
+
+def _log_tail(path: Path, limit: int = _FAILURE_SUMMARY_TAIL_BYTES) -> str:
+    """Read a bounded log tail without loading a multi-rank training log in full."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            return handle.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _failure_summary_lines(run_log: Path) -> list[str]:
+    """Select causal errors and their useful details from an allocation's log tail."""
+    paths = [run_log, *sorted(run_log.parent.glob(f"{run_log.stem}.task*.log"))]
+    categories: tuple[list[str], list[str], list[str]] = ([], [], [])
+    seen: set[str] = set()
+    for path in paths:
+        for raw in _log_tail(path).splitlines():
+            line = re.sub(r"^\s*\d+:\s*", "", raw).strip()
+            if not line or line in seen:
+                continue
+            for regex, bucket in zip(
+                (_PRIMARY_FAILURE_RE, _FAILURE_DETAIL_RE, _FALLBACK_FAILURE_RE),
+                categories,
+            ):
+                if regex.search(line):
+                    seen.add(line)
+                    bucket.append(line)
+                    break
+    selected = [*categories[0], *categories[1]] or categories[2]
+    return selected[:_FAILURE_SUMMARY_LIMIT]
+
+
+def _report_failure_summary(run_log: Path) -> None:
+    """Print the underlying allocation failure after verbose rank and cleanup output."""
+    lines = _failure_summary_lines(run_log)
+    if not lines:
+        return
+    logger.error("[slurm_job:failure] ===== underlying failure summary =====")
+    for line in lines:
+        logger.error(f"[slurm_job:failure] {line}")
+    logger.error(f"[slurm_job:failure] full logs: {run_log.parent}")
 
 def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tuple[str, ...] = ()) -> Path:
     """Write the stable argument block from one run beside that run's logs."""
@@ -1996,7 +2072,27 @@ class DeterministicFlavor(Flavor):
         policy.compares_routines = True
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
-        if not PerfFlavor().report(args, log):
+        cfg, tag, stem = _identity(args)
+        native_spec = next(
+            (spec for spec in reversed(_run_specs(args)) if _provider(spec.flavors) == "native"),
+            None,
+        )
+        # Multi-run determinism keeps each routine's daemon logs beneath that
+        # routine, while the batch log and report live at the job root. Report
+        # the native routine when one exists; an NVRx-only comparison has no
+        # native writer counters and therefore no performance baseline.
+        baseline = args.baseline if native_spec is not None else {}
+        daemon_dir = _argument_log(args, log, native_spec).parent if native_spec is not None else None
+        if not PerfReport.parse_and_report(
+            _selected_flavors(args).tag,
+            cfg,
+            tag,
+            log,
+            baseline,
+            log.with_name(f"{stem}_report.json"),
+            args.gpus_per_node,
+            daemon_dir=daemon_dir,
+        ):
             logger.warning("performance baseline failed; determinism comparisons passed")
         return True
 
@@ -2042,6 +2138,7 @@ class ValgrindFlavor(Flavor):
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.checkpoint_routines = 1
+        policy.phase2_save_interval = 1
         policy.manages_native_server = False
         policy.wheel_prep_mode = "--build-from-source"
         policy.wheel_defines = ("PHOENIX_BUILD_FOR_VALGRIND=1",)
@@ -3055,11 +3152,13 @@ def _compare_runs(args: argparse.Namespace, specs: tuple[RunSpec, ...], digests:
     if baseline is None and len(digests) < 2:
         return
     against = baseline or digests[0]
-    failures = [
-        spec.name or "run"
-        for spec, digest in zip(specs, digests, strict=True)
-        if digest != against and _digest_differences(against, digest)
-    ]
+    failures = []
+    for spec, digest in zip(specs, digests, strict=True):
+        if digest == against:
+            continue
+        differences = _digest_differences(against, digest)
+        if differences:
+            failures.append(f"{spec.name or 'run'} ({differences} differences)")
     if failures:
         raise RuntimeError(f"checkpoints differ from {against.name}: {', '.join(failures)}")
 
@@ -3803,6 +3902,21 @@ def _rank_logs_entry(argv: list[str]) -> None:
     # provide the same diagnostic artifacts as successful jobs.
     _write_and_compare_arguments(args, args.log_file, strict=False)
 
+
+def _failure_summary_entry(argv: list[str]) -> None:
+    """Summarize logs owned by the current GitLab job after its script fails."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if len(argv) != 1:
+        raise SystemExit(f"usage: {_FAILURE_SUMMARY_ENTRY_CMD} RUNS_ROOT")
+    root = Path(argv[0])
+    if not root.is_dir():
+        return
+    job_id = os.environ.get("CI_JOB_ID", "").strip()
+    runs = sorted(root.glob(f"{job_id}_*")) if job_id else sorted(root.iterdir())
+    for run in runs:
+        for log in sorted((run / "logs").glob("*.log")):
+            _report_failure_summary(log)
+
 def _epilog(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = _parser()
@@ -3975,10 +4089,45 @@ def _drop_sync_files() -> None:
     for path in sorted(RUN_ROOT.glob(f"**/{SYNC_DIR_NAME}")):
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path, ignore_errors=True)
+
+
+def _digest_value(value: str, limit: int = 160) -> str:
+    """Keep one digest value useful without letting metadata blobs flood the trace."""
+    shortened = value if len(value) <= limit else f"{value[:limit - 3]}..."
+    return repr(shortened)
+
+
+def _entry_difference_details(
+    produced: dict[str, str],
+    recorded: dict[str, str],
+    limit: int = _DIGEST_DIFF_DETAIL_LIMIT,
+) -> list[str]:
+    """Describe missing, extra and changed entries with the values that explain them."""
+    details = []
+    for key in sorted(recorded.keys() - produced.keys()):
+        details.append(f"missing {key}: baseline={_digest_value(recorded[key])}")
+        if len(details) == limit:
+            return details
+    for key in sorted(produced.keys() - recorded.keys()):
+        details.append(f"extra {key}: candidate={_digest_value(produced[key])}")
+        if len(details) == limit:
+            return details
+    for key in sorted(produced.keys() & recorded.keys()):
+        if produced[key] != recorded[key]:
+            details.append(
+                f"changed {key}: baseline={_digest_value(recorded[key])} "
+                f"candidate={_digest_value(produced[key])}",
+            )
+            if len(details) == limit:
+                return details
+    return details
+
+
 def _digest_differences(left: Path, right: Path) -> int:
     """Count how the checkpoints two digests describe differ, reporting each."""
     sides = [_digest_entries(path) for path in (left, right)]
     differences = 0
+    details_shown = 0
     for label in sorted(sides[0].keys() | sides[1].keys()):
         produced, recorded = sides[1].get(label), sides[0].get(label)
         if produced is None or recorded is None:
@@ -3987,10 +4136,21 @@ def _digest_differences(left: Path, right: Path) -> int:
             continue
         counts = _compare_entries(produced, recorded)
         logger.info(f"[slurm_job:diff] {label}: entries={len(produced)} {counts}")
-        differences += sum(
+        checkpoint_differences = sum(
             int(field.split("=")[1])
             for field in counts.split()
             if field.startswith(("missing", "extra", "changed"))
+        )
+        differences += checkpoint_differences
+        if checkpoint_differences and details_shown < _DIGEST_DIFF_DETAIL_LIMIT:
+            remaining = _DIGEST_DIFF_DETAIL_LIMIT - details_shown
+            for detail in _entry_difference_details(produced, recorded, remaining):
+                logger.info(f"[slurm_job:diff] {label}: {detail}")
+                details_shown += 1
+    if differences > details_shown:
+        logger.info(
+            f"[slurm_job:diff] {differences - details_shown} additional entry difference(s) omitted; "
+            f"inspect {left.name} and {right.name} in the job artifacts",
         )
     return differences
 
@@ -4030,5 +4190,7 @@ if __name__ == "__main__":
         _epilog(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == _RANK_LOGS_ENTRY_CMD:
         _rank_logs_entry(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == _FAILURE_SUMMARY_ENTRY_CMD:
+        _failure_summary_entry(sys.argv[2:])
     else:
         main()

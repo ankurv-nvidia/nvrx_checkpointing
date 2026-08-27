@@ -81,6 +81,7 @@ GROUPS = (
     "32node-nano4",
     "64node-ultra3bf16",
     "64node-ultra3fp8",
+    "8node-nano4",
     "8node-nano3",
 )
 
@@ -146,8 +147,6 @@ def _emit_multinode(
                 if flavors[0] == "detr" and "vg" not in flavors
                 else f"--flavor {common}+{provider}"
             )
-            flavor_arg_table = entry.get("flavor_args", {})
-            flavor_args = flavor_arg_table.get("+".join(flavors), flavor_arg_table.get(flavors[0], ""))
             # Common options must precede the first run-scoped option.
             # A zero segment keeps the classic single-allocation wide launch.
             segment = entry.get("job_array_segment")
@@ -157,7 +156,6 @@ def _emit_multinode(
                     f"--nodes {entry['nodes']} --config {entry['config']}",
                     f"--megatron-commit {entry['megatron_commit']}" if entry.get("megatron_commit") else "",
                     f"--job-array-segment {segment}" if segment is not None else "",
-                    flavor_args,
                     flavor_flags,
                 )
                 if part

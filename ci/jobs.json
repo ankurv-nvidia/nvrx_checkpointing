@@ -42,10 +42,8 @@
           "nodes": 8,
           "scale": "8x4",
           "group": "8node-nano3",
+          "pipeline_suite": "main-branch-runs",
           "timeout": "1d",
-          "flavor_args": {
-            "detr+vg": "--checkpoint-interval 1"
-          },
           "jobs": [
             [
               "native",
@@ -178,9 +176,6 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "job_array_segment": 8,
-          "flavor_args": {
-            "detr": "--muon-fp32-matmul-prec high --checkpoint-interval 1"
-          },
           "timeout": "1d",
           "jobs": [
             [
@@ -198,6 +193,32 @@
             [
               "nvrx",
               "perf"
+            ]
+          ]
+        },
+        {
+          "key": "nano4",
+          "config": "nano4",
+          "nodes": 8,
+          "scale": "8x4",
+          "group": "8node-nano4",
+          "runner_tags": [
+            "ociaga"
+          ],
+          "megatron_commit": "74a48940c309fe78b6f2d8591abeb0ae2ea6b6c1",
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ],
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "nvrx",
+              "detr"
             ]
           ]
         }

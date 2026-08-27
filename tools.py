@@ -73,8 +73,8 @@ register_state_dict.root = None
 register_state_dict.snapshot_state = None
 
 
-def _fresh_sharded_tensors(model, optimizer, metadata: dict) -> list:  # noqa: ANN001
-    """Re-extract the model + optimizer ShardedTensors (a flat list) for an in-place root refresh.
+def _refresh_optimizer_state(model, optimizer, metadata: dict, common: dict) -> list:  # noqa: ANN001
+    """Re-extract the optimizer's tensor and common state for a warm save.
 
     The bf16 Adam moments (exp_avg/exp_avg_sq) are transient get_unscaled_state().float() copies the
     optimizer never writes to again, so the root's once-registered handlers re-save the first-save
@@ -83,6 +83,10 @@ def _fresh_sharded_tensors(model, optimizer, metadata: dict) -> list:  # noqa: A
     while skipping the collective re-registration. Model/master-param ShardedTensors alias live
     storage, so refreshing them re-points to the same buffer (a no-op); refreshing all of them lets
     the native side assert a 1:1 node correspondence.
+
+    The cached common optimizer dictionary also contains mutable scalars such as each parameter
+    group's learning rate. Replace it from the same extraction so later checkpoints do not retain
+    the first warm save's values.
     """
     model = unwrap_model(model)
     state_dict = {}
@@ -90,7 +94,8 @@ def _fresh_sharded_tensors(model, optimizer, metadata: dict) -> list:  # noqa: A
         key = "model" if len(model) == 1 else f"model{i}"
         state_dict[key] = model[i].sharded_state_dict(metadata=metadata)
     state_dict["optimizer"] = optimizer.sharded_state_dict(state_dict, metadata=metadata)
-    sharded_part, _ = save_preprocess(state_dict, validate_access_integrity=False)
+    sharded_part, fresh_common = save_preprocess(state_dict, validate_access_integrity=False)
+    common["optimizer"] = fresh_common["optimizer"]
     return [leaf for leaf in nested_values(sharded_part) if isinstance(leaf, ShardedTensor)]
 
 
@@ -303,7 +308,7 @@ def _save_checkpoint_impl(  # noqa: PLR0913
             _, common["rerun_state_machine"] = extract_sharded_base(persistent)
         # Re-point the registered ShardedTensor handlers at freshly-extracted tensors so the root
         # re-reads current data instead of the transient bf16 moment copies frozen at the first save.
-        fresh = _fresh_sharded_tensors(model, optimizer, _build_sharded_state_dict_metadata(args))
+        fresh = _refresh_optimizer_state(model, optimizer, _build_sharded_state_dict_metadata(args), common)
         register_state_dict.root.refresh_sharded_tensors(fresh)
 
     # The writer emits torch_dist whatever --ckpt-format asks for, so name what it writes.
