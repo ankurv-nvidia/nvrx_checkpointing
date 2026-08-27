@@ -26,7 +26,7 @@ python3 -m pip install \
 ```
 
 Use the public Megatron-LM checkout pinned by this repository
-(`3126ff2e3c73c18a52130bf73f51fb9dba252b4c`) and make sure the
+(`aac9b2db7f0d203940f6c0a7f2852a094c18c12e`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every
 node.
 

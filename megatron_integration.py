@@ -1,13 +1,11 @@
 # ruff: noqa: ANN401, C901, PLC0415, SLF001
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Runtime integration for an unmodified Megatron-LM checkout.
+"""Runtime integration for the pinned, unmodified Megatron-LM checkout.
 
-The supported Megatron commit is the public parent of the historical
-``nvrx_checkpointing`` patch.  This module relocates that patch's Python
-integration points here: argument registration, checkpoint dispatch, warmup,
-and the distributed-optimizer dtype-key compatibility required to load old
-checkpoints.
+This module supplies the repository-owned Python integration points: argument
+registration, checkpoint dispatch, warmup, and the distributed-optimizer
+dtype-key compatibility required to load old checkpoints.
 
 ``install`` only replaces Python objects in the current process.  It never
 writes to the Megatron-LM source tree.
@@ -25,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SUPPORTED_MEGATRON_COMMIT = "3126ff2e3c73c18a52130bf73f51fb9dba252b4c"
+SUPPORTED_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
 
 _NATIVE_PROVIDER = "native"
 _REFERENCE_PROVIDER = "nvrx"
@@ -154,7 +152,7 @@ def _patch_distributed_optimizer() -> None:
 
 
 def _patch_argument_registration() -> None:
-    """Register the ``--ckpt-provider`` argument on Megatron's parser.
+    """Register and validate the repository's checkpoint-provider argument.
 
     The native provider keeps both ``--async-save`` and the configured ``async_strategy`` intact.
     Its async lifecycle is redirected separately to the repo-owned implementation, so the argument
@@ -165,12 +163,28 @@ def _patch_argument_registration() -> None:
     if getattr(arguments_module, _INSTALL_MARKER, False):
         return
     original_parse_args = arguments_module.parse_args
+    original_validate_args = arguments_module.validate_args
 
     @wraps(original_parse_args)
     def parse_args(extra_args_provider: Callable[[Any], Any] | None = None, ignore_unknown_args: bool = False) -> Any:
         return original_parse_args(compose_extra_args_provider(extra_args_provider), ignore_unknown_args)
 
+    @wraps(original_validate_args)
+    def validate_args(args: Any, defaults: dict[str, Any] | None = None) -> Any:
+        if (
+            getattr(args, "ckpt_provider", None) == _NATIVE_PROVIDER
+            and getattr(args, "ckpt_pg_tensors_cache_path", None) is not None
+        ):
+            arguments_module.warn_rank_0(
+                "--ckpt-pg-tensors-cache-path is ignored when --ckpt-provider=native; "
+                "disabling the process-group cache.",
+            )
+            args.ckpt_pg_tensors_cache_path = None
+            args.ckpt_pg_tensors_cache_create = False
+        return original_validate_args(args, {} if defaults is None else defaults)
+
     arguments_module.parse_args = parse_args
+    arguments_module.validate_args = validate_args
     setattr(arguments_module, _INSTALL_MARKER, True)
 
 

@@ -90,6 +90,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         native_readers=[],
         reference_async=[],
         reference_readers=[],
+        warnings=[],
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
@@ -178,7 +179,13 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     initialize_module = ModuleType("megatron.training.initialize")
     restart_module = ModuleType("megatron.training.inprocess_restart")
     training_module = ModuleType("megatron.training.training")
-    current_args = SimpleNamespace(ckpt_provider="native", async_save=True, async_strategy="nvrx")
+    current_args = SimpleNamespace(
+        ckpt_provider="native",
+        async_save=True,
+        async_strategy="nvrx",
+        ckpt_pg_tensors_cache_path="/run/pg-cache",
+        ckpt_pg_tensors_cache_create=True,
+    )
 
     def parse_args(extra_args_provider: Any = None, ignore_unknown_args: bool = False) -> Any:
         parser = argparse.ArgumentParser()
@@ -196,6 +203,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
 
     arguments_module.parse_args = parse_args
     arguments_module.validate_args = validate_args
+    arguments_module.warn_rank_0 = calls.warnings.append
 
     def record_reference_async(name: str, *args: Any) -> str:
         calls.reference_async.append((name, args))
@@ -387,6 +395,14 @@ def test_native_provider_preserves_configured_async_strategy(monkeypatch: pytest
     assert calls.validate == 1
     assert calls.args.async_save is True
     assert calls.args.async_strategy == "nvrx"
+    assert calls.args.ckpt_pg_tensors_cache_path is None
+    assert calls.args.ckpt_pg_tensors_cache_create is False
+    assert calls.warnings == [
+        (
+            "--ckpt-pg-tensors-cache-path is ignored when --ckpt-provider=native; "
+            "disabling the process-group cache."
+        ),
+    ]
 
 
 def test_reference_provider_preserves_nvrx_async_queue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,6 +412,9 @@ def test_reference_provider_preserves_nvrx_async_queue(monkeypatch: pytest.Monke
     assert calls.validate == 1
     assert calls.args.async_save is True
     assert calls.args.async_strategy == "nvrx"
+    assert calls.args.ckpt_pg_tensors_cache_path == "/run/pg-cache"
+    assert calls.args.ckpt_pg_tensors_cache_create is True
+    assert calls.warnings == []
 
 
 def test_native_provider_redirects_async_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:

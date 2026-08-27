@@ -205,7 +205,6 @@
           "runner_tags": [
             "ociaga"
           ],
-          "megatron_commit": "74a48940c309fe78b6f2d8591abeb0ae2ea6b6c1",
           "timeout": "1d",
           "jobs": [
             [

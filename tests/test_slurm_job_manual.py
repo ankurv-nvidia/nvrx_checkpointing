@@ -18,7 +18,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
-DEFAULT_MEGATRON_COMMIT = "3126ff2e3c73c18a52130bf73f51fb9dba252b4c"
+DEFAULT_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
 DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
 # A cross-source determinism run materializes one checkout of each dependency
 # per routine.
@@ -1281,6 +1281,33 @@ def test_deterministic_drops_async_checkpointing_by_default(
     assert "--deterministic-mode" in cmd
 
 
+def test_perf_enables_parallel_checkpoint_optimizations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    args = _args(tmp_path, config="nano3", nodes=8, flavors=["perf"])
+    slurm_job._configure_run(args)
+
+    for provider in ("native", "nvrx"):
+        phase1 = slurm_job._phase_command("nano3_8x4", args, provider, 1)[0]
+        phase2 = slurm_job._phase_command("nano3_8x4", args, provider, 2)[0]
+
+        for command in (phase1, phase2):
+            assert command.count("--ckpt-fully-parallel-save-process-group=ep_dp") == 1
+            assert command.count("--ckpt-fully-parallel-load-process-group=ep_dp") == 1
+            assert "--ckpt-fully-parallel-load-per-rank-objects" in command
+            assert "--ckpt-drop-redundant-extra-state" in command
+            assert "--no-ckpt-load-validate-sharding-integrity" in command
+            cache = next(option for option in command if option.startswith("--ckpt-pg-tensors-cache-path="))
+            assert cache.endswith("/pg-tensors-cache")
+        assert "--ckpt-pg-tensors-cache-create" in phase1
+        assert "--ckpt-pg-tensors-cache-create" not in phase2
+
+
 def test_every_variant_is_a_flavor_and_they_mix(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1301,13 +1328,13 @@ def test_every_variant_is_a_flavor_and_they_mix(
     assert "--async-ckpt-use-cpu-shm" not in options("ipc")
     assert "--no-ckpt-fully-parallel-save" in options("serial")
     assert _CONSTANT_STRUCTURE not in options("no-cnst-strct")
-    assert "--drop-redundant-extra-state" in options("drop-xstate")
+    assert "--ckpt-drop-redundant-extra-state" in options("drop-xstate")
 
     # And they compose, each contributing its own part.
     both = options("shm", "pg-cache", "drop-xstate")
     assert "--async-ckpt-use-cpu-shm" in both
     assert "--ckpt-fully-parallel-load-per-rank-objects" in both
-    assert "--drop-redundant-extra-state" in both
+    assert "--ckpt-drop-redundant-extra-state" in both
     # The cache is filled by the phase that creates it and read by the next.
     assert "--ckpt-pg-tensors-cache-create" in options("pg-cache", phase=1)
     assert "--ckpt-pg-tensors-cache-create" not in options("pg-cache", phase=2)
@@ -1929,6 +1956,7 @@ def test_job_array_passes_the_worker_script_directly_to_ft_launcher(
     worker_script = str(Path(slurm_job.__file__).resolve())
     assert worker_script in launcher_line
     assert f"ft_launcher python3 -u {worker_script}" not in launcher_line
+    assert "--rdzv-conf join_timeout=12000,store_connect_wait_seconds=600" in launcher_line
 
 
 def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
@@ -3236,6 +3264,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         " 0:   inference_dynamic_batching_enable_prefix_caching  False\n"
         " 0:   inference_dynamic_batching_unified_memory_level . 0\n"
         " 0:   config_logger_dir ............................... \n"
+        " 0:   ckpt_pg_tensors_cache_path ...................... /run/pg-tensors-cache\n"
         " 0:   data_cache_path ................................. /run/data-cache\n"
         " 0: WARNING: unrelated output inside the argument block\n"
         "0:   micro_batch_size ................................ 1\n"
@@ -3281,6 +3310,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     assert arguments.startswith("------------------------ arguments")
     assert "\n0:" not in arguments
     assert "data_cache_path" not in arguments
+    assert "ckpt_pg_tensors_cache_path" not in arguments
     assert "WARNING" not in arguments
     assert all(line == line.rstrip() for line in arguments.splitlines())
     assert "inference_dynamic_batching_enable_prefix_caching  False" in arguments

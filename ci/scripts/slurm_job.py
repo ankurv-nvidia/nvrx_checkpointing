@@ -88,7 +88,7 @@ ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
 DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.07-py3")
 DEFAULT_MEGATRON_REPO_URL = "https://github.com/NVIDIA/Megatron-LM.git"
-DEFAULT_MEGATRON_COMMIT = "3126ff2e3c73c18a52130bf73f51fb9dba252b4c"
+DEFAULT_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
 DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
@@ -1728,7 +1728,7 @@ def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tup
         line for line in blocks[-1].splitlines()
         if line.startswith("-") or re.match(r"^  [A-Za-z_]\w*(?: \.+ | {2})", line)
     ]
-    volatile = re.compile(r"^  (?:data_cache_path|load|save|tensorboard_dir) ")
+    volatile = re.compile(r"^  (?:ckpt_pg_tensors_cache_path|data_cache_path|load|save|tensorboard_dir) ")
     arguments = output / f"{_arguments_stem(args, variants)}_arguments.txt"
     arguments.write_text("\n".join(line.rstrip() for line in lines if not volatile.match(line)) + "\n")
     return arguments
@@ -2022,10 +2022,29 @@ class PerfFlavor(Flavor):
     execution_mode = True
     name = "perf"
     summary = "Measure one routine against a recorded throughput baseline."
+    edits = (
+        OptionEdit(
+            "all",
+            (
+                "--ckpt-fully-parallel-save-process-group=ep_dp",
+                "--ckpt-fully-parallel-load-process-group=ep_dp",
+                "--ckpt-pg-tensors-cache-path=@PG_CACHE_DIR@",
+                "--ckpt-fully-parallel-load-per-rank-objects",
+                "--ckpt-drop-redundant-extra-state",
+                "--no-ckpt-load-validate-sharding-integrity",
+            ),
+            (
+                "--ckpt-fully-parallel-save-process-group",
+                "--ckpt-fully-parallel-load-process-group",
+            ),
+        ),
+        OptionEdit("phase1", ("--ckpt-pg-tensors-cache-create",), ()),
+    )
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.requires_nvrx_absent = True
         policy.reporter = self.report
+        policy.option_edits += self.edits
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
@@ -3449,7 +3468,7 @@ def _job_array_body(
         '--rdzv-id "${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"',
         "--rdzv-backend c10d",
         '--rdzv-endpoint "${RDZV_HOST}:29400"',
-        "--rdzv-conf join_timeout=1200,store_connect_wait_seconds=600",
+        "--rdzv-conf join_timeout=12000,store_connect_wait_seconds=600",
         "--max-restarts 8",
         "--ft-restart-policy any-failed",
         f"--ft-segment {segment}",

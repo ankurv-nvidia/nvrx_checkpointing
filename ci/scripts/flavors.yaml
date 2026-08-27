@@ -94,4 +94,4 @@ drop-xstate:
   # This writes a smaller checkpoint that is equally correct, so a comparison
   # against a run without it compares two different shapes on purpose.
   all:
-    add: [--drop-redundant-extra-state]
+    add: [--ckpt-drop-redundant-extra-state]

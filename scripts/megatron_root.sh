@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeou pipefail
 
-COMMIT_HASH=${MEGATRON_COMMIT:-3126ff2e3c73c18a52130bf73f51fb9dba252b4c}
+COMMIT_HASH=${MEGATRON_COMMIT:-aac9b2db7f0d203940f6c0a7f2852a094c18c12e}
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
 

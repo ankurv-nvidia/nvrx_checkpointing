@@ -33,6 +33,7 @@
   attention_softmax_in_fp32 ....................... False
   auto_detect_ckpt_format ......................... False
   barrier_with_L1_time ............................ True
+  batch_invariant_backend ......................... te_native
   batch_invariant_mode ............................ False
   bert_binary_head ................................ True
   bert_embedder_type .............................. megatron
@@ -67,7 +68,6 @@
   ckpt_fully_parallel_save_process_group .......... dp
   ckpt_load_validate_sharding_integrity ........... True
   ckpt_pg_tensors_cache_create .................... False
-  ckpt_pg_tensors_cache_path ...................... None
   ckpt_provider ................................... native
   ckpt_step ....................................... None
   classes_fraction ................................ 1.0
@@ -290,6 +290,8 @@
   grpo_iterations ................................. 2
   grpo_kl_beta .................................... 0.001
   grpo_prompts_per_step ........................... 32
+  gtp_expert_remat_nccl_ub ........................ False
+  gtp_remat_nccl_ub ............................... False
   gtp_remat_opt_in_modules ........................ []
   gtp_remat_reduce_scatter_with_fp32_accumulation . False
   gtp_weight_remat_size ........................... 1
@@ -480,7 +482,9 @@
   modelopt_enabled ................................ False
   moe_apply_probs_on_input ........................ False
   moe_aux_loss_coeff .............................. 0.0001
+  moe_combine_bwd_dtype ........................... bf16
   moe_deepep_num_sms .............................. None
+  moe_dispatch_fwd_dtype .......................... bf16
   moe_enable_deepep ............................... False
   moe_enable_routing_replay ....................... False
   moe_expert_capacity_factor ...................... None
@@ -523,6 +527,7 @@
   moe_router_pre_softmax .......................... False
   moe_router_quantile_balancing_ema ............... 0.0
   moe_router_score_function ....................... sigmoid
+  moe_router_skip_muon ............................ False
   moe_router_topk ................................. 22
   moe_router_topk_scaling_factor .................. 5.0
   moe_routing_trace_capture_hidden_states ......... False
@@ -546,6 +551,7 @@
   mscale .......................................... 1.0
   mscale_all_dim .................................. 0.0
   mtp_detach_heads ................................ False
+  mtp_hsm ......................................... False
   mtp_hybrid_override_pattern ..................... None
   mtp_loss_scaling_factor ......................... 0.3
   mtp_num_layers .................................. 2
@@ -562,7 +568,7 @@
   muon_scalar_optimizer ........................... adam
   muon_scale_mode ................................. spectral
   muon_split_qkv .................................. True
-  muon_tp_mode .................................... blockwise
+  muon_tp_mode .................................... duplicated
   muon_use_syrk ................................... False
   mup_attn_scale_power ............................ 1.0
   mup_base_head_dim ............................... None
@@ -689,6 +695,7 @@
   rl_default_temperature .......................... 1.0
   rl_default_top_k ................................ -1
   rl_default_top_p ................................ 0
+  rl_durable_rollout_bank ......................... False
   rl_generation_lag ............................... None
   rl_importance_sampling_truncation_coef .......... None
   rl_inference_expert_model_parallel_size ......... None
@@ -707,6 +714,8 @@
   rl_profile ...................................... False
   rl_profile_dir .................................. None
   rl_prompts_per_eval ............................. 32
+  rl_rollout_bank_dir ............................. None
+  rl_rollout_bank_max_bytes ....................... 0
   rl_sequence_packing_algo ........................ fifo
   rl_sequence_packing_max_sequences_per_bin ....... 50
   rl_skip_bos_token ............................... False
@@ -802,6 +811,7 @@
   use_distributed_optimizer ....................... True
   use_flash_attn .................................. False
   use_fused_weighted_squared_relu ................. False
+  use_gigatoken ................................... False
   use_gloo_process_groups ......................... False
   use_grouped_gemm_for_dense_mlp .................. False
   use_grouped_gemm_for_shared_expert .............. False

@@ -414,6 +414,13 @@ Every run trains its own phase 1 from scratch and resumes its own phase 2
 from it, so `phase1-checkpoints` and `checkpoints` are both compared and a divergence introduced anywhere in training surfaces at the
 first checkpoint that follows it.
 
+The `perf` flavor selects the expert-data-parallel group for fully parallel
+save and load, loads per-rank objects directly, omits redundant extra state,
+and skips sharding-integrity validation. For the NVRx provider, phase 1 creates
+the process-group tensor distribution cache under the run directory and phase
+2 reuses it. The native provider warns and ignores the cache path because its
+checkpoint implementation does not use Megatron's process-group cache.
+
 Every phase resolves its sources from inside the training process, once all
 imports have bound, and records them:
 

@@ -800,7 +800,7 @@ wheel-publish:pypi:
     - job: wheel:aarch64
       artifacts: true
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --megatron-commit 74a48940c309fe78b6f2d8591abeb0ae2ea6b6c1 --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 8 --config nano4 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb300:native:nano4_8x4":
   extends: [.slurm_job, .runner_gb300, .manual_optional]
@@ -811,7 +811,7 @@ wheel-publish:pypi:
     - job: wheel:aarch64
       artifacts: true
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --megatron-commit 74a48940c309fe78b6f2d8591abeb0ae2ea6b6c1 --flavor perf+native"
+    JOB_ARGS: "--nodes 8 --config nano4 --flavor perf+native"
 
 "[DETR]:gb300:nvrx:nano4_8x4":
   extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
@@ -819,7 +819,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb300, 8n, ociaga]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --megatron-commit 74a48940c309fe78b6f2d8591abeb0ae2ea6b6c1 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
+    JOB_ARGS: "--nodes 8 --config nano4 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
 
 # 8node-nano3
 
