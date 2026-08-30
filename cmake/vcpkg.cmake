@@ -266,12 +266,6 @@ macro(vcpkg_init)
     _vcpkg_refresh_available_ports()
 endmacro()
 
-# VCPKG_AUTOCLONE_COMMIT is the minimum vcpkg the ports need: an existing
-# checkout is accepted when its HEAD contains that commit (HEAD may be newer),
-# and is fetched — unshallowed when needed — and pinned to it otherwise. The
-# vcpkg tool is removed on re-pin so the bootstrap in vcpkg_init rebuilds it
-# to match the ports tree. "master" and non-git roots (exported trees) skip
-# the check.
 function(_vcpkg_ensure_min_commit root min_commit)
     if ("${min_commit}" STREQUAL "master" OR NOT EXISTS "${root}/.git")
         return()
@@ -402,3 +396,8 @@ endfunction()
 
 get_property(Z_VCPKG_CMAKE_IN_TRY_COMPILE GLOBAL PROPERTY IN_TRY_COMPILE)
 set(SELF_FILE ${CMAKE_CURRENT_LIST_DIR})
+
+macro(vcpkg_provide_dependency)
+    vcpkg_init()
+    message(WARNING "vcpkg_dependency_provider: ${ARGN}")
+endmacro()

@@ -75,8 +75,8 @@ include_directories(include)
 
 set(BOOST_INCLUDE_LIBRARIES interprocess process dll asio program_options url beast iostreams)
 
-include(fmt)
 include(Boost)
+include(fmt)
 include(hwloc)
 include(miniz)
 include(zlib)
@@ -91,8 +91,13 @@ target_include_directories(phoenix_checkpoint PUBLIC
 )
 
 target_link_libraries(phoenix_checkpoint PUBLIC
+    Boost::asio
+    Boost::beast
+    Boost::dll
+    Boost::interprocess
+    Boost::process
+    Boost::url
     fmt::fmt-header-only
-    Boost::interprocess Boost::process Boost::dll Boost::asio Boost::beast Boost::url
     hwloc::hwloc
 )
 
@@ -148,14 +153,14 @@ endif()
 
 if (PHOENIX_BUILD_BENCHMARK OR PHOENIX_BUILD_TESTS)
     add_library(phoenix_checkpoint_fixture STATIC src/benchmark/ckpt_fixture.cpp)
-    # phoenix_checkpoint_distcp is listed alongside phoenix_checkpoint_server because
+    # distcpio is listed alongside daemon because
     # CMake only propagates OBJECT-library object files one consumer hop deep — the
     # transitive path fixture -> server -> distcp would otherwise leave distcp.cpp.o
     # out of this static archive.
     target_link_libraries(phoenix_checkpoint_fixture PUBLIC
         phoenix_checkpoint
-        phoenix_checkpoint_server
-        phoenix_checkpoint_distcp
+        daemon
+        distcpio
         fmt::fmt-header-only
         Boost::interprocess
         Boost::process
@@ -250,23 +255,23 @@ find_package(cpptrace CONFIG REQUIRED)
 # STATIC + POSITION_INDEPENDENT_CODE=ON would let transitive PUBLIC
 # propagation handle this naturally; defer that until a third consumer hits
 # the same wall.
-add_library(phoenix_checkpoint_distcp OBJECT src/checkpoint/distcp.cpp)
-target_link_libraries(phoenix_checkpoint_distcp PUBLIC
+add_library(distcpio OBJECT src/checkpoint/distcp.cpp)
+target_link_libraries(distcpio PUBLIC
     phoenix_checkpoint
     fmt::fmt-header-only
     miniz::miniz
     ZLIB::ZLIB)
 
-add_library(phoenix_checkpoint_server OBJECT
+add_library(daemon OBJECT
     src/checkpoint/server.cpp)
-# miniz is pulled in transitively via phoenix_checkpoint_distcp (PUBLIC above).
-target_link_libraries(phoenix_checkpoint_server PUBLIC phoenix_checkpoint phoenix_checkpoint_distcp fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url OpenSSL::Crypto)
+# miniz is pulled in transitively via distcpio (PUBLIC above).
+target_link_libraries(daemon PUBLIC phoenix_checkpoint distcpio fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url OpenSSL::Crypto)
 
 add_executable(checkpoint_server src/checkpoint/server_main.cpp)
-# phoenix_checkpoint_distcp is listed directly because CMake only propagates
+# distcpio is listed directly because CMake only propagates
 # OBJECT-lib object files one consumer hop — without this, distcp.cpp.o is
 # missing from the executable even though server.cpp references it.
-target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint_server phoenix_checkpoint_distcp cpptrace::cpptrace)
+target_link_libraries(checkpoint_server PUBLIC daemon distcpio cpptrace::cpptrace)
 
 add_custom_command(TARGET checkpoint_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>
@@ -307,7 +312,7 @@ if (PHOENIX_BUILD_TESTS)
             src/python/distcp_shim.cpp)
         SupressWarningForTarget(_distcp_shim)
         target_link_libraries(_distcp_shim PRIVATE
-            phoenix_checkpoint_distcp fmt::fmt-header-only)
+            distcpio fmt::fmt-header-only)
         target_is_python_extension(_distcp_shim)
 
         add_custom_command(TARGET _distcp_shim POST_BUILD

@@ -1,3 +1,4 @@
+#include "config.h"
 #include "logging.h"
 #include "messages.h"
 #include "server.h"
@@ -22,26 +23,8 @@
 extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);
 
-// Allow templated names and Expand %h (hostname) and %p (pid) to avoid collision on network-shared-fs
 static std::string GetLogPath()
-{
-    char const*           envLog  = ::getenv("NATIVE_CKPT_SERVER_LOG");
-    std::string           path    = (envLog != nullptr && *envLog != '\0') ? std::string(envLog) : "/tmp/native_ckpt_server.%h_%p.log";
-    std::array<char, 256> hostbuf = {};
-    std::string const     host
-        = (::gethostname(hostbuf.data(), hostbuf.size() - 1) == 0) ? std::string(hostbuf.data()) : std::string("unknown-host");
-
-    auto subst = [](std::string& s, char const* tok, std::string const& val) {
-        std::string const token(tok);
-        for (std::size_t pos = s.find(token); pos != std::string::npos; pos = s.find(token, pos + val.size()))
-        {
-            s.replace(pos, token.size(), val);
-        }
-    };
-    subst(path, "%h", host);
-    subst(path, "%p", std::to_string(::getpid()));
-    return path;
-}
+{ return checkpoint::config::GetConfigValue<checkpoint::config::ServerLog>().string(); }
 
 // Detach stdin/stderr so the daemon never blocks on a pipe owned by the departed client.
 // Stdout stays on the launcher pipe for RunServer's "READY\n" handshake (single-write, SIGPIPE ignored).

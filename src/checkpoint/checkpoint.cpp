@@ -2,6 +2,7 @@
 #include "SetThreadName.h"
 
 #include "checkpoint.h"
+#include "config.h"
 #include "fmttensor.h"
 #include "messages.h"
 #include "numa_utils.h"
@@ -49,12 +50,6 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
-static auto GetEnv(char const* envVar, std::string_view defaultVal) -> std::string_view
-{
-    auto* val = getenv(envVar);
-    return val != nullptr ? std::string_view(val) : defaultVal;
-};
-
 void SvcPing()
 {
     SUPPRESS_WARNINGS_START
@@ -66,7 +61,7 @@ void SvcPing()
     auto             selfLoc   = boost::dll::this_line_location();
     auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
     if (TryConnectToCheckpointService()) { return; }
-    if (GetEnv("CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH", "0") == "1")
+    if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }

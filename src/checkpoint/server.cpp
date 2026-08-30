@@ -5,6 +5,7 @@
 #include "fmttensor.h"
 #include "logging.h"
 #include "messages.h"
+#include "net_utils.h"
 #include "numa_utils.h"
 #include "serdes_utils.h"
 #include "server.h"
@@ -223,11 +224,6 @@ template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
         return fmt::format_to(ctx.out(), "{:x}", ptrVal);
     }
 };
-
-template <> struct fmt::formatter<boost::asio::ip::tcp::endpoint> : fmt::ostream_formatter
-{};
-template <> struct fmt::formatter<boost::asio::ip::address> : fmt::ostream_formatter
-{};
 
 template <typename TStream> static void TryCleanShutdown(TStream& stream)
 {
@@ -533,60 +529,6 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
             }
         }
     });
-}
-
-static auto ResolvePeerEndpoint(boost::asio::io_context& ioc, std::string_view const& peer)
-{
-    // For some weird reason resolver does not like quering the same peer multiple times
-    // Ends up giving host not found. So just cache the results to avoid duplicate work
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type> EndpointCache;
-    static std::mutex                                                                         Mutex;
-    SUPPRESS_WARNINGS_END
-
-    boost::urls::url peerAddr;
-
-    auto it = peer.find(':');
-    if (it != std::string::npos)
-    {
-        peerAddr.set_host(peer.substr(0, it));
-        peerAddr.set_port(peer.substr(it + 1));
-    }
-    else
-    {
-        peerAddr.set_host(peer);
-        peerAddr.set_port(std::to_string(cipc::Message::Port));
-    }
-
-    std::scoped_lock lock(Mutex);
-    if (auto it1 = EndpointCache.find(peerAddr); it1 != EndpointCache.end()) { return std::make_pair(it1->first, it1->second); }
-
-    boost::asio::ip::tcp::resolver resolver(ioc);
-    auto                           results = resolver.resolve(peerAddr.host(), peerAddr.port());
-    if (results.empty()) { throw std::runtime_error(fmt::format("[native_ckpt:svr] Failed to resolve address for peer={}", peer)); }
-    EndpointCache[peerAddr] = results;
-    return std::make_pair(peerAddr, results);
-}
-
-[[nodiscard]] static auto CreateRequestForPeer(boost::asio::io_context&  ioc,
-                                               boost::beast::tcp_stream& stream,
-                                               std::string_view const&   peer,
-                                               std::string_view const&   target)
-{
-    auto [peerAddr, resolveResults] = ResolvePeerEndpoint(ioc, peer);
-    auto const endpoint             = stream.connect(resolveResults);
-    INFO("Connected to endpoint={} resolved from peer={}", endpoint, peer);
-
-    Request req;
-    // Write HTTP/1.1 request headers with Transfer-Encoding: chunked (no Content-Length)
-    req.method(boost::beast::http::verb::post);
-    static constexpr int HttpVersion11 = 11;    // HTTP/1.1
-    req.version(HttpVersion11);
-    req.set(boost::beast::http::field::host, fmt::format("{}:{}", peerAddr.host(), peerAddr.port()));
-    req.set(boost::beast::http::field::content_type, "application/octet-stream");
-    req.target(target);
-    return req;
 }
 
 Session::Session(Server* serverIn, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :

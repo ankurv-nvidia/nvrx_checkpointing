@@ -93,7 +93,7 @@ SUPPRESS_CLANG_WARNING("-Wunused-macros")
 #endif
 
 #ifndef CLASS_DEFAULT_COPY_AND_MOVE
-// NOLINTBEGIN(bugprone-macro-parentheses)
+// NOLINTBEGIN(bugprone-macro-parentheses,cppcoreguidelines-macro-usage)
 #define CLASS_DEFAULT_COPY_AND_MOVE(name)       \
     name(name const&)                = default; \
     name(name&&) noexcept            = default; \
@@ -139,9 +139,9 @@ SUPPRESS_CLANG_WARNING("-Wunused-macros")
     constexpr strct& operator=(strct&&)               = default; \
     ~strct()                                          = default; \
     constexpr bool operator==(strct const& rhs) const = default
-// NOLINTEND(bugprone-macro-parentheses)
+// NOLINTEND(bugprone-macro-parentheses,cppcoreguidelines-macro-usage)
 #ifndef TODO
 #ifdef __cpp_exceptions
-#define TODO(...) throw "TODO:" __VA_ARGS__
+#define TODO(...) throw "TODO:" __VA_ARGS__    // NOLINT(cppcoreguidelines-macro-usage)
 #endif
 #endif
