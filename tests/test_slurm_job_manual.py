@@ -2468,6 +2468,15 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert main_only
     assert all(job["extends"][-1] == ".main_branch_runs_pipeline" for job in main_only.values())
 
+    gpt_moe = workloads["[PERF]:gb200:native:gpt_moe_1x4"]
+    assert gpt_moe["extends"] == [".slurm_job", ".runner_gb200", ".main_branch_runs_pipeline"]
+    assert gpt_moe["tags"] == ["gb200", "1n"]
+    assert shlex.split(gpt_moe["variables"]["JOB_ARGS"]) == [
+        "--nodes", "1", "--config", "gpt_moe",
+        "--flavor", "perf+native",
+        "--checkpoint-interval", "20",
+    ]
+
     large = {
         name: job for name, job in workloads.items()
         if (
@@ -2990,6 +2999,7 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert "[DETR]:gb200:native:nano3_8x4" in bundles["main-branch-runs"]["dependencies"]
     assert "[PERF]:gb200:native:nano3_8x4" in bundles["main-branch-runs"]["dependencies"]
     assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
+    assert "[PERF]:gb200:native:gpt_moe_1x4" in bundles["main-branch-runs"]["dependencies"]
 
 
 def test_default_native_jobs_use_wheel_artifacts() -> None:
@@ -4456,6 +4466,40 @@ def test_nano4_matches_the_30b_gdp_reference_architecture() -> None:
     main, *mtp = nano4["hybrid-layer-pattern"].split("/")
     assert len(main) == 52  # noqa: PLR2004
     assert mtp == ["*E", "*E"]
+
+
+def test_gpt_moe_reproduces_two_prepended_expert_axes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    gpt_moe = slurm_job._model_config("gpt_moe")
+
+    assert gpt_moe["ci"] == {"pretrain-entry": "gpt"}
+    assert gpt_moe["num-layers"] == 2  # noqa: PLR2004
+    assert gpt_moe["num-experts"] == 8  # noqa: PLR2004
+    assert gpt_moe["moe-layer-freq"] == 1
+    assert gpt_moe["moe-grouped-gemm"] is True
+    assert gpt_moe["tensor-model-parallel-size"] == 2  # noqa: PLR2004
+    assert gpt_moe["expert-model-parallel-size"] == 2  # noqa: PLR2004
+    assert gpt_moe["expert-tensor-parallel-size"] == 2  # noqa: PLR2004
+    assert gpt_moe["kv-channels"] == 32  # noqa: PLR2004
+    assert gpt_moe["is-hybrid-model"] is False
+    assert gpt_moe["spec"] is None
+
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    args = _args(tmp_path, config="gpt_moe", nodes=1, gpus_per_node=4, flavors=["perf", "native"])
+    slurm_job._configure_run(args)
+    command, _env = slurm_job._phase_command("gpt_moe_1x4", args, "native", 2)
+
+    entry = command.index(slurm_job._PRETRAIN_ENTRY_CMD)
+    assert command[entry + 1 : entry + 3] == ["2", "gpt"]
+    assert "--ci" not in command
+    assert "--is-hybrid-model" not in command
+    assert "--spec" not in command
+    assert command[command.index("--moe-layer-freq") + 1] == "1"
 
 
 def test_super3_profiles_share_reference_architecture() -> None:

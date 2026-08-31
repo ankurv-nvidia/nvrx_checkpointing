@@ -445,9 +445,9 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                 "global_shape size ([{}]) mismatch with global_offset size ([{}])", nb::str(globalShape), nb::str(globalOffset)));
         }
 
-        [&]() {
+        auto prependAxisNumValue = [&]() -> size_t {
             auto prependAxisNum = container["prepend_axis_num"];
-            if (prependAxisNum.is_none() && globalShape.size() == localShape.size()) { return; }
+            if (prependAxisNum.is_none() && globalShape.size() == localShape.size()) { return 0; }
             if (prependAxisNum.is_none() && globalShape.size() != localShape.size())
             {
                 throwError(fmt::format("prepend_axis_num is None inconsistent with global_shape([{}]), local_shape([{}])",
@@ -455,13 +455,16 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                                        nb::str(localShape)));
             }
             if (!nb::isinstance<int64_t>(prependAxisNum)) { throwError("prependAxisNum is not int"); }
-            auto prependAxisNumValue = nb::cast<int64_t>(prependAxisNum);
-            if (prependAxisNumValue == 0 && globalShape.size() == localShape.size()) { return; }
-            if (prependAxisNumValue == 1 && globalShape.size() == (localShape.size() + 1)) { return; }
+            auto value = nb::cast<int64_t>(prependAxisNum);
+            if (value >= 0 && globalShape.size() >= localShape.size() && std::cmp_equal(value, globalShape.size() - localShape.size()))
+            {
+                return static_cast<size_t>(value);
+            }
             throwError(fmt::format("prepend_axis_num = {} inconsistent with global_shape([{}]), local_shape([{}])",
-                                   prependAxisNumValue,
+                                   value,
                                    nb::str(globalShape),
                                    nb::str(localShape)));
+            std::unreachable();
         }();
 
         [&]() {
@@ -503,11 +506,11 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                 }
                 auto fragVal      = nb::cast<int64_t>(axisFragmentationsTuple[i]);
                 auto globalDimVal = nb::cast<int64_t>(globalShape[i]);
-                if (globalShape.size() != localShape.size() && i == 0)
+                if (i < prependAxisNumValue)
                 {
                     if (fragVal != globalDimVal)
                     {
-                        throwError("axis_fragmentations[0] does not match global_shape[0] for prepend_axis_num=1 case");
+                        throwError(fmt::format("axis_fragmentations[{}] does not match global_shape[{}] for prepended axis", i, i));
                     }
                     continue;
                 }
@@ -528,13 +531,12 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         for (auto const& val : globalShape) { ds4tensor.fulldim.push_back(nb::cast<DS4Tensor::SizeT>(val)); }
         for (size_t i = 0; i < globalShape.size(); ++i)
         {
-            auto    start               = nb::cast<int64_t>(globalOffset[i]);
-            auto    prependAxisNumValue = nb::cast<int64_t>(container["prepend_axis_num"]);
+            auto    start = nb::cast<int64_t>(globalOffset[i]);
             int64_t end{};
-            if (std::cmp_less(i, prependAxisNumValue)) { end = start + 1; }
+            if (i < prependAxisNumValue) { end = start + 1; }
             else
             {
-                end = start + nb::cast<int64_t>(localShape[i - static_cast<size_t>(prependAxisNumValue)]);
+                end = start + nb::cast<int64_t>(localShape[i - prependAxisNumValue]);
             }
             ds4tensor.sharddim.push_back(Range{.begin = static_cast<size_t>(start), .end = static_cast<size_t>(end)});
         }

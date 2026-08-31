@@ -175,6 +175,44 @@ void AddShardedTensorLeaf(StateTree&                 tree,
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
 
+TEST_CASE("state registry permits distinct local shards under one tensor key", "[state][tier1]")
+{
+    StateTree tree(SingleRankTopo());
+
+    auto addShard = [&](size_t layer, size_t expert) {
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN("weight");
+        auto&     leaf          = tree.AddChild(parent, leafName);
+        DS4Tensor tensor;
+        tensor.dtype  = DS4Tensor::DType::Float32;
+        tensor.device = DeviceId{"cpu"};
+        for (auto dim : {size_t{2}, size_t{2}, size_t{4}}) { tensor.fulldim.push_back(dim); }
+        tensor.sharddim.push_back({.begin = layer, .end = layer + 1});
+        tensor.sharddim.push_back({.begin = expert, .end = expert + 1});
+        tensor.sharddim.push_back({.begin = 0, .end = 4});
+        leaf.data = tensor;
+    };
+
+    addShard(1, 1);
+    addShard(0, 1);
+    addShard(1, 0);
+    addShard(0, 0);
+    REQUIRE_NOTHROW(tree.FinalizeRegistry());
+
+    std::vector<DS4Tensor::DimRange> ranges;
+    tree.WalkNodes([&](StateNode const& node) {
+        if (tree.GetNodeId(node.handle) == "weight") { ranges.push_back(std::get<StateNode::TensorShard>(node.data).sharddim); }
+    });
+    REQUIRE(ranges.size() == 4);
+    REQUIRE(ranges[0][0].begin == 0);
+    REQUIRE(ranges[0][1].begin == 0);
+    REQUIRE(ranges[1][0].begin == 0);
+    REQUIRE(ranges[1][1].begin == 1);
+    REQUIRE(ranges[2][0].begin == 1);
+    REQUIRE(ranges[2][1].begin == 0);
+    REQUIRE(ranges[3][0].begin == 1);
+    REQUIRE(ranges[3][1].begin == 1);
+}
+
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
 {
     auto const beginRecord

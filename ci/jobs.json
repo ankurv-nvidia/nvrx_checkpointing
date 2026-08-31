@@ -37,6 +37,20 @@
       ],
       "multinode": [
         {
+          "key": "gpt-moe",
+          "config": "gpt_moe",
+          "nodes": 1,
+          "scale": "1x4",
+          "pipeline_suite": "main-branch-runs",
+          "checkpoint_interval": 20,
+          "jobs": [
+            [
+              "native",
+              "perf"
+            ]
+          ]
+        },
+        {
           "key": "nano3",
           "config": "nano3",
           "nodes": 8,

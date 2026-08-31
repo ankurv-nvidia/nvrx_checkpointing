@@ -645,9 +645,23 @@ struct StateTree
                 if (childJ.data.index() == static_cast<size_t>(StateNode::Type::Invalid)) { continue; }
                 if (cmp == 0)
                 {
-                    fmt::print(
-                        stderr, "Duplicate state name {} found in root registry. Parent Node: {} \n", childI.name, GetNodeId(node.handle));
-                    throw std::runtime_error(fmt::format("Duplicate state name {} found in root registry", childI.name));
+                    auto const tensorShardType = static_cast<size_t>(StateNode::Type::TensorShard);
+                    if (childI.data.index() != tensorShardType || childJ.data.index() != tensorShardType)
+                    {
+                        fmt::print(stderr,
+                                   "Duplicate state name {} found in root registry. Parent Node: {} \n",
+                                   childI.name,
+                                   GetNodeId(node.handle));
+                        throw std::runtime_error(fmt::format("Duplicate state name {} found in root registry", childI.name));
+                    }
+                    auto const& shardI = std::get<StateNode::TensorShard>(childI.data);
+                    auto const& shardJ = std::get<StateNode::TensorShard>(childJ.data);
+                    if (shardI.dtype != shardJ.dtype || shardI.fulldim != shardJ.fulldim || shardI.sharddim == shardJ.sharddim)
+                    {
+                        throw std::runtime_error(fmt::format("Duplicate tensor shard {} found in root registry", childI.name));
+                    }
+                    // Megatron emits stacked layers and experts as distinct local shards under one FQN.
+                    cmp = shardJ.sharddim < shardI.sharddim ? 1 : -1;
                 }
                 if (cmp > 0)
                 {

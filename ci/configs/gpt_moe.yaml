@@ -1,0 +1,74 @@
+# One-node homogeneous GPT-MoE reproducer for the two prepended layer/expert axes in NVBug 6683329.
+
+ci:
+  pretrain-entry: gpt
+
+# Disable the hybrid/MTP architecture inherited from the common profile.
+is-hybrid-model: false
+spec: null
+hybrid-override-pattern: null
+mamba-num-heads: null
+mtp-num-layers: null
+mtp-hybrid-override-pattern: null
+mtp-loss-scaling-factor: null
+moe-latent-size: null
+first-last-layers-bf16: false
+
+# Width and sequence length are reduced because registration depends on axis count, not tensor size.
+num-layers: 2
+hidden-size: 256
+ffn-hidden-size: 512
+moe-ffn-hidden-size: 512
+num-attention-heads: 8
+group-query-attention: true
+num-query-groups: 8
+kv-channels: 32
+seq-length: 128
+max-position-embeddings: 128
+position-embedding-type: rope
+rotary-base: 500000
+vocab-size: 32000
+
+# Homogeneous grouped experts create both prepended axes; the layer frequency remains explicit.
+num-experts: 8
+moe-layer-freq: 1
+moe-grouped-gemm: true
+moe-router-topk: 2
+moe-router-load-balancing-type: aux_loss
+moe-aux-loss-coeff: "1e-2"
+moe-router-dtype: fp32
+moe-router-score-function: softmax
+moe-router-enable-expert-bias: false
+moe-permute-fusion: false
+moe-token-dispatcher-type: alltoall
+
+# One GB200 node retains tensor, expert, and expert-tensor sharding on four GPUs.
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 2
+expert-tensor-parallel-size: 2
+pipeline-model-parallel-size: 1
+sequence-parallel: true
+micro-batch-size: 2
+global-batch-size: 8
+
+swiglu: true
+squared-relu: false
+use-fused-weighted-squared-relu: false
+cross-entropy-loss-fusion: false
+cross-entropy-fusion-impl: null
+cuda-graph-impl: null
+cuda-graph-modules: null
+no-gradient-accumulation-fusion: false
+
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+async-save: true
+use-persistent-ckpt-worker: true
+ckpt-assume-constant-structure: true
+
+eval-iters: 0
+eval-interval: 1000
+log-interval: 1
+job_time_in_mins:
+  srun:
+    perf: 60

@@ -131,6 +131,7 @@ _SLURM_STATUS_PERIOD_SECONDS = 5 * 60
 _PHASE1_TRAIN_ITERS = 100
 _LONG_RUN_TRAIN_SAMPLES = 1_000_000_000
 _CLEANUP_GRACE_MINUTES = 5
+_PRETRAIN_ENTRYPOINTS = frozenset({"gpt", "hybrid"})
 
 # One array task owns one NVLink domain: TP/EP collectives stay on NVLink and
 # --ft-segment can evict and replace a whole domain at once. Any job wider than
@@ -2507,6 +2508,14 @@ def _model_config(name: str) -> dict:
     base = _load_yaml(CONFIGS_DIR / "base.yaml")
     return _deep_merge(base, _profile_config(name))
 
+def _pretrain_entrypoint(config_name: str) -> str:
+    metadata = _model_config(config_name).get("ci") or {}
+    entrypoint = metadata.get("pretrain-entry", "hybrid")
+    if entrypoint not in _PRETRAIN_ENTRYPOINTS:
+        choices = ", ".join(sorted(_PRETRAIN_ENTRYPOINTS))
+        raise ValueError(f"model config {config_name!r} has invalid CI pretrain entrypoint {entrypoint!r}; choose {choices}")
+    return entrypoint
+
 
 def _time_budget(config_name: str, flavors: FlavorSelection, use: str, default: int) -> int:
     table = (_model_config(config_name).get("job_time_in_mins") or {}).get(use) or {}
@@ -2607,7 +2616,7 @@ def _train_options(cfg: str, config: TrainConfig) -> list[str]:
     model = {
         k: v
         for k, v in _model_config(config.model_config).items()
-        if k not in {"job_partition", "job_time_in_mins"}
+        if k not in {"ci", "job_partition", "job_time_in_mins"}
     }
     if config.extend_training:
         model["train-samples"] = _LONG_RUN_TRAIN_SAMPLES
@@ -2764,7 +2773,11 @@ def _phase_command(
     if "--fine-grained-activation-offloading" in opts:
         env["NVTE_CPU_OFFLOAD_V1"] = "1"
     os.environ["NATIVE_CKPT_SERVER_LOG"] = env["NATIVE_CKPT_SERVER_LOG"]
-    return ["python3", "-u", str(Path(__file__).resolve()), _PRETRAIN_ENTRY_CMD, str(phase), *opts, *args.extra_args], env
+    entrypoint = _pretrain_entrypoint(config.model_config)
+    return [
+        "python3", "-u", str(Path(__file__).resolve()), _PRETRAIN_ENTRY_CMD,
+        str(phase), entrypoint, *opts, *args.extra_args,
+    ], env
 def _print_flavor_options(flavors: FlavorSelection, phase: int, applied: list[str]) -> None:
     """Record what the selected variants changed about this phase's command."""
     if _rank_env("SLURM_PROCID", "RANK", "0") != "0" or not applied:
@@ -3276,7 +3289,7 @@ class _PeakHbmSampler:
         with contextlib.suppress(Exception):
             self._sample_once()
 
-def _pretrain_entry(phase: int) -> None:
+def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
@@ -3290,19 +3303,24 @@ def _pretrain_entry(phase: int) -> None:
         pretrain,
         set_startup_timestamps,
     )
-    from megatron.training.argument_utils import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
-        hybrid_config_from_args,
-        pretrain_cfg_container_from_args,
-    )
+    from megatron.training.argument_utils import pretrain_cfg_container_from_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
 
     try:
         from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     except ImportError:
         add_modelopt_args = None
-    import pretrain_hybrid as ph  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
-    from hybrid_builders import hybrid_builder  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
-    from model_provider import model_provider  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    if entrypoint == "gpt":
+        import pretrain_gpt as pretrain_module  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+        from megatron.training.argument_utils import gpt_config_from_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    elif entrypoint == "hybrid":
+        import pretrain_hybrid as pretrain_module  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+        from hybrid_builders import hybrid_builder as model_builder  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+        from megatron.training.argument_utils import hybrid_config_from_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+        from model_provider import model_provider  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    else:
+        choices = ", ".join(sorted(_PRETRAIN_ENTRYPOINTS))
+        raise ValueError(f"unknown pretrain entrypoint {entrypoint!r}; choose {choices}")
 
     rank0 = os.environ.get("RANK", "0") == "0"
     if rank0:
@@ -3310,25 +3328,31 @@ def _pretrain_entry(phase: int) -> None:
         _print_source_provenance()
     start = time.time()
     set_startup_timestamps(program_start=start, main_entry=start)
-    ph.train_valid_test_datasets_provider.is_distributed = True
+    pretrain_module.train_valid_test_datasets_provider.is_distributed = True
     pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     args = parse_and_validate_args(
         extra_args_provider=megatron_integration.compose_extra_args_provider(add_modelopt_args),
         args_defaults={"tokenizer_type": "NullTokenizer"},
     )
-    model_cfg = hybrid_config_from_args(args)
+    model_cfg = hybrid_config_from_args(args) if entrypoint == "hybrid" else gpt_config_from_args(args)
     import torch  # noqa: PLC0415
 
     hbm = _PeakHbmSampler(torch)
     hbm.start()
     try:
+        pretrain_kwargs = {
+            "train_valid_test_dataset_provider": pretrain_module.train_valid_test_datasets_provider,
+            "model_type": ModelType.encoder_or_decoder,
+            "forward_step_func": pretrain_module.forward_step,
+            "store": store,
+        }
+        if entrypoint == "gpt":
+            pretrain_kwargs["get_embedding_ranks"] = pretrain_module.get_embedding_ranks
+        else:
+            pretrain_kwargs["model_provider"] = partial(model_provider, model_builder)
         pretrain_fn(
             pretrain_cfg_container_from_args(args, model_cfg),
-            train_valid_test_dataset_provider=ph.train_valid_test_datasets_provider,
-            model_provider=partial(model_provider, hybrid_builder),
-            model_type=ModelType.encoder_or_decoder,
-            forward_step_func=ph.forward_step,
-            store=store,
+            **pretrain_kwargs,
         )
     finally:
         import resource  # noqa: I001, PLC0415
@@ -4202,9 +4226,10 @@ if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--diff-digests":
         _diff_digests(Path(sys.argv[2]), Path(sys.argv[3]))
     if len(sys.argv) > 1 and sys.argv[1] == _PRETRAIN_ENTRY_CMD:
-        phase = int(sys.argv.pop(2))
-        sys.argv = ["pretrain_hybrid.py", *sys.argv[2:]]
-        _pretrain_entry(phase)
+        phase = int(sys.argv[2])
+        entrypoint = sys.argv[3]
+        sys.argv = [f"pretrain_{entrypoint}.py", *sys.argv[4:]]
+        _pretrain_entry(phase, entrypoint)
     elif len(sys.argv) > 1 and sys.argv[1] == _EPILOG_ENTRY_CMD:
         _epilog(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == _RANK_LOGS_ENTRY_CMD:

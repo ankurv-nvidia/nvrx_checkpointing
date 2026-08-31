@@ -629,6 +629,12 @@ wheel-publish:pypi:
   variables:
     JOB_ARGS: "--config pico --flavor perf+native"
 
+"[PERF]:gb200:native:gpt_moe_1x4":
+  extends: [.slurm_job, .runner_gb200, .main_branch_runs_pipeline]
+  tags: [gb200, 1n]
+  variables:
+    JOB_ARGS: "--nodes 1 --config gpt_moe --flavor perf+native --checkpoint-interval 20"
+
 "[PERF]:h100:native:pico_1x8":
   extends: [.slurm_job, .runner_h100, .main_branch_runs_pipeline]
   tags: [h100, 1n]
@@ -918,6 +924,7 @@ wheel-publish:pypi:
   when: always
   dependencies:
     - "gb200:valgrind:pico_1x4"
+    - "[PERF]:gb200:native:gpt_moe_1x4"
     - "[DETR]:gb200:native:nano3_8x4"
     - "[PERF]:gb200:native:nano3_8x4"
     - "[DETR]:gb200:native:nano3_8x4:vg"
