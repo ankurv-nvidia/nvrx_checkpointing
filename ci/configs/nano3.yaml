@@ -1,7 +1,7 @@
 # nano3 profile: a fixed-EP (EP=32) Mamba-hybrid MoE recipe run at 8 nodes,
 # mirroring a real nemotron-MoE "nano" training run as closely as the CI harness
 # allows. Deep-merged over base.yaml. Model dimensions, routing, attention
-# grouping, the bf16 layer head/tail, MTP, the precision-aware (bf16) optimizer,
+# grouping, the bf16 layer head/tail, MTP, the precision-aware optimizer,
 # and the MoE routing/streaming knobs are pinned here to match the production
 # recipe. Parallelism pins TP=2 / EP=32 (EP=32 needs >= 32 GPUs, i.e. 8 nodes at
 # 4 GPUs/node); global batch size tracks the runner's GPU count.
@@ -59,12 +59,10 @@ mtp-hybrid-override-pattern: null
 mtp-loss-scaling-factor: "0.1"
 calculate-per-token-loss: false
 
-# Precision-aware optimizer: bf16 moments + bf16 main grads, grads reduced in
-# bf16 (which also clears accumulate-allreduce-grads-in-fp32 in code).
+# Precision-aware optimizer keeps main grads and reductions in bf16. Optimizer
+# parameters and moments inherit their fp32 dtypes from the common profile.
 use-precision-aware-optimizer: true
 main-grads-dtype: bf16
-exp-avg-dtype: bf16
-exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
 
 # Routing (top-k and scaling pinned for nano)

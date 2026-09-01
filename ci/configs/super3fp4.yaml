@@ -7,12 +7,10 @@ inherits: super3
 fp4-format: e2m1
 fp4-recipe: nvfp4
 
-# Keep optimizer state in BF16 so the 88-layer model retains additional HBM
-# headroom for fused cross-entropy and MTP temporaries on GB200 GPUs.
+# Precision-aware optimizer keeps main grads and reductions in bf16. Optimizer
+# parameters and moments inherit their fp32 dtypes from the common profile.
 use-precision-aware-optimizer: true
 main-grads-dtype: bf16
-exp-avg-dtype: bf16
-exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
 
 # Mamba capture faults on replay, while adding MoE-router capture consumes too

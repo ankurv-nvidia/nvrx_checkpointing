@@ -141,7 +141,11 @@ def _emit_multinode(
             # the staging a given flavor wants when the default does not suit
             # it, so one flavor's staging changes without moving the other's.
             if entry["nodes"] >= ASYNC_FROM_NODES:
-                common += "+" + entry.get("staging", {}).get(flavors[0], "async")
+                # A null per-flavor staging override keeps that validation
+                # synchronous while the other jobs for the entry stay async.
+                staging = entry.get("staging", {}).get(flavors[0], "async")
+                if staging:
+                    common += "+" + staging
             flavor_flags = (
                 f"--flavor {common} --run=ref:nvrx --run=cmp:{provider}"
                 if flavors[0] == "detr" and "vg" not in flavors

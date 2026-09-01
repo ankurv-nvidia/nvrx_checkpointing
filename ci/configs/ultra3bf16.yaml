@@ -68,8 +68,6 @@ lr: "2.5e-4"
 min-lr: "2.5e-6"
 use-precision-aware-optimizer: true
 main-grads-dtype: bf16
-exp-avg-dtype: bf16
-exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
 
 # Keep the persistent async checkpoint worker on CPU-backed shared memory.

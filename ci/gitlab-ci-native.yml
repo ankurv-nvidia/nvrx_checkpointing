@@ -777,7 +777,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 64n]
   variables:
-    JOB_ARGS: "--nodes 64 --config ultra3fp8 --flavor detr+async --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 64 --config ultra3fp8 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:ultra3fp8_64x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
@@ -817,7 +817,7 @@ wheel-publish:pypi:
     - job: wheel:aarch64
       artifacts: true
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --flavor perf+native"
+    JOB_ARGS: "--nodes 8 --config nano4 --flavor perf+native --checkpoint-interval 25"
 
 "[DETR]:gb300:nvrx:nano4_8x4":
   extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]

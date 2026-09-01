@@ -1,14 +1,10 @@
 # Explicit BF16 precision profile for the shared Super3 architecture.
 inherits: super3
 
-# Keep optimizer state in BF16 so the 88-layer model retains enough HBM for
-# the fused cross-entropy temporary, as the NVFP4 profile of the same
-# architecture already does. Without it the deterministic gate exhausts the
-# device at sixteen nodes.
+# Precision-aware optimizer keeps main grads and reductions in bf16. Optimizer
+# parameters and moments inherit their fp32 dtypes from the common profile.
 use-precision-aware-optimizer: true
 main-grads-dtype: bf16
-exp-avg-dtype: bf16
-exp-avg-sq-dtype: bf16
 grad-reduce-in-bf16: true
 
 # Recompute the MoE block rather than holding it. The deterministic gate

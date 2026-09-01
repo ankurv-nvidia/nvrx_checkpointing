@@ -187,8 +187,8 @@
   exit_signal_handler ............................. False
   exit_signal_handler_for_dataloader .............. False
   exit_signal_handler_for_training ................ False
-  exp_avg_dtype ................................... torch.bfloat16
-  exp_avg_sq_dtype ................................ torch.bfloat16
+  exp_avg_dtype ................................... torch.float32
+  exp_avg_sq_dtype ................................ torch.float32
   experimental_attention_variant .................. None
   expert_gtp_weight_remat_size .................... 1
   expert_model_parallel_size ...................... 32

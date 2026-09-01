@@ -2451,6 +2451,9 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
         assert "--cuda-graph-impl" not in args
         assert "--cuda-graph-modules" not in args
         assert "--muon-fp32-matmul-prec" not in args
+        if "[PERF]" in name:
+            interval_index = args.index("--checkpoint-interval")
+            assert args[interval_index + 1] == "25"
 
     nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
     assert any(":super3fp4_16x4" in name for name in nvrx)
@@ -2498,11 +2501,12 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     ultra64_det = shlex.split(large["[DETR]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
     assert ultra64_det == [
         "--nodes", "64", "--config", "ultra3fp8",
-        "--flavor", "detr+async", "--run=ref:nvrx", "--run=cmp:native",
+        "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
     ]
     # Staging is named per entry and per flavor: the sixteen-node gate stages
-    # through shared memory while the run beside it and the 64-node gate keep
-    # the default.
+    # through shared memory while the run beside it keeps the default. The
+    # 64-node determinism gate stays synchronous to avoid async staging's extra
+    # host-memory pressure for this large optimizer state.
     super16_det = shlex.split(large["[DETR]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
     super16_perf = shlex.split(large["[PERF]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
     assert "detr+shm" in super16_det
@@ -4390,8 +4394,9 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
         "ckpt-fully-parallel-load-process-group": "ep_dp",
         "use-precision-aware-optimizer": True,
         "main-grads-dtype": "bf16",
-        "exp-avg-dtype": "bf16",
-        "exp-avg-sq-dtype": "bf16",
+        "main-params-dtype": "fp32",
+        "exp-avg-dtype": "fp32",
+        "exp-avg-sq-dtype": "fp32",
         "grad-reduce-in-bf16": True,
     }
 
@@ -4457,8 +4462,6 @@ def test_nano4_matches_the_30b_gdp_reference_architecture() -> None:
     optimizer_precision = {
         "use-precision-aware-optimizer",
         "main-grads-dtype",
-        "exp-avg-dtype",
-        "exp-avg-sq-dtype",
         "grad-reduce-in-bf16",
     }
     assert optimizer_precision.isdisjoint(nano4)
@@ -4514,8 +4517,6 @@ def test_super3_profiles_share_reference_architecture() -> None:
     optimizer_precision = {
         "use-precision-aware-optimizer": True,
         "main-grads-dtype": "bf16",
-        "exp-avg-dtype": "bf16",
-        "exp-avg-sq-dtype": "bf16",
         "grad-reduce-in-bf16": True,
     }
     expected = {
@@ -4536,8 +4537,6 @@ def test_super3_profiles_share_reference_architecture() -> None:
 
     assert {key: fp4.pop(key) for key in precision} == precision
     assert {key: fp4.pop(key) for key in optimizer_precision} == optimizer_precision
-    # Both precision profiles of this architecture hold the optimizer's moments
-    # in BF16, which is what leaves the device room for the MoE temporaries.
     assert {key: bf16.pop(key) for key in optimizer_precision} == optimizer_precision
     # Both profiles need TP4 to halve the native fused-loss temporary while
     # retaining identical model topology.
@@ -4563,6 +4562,18 @@ def test_super3_profiles_share_reference_architecture() -> None:
     assert fp4 == bf16
     assert {key: bf16[key] for key in expected} == expected
     assert len(bf16["hybrid-override-pattern"]) == 88  # noqa: PLR2004
+
+
+def test_all_model_configs_use_fp32_optimizer_states() -> None:
+    slurm_job = _load_slurm_job()
+
+    for path in sorted(slurm_job.CONFIGS_DIR.glob("*.yaml")):
+        if path.stem == "base":
+            continue
+        config = slurm_job._model_config(path.stem)
+        assert config["main-params-dtype"] == "fp32", path.stem
+        assert config["exp-avg-dtype"] == "fp32", path.stem
+        assert config["exp-avg-sq-dtype"] == "fp32", path.stem
 
 
 def test_cuda_graph_selection_is_profile_scoped() -> None:

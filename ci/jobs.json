@@ -152,6 +152,9 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
+          "staging": {
+            "detr": null
+          },
           "jobs": [
             [
               "native",
@@ -216,6 +219,7 @@
           "nodes": 8,
           "scale": "8x4",
           "group": "8node-nano4",
+          "checkpoint_interval": 25,
           "runner_tags": [
             "ociaga"
           ],

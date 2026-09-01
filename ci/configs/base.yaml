@@ -83,6 +83,9 @@ weight-decay: "0.1"
 clip-grad: "1.0"
 adam-beta1: "0.9"
 adam-beta2: "0.95"
+main-params-dtype: fp32
+exp-avg-dtype: fp32
+exp-avg-sq-dtype: fp32
 
 # Regularization
 attention-dropout: "0.0"
