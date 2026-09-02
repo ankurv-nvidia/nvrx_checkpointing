@@ -4,16 +4,29 @@
 #include "ckpt_fixture.h"
 #include "distcp.h"
 #include "distcp_internal.h"
+#include "logging.h"
 #include "server.h"
 #include "session.h"
 #include "state.h"
 #include "telemetry.h"
 #include "tensor.h"
 
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/iostreams/close.hpp>
+#include <boost/iostreams/device/back_inserter.hpp>
+#include <boost/iostreams/filter/gzip.hpp>
+#include <boost/iostreams/filtering_stream.hpp>
+
 #include <fmt/format.h>
 
 #include <catch2/catch_session.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include <opentelemetry/proto/collector/logs/v1/logs_service.pb.h>
+#include <opentelemetry/proto/collector/metrics/v1/metrics_service.pb.h>
+#include <opentelemetry/proto/collector/trace/v1/trace_service.pb.h>
 
 #include <algorithm>
 #include <array>
@@ -32,41 +45,45 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+
+// NOLINTBEGIN(readability-magic-numbers)
 
 // Populated from --registry on the command line in main(). Tests that need
 // it (the [round-trip] case) assert non-empty before use; ctest wires the
 // path via catch_discover_tests(... EXTRA_ARGS --registry <path>) so the
 // binary itself stays portable.
-namespace
-{
+
 SUPPRESS_WARNINGS_START
 SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
 SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-std::filesystem::path GRegistryPath;
+static std::filesystem::path GRegistryPath;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
 
-std::filesystem::path const& TestRegistryPath()
+static std::filesystem::path const& TestRegistryPath()
 { return GRegistryPath; }
 
 // Stem-based subdirectory under the test temp root. Not strictly unique across
 // concurrent ctest workers, but every call site `remove_all`s before use, so
 // single-process runs are safe and `ctest -jN` only collides if two distinct
 // jobs share the same stem (we use distinct stems per TEST_CASE).
-std::filesystem::path CkptDir(std::string_view stem)
+static std::filesystem::path CkptDir(std::string_view stem)
 {
     auto base = std::filesystem::temp_directory_path() / "phoenix_ckpttest";
     std::filesystem::create_directories(base);
     return base / stem;
 }
 
-RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
+static RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
 {
     return RankTopology{
         .rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"}};
 }
-
+namespace
+{
 struct TestShardEntry
 {
     char const*         srcPtr;
@@ -76,8 +93,8 @@ struct TestShardEntry
     DS4Tensor::DimRange sharddim;
     DS4Tensor::Dim      shape;
 };
-
-std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank rank, ByteStorage const& tensorStorage)
+}    // namespace
+static std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank rank, ByteStorage const& tensorStorage)
 {
     std::vector<TestShardEntry> out;
     auto const*                 base = static_cast<char const*>(tensorStorage.data);
@@ -129,7 +146,8 @@ std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank ran
 
 // Attaches a fully-occupied (sharddim == fulldim) TensorShard leaf at the
 // given FQN. `handle` is the byte offset into the surrounding ByteStorage.
-void AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
+static void
+AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
 {
     auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
     auto&     leaf          = tree.AddChild(parent, leafName);
@@ -145,12 +163,12 @@ void AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType 
     leaf.data = StateNode::TensorShard{tnsr};
 }
 
-void AddShardedTensorLeaf(StateTree&                 tree,
-                          std::string_view           fqn,
-                          DS4Tensor::DType           dtype,
-                          std::vector<size_t> const& shape,
-                          Rank                       rank,
-                          uint64_t                   handle)
+static void AddShardedTensorLeaf(StateTree&                 tree,
+                                 std::string_view           fqn,
+                                 DS4Tensor::DType           dtype,
+                                 std::vector<size_t> const& shape,
+                                 Rank                       rank,
+                                 uint64_t                   handle)
 {
     DS4Tensor::Dim fulldim;
     for (auto d : shape) { fulldim.push_back(d); }
@@ -170,7 +188,6 @@ void AddShardedTensorLeaf(StateTree&                 tree,
     for (auto d : shape) { sharddim.push_back({.begin = 0, .end = d}); }
     st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = handle, .rank = rank});
 }
-}    // namespace
 
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
@@ -215,32 +232,50 @@ TEST_CASE("state registry permits distinct local shards under one tensor key", "
 
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
 {
-    auto const beginRecord
-        = fmt::format("{}",
-                      checkpoint::telemetry::span::CkptSave::Begin{
-                          .id = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
-                          .startedAt = std::chrono::nanoseconds{123456},
-                      });
-    auto const endRecord
-        = fmt::format("{}",
-                      checkpoint::telemetry::span::CkptSave::End{
-                          .id = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
-                          .d2hDuration       = std::chrono::seconds{1},
-                          .snapshotDuration  = std::chrono::microseconds{15},
-                          .totalDuration     = std::chrono::microseconds{20},
-                          .numTensors        = 2,
-                          .d2hRequestCount   = 4,
-                          .totalTensorBytes  = 1024 * 1024,
-                          .totalWrittenBytes = 2048,
-                      });
+    auto const outDir     = CkptDir("telemetry_schema");
+    auto const stderrPath = outDir / "stderr.log";
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
 
-    REQUIRE(beginRecord == "[native_ckpt:svr][3][PERF] Rank=1 Begin span=ckpt.save started_at_ns=123456 snapshot=2\n");
+    int const savedStderr = ::dup(STDERR_FILENO);
+    int const captureFd   = ::creat(stderrPath.c_str(), S_IRUSR | S_IWUSR);
+    REQUIRE(savedStderr >= 0);
+    REQUIRE(captureFd >= 0);
+    std::fflush(stderr);
+    REQUIRE(::dup2(captureFd, STDERR_FILENO) >= 0);
+    ::close(captureFd);
+
+    PERF() << checkpoint::telemetry::span::CkptSave::Begin{
+        .id        = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+        .startedAt = std::chrono::nanoseconds{123456},
+    };
+    PERF() << checkpoint::telemetry::span::CkptSave::End{
+        .id                = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+        .d2hDuration       = std::chrono::seconds{1},
+        .snapshotDuration  = std::chrono::microseconds{15},
+        .totalDuration     = std::chrono::microseconds{20},
+        .numTensors        = 2,
+        .d2hRequestCount   = 4,
+        .totalTensorBytes  = 1024ull * 1024,
+        .totalWrittenBytes = 2048,
+    };
+    std::fflush(stderr);
+    int const restoreResult = ::dup2(savedStderr, STDERR_FILENO);
+    ::close(savedStderr);
+    REQUIRE(restoreResult >= 0);
+
+    std::ifstream recordsFile(stderrPath);
+    REQUIRE(recordsFile.good());
+    std::string const records((std::istreambuf_iterator<char>(recordsFile)), std::istreambuf_iterator<char>());
+    std::string const beginRecord = "[native_ckpt:svr][3][PERF] Rank=1 Begin span=ckpt.save started_at_ns=123456 snapshot=2\n";
+    REQUIRE(records.starts_with(beginRecord));
     auto const durationSuffix = std::string{R"((?:u|µ)s)"};
     auto const endPattern     = std::regex{
         R"(\[native_ckpt:svr\]\[3\]\[PERF\] Rank=1 Finished bw_mbps=1\.00 \| Time\(us\):  wr_tnsr_us=1000000)" + durationSuffix
         + R"( snapshot_us=15)" + durationSuffix + R"( total_us=20)" + durationSuffix
         + R"( \| Count: num_tensors=2 total_d2h=4 \| Bytes: total_written_bytes=2048 avg_d2h_rq=262144 avg_tnsr=524288 snapshot=2\n)"};
-    REQUIRE(std::regex_match(endRecord, endPattern));
+    REQUIRE(std::regex_match(records.substr(beginRecord.size()), endPattern));
+    std::filesystem::remove_all(outDir);
 }
 
 TEST_CASE("snapshot completion is global on the coordinator and local on peers", "[server][completion]")
@@ -344,7 +379,7 @@ TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[
     REQUIRE(entries[1].shape.size() == 2);
     REQUIRE(entries[1].shape[0] == 4);
     REQUIRE(entries[1].shape[1] == 2);
-    REQUIRE(entries[1].length == 4u * 2u * 4u);    // 8 int32 elements
+    REQUIRE(entries[1].length == 4ull * 2u * 4u);    // 8 int32 elements
 }
 
 TEST_CASE("distcp shard walk expands ShardedTensor into per-rank entries", "[distcp][tier1]")
@@ -478,18 +513,351 @@ TEST_CASE("distcp shard walk skips zero-length shards", "[distcp][tier1]")
     REQUIRE(entries[0].fqn == "non_empty");
 }
 
-namespace
-{
-constexpr char KZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};
+static constexpr char KZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};    // NOLINT
 
-std::vector<char> ReadFile(std::filesystem::path const& path)
+static std::vector<char> ReadFile(std::filesystem::path const& path)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f) { throw std::runtime_error(fmt::format("[ckpttest] cannot open {}", path.string())); }
     std::vector<char> out((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     return out;
 }
-}    // namespace
+
+TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemetry][tier1]")
+{
+    auto const outDir      = CkptDir("otel_sdk_export");
+    auto const spansPath   = outDir / "telemetry.jsonl";
+    auto const metricsPath = std::filesystem::path{spansPath.string() + ".metrics"};
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);                // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);             // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", spansPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_METRICS", "1", 1);               // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                  // NOLINT(concurrency-mt-unsafe)
+    ::setenv("MEGATRON_OTEL_RUN_ID", "test-run", 1);            // NOLINT(concurrency-mt-unsafe)
+    checkpoint::telemetry::Init();
+
+    auto const startedAt = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+                           - std::chrono::microseconds{20};
+    PERF() << checkpoint::telemetry::span::CkptSave::Begin{
+        .id        = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+        .startedAt = startedAt,
+    };
+    PERF() << checkpoint::telemetry::span::CkptSave::End{
+        .id                = {.sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{1}, .snapshotId = checkpoint::ipc::SnapshotId{2}},
+        .d2hDuration       = std::chrono::microseconds{10},
+        .snapshotDuration  = std::chrono::microseconds{15},
+        .totalDuration     = std::chrono::microseconds{20},
+        .numTensors        = 2,
+        .d2hRequestCount   = 4,
+        .totalTensorBytes  = 1024,
+        .totalWrittenBytes = 2048,
+    };
+    auto const durableStartedAt = std::chrono::system_clock::now() - std::chrono::microseconds{30};
+    auto const durableId        = checkpoint::telemetry::span::Id{
+        .sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId{2}};
+    PERF() << checkpoint::telemetry::span::SvrDurable::Begin{.id = durableId, .startedAt = durableStartedAt};
+    PERF() << checkpoint::telemetry::span::SvrDurable::End{.id = durableId};
+    checkpoint::telemetry::Shutdown();
+    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");     // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");       // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("MEGATRON_OTEL_RUN_ID");        // NOLINT(concurrency-mt-unsafe)
+
+    REQUIRE(std::filesystem::exists(spansPath));
+    REQUIRE(std::filesystem::exists(metricsPath));
+    auto const spanBytes   = ReadFile(spansPath);
+    auto const metricBytes = ReadFile(metricsPath);
+    auto const spanJson    = std::string(spanBytes.begin(), spanBytes.end());
+    auto const metricJson  = std::string(metricBytes.begin(), metricBytes.end());
+    REQUIRE(spanJson.contains("ckpt.save"));
+    REQUIRE(spanJson.contains(checkpoint::telemetry::span::SvrDurable::Name));
+    REQUIRE(spanJson.contains("nvrx.session_id"));
+    REQUIRE(spanJson.contains("nvrx.snapshot_id"));
+    REQUIRE(spanJson.contains("test-run"));
+    REQUIRE(spanJson.contains(fmt::format("\"startTimeUnixNano\":\"{}\"", startedAt.count())));
+    REQUIRE(spanJson.contains(fmt::format("\"endTimeUnixNano\":\"{}\"", (startedAt + std::chrono::microseconds{20}).count())));
+    REQUIRE(metricJson.contains("nvrx.ckpt.save.bw_mbps"));
+    REQUIRE(metricJson.contains("nvrx.ckpt.save.wr_tnsr_us"));
+    REQUIRE(metricJson.contains("nvrx.ckpt.save.total_written_bytes"));
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]")
+{
+    auto const outDir     = CkptDir("otel_log_export");
+    auto const outPath    = outDir / "telemetry.jsonl";
+    auto const logsPath   = std::filesystem::path{outPath.string() + ".logs"};
+    auto const stderrPath = outDir / "stderr.log";
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);              // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);           // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_METRICS", "0", 1);             // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                // NOLINT(concurrency-mt-unsafe)
+    checkpoint::telemetry::Init();
+    checkpoint::logging::Init();
+
+    int const savedStderr = ::dup(STDERR_FILENO);
+    int const captureFd   = ::creat(stderrPath.c_str(), S_IRUSR | S_IWUSR);
+    REQUIRE(savedStderr >= 0);
+    REQUIRE(captureFd >= 0);
+    std::fflush(stderr);
+    REQUIRE(::dup2(captureFd, STDERR_FILENO) >= 0);
+    ::close(captureFd);
+
+    static constexpr int TestValue = 42;
+    checkpoint::logging::Info("combined sink record {}", TestValue);
+    checkpoint::logging::Warn("second sink record");
+    checkpoint::logging::Shutdown();
+    std::fflush(stderr);
+    int const restoreResult = ::dup2(savedStderr, STDERR_FILENO);
+    ::close(savedStderr);
+
+    checkpoint::telemetry::Shutdown();
+    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");     // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");       // NOLINT(concurrency-mt-unsafe)
+
+    REQUIRE(restoreResult >= 0);
+    auto const stderrBytes = ReadFile(stderrPath);
+    auto const stderrText  = std::string(stderrBytes.begin(), stderrBytes.end());
+    REQUIRE(stderrText == "[native_ckpt:svr][INFO] combined sink record 42\n[native_ckpt:svr][WARN] second sink record\n");
+
+    REQUIRE(std::filesystem::exists(logsPath));
+    auto const logBytes = ReadFile(logsPath);
+    auto const logJson  = std::string(logBytes.begin(), logBytes.end());
+    REQUIRE(logJson.contains("combined sink record 42"));
+    REQUIRE(logJson.contains("second sink record"));
+    REQUIRE_FALSE(logJson.contains("combined sink record 42\\n"));
+    REQUIRE_FALSE(logJson.contains("second sink record\\n"));
+    REQUIRE_FALSE(logJson.contains("[native_ckpt:svr][INFO] combined sink record 42"));
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telemetry][tier1]")
+{
+    auto const outDir  = CkptDir("otel_daemon_export");
+    auto const outPath = outDir / "telemetry.jsonl";
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);              // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "daemon", 1);         // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                // NOLINT(concurrency-mt-unsafe)
+    checkpoint::telemetry::Init();
+    checkpoint::telemetry::Collect(R"({"discarded":true})");
+    checkpoint::telemetry::Shutdown();
+
+    checkpoint::telemetry::Init();
+    checkpoint::telemetry::InitLocalCollector(outPath);
+    checkpoint::telemetry::InitLocalCollector(outPath);
+    checkpoint::telemetry::Collect(R"({"written_once":true})");
+    checkpoint::telemetry::Collect(R"({"second_local_line":true})");
+    checkpoint::telemetry::Collect(R"({"received_remotely":true})");
+    checkpoint::telemetry::Collect(R"({"second_remote_line":true})");
+    auto const spanId = checkpoint::telemetry::span::Id{
+        .sessionId = checkpoint::ipc::SessionId::Default, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId::Default};
+    PERF() << checkpoint::telemetry::span::SvrWriteMetadata::Begin{.id = spanId};
+    PERF() << checkpoint::telemetry::span::SvrWriteMetadata::End{.id = spanId};
+    checkpoint::telemetry::Shutdown();
+    checkpoint::telemetry::Shutdown();
+    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");      // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");      // NOLINT(concurrency-mt-unsafe)
+
+    REQUIRE(std::filesystem::exists(outPath));
+    auto const bytes = ReadFile(outPath);
+    auto const json  = std::string(bytes.begin(), bytes.end());
+    REQUIRE(json.contains(checkpoint::telemetry::span::SvrWriteMetadata::Name));
+    REQUIRE(json.contains("{\"received_remotely\":true}\n{\"second_remote_line\":true}\n"));
+    REQUIRE(json.contains("{\"written_once\":true}\n{\"second_local_line\":true}\n"));
+    REQUIRE_FALSE(json.contains(R"({"discarded":true})"));
+    auto const writtenOnce = json.find(R"({"written_once":true})");
+    REQUIRE(writtenOnce != std::string::npos);
+    REQUIRE(writtenOnce == json.rfind(R"({"written_once":true})"));
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("OTLP HTTP protobuf signals sink as canonical JSONL", "[telemetry][tier1]")
+{
+    namespace proto_logs    = opentelemetry::proto::collector::logs::v1;
+    namespace proto_metrics = opentelemetry::proto::collector::metrics::v1;
+    namespace proto_trace   = opentelemetry::proto::collector::trace::v1;
+
+    auto const outDir  = CkptDir("otlp_http_receiver");
+    auto const outPath = outDir / "telemetry.jsonl";
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+    checkpoint::telemetry::Shutdown();
+
+    proto_trace::ExportTraceServiceRequest bufferedRequest;
+    bufferedRequest.add_resource_spans()->add_scope_spans()->add_spans()->set_name("received.before_topology");
+    auto const bufferedResponse
+        = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", {}, bufferedRequest.SerializeAsString());
+    checkpoint::telemetry::InitLocalCollector(outPath);
+
+    proto_trace::ExportTraceServiceRequest traceRequest;
+    auto*                                  span = traceRequest.add_resource_spans()->add_scope_spans()->add_spans();
+    span->set_name("received.trace");
+    span->set_trace_id("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f", 16);
+    span->set_span_id("\x10\x11\x12\x13\x14\x15\x16\x17", 8);
+    span->set_start_time_unix_nano(10);
+    span->set_end_time_unix_nano(20);
+    auto const traceResponse
+        = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", {}, traceRequest.SerializeAsString());
+
+    proto_metrics::ExportMetricsServiceRequest metricsRequest;
+    auto*                                      metric = metricsRequest.add_resource_metrics()->add_scope_metrics()->add_metrics();
+    metric->set_name("received.metric");
+    metric->mutable_gauge()->add_data_points()->set_as_double(42.0);
+    std::string compressedMetrics;
+    {
+        boost::iostreams::filtering_ostream output;
+        output.push(boost::iostreams::gzip_compressor{});
+        output.push(boost::iostreams::back_inserter(compressedMetrics));
+        auto const bytes = metricsRequest.SerializeAsString();
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        boost::iostreams::close(output);
+    }
+    auto const metricsResponse = checkpoint::telemetry::ReceiveOtlp("/v1/metrics", "application/x-protobuf", "gzip", compressedMetrics);
+
+    proto_logs::ExportLogsServiceRequest logsRequest;
+    auto*                                logRecord = logsRequest.add_resource_logs()->add_scope_logs()->add_log_records();
+    logRecord->mutable_body()->set_string_value("received log");
+    auto const logsResponse = checkpoint::telemetry::ReceiveOtlp("/v1/logs", "application/x-protobuf", {}, logsRequest.SerializeAsString());
+
+    auto const invalidResponse
+        = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", {}, std::string_view{"\xff", 1});
+    auto const unsupportedResponse
+        = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/json", {}, traceRequest.SerializeAsString());
+    auto const invalidGzipResponse = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", "gzip", "not gzip");
+    auto const emptyResponse       = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", {}, {});
+    checkpoint::telemetry::Shutdown();
+
+    REQUIRE(bufferedResponse.status == 200);
+    REQUIRE(bufferedResponse.body.empty());
+    REQUIRE(traceResponse.status == 200);
+    REQUIRE(traceResponse.body.empty());
+    REQUIRE(metricsResponse.status == 200);
+    REQUIRE(metricsResponse.body.empty());
+    REQUIRE(logsResponse.status == 200);
+    REQUIRE(logsResponse.body.empty());
+    REQUIRE(invalidResponse.status == 400);
+    REQUIRE_FALSE(invalidResponse.body.empty());
+    REQUIRE(unsupportedResponse.status == 415);
+    REQUIRE_FALSE(unsupportedResponse.body.empty());
+    REQUIRE(invalidGzipResponse.status == 400);
+    REQUIRE_FALSE(invalidGzipResponse.body.empty());
+    REQUIRE(emptyResponse.status == 200);
+    REQUIRE(emptyResponse.body.empty());
+
+    std::ifstream            file(outPath);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(file, line);) { lines.push_back(std::move(line)); }
+    REQUIRE(lines.size() == 4);
+    auto const json = fmt::format("{}\n{}\n{}\n{}", lines[0], lines[1], lines[2], lines[3]);
+    REQUIRE(json.contains("received.before_topology"));
+    REQUIRE(json.contains("received.trace"));
+    REQUIRE(json.contains(R"("traceId":"000102030405060708090a0b0c0d0e0f")"));
+    REQUIRE(json.contains(R"("spanId":"1011121314151617")"));
+    REQUIRE(json.contains("received.metric"));
+    REQUIRE(json.contains("received log"));
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("OTLP relay forwards the encoded request unchanged", "[telemetry][tier1]")
+{
+    boost::asio::io_context        ioc;
+    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    std::string                    target;
+    std::string                    contentType;
+    std::string                    contentEncoding;
+    std::string                    body;
+
+    opentelemetry::proto::collector::trace::v1::ExportTraceServiceResponse downstreamResponse;
+    downstreamResponse.mutable_partial_success()->set_error_message("forwarded response");
+    auto const   downstreamBody = downstreamResponse.SerializeAsString();
+    std::jthread receiver([&] {
+        boost::asio::ip::tcp::socket socket{ioc};
+        acceptor.accept(socket);
+        boost::beast::flat_buffer                                    buffer;
+        boost::beast::http::request<boost::beast::http::string_body> request;
+        boost::beast::http::read(socket, buffer, request);
+        target          = request.target();
+        contentType     = request[boost::beast::http::field::content_type];
+        contentEncoding = request[boost::beast::http::field::content_encoding];
+        body            = request.body();
+
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, request.version()};
+        response.set(boost::beast::http::field::content_type, "application/x-protobuf");
+        response.keep_alive(false);
+        response.body() = downstreamBody;
+        response.prepare_payload();
+        boost::beast::http::write(socket, response);
+    });
+
+    checkpoint::telemetry::InitRelayCollector(fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port()));
+    std::string const opaqueBody{"\x00\xff\x01\x02", 4};
+    auto const        response = checkpoint::telemetry::ReceiveOtlp("/v1/traces", "application/x-protobuf", "gzip", opaqueBody);
+    receiver.join();
+    checkpoint::telemetry::Shutdown();
+
+    REQUIRE(target == "/v1/traces");
+    REQUIRE(contentType == "application/x-protobuf");
+    REQUIRE(contentEncoding == "gzip");
+    REQUIRE(body == opaqueBody);
+    REQUIRE(response.status == 200);
+    REQUIRE(response.body == downstreamBody);
+}
+
+TEST_CASE("Telemetry relay retries one opaque export batch", "[telemetry][tier1]")
+{
+    boost::asio::io_context        ioc;
+    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    std::vector<std::string>       bodies;
+    std::vector<bool>              chunked;
+    std::vector<std::string>       contentTypes;
+    std::jthread                   receiver([&] {
+        for (size_t remaining = 3; remaining != 0; --remaining)
+        {
+            boost::asio::ip::tcp::socket socket{ioc};
+            acceptor.accept(socket);
+            boost::beast::flat_buffer                                    buffer;
+            boost::beast::http::request<boost::beast::http::string_body> request;
+            boost::beast::http::read(socket, buffer, request);
+            bodies.push_back(request.body());
+            chunked.push_back(request.chunked());
+            contentTypes.emplace_back(request[boost::beast::http::field::content_type]);
+
+            boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::service_unavailable,
+                                                                                   request.version()};
+            response.keep_alive(false);
+            response.body() = "{}";
+            response.prepare_payload();
+            boost::beast::http::write(socket, response);
+        }
+    });
+
+    checkpoint::telemetry::InitRelayCollector(fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port()));
+    REQUIRE_THROWS(checkpoint::telemetry::Collect(R"({"resourceSpans":[]})"));
+    receiver.join();
+
+    REQUIRE(bodies == std::vector<std::string>{R"({"resourceSpans":[]})", R"({"resourceSpans":[]})", R"({"resourceSpans":[]})"});
+    REQUIRE(chunked == std::vector<bool>{false, false, false});
+    REQUIRE(contentTypes == std::vector<std::string>{"application/json", "application/json", "application/json"});
+    REQUIRE_NOTHROW(checkpoint::telemetry::Shutdown());
+}
 
 namespace
 {
@@ -499,8 +867,9 @@ struct PredictedRecord
     uint64_t    fileOffset{0};
     uint64_t    length{0};
 };
+}    // namespace
 
-std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
+static std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
 {
     std::vector<PredictedRecord> out;
     uint64_t                     cursor = 0;
@@ -534,7 +903,6 @@ std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
     });
     return out;
 }
-}    // namespace
 
 TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs", "[distcp][tier2]")
 {
@@ -625,7 +993,7 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         // Rank-specific deterministic bytes so a cross-rank write would surface
         // as bogus payload at a recorded (offset, length).
         auto* bytes = static_cast<unsigned char*>(ls.tensorStorage->data);
-        for (size_t i = 0; i < ls.tensorStorage->size; ++i) { bytes[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
+        for (size_t i = 0; i < ls.tensorStorage->size; ++i) { bytes[i] = static_cast<unsigned char>(((size_t{r} * 17u) + i) & 0xffu); }
         ls.tree = std::make_unique<StateTree>(SingleRankTopo(r, kWorldSize));
         AddShardedTensorLeaf(*ls.tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{r}, 0);    // 16 B
         AddShardedTensorLeaf(*ls.tree, "b", DS4Tensor::DType::Int8, {4}, Rank{r}, 16);         //  4 B
@@ -681,8 +1049,8 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         // the signature instead of slicing at a fixed offset. A cross-rank
         // write would surface here as a missed match.
         std::array<unsigned char, 16> signature{};
-        for (size_t i = 0; i < signature.size(); ++i) { signature[i] = static_cast<unsigned char>(((r * 17u) + i) & 0xffu); }
-        auto const* needle = reinterpret_cast<char const*>(signature.data());
+        for (size_t i = 0; i < signature.size(); ++i) { signature[i] = static_cast<unsigned char>(((size_t{r} * 17u) + i) & 0xffu); }
+        auto const* needle = reinterpret_cast<char const*>(signature.data());    // NOLINT
         auto const  found  = std::search(fileBytes.begin(), fileBytes.end(), needle, needle + signature.size());
         REQUIRE(found != fileBytes.end());
     }
@@ -770,7 +1138,7 @@ TEST_CASE("distcp::WriteMetadata emits .metadata for shards rank 0 never wrote",
         for (auto const& [r, ranges] : shards)
         {
             DS4Tensor::DimRange sharddim;
-            for (auto const& [b, e] : ranges) { sharddim.push_back({b, e}); }
+            for (auto const& [b, e] : ranges) { sharddim.push_back({.begin = b, .end = e}); }
             st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = r});
         }
         leaf.data = std::move(st);
@@ -831,8 +1199,8 @@ TEST_CASE("distcp Blobs live in their rank's shard file", "[distcp][tier1][metad
     REQUIRE(readFile(outDir / "__1_0.distcp") == "alphabetadelta");
 
     auto const metadata = readFile(outDir / ".metadata");
-    REQUIRE(metadata.find("__0_0.distcp") != std::string::npos);
-    REQUIRE(metadata.find("__1_0.distcp") != std::string::npos);
+    REQUIRE(metadata.contains("__0_0.distcp"));
+    REQUIRE(metadata.contains("__1_0.distcp"));
 
 #ifdef PHOENIX_VENV_PYTHON
     // The lowest-rank alpha replica owns the metadata entry. Rank 1 still wrote
@@ -844,7 +1212,7 @@ TEST_CASE("distcp Blobs live in their rank's shard file", "[distcp][tier1][metad
                                       "assert s['beta']==('__1_0.distcp',5,4); assert s['delta']==('__1_0.distcp',9,5)\"",
                                       PHOENIX_VENV_PYTHON,
                                       metaPath.string());
-    REQUIRE(std::system(cmd.c_str()) == 0);
+    REQUIRE(std::system(cmd.c_str()) == 0);    // NOLINT
 #endif
 
     auto inconsistentView = view;
@@ -886,7 +1254,7 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     // when the load actually breaks.
     auto const cmd
         = fmt::format("{} -c \"import pickle; pickle.load(open(r'{}','rb'))\" >/dev/null", PHOENIX_VENV_PYTHON, metaPath.string());
-    int const rc = std::system(cmd.c_str());
+    int const rc = std::system(cmd.c_str());    // NOLINT
     REQUIRE(rc == 0);
 }
 #endif
@@ -997,3 +1365,5 @@ int main(int argc, char* argv[])
     GRegistryPath = registry;
     return session.run();
 }
+
+// NOLINTEND(readability-magic-numbers)

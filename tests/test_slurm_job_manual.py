@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.util
 import io
+import json
 import lzma
+import re
 import shlex
 import subprocess
 import sys
@@ -34,15 +36,26 @@ _MUTATED_ENV = (
     "ENROOT_IMAGE_DIR",
     "MEGATRON_COMMIT",
     "MEGATRON_NATIVE_BUILD_DIR",
+    "MEGATRON_OTEL_ENABLED",
+    "MEGATRON_OTEL_METRICS_ENABLED",
+    "MEGATRON_OTEL_EXPORT_STRATEGY",
+    "MEGATRON_OTEL_RUN_ID",
+    "MEGATRON_OTEL_TRACES_ENABLED",
     "MEGATRON_REPO_URL",
     "MEGATRON_ROOT",
     "MASTER_PORT",
     "NATIVE_CKPT_SERVER_LOG",
+    "NATIVE_CKPT_OTEL_DIR",
+    "NATIVE_CKPT_OTEL_ENABLE",
+    "NATIVE_CKPT_OTEL_EXPORT",
+    "NATIVE_CKPT_OTEL_FILE",
     "NCCL_IB_TIMEOUT",
     "NCCL_NET",
     "NVTE_BWD_LAYERNORM_SM_MARGIN",
     "NVTE_FWD_LAYERNORM_SM_MARGIN",
     "NVTE_FUSED_ATTN",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
     "PYTORCH_CUDA_ALLOC_CONF",
     "QUANTIZATION_TYPE_DEBUG",
     "SLURMJOB_OPT_BACKGROUND",
@@ -89,7 +102,13 @@ yaml.SafeLoader.add_constructor("!reference", lambda loader, node: loader.constr
 _SCRATCH_RESULTS = Path(tempfile.mkdtemp(prefix="slurm-job-tests-"))
 
 
-def _perf_finished(rank: int = 0, bandwidth: float = 150000, write_us: int = 10, written_bytes: int = 100, snapshot: int = 1) -> str:
+def _perf_finished(
+    rank: int = 0,
+    bandwidth: float = 150000,
+    write_us: int = 10,
+    written_bytes: int = 100,
+    snapshot: int = 1,
+) -> str:
     return (
         f"[native_ckpt:svr][0][PERF] Rank={rank} Finished bw_mbps={bandwidth:.2f} "
         f"| Time(us):  wr_tnsr_us={write_us}us snapshot_us=11us total_us=12us "
@@ -98,11 +117,96 @@ def _perf_finished(rank: int = 0, bandwidth: float = 150000, write_us: int = 10,
     )
 
 
-def _perf_span(rank: int = 0, bandwidth: float = 150000, write_us: int = 10, written_bytes: int = 100, snapshot: int = 1) -> str:
+def _perf_span(
+    rank: int = 0,
+    bandwidth: float = 150000,
+    write_us: int = 10,
+    written_bytes: int = 100,
+    snapshot: int = 1,
+) -> str:
     return (
-        f"[native_ckpt:svr][0][PERF] Rank={rank} Begin span=ckpt.save started_at_ns=123456 snapshot={snapshot}\n"
+        f"[native_ckpt:svr][0][PERF] Rank={rank} "
+        f"Begin span=ckpt.save started_at_ns=123456 snapshot={snapshot}\n"
         f"{_perf_finished(rank, bandwidth, write_us, written_bytes, snapshot)}\n"
     )
+
+
+def _native_otel_sample(
+    rank: int = 0,
+    bandwidth: float = 150000,
+    write_us: int = 10,
+    written_bytes: int = 100,
+    snapshot: int = 1,
+) -> dict:
+    return {
+        "session_id": 0,
+        "rank": rank,
+        "snapshot_id": snapshot,
+        "bw_mbps": bandwidth,
+        "wr_tnsr_us": write_us,
+        "snapshot_us": 11,
+        "total_us": 12,
+        "num_tensors": 2,
+        "total_d2h": 2,
+        "total_tensor_bytes": written_bytes,
+        "total_written_bytes": written_bytes,
+        "avg_d2h_rq": written_bytes // 2,
+        "avg_tnsr": written_bytes // 2,
+        "start_time_unix_nano": 1,
+        "end_time_unix_nano": 2,
+    }
+
+
+def _otel_data(
+    *samples: dict,
+    megatron_spans: list[dict] | None = None,
+    megatron_metrics: list[dict] | None = None,
+    resource_metrics: list[dict] | None = None,
+) -> dict:
+    return {
+        "native_saves": list(samples),
+        "daemon_durable_spans": [],
+        "megatron_spans": megatron_spans or [],
+        "megatron_metrics": megatron_metrics or [],
+        "resource_metrics": resource_metrics or [],
+    }
+
+
+def _checkpoint_span(
+    name: str,
+    start_ms: float,
+    end_ms: float,
+    *,
+    call_idx: int | list[int] | None = None,
+    rank: int = 0,
+) -> dict:
+    attributes = {} if call_idx is None else {"nvrx.call_idx": call_idx}
+    return {
+        "name": name,
+        "resource": {"dl.rank": rank},
+        "attributes": attributes,
+        "start_time_unix_nano": round(start_ms * 1e6),
+        "end_time_unix_nano": round(end_ms * 1e6),
+    }
+
+
+def _megatron_perf_metric_samples(*ranks: int) -> list[dict]:
+    values = {
+        "megatron.training.step_duration_ms": 20.0,
+        "megatron.training.throughput_tflops": 120.0,
+        "megatron.training.tokens_per_sec": 8000.0,
+        "megatron.training.memory_allocated_gb": 60.0,
+    }
+    return [
+        {
+            "name": name,
+            "resource": {"dl.rank": rank},
+            "value": value + rank,
+            "time_unix_nano": 10,
+        }
+        for rank in ranks
+        for name, value in values.items()
+    ]
 
 
 def _load_slurm_job():
@@ -305,7 +409,12 @@ def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(slurm_job.shutil, "which", lambda _name: "/usr/bin/valgrind")
     monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(require_stopped=lambda: None))
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
-    monkeypatch.setattr(slurm_job.subprocess, "Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("popen reached")))
+    def popen(*_args: object, **kwargs: object) -> None:
+        assert "--errors-for-leak-kinds=definite,indirect" in _args[0]
+        assert kwargs["env"]["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+        raise RuntimeError("popen reached")
+
+    monkeypatch.setattr(slurm_job.subprocess, "Popen", popen)
 
     with pytest.raises(RuntimeError, match="popen reached"), slurm_job.ValgrindFlavor().server("test", 2):
         pass
@@ -1308,6 +1417,321 @@ def test_perf_enables_parallel_checkpoint_optimizations(
         assert "--ckpt-pg-tensors-cache-create" not in phase2
 
 
+def test_both_providers_export_megatron_otel_to_local_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    args = _args(tmp_path, config="nano3", nodes=8, flavors=["perf", "native"])
+    slurm_job._configure_run(args)
+
+    _cmd, native_env = slurm_job._phase_command("nano3_8x4", args, "native", 1)
+    _cmd, nvrx_env = slurm_job._phase_command("nano3_8x4", args, "nvrx", 1)
+
+    assert {name: native_env[name] for name in slurm_job._MEGATRON_OTEL_ENV_DEFAULTS} == {
+        "MEGATRON_OTEL_ENABLED": "1",
+        "MEGATRON_OTEL_METRICS_ENABLED": "1",
+        "MEGATRON_OTEL_EXPORT_STRATEGY": "all_ranks",
+        "MEGATRON_OTEL_SPAN_GROUPS": "default,load_checkpoint",
+        "MEGATRON_OTEL_TRACES_ENABLED": "1",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4100",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    }
+    assert {name: nvrx_env[name] for name in slurm_job._MEGATRON_OTEL_ENV_DEFAULTS} == {
+        name: native_env[name] for name in slurm_job._MEGATRON_OTEL_ENV_DEFAULTS
+    }
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        ("native", ["perf", "native"], "0", "worker", None, "collector"),
+        ("nvrx", ["perf"], "0", "worker", "leader:4100", "relay"),
+        ("nvrx", ["perf"], "4", "leader", "file", "collector"),
+    ],
+)
+def test_routine_validates_each_collected_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    routing: tuple[str, list[str], str, str, str | None, str],
+) -> None:
+    slurm_job = _load_slurm_job()
+    provider, flavor_names, rank, host, collector, server_role = routing
+    args = _args(tmp_path, repeat=1)
+    args.flavors = slurm_job.FlavorSelection(flavor_names)
+    child_envs = []
+    validated = []
+    lifecycle = []
+    stops = []
+
+    def phase_command(_cfg: str, _args: object, _provider: str, _phase: int, _cycle: int = 0, **_kwargs: object):
+        env = {"SLURM_JOB_ID": "42", "MEGATRON_OTEL_ENABLED": "1", "MASTER_ADDR": "leader"}
+        child_envs.append(env)
+        return ["true"], env
+
+    monkeypatch.setattr(slurm_job, "RUN_NAME", "otel-run")
+    monkeypatch.setenv("SLURM_PROCID", rank)
+    monkeypatch.setenv("RANK", rank)
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: host)
+    monkeypatch.setitem(
+        sys.modules,
+        "nvrx_checkpointing",
+        SimpleNamespace(checkpoint=SimpleNamespace(ping=lambda: lifecycle.append(("ping", "")))),
+    )
+    monkeypatch.setattr(slurm_job, "_phase_command", phase_command)
+    monkeypatch.setattr(slurm_job, "_sync_ranks", lambda tag: lifecycle.append(("sync", tag)))
+    monkeypatch.setattr(slurm_job, "wait_for_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(slurm_job.otel_report, "validate_collected", lambda *values: validated.append(values))
+    monkeypatch.setattr(slurm_job.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(args.flavors.policy, "stop_server", lambda *values, **_kwargs: stops.append(values))
+
+    slurm_job._run_routine("nano3_4x4", args, provider)
+
+    assert [env["MEGATRON_OTEL_RUN_ID"] for env in child_envs] == [
+        "42-otel-run-phase1-sr0-te0",
+        "42-otel-run-cycle1-sr0-te0",
+    ]
+    assert sum(event == ("ping", "") for event in lifecycle) == 2  # noqa: PLR2004
+    if provider == "native":
+        expected_startup = [("ping", ""), ("sync", "phase1-otel-listeners-ready")]
+    elif server_role == "collector":
+        expected_startup = [
+            ("ping", ""),
+            ("sync", "phase1-otel-collector-ready"),
+            ("sync", "phase1-otel-listeners-ready"),
+        ]
+    else:
+        expected_startup = [
+            ("sync", "phase1-otel-collector-ready"),
+            ("ping", ""),
+            ("sync", "phase1-otel-listeners-ready"),
+        ]
+    assert lifecycle[: len(expected_startup)] == expected_startup
+    assert [env.get("NATIVE_CKPT_OTEL_COLLECTOR") for env in child_envs] == [collector, collector]
+    assert [label.rsplit("-", 2)[-2] for _provider, label in stops] == [server_role, server_role]
+    validation_calls = [
+        (path.name, run_id, actual_provider, checkpoints)
+        for path, run_id, _nodes, _gpus, actual_provider, checkpoints in validated
+    ]
+    assert validation_calls == (
+        [
+            ("native_ckpt_otel.jsonl", "42-otel-run-phase1-sr0-te0", provider, 1),
+            ("native_ckpt_otel.jsonl", "42-otel-run-cycle1-sr0-te0", provider, 3),
+        ]
+        if rank == "0"
+        else []
+    )
+
+
+def test_otel_checkpoint_timings_are_grouped_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+    )
+    batch_log = tmp_path / "job" / "logs" / "job.log"
+    batch_log.parent.mkdir(parents=True)
+    reports = []
+    for spec in slurm_job._run_specs(args):
+        root = slurm_job._argument_log(args, batch_log, spec).parent / "otel"
+        for phase in ("cycle1", "phase1"):
+            path = root / phase / "native_ckpt_otel.jsonl"
+            path.parent.mkdir(parents=True)
+            path.touch()
+    monkeypatch.setattr(slurm_job.otel_report, "log_checkpoint_timings", lambda *values: reports.append(values))
+
+    slurm_job._log_otel_checkpoint_timings(args, batch_log)
+
+    assert [(path.parent.name, run_id, label) for path, run_id, label in reports] == [
+        ("phase1", None, "ref phase1"),
+        ("cycle1", None, "ref cycle1"),
+        ("phase1", None, "cmp phase1"),
+        ("cycle1", None, "cmp cycle1"),
+    ]
+
+
+def test_megatron_otel_validation_requires_every_rank(tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    path = tmp_path / "native_ckpt_otel.jsonl"
+
+    def record(rank: int) -> dict:
+        return {
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": [
+                            {"key": "nemo.run.id", "value": {"stringValue": "run-1"}},
+                            {"key": "dl.rank", "value": {"intValue": str(rank)}},
+                        ],
+                    },
+                    "scopeSpans": [{"spans": [{"name": "megatron.train.iteration"}]}],
+                },
+            ],
+        }
+
+    def metric_record(rank: int, provider: str = "nvrx") -> dict:
+        resource = {
+            "attributes": [
+                {"key": "nemo.run.id", "value": {"stringValue": "run-1"}},
+                {"key": "dl.rank", "value": {"intValue": str(rank)}},
+                {"key": "checkpoint.provider", "value": {"stringValue": provider}},
+            ],
+        }
+        metrics = [
+            {
+                "name": f"nvrx.checkpoint.run.{name}",
+                "gauge": {"dataPoints": [{"asInt": "1"}]},
+            }
+            for name in ("gpu_peak_bytes", "gpu_hbm_peak_bytes", "gpu_total_bytes", "cpu_rss_bytes")
+        ]
+        return {"resourceMetrics": [{"resource": resource, "scopeMetrics": [{"metrics": metrics}]}]}
+
+    def megatron_metric_record(rank: int) -> dict:
+        resource = {
+            "attributes": [
+                {"key": "nemo.run.id", "value": {"stringValue": "run-1"}},
+                {"key": "dl.rank", "value": {"intValue": str(rank)}},
+            ],
+        }
+        metrics = [
+            {
+                "name": name,
+                "gauge": {"dataPoints": [{"asDouble": 1.0, "timeUnixNano": "10"}]},
+            }
+            for name in slurm_job.otel_report.MEGATRON_PERF_METRICS
+        ]
+        return {"resourceMetrics": [{"resource": resource, "scopeMetrics": [{"metrics": metrics}]}]}
+
+    checkpoints = [record(rank) for rank in range(8)]
+    for checkpoint in checkpoints:
+        checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] = "megatron.checkpoint.save"
+        checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"][0].update(
+            {"startTimeUnixNano": "1", "endTimeUnixNano": "2"},
+        )
+    path.write_text(
+        "\n".join(
+            json.dumps(item)
+            for item in [
+                *checkpoints,
+                *(megatron_metric_record(rank) for rank in range(8)),
+                *(metric_record(rank) for rank in range(8)),
+            ]
+        )
+        + "\n",
+    )
+    slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "nvrx", 1)
+
+    with pytest.raises(RuntimeError, match="checkpoint save span counts mismatch"):
+        slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "nvrx", 2)
+
+    with pytest.raises(RuntimeError, match=r"expected \[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11\], found \[0, 1, 2, 3, 4, 5, 6, 7\]"):
+        slurm_job.otel_report.validate_collected(path, "run-1", 3, 4, "nvrx", 1)
+
+    incomplete_megatron = megatron_metric_record(7)
+    missing_name = incomplete_megatron["resourceMetrics"][0]["scopeMetrics"][0]["metrics"].pop()["name"]
+    path.write_text(
+        "\n".join(
+            json.dumps(item)
+            for item in [
+                *checkpoints,
+                *(megatron_metric_record(rank) for rank in range(7)),
+                incomplete_megatron,
+                *(metric_record(rank) for rank in range(8)),
+            ]
+        )
+        + "\n",
+    )
+    with pytest.raises(RuntimeError, match=rf"Megatron training metric {re.escape(missing_name)} ranks mismatch"):
+        slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "nvrx", 1)
+
+    def native_record(rank: int) -> dict:
+        attrs = [
+            {"key": f"nvrx.{key}", "value": {"intValue": str(value)}}
+            for key, value in {
+                "session_id": 0,
+                "rank": rank,
+                "snapshot_id": 1,
+                "wr_tnsr_us": 10,
+                "snapshot_us": 11,
+                "total_us": 12,
+                "num_tensors": 2,
+                "total_d2h": 2,
+                "total_tensor_bytes": 100,
+                "total_written_bytes": 100,
+                "avg_d2h_rq": 50,
+                "avg_tnsr": 50,
+            }.items()
+        ]
+        attrs.append({"key": "nvrx.bw_mbps", "value": {"doubleValue": 10.0}})
+        spans = [
+            {
+                "name": "ckpt.save",
+                "attributes": attrs,
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2",
+            },
+        ]
+        if rank == 0:
+            spans.append(
+                {
+                    "name": "ckpt.svr.durable",
+                    "attributes": [
+                        {"key": "nvrx.session_id", "value": {"intValue": "0"}},
+                        {"key": "nvrx.snapshot_id", "value": {"intValue": "1"}},
+                    ],
+                    "startTimeUnixNano": "1",
+                    "endTimeUnixNano": "2",
+                },
+            )
+        return {
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": [
+                            {"key": "nemo.run.id", "value": {"stringValue": "run-1"}},
+                        ],
+                    },
+                    "scopeSpans": [
+                        {
+                            "spans": spans,
+                        },
+                    ],
+                },
+            ],
+        }
+
+    native_spans = [native_record(rank) for rank in range(8)]
+    native_records = [
+        *checkpoints,
+        *(megatron_metric_record(rank) for rank in range(8)),
+        *(metric_record(rank, "native") for rank in range(8)),
+        *native_spans,
+    ]
+    path.write_text("\n".join(json.dumps(item) for item in native_records) + "\n")
+    slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "native", 1)
+
+    native_spans[0]["resourceSpans"][0]["scopeSpans"][0]["spans"].pop()
+    path.write_text("\n".join(json.dumps(item) for item in native_records) + "\n")
+    with pytest.raises(RuntimeError, match="durable OTLP spans mismatch"):
+        slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "native", 1)
+
+    path.write_text("\n".join(json.dumps(item) for item in native_records[:-1]) + "\n")
+    with pytest.raises(RuntimeError, match="native checkpoint OTLP span ranks mismatch"):
+        slurm_job.otel_report.validate_collected(path, "run-1", 2, 4, "native", 1)
+
+
 def test_every_variant_is_a_flavor_and_they_mix(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2298,11 +2722,22 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
     assert '"nvidia-cudnn-frontend[cutedsl]==1.26.0"' in prepare
+    assert '"${MEGATRON_ROOT}[training,dev,otel,te,ssm]"' in prepare
+    assert 'export TMS_CUDA_MAJOR="${BASH_REMATCH[1]}"' in prepare
     assert "nvidia-nvshmem-cu13==3.7.2" in prepare
     assert built[-1][2] == {}
     assert validated == ["backfill", "interactive"]
     assert "--partition=interactive" in runs[-1][0]
     assert runs[-1][1]["env"]["NVTE_WITH_NCCL_EP"] == "0"
+
+
+def test_otel_cmake_replaces_the_incompatible_legacy_vcpkg_port() -> None:
+    module = (REPO_ROOT / "cmake/modules/OpenTelemetry.cmake").read_text()
+
+    legacy_remove = 'remove "opentelemetry-cpp:${VCPKG_TARGET_TRIPLET}" --recurse'
+    cpp23_install = 'vcpkg_install("opentelemetry-cpp23[otlp-file]")'
+    assert legacy_remove in module
+    assert module.index(legacy_remove) < module.index(cpp23_install)
 
 
 def test_slurm_job_consumers_import() -> None:
@@ -2953,6 +3388,8 @@ def test_default_pipeline_has_manual_suite_launchers() -> None:
     assert "variables[UPSTREAM_WHEEL_AARCH64_JOB_ID]" in script
     assert "CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" in script
     assert "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA" in script
+    assert "head -n1" not in script
+    assert "sed -n '1p'" in script
     needs = {need["job"]: need["artifacts"] for need in launcher["needs"]}
     assert needs == {
         "wheel:x86_64": True,
@@ -3004,6 +3441,15 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert "[PERF]:gb200:native:nano3_8x4" in bundles["main-branch-runs"]["dependencies"]
     assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
     assert "[PERF]:gb200:native:gpt_moe_1x4" in bundles["main-branch-runs"]["dependencies"]
+
+
+def test_slurm_jobs_upload_otel_jsonl() -> None:
+    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
+
+    paths = config[".slurm_job"]["artifacts"]["paths"]
+    assert "ci/ci-results/otel/*/*.jsonl" in paths
+    assert "ci/ci-runs/*/logs/otel/*/*.jsonl" in paths
+    assert "ci/ci-runs/*/*/logs/otel/*/*.jsonl" in paths
 
 
 def test_default_native_jobs_use_wheel_artifacts() -> None:
@@ -3097,7 +3543,7 @@ def test_deterministic_flavor_keeps_perf_epilog_unless_valgrind(monkeypatch: pyt
     calls = []
     monkeypatch.setattr(
         slurm_job.PerfReport,
-        "parse_and_report",
+        "report",
         lambda *args, **kwargs: calls.append((args, kwargs)) or False,
     )
     deterministic_args = _args(tmp_path, flavors=["detr"], baseline={})
@@ -3112,7 +3558,35 @@ def test_deterministic_flavor_keeps_perf_epilog_unless_valgrind(monkeypatch: pyt
     assert len(calls) == 1
 
 
-def test_deterministic_report_reads_the_native_routines_daemon_logs(
+def test_valgrind_epilog_uses_log_reporting(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    log = tmp_path / "run.log"
+    log.write_text("")
+    validated = []
+    monkeypatch.setattr(slurm_job.log_report, "validate_checkpoint_saves", lambda *args: validated.append(args))
+    monkeypatch.setattr(slurm_job, "_write_and_compare_arguments", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        slurm_job,
+        "_log_otel_checkpoint_timings",
+        lambda *_args: pytest.fail("valgrind must not require OTel files"),
+    )
+
+    slurm_job._epilog(
+        [
+            "--nodes=1",
+            "--gpus-per-node=1",
+            "--config=pico",
+            "--flavor=detr,vg,native",
+            f"--log-file={log}",
+            '--baseline-json={"metrics":{}}',
+        ],
+    )
+
+    assert validated
+
+
+def test_deterministic_report_reads_the_native_routines_otel_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3120,7 +3594,7 @@ def test_deterministic_report_reads_the_native_routines_daemon_logs(
     calls = []
     monkeypatch.setattr(
         slurm_job.PerfReport,
-        "parse_and_report",
+        "report",
         lambda *args, **kwargs: calls.append((args, kwargs)) or True,
     )
     baseline = {"metrics": {"bw_mbps": 115000}}
@@ -3138,8 +3612,11 @@ def test_deterministic_report_reads_the_native_routines_daemon_logs(
     assert args.flavors.policy.epilog(args, log)
 
     positional, keywords = calls[0]
+    assert positional[0] == "detr"
+    assert positional[2] == "detr-native"
     assert positional[4] is baseline
-    assert keywords["daemon_dir"] == tmp_path / "native.cmp" / "logs"
+    assert positional[3] == tmp_path / "native.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
+    assert keywords == {"results_dir": tmp_path / "native.cmp" / "logs"}
 
 
 def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
@@ -3150,7 +3627,7 @@ def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
     calls = []
     monkeypatch.setattr(
         slurm_job.PerfReport,
-        "parse_and_report",
+        "report",
         lambda *args, **kwargs: calls.append((args, kwargs)) or True,
     )
     args = _args(
@@ -3166,8 +3643,11 @@ def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
     assert args.flavors.policy.epilog(args, tmp_path / "logs" / "job.log")
 
     positional, keywords = calls[0]
+    assert positional[0] == "detr"
+    assert positional[2] == "detr-nvrx"
     assert positional[4] == {}
-    assert keywords["daemon_dir"] is None
+    assert positional[3] == tmp_path / "nvrx.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
+    assert keywords == {"results_dir": tmp_path / "nvrx.cmp" / "logs"}
 
 
 def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
@@ -3268,11 +3748,6 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     monkeypatch.setattr(slurm_job, "_load_yaml", lambda *_: pytest.fail("batch epilog must not load YAML"))
     log = tmp_path / "run.log"
     log.write_text(
-        "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
-        "[native_ckpt:phase] phase=2\n"
-        "successfully saved async checkpoint from iteration 250 to /run/checkpoints\n"
-        "successfully saved async checkpoint from iteration 500 to /run/checkpoints\n"
-        "successfully saved async checkpoint from iteration 750 to /run/checkpoints\n"
         "0: ------------------------ arguments ------------------------\n"
         " 0:   ckpt_provider ................................... native\n"
         " 0:   inference_dynamic_batching_enable_prefix_caching  False\n"
@@ -3284,8 +3759,15 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "0:   micro_batch_size ................................ 1\n"
         "0: -------------------- end of arguments ---------------------\n",
     )
-    # The daemon carries the perf counters, in its own per-host log for the measured cycle.
-    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
+    monkeypatch.setattr(
+        slurm_job.otel_report,
+        "load_latest",
+        lambda _path: _otel_data(
+            _native_otel_sample(),
+            megatron_metrics=_megatron_perf_metric_samples(0),
+        ),
+    )
+    (tmp_path / "checkpoint_server.cycle1.log").write_text("")
     baseline = '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}'
     # The epilog compares the options the run trained on as well as its
     # numbers, so record the ones this log carries.
@@ -3300,6 +3782,7 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "  micro_batch_size ................................ 1\n",
     )
     monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
+    monkeypatch.setattr(slurm_job, "_log_otel_checkpoint_timings", lambda *_args: None)
 
     slurm_job._epilog(
         ["--nodes",
@@ -3331,7 +3814,28 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     assert "inference_dynamic_batching_unified_memory_level . 0" in arguments
     assert yaml.safe_load(next((tmp_path / "baselines").glob("*.yaml")).read_text()) == {
         "description": "auto-generated by CI",
-        "metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100},
+        "source": "otlp",
+        "metrics": {
+            "bw_mbps": 150000,
+            "wr_tnsr_us": 10,
+            "total_written_bytes": 100,
+            "megatron.training.step_duration_ms": 20,
+            "megatron.training.throughput_tflops": 120,
+            "megatron.training.tokens_per_sec": 8000,
+            "megatron.training.memory_allocated_gb": 60,
+        },
+        "rank_statistics": {
+            name: {"min": value, "median": value, "max": value}
+            for name, value in {
+                "bw_mbps": 150000,
+                "wr_tnsr_us": 10,
+                "total_written_bytes": 100,
+                "megatron.training.step_duration_ms": 20.0,
+                "megatron.training.throughput_tflops": 120.0,
+                "megatron.training.tokens_per_sec": 8000.0,
+                "megatron.training.memory_allocated_gb": 60.0,
+            }.items()
+        },
     }
 
 
@@ -3343,17 +3847,12 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
     log = tmp_path / "run.log"
     log.write_text("")  # task 0's stream carries no training output this time
     (tmp_path / "run.task4.log").write_text(
-        "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
-        "[native_ckpt:phase] phase=2\n"
-        "successfully saved async checkpoint from iteration 250 to /run/checkpoints\n"
-        "successfully saved async checkpoint from iteration 500 to /run/checkpoints\n"
-        "successfully saved async checkpoint from iteration 750 to /run/checkpoints\n"
         "0: ------------------------ arguments ------------------------\n"
         " 0:   ckpt_provider ................................... native\n"
         "0:   micro_batch_size ................................ 1\n"
         "0: -------------------- end of arguments ---------------------\n",
     )
-    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
+    monkeypatch.setattr(slurm_job.otel_report, "load_latest", lambda _path: _otel_data(_native_otel_sample()))
     monkeypatch.setenv("PLATFORM", "devbox")
     recorded = tmp_path / "recorded"
     recorded.mkdir()
@@ -3362,6 +3861,7 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
         "  micro_batch_size ................................ 1\n",
     )
     monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
+    monkeypatch.setattr(slurm_job, "_log_otel_checkpoint_timings", lambda *_args: None)
 
     slurm_job._epilog(
         ["--nodes",
@@ -3382,7 +3882,6 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
     )
 
     combined = (tmp_path / "run.combined.log").read_text()
-    assert "successfully saved async checkpoint from iteration 750 to /run/checkpoints" in combined
     assert "end of arguments" in combined
     assert list(tmp_path.glob("*_report.json"))
 
@@ -3408,7 +3907,7 @@ def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
     log.write_text("")
     log.with_name(f"{stem}_report.json").write_text('{"metrics":{"gpu_hbm_peak_pct":{"max":90}}}')
 
-    slurm_job._write_performance_baseline(args, log)
+    slurm_job._write_performance_baseline(args, log.parent)
 
     assert not (log.parent / "baselines").exists()
 
@@ -3434,20 +3933,53 @@ def test_native_perf_refuses_an_incomplete_baseline_candidate(
     log.parent.mkdir()
     log.write_text("")
     log.with_name(f"{stem}_report.json").write_text(
-        '{"ckpt_save_markers_valid":false,"metrics":{"gpu_peak_bytes":{"mean":100}}}',
+        '{"telemetry_source":"otlp","ckpt_save_spans_valid":false,"metrics":{"gpu_peak_bytes":{"mean":100}}}',
     )
 
     with caplog.at_level("WARNING"):
-        slurm_job._write_performance_baseline(args, log)
+        slurm_job._write_performance_baseline(args, log.parent)
 
     assert not list((log.parent / "baselines").glob("*.yaml"))
     assert "refusing to write an incomplete baseline candidate" in caplog.text
     assert "required metrics were absent" in caplog.text
 
 
-def test_batch_epilog_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavor=["perf", "native"],
+        flavors=slurm_job.FlavorSelection(["perf", "native"]),
+    )
+    _cfg, _flavor, stem = slurm_job._identity(args)
+    report = {
+        "telemetry_source": "logs",
+        "ckpt_save_markers_valid": True,
+        "metrics": {
+            "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
+            "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
+            "total_written_bytes": {"mean": 100, "higher_is_better": None, "unit": "B"},
+        },
+    }
+    (tmp_path / f"{stem}_report.json").write_text(json.dumps(report))
+
+    slurm_job._write_performance_baseline(args, tmp_path)
+
+    candidate = yaml.safe_load((tmp_path / "baselines" / f"{stem}.yaml").read_text())
+    assert candidate["source"] == "logs"
+    assert candidate["metrics"] == {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}
+
+
+def test_log_report_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
+    monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     log = tmp_path / "run.log"
     log.write_text(
         "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
@@ -3457,7 +3989,8 @@ def test_batch_epilog_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.Mo
 
     with pytest.raises(RuntimeError, match=r"found 1 phase-1 and 2 phase-2 saves; expected at least 1 and 3"):
         slurm_job._epilog(
-            ["--nodes",
+            [
+                "--nodes",
                 "1",
                 "--gpus-per-node",
                 "1",
@@ -3536,7 +4069,7 @@ def test_two_jobs_comparing_different_providers_record_separately(
     assert stem("nvrx").endswith("-nvrx")
 
 
-def test_each_run_writes_and_compares_its_own_arguments(
+def test_native_detr_compares_only_native_arguments(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3560,7 +4093,8 @@ def test_each_run_writes_and_compares_its_own_arguments(
     recorded.mkdir()
     monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
 
-    for spec in slurm_job._run_specs(args):
+    specs = slurm_job._run_specs(args)
+    for spec in specs:
         log = slurm_job._argument_log(args, batch_log, spec)
         log.parent.mkdir(parents=True)
         provider = spec.variants[0]
@@ -3571,15 +4105,17 @@ def test_each_run_writes_and_compares_its_own_arguments(
             "-------------------- end of arguments ---------------------\n"
         )
         log.write_text(block)
-        stem = slurm_job._arguments_stem(spec.args, ())
-        (recorded / f"{stem}_arguments.txt").write_text(block)
+        if provider == "native":
+            stem = slurm_job._arguments_stem(spec.args, ())
+            (recorded / f"{stem}_arguments.txt").write_text(block)
 
     assert slurm_job._write_and_compare_arguments(args, batch_log) is True
-    for spec in slurm_job._run_specs(args):
+    for spec in specs:
         log = slurm_job._argument_log(args, batch_log, spec)
         candidate = log.parent / "baselines" / f"{slurm_job._arguments_stem(spec.args, ())}_arguments.txt"
-        assert candidate.exists()
-        assert f"ckpt_provider ................................... {spec.variants[0]}" in candidate.read_text()
+        assert candidate.exists() is (spec.variants[0] == "native")
+        if candidate.exists():
+            assert "ckpt_provider ................................... native" in candidate.read_text()
 
 
 def test_arguments_with_nothing_recorded_do_not_pass_uncompared(
@@ -3665,9 +4201,14 @@ def test_failing_rank_log_output_is_bounded(
     assert "1 additional exited rank(s)" in caplog.text
 
 
-def test_batch_epilog_requires_both_deterministic_checkpoint_routines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_log_report_requires_both_deterministic_checkpoint_routines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
+    monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     log = tmp_path / "run.log"
     log.write_text(
         "successfully saved checkpoint from iteration 100 to /run/phase1-checkpoints\n"
@@ -3678,7 +4219,8 @@ def test_batch_epilog_requires_both_deterministic_checkpoint_routines(monkeypatc
 
     with pytest.raises(RuntimeError, match=r"expected at least 2 and 6"):
         slurm_job._epilog(
-            ["--nodes",
+            [
+                "--nodes",
                 "1",
                 "--gpus-per-node",
                 "1",
@@ -3698,64 +4240,144 @@ def test_batch_epilog_requires_both_deterministic_checkpoint_routines(monkeypatc
         )
 
 
-def test_perf_parser_supports_python_without_strict_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_otel_metrics_support_python_without_strict_zip(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     builtin_zip = zip
     monkeypatch.setattr(slurm_job, "zip", builtin_zip, raising=False)
-    text = "\n".join(
-        _perf_finished(rank, bandwidth)
-        for rank, bandwidth in enumerate((100, 100, 80, 80))
-    )
+    samples = [_native_otel_sample(rank, bandwidth) for rank, bandwidth in enumerate((100, 100, 80, 80))]
 
-    metrics = slurm_job.PerfReport._parse_metrics(text, 4)
+    metrics = slurm_job.otel_report.metrics_from_data(_otel_data(*samples), 4)
 
     assert metrics["bw_mbps"]["median"] == 90  # noqa: PLR2004
     assert metrics["bw_socket_imbalance"]["mean"] == 1.25  # noqa: PLR2004
 
 
-def test_perf_markers_require_the_complete_schema_and_matching_span_ids(caplog: pytest.LogCaptureFixture) -> None:
+def test_native_perf_spans_require_the_complete_schema_and_timestamps(caplog: pytest.LogCaptureFixture) -> None:
     slurm_job = _load_slurm_job()
 
-    assert slurm_job.PerfReport._validate_daemon_markers(_perf_span(rank=2, snapshot=7))
+    sample = _native_otel_sample(rank=2, snapshot=7, write_us=1_000_000)
+    assert slurm_job.otel_report.native_spans_valid([sample])
+    assert slurm_job.otel_report.metrics_from_data(_otel_data(sample))["wr_tnsr_us"]["mean"] == 1_000_000
+
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.otel_report.native_spans_valid([{key: value for key, value in sample.items() if key != "bw_mbps"}])
+    assert "did not match the required schema" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.otel_report.native_spans_valid([{**sample, "end_time_unix_nano": 1}])
+    assert "invalid timestamps" in caplog.text
+
+
+def test_native_perf_spans_warn_when_the_measured_cycle_is_missing(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+
+    with caplog.at_level("WARNING"):
+        assert not slurm_job.otel_report.native_spans_valid([])
+
+    assert "no ckpt.save spans found" in caplog.text
+
+
+def test_perf_metrics_have_no_log_fallback() -> None:
+    slurm_job = _load_slurm_job()
+    sample = _native_otel_sample(rank=2, bandwidth=42, write_us=20, written_bytes=200, snapshot=7)
+
+    metrics = slurm_job.otel_report.metrics_from_data(_otel_data(sample))
+    assert metrics["bw_mbps"]["mean"] == 42  # noqa: PLR2004
+    assert slurm_job.otel_report.metrics_from_data(_otel_data()) == {}
+
+
+def test_log_report_requires_matching_perf_markers(caplog: pytest.LogCaptureFixture) -> None:
+    slurm_job = _load_slurm_job()
+
     for suffix in ("us", "µs"):
         one_second = _perf_span(write_us=1_000_000).replace("1000000us", f"1000000{suffix}")
-        assert slurm_job.PerfReport._validate_daemon_markers(one_second)
-        assert slurm_job.PerfReport._parse_metrics("", daemon_text=one_second)["wr_tnsr_us"]["mean"] == 1_000_000
+        assert slurm_job.log_report._validate_daemon_markers(one_second)
+        assert slurm_job.log_report._metrics("", one_second, 1)["wr_tnsr_us"]["mean"] == 1_000_000
 
     malformed = _perf_span(rank=2, snapshot=7).replace(" snapshot_us=11us", "")
     with caplog.at_level("WARNING"):
-        assert not slurm_job.PerfReport._validate_daemon_markers(malformed)
+        assert not slurm_job.log_report._validate_daemon_markers(malformed)
     assert "did not match the required schema" in caplog.text
 
     caplog.clear()
     mismatched = _perf_span(rank=2, snapshot=7).replace("snapshot=7\n", "snapshot=8\n", 1)
     with caplog.at_level("WARNING"):
-        assert not slurm_job.PerfReport._validate_daemon_markers(mismatched)
+        assert not slurm_job.log_report._validate_daemon_markers(mismatched)
     assert "without Finished" in caplog.text
     assert "without Begin" in caplog.text
 
 
-def test_perf_markers_warn_when_the_measured_daemon_cycle_is_missing(caplog: pytest.LogCaptureFixture) -> None:
+def test_perf_report_uses_logs_only_when_otel_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     slurm_job = _load_slurm_job()
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
+    monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
+    monkeypatch.setattr(slurm_job.otel_report, "post_process", lambda *_args: pytest.fail("OTLP must be disabled"))
+    log = tmp_path / "run.log"
+    log.write_text(
+        "[native_ckpt:phase] phase=2\n"
+        "[2026-08-15 11:00:00.000000] saving checkpoint at iteration 300 to /ckpt\n"
+        "[2026-08-15 11:00:20.000000] successfully saved checkpoint from iteration 300 to /ckpt\n"
+        "[native_ckpt:mem] rank=0 gpu_peak_bytes=80 gpu_hbm_peak_bytes=90 "
+        "gpu_total_bytes=100 cpu_rss_bytes=10\n",
+    )
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
+    report_path = tmp_path / "report.json"
 
-    with caplog.at_level("WARNING"):
-        assert not slurm_job.PerfReport._validate_daemon_markers("")
+    passed = slurm_job.PerfReport.report(
+        "perf",
+        "pico_1x1",
+        "perf",
+        log,
+        {"metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}},
+        report_path,
+        1,
+    )
 
-    assert "no schema-valid ckpt.save Begin markers" in caplog.text
-    assert "no schema-valid ckpt.save Finished markers" in caplog.text
+    report = json.loads(report_path.read_text())
+    assert passed
+    assert report["telemetry_source"] == "logs"
+    assert report["ckpt_save_markers_valid"]
+    assert report["metrics"]["ckpt_durable_ms"]["mean"] == 20000
+
+
+def test_perf_report_does_not_fall_back_when_otel_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "1")
+    monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
+    monkeypatch.setattr(slurm_job.log_report, "post_process", lambda *_args: pytest.fail("logs must not be used"))
+    monkeypatch.setattr(slurm_job.otel_report, "load_latest", lambda _path: _otel_data())
+    log = tmp_path / "run.log"
+    log.write_text(_perf_span())
+
+    with pytest.raises(RuntimeError, match="no perf metrics found in otlp report data"):
+        slurm_job.PerfReport.report("perf", "pico_1x1", "perf-native", log, {}, tmp_path / "report.json", 1)
 
 
 def test_native_perf_report_cannot_pass_on_memory_metrics_alone(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
     log = tmp_path / "run.log"
     report_path = tmp_path / "report.json"
     log.write_text("[native_ckpt:mem] rank=0 gpu_peak_bytes=100 cpu_rss_bytes=10\n")
+    resource_metric = {
+        "name": "nvrx.checkpoint.run.gpu_peak_bytes",
+        "resource": {"dl.rank": 0},
+        "value": 100,
+    }
+    monkeypatch.setattr(slurm_job.otel_report, "load_latest", lambda _path: _otel_data(resource_metrics=[resource_metric]))
 
     with caplog.at_level("WARNING"):
-        passed = slurm_job.PerfReport.parse_and_report(
+        passed = slurm_job.PerfReport.report(
             "perf-native",
             "pico_1x1",
             "perf-native",
@@ -3768,135 +4390,122 @@ def test_native_perf_report_cannot_pass_on_memory_metrics_alone(
     report = yaml.safe_load(report_path.read_text())
     assert not passed
     assert not report["passed"]
-    assert not report["ckpt_save_markers_valid"]
+    assert not report["ckpt_save_spans_valid"]
     assert report["comparison"]["bw_mbps"]["reason"] == "missing_metric"
-    assert report["comparison"]["ckpt_save_markers"]["status"] == "FAIL"
+    assert report["comparison"]["ckpt_save_spans"]["status"] == "FAIL"
     assert "required baseline metric 'wr_tnsr_us' was not measured" in caplog.text
 
 
-def test_durability_pairs_async_saves_by_iteration() -> None:
-    """An async save completes out of order, so the pair is matched on the iteration."""
+def test_durability_pairs_async_saves_by_call_index() -> None:
     slurm_job = _load_slurm_job()
-    text = "\n".join(
-        (
-            "[2026-08-15 10:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
-            "[2026-08-15 10:01:00.000000] saving checkpoint at iteration     200 to /ckpt in torch_dist format",
-            "  [2026-08-15 10:00:12.250000] successfully saved checkpoint from iteration     100 to /ckpt",
-            "  [2026-08-15 10:01:09.750000] successfully saved local checkpoint from iteration     200 to /ckpt",
-        ),
-    )
+    spans = [
+        _checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=7),
+        _checkpoint_span("megatron.checkpoint.save", 10, 12, call_idx=8),
+        _checkpoint_span("megatron.checkpoint.save.finalize", 18, 20, call_idx=[8]),
+        _checkpoint_span("megatron.checkpoint.exit_finalize", 20, 25, call_idx=[7]),
+    ]
 
-    assert slurm_job.PerfReport._durability_ms(text) == [12250.0, 9750.0]
+    assert slurm_job.otel_report.checkpoint_durability_ms(spans) == ([25.0, 10.0], [0, 0])
 
 
-def test_durability_pairs_within_a_cycle_when_iterations_repeat() -> None:
-    """A determinism run saves the same iterations every cycle; spans must stay positive."""
+def test_durability_pairs_native_saves_and_finalizers_in_fifo_order() -> None:
     slurm_job = _load_slurm_job()
-    text = "\n".join(
-        (
-            "[2026-08-15 10:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
-            "  [2026-08-15 10:00:10.000000] successfully saved checkpoint from iteration     100 to /ckpt",
-            "[2026-08-15 11:00:00.000000] saving checkpoint at iteration     100 to /ckpt in torch_dist format",
-            "  [2026-08-15 11:00:12.000000] successfully saved checkpoint from iteration     100 to /ckpt",
-        ),
-    )
+    spans = [
+        _checkpoint_span("megatron.checkpoint.save", 0, 2),
+        _checkpoint_span("megatron.checkpoint.save", 10, 12),
+        _checkpoint_span("nvrx.checkpoint.wait_previous", 18, 20, call_idx=[0]),
+        _checkpoint_span("megatron.checkpoint.exit_finalize", 20, 25, call_idx=[1]),
+    ]
 
-    assert slurm_job.PerfReport._durability_ms(text) == [10000.0, 12000.0]
+    assert slurm_job.otel_report.checkpoint_durability_ms(spans) == ([20.0, 15.0], [0, 0])
 
 
-def test_durability_skips_a_save_that_began_before_the_measured_phase() -> None:
+def test_durability_warns_and_pairs_malformed_nvrx_indices_in_fifo_order(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     slurm_job = _load_slurm_job()
-    text = "\n".join(
-        (
-            "  [2026-08-15 12:00:05.000000] successfully saved checkpoint from iteration      50 to /ckpt",
-            "[2026-08-15 12:00:10.000000] saving checkpoint at iteration     500 to /ckpt in torch_dist format",
-            "  [2026-08-15 12:00:41.000000] successfully saved checkpoint from iteration     500 to /ckpt",
-        ),
-    )
+    spans = [
+        _checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=0),
+        _checkpoint_span("megatron.checkpoint.save", 10, 12, call_idx=1),
+        _checkpoint_span("megatron.checkpoint.save", 20, 22, call_idx=2),
+        _checkpoint_span("megatron.checkpoint.save.finalize", 4, 5, call_idx=[0]),
+        _checkpoint_span("megatron.checkpoint.save.finalize", 14, 15, call_idx=[0]),
+        _checkpoint_span("megatron.checkpoint.exit_finalize", 24, 30, call_idx=[0]),
+    ]
 
-    assert slurm_job.PerfReport._durability_ms(text) == [31000.0]
+    with caplog.at_level("WARNING"):
+        assert slurm_job.otel_report.checkpoint_durability_ms(spans) == ([5.0, 5.0, 10.0], [0, 0, 0])
+
+    assert "finalizer call indices mismatch" in caplog.text
+    assert "pairing in FIFO order" in caplog.text
+
+
+def test_durability_aggregates_identical_index_warnings_across_ranks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    spans = [
+        _checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=0, rank=rank)
+        for rank in range(16)
+    ] + [
+        _checkpoint_span("megatron.checkpoint.save.finalize", 4, 5, call_idx=[1], rank=rank)
+        for rank in range(16)
+    ]
+
+    with caplog.at_level("WARNING"):
+        slurm_job.otel_report.checkpoint_durability_ms(spans)
+
+    assert caplog.text.count("finalizer call indices mismatch") == 1
+    assert "ranks=0-15 (16 total)" in caplog.text
+
+
+def test_durability_requires_async_finalizer_span() -> None:
+    slurm_job = _load_slurm_job()
+
+    with pytest.raises(RuntimeError, match="no finalizer"):
+        slurm_job.otel_report.checkpoint_durability_ms(
+            [_checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=7)],
+        )
+
+    with pytest.raises(RuntimeError, match="finalizer count mismatch"):
+        slurm_job.otel_report.checkpoint_durability_ms(
+            [
+                _checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=7),
+                _checkpoint_span("megatron.checkpoint.save", 10, 12, call_idx=8),
+                _checkpoint_span("megatron.checkpoint.save.finalize", 4, 5, call_idx=[0]),
+            ],
+        )
 
 
 def test_durability_is_reported_for_both_providers() -> None:
-    """The trainer-log metric works without a daemon; the daemon metric is native-only."""
     slurm_job = _load_slurm_job()
-    text = "\n".join(
-        (
-            "[2026-08-15 11:00:00.000000] saving checkpoint at iteration     300 to /ckpt in torch_dist format",
-            "  [2026-08-15 11:00:20.000000] successfully saved checkpoint from iteration     300 to /ckpt",
-        ),
-    )
-    daemon = (
-        "[native_ckpt:svr][abc123#0][PERF] Snapshot=3 Durable ranks=6144 | "
-        "Time(us): activate_to_durable_us=11500000"
-    )
-
-    without_daemon = slurm_job.PerfReport._parse_metrics(text)
-    assert without_daemon["ckpt_durable_ms"]["mean"] == 20000.0  # noqa: PLR2004
+    saves = [
+        _checkpoint_span("megatron.checkpoint.save", 0, 20_000),
+        _checkpoint_span("megatron.checkpoint.save", 0, 24_000, rank=4),
+    ]
+    without_daemon = slurm_job.otel_report.metrics_from_data(_otel_data(megatron_spans=saves))
+    assert without_daemon["ckpt_durable_ms"]["mean"] == 22000.0  # noqa: PLR2004
+    assert without_daemon["ckpt_durable_ms"]["rank_min"] == 20000.0  # noqa: PLR2004
+    assert without_daemon["ckpt_durable_ms"]["rank_median"] == 22000.0  # noqa: PLR2004
+    assert without_daemon["ckpt_durable_ms"]["rank_max"] == 24000.0  # noqa: PLR2004
     assert without_daemon["ckpt_durable_ms"]["higher_is_better"] is False
     assert "ckpt_daemon_durable_ms" not in without_daemon
 
-    with_daemon = slurm_job.PerfReport._parse_metrics(text, None, daemon)
+    data = _otel_data(megatron_spans=saves)
+    data["daemon_durable_spans"] = [_checkpoint_span("ckpt.svr.durable", 0, 11_500)]
+    with_daemon = slurm_job.otel_report.metrics_from_data(data)
     assert with_daemon["ckpt_daemon_durable_ms"]["mean"] == 11500.0  # noqa: PLR2004
 
 
-def test_checkpoint_timers_are_read_from_the_rank_that_records_them(
-    caplog: pytest.LogCaptureFixture,
-    tmp_path: Path,
-) -> None:
-    """Megatron logs its timers on the last rank, not the rank everything else is read from."""
+def test_daemon_durability_is_summarised_from_otel(caplog: pytest.LogCaptureFixture) -> None:
     slurm_job = _load_slurm_job()
-    # The report is handed the job log, not a rank log: RESULTS_DIR is <run>/logs.
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    job_log = logs / "gb200_async-native-perf_cfg.log"
-    job_log.write_text("no timers here\n")
-    (logs / "cfg_run-routine_rank0.log").write_text("rank 0 never holds them\n")
-    (logs / "cfg_run-routine_rank9.log").write_text("    save-checkpoint ....: (9.0, 9.0)\n")
-    last = logs / "cfg_run-routine_rank10.log"
-    last.write_text(
-        "    save-checkpoint ....: (601.13, 2848.37)\n"
-        "    load-checkpoint ....: (36220.47, 36220.69)\n"
-        "    save-checkpoint ....: (575.53, 2874.46)\n",
-    )
-
-    assert slurm_job.PerfReport._routine_rank_logs(job_log)["cfg_run"][10] == last
-
-    with caplog.at_level("INFO"):
-        slurm_job.PerfReport._log_checkpoint_timings(job_log)
-
-    # Rank 10 wins over rank 9: the comparison is numeric, not lexical.
-    assert "(601.13, 2848.37)" in caplog.text
-    assert "(575.53, 2874.46)" in caplog.text
-    assert "(36220.47, 36220.69)" in caplog.text
-    assert "(9.0, 9.0)" not in caplog.text
-
-
-def test_checkpoint_timers_are_silent_when_a_run_recorded_none(
-    caplog: pytest.LogCaptureFixture,
-    tmp_path: Path,
-) -> None:
-    slurm_job = _load_slurm_job()
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    job_log = logs / "cfg.log"
-    job_log.write_text("nothing interesting\n")
-    (logs / "cfg_run-routine_rank0.log").write_text("no timers either\n")
-
-    with caplog.at_level("INFO"):
-        slurm_job.PerfReport._log_checkpoint_timings(job_log)
-
-    assert "checkpoint timers" not in caplog.text
-
-    # A job log that is not inside a logs/ directory has no rank logs to find.
-    stray = tmp_path / "stray.log"
-    stray.write_text("x\n")
-    assert slurm_job.PerfReport._routine_rank_logs(stray) == {}
-
-
-def test_durability_is_summarised_beside_the_save_timings(caplog: pytest.LogCaptureFixture) -> None:
-    slurm_job = _load_slurm_job()
-    metrics = {"ckpt_daemon_durable_ms": slurm_job.PerfReport._metric([11000.0, 12000.0], "ms", False)}
+    metrics = {
+        "ckpt_daemon_durable_ms": slurm_job.otel_report.metric(
+            [11000.0, 12000.0],
+            "ms",
+            higher_is_better=False,
+        ),
+    }
 
     with caplog.at_level("INFO"):
         slurm_job.PerfReport._log_daemon_durability(metrics)
@@ -3912,7 +4521,7 @@ def test_durability_summary_is_silent_without_checkpoints(caplog: pytest.LogCapt
     with caplog.at_level("INFO"):
         slurm_job.PerfReport._log_daemon_durability({})
         slurm_job.PerfReport._log_daemon_durability(
-            {"ckpt_durable_ms": slurm_job.PerfReport._metric([9000.0], "ms", False)},
+            {"ckpt_durable_ms": slurm_job.otel_report.metric([9000.0], "ms", higher_is_better=False)},
         )
 
     assert "daemon activate" not in caplog.text
@@ -3923,7 +4532,7 @@ def test_durability_carries_a_wide_tolerance() -> None:
     slurm_job = _load_slurm_job()
 
     def compare(measured: float, tolerances: dict | None = None) -> tuple[dict, bool]:
-        metrics = {"ckpt_durable_ms": slurm_job.PerfReport._metric([measured], "ms", False)}
+        metrics = {"ckpt_durable_ms": slurm_job.otel_report.metric([measured], "ms", higher_is_better=False)}
         baseline = {"metrics": {"ckpt_durable_ms": 20000}, "tolerances": tolerances or {}}
         return slurm_job.PerfReport._compare_to_baseline(metrics, baseline, slurm_job.PERF_TOLERANCE)
 
@@ -3937,7 +4546,7 @@ def test_durability_carries_a_wide_tolerance() -> None:
 
 def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
     slurm_job = _load_slurm_job()
-    metrics = {"ckpt_durable_ms": slurm_job.PerfReport._metric([20000.0], "ms", False)}
+    metrics = {"ckpt_durable_ms": slurm_job.otel_report.metric([20000.0], "ms", higher_is_better=False)}
 
     result, passed = slurm_job.PerfReport._compare_to_baseline(metrics, {"metrics": {}}, 0.1)
 
@@ -3947,7 +4556,7 @@ def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
 
 def test_a_required_baseline_metric_missing_from_the_run_fails_the_job(caplog: pytest.LogCaptureFixture) -> None:
     slurm_job = _load_slurm_job()
-    metrics = {"gpu_peak_bytes": slurm_job.PerfReport._metric([100], "B", False)}  # noqa: FBT003
+    metrics = {"gpu_peak_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False)}
 
     with caplog.at_level("WARNING"):
         result, passed = slurm_job.PerfReport._compare_to_baseline(
@@ -3968,21 +4577,50 @@ def test_a_required_baseline_metric_missing_from_the_run_fails_the_job(caplog: p
 
 def test_perf_report_uses_the_largest_rank_hbm_peak() -> None:
     slurm_job = _load_slurm_job()
-    text = "\n".join(
-        (
-            "[native_ckpt:mem] rank=0 gpu_peak_bytes=80 gpu_hbm_peak_bytes=90 "
-            "gpu_total_bytes=100 cpu_rss_bytes=10",
-            "[native_ckpt:mem] rank=58 gpu_peak_bytes=85 gpu_hbm_peak_bytes=98 "
-            "gpu_total_bytes=100 cpu_rss_bytes=10",
-        ),
-    )
+    resource_metrics = [
+        {"name": f"nvrx.checkpoint.run.{name}", "resource": {"dl.rank": rank}, "value": value}
+        for rank, values in ((0, (80, 90, 100)), (58, (85, 98, 100)))
+        for name, value in zip(("gpu_peak_bytes", "gpu_hbm_peak_bytes", "gpu_total_bytes"), values)
+    ]
+    resource_metrics += [
+        {"name": "nvrx.checkpoint.run.cpu_rss_bytes", "resource": {"dl.rank": rank}, "value": value}
+        for rank, value in ((0, 101), (58, 104))
+    ]
 
-    metrics = slurm_job.PerfReport._parse_metrics(text, 4)
+    metrics = slurm_job.otel_report.metrics_from_data(_otel_data(resource_metrics=resource_metrics), 4)
 
     assert metrics["gpu_hbm_peak_bytes"]["max"] == 98  # noqa: PLR2004
     assert metrics["gpu_hbm_peak_pct"]["max"] == 98  # noqa: PLR2004
     assert metrics["gpu_hbm_peak_pct"]["ranks"] == [0, 58]
+    assert metrics["cpu_rss_bytes"]["max"] == 104  # noqa: PLR2004
     assert slurm_job.PerfReport._statistic("gpu_hbm_peak_pct", metrics["gpu_hbm_peak_pct"]) == "max"
+
+
+def test_megatron_perf_metrics_report_latest_values_across_export_ranks() -> None:
+    slurm_job = _load_slurm_job()
+    samples = _megatron_perf_metric_samples(0, 4)
+    samples.append(
+        {
+            "name": "megatron.training.throughput_tflops",
+            "resource": {"dl.rank": 0},
+            "value": 999.0,
+            "time_unix_nano": 1,
+        },
+    )
+
+    metrics = slurm_job.otel_report.metrics_from_data(_otel_data(megatron_metrics=samples), 4)
+
+    throughput = metrics["megatron.training.throughput_tflops"]
+    assert throughput["per_rank_median"] == {0: 120.0, 4: 124.0}
+    assert throughput["rank_min"] == 120.0
+    assert throughput["rank_median"] == 122.0
+    assert throughput["rank_max"] == 124.0
+    assert throughput["median"] == 122.0
+    assert slurm_job.PerfReport._statistic("megatron.training.throughput_tflops", throughput) == "median"
+    assert slurm_job.PerfReport._statistic(
+        "megatron.training.memory_allocated_gb",
+        metrics["megatron.training.memory_allocated_gb"],
+    ) == "max"
 
 
 def test_hbm_sampler_tracks_whole_device_usage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4347,11 +4985,14 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
         "moe",
     ]
 
-    slurm_job.FlavorSelection(["vg"]).transform(opts, {})
+    env = {}
+    slurm_job.FlavorSelection(["vg"]).transform(opts, env)
 
     assert "--check-for-nan-in-loss-and-grad" in opts
     assert "--no-check-for-nan-in-loss-and-grad" not in opts
     assert opts[-2:] == ["--rerun-mode", "disabled"]
+    assert env["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+    assert env["MEGATRON_OTEL_ENABLED"] == "0"
 
 
 def test_nonzero_rank_log_is_retained_without_mirroring_stdout(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:

@@ -1,26 +1,27 @@
 #pragma once
 #include "messages.h"
 
-#include <fmt/format.h>
-
-#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <filesystem>
+#include <string>
 #include <string_view>
 
 namespace checkpoint::telemetry::span
 {
+struct Id
+{
+    ipc::SessionId  sessionId{};
+    Rank            rank{};
+    ipc::SnapshotId snapshotId{};
+
+    constexpr bool operator==(Id const&) const = default;
+};
 
 struct CkptSave
 {
     static constexpr std::string_view Name = "ckpt.save";
-    struct Id
-    {
-        ipc::SessionId  sessionId{};
-        Rank            rank{};
-        ipc::SnapshotId snapshotId{};
-    };
 
     struct Begin
     {
@@ -41,66 +42,122 @@ struct CkptSave
     };
 };
 
+struct SvrFinalize
+{
+    static constexpr std::string_view Name = "ckpt.svr.finalize";
+
+    struct Begin
+    {
+        Id id{};
+    };
+
+    struct End
+    {
+        Id id{};
+    };
+};
+
+struct SvrWriteMetadata
+{
+    static constexpr std::string_view Name = "ckpt.svr.write_metadata";
+
+    struct Begin
+    {
+        Id id{};
+    };
+
+    struct End
+    {
+        Id id{};
+    };
+};
+
+struct SvrDurable
+{
+    static constexpr std::string_view Name = "ckpt.svr.durable";
+
+    struct Begin
+    {
+        Id                                    id{};
+        std::chrono::system_clock::time_point startedAt;
+    };
+    struct End
+    {
+        Id id{};
+    };
+};
+
 }    // namespace checkpoint::telemetry::span
-
-template <> struct fmt::formatter<checkpoint::telemetry::span::CkptSave::Begin> : fmt::formatter<std::string_view>
-{
-    auto format(checkpoint::telemetry::span::CkptSave::Begin const& evt, fmt::format_context& ctx) const    // NOLINT
-    {
-        return fmt::format_to(ctx.out(),
-                              "[native_ckpt:svr][{}][PERF] Rank={} Begin span={} started_at_ns={} snapshot={}\n",
-                              static_cast<uint32_t>(evt.id.sessionId),
-                              static_cast<uint32_t>(evt.id.rank),
-                              checkpoint::telemetry::span::CkptSave::Name,
-                              evt.startedAt.count(),
-                              static_cast<uint32_t>(evt.id.snapshotId));
-    }
-};
-
-template <> struct fmt::formatter<checkpoint::telemetry::span::CkptSave::End> : fmt::formatter<std::string_view>
-{
-    auto format(checkpoint::telemetry::span::CkptSave::End const& evt, fmt::format_context& ctx) const    // NOLINT
-    {
-        auto const writeSeconds = static_cast<double>(evt.d2hDuration.count()) / 1e6;    // NOLINT
-        return fmt::format_to(
-            ctx.out(),
-            "[native_ckpt:svr][{}][PERF] Rank={} Finished bw_mbps={:.2f} "
-            "| Time(us):  wr_tnsr_us={} snapshot_us={} total_us={} "
-            "| Count: num_tensors={} total_d2h={} "
-            "| Bytes: total_written_bytes={} avg_d2h_rq={} avg_tnsr={} snapshot={}\n",
-            static_cast<uint32_t>(evt.id.sessionId),
-            static_cast<uint32_t>(evt.id.rank),
-            writeSeconds == 0.0 ? 0.0 : static_cast<double>(evt.totalTensorBytes) / (1024.0 * 1024.0) / writeSeconds,    // NOLINT
-            evt.d2hDuration,
-            evt.snapshotDuration,
-            evt.totalDuration,
-            evt.numTensors,
-            evt.d2hRequestCount,
-            evt.totalWrittenBytes,
-            evt.totalTensorBytes / std::max(evt.d2hRequestCount, uint64_t{1}),
-            evt.totalTensorBytes / std::max(evt.numTensors, uint64_t{1}),
-            static_cast<uint32_t>(evt.id.snapshotId));
-    }
-};
 
 namespace checkpoint::telemetry
 {
 
-struct PerfStream
-{};
-
-inline PerfStream operator<<(PerfStream stream, span::CkptSave::Begin const& value)
+void Init();
+void Shutdown();
+template <typename TSpan> struct Emitter;
+template <> struct Emitter<span::CkptSave::Begin>
 {
-    fmt::print(stderr, "{}", value);
-    return stream;
-}
-
-inline PerfStream operator<<(PerfStream stream, span::CkptSave::End const& value)
+    static void Emit(span::CkptSave::Begin const& fields);
+};
+template <> struct Emitter<span::CkptSave::End>
 {
-    fmt::print(stderr, "{}", value);
-    return stream;
-}
+    static void Emit(span::CkptSave::End const& fields);
+};
+
+template <> struct Emitter<span::SvrFinalize::Begin>
+{
+    static void Emit(span::SvrFinalize::Begin const& fields);
+};
+template <> struct Emitter<span::SvrFinalize::End>
+{
+    static void Emit(span::SvrFinalize::End const& fields);
+};
+
+template <> struct Emitter<span::SvrWriteMetadata::Begin>
+{
+    static void Emit(span::SvrWriteMetadata::Begin const& fields);
+};
+template <> struct Emitter<span::SvrWriteMetadata::End>
+{
+    static void Emit(span::SvrWriteMetadata::End const& fields);
+};
+
+template <> struct Emitter<span::SvrDurable::Begin>
+{
+    static void Emit(span::SvrDurable::Begin const& fields);
+};
+template <> struct Emitter<span::SvrDurable::End>
+{
+    static void Emit(span::SvrDurable::End const& fields);
+};
+
+struct Stream
+{
+    template <typename T> Stream& operator<<(T const& value)
+    {
+        Emitter<T>::Emit(value);
+        return *this;
+    }
+};
+
+void InitLocalCollector(std::filesystem::path const& filePath);
+void InitRelayCollector(std::string_view const& relayToRemote);
+void Collect(std::string_view const& payload);
+
+struct OtlpResponse
+{
+    uint16_t    status;
+    std::string body;
+};
+
+inline constexpr size_t MaxOtlpRequestBytes = 64UL * 1024 * 1024;
+OtlpResponse            ReceiveOtlp(std::string_view const& path,
+                                    std::string_view const& contentType,
+                                    std::string_view const& contentEncoding,
+                                    std::string_view const& payload);
 
 }    // namespace checkpoint::telemetry
 
-#define PERF() (::checkpoint::telemetry::PerfStream{}) /* NOLINT */
+// NOLINTBEGIN(cppcoreguidelines-macro-usage)
+#define PERF() (::checkpoint::telemetry::Stream{})
+// NOLINTEND(cppcoreguidelines-macro-usage)

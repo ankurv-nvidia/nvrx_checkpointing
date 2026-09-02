@@ -30,3 +30,4 @@
 # `git diff`/`git show` so baseline updates stay reviewable. One-time opt-in:
 #   git config diff.xztext.textconv 'xz -dcq'
 metadata/**/reference.metadata.info.xz diff=xztext
+cmake/vcpkg-ports/opentelemetry-cpp23/*.patch whitespace=-trailing-space

@@ -42,20 +42,20 @@ import shlex
 import shutil
 import signal
 import socket
-import statistics
 import string
 import subprocess
 import sys
 import threading
 import time
-from collections import Counter, namedtuple
+from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
-from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import log_report
+import otel_report
 import wheel_install
 import yaml
 
@@ -96,7 +96,6 @@ _NVRX_MODULE = "nvidia_resiliency_ext"
 SOFT_FAIL_RC = 3
 PERF_TOLERANCE = 0.05
 MAX_BW_SOCKET_IMBALANCE = 1.30
-REQUIRED_NATIVE_PERF_METRICS = frozenset({"bw_mbps", "wr_tnsr_us", "total_written_bytes"})
 # Durability spans the whole distributed write, so it carries the shared filesystem's
 # variance rather than the checkpointer's: on a busy Lustre the same job can differ
 # several-fold. Track the number, but only fail on a change too large for that to
@@ -163,6 +162,17 @@ _TRAIN_ENV_DEFAULTS = {
     "QUANTIZATION_TYPE_DEBUG": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "MASTER_PORT": "29500",
+    "NATIVE_CKPT_OTEL_ENABLE": "1",
+    "NATIVE_CKPT_OTEL_EXPORT": "daemon",
+}
+_MEGATRON_OTEL_ENV_DEFAULTS = {
+    "MEGATRON_OTEL_ENABLED": "1",
+    "MEGATRON_OTEL_METRICS_ENABLED": "1",
+    "MEGATRON_OTEL_EXPORT_STRATEGY": "all_ranks",
+    "MEGATRON_OTEL_SPAN_GROUPS": "default,load_checkpoint",
+    "MEGATRON_OTEL_TRACES_ENABLED": "1",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4100",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
 }
 _PRETRAIN_ENV_NAMES = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH",
@@ -174,6 +184,9 @@ _PRETRAIN_ENV_NAMES = {
     "LOCAL_WORLD_SIZE",
     "MAMBA_DETERMINISTIC",
     "MASTER_ADDR",
+    "NATIVE_CKPT_OTEL_COLLECTOR",
+    "NATIVE_CKPT_OTEL_DIR",
+    "NATIVE_CKPT_OTEL_FILE",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
     "NCCL_NET",
@@ -196,45 +209,9 @@ _PRETRAIN_ENV_NAMES = {
     "SLURM_TASKS_PER_NODE",
     "TORCHELASTIC_RESTART_COUNT",
     "WORLD_SIZE",
+    *_MEGATRON_OTEL_ENV_DEFAULTS,
+    "MEGATRON_OTEL_RUN_ID",
 }
-# The daemon emits one strictly-shaped Begin/Finished pair per rank and save into
-# its own per-host log rather than the trainer's output. Matching the whole line
-# makes a telemetry schema change visible instead of silently dropping metrics.
-_PERF_BEGIN_RE = re.compile(
-    r"^\[native_ckpt:svr\]\[(?P<session>\d+)\]\[PERF\] Rank=(?P<rank>\d+) "
-    r"Begin span=ckpt\.save started_at_ns=(?P<started_at_ns>\d+) snapshot=(?P<snapshot>\d+)$",
-    re.MULTILINE,
-)
-_BW_RE = re.compile(
-    r"^\[native_ckpt:svr\]\[(?P<session>\d+)\]\[PERF\] Rank=(?P<rank>\d+) Finished "
-    r"bw_mbps=(?P<bw_mbps>\d+(?:\.\d+)?) \| Time\(us\):  "
-    r"wr_tnsr_us=(?P<wr_tnsr_us>\d+)[uµ]s "
-    r"snapshot_us=(?P<snapshot_us>\d+)[uµ]s total_us=(?P<total_us>\d+)[uµ]s \| "
-    r"Count: num_tensors=(?P<num_tensors>\d+) total_d2h=(?P<total_d2h>\d+) \| "
-    r"Bytes: total_written_bytes=(?P<total_written_bytes>\d+) "
-    r"avg_d2h_rq=(?P<avg_d2h_rq>\d+) avg_tnsr=(?P<avg_tnsr>\d+) "
-    r"snapshot=(?P<snapshot>\d+)$",
-    re.MULTILINE,
-)
-_MEM_RE = re.compile(
-    r"\[native_ckpt:mem\](?: rank=(\d+))? gpu_peak_bytes=(\d+)"
-    r"(?: gpu_hbm_peak_bytes=(\d+) gpu_total_bytes=(\d+))? cpu_rss_bytes=(\d+)",
-)
-_PHASE2_MARKER = "[native_ckpt:phase] phase=2"
-_SAVE_RE = re.compile(r"successfully saved (?:async )?checkpoint from iteration\s+\d+\s+to\s+(\S+)")
-# The coordinator daemon reports a checkpoint durable once every shard and the metadata
-# are on disk. Native-only: the nvrx provider never starts this daemon.
-_DAEMON_DURABLE_RE = re.compile(
-    r"\[native_ckpt:svr\]\[[^\]]*\]\[PERF\] Snapshot=(\d+) Durable[^\n]*?activate_to_durable_us=(\d+)",
-)
-# Megatron prints this pair around every save, and the native writer mirrors it
-# byte-for-byte, so the gap measures durability the same way whichever provider ran.
-# Matched as one alternation so the two events stay in the order the run emitted them.
-_CKPT_EVENT_RE = re.compile(
-    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\] "
-    r"(saving checkpoint at iteration|successfully saved (?:\S+ )?checkpoint from iteration)"
-    r"\s+(\d+)",
-)
 _ARGUMENTS_RE = re.compile(
     r"-{24} arguments -{24}.*?-{20} end of arguments -{21}",
     re.DOTALL,
@@ -247,6 +224,12 @@ def sys_path_insert(path: Path) -> None:
     entries = [entry for entry in os.environ.get("PYTHONPATH", "").split(":") if entry]
     if value not in entries:
         os.environ["PYTHONPATH"] = ":".join([value, *entries])
+
+def _otel_reporting_enabled(flavors: FlavorSelection | None = None) -> bool:
+    return (flavors is None or flavors.policy.otel_reporting) and (
+        os.environ.get("NATIVE_CKPT_OTEL_ENABLE", _TRAIN_ENV_DEFAULTS["NATIVE_CKPT_OTEL_ENABLE"]) == "1"
+        or os.environ.get("MEGATRON_OTEL_ENABLED", _MEGATRON_OTEL_ENV_DEFAULTS["MEGATRON_OTEL_ENABLED"]) == "1"
+    )
 
 
 def _job_array_segment(args: argparse.Namespace) -> int:
@@ -1187,16 +1170,6 @@ def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: 
         raise RuntimeError(f"job failed with exit code {rc}; log: {log_file}")
     return rc
 
-def _rank_memory_measurements(job_log: Path) -> str:
-    """Collect final memory records from every rank log belonging to a job."""
-    if job_log.parent.name != "logs":
-        return ""
-    run_root = job_log.parent.parent
-    records = []
-    for path in sorted(run_root.glob("**/logs/*-routine_rank*.log")):
-        records.extend(match.group(0) for match in _MEM_RE.finditer(path.read_text(errors="replace")))
-    return "\n".join(records)
-
 class PerfReport:
     @staticmethod
     def _platform_bandwidth_baseline(platform: str) -> int:
@@ -1220,72 +1193,6 @@ class PerfReport:
         return baseline
 
     @staticmethod
-    def _metric(samples: list[float | int], unit: str, higher: bool | None, ranks: list[int] | None = None) -> dict:
-        return {
-            "samples": samples,
-            "ranks": ranks,
-            "mean": statistics.mean(samples),
-            "median": statistics.median(samples),
-            "min": min(samples),
-            "max": max(samples),
-            "unit": unit,
-            "higher_is_better": higher,
-        }
-
-    @staticmethod
-    def _routine_rank_logs(job_log: Path) -> dict[str, dict[int, Path]]:
-        """The per-rank routine logs a job wrote, grouped by the routine that wrote them.
-
-        A determinism job runs two routines, `--run=ref:... --run=cmp:...`, each into its
-        own directory. They are what the job exists to compare, so both are reported. The
-        report is handed the job log, so the rank logs are found beside it the way the
-        per-rank memory records are.
-        """
-        if job_log.parent.name != "logs":
-            return {}
-        grouped: dict[str, dict[int, Path]] = {}
-        for path in job_log.parent.parent.glob("**/logs/*-routine_rank*.log"):
-            if match := re.fullmatch(r"(?P<label>.+)-routine_rank(?P<rank>\d+)", path.stem):
-                grouped.setdefault(match["label"], {})[int(match["rank"])] = path
-        return dict(sorted(grouped.items()))
-
-    @staticmethod
-    def _read(path: Path) -> str:
-        try:
-            return path.read_text(errors="replace")
-        except OSError:
-            return ""
-
-    @staticmethod
-    def _log_checkpoint_timings(job_log: Path) -> None:
-        """Report what each routine a job ran cost to checkpoint.
-
-        Megatron's Timers.log writes to the last rank, while the save/saved pair a
-        durability span is measured from is printed by rank 0, so each routine is read
-        from both ends of its own rank set.
-        """
-        for label, ranks in PerfReport._routine_rank_logs(job_log).items():
-            last = ranks[max(ranks)]
-            timers = [
-                line.rstrip()
-                for line in PerfReport._read(last).splitlines()
-                if "save-checkpoint" in line or "load-checkpoint" in line
-            ]
-            if timers:
-                logger.info(f"{label}: checkpoint timers from {last.name} (min, max ms across ranks)")
-                for line in timers:
-                    logger.info(line)
-            spans = PerfReport._durability_ms(PerfReport._read(ranks[min(ranks)]))
-            if spans:
-                samples = ", ".join(f"{value:.2f}" for value in spans)
-                logger.info(f"{label}: checkpoint durability (min, max ms across saves)")
-                logger.info(
-                    "    save -> durable ".ljust(52, ".")
-                    + f": ({min(spans):.2f}, {max(spans):.2f})  mean {statistics.mean(spans):.2f}"
-                    + f"  over {len(spans)} save(s) [{samples}]",
-                )
-
-    @staticmethod
     def _log_daemon_durability(metrics: dict) -> None:
         """Report the coordinator's own view of durability.
 
@@ -1304,150 +1211,16 @@ class PerfReport:
         )
 
     @staticmethod
-    def _durability_ms(text: str) -> list[float]:
-        """Milliseconds from each save starting to its checkpoint being durable.
-
-        Reported in the same unit as Megatron's checkpoint timers so a job log can be read
-        without converting between the two.
-
-        Measured in the trainer rather than the daemon, because that is the only side both
-        providers share: the nvrx provider never starts the checkpoint daemon. Covers the
-        whole save, staging included, so it is the number a training run feels.
-
-        Read in document order and consumed on use, because a determinism run saves the same
-        iteration once per cycle: keyed only by iteration, an early save would pair with a
-        later cycle's start and report a negative span.
-        """
-        fmt = "%Y-%m-%d %H:%M:%S.%f"
-        started: dict[int, str] = {}
-        elapsed = []
-        for match in _CKPT_EVENT_RE.finditer(text):
-            timestamp, event, iteration = match[1], match[2], int(match[3])
-            if event.startswith("saving"):
-                started[iteration] = timestamp
-                continue
-            start = started.pop(iteration, None)
-            if start is None:
-                continue  # save began before the measured phase; its start is not in `text`
-            span = datetime.strptime(timestamp, fmt) - datetime.strptime(start, fmt)
-            elapsed.append(round(span.total_seconds() * 1000, 2))
-        return elapsed
-
-    @staticmethod
-    def _daemon_text(results_dir: Path) -> str:
-        """Concatenate the daemon logs of the newest measured cycle.
-
-        Every host writes its own log and the daemon restarts each cycle, so the newest
-        cycle is the routine a baseline is made of — the same routine the trainer log's
-        last phase-2 marker selects.
-        """
-        by_cycle: dict[int, list[Path]] = {}
-        for path in results_dir.glob("checkpoint_server.cycle*.log"):
-            tag = path.name.split(".")[1]
-            if tag.startswith("cycle") and tag[5:].isdigit():
-                by_cycle.setdefault(int(tag[5:]), []).append(path)
-        if not by_cycle:
-            return ""
-        return "\n".join(p.read_text(errors="replace") for p in sorted(by_cycle[max(by_cycle)]))
-
-    @staticmethod
-    def _validate_daemon_markers(daemon_text: str) -> bool:
-        """Require complete, schema-valid Begin/Finished pairs from the measured daemon cycle."""
-        marker_lines = [
-            line for line in daemon_text.splitlines()
-            if "[PERF]" in line and ("Begin span=ckpt.save" in line or " Finished " in line)
-        ]
-        invalid = [line for line in marker_lines if not (_PERF_BEGIN_RE.fullmatch(line) or _BW_RE.fullmatch(line))]
-        begins = Counter(
-            (match["session"], int(match["rank"]), int(match["snapshot"]))
-            for match in _PERF_BEGIN_RE.finditer(daemon_text)
-        )
-        finished = Counter(
-            (match["session"], int(match["rank"]), int(match["snapshot"]))
-            for match in _BW_RE.finditer(daemon_text)
-        )
-
-        valid = True
-        if invalid:
-            logger.warning(
-                f"[slurm_job:perf] WARNING {len(invalid)} ckpt.save PERF marker(s) did not match the required schema; "
-                f"first mismatch: {invalid[0]}",
-            )
-            valid = False
-        if not begins:
-            logger.warning("[slurm_job:perf] WARNING no schema-valid ckpt.save Begin markers found in measured-cycle daemon logs")
-            valid = False
-        if not finished:
-            logger.warning("[slurm_job:perf] WARNING no schema-valid ckpt.save Finished markers found in measured-cycle daemon logs")
-            valid = False
-
-        missing_finished = begins - finished
-        missing_begins = finished - begins
-        if missing_finished or missing_begins:
-            def describe(records: Counter) -> str:
-                return ", ".join(
-                    f"session={session}/rank={rank}/snapshot={snapshot} x{count}"
-                    for (session, rank, snapshot), count in records.items()
-                )
-
-            if missing_finished:
-                logger.warning(f"[slurm_job:perf] WARNING ckpt.save Begin marker(s) without Finished: {describe(missing_finished)}")
-            if missing_begins:
-                logger.warning(f"[slurm_job:perf] WARNING ckpt.save Finished marker(s) without Begin: {describe(missing_begins)}")
-            valid = False
-        return valid
-
-    @staticmethod
-    def _parse_metrics(text: str, gpus_per_node: int | None = None, daemon_text: str | None = None) -> dict:
-        text = text[text.rfind(_PHASE2_MARKER) :] if _PHASE2_MARKER in text else text
-        # The memory records come from the ranks; the bandwidth counters from the daemon.
-        matches = list(_BW_RE.finditer(text if daemon_text is None else daemon_text))
-        metrics: dict = {}
-        if matches:
-            ranks = [int(m["rank"]) for m in matches]
-            bw = [round(float(m["bw_mbps"])) for m in matches]
-            write = [int(m["wr_tnsr_us"]) for m in matches]
-            metrics = {
-                "bw_mbps": PerfReport._metric(bw, "MB/s", True, ranks),
-                "wr_tnsr_us": PerfReport._metric(write, "us", False, ranks),
-                "total_written_bytes": PerfReport._metric([int(m["total_written_bytes"]) for m in matches], "B", None, ranks),
-            }
-            unique = sorted(set(ranks))
-            per_rank = [statistics.mean(v for r, v in zip(ranks, bw) if r == rank) for rank in unique]
-            if gpus_per_node and len(per_rank) == gpus_per_node and len(per_rank) >= 4 and len(per_rank) % 2 == 0:
-                half = len(per_rank) // 2
-                means = statistics.mean(per_rank[:half]), statistics.mean(per_rank[half:])
-                metrics["bw_socket_imbalance"] = PerfReport._metric([max(means) / min(means)], "ratio", None)
-        durable = PerfReport._durability_ms(text)
-        if durable:
-            metrics["ckpt_durable_ms"] = PerfReport._metric(durable, "ms", False)
-        if daemon_text:
-            daemon_durable = [int(m[2]) / 1e3 for m in _DAEMON_DURABLE_RE.finditer(daemon_text)]
-            if daemon_durable:
-                metrics["ckpt_daemon_durable_ms"] = PerfReport._metric(daemon_durable, "ms", False)
-        memory = list(_MEM_RE.finditer(text))
-        if memory:
-            ranks = [int(m[1]) for m in memory if m[1] is not None]
-            memory_ranks = ranks if len(ranks) == len(memory) else None
-            metrics["gpu_peak_bytes"] = PerfReport._metric(
-                [int(m[2]) for m in memory], "B", False, memory_ranks,
-            )
-            hbm = [(int(m[3]), int(m[4])) for m in memory if m[3] is not None and m[4] is not None]
-            if hbm:
-                hbm_ranks = ranks if len(ranks) == len(hbm) else None
-                metrics["gpu_hbm_peak_bytes"] = PerfReport._metric(
-                    [used for used, _total in hbm], "B", False, hbm_ranks,
-                )
-                metrics["gpu_hbm_peak_pct"] = PerfReport._metric(
-                    [used * 100 / total for used, total in hbm], "%", False, hbm_ranks,
-                )
-        return metrics
-
-    @staticmethod
     def _statistic(name: str, measured: dict) -> str:
-        if name in {"gpu_hbm_peak_bytes", "gpu_hbm_peak_pct"} and "max" in measured:
+        if name in {"gpu_hbm_peak_bytes", "gpu_hbm_peak_pct", "megatron.training.memory_allocated_gb"} and "max" in measured:
             return "max"
-        if name in {"bw_mbps", "wr_tnsr_us"} and "median" in measured:
+        if name in {
+            "bw_mbps",
+            "wr_tnsr_us",
+            "megatron.training.step_duration_ms",
+            "megatron.training.throughput_tflops",
+            "megatron.training.tokens_per_sec",
+        } and "median" in measured:
             return "median"
         return "mean"
 
@@ -1495,7 +1268,7 @@ class PerfReport:
         return result, passed
 
     @staticmethod
-    def parse_and_report(
+    def report(
         job: str,
         config: str,
         flavor: str,
@@ -1504,37 +1277,33 @@ class PerfReport:
         report_path: Path,
         gpus: int,
         *,
-        daemon_dir: Path | None = None,
+        results_dir: Path | None = None,
     ) -> bool:
-        text = log.read_text(errors="replace")
-        # Rank 0 is the only routine log mirrored into the combined job log.
-        # Read the short per-rank memory records so the HBM peak describes the
-        # most heavily loaded GPU rather than whichever GPU owns global rank 0.
-        memory = _rank_memory_measurements(log)
-        metric_text = f"{_MEM_RE.sub('', text)}\n{memory}" if memory else text
-        daemon_text = PerfReport._daemon_text(daemon_dir or log.parent)
         flavor_names = flavor.split("-")
-        native = "nvrx" not in flavor_names and ("native" in flavor_names or bool(daemon_text))
-        markers_valid = PerfReport._validate_daemon_markers(daemon_text) if native else True
-        metrics = PerfReport._parse_metrics(metric_text, gpus, daemon_text)
-        # What the run cost to checkpoint, gathered in one place once it is over: the
-        # per-rank timers Megatron kept, then how long each save took to become durable.
-        PerfReport._log_checkpoint_timings(log)
+        results_dir = results_dir or log.parent
+        native = "nvrx" not in flavor_names and (
+            "native" in flavor_names or any(results_dir.glob("checkpoint_server.cycle*.log"))
+        )
+        processed = (
+            otel_report.post_process(results_dir, gpus, native)
+            if _otel_reporting_enabled()
+            else log_report.post_process(log, results_dir, gpus, native)
+        )
+        metrics = processed["metrics"]
         PerfReport._log_daemon_durability(metrics)
-        # The extension's own writer emits checkpoint times rather than the
-        # bandwidth counters a baseline is made of, so it has nothing to compare.
-        if not metrics and not native:
-            return True
         if not metrics:
-            raise RuntimeError(f"no perf metrics found in {log} or the daemon logs beside it")
+            if processed["source"] == "logs" and not native:
+                return True
+            raise RuntimeError(f"no perf metrics found in {processed['source']} report data for {results_dir}")
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
-        if native:
-            comparison["ckpt_save_markers"] = {
-                "status": "PASS" if markers_valid else "FAIL",
-                "measured": "paired" if markers_valid else "missing_or_mismatched",
-                "baseline": "paired",
+        validation = processed["validation"]
+        if validation:
+            comparison[validation["name"]] = {
+                "status": "PASS" if validation["valid"] else "FAIL",
+                "measured": validation["measured"],
+                "baseline": validation["baseline"],
             }
-            passed &= markers_valid
+            passed &= validation["valid"]
         for name, value in comparison.items():
             logger.info(f"[{value['status']}] {name}: {value['measured']}")
         report = {
@@ -1542,11 +1311,13 @@ class PerfReport:
             "config": config,
             "flavor_tag": flavor,
             "cluster": cluster_tag(),
+            "telemetry_source": processed["source"],
             "passed": passed,
-            "ckpt_save_markers_valid": markers_valid if native else None,
             "metrics": {name: {k: v for k, v in metric.items() if k not in ("samples", "ranks")} for name, metric in metrics.items()},
             "comparison": comparison,
         }
+        if validation:
+            report[validation["report_field"]] = validation["valid"]
         report_path.write_text(json.dumps(report, indent=2))
         return passed
 
@@ -1742,14 +1513,16 @@ def _argument_log(_args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> 
     return run / "logs" / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
 
 def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, strict: bool = True) -> bool:
-    """Generate, compare and retain arguments for every run the job executed."""
+    """Generate, compare and retain arguments for the runs under test."""
     results = []
-    specs = _run_specs(args)
+    all_specs = _run_specs(args)
+    native_specs = tuple(spec for spec in all_specs if _provider(spec.flavors) == "native")
+    specs = native_specs if args.flavors.policy.compares_routines and native_specs else all_specs
     for spec in specs:
         log = _argument_log(args, batch_log, spec)
         # A unit/local epilog may only have the combined log. Real multi-run
         # jobs always have one rank-0 log per run and must not fall back.
-        if not log.exists() and len(specs) == 1:
+        if not log.exists() and len(all_specs) == 1:
             log = batch_log
         if not log.exists():
             message = f"argument log for run {spec.name!r} does not exist: {log}"
@@ -1768,7 +1541,26 @@ def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, s
         results.append(_compare_arguments(spec.args, log, ()))
     return len(results) == len(specs) and all(results)
 
-def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
+def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> None:
+    specs = _run_specs(args)
+    for spec in specs:
+        results_dir = _argument_log(args, batch_log, spec).parent
+        otel_files = sorted(
+            results_dir.glob("otel/*/native_ckpt_otel.jsonl"),
+            key=lambda path: (
+                path.parent.name != "phase1",
+                int(path.parent.name.removeprefix("cycle"))
+                if path.parent.name.startswith("cycle") and path.parent.name.removeprefix("cycle").isdigit()
+                else 0,
+            ),
+        )
+        if not otel_files:
+            raise RuntimeError(f"no checkpoint OTLP files found in {results_dir / 'otel'}")
+        for path in otel_files:
+            label = f"{spec.name} {path.parent.name}" if len(specs) > 1 else path.parent.name
+            otel_report.log_checkpoint_timings(path, None, label)
+
+def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> None:
     """Write measured metrics from the job-level report as a candidate baseline."""
     flavors = _selected_flavors(args)
     # NVRX does not expose the native writer's bandwidth counters. Keep its
@@ -1777,24 +1569,31 @@ def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
     if "perf" not in flavors.names or "nvrx" in flavors.names:
         return
     _cfg, _flavor, stem = _identity(args)
-    output = log.parent / "baselines"
+    output = results_dir / "baselines"
     output.mkdir(parents=True, exist_ok=True)
 
-    report_path = log.with_name(f"{stem}_report.json")
+    report_path = results_dir / f"{stem}_report.json"
     if not report_path.exists():
         return
     report = json.loads(report_path.read_text())
     measured = report.get("metrics", {})
-    missing = REQUIRED_NATIVE_PERF_METRICS - measured.keys()
-    if report.get("ckpt_save_markers_valid") is not True or missing:
+    source = report.get("telemetry_source")
+    if source not in {"logs", "otlp"}:
+        logger.warning(f"[slurm_job:perf] WARNING refusing baseline candidate with unknown telemetry source: {source!r}")
+        return
+    required = otel_report.REQUIRED_PERF_METRICS if source == "otlp" else log_report.REQUIRED_PERF_METRICS
+    validation_field = "ckpt_save_spans_valid" if source == "otlp" else "ckpt_save_markers_valid"
+    missing = required - measured.keys()
+    if report.get(validation_field) is not True or missing:
         details = []
-        if report.get("ckpt_save_markers_valid") is not True:
-            details.append("ckpt.save markers were missing or mismatched")
+        if report.get(validation_field) is not True:
+            details.append("ckpt.save records were missing or invalid")
         if missing:
             details.append(f"required metrics were absent: {', '.join(sorted(missing))}")
         logger.warning(f"[slurm_job:perf] WARNING refusing to write an incomplete baseline candidate: {'; '.join(details)}")
         return
     metrics = {}
+    rank_statistics = {}
     for name, value in measured.items():
         # Socket imbalance is an in-job topology diagnostic rather than a
         # workload baseline. The measured bandwidth belongs in the candidate
@@ -1804,9 +1603,18 @@ def _write_performance_baseline(args: argparse.Namespace, log: Path) -> None:
         statistic = PerfReport._statistic(name, value)
         if statistic in value:
             measured_value = value[statistic]
-            metrics[name] = round(measured_value, 2) if name.endswith("_pct") else round(measured_value)
+            preserve_decimals = name.endswith("_pct") or name.startswith("megatron.training.")
+            metrics[name] = round(measured_value, 2) if preserve_decimals else round(measured_value)
+        if {"rank_min", "rank_median", "rank_max"} <= value.keys():
+            rank_statistics[name] = {
+                "min": round(value["rank_min"], 2),
+                "median": round(value["rank_median"], 2),
+                "max": round(value["rank_max"], 2),
+            }
     if metrics:
-        baseline = {"description": "auto-generated by CI", "metrics": metrics}
+        baseline = {"description": "auto-generated by CI", "source": source, "metrics": metrics}
+        if rank_statistics:
+            baseline["rank_statistics"] = rank_statistics
         (output / f"{stem}.yaml").write_text(yaml.safe_dump(baseline, sort_keys=False))
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -1879,6 +1687,7 @@ def _base_env() -> dict[str, str]:
             "NATIVE_CKPT_SERVER_LOG",
             str(RESULTS_DIR / "checkpoint_server.%h.%p.log"),
         ),
+        "NATIVE_CKPT_OTEL_DIR": os.environ.get("NATIVE_CKPT_OTEL_DIR", str(RESULTS_DIR / "otel")),
     }
 
 # A run trains phase 1 from scratch and phase 2 resuming from it. A variant
@@ -1903,6 +1712,7 @@ class FlavorPolicy:
     phase2_checkpoints: int = 3
     checkpoint_routines: int = 1
     manages_native_server: bool = True
+    otel_reporting: bool = True
     requires_nvrx_absent: bool = False
     compares_routines: bool = False
     # The variant a single-routine run trains as, so its options are the
@@ -1967,8 +1777,8 @@ class FlavorPolicy:
     def run_worker(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
         (self.worker or _run_routine)(cfg, args, provider, label)
 
-    def stop_server(self, provider: str, tag: str, graceful: bool = True) -> None:
-        if self.manages_native_server and provider == "native":
+    def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
+        if self.manages_native_server:
             def stop() -> None:
                 pids = CHECKPOINT_SERVER.pids()
                 CHECKPOINT_SERVER.stop(graceful)
@@ -2052,7 +1862,7 @@ class PerfFlavor(Flavor):
         baseline = args.baseline if hasattr(args, "baseline") else PerfReport.baseline(stem)
         if "nvrx" in _selected_flavors(args).names:
             baseline = {}
-        return PerfReport.parse_and_report(
+        return PerfReport.report(
             _selected_flavors(args).tag,
             cfg,
             tag,
@@ -2093,25 +1903,27 @@ class DeterministicFlavor(Flavor):
 
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
-        native_spec = next(
-            (spec for spec in reversed(_run_specs(args)) if _provider(spec.flavors) == "native"),
-            None,
+        specs = _run_specs(args)
+        report_spec = next(
+            (spec for spec in reversed(specs) if _provider(spec.flavors) == "native"),
+            specs[-1],
         )
         # Multi-run determinism keeps each routine's daemon logs beneath that
         # routine, while the batch log and report live at the job root. Report
-        # the native routine when one exists; an NVRx-only comparison has no
-        # native writer counters and therefore no performance baseline.
-        baseline = args.baseline if native_spec is not None else {}
-        daemon_dir = _argument_log(args, log, native_spec).parent if native_spec is not None else None
-        if not PerfReport.parse_and_report(
-            _selected_flavors(args).tag,
-            cfg,
+        # the native routine when one exists; otherwise report the final run.
+        native = _provider(report_spec.flavors) == "native"
+        baseline = args.baseline if native else {}
+        source_log = _argument_log(args, log, report_spec)
+        report_tag = "-".join(dict.fromkeys((*_selected_flavors(args).names, *report_spec.flavors.names)))
+        if not PerfReport.report(
             tag,
-            log,
+            cfg,
+            report_tag,
+            source_log,
             baseline,
             log.with_name(f"{stem}_report.json"),
             args.gpus_per_node,
-            daemon_dir=daemon_dir,
+            results_dir=source_log.parent,
         ):
             logger.warning("performance baseline failed; determinism comparisons passed")
         return True
@@ -2160,6 +1972,7 @@ class ValgrindFlavor(Flavor):
         policy.checkpoint_routines = 1
         policy.phase2_save_interval = 1
         policy.manages_native_server = False
+        policy.otel_reporting = False
         policy.wheel_prep_mode = "--build-from-source"
         policy.wheel_defines = ("PHOENIX_BUILD_FOR_VALGRIND=1",)
         policy.install_prebuilt = False
@@ -2179,6 +1992,8 @@ class ValgrindFlavor(Flavor):
         # independent training NaN abort enabled: corruption may surface there
         # even when memcheck does not diagnose it.
         _set(opts, "--rerun-mode", "disabled")
+        # Keep third-party OTel/protobuf internals outside the daemon's Memcheck gate.
+        env.update(NATIVE_CKPT_OTEL_ENABLE="0", MEGATRON_OTEL_ENABLED="0")
         env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
 
     @contextlib.contextmanager
@@ -2204,12 +2019,14 @@ class ValgrindFlavor(Flavor):
             "--tool=memcheck",
             "--leak-check=full",
             "--show-leak-kinds=all",
+            "--errors-for-leak-kinds=definite,indirect",
             "--error-exitcode=42",
             f"--log-file={report}",
             str(nvrx_checkpointing.SERVER_PATH),
         ]
+        server_env = {**os.environ, "NATIVE_CKPT_OTEL_ENABLE": "0"}
         with server_log.open("w") as output:
-            proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env=server_env)
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline and proc.poll() is None:
                 if "Checkpoint server started" in server_log.read_text(errors="replace"):
@@ -2763,6 +2580,8 @@ def _phase_command(
         checkpoints_override=checkpoints_override,
     )
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
+    for name, value in _MEGATRON_OTEL_ENV_DEFAULTS.items():
+        env.setdefault(name, value)
     include_nvrx = not (provider == "native" and flavors.policy.requires_nvrx_absent)
     _toolchain(cfg, args).apply(env, include_nvrx=include_nvrx)
     flavors.transform(opts, env)
@@ -2791,6 +2610,7 @@ def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
     for name in sorted(_RUN_ENV_NAMES | _PRETRAIN_ENV_NAMES | _TRAIN_ENV_DEFAULTS.keys()):
         if name in env:
             print(f"[slurm_job:env] {name}={shlex.quote(env[name])}", flush=True)  # noqa: T201
+
 def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
     flavors = _selected_flavors(args)
     stem = f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
@@ -2806,6 +2626,11 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             f"[slurm_job:restart] {label or 'run'} resuming phase 2 from iteration {resume_iteration}",
         )
     while phase == 1 or args.repeat == 0 or cycle < args.repeat:
+        expected_checkpoints = 1 if phase == 1 else flavors.policy.phase2_checkpoints
+        if phase == 2 and args.checkpoints_per_run is not None:
+            expected_checkpoints = args.checkpoints_per_run
+        if checkpoints_override is not None:
+            expected_checkpoints = checkpoints_override
         cmd, env = _phase_command(
             cfg,
             args,
@@ -2819,18 +2644,54 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         rank = _rank_env("SLURM_PROCID", "RANK", "0")
         log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{rank}.log" if label else None
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
-        # The daemon carries the perf counters now, and it is restarted per cycle. Name its
-        # log for the cycle so the report can tell the measured routine from the reference.
         server_log = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
-        # The trainer auto-launches the daemon, so both the parent-side server context and
-        # the already-materialized child environment must name the same measured cycle.
         os.environ["NATIVE_CKPT_SERVER_LOG"] = server_log
         env["NATIVE_CKPT_SERVER_LOG"] = server_log
+        otel_cycle_dir = RESULTS_DIR / "otel" / cycle_tag
+        otel_cycle_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["NATIVE_CKPT_OTEL_DIR"] = str(otel_cycle_dir)
+        env["NATIVE_CKPT_OTEL_DIR"] = str(otel_cycle_dir)
+        otel_file = otel_cycle_dir / "native_ckpt_otel.jsonl"
+        os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
+        env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
+        otel_enabled = env.get("MEGATRON_OTEL_ENABLED") == "1"
+        relay_megatron_otel = provider != "native" and otel_enabled
+        collector_node = (
+            socket.gethostname().split(".", 1)[0] == env["MASTER_ADDR"].split(".", 1)[0]
+            if relay_megatron_otel
+            else int(rank) < args.gpus_per_node
+        )
+        collector = "" if not relay_megatron_otel else ("file" if collector_node else f"{env['MASTER_ADDR']}:4100")
+        if collector:
+            os.environ["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
+            env["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
+        else:
+            os.environ.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
+            env.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
+        job_id = env.get("SLURM_ARRAY_JOB_ID") or env.get("SLURM_JOB_ID", "local")
+        slurm_restart = "0" if _in_job_array() else env.get("SLURM_RESTART_COUNT", "0")
+        elastic_restart = env.get("TORCHELASTIC_RESTART_COUNT", "0")
+        run_id = f"{job_id}-{RUN_NAME}-{cycle_tag}-sr{slurm_restart}-te{elastic_restart}"
+        env["MEGATRON_OTEL_RUN_ID"] = run_id
+        os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
+        server_enabled = flavors.policy.manages_native_server and (provider == "native" or otel_enabled)
+        if server_enabled:
+            from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+
+            if relay_megatron_otel:
+                if collector_node:
+                    _node_once(f"{label}-{cycle_tag}-otel-collector".strip("-"), checkpoint.ping)
+                _sync_ranks(f"{label}-{cycle_tag}-otel-collector-ready".strip("-"))
+                if not collector_node:
+                    _node_once(f"{label}-{cycle_tag}-otel-relay".strip("-"), checkpoint.ping)
+            else:
+                _node_once(f"{label}-{cycle_tag}-otel-listener".strip("-"), checkpoint.ping)
+            _sync_ranks(f"{label}-{cycle_tag}-otel-listeners-ready".strip("-"))
         if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
         with (
             flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
-            _server_heartbeat(flavors.policy.manages_native_server and provider == "native"),
+            _server_heartbeat(server_enabled),
         ):
             _print_pretrain_env(env, cycle_tag)
             rc = (
@@ -2854,11 +2715,25 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                 _run_dir(cfg) / f"phase1-checkpoints/iter_{flavors.policy.phase1_train_iters:07d}/.metadata",
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
+        if server_enabled and not collector_node:
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop")
+        _sync_ranks(f"{label}-{cycle_tag}-relays-stopped".strip("-"))
+        if server_enabled and collector_node:
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
+        _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
+        if otel_enabled and rank == "0":
+            otel_report.validate_collected(
+                otel_file,
+                run_id,
+                args.nodes,
+                args.gpus_per_node,
+                provider,
+                expected_checkpoints,
+            )
+        if phase == 1:
             phase = 2
         else:
             cycle += 1
-        flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-stop")
-        _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
 def _manifest(iter_dir: Path, baseline: Path | None = None) -> int:
     """Record what one checkpoint holds, and diff it against a baseline if given.
 
@@ -3289,6 +3164,41 @@ class _PeakHbmSampler:
         with contextlib.suppress(Exception):
             self._sample_once()
 
+def _emit_checkpoint_resource_metrics(
+    provider: str,
+    *,
+    gpu_peak_bytes: int,
+    gpu_hbm_peak_bytes: int,
+    gpu_total_bytes: int,
+    cpu_rss_bytes: int,
+) -> None:
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter  # noqa: PLC0415
+    from opentelemetry.sdk.metrics import MeterProvider  # noqa: PLC0415
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader  # noqa: PLC0415
+    from opentelemetry.sdk.resources import Resource  # noqa: PLC0415
+
+    resource = Resource.create(
+        {
+            "service.name": "nvrx-checkpoint-ci",
+            "nemo.run.id": os.environ["MEGATRON_OTEL_RUN_ID"],
+            "dl.rank": int(os.environ.get("RANK", "0")),
+            "checkpoint.provider": provider,
+        },
+    )
+    reader = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=60_000)
+    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    meter = meter_provider.get_meter("nvrx.checkpoint.ci")
+    values = {
+        "nvrx.checkpoint.run.gpu_peak_bytes": gpu_peak_bytes,
+        "nvrx.checkpoint.run.gpu_hbm_peak_bytes": gpu_hbm_peak_bytes,
+        "nvrx.checkpoint.run.gpu_total_bytes": gpu_total_bytes,
+        "nvrx.checkpoint.run.cpu_rss_bytes": cpu_rss_bytes,
+    }
+    instruments = [meter.create_gauge(name, unit="By") for name in values]
+    for instrument, value in zip(instruments, values.values()):
+        instrument.set(value)
+    meter_provider.shutdown()
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
@@ -3355,20 +3265,29 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
             **pretrain_kwargs,
         )
     finally:
-        import resource  # noqa: I001, PLC0415
+        import resource  # noqa: PLC0415
 
         hbm.close()
         gpu_peak = torch.cuda.max_memory_allocated(hbm.device) if torch.cuda.is_initialized() else 0
-        print(  # noqa: T201
-            f"[native_ckpt:mem] rank={os.environ.get('RANK', '0')} gpu_peak_bytes={gpu_peak} "
-            f"gpu_hbm_peak_bytes={hbm.peak_bytes} gpu_total_bytes={hbm.total_bytes} "
-            f"cpu_rss_bytes={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}",
-            flush=True,
-        )
+        cpu_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        if os.environ.get("MEGATRON_OTEL_ENABLED") == "1":
+            _emit_checkpoint_resource_metrics(
+                args.ckpt_provider,
+                gpu_peak_bytes=gpu_peak,
+                gpu_hbm_peak_bytes=hbm.peak_bytes,
+                gpu_total_bytes=hbm.total_bytes,
+                cpu_rss_bytes=cpu_rss,
+            )
+        else:
+            print(  # noqa: T201
+                f"[native_ckpt:mem] rank={os.environ.get('RANK', '0')} gpu_peak_bytes={gpu_peak} "
+                f"gpu_hbm_peak_bytes={hbm.peak_bytes} gpu_total_bytes={hbm.total_bytes} "
+                f"cpu_rss_bytes={cpu_rss}",
+                flush=True,
+            )
 
 def _worker(args: argparse.Namespace) -> None:
     flavors = _selected_flavors(args)
-    provider = _provider(flavors)
     if any(
         _provider(spec.flavors) == "native" and spec.flavors.policy.requires_nvrx_absent
         for spec in _run_specs(args)
@@ -3388,7 +3307,7 @@ def _worker(args: argparse.Namespace) -> None:
         _perform_runs(cfg, args)
     except BaseException:
         local_rank = int(_rank_env("SLURM_LOCALID", "LOCAL_RANK", "0"))
-        if flavors.policy.manages_native_server and provider == "native" and local_rank == 0:
+        if flavors.policy.manages_native_server and local_rank == 0:
             with contextlib.suppress(Exception):
                 CHECKPOINT_SERVER.request("stop", 5)
         raise
@@ -3842,6 +3761,9 @@ _ENV_SCOPES = {
     "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
+    "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_DIR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
+    "MEGATRON_OTEL_RUN_ID": "rw",
+    **dict.fromkeys(_MEGATRON_OTEL_ENV_DEFAULTS, "rw"),
 }
 def _env_names(scope: str) -> list[str]:
     return [option.env for option in _RUN_OPTIONS.values() if scope in option.scopes] + [
@@ -3969,6 +3891,7 @@ def _epilog(argv: list[str]) -> None:
     args.flavors = FlavorSelection(args.flavor)
     _selected_flavors(args)
     args.baseline = json.loads(args.baseline_json)
+    otel_reporting = _otel_reporting_enabled(args.flavors)
     log_file = args.log_file
     if _in_job_array():
         # The launcher's rank 0 lands on whichever array task joins the rendezvous
@@ -3978,38 +3901,21 @@ def _epilog(argv: list[str]) -> None:
         combined = log_file.with_suffix(".combined.log")
         combined.write_text(log_file.read_text(errors="replace") + "".join(p.read_text(errors="replace") for p in task_logs))
         log_file = combined
-    text = log_file.read_text(errors="replace")
-    saves = _SAVE_RE.findall(text)
-    phase1 = sum("/phase1-checkpoints" in path for path in saves)
-    phase2 = sum("/checkpoints" in path and "/phase1-checkpoints" not in path for path in saves)
-    # A recorded baseline stands in for the reference routine, so only the
-    # compare routine writes checkpoints.
-    specs = _run_specs(args)
-    expected_phase1 = len(specs)
-    expected_phase2 = sum(
-        (
-            spec.flavors.policy.phase2_checkpoints
-            if spec.args.checkpoints_per_run is None
-            else spec.args.checkpoints_per_run
+    if not otel_reporting:
+        specs = _run_specs(args)
+        expected_phase2 = sum(
+            (spec.flavors.policy.phase2_checkpoints if spec.args.checkpoints_per_run is None else spec.args.checkpoints_per_run)
+            * (spec.args.repeat or 1)
+            for spec in specs
         )
-        * (spec.args.repeat or 1)
-        for spec in specs
-    )
-    logger.info(
-        f"[slurm_job:epilog] checkpoint saves: phase1={phase1}, phase2={phase2}, "
-        f"expected_phase1={expected_phase1}, expected_phase2={expected_phase2}",
-    )
-    if phase1 < expected_phase1 or (expected_phase2 and phase2 < expected_phase2):
-        raise RuntimeError(
-            f"incomplete checkpoint cycle in {args.log_file}: "
-            f"found {phase1} phase-1 and {phase2} phase-2 saves; "
-            f"expected at least {expected_phase1} and {expected_phase2}",
-        )
+        log_report.validate_checkpoint_saves(log_file, len(specs), expected_phase2)
     passed = args.flavors.policy.epilog(args, log_file)
-    _write_performance_baseline(args, log_file)
+    _write_performance_baseline(args, log_file.parent)
     # The arguments a run trained on are part of what its result means, so they
     # are compared with the same standing as the numbers it produced.
     passed = _write_and_compare_arguments(args, log_file) and passed
+    if otel_reporting:
+        _log_otel_checkpoint_timings(args, log_file)
     if not passed:
         raise SystemExit(SOFT_FAIL_RC)
 

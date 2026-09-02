@@ -15,6 +15,8 @@ def test_native_async_request_runs_and_finalizes_without_external_strategy(
     monkeypatch.setattr(native_async.torch.distributed, "is_initialized", lambda: False)
     events: list[str] = []
     background_thread: list[int] = []
+    tagged: list[int | list[int]] = []
+    monkeypatch.setattr(native_async, "_tag_current_span_call_idx", tagged.append)
 
     def async_fn(value: str) -> None:
         background_thread.append(threading.get_ident())
@@ -25,12 +27,13 @@ def test_native_async_request_runs_and_finalizes_without_external_strategy(
         async_fn_args=("background",),
         finalize_fns=[lambda: events.append("finalize")],
     )
-    native_async.schedule_async_save(request)
+    call_idx = native_async.schedule_async_save(request)
     native_async.maybe_finalize_async_save(blocking=True, terminate=True)
 
     assert events == ["background", "finalize"]
     assert background_thread != [threading.get_ident()]
     assert native_async.is_empty_async_queue()
+    assert tagged == [call_idx, [call_idx]]
 
 
 def test_next_save_waits_for_previous_save_to_finalize(

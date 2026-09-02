@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # ruff: noqa: ANN401, ARG001, C901, INP001, PLR0913, PLR0915, S101, SLF001
 
 from __future__ import annotations
@@ -6,6 +7,7 @@ import argparse
 import ast
 import importlib.util
 import sys
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -73,6 +75,129 @@ def test_warm_save_refreshes_mutable_common_optimizer_state() -> None:
 
     assert refreshed == [tensor]
     assert common["optimizer"] is fresh_optimizer
+
+
+def test_native_save_traces_cpp_enqueue_and_completion() -> None:
+    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_checkpoint_span", "_serialize_common_state", "_snapshot", "save"}
+    ]
+    events = []
+
+    @contextmanager
+    def managed_span(group: str, name: str, **attributes: Any) -> Any:
+        events.append(("begin", group, name, attributes["megatron.iteration"]))
+        yield
+        events.append(("end", group, name, attributes["megatron.iteration"]))
+
+    class Root:
+        def save_async(self, iteration: int, checkpoint_dir: Path) -> None:
+            events.append(("save_async", iteration, checkpoint_dir))
+
+        def wait_for_deferred_save(self) -> None:
+            events.append(("wait_for_deferred_save",))
+
+    namespace = {
+        "AbstractContextManager": AbstractContextManager,
+        "Path": Path,
+        "_otel_managed_span": managed_span,
+        "torch": SimpleNamespace(distributed=SimpleNamespace(get_rank=lambda: 1)),
+        "register_state_dict": SimpleNamespace(root=Root(), snapshot_state=None),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "tools.py", "exec"), namespace)
+    checkpoint_dir = Path("/checkpoint")
+
+    namespace["save"]({}, 125, checkpoint_dir)
+
+    assert events == [
+        ("begin", "checkpoint", "nvrx.checkpoint.serialize_common_state", 125),
+        ("end", "checkpoint", "nvrx.checkpoint.serialize_common_state", 125),
+        ("begin", "checkpoint", "nvrx.checkpoint.cpp.save_async", 125),
+        ("save_async", 125, checkpoint_dir),
+        ("end", "checkpoint", "nvrx.checkpoint.cpp.save_async", 125),
+        ("begin", "checkpoint", "nvrx.checkpoint.cpp.wait_for_deferred_save", 125),
+        ("wait_for_deferred_save",),
+        ("end", "checkpoint", "nvrx.checkpoint.cpp.wait_for_deferred_save", 125),
+    ]
+
+
+def test_save_checkpoint_captures_entry_time_before_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_checkpoint_span", "save_checkpoint"}
+    ]
+    events = []
+    root = SimpleNamespace(startedAt=None)
+
+    @contextmanager
+    def managed_span(group: str, name: str, **attributes: Any) -> Any:
+        events.append(("begin", name))
+        yield
+        events.append(("end", name))
+
+    native_async = ModuleType("nvrx_checkpointing.native_async")
+    native_async.is_previous_save_in_progress = lambda: False
+    native_async.wait_for_previous_save = lambda: events.append(("wait",))
+    package = ModuleType("nvrx_checkpointing")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", package)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.native_async", native_async)
+
+    def prepare(*args: Any, **kwargs: Any) -> tuple[SimpleNamespace, dict]:
+        events.append(("prepare", root.startedAt))
+        return SimpleNamespace(save="/checkpoints"), {}
+
+    def serialize(common: dict, iteration: int) -> None:
+        events.append(("serialize", root.startedAt, iteration, common))
+
+    def snapshot(iteration: int, checkpoint_dir: Path) -> None:
+        events.append(("snapshot", root.startedAt, iteration, checkpoint_dir))
+
+    namespace = {
+        "__package__": "nvrx_checkpointing",
+        "AbstractContextManager": AbstractContextManager,
+        "Path": Path,
+        "_checkpoint_span": None,
+        "_finalize_checkpoint": lambda _args, iteration: events.append(("finalize", iteration)),
+        "_otel_managed_span": managed_span,
+        "_prepare_checkpoint": prepare,
+        "_serialize_common_state": serialize,
+        "_snapshot": snapshot,
+        "diagnose_checkpoint_server_failure": lambda _error: None,
+        "get_checkpoint_name": lambda *_args, **_kwargs: "/checkpoint/iter_0000125",
+        "print_rank_0": lambda _message: None,
+        "register_state_dict": SimpleNamespace(root=root),
+        "time": SimpleNamespace(time_ns=lambda: 123, monotonic=lambda: 0.0),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "tools.py", "exec"), namespace)
+
+    namespace["save_checkpoint"](125, [], None, None, 0)
+
+    assert root.startedAt == 123  # noqa: PLR2004
+    assert events == [
+        ("begin", "nvrx.checkpoint.save"),
+        ("begin", "nvrx.checkpoint.prepare"),
+        ("begin", "nvrx.checkpoint.wait_previous"),
+        ("wait",),
+        ("end", "nvrx.checkpoint.wait_previous"),
+        ("begin", "megatron.checkpoint.save.state_dict"),
+        ("prepare", None),
+        ("end", "megatron.checkpoint.save.state_dict"),
+        ("serialize", 123, 125, {}),
+        ("end", "nvrx.checkpoint.prepare"),
+        ("begin", "megatron.checkpoint.save.io_write"),
+        ("snapshot", 123, 125, Path("/checkpoint/iter_0000125")),
+        ("end", "megatron.checkpoint.save.io_write"),
+        ("begin", "nvrx.checkpoint.enqueue_finalize"),
+        ("finalize", 125),
+        ("end", "nvrx.checkpoint.enqueue_finalize"),
+        ("end", "nvrx.checkpoint.save"),
+    ]
 
 
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:

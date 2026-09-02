@@ -1,6 +1,8 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 import io
 import os
 import time
+from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
 
@@ -24,11 +26,25 @@ from megatron.training.checkpointing import (
 from megatron.training.global_vars import get_args
 from megatron.training.utils import print_rank_0
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from . import checkpoint, mapping
 from .ckpt_diag import diagnose_checkpoint_server_failure
 from .peers import OrderedPeers, detect_environment_peers
 
 _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
+
+
+def _checkpoint_span(name: str, iteration: int) -> AbstractContextManager[object]:
+    return _otel_managed_span(
+        "checkpoint",
+        name,
+        is_goodput_span=True,
+        **{"megatron.iteration": iteration, "nvrx.snapshot_id": iteration},
+    )
 
 
 def detect_peers(rank: int, world_size: int) -> OrderedPeers:
@@ -107,18 +123,29 @@ def warmup() -> None:
     checkpoint.model_state.warmup(rank, world_size, **ordered_peers.checkpoint_args())
 
 
+def _serialize_common_state(common_state: dict, iteration: int) -> None:
+    with _checkpoint_span("nvrx.checkpoint.serialize_common_state", iteration):
+        if torch.distributed.get_rank() == 0:
+            buffer = io.BytesIO()
+            # Match Megatron's current ShardedObject representation: DCP stores a
+            # torch.save archive containing a one-element list with the common dict.
+            torch.save([common_state], buffer)
+            if register_state_dict.snapshot_state is None:
+                raise RuntimeError("common-state snapshot dictionary was not registered")
+            register_state_dict.snapshot_state[_DCP_COMMON_STATE_KEY] = buffer.getvalue()
+
+
+def _snapshot(iteration: int, checkpoint_dir: Path) -> None:
+    with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
+        register_state_dict.root.save_async(iteration, checkpoint_dir)
+    with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_deferred_save", iteration):
+        register_state_dict.root.wait_for_deferred_save()
+
+
 def save(common_state: dict, iteration: int, checkpoint_dir: Path) -> None:
     """Queue common state and registered tensor shards for daemon-side DCP output."""
-    if torch.distributed.get_rank() == 0:
-        buffer = io.BytesIO()
-        # Match Megatron's current ShardedObject representation: DCP stores a
-        # torch.save archive containing a one-element list with the common dict.
-        torch.save([common_state], buffer)
-        if register_state_dict.snapshot_state is None:
-            raise RuntimeError("common-state snapshot dictionary was not registered")
-        register_state_dict.snapshot_state[_DCP_COMMON_STATE_KEY] = buffer.getvalue()
-    register_state_dict.root.save_async(iteration, checkpoint_dir)
-    register_state_dict.root.wait_for_deferred_save()
+    _serialize_common_state(common_state, iteration)
+    _snapshot(iteration, checkpoint_dir)
 
 
 # The native writer registers every rank under session id 0 (cipc::SessionId{0}); the finalize
@@ -138,7 +165,7 @@ def _wait_for_ckpt_finalize(session_id: int, iteration: int) -> None:
 
 def _timestamp() -> str:
     """Megatron stamps its checkpoint lines with this, so ours read the same in a job log."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  # noqa: DTZ005
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def _print_rank_0_inline(message: str) -> None:
@@ -209,7 +236,7 @@ def _finalize_checkpoint(args, iteration: int) -> None:  # noqa: ANN001
     )
 
 
-def save_checkpoint(  # noqa: PLR0913
+def save_checkpoint(  # noqa: PLR0913, PLR0917
     iteration: int,
     model,  # noqa: ANN001
     optimizer,  # noqa: ANN001
@@ -217,47 +244,56 @@ def save_checkpoint(  # noqa: PLR0913
     num_floating_point_operations_so_far: int,
     train_data_iterator=None,  # noqa: ANN001
 ) -> None:
-    if register_state_dict.root is not None:
-        register_state_dict.root.startedAt = time.time_ns()
-    try:
-        # The preceding call returned after transferring its snapshot to the daemon. Join its
-        # durability request before reading any live model or optimizer state for this snapshot.
-        from .native_async import is_previous_save_in_progress, wait_for_previous_save  # noqa: PLC0415
+    started_at_ns = time.time_ns()
+    with _checkpoint_span("nvrx.checkpoint.save", iteration):
+        try:
+            with _checkpoint_span("nvrx.checkpoint.prepare", iteration):
+                from .native_async import is_previous_save_in_progress, wait_for_previous_save  # noqa: PLC0415
 
-        serialize_start = None
-        if is_previous_save_in_progress():
-            serialize_start = time.monotonic()
-            _print_rank_0_inline(
-                f"  [{_timestamp()}] WARNING: checkpoint save at iteration {iteration:7d} "
-                "waiting for prev save ... ",
-            )
-        wait_for_previous_save()
-        if serialize_start is not None:
-            serialized_milliseconds = (time.monotonic() - serialize_start) * 1000
-            print_rank_0(f"Took {serialized_milliseconds:.3f} ms")
-        _save_checkpoint_impl(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            train_data_iterator=train_data_iterator,
-        )
-    except Exception as e:
-        diagnose_checkpoint_server_failure(e)
-        print_rank_0(f"Error saving checkpoint at iteration {iteration}: {e}")
-        raise
+                serialize_start = None
+                if is_previous_save_in_progress():
+                    serialize_start = time.monotonic()
+                    _print_rank_0_inline(
+                        f"  [{_timestamp()}] WARNING: checkpoint save at iteration {iteration:7d} "
+                        "waiting for prev save ... ",
+                    )
+                with _checkpoint_span("nvrx.checkpoint.wait_previous", iteration):
+                    wait_for_previous_save()
+                if serialize_start is not None:
+                    serialized_milliseconds = (time.monotonic() - serialize_start) * 1000
+                    print_rank_0(f"Took {serialized_milliseconds:.3f} ms")
+                with _checkpoint_span("megatron.checkpoint.save.state_dict", iteration):
+                    args, common = _prepare_checkpoint(
+                        iteration,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        num_floating_point_operations_so_far,
+                        train_data_iterator=train_data_iterator,
+                    )
+                register_state_dict.root.startedAt = started_at_ns
+                checkpoint_dir = Path(get_checkpoint_name(args.save, iteration, return_base_dir=True))
+                _serialize_common_state(common, iteration)
+            with _checkpoint_span("megatron.checkpoint.save.io_write", iteration):
+                _snapshot(iteration, checkpoint_dir)
+            with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
+                _finalize_checkpoint(args, iteration)
+        except Exception as e:
+            diagnose_checkpoint_server_failure(e)
+            print_rank_0(f"Error saving checkpoint at iteration {iteration}: {e}")
+            raise
 
 
-def _save_checkpoint_impl(  # noqa: PLR0913
+def _prepare_checkpoint(  # noqa: PLR0913
     iteration: int,
     model,  # noqa: ANN001
     optimizer,  # noqa: ANN001
     opt_param_scheduler,  # noqa: ANN001
     num_floating_point_operations_so_far: int,
+    *,
     train_data_iterator=None,  # noqa: ANN001
-) -> None:
-    """Save a synchronous torch_dist checkpoint through the native writer.
+) -> tuple[object, dict]:
+    """Prepare the state consumed by the native checkpoint writer.
 
     The first save builds the full sharded state dict and registers it; later saves reuse
     that registration — model weights and master params are read live through the frozen
@@ -316,8 +352,7 @@ def _save_checkpoint_impl(  # noqa: PLR0913
         f"[{_timestamp()}] saving checkpoint "
         f"at iteration {iteration:7d} to {args.save} in torch_dist format",
     )
-    save(common, iteration, Path(get_checkpoint_name(args.save, iteration, return_base_dir=True)))
-    _finalize_checkpoint(args, iteration)
+    return args, common
 
 
 save_checkpoint.common = None

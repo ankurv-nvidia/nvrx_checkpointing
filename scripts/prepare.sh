@@ -228,7 +228,14 @@ function megatron {
     git config --system protocol.version 1
     resolve_megatron_root
     nvcc --version || cuda13
-    nvcc --version
+    _NVCC_VERSION=$(nvcc --version)
+    printf '%s\n' "${_NVCC_VERSION}"
+    if [[ "${_NVCC_VERSION}" =~ release[[:space:]]+([0-9]+)\. ]]; then
+        export TMS_CUDA_MAJOR="${BASH_REMATCH[1]}"
+    else
+        echo "Unable to determine the CUDA major version from nvcc" >&2
+        return 1
+    fi
     export MAX_JOBS=4
     export CC=gcc
     export CXX=g++
@@ -255,7 +262,7 @@ function megatron {
     export UV_CACHE_DIR="$(mktemp -d)"
     # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
     uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.26.0"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,te,ssm]"
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]

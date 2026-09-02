@@ -14,6 +14,11 @@ include(vcpkg)
 include(CheckLanguage)
 check_language(CUDA)
 
+cmake_path(CONVERT "$ENV{VCPKG_OVERLAY_PORTS}" TO_CMAKE_PATH_LIST vcpkg_overlay_ports)
+list(PREPEND vcpkg_overlay_ports "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-ports")
+list(REMOVE_DUPLICATES vcpkg_overlay_ports)
+cmake_path(CONVERT "${vcpkg_overlay_ports}" TO_NATIVE_PATH_LIST vcpkg_overlay_ports)
+set(ENV{VCPKG_OVERLAY_PORTS} "${vcpkg_overlay_ports}")
 
 vcpkg_init()
 
@@ -79,11 +84,16 @@ include(Boost)
 include(fmt)
 include(hwloc)
 include(miniz)
+include(OpenTelemetry)
+include(spdlog)
 include(zlib)
 
 #find_package(Boost CONFIG REQUIRED OPTIONAL_COMPONENTS interprocess)
 
-add_library(phoenix_checkpoint OBJECT src/checkpoint/checkpoint.cpp)
+add_library(phoenix_checkpoint OBJECT
+    src/checkpoint/checkpoint.cpp
+    src/checkpoint/logtel.cpp
+)
 
 target_include_directories(phoenix_checkpoint PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -93,12 +103,28 @@ target_include_directories(phoenix_checkpoint PUBLIC
 target_link_libraries(phoenix_checkpoint PUBLIC
     Boost::asio
     Boost::beast
+    Boost::container
     Boost::dll
     Boost::interprocess
     Boost::process
     Boost::url
     fmt::fmt-header-only
     hwloc::hwloc
+    opentelemetry-cpp::api
+    opentelemetry-cpp::sdk
+    opentelemetry-cpp::common
+    opentelemetry-cpp::resources
+    opentelemetry-cpp::trace
+    opentelemetry-cpp::metrics
+    opentelemetry-cpp::logs
+    opentelemetry-cpp::otlp_recordable
+    opentelemetry-cpp::otlp_file_client
+    opentelemetry-cpp::otlp_file_exporter
+    opentelemetry-cpp::otlp_file_metric_exporter
+    opentelemetry-cpp::otlp_file_log_record_exporter
+    opentelemetry-cpp::proto
+    spdlog::spdlog_header_only
+    ZLIB::ZLIB
 )
 
 # target_compile_definitions(phoenix_checkpoint PUBLIC SHM_RING_BUFFER_ENABLE_PERF_METRICS=1)
@@ -271,7 +297,7 @@ add_executable(checkpoint_server src/checkpoint/server_main.cpp)
 # distcpio is listed directly because CMake only propagates
 # OBJECT-lib object files one consumer hop — without this, distcp.cpp.o is
 # missing from the executable even though server.cpp references it.
-target_link_libraries(checkpoint_server PUBLIC daemon distcpio cpptrace::cpptrace)
+target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint daemon distcpio cpptrace::cpptrace)
 
 add_custom_command(TARGET checkpoint_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>

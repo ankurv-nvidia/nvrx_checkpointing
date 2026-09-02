@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <utility>
 
+static constexpr int HttpVersion11 = 11;
+
 template <> struct fmt::formatter<boost::asio::ip::tcp::endpoint> : fmt::ostream_formatter
 {};
 template <> struct fmt::formatter<boost::asio::ip::address> : fmt::ostream_formatter
@@ -72,7 +74,6 @@ inline auto ResolveEndpoint(boost::asio::io_context& ioc, std::string_view const
 
     Request req;
     req.method(boost::beast::http::verb::post);
-    static constexpr int HttpVersion11 = 11;
     req.version(HttpVersion11);
     req.set(boost::beast::http::field::host, fmt::format("{}:{}", peerAddr.host(), peerAddr.port()));
     req.set(boost::beast::http::field::content_type, "application/octet-stream");

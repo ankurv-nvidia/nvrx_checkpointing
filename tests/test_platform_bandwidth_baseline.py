@@ -6,16 +6,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci" / "scripts"))
 
-from slurm_job import PERF_TOLERANCE, PerfReport
+from slurm_job import PERF_TOLERANCE, PerfReport, otel_report
 
 
-def _perf_finished(bandwidth: float, write_us: int) -> str:
-    return (
-        f"[native_ckpt:svr][0][PERF] Rank=0 Finished bw_mbps={bandwidth:.2f} "
-        f"| Time(us):  wr_tnsr_us={write_us}us snapshot_us=11us total_us=12us "
-        "| Count: num_tensors=2 total_d2h=2 | Bytes: total_written_bytes=100 "
-        "avg_d2h_rq=50 avg_tnsr=50 snapshot=1"
-    )
+def _otel_data(rows: list[tuple[float, int]]) -> dict[str, list]:
+    return {
+        "native_saves": [
+            {"rank": rank, "bw_mbps": bandwidth, "wr_tnsr_us": write_us, "total_written_bytes": 100}
+            for rank, (bandwidth, write_us) in enumerate(rows)
+        ],
+        "daemon_durable_spans": [],
+        "megatron_spans": [],
+        "megatron_metrics": [],
+        "resource_metrics": [],
+    }
 
 
 def test_each_platform_has_one_bandwidth_floor() -> None:
@@ -32,9 +36,7 @@ def test_each_platform_has_one_bandwidth_floor() -> None:
 
 
 def test_native_bandwidth_is_reported_as_integer_mbps() -> None:
-    log = _perf_finished(94000.4, 10)
-
-    metrics = PerfReport._parse_metrics(log, 4)
+    metrics = otel_report.metrics_from_data(_otel_data([(94000.4, 10)]), 4)
 
     assert metrics["bw_mbps"]["mean"] == 94000
     assert metrics["bw_mbps"]["unit"] == "MB/s"
@@ -70,11 +72,7 @@ def test_lower_is_better_metric_is_a_ceiling_not_a_floor() -> None:
 
 
 def test_timing_baselines_use_steady_state_median() -> None:
-    log = "\n".join(
-        _perf_finished(bw, write)
-        for bw, write in ((80000, 38000), (145000, 20500), (150000, 19500))
-    )
-    metrics = PerfReport._parse_metrics(log, 4)
+    metrics = otel_report.metrics_from_data(_otel_data([(80000, 38000), (145000, 20500), (150000, 19500)]), 4)
     comparison, passed = PerfReport._compare_to_baseline(
         metrics,
         {"metrics": {"bw_mbps": 140000, "wr_tnsr_us": 22000}},

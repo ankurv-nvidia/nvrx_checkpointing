@@ -21,6 +21,13 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from torch.distributed.checkpoint import FileSystemReader, Metadata
 
+try:
+    from nemo.lens.helpers import safe_set_span_attributes
+    from opentelemetry import trace
+except (ImportError, ModuleNotFoundError):
+    safe_set_span_attributes = None
+    trace = None
+
 if TYPE_CHECKING:
     import os
     from collections.abc import Callable
@@ -46,6 +53,12 @@ class _PendingRequest:
 _pending: deque[_PendingRequest] = deque()
 _executor: ThreadPoolExecutor | None = None
 _next_call_idx = 0
+
+
+def _tag_current_span_call_idx(call_idx: int | list[int]) -> None:
+    if safe_set_span_attributes is None or trace is None:
+        return
+    safe_set_span_attributes(trace.get_current_span(), {"nvrx.call_idx": call_idx})
 
 
 class NativeCachedMetadataFileSystemReader(FileSystemReader):
@@ -130,12 +143,14 @@ def schedule_async_save(request: AsyncRequest) -> int:
     _next_call_idx += 1
     future = _get_executor().submit(_run_request, request)
     _pending.append(_PendingRequest(call_idx, future, list(request.finalize_fns)))
+    _tag_current_span_call_idx(call_idx)
     return call_idx
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -> None:
     """Finalize completed native requests in the same order on every rank."""
     global _executor  # noqa: PLW0603
+    finalized = []
     while _pending:
         request = _pending[0]
         if blocking:
@@ -155,6 +170,10 @@ def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -
         except Exception as error:  # noqa: BLE001 - keep ranks in lockstep before surfacing it
             finalize_error = error
         _raise_collective_failure(request.call_idx, finalize_error, "finalization")
+        finalized.append(request.call_idx)
+
+    if finalized:
+        _tag_current_span_call_idx(finalized)
 
     if terminate and _executor is not None:
         if _pending:

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -95,10 +96,34 @@ struct WDir
         return path;
     }
 };
+
+struct OtelExportMode
+{
+    enum class ValueType : uint8_t
+    {
+        File,
+        Daemon,
+        Both
+    };
+
+    static ValueType Parse(std::string_view value)
+    {
+        if (value == "file") { return ValueType::File; }
+        if (value == "both") { return ValueType::Both; }
+        return ValueType::Daemon;
+    }
+};
 }    // namespace checkpoint::config::types
 
 namespace checkpoint::config
 {
+struct LogLevel
+{
+    static constexpr std::string_view Name    = "log.level";
+    static constexpr std::string_view Default = "info";
+    using Type                                = types::Text;
+};
+
 struct ServerLog
 {
     static constexpr std::string_view Name    = "server.log";
@@ -111,6 +136,76 @@ struct SvcDisableAutoLaunch
     static constexpr std::string_view Env     = "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH";
     static constexpr std::string_view Default = "0";
     using Type                                = types::EnabledByOne;
+};
+
+struct OtelEnable
+{
+    static constexpr std::string_view Name    = "otel.enable";
+    static constexpr std::string_view Default = "0";
+    using Type                                = types::OptIn;
+};
+
+struct OtelExport
+{
+    static constexpr std::string_view Name    = "otel.export";
+    static constexpr std::string_view Default = "daemon";
+    using Type                                = types::OtelExportMode;
+};
+
+struct OtelFile
+{
+    static constexpr std::string_view Name = "otel.file";
+    static constexpr std::string_view Default;
+    using Type = types::WFile;
+};
+
+struct OtelDir
+{
+    static constexpr std::string_view Name    = "otel.dir";
+    static constexpr std::string_view Default = "/tmp";
+    using Type                                = types::WDir;
+};
+
+struct OtelService
+{
+    static constexpr std::string_view Name = "otel.service";
+    static constexpr std::string_view Default;
+    using Type = types::Text;
+};
+
+struct OtelCollector
+{
+    static constexpr std::string_view Name = "otel.collector";
+    static constexpr std::string_view Default;
+    using Type = types::Text;
+};
+
+struct OtelRunId
+{
+    static constexpr std::string_view Env = "MEGATRON_OTEL_RUN_ID";
+    static constexpr std::string_view Default;
+    using Type = types::Text;
+};
+
+struct CiPhase
+{
+    static constexpr std::string_view Name = "ci.phase";
+    static constexpr std::string_view Default;
+    using Type = types::Text;
+};
+
+struct OtelMetrics
+{
+    static constexpr std::string_view Name    = "otel.metrics";
+    static constexpr std::string_view Default = "0";
+    using Type                                = types::OptIn;
+};
+
+struct OtelLogs
+{
+    static constexpr std::string_view Name    = "otel.logs";
+    static constexpr std::string_view Default = "1";
+    using Type                                = types::OptOut;
 };
 
 namespace detail
@@ -143,11 +238,33 @@ template <typename TConfig> consteval auto EnvName()
 }
 }    // namespace detail
 
-template <typename TConfig> [[nodiscard]] typename TConfig::Type::ValueType GetConfigValue()
+template <typename TConfig> [[nodiscard]] auto GetConfigValue()
 {
     constexpr auto         envName  = detail::EnvName<TConfig>();
     char const*            rawValue = std::getenv(envName.data());    // NOLINT(concurrency-mt-unsafe)
     std::string_view const value    = rawValue != nullptr && *rawValue != '\0' ? std::string_view{rawValue} : TConfig::Default;
     return TConfig::Type::Parse(value);
 }
+
+using OtelExportMode = types::OtelExportMode::ValueType;
+
+struct OtelConfig
+{
+    bool                  enabled   = GetConfigValue<OtelEnable>();
+    OtelExportMode        mode      = GetConfigValue<OtelExport>();
+    std::filesystem::path file      = GetConfigValue<OtelFile>();
+    std::filesystem::path dir       = GetConfigValue<OtelDir>();
+    std::string           service   = GetConfigValue<OtelService>();
+    std::string           collector = GetConfigValue<OtelCollector>();
+    std::string           runId     = GetConfigValue<OtelRunId>();
+    std::string           ciPhase   = GetConfigValue<CiPhase>();
+    bool                  metrics   = GetConfigValue<OtelMetrics>();
+    bool                  logs      = GetConfigValue<OtelLogs>();
+
+    [[nodiscard]] std::filesystem::path ExportFile() const
+    { return file.empty() ? dir / Substitute("native_ckpt_otel_svr_%h_pid%p.jsonl") : file; }
+
+    [[nodiscard]] std::filesystem::path CollectorFile() const
+    { return file.empty() ? std::filesystem::path{"/tmp/native_ckpt_otel.jsonl"} : file; }
+};
 }    // namespace checkpoint::config

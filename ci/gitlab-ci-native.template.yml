@@ -142,6 +142,9 @@ variables:
       - ci/ci-runs/*/*/logs/*.log
       - ci/ci-runs/*/logs/*_report.json
       - ci/ci-runs/*/*/logs/*_report.json
+      - ci/ci-results/otel/*/*.jsonl
+      - ci/ci-runs/*/logs/otel/*/*.jsonl
+      - ci/ci-runs/*/*/logs/otel/*/*.jsonl
       # The submitted sbatch script; its header records the exact submit command, so it
       # doubles as a reproducer for re-running the SLURM job by hand.
       - ci/ci-results/*.sbatch
@@ -284,7 +287,7 @@ variables:
         --form "variables[NVRX_COMMIT]=${NVRX_COMMIT}" \
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/trigger/pipeline")"
       printf '%s\n' "${response}" | grep -Eq "\"sha\":[[:space:]]*\"${suite_sha}\""
-      pipeline_id="$(printf '%s\n' "${response}" | grep -o '"id":[[:space:]]*[0-9]*' | head -n1 | cut -d: -f2 | tr -d ' ')"
+      pipeline_id="$(printf '%s\n' "${response}" | grep -o '"id":[[:space:]]*[0-9]*' | sed -n '1p' | cut -d: -f2 | tr -d ' ')"
       echo "Launched ${LAUNCH_PIPELINE_SUITE} pipeline ${CI_PROJECT_URL}/-/pipelines/${pipeline_id}"
 
 launch:nvrx-pipeline:

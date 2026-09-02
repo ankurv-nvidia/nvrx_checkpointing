@@ -2,6 +2,7 @@
 #include "SetThreadName.h"
 
 #include "byte_storage.h"
+#include "config.h"
 #include "fmttensor.h"
 #include "logging.h"
 #include "messages.h"
@@ -224,7 +225,6 @@ template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
         return fmt::format_to(ctx.out(), "{:x}", ptrVal);
     }
 };
-
 template <typename TStream> static void TryCleanShutdown(TStream& stream)
 {
     boost::system::error_code ec;
@@ -790,9 +790,6 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     auto const numTensors                  = localState.localRegistry->GetTotalNumTensors();
     auto const totalTensorStateSizeInBytes = localState.localRegistry->GetTotalTensorStateSizeInBytes();
 
-    // TODO_GLOBAL_REGISTRY_BCASE
-    // Coordinator-peer ranks wait for every fragment: remote merges reallocate the tree's
-    // node array, and the WriteRankShard walk below is unlocked.
     auto const localNodeWorldSize = onCoordinatorPeer ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
 
     while (true)
@@ -853,7 +850,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             globalRegistry = snapshot.globalRegistry;
         }
 
+        PERF() << tel::span::SvrWriteMetadata::Begin{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
         WriteGlobalStateTreeToFile_(sessionState, snapshot.path.parent_path() / "registry.bin");
+        PERF() << tel::span::SvrWriteMetadata::End{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
         BroadcastGlobalRegistryToPeers_(*globalRegistry);
 
         auto dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(topo.worldSize));
@@ -937,6 +936,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
         // Rank 0 joins last, so the set is now world-size: every shard and the metadata
         // are on disk and the checkpoint is loadable.
+        // This raw marker has a strict schema consumed by CI.
         fmt::print(stderr,
                    "[native_ckpt:svr][{}#{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
                    *server,
@@ -944,6 +944,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                    hdr.snapshotId,
                    static_cast<size_t>(topo.worldSize),
                    durableUs.count());
+        PERF() << tel::span::SvrDurable::End{.id = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId}};
     }
 
     // A daemon's snapshot data has no use once its local shards are written: the
@@ -987,6 +988,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 
     INFO("[{}#{}] OnFinalizeSnapshotAsync_ for rank={}, snapshotId={} ", *server, sessionId, hdr.globalRank, hdr.snapshotId);
     auto const totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(PerfClock::now().time_since_epoch() - startedAt);
+    PERF() << tel::span::SvrFinalize::End{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
     PERF() << tel::span::CkptSave::End{
         .id                = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
         .d2hDuration       = std::chrono::duration_cast<std::chrono::microseconds>(hdr.d2hDuration),
@@ -997,7 +999,6 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         .totalTensorBytes  = totalTensorStateSizeInBytes,
         .totalWrittenBytes = hdr.totalSnapshotBytes,
     };
-    // SendLocalShardedStateRegistryToPeer(cipc::Rank rank, std::string const& peer)
 }
 
 void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
@@ -1517,6 +1518,8 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                                              hdr.globalRank,
                                              hdr.snapshotId));
     }
+    bool                                  beginDurableSpan = false;
+    std::chrono::system_clock::time_point durableStartedAt;
     {
         std::scoped_lock lock(mutex);
         auto             snapshotIt = snapshots.find(hdr.snapshotId);
@@ -1526,6 +1529,8 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
             snapshot->snapshotId = hdr.snapshotId;
             snapshot->name       = fmt::format("snapshot_{}", hdr.snapshotId);
             snapshot->path       = ckptPath / fmt::format("checkpoint_session_{}.snapshot_{}.bin", sessionId, hdr.snapshotId);
+            durableStartedAt     = snapshot->activatedAt;
+            beginDurableSpan     = true;
             snapshotIt           = snapshots.insert({hdr.snapshotId, std::move(snapshot)}).first;
         }
 
@@ -1580,6 +1585,12 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         snapshotIt->second->localStates[hdr.globalRank] = std::move(localState);
     }
 
+    if (beginDurableSpan && IsCoordinatorPeer())
+    {
+        PERF() << tel::span::SvrDurable::Begin{.id        = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId},
+                                               .startedAt = durableStartedAt};
+    }
+
     PERF() << tel::span::CkptSave::Begin{
         .id        = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
         .startedAt = startedAt,
@@ -1596,6 +1607,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
 
 void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char const> /* buf */)
 {
+    PERF() << tel::span::SvrFinalize::Begin{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
     {
         std::scoped_lock lock(mutex);
 
@@ -1636,8 +1648,6 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
         }
         snapshot.finalizedRanks.insert(hdr.globalRank);
     }
-    // TODO_SAVETENSORS : Write out the rank specific checkpoint file
-    // WriteTensorsToFile(snapshot, snapshot.path / "tensors.bin");
 
     {
         std::scoped_lock lock(mutex);    // see Handle(LocalStateRegistry): the task list is shared across concurrent handlers
@@ -1761,6 +1771,18 @@ bool Session::IsSnapshotDurable(cipc::SnapshotId snapshotId) const
 
 void Server::Start()
 {
+    checkpoint::logging::Init();
+    checkpoint::telemetry::Init();
+    checkpoint::config::OtelConfig const otelConfig;
+    if (otelConfig.enabled && otelConfig.mode == checkpoint::config::OtelExportMode::Daemon && !otelConfig.collector.empty())
+    {
+        if (otelConfig.collector == "file") { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
+        else
+        {
+            checkpoint::telemetry::InitRelayCollector(otelConfig.collector);
+        }
+    }
+
     std::scoped_lock lock(_mutex);
     _stopRequested = false;
     if (_running) { return; }
@@ -1879,7 +1901,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     case cipc::Message::Type::Ping:
     {
         Ping();
-        return;    // TODO : reset the shutdown timer
+        return;
     }
     case cipc::Message::Type::Shutdown:
     {
@@ -1907,6 +1929,12 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         INFO("[{}#{}] ActivateSession workDir={}", *this, hdr1.sessionId, workDir);
         auto it = _activeSessions.find(hdr1.sessionId);
         it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
+        checkpoint::config::OtelConfig const otelConfig;
+        if (otelConfig.enabled && otelConfig.mode == checkpoint::config::OtelExportMode::Daemon)
+        {
+            if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
+            else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
+        }
     }
     break;
     case cipc::Message::Type::FinalizeSession:
@@ -1952,6 +1980,8 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
 
 void Server::Stop()
 {
+    checkpoint::logging::Shutdown();
+    checkpoint::telemetry::Shutdown();
     bool wasRunning = false;
     {
         std::scoped_lock lock(_mutex);
@@ -2092,7 +2122,7 @@ void Server::FindOrWaitForSessionAndSnapshot_(std::string_view context,
 {
     unsigned attempt = 0;
     auto     start   = PerfClock::now();
-    // TODO : avoid a stall. Use pending queues that are processed when session+snapshot is activated.
+    // TODO_NOSTALL : avoid a stall. Use pending queues that are processed when session+snapshot is activated.
     while (true)
     {
         if (attempt > 0)
@@ -2126,7 +2156,7 @@ template <typename TLambda> void Server::FindOrWaitForSession_(std::string_view 
 {
     unsigned attempt = 0;
     auto     start   = PerfClock::now();
-    // TODO : avoid a stall. Use pending queues that are processed when session+snapshot is activated.
+    // TODO_NOSTALL : avoid a stall. Use pending queues that are processed when session+snapshot is activated.
     while (true)
     {
         if (attempt > 0)
@@ -2379,7 +2409,7 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
     stream.expires_never();
 
     boost::system::error_code                                    ec;
-    boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, 11};
+    boost::beast::http::response<boost::beast::http::empty_body> res{boost::beast::http::status::ok, HttpVersion11};
     res.set(boost::beast::http::field::server, "NativeCheckpointServer");
     res.set(boost::beast::http::field::content_type, "application/x-ndjson");
     res.chunked(true);
@@ -2447,7 +2477,7 @@ bool Server::IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, c
     return session.IsSnapshotDurable(snapshotId);
 }
 
-void Server::HandleRequest_(tcp_stream& stream)
+void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-function-cognitive-complexity)
 {
     boost::beast::flat_buffer buffer;
     // First, read only the headers to determine the endpoint
@@ -2504,7 +2534,7 @@ void Server::HandleRequest_(tcp_stream& stream)
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        // TODO : move it before we send 200 once we dont stall for session+snaphot anymore
+        // TODO_NOSTALL : move it before we send 200 once we dont stall for session+snaphot anymore
         NotifyFinalizeComplete_(sessionId, snapshotId, rank);
     }
     else if (matches({"api", "peer", "writeckptcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
@@ -2521,7 +2551,7 @@ void Server::HandleRequest_(tcp_stream& stream)
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        // TODO : move it before we send 200 once we dont stall for session+snaphot anymore
+        // TODO_NOSTALL : move it before we send 200 once we dont stall for session+snaphot anymore
         NotifyWriteCkptComplete_(sessionId, snapshotId, rank);
     }
     // The global registry for a snapshot (body = deflated serialized tree).
@@ -2619,6 +2649,41 @@ void Server::HandleRequest_(tcp_stream& stream)
         _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration]() mutable {
             FinalizeWaitLoop_(std::move(s), sessionId, iteration);
         }));
+    }
+    else if ((url.path() == "/v1/traces" || url.path() == "/v1/metrics" || url.path() == "/v1/logs")
+             && headers.method() == boost::beast::http::verb::post)
+    {
+        std::string const path            = url.path();
+        std::string const contentType     = headers[boost::beast::http::field::content_type];
+        std::string const contentEncoding = headers[boost::beast::http::field::content_encoding];
+        unsigned const    version         = headers.version();
+
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(checkpoint::telemetry::MaxOtlpRequestBytes);
+        boost::beast::http::read(stream, buffer, bodyParser);
+        auto result = checkpoint::telemetry::ReceiveOtlp(path, contentType, contentEncoding, bodyParser.get().body());
+
+        boost::beast::http::response<boost::beast::http::string_body> res{static_cast<boost::beast::http::status>(result.status), version};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.set(boost::beast::http::field::content_type, "application/x-protobuf");
+        res.keep_alive(false);
+        res.body() = std::move(result.body);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    else if ((url.path() == "/api/telemetry" || url.path() == "/api/telemetry/remote")
+             && headers.method() == boost::beast::http::verb::post)
+    {
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(checkpoint::telemetry::MaxOtlpRequestBytes);
+        boost::beast::http::read(stream, buffer, bodyParser);
+        checkpoint::telemetry::Collect(bodyParser.get().body());
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
     }
     else
     {
@@ -2829,6 +2894,7 @@ SUPPRESS_WARNINGS_END
 
 void RunInprocServer(uint16_t nodes)
 {
+    checkpoint::logging::Init();
     for (uint16_t i = 0; i < nodes; i++)
     {
         INFO("Starting inproc server instance for node={}", i);
@@ -2866,7 +2932,8 @@ void StopInprocServer()
 
 void WaitForInprocServerWrites()
 {
-    auto const deadline = PerfClock::now() + AutoShutdownTimeout;
+    static constexpr auto WaitDuration = 50ms;
+    auto const            deadline     = PerfClock::now() + AutoShutdownTimeout;
     while (true)
     {
         bool foundServer = false;
@@ -2882,7 +2949,7 @@ void WaitForInprocServerWrites()
         {
             throw std::runtime_error("Timed out waiting for in-process checkpoint server writes to become durable");
         }
-        std::this_thread::sleep_for(50ms);
+        std::this_thread::sleep_for(WaitDuration);
     }
 }
 

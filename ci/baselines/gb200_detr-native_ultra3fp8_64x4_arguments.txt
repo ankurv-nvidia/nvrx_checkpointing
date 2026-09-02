@@ -26,7 +26,7 @@
   async_ckpt_io_priority .......................... 3
   async_ckpt_use_cpu_shm .......................... False
   async_save ...................................... False
-  async_strategy .................................. nvrx
+  async_strategy .................................. mcore
   attention_backend ............................... AttnBackend.unfused
   attention_dropout ............................... 0.0
   attention_output_gate ........................... False
