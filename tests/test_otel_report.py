@@ -257,6 +257,66 @@ def test_run_filter_deduplicates_retried_spans(tmp_path: Path) -> None:
     assert samples[0]["bw_mbps"] == 100.0
 
 
+def test_parsed_otel_data_is_reused_by_all_collectors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = Path(_write_jsonl(tmp_path / "t.jsonl", [_save_span(0, 100.0, 200, 4096), _resource_metrics(0)]))
+    real_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == source:
+            reads += 1
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    data = otel_report.OtelData([source])
+
+    assert len(otel_report.collect_samples(data)) == 1
+    assert len(otel_report.collect_spans(data, "ckpt.save")) == 1
+    assert len(otel_report.collect_resource_metrics(data)) == 1
+    assert reads == 1
+
+
+def test_analysis_sidecar_avoids_epilog_reparse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cycle = tmp_path / "otel" / "cycle1"
+    cycle.mkdir(parents=True)
+    source = cycle / "native_ckpt_otel.jsonl"
+    source.write_text("not parsed\n")
+    analysis = {
+        "metrics": {},
+        "native_spans_valid": True,
+        "checkpoint_timings": [{"label": "save-checkpoint", "min": 1.0, "max": 3.0, "median": 2.0}],
+        "checkpoint_durability": None,
+    }
+    otel_report.write_analysis(source, analysis)
+    real_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == source:
+            reads += 1
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+
+    assert otel_report.post_process(tmp_path, 4, native=True)["validation"]["valid"]
+    with caplog.at_level("INFO"):
+        otel_report.log_checkpoint_timings(source, None, "cycle1")
+    assert "(1.00, 3.00, 2.00)" in caplog.text
+    assert reads == 0
+
+    source.write_text("changed\n")
+    reads = 0
+    with pytest.raises(ValueError, match="invalid OTLP JSON"):
+        otel_report.post_process(tmp_path, 4, native=True)
+    assert reads == 1
+
+
 def test_main_prints_json_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = _write_jsonl(tmp_path / "t.jsonl", [_save_span(0, 100.0, 200, 4096)])
 

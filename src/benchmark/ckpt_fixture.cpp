@@ -294,7 +294,8 @@ void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorSto
 
 void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
 {
-    for (uint32_t i = 1; i < 6; i++)
+    static constexpr uint32_t NumSnapshots = 5;
+    for (uint32_t i = 1; i <= NumSnapshots; i++)
     {
         SaveCheckpoint(tree, cipc::SnapshotId{i}, ckptDir);
         WaitForCheckpointSave(tree.Topo());

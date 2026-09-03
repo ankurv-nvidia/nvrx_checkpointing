@@ -20,7 +20,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,8 +29,16 @@ namespace nb = nanobind;
 
 namespace
 {
-
-DS4Tensor::DType ParseDType(std::string const& name)
+// Each entry: (fqn, dtype_name, shape, data_bytes).
+struct InputEntry
+{
+    std::string                fqn;
+    DS4Tensor::DType           dtype{};
+    std::vector<size_t>        shape;
+    std::vector<unsigned char> bytes;
+};
+}    // namespace
+static DS4Tensor::DType ParseDType(std::string const& name)
 {
     using DT = DS4Tensor::DType;
     if (name == "float16") { return DT::Float16; }
@@ -49,17 +56,7 @@ DS4Tensor::DType ParseDType(std::string const& name)
     if (name == "bool") { return DT::Bool; }
     throw std::runtime_error(fmt::format("distcp_shim: unsupported dtype '{}'", name));
 }
-
-// Each entry: (fqn, dtype_name, shape, data_bytes).
-struct InputEntry
-{
-    std::string                fqn;
-    DS4Tensor::DType           dtype;
-    std::vector<size_t>        shape;
-    std::vector<unsigned char> bytes;
-};
-
-InputEntry ConvertEntry(nb::tuple const& t)
+static InputEntry ConvertEntry(nb::tuple const& t)
 {
     if (t.size() != 4) { throw std::runtime_error("distcp_shim: each entry must be (fqn, dtype, shape, bytes)"); }
     InputEntry e;
@@ -78,7 +75,7 @@ InputEntry ConvertEntry(nb::tuple const& t)
 
 // Parse Python's (fqn, bytes) object tuples into owned Blob storage. The
 // parity shim is single-rank, so every Blob belongs to the calling rank.
-std::vector<std::pair<std::string, std::vector<char>>> ParseObjects(nb::list const& objectsPy)
+static std::vector<std::pair<std::string, std::vector<char>>> ParseObjects(nb::list const& objectsPy)
 {
     std::vector<std::pair<std::string, std::vector<char>>> out;
     out.reserve(objectsPy.size());
@@ -93,7 +90,7 @@ std::vector<std::pair<std::string, std::vector<char>>> ParseObjects(nb::list con
     return out;
 }
 
-nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy, nb::list const& objectsPy)
+static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy, nb::list const& objectsPy)
 {
     std::vector<InputEntry> entries;
     entries.reserve(entriesPy.size());
@@ -170,7 +167,7 @@ nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list c
     return out;
 }
 
-DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
+static DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 {
     DS4Tensor::DimRange out;
     auto                sdList = nb::cast<nb::list>(sd);
@@ -193,7 +190,7 @@ DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
 // The (file_offset, length) values are used as the verification side-channel
 // inside WriteMetadata — they're asserted against the analytical prediction.
-void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects)
+static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects)
 {
     RankTopology topo{
         .rank         = Rank{0},
@@ -246,8 +243,6 @@ void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::l
     for (auto const& [fqn, bytes] : blobBytes) { blobView[fqn][Rank{0}] = {.length = bytes.size()}; }
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, blobView);
 }
-
-}    // namespace
 
 NB_MODULE(_distcp_shim, m)    // NOLINT
 {

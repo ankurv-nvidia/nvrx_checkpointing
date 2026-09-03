@@ -1464,6 +1464,7 @@ def test_routine_validates_each_collected_cycle(
     args.flavors = slurm_job.FlavorSelection(flavor_names)
     child_envs = []
     validated = []
+    converted = []
     lifecycle = []
     stops = []
 
@@ -1471,6 +1472,11 @@ def test_routine_validates_each_collected_cycle(
         env = {"SLURM_JOB_ID": "42", "MEGATRON_OTEL_ENABLED": "1", "MASTER_ADDR": "leader"}
         child_envs.append(env)
         return ["true"], env
+
+    def run(*_args: object, env: dict[str, str] | None = None, **_kwargs: object) -> SimpleNamespace:
+        if env is not None:
+            Path(env["NATIVE_CKPT_OTEL_FILE"]).touch()
+        return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(slurm_job, "RUN_NAME", "otel-run")
     monkeypatch.setenv("SLURM_PROCID", rank)
@@ -1485,7 +1491,14 @@ def test_routine_validates_each_collected_cycle(
     monkeypatch.setattr(slurm_job, "_sync_ranks", lambda tag: lifecycle.append(("sync", tag)))
     monkeypatch.setattr(slurm_job, "wait_for_file", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(slurm_job.otel_report, "validate_collected", lambda *values: validated.append(values))
-    monkeypatch.setattr(slurm_job.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        slurm_job.otel_report,
+        "OtelData",
+        lambda paths: SimpleNamespace(paths=paths, records=[("record", {})]),
+    )
+    monkeypatch.setattr(slurm_job.otel_report, "write_analysis", lambda *_args: None)
+    monkeypatch.setattr(slurm_job.otel_to_perfetto, "convert_records", lambda *values: converted.append(values))
+    monkeypatch.setattr(slurm_job.subprocess, "run", run)
     monkeypatch.setattr(args.flavors.policy, "stop_server", lambda *values, **_kwargs: stops.append(values))
 
     slurm_job._run_routine("nano3_4x4", args, provider)
@@ -1513,8 +1526,8 @@ def test_routine_validates_each_collected_cycle(
     assert [env.get("NATIVE_CKPT_OTEL_COLLECTOR") for env in child_envs] == [collector, collector]
     assert [label.rsplit("-", 2)[-2] for _provider, label in stops] == [server_role, server_role]
     validation_calls = [
-        (path.name, run_id, actual_provider, checkpoints)
-        for path, run_id, _nodes, _gpus, actual_provider, checkpoints in validated
+        (source.paths[0].name, run_id, actual_provider, checkpoints)
+        for source, run_id, _nodes, _gpus, actual_provider, checkpoints in validated
     ]
     assert validation_calls == (
         [
@@ -1523,6 +1536,9 @@ def test_routine_validates_each_collected_cycle(
         ]
         if rank == "0"
         else []
+    )
+    assert [output.name for _records, output in converted] == (
+        ["native_ckpt_perfetto.json", "native_ckpt_perfetto.json"] if rank == "0" else []
     )
 
 
@@ -1616,9 +1632,17 @@ def test_megatron_otel_validation_requires_every_rank(tmp_path: Path) -> None:
 
     checkpoints = [record(rank) for rank in range(8)]
     for checkpoint in checkpoints:
-        checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] = "megatron.checkpoint.save"
-        checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"][0].update(
+        save = checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        save["name"] = "megatron.checkpoint.save"
+        save.update(
             {"startTimeUnixNano": "1", "endTimeUnixNano": "2"},
+        )
+        checkpoint["resourceSpans"][0]["scopeSpans"][0]["spans"].append(
+            {
+                "name": "megatron.checkpoint.exposed_save",
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2",
+            },
         )
     path.write_text(
         "\n".join(
@@ -3443,13 +3467,16 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert "[PERF]:gb200:native:gpt_moe_1x4" in bundles["main-branch-runs"]["dependencies"]
 
 
-def test_slurm_jobs_upload_otel_jsonl() -> None:
+def test_slurm_jobs_upload_otel_and_perfetto_files() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
 
     paths = config[".slurm_job"]["artifacts"]["paths"]
     assert "ci/ci-results/otel/*/*.jsonl" in paths
     assert "ci/ci-runs/*/logs/otel/*/*.jsonl" in paths
     assert "ci/ci-runs/*/*/logs/otel/*/*.jsonl" in paths
+    assert "ci/ci-results/otel/*/*perfetto.json" in paths
+    assert "ci/ci-runs/*/logs/otel/*/*perfetto.json" in paths
+    assert "ci/ci-runs/*/*/logs/otel/*/*perfetto.json" in paths
 
 
 def test_default_native_jobs_use_wheel_artifacts() -> None:

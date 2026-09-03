@@ -56,6 +56,7 @@ from types import ModuleType, SimpleNamespace
 
 import log_report
 import otel_report
+import otel_to_perfetto
 import wheel_install
 import yaml
 
@@ -2655,6 +2656,10 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
         env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
         otel_enabled = env.get("MEGATRON_OTEL_ENABLED") == "1"
+        perfetto_file = otel_cycle_dir / "native_ckpt_perfetto.json"
+        if otel_enabled and rank == "0":
+            perfetto_file.unlink(missing_ok=True)
+            otel_report.analysis_path(otel_file).unlink(missing_ok=True)
         relay_megatron_otel = provider != "native" and otel_enabled
         collector_node = (
             socket.gethostname().split(".", 1)[0] == env["MASTER_ADDR"].split(".", 1)[0]
@@ -2722,14 +2727,19 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
         if otel_enabled and rank == "0":
-            otel_report.validate_collected(
-                otel_file,
+            if not otel_file.is_file():
+                raise RuntimeError(f"Megatron emitted no collected OTLP file: {otel_file}")
+            otel_data = otel_report.OtelData([otel_file])
+            otel_to_perfetto.convert_records(otel_data.records, perfetto_file)
+            analysis = otel_report.validate_collected(
+                otel_data,
                 run_id,
                 args.nodes,
                 args.gpus_per_node,
                 provider,
                 expected_checkpoints,
             )
+            otel_report.write_analysis(otel_file, analysis)
         if phase == 1:
             phase = 2
         else:

@@ -18,7 +18,6 @@
 #include <functional>
 #include <ios>
 #include <limits>
-#include <memory>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -494,18 +493,20 @@ static void WriteBytes(std::ostream& output, char const* data, size_t size, std:
         size -= writeSize;
     }
 }
-
+namespace
+{
 // A miniz user writer streams the already-CRC'd ZIP bytes directly to the rank
 // file and captures the supplied CRC from each emitted data descriptor. The
 // descriptor value is the same one PyTorchStreamWriter uses for serialization_id.
 struct StreamingZipOutput
 {
-    std::ostream&    output;
+    std::ostream&    output;    // NOLINT
     std::string_view contextName;
     uint64_t         nextOffset{};
     uint32_t         lastDescriptorCrc{};
     bool             sawDescriptor{};
 };
+}    // namespace
 
 static size_t StreamZipWrite(void* opaque, mz_uint64 fileOffset, void const* buffer, size_t size)
 {
@@ -673,8 +674,8 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     auto addEntry = [&](EntryPlan& plan, std::string_view bareName) {
         plan.padding               = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
         streamOutput.sawDescriptor = false;
-        auto const entryCrc
-            = static_cast<mz_uint32>(::crc32_z(/*crc=*/0L, reinterpret_cast<Bytef const*>(plan.data), static_cast<z_size_t>(plan.size)));
+        auto const entryCrc        = static_cast<mz_uint32>(
+            ::crc32_z(/*crc=*/0L, reinterpret_cast<Bytef const*>(plan.data), static_cast<z_size_t>(plan.size)));    // NOLINT
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         plan.fullName.c_str(),
                                         plan.data,
@@ -770,7 +771,7 @@ static uint64_t WriteShardArchive(std::ostream&         output,
         mz_zip_writer_end(&zip);
         throw std::runtime_error(fmt::format("distcp: mz_zip_writer_finalize_archive failed for '{}'", contextName));
     }
-    size_t const archiveSize = static_cast<size_t>(zip.m_archive_size);
+    auto const archiveSize = static_cast<size_t>(zip.m_archive_size);
     mz_zip_writer_end(&zip);
 
     return archiveSize;

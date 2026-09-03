@@ -219,7 +219,8 @@ def _patch_native_async_lifecycle() -> None:
     def schedule_async_save(request: Any) -> Any:
         if is_native():
             return native_async.schedule_async_save(request)
-        return original_schedule(request)
+        queue = async_utils_module._get_async_calls_queue()
+        return original_schedule(request._replace(call_idx=queue.call_idx + 1))
 
     @wraps(original_finalize)
     def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -> Any:

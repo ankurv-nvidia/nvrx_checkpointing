@@ -3,7 +3,6 @@
 
 #include "byte_storage.h"
 #include "config.h"
-#include "fmttensor.h"
 #include "logging.h"
 #include "messages.h"
 #include "net_utils.h"
@@ -495,18 +494,6 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
 {
     auto rank = registry.Topo().rank;
     registry.WalkNodes([&](auto& node) {
-#ifdef NATIVE_CKPT_TRACE_NODE
-        auto fqn = registry.GetNodeId(node.handle);
-        if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
-        {
-            INFO("[{}#{}] ForeachTensorShardInfo NATIVE_CKPT_TRACE_NODE={}. Node data rank={} index={}",
-                 *server,
-                 sessionId,
-                 fqn,
-                 rank,
-                 node.data.index());
-        }
-#endif
         if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
         {
             auto& tnsr = std::get<StateNode::TensorShard>(node.data);
@@ -572,7 +559,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
 #ifdef DEBUG_MD5SUM
 // Write {peerIndex}.metadata.info: sorted "key=value" pairs per tensor node, aligned with
 // reference.metadata.info (from distcp_trace.py) for line-by-line diffing.
-void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
+void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    // NOLINT(readability-function-cognitive-complexity)
 {
     auto peerIndex = static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer;
 
@@ -632,21 +619,10 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
             auto const type = static_cast<StateNode::Type>(node.data.index());
             if (type == StateNode::Type::TensorShard)
             {
-                auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
-                auto const  size = tnsr.ShardSizeBytes();
-                auto const* data = static_cast<char const*>(localState->tensorStorage.data) + tnsr.handle;    // NOLINT
-#ifdef NATIVE_CKPT_TRACE_NODE
-                auto fqn = localState->localRegistry->GetNodeId(node.handle);
-                if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
-                {
-                    INFO("[{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. ByteStorage Offset={}",
-                         *server,
-                         sessionId,
-                         fqn,
-                         tnsr.handle);
-                }
-#endif
-                auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
+                auto const& tnsr     = std::get<StateNode::TensorShard>(node.data);
+                auto const  size     = tnsr.ShardSizeBytes();
+                auto const* data     = static_cast<char const*>(localState->tensorStorage.data) + tnsr.handle;    // NOLINT
+                auto const  localFqn = localState->localRegistry->GetNodeId(node.handle);
                 localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, tnsr.sharddim), tnsr.handle);
                 addmd5(fmt::format("{}[{}]", localFqn, tnsr.sharddim), ComputeMd5Hex(data, size));
             }
@@ -655,19 +631,8 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const
                 auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
                 for (auto const& shard : tnsr.shards)
                 {
-                    auto const size = shard.ShardSizeBytes(tnsr.dtype);
-                    auto const data = localState->tensorStorage.AsSpan<char const>(shard.handle, size);
-#ifdef NATIVE_CKPT_TRACE_NODE
-                    auto fqn = localState->localRegistry->GetNodeId(node.handle);
-                    if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
-                    {
-                        INFO("[{}#{}] WriteNativeMetadataInfo_ NATIVE_CKPT_TRACE_NODE={}. ByteStorage Offset={}",
-                             *server,
-                             sessionId,
-                             fqn,
-                             shard.handle);
-                    }
-#endif
+                    auto const size     = shard.ShardSizeBytes(tnsr.dtype);
+                    auto const data     = localState->tensorStorage.AsSpan<char const>(shard.handle, size);
                     auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
                     localShardHandleMap.emplace(makeShardHandleKey(shard.rank, localFqn, shard.sharddim), shard.handle);
                     addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim), ComputeMd5Hex(data.data(), data.size()));
@@ -801,9 +766,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             {
                 if (onCoordinatorPeer && snapshotPtr->globalRegistry == nullptr)
                 {
-                    // Keep snapshot-scoped Blob values out of the session
-                    // template while preserving the complete replica view.
-                    snapshotPtr->globalRegistry = sessionState.globalRegistry->Clone();
+                    snapshotPtr->globalRegistry = sessionState.globalRegistry;
                     for (auto const& blob : snapshotPtr->snapshotBlobs) { snapshotPtr->globalRegistry->SetBlob(blob.fqn, blob.data); }
                 }
                 break;
@@ -1012,16 +975,6 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 
     for (auto const& tensorShard : tensorShards)
     {
-#ifdef NATIVE_CKPT_TRACE_NODE
-        if (tensorShard.nodeId.contains(NATIVE_CKPT_TRACE_NODE))
-        {
-            INFO("[{}#{}] MergeFragmentToGlobalState_ Found tensor shard with nodeId containing NATIVE_CKPT_TRACE_NODE={} rank={}",
-                 *server,
-                 sessionId,
-                 NATIVE_CKPT_TRACE_NODE,
-                 tensorShard.rank);
-        }
-#endif
         tensorShard.tensorInfo.AssertShardIsValid();
         // Look up the node by its string NodeId
         auto it = tensorMap.find(tensorShard.nodeId);
@@ -2841,6 +2794,12 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
                                                          sessionId,
                                                          sessionState.globalRegistry->GetNodeId(node.handle)));
                 }
+                if (node.data.index() == static_cast<size_t>(StateNode::Type::Blob))
+                {
+                    // Payload bytes stay on their owning rank; the coordinator keeps the node only.
+                    node.data = StateNode::Blob{};
+                    return;
+                }
                 if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor)) { return; }
                 tensorMap[localState.localRegistry->GetNodeId(node.handle)] = node.handle;
             });
@@ -2856,19 +2815,6 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
         // Record only lengths here; rank 0's own and snapshot-scoped values are
         // assembled once their fresh per-save bytes are known.
         if (IsCoordinatorPeer() && rank != Rank{0}) { RecordBlobMetasLocked_(lock, rank, *localState.localRegistry); }
-#ifdef NATIVE_CKPT_TRACE_NODE
-        if (tensorMap.contains(NATIVE_CKPT_TRACE_NODE))
-        {
-            auto const& shTen
-                = std::get<StateNode::ShardedTensor>(sessionState.globalRegistry->GetNode(tensorMap[NATIVE_CKPT_TRACE_NODE]).data);
-            VERBOSE("[{}#{}] Rank={} Found in tensorMap NATIVE_CKPT_TRACE_NODE={}  {}",
-                    *server,
-                    sessionId,
-                    rank,
-                    NATIVE_CKPT_TRACE_NODE,
-                    shTen);
-        }
-#endif
     }
     {
         // TODO_NOPENDING_STRUCT

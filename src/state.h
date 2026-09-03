@@ -629,7 +629,7 @@ struct StateTree
         }
     }
 
-    [[maybe_unused]] void SortDictionaryNode_(StateNode& node)
+    [[maybe_unused]] void SortDictionaryNode_(StateNode& node)    // NOLINT
     {
         assert(node.data.index() == static_cast<size_t>(StateNode::Type::Dict));
         auto& children = std::get<StateNode::Dict>(node.data);

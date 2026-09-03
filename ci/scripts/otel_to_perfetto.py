@@ -83,9 +83,9 @@ def _timestamps(record: dict) -> Iterator[int]:
     yield from _log_timestamps(record)
 
 
-def _origin(paths: Sequence[Path]) -> int:
+def _origin(records: Sequence[tuple[Path, dict]]) -> int:
     origin_ns: int | None = None
-    for _, record in _records(paths):
+    for _, record in records:
         for timestamp in _timestamps(record):
             if timestamp > 0 and (origin_ns is None or timestamp < origin_ns):
                 origin_ns = timestamp
@@ -326,20 +326,27 @@ def _emit_logs(writer: _Writer, tracks: _Tracks, path: Path, record: dict) -> in
     return count
 
 
-def convert(paths: Sequence[Path], output: Path) -> dict[str, int]:
-    origin_ns = _origin(paths)
+def convert_records(records: Sequence[tuple[Path, dict]], output: Path) -> dict[str, int]:
+    for path, record in records:
+        if not any(signal in record for signal in _SIGNALS):
+            raise ValueError(f"{path}: unknown OTLP record type")
+    origin_ns = _origin(records)
     stats = {"spans": 0, "metrics": 0, "logs": 0, "tracks": 0}
     seen: set[tuple[str, str]] = set()
     with output.open("w", encoding="utf-8") as handle:
         writer = _Writer(handle, origin_ns)
         tracks = _Tracks(writer)
-        for path, record in _records(paths):
+        for path, record in records:
             stats["spans"] += _emit_spans(writer, tracks, path, record, seen)
             stats["metrics"] += _emit_metrics(writer, tracks, path, record)
             stats["logs"] += _emit_logs(writer, tracks, path, record)
         stats["tracks"] = tracks.count
         writer.finish()
     return stats
+
+
+def convert(paths: Sequence[Path], output: Path) -> dict[str, int]:
+    return convert_records(list(_records(paths)), output)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

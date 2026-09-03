@@ -5,7 +5,6 @@
 #include <boost/beast.hpp>
 #include <fmt/format.h>
 
-#include <chrono>
 #include <string>
 #include <thread>
 
@@ -19,6 +18,7 @@ inline bool TryConnectToCheckpointService()
 
     static constexpr int      MaxInterruptedRetries = 5;
     static constexpr int      MaxConnectAttempts    = 2;
+    static constexpr auto     RetryInterval         = 100ms;
     boost::system::error_code ec;
 
     for (int connectAttempt = 0; connectAttempt < MaxConnectAttempts; ++connectAttempt)
@@ -57,7 +57,7 @@ inline bool TryConnectToCheckpointService()
             ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
             return true;
         }
-        if (connectAttempt + 1 < MaxConnectAttempts) { std::this_thread::sleep_for(100ms); }
+        if (connectAttempt + 1 < MaxConnectAttempts) { std::this_thread::sleep_for(RetryInterval); }
     }
 
     if (ec != boost::asio::error::connection_refused)

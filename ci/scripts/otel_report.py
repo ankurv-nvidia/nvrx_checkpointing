@@ -32,6 +32,7 @@ _CHECKPOINT_TIMING_SPANS = {
     "megatron.checkpoint.exposed_save",
     "megatron.checkpoint.load",
 }
+_ANALYSIS_NAME = "native_ckpt_otel.report.json"
 
 
 def _otlp_value(value: dict) -> object:
@@ -48,26 +49,27 @@ def _otlp_value(value: dict) -> object:
     return None
 
 
-def _iter_objects(paths: list[str]) -> Iterator[dict]:
+def _iter_records(paths: list[str | Path]) -> Iterator[tuple[Path, dict]]:
     for path in paths:
-        with Path(path).open() as handle:
+        source = Path(path)
+        with source.open() as handle:
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
                     continue
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError as error:
-                    raise ValueError(f"{path}:{line_number}: invalid OTLP JSON") from error
-                yield obj
+                    raise ValueError(f"{source}:{line_number}: invalid OTLP JSON") from error
+                yield source, obj
 
 
 def _attributes(record: dict) -> dict:
     return {attr["key"]: _otlp_value(attr["value"]) for attr in record.get("attributes", [])}
 
 
-def iter_spans(paths: list[str]) -> Iterator[dict]:
+def _iter_spans(records: list[tuple[Path, dict]]) -> Iterator[dict]:
     seen: set[tuple[str, str]] = set()
-    for obj in _iter_objects(paths):
+    for _path, obj in records:
         for resource_spans in obj.get("resourceSpans", []):
             resource = _attributes(resource_spans.get("resource", {}))
             for scope_spans in resource_spans.get("scopeSpans", []):
@@ -88,32 +90,8 @@ def iter_spans(paths: list[str]) -> Iterator[dict]:
                     }
 
 
-def iter_span_resources(paths: list[str], name_prefix: str) -> Iterator[dict]:
-    for span in iter_spans(paths):
-        if span["name"].startswith(name_prefix):
-            yield span["resource"]
-
-
-def iter_span_samples(paths: list[str]) -> Iterator[dict]:
-    for span in iter_spans(paths):
-        if span["name"] != SAVE_SPAN:
-            continue
-        sample = {
-            key[len(_ATTR_PREFIX) :]: value
-            for key, value in span["attributes"].items()
-            if key.startswith(_ATTR_PREFIX)
-        }
-        if (ci_phase := span["resource"].get("nvrx.ci_phase")) is not None:
-            sample["ci_phase"] = ci_phase
-        if (run_id := span["resource"].get("nemo.run.id")) is not None:
-            sample["run_id"] = run_id
-        sample["start_time_unix_nano"] = span["start_time_unix_nano"]
-        sample["end_time_unix_nano"] = span["end_time_unix_nano"]
-        yield sample
-
-
-def iter_metric_samples(paths: list[str]) -> Iterator[dict]:
-    for obj in _iter_objects(paths):
+def _iter_metric_samples(records: list[tuple[Path, dict]]) -> Iterator[dict]:
+    for _path, obj in records:
         for resource_metrics in obj.get("resourceMetrics", []):
             resource = _attributes(resource_metrics.get("resource", {}))
             for scope_metrics in resource_metrics.get("scopeMetrics", []):
@@ -140,52 +118,100 @@ def iter_metric_samples(paths: list[str]) -> Iterator[dict]:
                                 }
 
 
-def collect_megatron_checkpoint_spans(paths: list[str], run_id: str | None = None) -> list[dict]:
+class OtelData:
+    def __init__(self, paths: list[str | Path]) -> None:
+        self.paths = [Path(path) for path in paths]
+        self.records = list(_iter_records(self.paths))
+        self.spans = list(_iter_spans(self.records))
+        self.metric_samples = list(_iter_metric_samples(self.records))
+
+
+def _data(source: OtelData | list[str | Path]) -> OtelData:
+    return source if isinstance(source, OtelData) else OtelData(source)
+
+
+def iter_spans(source: OtelData | list[str | Path]) -> Iterator[dict]:
+    yield from _data(source).spans
+
+
+def iter_span_resources(source: OtelData | list[str | Path], name_prefix: str) -> Iterator[dict]:
+    for span in iter_spans(source):
+        if span["name"].startswith(name_prefix):
+            yield span["resource"]
+
+
+def iter_span_samples(source: OtelData | list[str | Path]) -> Iterator[dict]:
+    for span in iter_spans(source):
+        if span["name"] != SAVE_SPAN:
+            continue
+        sample = {
+            key[len(_ATTR_PREFIX) :]: value
+            for key, value in span["attributes"].items()
+            if key.startswith(_ATTR_PREFIX)
+        }
+        if (ci_phase := span["resource"].get("nvrx.ci_phase")) is not None:
+            sample["ci_phase"] = ci_phase
+        if (run_id := span["resource"].get("nemo.run.id")) is not None:
+            sample["run_id"] = run_id
+        sample["start_time_unix_nano"] = span["start_time_unix_nano"]
+        sample["end_time_unix_nano"] = span["end_time_unix_nano"]
+        yield sample
+
+
+def iter_metric_samples(source: OtelData | list[str | Path]) -> Iterator[dict]:
+    yield from _data(source).metric_samples
+
+
+def collect_megatron_checkpoint_spans(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
     return [
         span
-        for span in iter_spans(paths)
+        for span in iter_spans(source)
         if span["name"].startswith("megatron.checkpoint.")
         and (run_id is None or str(span["resource"].get("nemo.run.id")) == run_id)
     ]
 
 
-def collect_checkpoint_spans(paths: list[str], run_id: str | None = None) -> list[dict]:
+def collect_checkpoint_spans(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
     return [
         span
-        for span in iter_spans(paths)
+        for span in iter_spans(source)
         if (span["name"].startswith("megatron.checkpoint.") or span["name"] == "nvrx.checkpoint.wait_previous")
         and (run_id is None or str(span["resource"].get("nemo.run.id")) == run_id)
     ]
 
 
-def collect_spans(paths: list[str], name: str, run_id: str | None = None) -> list[dict]:
+def collect_spans(source: OtelData | list[str | Path], name: str, run_id: str | None = None) -> list[dict]:
     return [
         span
-        for span in iter_spans(paths)
+        for span in iter_spans(source)
         if span["name"] == name
         and (run_id is None or str(span["resource"].get("nemo.run.id")) == run_id)
     ]
 
 
-def collect_metrics(paths: list[str], name_prefix: str, run_id: str | None = None) -> list[dict]:
+def collect_metrics(source: OtelData | list[str | Path], name_prefix: str, run_id: str | None = None) -> list[dict]:
     return [
         sample
-        for sample in iter_metric_samples(paths)
+        for sample in iter_metric_samples(source)
         if sample["name"].startswith(name_prefix)
         and (run_id is None or str(sample["resource"].get("nemo.run.id")) == run_id)
     ]
 
 
-def collect_resource_metrics(paths: list[str], run_id: str | None = None) -> list[dict]:
-    return collect_metrics(paths, "nvrx.checkpoint.run.", run_id)
+def collect_resource_metrics(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
+    return collect_metrics(source, "nvrx.checkpoint.run.", run_id)
 
 
-def collect_megatron_training_metrics(paths: list[str], run_id: str | None = None) -> list[dict]:
-    return collect_metrics(paths, "megatron.training.", run_id)
+def collect_megatron_training_metrics(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
+    return collect_metrics(source, "megatron.training.", run_id)
 
 
-def collect_samples(paths: list[str], ci_phase: str | None = None, run_id: str | None = None) -> list[dict]:
-    samples = list(iter_span_samples(paths))
+def collect_samples(
+    source: OtelData | list[str | Path],
+    ci_phase: str | None = None,
+    run_id: str | None = None,
+) -> list[dict]:
+    samples = list(iter_span_samples(source))
     if ci_phase is not None:
         samples = [s for s in samples if str(s.get("ci_phase")) == str(ci_phase)]
     if run_id is not None:
@@ -238,18 +264,19 @@ def _checkpoint_timing_run_id(spans: list[dict], path: Path, run_id: str | None)
     return run_ids.pop()
 
 
-def log_checkpoint_timings(path: Path, run_id: str | None, run: str) -> None:
+def _checkpoint_timing_report(
+    spans: list[dict],
+    path: Path,
+    run_id: str | None,
+    durability: tuple[list[float], list[int]],
+) -> dict:
     by_checkpoint: dict[tuple[str, int | None], dict[int, list[float]]] = {}
     started: dict[tuple[str, int | None], int] = {}
-    checkpoint_spans = []
-    spans = list(iter_spans([str(path)]))
     run_id = _checkpoint_timing_run_id(spans, path, run_id)
     for span in spans:
         name = span["name"]
         if str(span["resource"].get("nemo.run.id")) != run_id:
             continue
-        if name.startswith("megatron.checkpoint.") or name == "nvrx.checkpoint.wait_previous":
-            checkpoint_spans.append(span)
         if name not in _CHECKPOINT_TIMING_SPANS:
             continue
         start, end = span["start_time_unix_nano"], span["end_time_unix_nano"]
@@ -262,24 +289,59 @@ def log_checkpoint_timings(path: Path, run_id: str | None, run: str) -> None:
         started[key] = min(started.get(key, start), start)
     if not any(name == "megatron.checkpoint.exposed_save" for name, _iteration in by_checkpoint):
         raise RuntimeError(f"no megatron.checkpoint.exposed_save spans found for run {run_id!r} in {path}")
-    logger.info(f"{run}: checkpoint timings (min, max, median ms across ranks)")
+    timings = []
     for (name, iteration), by_rank in sorted(by_checkpoint.items(), key=lambda item: started[item[0]]):
         values = [statistics.median(samples) for samples in by_rank.values()]
         label = "load-checkpoint" if name.endswith(".load") else "save-checkpoint"
         if iteration is not None:
             label += f" iteration {iteration}"
-        logger.info(
-            f"    {(label + ' ').ljust(48, '.')}"
-            f": ({min(values):.2f}, {max(values):.2f}, {statistics.median(values):.2f})",
+        timings.append(
+            {
+                "label": label,
+                "min": min(values),
+                "max": max(values),
+                "median": statistics.median(values),
+            },
         )
-    durable, ranks = checkpoint_durability_ms(checkpoint_spans)
+    durable, ranks = durability
+    durability_report = None
     if durable:
+        durability_report = {
+            "min": min(durable),
+            "max": max(durable),
+            "median": statistics.median(durable),
+            "mean": statistics.mean(durable),
+            "spans": len(durable),
+            "ranks": len(set(ranks)),
+        }
+    return {"run_id": run_id, "checkpoint_timings": timings, "checkpoint_durability": durability_report}
+
+
+def log_checkpoint_analysis(analysis: dict, run: str) -> None:
+    logger.info(f"{run}: checkpoint timings (min, max, median ms across ranks)")
+    for timing in analysis["checkpoint_timings"]:
+        logger.info(
+            f"    {(timing['label'] + ' ').ljust(48, '.')}"
+            f": ({timing['min']:.2f}, {timing['max']:.2f}, {timing['median']:.2f})",
+        )
+    if durability := analysis.get("checkpoint_durability"):
         logger.info(f"{run}: checkpoint durability (min, max, median ms across ranks and saves)")
         logger.info(
             f"    {'save -> durable '.ljust(48, '.')}"
-            f": ({min(durable):.2f}, {max(durable):.2f}, {statistics.median(durable):.2f})  "
-            f"mean {statistics.mean(durable):.2f} over {len(durable)} span(s) across {len(set(ranks))} rank(s)",
+            f": ({durability['min']:.2f}, {durability['max']:.2f}, {durability['median']:.2f})  "
+            f"mean {durability['mean']:.2f} over {durability['spans']} span(s) "
+            f"across {durability['ranks']} rank(s)",
         )
+
+
+def log_checkpoint_timings(path: Path, run_id: str | None, run: str) -> None:
+    if analysis := _load_analysis(path):
+        log_checkpoint_analysis(analysis, run)
+        return
+    source = OtelData([path])
+    checkpoint_spans = collect_checkpoint_spans(source, run_id)
+    durability = checkpoint_durability_ms(checkpoint_spans)
+    log_checkpoint_analysis(_checkpoint_timing_report(source.spans, path, run_id, durability), run)
 
 
 def load_latest(results_dir: Path) -> dict[str, list]:
@@ -295,19 +357,20 @@ def load_latest(results_dir: Path) -> dict[str, list]:
         return empty
     by_cycle = {int(path.name[5:]): path for path in otel_root.glob("cycle*") if path.is_dir() and path.name[5:].isdigit()}
     newest = by_cycle[max(by_cycle)] if by_cycle else otel_root
-    files = [str(path) for path in sorted(newest.glob("*.jsonl"))]
+    files = sorted(newest.glob("*.jsonl"))
     if not files:
         return empty
-    resource_metrics = collect_resource_metrics(files)
+    source = OtelData(files)
+    resource_metrics = collect_resource_metrics(source)
     run_id = os.environ.get("MEGATRON_OTEL_RUN_ID")
     if run_id is None and resource_metrics:
         latest = max(resource_metrics, key=lambda sample: sample["time_unix_nano"])
         run_id = str(latest["resource"].get("nemo.run.id"))
     return {
-        "native_saves": collect_samples(files, run_id=run_id),
-        "daemon_durable_spans": collect_spans(files, "ckpt.svr.durable", run_id),
-        "megatron_spans": collect_checkpoint_spans(files, run_id),
-        "megatron_metrics": collect_megatron_training_metrics(files, run_id),
+        "native_saves": collect_samples(source, run_id=run_id),
+        "daemon_durable_spans": collect_spans(source, "ckpt.svr.durable", run_id),
+        "megatron_spans": collect_checkpoint_spans(source, run_id),
+        "megatron_metrics": collect_megatron_training_metrics(source, run_id),
         "resource_metrics": [
             sample for sample in resource_metrics if run_id is None or str(sample["resource"].get("nemo.run.id")) == run_id
         ],
@@ -519,9 +582,13 @@ def _resource_metrics(samples: list[dict]) -> dict:
     return metrics
 
 
-def metrics_from_data(data: dict[str, list], gpus_per_node: int | None = None) -> dict:
+def metrics_from_data(
+    data: dict[str, list],
+    gpus_per_node: int | None = None,
+    durability: tuple[list[float], list[int]] | None = None,
+) -> dict:
     metrics = _native_metrics(data["native_saves"], gpus_per_node)
-    durable, durable_ranks = checkpoint_durability_ms(data["megatron_spans"])
+    durable, durable_ranks = durability if durability is not None else checkpoint_durability_ms(data["megatron_spans"])
     if durable:
         metrics["ckpt_durable_ms"] = metric(
             durable,
@@ -545,12 +612,11 @@ def metrics_from_data(data: dict[str, list], gpus_per_node: int | None = None) -
     return metrics
 
 
-def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
-    data = load_latest(results_dir)
-    valid = native_spans_valid(data["native_saves"]) if native else True
+def _processed(analysis: dict, native: bool) -> dict:
+    valid = bool(analysis.get("native_spans_valid")) if native else True
     return {
         "source": "otlp",
-        "metrics": metrics_from_data(data, gpus_per_node),
+        "metrics": analysis["metrics"],
         "validation": (
             {
                 "name": "ckpt_save_spans",
@@ -565,22 +631,60 @@ def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
     }
 
 
+def analysis_path(path: Path) -> Path:
+    return path.with_name(_ANALYSIS_NAME)
+
+
+def write_analysis(path: Path, analysis: dict) -> None:
+    stat = path.stat()
+    analysis = {**analysis, "otel_file": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}}
+    analysis_path(path).write_text(json.dumps(analysis, separators=(",", ":")))
+
+
+def _load_analysis(path: Path) -> dict | None:
+    report = analysis_path(path)
+    if not path.is_file() or not report.is_file():
+        return None
+    analysis = json.loads(report.read_text())
+    stat = path.stat()
+    return analysis if analysis.get("otel_file") == {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns} else None
+
+
+def _load_latest_analysis(results_dir: Path) -> dict | None:
+    root = results_dir / "otel"
+    if not root.is_dir():
+        return None
+    by_cycle = {int(path.name[5:]): path for path in root.glob("cycle*") if path.is_dir() and path.name[5:].isdigit()}
+    newest = by_cycle[max(by_cycle)] if by_cycle else root
+    return _load_analysis(newest / "native_ckpt_otel.jsonl")
+
+
+def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
+    if analysis := _load_latest_analysis(results_dir):
+        return _processed(analysis, native)
+    data = load_latest(results_dir)
+    valid = native_spans_valid(data["native_saves"]) if native else True
+    return _processed({"metrics": metrics_from_data(data, gpus_per_node), "native_spans_valid": valid}, native)
+
+
 def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
-    path: Path,
+    source: Path | OtelData,
     run_id: str,
     nodes: int,
     gpus_per_node: int,
     provider: str,
     expected_checkpoints: int,
-) -> None:
-    if not path.is_file():
+) -> dict:
+    path = source.paths[0] if isinstance(source, OtelData) else source
+    if not isinstance(source, OtelData) and not path.is_file():
         raise RuntimeError(f"Megatron emitted no collected OTLP file: {path}")
-    resources = [resource for resource in iter_span_resources([str(path)], "megatron.") if str(resource.get("nemo.run.id")) == run_id]
+    data = source if isinstance(source, OtelData) else OtelData([path])
+    resources = [resource for resource in iter_span_resources(data, "megatron.") if str(resource.get("nemo.run.id")) == run_id]
     ranks = {int(resource["dl.rank"]) for resource in resources if resource.get("dl.rank") is not None}
     expected = set(range(nodes * gpus_per_node))
     if ranks != expected:
         raise RuntimeError(f"Megatron OTLP exporter ranks mismatch: expected {sorted(expected)}, found {sorted(ranks)} in {path}")
-    megatron_metrics = collect_megatron_training_metrics([str(path)], run_id)
+    megatron_metrics = collect_megatron_training_metrics(data, run_id)
     for name in MEGATRON_PERF_METRICS:
         matching = [sample for sample in megatron_metrics if sample["name"] == name]
         metric_ranks = {int(sample["resource"].get("dl.rank", -1)) for sample in matching}
@@ -590,7 +694,7 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
             )
         if any(sample["time_unix_nano"] <= 0 or not math.isfinite(sample["value"]) for sample in matching):
             raise RuntimeError(f"Megatron training metric {name} has invalid OTLP points in {path}")
-    resource_metrics = collect_resource_metrics([str(path)], run_id)
+    resource_metrics = collect_resource_metrics(data, run_id)
     expected_metric_ranks = set(range(nodes * gpus_per_node))
     required_metrics = {
         "nvrx.checkpoint.run.gpu_peak_bytes",
@@ -611,7 +715,7 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
             raise RuntimeError(
                 f"checkpoint resource metric {name} provider mismatch: expected {provider!r}, found {sorted(metric_providers)} in {path}",
             )
-    checkpoint_spans = collect_checkpoint_spans([str(path)], run_id)
+    checkpoint_spans = collect_checkpoint_spans(data, run_id)
     save_counts = {
         rank: sum(
             span["name"] == "megatron.checkpoint.save" and int(span["resource"].get("dl.rank", -1)) == rank for span in checkpoint_spans
@@ -624,10 +728,11 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
             f"Megatron checkpoint save span counts mismatch: expected {expected_save_counts}, "
             f"found {save_counts} for run {run_id!r} in {path}",
         )
-    checkpoint_durability_ms(checkpoint_spans)
+    durability = checkpoint_durability_ms(checkpoint_spans)
+    native_spans = collect_samples(data, run_id=run_id)
+    valid_native_spans = native_spans_valid(native_spans) if provider == "native" else False
     if provider == "native":
-        native_spans = collect_samples([str(path)], run_id=run_id)
-        if not native_spans_valid(native_spans):
+        if not valid_native_spans:
             raise RuntimeError(f"native checkpoint OTLP spans are missing or invalid in {path}")
         snapshots: dict[tuple[int, int], set[int]] = {}
         for span in native_spans:
@@ -640,7 +745,7 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
                 f"native checkpoint OTLP span ranks mismatch for session/snapshot {key}: "
                 f"expected {sorted(expected_metric_ranks)}, found {sorted(found)} in {path}",
             )
-        durable_spans = collect_spans([str(path)], "ckpt.svr.durable", run_id)
+        durable_spans = collect_spans(data, "ckpt.svr.durable", run_id)
         durable_ids = {
             (int(span["attributes"].get("nvrx.session_id", -1)), int(span["attributes"].get("nvrx.snapshot_id", -1)))
             for span in durable_spans
@@ -650,6 +755,21 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
             raise RuntimeError(
                 f"native checkpoint durable OTLP spans mismatch: expected {sorted(snapshots)}, found {sorted(durable_ids)} in {path}",
             )
+    report_data = {
+        "native_saves": native_spans,
+        "daemon_durable_spans": collect_spans(data, "ckpt.svr.durable", run_id),
+        "megatron_spans": checkpoint_spans,
+        "megatron_metrics": megatron_metrics,
+        "resource_metrics": resource_metrics,
+    }
+    return {
+        "source": "otlp",
+        "run_id": run_id,
+        "provider": provider,
+        "native_spans_valid": valid_native_spans,
+        "metrics": metrics_from_data(report_data, gpus_per_node, durability),
+        **_checkpoint_timing_report(data.spans, path, run_id, durability),
+    }
 # Entries define the unit and whether larger values are better.
 _SUMMARY_METRICS = (
     ("bw_mbps", "MB/s", True),

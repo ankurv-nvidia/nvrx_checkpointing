@@ -10,7 +10,7 @@ import sys
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     import pytest
@@ -201,6 +201,10 @@ def test_save_checkpoint_captures_entry_time_before_preparation(monkeypatch: pyt
 
 
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:
+    class ReferenceRequest(NamedTuple):
+        value: str
+        call_idx: int = 0
+
     calls = SimpleNamespace(
         empty_cache=0,
         free_overlap=0,
@@ -214,6 +218,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         native_async=[],
         native_readers=[],
         reference_async=[],
+        reference_request=ReferenceRequest,
         reference_readers=[],
         warnings=[],
     )
@@ -334,9 +339,24 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         calls.reference_async.append((name, args))
         return f"reference-{name}"
 
+    reference_queue = SimpleNamespace(call_idx=-1)
+    reference_pending = []
+
+    def schedule_reference(request: ReferenceRequest) -> str:
+        reference_queue.call_idx += 1
+        reference_pending.append(request)
+        return record_reference_async("schedule", request)
+
+    def finalize_reference(*args: Any) -> list[int]:
+        record_reference_async("finalize", *args)
+        finalized = [request.call_idx for request in reference_pending]
+        reference_pending.clear()
+        return finalized
+
+    async_utils_module._get_async_calls_queue = lambda: reference_queue
     async_utils_module.init_persistent_async_worker = lambda *args: record_reference_async("init", *args)
-    async_utils_module.schedule_async_save = lambda *args: record_reference_async("schedule", *args)
-    async_utils_module.maybe_finalize_async_save = lambda *args: record_reference_async("finalize", *args)
+    async_utils_module.schedule_async_save = schedule_reference
+    async_utils_module.maybe_finalize_async_save = finalize_reference
     async_utils_module.is_empty_async_queue = lambda: record_reference_async("is-empty") == "empty"
     async_utils_module.reset_persistent_async_worker = lambda *args: record_reference_async("reset", *args)
     checkpointing_module.schedule_async_save = async_utils_module.schedule_async_save
@@ -566,7 +586,7 @@ def test_reference_provider_keeps_original_async_lifecycle(monkeypatch: pytest.M
     calls.args.ckpt_provider = "nvrx"
 
     calls.initialize_module.init_persistent_async_worker(3, "forkserver")
-    calls.async_utils_module.schedule_async_save("request")
+    calls.async_utils_module.schedule_async_save(calls.reference_request("request"))
     calls.training_module.maybe_finalize_async_save(True, True)
     calls.checkpointing_module.is_empty_async_queue()
     calls.restart_module.reset_persistent_async_worker("nvrx")
@@ -574,11 +594,23 @@ def test_reference_provider_keeps_original_async_lifecycle(monkeypatch: pytest.M
     assert calls.native_async == []
     assert calls.reference_async == [
         ("init", (3, "forkserver")),
-        ("schedule", ("request",)),
+        ("schedule", (calls.reference_request("request", 0),)),
         ("finalize", (True, True)),
         ("is-empty", ()),
         ("reset", ("nvrx",)),
     ]
+
+
+def test_reference_async_requests_receive_monotonic_call_indices(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.args.ckpt_provider = "nvrx"
+
+    for value in ("first", "second", "third"):
+        calls.async_utils_module.schedule_async_save(calls.reference_request(value))
+
+    scheduled = [args[0] for name, args in calls.reference_async if name == "schedule"]
+    assert [request.call_idx for request in scheduled] == [0, 1, 2]
+    assert calls.training_module.maybe_finalize_async_save() == [0, 1, 2]
 
 
 def test_native_provider_uses_repo_owned_load_reader(monkeypatch: pytest.MonkeyPatch) -> None:

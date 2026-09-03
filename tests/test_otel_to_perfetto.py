@@ -145,6 +145,50 @@ def test_unknown_jsonl_record_fails_with_location(tmp_path: Path) -> None:
         otel_to_perfetto.convert([source], output)
 
 
+def test_conversion_parses_input_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "native_ckpt_otel.jsonl"
+    output = tmp_path / "native_ckpt_perfetto.json"
+    _write(
+        source,
+        [
+            {
+                "resourceSpans": [
+                    {
+                        "resource": _resource(),
+                        "scopeSpans": [
+                            {
+                                "spans": [
+                                    {
+                                        "traceId": "trace-1",
+                                        "spanId": "span-1",
+                                        "name": "checkpoint",
+                                        "startTimeUnixNano": "1000",
+                                        "endTimeUnixNano": "2000",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    )
+    real_open = Path.open
+    reads = 0
+
+    def counted_open(path: Path, *args, **kwargs):
+        nonlocal reads
+        if path == source:
+            reads += 1
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+
+    otel_to_perfetto.convert([source], output)
+
+    assert reads == 1
+
+
 def test_span_rank_selects_distinct_daemon_tracks(tmp_path: Path) -> None:
     source = tmp_path / "native_ckpt_otel.jsonl"
     output = tmp_path / "native_ckpt_perfetto.json"

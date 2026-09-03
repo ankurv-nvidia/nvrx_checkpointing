@@ -16,7 +16,7 @@
 // any in-flight GPU writes to the buffer are visible to the CPU as soon as the
 // corresponding command buffer completes.
 
-struct MetalContext : public DeviceContext {
+struct MetalContext : public DeviceContext { // NOLINT
   MetalContext(DeviceId deviceIn, uint8_t streamIdxIn)
       : DeviceContext(deviceIn, streamIdxIn) {}
 
