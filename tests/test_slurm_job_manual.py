@@ -2805,14 +2805,18 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
         "when": "on_success",
     }
     assert manual_optional["rules"][2] == {
-        "if": '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"',
+        "if": '$RUN_PIPELINE == "true"',
+        "when": "on_success",
+    }
+    assert manual_optional["rules"][3] == {
+        "if": '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS',
         "when": "on_success",
     }
     # A rule's allow_failure replaces the job's own, so leaving it unset keeps
     # the job's exit_codes: a played job that fails reports a failure, and only
     # the perf-drift exit is tolerated.
-    assert manual_optional["rules"][3] == {"when": "manual"}
-    assert "allow_failure" not in manual_optional["rules"][3]
+    assert manual_optional["rules"][4] == {"when": "manual"}
+    assert "allow_failure" not in manual_optional["rules"][4]
     for suite in ("nvrx", "large_scale", "main_branch_runs"):
         policy = config[f".{suite}_pipeline"]
         assert "allow_failure" not in policy
@@ -3364,7 +3368,7 @@ def test_sacct_job_array_without_indexed_rows_fails_on_any_failed_task(monkeypat
         slurm_job._verify_allocation("123", 0, job_array=True)
 
 
-def test_workflow_runs_mr_updates_but_not_ordinary_pushes() -> None:
+def test_workflow_reuses_head_pipeline_and_runs_open_mr_pushes() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
     rules = config["workflow"]["rules"]
 
@@ -3374,7 +3378,8 @@ def test_workflow_runs_mr_updates_but_not_ordinary_pushes() -> None:
         "large-scale",
         "main-branch-runs",
     ]
-    assert {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'} in rules
+    assert not any('CI_PIPELINE_SOURCE == "merge_request_event"' in rule.get("if", "") for rule in rules)
+    assert {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'} in rules
     assert {"if": '$CI_PIPELINE_SOURCE == "push" && $RUN_PIPELINE == "true"'} in rules
     assert any("pipeline" in rule.get("if", "") and rule.get("when") != "never" for rule in rules)
     assert any(rule.get("when") == "never" and "PIPELINE_SUITE !=" in rule.get("if", "") for rule in rules)
@@ -4336,6 +4341,7 @@ def test_log_report_requires_matching_perf_markers(caplog: pytest.LogCaptureFixt
 
 
 def test_perf_report_uses_logs_only_when_otel_is_disabled(
+    caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4351,24 +4357,28 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
         "[native_ckpt:mem] rank=0 gpu_peak_bytes=80 gpu_hbm_peak_bytes=90 "
         "gpu_total_bytes=100 cpu_rss_bytes=10\n",
     )
-    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(_perf_span())
+    (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
+        _perf_span(write_us=8, snapshot=1) + _perf_span(write_us=10, snapshot=2) + _perf_span(write_us=12, snapshot=3),
+    )
     report_path = tmp_path / "report.json"
 
-    passed = slurm_job.PerfReport.report(
-        "perf",
-        "pico_1x1",
-        "perf",
-        log,
-        {"metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}},
-        report_path,
-        1,
-    )
+    with caplog.at_level("INFO"):
+        passed = slurm_job.PerfReport.report(
+            "perf",
+            "pico_1x1",
+            "perf",
+            log,
+            {"metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}},
+            report_path,
+            1,
+        )
 
     report = json.loads(report_path.read_text())
     assert passed
     assert report["telemetry_source"] == "logs"
     assert report["ckpt_save_markers_valid"]
     assert report["metrics"]["ckpt_durable_ms"]["mean"] == 20000
+    assert ("[PASS] wr_tnsr_us: median=10 us (min=8 us, median=10 us, max=12 us); baseline=10.0 us; tolerance=5.0%") in caplog.messages
 
 
 def test_perf_report_does_not_fall_back_when_otel_is_enabled(

@@ -1306,7 +1306,22 @@ class PerfReport:
             }
             passed &= validation["valid"]
         for name, value in comparison.items():
-            logger.info(f"[{value['status']}] {name}: {value['measured']}")
+            metric = metrics.get(name, {})
+            unit = f" {metric['unit']}" if metric.get("unit") else ""
+            if all(statistic in metric for statistic in ("min", "median", "max")):
+                statistic = value.get("statistic") or PerfReport._statistic(name, metric)
+                measured = (
+                    f"{statistic}={value['measured']}{unit} "
+                    f"(min={metric['min']}{unit}, median={metric['median']}{unit}, max={metric['max']}{unit})"
+                )
+            else:
+                measured = f"measured={value['measured']}{unit}"
+            details = [measured]
+            if "baseline" in value:
+                details.append(f"baseline={value['baseline']}{unit}")
+            if "tolerance_pct" in value:
+                details.append(f"tolerance={value['tolerance_pct']}%")
+            logger.info(f"[{value['status']}] {name}: {'; '.join(details)}")
         report = {
             "job": job,
             "config": config,
