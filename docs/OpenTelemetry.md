@@ -109,6 +109,12 @@ the collected OTLP data after a run:
   duration; the final gauge point supplies each other value.
 - CUDA allocation, HBM, GPU capacity, and CPU RSS gauges are exported once per rank
   after training and aggregated by rank.
+- The Slurm harness also persists each training rank's process high-water mark and
+  reads each native checkpoint daemon's Linux `VmHWM` immediately before shutdown.
+  The final report prints `training_process_peak_rss_bytes` across ranks and
+  `checkpoint_daemon_peak_rss_bytes` across nodes, taking each process's maximum
+  over every phase and cycle in the run. These are informational metrics and do
+  not enter performance baselines.
 
 Metrics carrying `dl.rank` retain per-rank medians plus min, median, and max across
 ranks in the JSON report and generated baseline candidate. Checkpoint durability is

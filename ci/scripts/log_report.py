@@ -234,12 +234,14 @@ def _metrics(text: str, daemon_text: str, gpus_per_node: int | None) -> dict:
                 higher_is_better=False,
                 ranks=hbm_ranks,
             )
-        metrics["cpu_rss_bytes"] = _metric(
-            [int(match[5]) for match in memory],
-            "B",
-            higher_is_better=False,
-            ranks=memory_ranks,
-        )
+        cpu_rss = [int(match[5]) for match in memory]
+        if memory_ranks is not None:
+            per_rank = {
+                rank: max(value for sample_rank, value in zip(memory_ranks, cpu_rss) if sample_rank == rank)
+                for rank in sorted(set(memory_ranks))
+            }
+            cpu_rss, memory_ranks = list(per_rank.values()), list(per_rank)
+        metrics["cpu_rss_bytes"] = _metric(cpu_rss, "B", higher_is_better=False, ranks=memory_ranks)
     return metrics
 
 

@@ -388,6 +388,71 @@ def test_server_log_error_is_a_failure(
         slurm_job.FlavorPolicy().stop_server("native", "phase2")
 
 
+def test_host_memory_metrics_distinguish_training_process_and_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    proc = tmp_path / "proc"
+    (proc / "42").mkdir(parents=True)
+    (proc / "42" / "status").write_text("Name:\tcheckpoint_serv\nVmHWM:\t123456 kB\n")
+    monkeypatch.setattr(slurm_job, "_PROC_ROOT", proc)
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node-a.example.com")
+
+    slurm_job._record_daemon_peak_rss("cycle1", ["42"])
+    metrics = slurm_job._with_host_memory_metrics(
+        {
+            "cpu_rss_bytes": slurm_job.otel_report.metric(
+                [100, 104],
+                "B",
+                higher_is_better=False,
+                ranks=[0, 1],
+            ),
+        },
+        tmp_path,
+    )
+
+    assert "cpu_rss_bytes" not in metrics
+    assert metrics["training_process_peak_rss_bytes"]["max"] == 104  # noqa: PLR2004
+    assert metrics["checkpoint_daemon_peak_rss_bytes"]["max"] == 123456 * 1024
+    assert metrics["checkpoint_daemon_peak_rss_bytes"]["per_node"] == {"node-a": 123456 * 1024}
+    assert slurm_job.PerfReport._statistic(
+        "training_process_peak_rss_bytes",
+        metrics["training_process_peak_rss_bytes"],
+    ) == "max"
+
+
+def test_log_report_uses_each_ranks_peak_rss_across_all_phases() -> None:
+    slurm_job = _load_slurm_job()
+    text = "\n".join(
+        f"[native_ckpt:mem] rank={rank} gpu_peak_bytes=1 cpu_rss_bytes={rss}"
+        for rank, rss in ((0, 100), (1, 120), (0, 130), (1, 110))
+    )
+
+    measured = slurm_job.log_report._metrics(text, "", 4)["cpu_rss_bytes"]
+
+    assert measured["samples"] == [130, 120]
+    assert measured["per_rank_median"] == {0: 130, 1: 120}
+
+
+def test_only_native_provider_records_checkpoint_daemon_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    recorded = []
+    monkeypatch.setattr(
+        slurm_job,
+        "CHECKPOINT_SERVER",
+        SimpleNamespace(pids=lambda: ["42"], stop=lambda graceful: recorded.append(("stop", graceful))),
+    )
+    monkeypatch.setattr(slurm_job, "_record_daemon_peak_rss", lambda tag, pids: recorded.append((tag, pids)))
+    monkeypatch.setattr(slurm_job, "_node_once", lambda _tag, action: action())
+
+    slurm_job.FlavorPolicy().stop_server("nvrx", "reference", graceful=False)
+    slurm_job.FlavorPolicy().stop_server("native", "measured", graceful=False)
+
+    assert recorded == [("stop", False), ("measured", ["42"]), ("stop", False)]
+
+
 def test_server_heartbeat_pings_only_from_node_leader(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     requests = []
@@ -2838,7 +2903,7 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
         "when": "on_success",
     }
     assert manual_optional["rules"][3] == {
-        "if": '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS',
+        "if": '$CI_OPEN_MERGE_REQUESTS',
         "when": "on_success",
     }
     # A rule's allow_failure replaces the job's own, so leaving it unset keeps
@@ -4034,6 +4099,8 @@ def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPa
             "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
             "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
             "total_written_bytes": {"mean": 100, "higher_is_better": None, "unit": "B"},
+            "checkpoint_daemon_peak_rss_bytes": {"max": 200, "higher_is_better": False, "unit": "B"},
+            "training_process_peak_rss_bytes": {"max": 300, "higher_is_better": False, "unit": "B"},
         },
     }
     (tmp_path / f"{stem}_report.json").write_text(json.dumps(report))
@@ -4398,6 +4465,9 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
         _perf_span(write_us=8, snapshot=1) + _perf_span(write_us=10, snapshot=2) + _perf_span(write_us=12, snapshot=3),
     )
+    (tmp_path / "host_memory.daemon.cycle1.host.json").write_text(
+        '{"node":"host","peak_rss_bytes":20,"pids":[1]}',
+    )
     report_path = tmp_path / "report.json"
 
     with caplog.at_level("INFO"):
@@ -4416,6 +4486,10 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     assert report["telemetry_source"] == "logs"
     assert report["ckpt_save_markers_valid"]
     assert report["metrics"]["ckpt_durable_ms"]["mean"] == 20000
+    assert report["metrics"]["training_process_peak_rss_bytes"]["max"] == 10  # noqa: PLR2004
+    assert report["metrics"]["checkpoint_daemon_peak_rss_bytes"]["max"] == 20  # noqa: PLR2004
+    assert "[no_baseline] training_process_peak_rss_bytes: max=10 B" in caplog.text
+    assert "[no_baseline] checkpoint_daemon_peak_rss_bytes: max=20 B" in caplog.text
     assert ("[PASS] wr_tnsr_us: median=10 us (min=8 us, median=10 us, max=12 us); baseline=10.0 us; tolerance=5.0%") in caplog.messages
 
 

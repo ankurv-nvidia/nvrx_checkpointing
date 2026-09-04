@@ -238,7 +238,10 @@ variables:
       when: on_success
     - if: '$RUN_PIPELINE == "true"'
       when: on_success
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'
+    # MR validation stays on the source branch. This also covers an explicit
+    # API/web pipeline started after the MR is open; workflow rules still decide
+    # whether a pipeline is created, so this cannot duplicate it.
+    - if: '$CI_OPEN_MERGE_REQUESTS'
       when: on_success
     - when: manual
 

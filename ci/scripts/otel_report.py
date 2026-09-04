@@ -650,6 +650,25 @@ def _load_analysis(path: Path) -> dict | None:
     return analysis if analysis.get("otel_file") == {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns} else None
 
 
+def _complete_run_cpu_rss(results_dir: Path) -> dict | None:
+    """Return each training rank's largest peak RSS across all completed phases."""
+    root = results_dir / "otel"
+    sources = [root / "native_ckpt_otel.jsonl", *sorted(root.glob("*/native_ckpt_otel.jsonl"))]
+    per_rank: dict[int, int] = {}
+    for source in sources:
+        analysis = _load_analysis(source)
+        measured = analysis.get("metrics", {}).get("cpu_rss_bytes") if analysis else None
+        if not measured or measured.get("ranks") is None:
+            continue
+        for rank, value in zip(measured["ranks"], measured["samples"], strict=True):
+            rank_id = int(rank)
+            per_rank[rank_id] = max(round(value), per_rank.get(rank_id, 0))
+    if not per_rank:
+        return None
+    ranks = sorted(per_rank)
+    return metric([per_rank[rank] for rank in ranks], "B", higher_is_better=False, ranks=ranks)
+
+
 def _load_latest_analysis(results_dir: Path) -> dict | None:
     root = results_dir / "otel"
     if not root.is_dir():
@@ -661,10 +680,14 @@ def _load_latest_analysis(results_dir: Path) -> dict | None:
 
 def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
     if analysis := _load_latest_analysis(results_dir):
-        return _processed(analysis, native)
-    data = load_latest(results_dir)
-    valid = native_spans_valid(data["native_saves"]) if native else True
-    return _processed({"metrics": metrics_from_data(data, gpus_per_node), "native_spans_valid": valid}, native)
+        processed = _processed(analysis, native)
+    else:
+        data = load_latest(results_dir)
+        valid = native_spans_valid(data["native_saves"]) if native else True
+        processed = _processed({"metrics": metrics_from_data(data, gpus_per_node), "native_spans_valid": valid}, native)
+    if cpu_rss := _complete_run_cpu_rss(results_dir):
+        processed["metrics"]["cpu_rss_bytes"] = cpu_rss
+    return processed
 
 
 def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917

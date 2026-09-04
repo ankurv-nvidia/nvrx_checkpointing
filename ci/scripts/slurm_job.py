@@ -105,6 +105,10 @@ WIDE_TOLERANCE_METRICS = {
     "ckpt_durable_ms": 2.0,
     "ckpt_daemon_durable_ms": 2.0,
 }
+HOST_MEMORY_METRICS = frozenset({
+    "checkpoint_daemon_peak_rss_bytes",
+    "training_process_peak_rss_bytes",
+})
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
 # The allocation directory owns every named run.
@@ -143,6 +147,8 @@ SYNC_DIR_NAME = ".sync"
 _TORCH_STORAGE_ALIGNMENT = 64
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_PROC_STATUS_HWM_RE = re.compile(r"^VmHWM:\s+(\d+)\s+kB$", re.MULTILINE)
+_PROC_ROOT = Path("/proc")
 _WORKTREE_REVISION = "HEAD"
 # A run directory is named for what it holds: the model it trained, the sources
 # it trained on, and the variants it carried. Two runs differing in any of those
@@ -1171,6 +1177,53 @@ def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: 
         raise RuntimeError(f"job failed with exit code {rc}; log: {log_file}")
     return rc
 
+def _process_peak_rss_bytes(pid: str) -> int | None:
+    """Read the kernel-maintained peak RSS for one live Linux process."""
+    try:
+        status = (_PROC_ROOT / pid / "status").read_text()
+    except (OSError, UnicodeError):
+        return None
+    match = _PROC_STATUS_HWM_RE.search(status)
+    return int(match[1]) * 1024 if match else None
+
+def _record_daemon_peak_rss(tag: str, pids: list[str]) -> None:
+    """Persist one daemon high-water mark before the process exits."""
+    values = [value for pid in pids if (value := _process_peak_rss_bytes(pid)) is not None]
+    if not values:
+        logger.warning(f"[slurm_job:memory] checkpoint daemon peak RSS unavailable for pids {pids}")
+        return
+    host = socket.gethostname().split(".", 1)[0]
+    safe_tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+    record = {
+        "node": host,
+        "peak_rss_bytes": max(values),
+        "pids": [int(pid) for pid in pids],
+    }
+    path = RESULTS_DIR / f"host_memory.daemon.{safe_tag}.{host}.json"
+    path.write_text(json.dumps(record, separators=(",", ":")))
+
+def _with_host_memory_metrics(metrics: dict, results_dir: Path) -> dict:
+    """Add complete-run peak RSS for the training ranks and daemon nodes."""
+    result = dict(metrics)
+    if training := result.pop("cpu_rss_bytes", None):
+        result["training_process_peak_rss_bytes"] = training
+
+    per_node: dict[str, int] = {}
+    for path in results_dir.glob("host_memory.daemon.*.json"):
+        try:
+            record = json.loads(path.read_text())
+            node = str(record["node"])
+            value = int(record["peak_rss_bytes"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning(f"[slurm_job:memory] ignoring malformed daemon memory record {path}")
+            continue
+        per_node[node] = max(value, per_node.get(node, 0))
+    if per_node:
+        daemon = otel_report.metric(list(per_node.values()), "B", higher_is_better=False)
+        daemon["per_node"] = dict(sorted(per_node.items()))
+        result["checkpoint_daemon_peak_rss_bytes"] = daemon
+    return result
+
 class PerfReport:
     @staticmethod
     def _platform_bandwidth_baseline(platform: str) -> int:
@@ -1213,7 +1266,12 @@ class PerfReport:
 
     @staticmethod
     def _statistic(name: str, measured: dict) -> str:
-        if name in {"gpu_hbm_peak_bytes", "gpu_hbm_peak_pct", "megatron.training.memory_allocated_gb"} and "max" in measured:
+        if name in {
+            *HOST_MEMORY_METRICS,
+            "gpu_hbm_peak_bytes",
+            "gpu_hbm_peak_pct",
+            "megatron.training.memory_allocated_gb",
+        } and "max" in measured:
             return "max"
         if name in {
             "bw_mbps",
@@ -1293,7 +1351,7 @@ class PerfReport:
             if otel_reporting
             else log_report.post_process(log, results_dir, gpus, native)
         )
-        metrics = processed["metrics"]
+        metrics = _with_host_memory_metrics(processed["metrics"], results_dir)
         PerfReport._log_daemon_durability(metrics)
         if not metrics:
             if processed["source"] == "logs" and not native:
@@ -1617,7 +1675,7 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
         # Socket imbalance is an in-job topology diagnostic rather than a
         # workload baseline. The measured bandwidth belongs in the candidate
         # even though the shared platform floor remains the enforced gate.
-        if name == "bw_socket_imbalance":
+        if name == "bw_socket_imbalance" or name in HOST_MEMORY_METRICS:
             continue
         statistic = PerfReport._statistic(name, value)
         if statistic in value:
@@ -1799,10 +1857,12 @@ class FlavorPolicy:
     def run_worker(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
         (self.worker or _run_routine)(cfg, args, provider, label)
 
-    def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
+    def stop_server(self, provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server:
             def stop() -> None:
                 pids = CHECKPOINT_SERVER.pids()
+                if provider == "native":
+                    _record_daemon_peak_rss(tag, pids)
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
                     pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]

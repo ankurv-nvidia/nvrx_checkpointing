@@ -317,6 +317,28 @@ def test_analysis_sidecar_avoids_epilog_reparse(
     assert reads == 1
 
 
+def test_post_process_uses_each_ranks_peak_rss_across_all_phases(tmp_path: Path) -> None:
+    for phase, values in {"phase1": [100, 120], "cycle1": [130, 110]}.items():
+        source = tmp_path / "otel" / phase / "native_ckpt_otel.jsonl"
+        source.parent.mkdir(parents=True)
+        source.write_text("not parsed\n")
+        otel_report.write_analysis(
+            source,
+            {
+                "metrics": {
+                    "cpu_rss_bytes": otel_report.metric(values, "B", higher_is_better=False, ranks=[0, 1]),
+                },
+                "native_spans_valid": True,
+            },
+        )
+
+    measured = otel_report.post_process(tmp_path, 4, native=True)["metrics"]["cpu_rss_bytes"]
+
+    assert measured["samples"] == [130, 120]
+    assert measured["per_rank_median"] == {0: 130, 1: 120}
+    assert measured["max"] == 130  # noqa: PLR2004
+
+
 def test_main_prints_json_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = _write_jsonl(tmp_path / "t.jsonl", [_save_span(0, 100.0, 200, 4096)])
 
