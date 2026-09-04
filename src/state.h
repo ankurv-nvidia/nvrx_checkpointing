@@ -101,14 +101,7 @@ template <> struct fmt::formatter<StateNode::Handle> : fmt::formatter<std::strin
 
 struct StateTree
 {
-    struct SnapshotBlob
-    {
-        std::string fqn;
-        std::string data;
-    };
-
-    using NodeId        = std::string;
-    using SnapshotBlobs = std::vector<SnapshotBlob>;
+    using NodeId = std::string;
 
     StateTree(RankTopology topo) : _topo(std::move(topo))
     {
@@ -222,16 +215,7 @@ struct StateTree
     void SetBlob(std::string_view const& fqn, std::string_view const& data)
     {
         auto const handle = FindNodeByFQN(fqn);
-        if (handle == StateNode::Handle::Invalid)
-        {
-            // The coordinator gathers only tensor shards across ranks, so a
-            // snapshot-scoped common-state fqn may not exist in the merged registry
-            // yet (it lives only on rank 0). Materialize it on first set.
-            auto [childName, parent] = FindOrAddNodeByFQN(fqn);
-            auto& child              = AddChild(parent, childName);
-            child.data               = StateNode::Blob(data.begin(), data.end());
-            return;
-        }
+        if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("State '{}' is not registered", fqn)); }
         auto& node = GetNode(handle);
         if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob))
         {
@@ -240,24 +224,76 @@ struct StateTree
         node.data = StateNode::Blob(data.begin(), data.end());
     }
 
-    SnapshotBlobs CaptureSnapshotBlobs() const
+    void SetScalar(std::string_view const& fqn, StateNode::Scalar const& data)
     {
-        SnapshotBlobs result;
-        WalkNodes([&](StateNode const& node) {
-            if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob) || node.handler == nullptr
-                || !node.handler->IsSnapshotScoped())
-            {
-                return;
-            }
-            auto const blob = node.handler->GetBlob();
-            result.push_back({.fqn = GetNodeId(node.handle), .data = std::string(blob.begin(), blob.end())});
-        });
-        return result;
+        auto const handle = FindNodeByFQN(fqn);
+        if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("State '{}' is not registered", fqn)); }
+        auto& node = GetNode(handle);
+        if (node.data.index() != static_cast<size_t>(StateNode::Type::Scalar))
+        {
+            throw std::runtime_error(fmt::format("State '{}' is not a Scalar", fqn));
+        }
+        node.data = data;
     }
 
-    void RegisterStateHandler(StateNode::Handle node, std::unique_ptr<IStateHandler> handler)
+    // Refresh one leaf while preserving the registered structure and Blob capacity.
+    void RefreshNodeDataFromHandler(StateNode& node)
     {
-        auto const& stateName = handler->name;
+        auto* const handler = node.handler.get();
+        if (handler == nullptr) { throw std::logic_error("Cannot refresh a state node without a handler"); }
+        handler->Update();
+        auto const fqn = GetNodeId(node.handle);
+        switch (handler->GetType())
+        {
+        case StateType::Blob:
+        {
+            auto const registeredSize = std::get<StateNode::Blob>(node.data).size();
+            auto       blob           = handler->GetBlob();
+            if (handler->IsSnapshotScoped())
+            {
+                if (blob.size() > registeredSize)
+                {
+                    throw std::runtime_error(
+                        fmt::format("State '{}' serialized to {} bytes, exceeding its registered {}-byte snapshot capacity",
+                                    fqn,
+                                    blob.size(),
+                                    registeredSize));
+                }
+                blob.resize(registeredSize);
+            }
+            else if (blob.size() != registeredSize)
+            {
+                throw std::runtime_error(fmt::format(
+                    "State '{}' changed serialized size after registry synchronization: {} != {} bytes", fqn, blob.size(), registeredSize));
+            }
+            node.data = std::move(blob);
+            break;
+        }
+        case StateType::Scalar: node.data = handler->GetScalarState(); break;
+        case StateType::TensorShard:
+        {
+            auto const previous = std::get<StateNode::TensorShard>(node.data);
+            auto       current  = handler->GetTensorState();
+            if (current.dtype != previous.dtype || current.fulldim != previous.fulldim || current.sharddim != previous.sharddim)
+            {
+                throw std::runtime_error(fmt::format("State '{}' changed tensor metadata after registry synchronization", fqn));
+            }
+            node.data = std::move(current);
+            break;
+        }
+        case StateType::ShardedTensor: [[fallthrough]];
+        case StateType::Dict: [[fallthrough]];
+        case StateType::Invalid: [[fallthrough]];
+        case StateType::Unknown: [[fallthrough]];
+        default: throw std::logic_error("Unknown state type");
+        }
+    }
+
+    void RegisterStateHandler(StateNode::Handle node, std::unique_ptr<IStateHandler> handler, bool allowFQN = false)
+    {
+        auto const&      stateName = handler->name;
+        std::string_view childName = stateName;
+        bool             allowDuplicates{false};
         if (stateName.contains('.'))
         {
 #ifdef NATIVE_CKPT_WARN_FQN
@@ -270,36 +306,33 @@ struct StateTree
                        parentFQN,
                        stateName);
 #endif
-            if (handler->GetType() != StateNode::Type::TensorShard)
+            if (handler->GetType() != StateNode::Type::TensorShard && !allowFQN)
             {
-                throw std::runtime_error(
-                    fmt::format("StateName with dots only allowed for TensorShard type. Invalid stateName: {}", stateName));
+                throw std::runtime_error(fmt::format(
+                    "StateName with dots only allowed for TensorShard or explicitly qualified handlers. Invalid stateName: {}", stateName));
             }
 
-            auto [childName, parentNode] = FindOrAddNodeByFQN(stateName);
-            // Add the final node which contains the handler
-            auto& child   = AddChild(parentNode, childName, true);
-            child.handler = std::move(handler);
-            child.data    = child.handler->GetTensorState();
-            return;
+            auto [fqnChildName, parentNode] = FindOrAddNodeByFQN(stateName);
+            node                            = parentNode;
+            childName                       = fqnChildName;
+            allowDuplicates                 = true;
         }
 
-        auto& child   = AddChild(node, stateName, false);
-        auto* ptr     = handler.get();
+        auto& child   = AddChild(node, childName, allowDuplicates);
         child.handler = std::move(handler);
-        switch (ptr->GetType())
+        switch (child.handler->GetType())
         {
-        case StateType::Blob: child.data = ptr->GetBlob(); break;
-        case StateType::Scalar: child.data = ptr->GetScalarState(); break;
-        case StateType::TensorShard:
+        case StateType::Blob:
         {
-            auto tnsr = ptr->GetTensorState();
-            //            tnsr.deviceGlobalRank = _topo.rank;
-            child.data = tnsr;
+            auto blob = child.handler->GetBlob();
+            if (child.handler->IsSnapshotScoped()) { blob.resize(SnapshotBlobCapacity_(blob.size())); }
+            child.data = std::move(blob);
             break;
         }
-        case StateType::ShardedTensor: [[fallthrough]];    // Not expected to have a handler
-        case StateType::Dict: [[fallthrough]];             // child.data = StateNode::Dict{}; break;
+        case StateType::Scalar: child.data = child.handler->GetScalarState(); break;
+        case StateType::TensorShard: child.data = child.handler->GetTensorState(); break;
+        case StateType::ShardedTensor: [[fallthrough]];
+        case StateType::Dict: [[fallthrough]];
         case StateType::Invalid: [[fallthrough]];
         case StateType::Unknown: [[fallthrough]];
         default: throw std::logic_error("Unknown state type");
@@ -500,6 +533,7 @@ struct StateTree
         clone._nodes.reserve(_nodes.size());
         clone._nodes.clear();
         for (auto const& node : _nodes) { clone._nodes.emplace_back(node.handle, node.parent, node.name, StateNode::Variant{node.data}); }
+        clone.startedAt = startedAt;
     }
 
     auto Clone() const
@@ -555,6 +589,17 @@ struct StateTree
     }
 
     private:
+    static size_t SnapshotBlobCapacity_(size_t serializedSize)
+    {
+        static constexpr size_t Padding   = 512;
+        static constexpr size_t Alignment = 1024;
+        if (serializedSize > std::numeric_limits<size_t>::max() - Padding - (Alignment - 1))
+        {
+            throw std::overflow_error("Snapshot Blob capacity overflow");
+        }
+        return ((serializedSize + Padding + Alignment - 1) / Alignment) * Alignment;
+    }
+
     void DebugPrintRecr_(size_t depth, StateNode::Handle nodeHandle, std::unordered_set<StateNode::Handle>& visited) const
     {
         if (visited.contains(nodeHandle))

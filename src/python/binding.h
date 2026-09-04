@@ -57,7 +57,3 @@ void RegisterStateDictRecr(StateTree&                     root,
                            nanobind::dict const&          container,
                            bool                           recursive,
                            std::unordered_set<PyObject*>& visited);
-
-// Refresh the registered ShardedTensor nodes in place on the cached root from a flat list of fresh
-// ShardedTensors, matched by (key, sharddim, fulldim). Defined in torch_bindings.cpp.
-void RefreshShardedTensors(StateTree& self, nanobind::list const& freshList);

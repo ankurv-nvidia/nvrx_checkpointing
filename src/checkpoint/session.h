@@ -60,8 +60,6 @@ struct Session
 
         std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
-        StateTree::SnapshotBlobs snapshotBlobs;
-
         checkpoint::distcp::BlobMetadataByFqn blobMetadata;
         std::shared_ptr<StateTree>            globalRegistry;
         std::shared_ptr<StateTree>            dedupedGlobalRegistry;
@@ -148,8 +146,6 @@ struct Session
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
     void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
-    void PrepareBlobState_(Snapshot& snapshot, LocalState& localState, checkpoint::ipc::Rank rank) const;
-
     void SendToPeerWithRetries_(std::string_view const& peer,
                                 std::string_view const& body,
                                 std::string_view const& target,

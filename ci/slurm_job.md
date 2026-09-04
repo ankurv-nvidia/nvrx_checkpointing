@@ -114,7 +114,7 @@ marker that ends every peer task. Task 0 keeps its healthy launcher agents
 alive when another node in its domain is evicted, allowing the hot-spare domain
 to finish the world without losing the rendezvous store. The launcher records
 the world's rank-to-node map in a cycle-info file (`--ft-cycle-info-dir` under
-the run directory); `nvrx_checkpointing.tools` reads it via
+the run directory); `nvrx_checkpointing.megatron.save` reads it via
 `NVRX_CURRENT_CYCLE_INFO` to build the rank-ordered checkpoint peer list.
 Each elastic cycle uses its own synchronization markers. If `ft_launcher`
 restarts the worker, phase 1 is reused only after its checkpoint is durable,
@@ -410,16 +410,23 @@ extra Megatron arguments. Setting only a run's `--megatron-commit` holds the
 extension fixed, and the reverse holds Megatron-LM fixed. Separate jobs can
 still be compared later with `--diff-digests`.
 
-Every run trains its own phase 1 from scratch and resumes its own phase 2
-from it, so `phase1-checkpoints` and `checkpoints` are both compared and a divergence introduced anywhere in training surfaces at the
-first checkpoint that follows it.
+Every deterministic run trains its own phase 1 through iteration 50, saves at
+iterations 25 and 50, and resumes phase 2 from the iteration-50 checkpoint.
+Both `phase1-checkpoints` and `checkpoints` are compared, so the second
+phase-1 save exercises cached state and any resulting divergence surfaces
+after that exact checkpoint is loaded.
+
+Deterministic runs disable checkpoint telemetry because OpenTelemetry's Python
+span-ID generator advances the application `random` state. Provider-specific
+span sets would otherwise make the checkpoints differ before their contents
+reach either writer. Performance runs retain full telemetry.
 
 The `perf` flavor selects the expert-data-parallel group for fully parallel
 save and load, loads per-rank objects directly, omits redundant extra state,
 and skips sharding-integrity validation. For the NVRx provider, phase 1 creates
 the process-group tensor distribution cache under the run directory and phase
-2 reuses it. The native provider warns and ignores the cache path because its
-checkpoint implementation does not use Megatron's process-group cache.
+2 reuses it. The native provider ignores the cache path because its checkpoint
+implementation does not use Megatron's process-group cache.
 
 Every phase resolves its sources from inside the training process, once all
 imports have bound, and records them:

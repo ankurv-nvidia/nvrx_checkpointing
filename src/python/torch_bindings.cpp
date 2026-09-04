@@ -69,6 +69,8 @@ struct CachedTypes
 
 }    // namespace
 
+static bool IsMainReplica(nb::handle replicaId);
+
 static int64_t DtypeNameToId(std::string_view name)
 {
     for (auto const& e : KDtypeIds)
@@ -195,7 +197,7 @@ static CachedTypes const& CachedTypesGet()
     static CachedTypes Types = []() {
         nb::gil_scoped_acquire acquire;
         auto                   torchModule                  = nb::module_::import_("torch");
-        auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.mapping");
+        auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
         auto                   megatronShardedTensor        = nb::object(nb::none());
         auto                   megatronShardedTensorFactory = nb::object(nb::none());
         auto                   megatronShardedObject        = nb::object(nb::none());
@@ -344,6 +346,7 @@ struct StateTreeTorchGeneratorHandler : StateTree::StateHandler<StateTree::State
 
     StateNode::Blob GetBlob() override
     {
+        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
         nb::gil_scoped_acquire acquire;
         auto                   state = container[key].attr("get_state")();
         // get_state() returns a uint8 CPU tensor on modern torch.
@@ -378,30 +381,72 @@ struct StateTreeTorchGeneratorHandler : StateTree::StateHandler<StateTree::State
 struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateType::TensorShard>
 {
     public:
-    static std::unique_ptr<StateTreeShardedTensorHandler> Create(nb::dict const& containerIn, nb::str nameIn)
+    static std::unique_ptr<StateTreeShardedTensorHandler> Create(nb::handle containerIn, nb::handle keyIn, nb::str nameIn)
     {
-        auto meta = Convert_(nameIn, containerIn);
-        return std::unique_ptr<StateTreeShardedTensorHandler>(new StateTreeShardedTensorHandler(containerIn, nameIn, meta));
+        nb::gil_scoped_acquire acquire;
+        auto                   container = nb::borrow<nb::object>(containerIn);
+        auto                   key       = nb::borrow<nb::object>(keyIn);
+        auto                   meta      = Convert_(nameIn, CurrentMetadata_(container, key, false, 0));
+        return std::unique_ptr<StateTreeShardedTensorHandler>(
+            new StateTreeShardedTensorHandler(std::move(container), std::move(key), false, 0, nameIn, meta));
     }
 
-    // Re-read the (possibly re-pointed) container so node.data tracks the current tensor. The bf16
-    // optimizer moments are transient get_unscaled_state().float() copies the optimizer never
-    // rewrites; without this the once-registered handle re-saves stale iter-of-registration bytes.
-    void Update() override { meta = Convert_(key, container); }
+    static std::unique_ptr<StateTreeShardedTensorHandler>
+    CreateFactoryElement(nb::dict containerIn, nb::str keyIn, size_t factoryIndexIn, nb::str nameIn, nb::dict const& initialMetadata)
+    {
+        nb::gil_scoped_acquire acquire;
+        auto                   meta = Convert_(nameIn, initialMetadata);
+        return std::unique_ptr<StateTreeShardedTensorHandler>(
+            new StateTreeShardedTensorHandler(std::move(containerIn), std::move(keyIn), true, factoryIndexIn, nameIn, meta));
+    }
+
+    // Resolve the current object through the cached parent container. Transient optimizer
+    // tensors are replaced between saves, so retaining their original __dict__ would preserve
+    // a stale data pointer.
+    void Update() override
+    {
+        nb::gil_scoped_acquire acquire;
+        nb::str                currentName(name.c_str(), name.size());
+        auto                   current = Convert_(currentName, CurrentMetadata_(container, key, factoryElement, factoryIndex));
+        if (StrView(currentName) != name)
+        {
+            throw std::runtime_error(fmt::format("ShardedTensor key changed from {} to {}", name, currentName));
+        }
+        meta = std::move(current);
+    }
 
     private:
-    StateTreeShardedTensorHandler(nb::dict containerIn, nb::str const& nameIn, DS4Tensor const& metaIn) :
+    StateTreeShardedTensorHandler(nb::object       containerIn,
+                                  nb::object       keyIn,
+                                  bool             factoryElementIn,
+                                  size_t           factoryIndexIn,
+                                  nb::str const&   nameIn,
+                                  DS4Tensor const& metaIn) :
         StateTree::StateHandler<StateTree::StateType::TensorShard>(StrView(nameIn)),
         meta(metaIn),
         container(std::move(containerIn)),
-        key(nameIn)
+        key(std::move(keyIn)),
+        factoryElement(factoryElementIn),
+        factoryIndex(factoryIndexIn)
     {}
+
+    static nb::dict CurrentMetadata_(nb::object const& container, nb::object const& key, bool factoryElement, size_t factoryIndex)
+    {
+        auto* value = PyObject_GetItem(container.ptr(), key.ptr());
+        if (value == nullptr) { throw nb::python_error(); }
+        auto object = nb::steal<nb::object>(value);
+        if (factoryElement)
+        {
+            auto built = nb::cast<nb::list>(object.attr("build")());
+            if (factoryIndex >= built.size()) { throw std::runtime_error("ShardedTensorFactory changed its output length"); }
+            object = nb::borrow<nb::object>(built[factoryIndex]);
+        }
+        return nb::cast<nb::dict>(object.attr("__dict__"));
+    }
 
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     static DS4Tensor Convert_(nb::str& name, nb::dict const& container)
     {
-        nb::gil_scoped_acquire acquire;
-
         using Range = DS4Tensor::Range;
         DS4Tensor ds4tensor{};
 
@@ -569,84 +614,66 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         throw std::runtime_error("SetTensorState not implemented for ShardedTensor");
     }
 
-    // Re-point at a freshly-extracted ShardedTensor's __dict__ before Update() re-reads it.
-    // Caller (RefreshShardedTensors) holds the GIL; not safe from a non-Python thread.
-    void SetContainer(nb::dict newContainer) { container = std::move(newContainer); }
+    DS4Tensor  meta;
+    nb::object container;
+    nb::object key;
+    bool       factoryElement;
+    size_t     factoryIndex;
+};
 
-    DS4Tensor meta;
-    nb::dict  container;
-    nb::str   key;
+struct StateTreeShardedObjectHandler : StateTree::StateHandler<StateTree::StateType::Blob>
+{
+    StateTreeShardedObjectHandler(nb::dict containerIn, nb::str keyIn, std::string uniqueKeyIn) :
+        StateTree::StateHandler<StateTree::StateType::Blob>(uniqueKeyIn),
+        container(std::move(containerIn)),
+        key(std::move(keyIn)),
+        uniqueKey(std::move(uniqueKeyIn))
+    {}
+
+    void Update() override
+    {
+        nb::gil_scoped_acquire acquire;
+        auto const             currentKey = nb::cast<std::string>(container[key].attr("unique_key"));
+        if (currentKey != uniqueKey)
+        {
+            throw std::runtime_error(fmt::format("ShardedObject key changed from {} to {}", uniqueKey, currentKey));
+        }
+    }
+    [[nodiscard]] bool IsSnapshotScoped() const override { return true; }
+
+    StateNode::Blob GetBlob() override
+    {
+        // TODO_BG_SERIALIZE: Measure this GIL-held torch.save and move it behind immutable capture.
+        nb::gil_scoped_acquire acquire;
+        nb::object             io    = nb::module_::import_("io");
+        nb::object             torch = nb::module_::import_("torch");
+        nb::object             buf   = io.attr("BytesIO")();
+        nb::list               one;
+        one.append(container[key].attr("data"));
+        torch.attr("save")(one, buf);
+        auto const raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
+        return {raw.c_str(), raw.c_str() + raw.size()};
+    }
+
+    void SetBlob(std::string_view const& /* value */) override { throw std::runtime_error("SetBlob not implemented for ShardedObject"); }
+
+    nb::dict    container;
+    nb::str     key;
+    std::string uniqueKey;
 };
 }    // namespace
 
-// Identity of a registered shard within the tree: the ShardedTensor key plus its shard offset range
-// and full shape. dp_reshardable buckets register many param/padding ShardedTensors under ONE key,
-// distinguished only by flattened_range (-> sharddim), so the key alone is not unique.
-static std::string ShardCompositeKey(std::string_view keyStr, DS4Tensor const& meta)
+static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle node, nb::str const& name, nb::dict const& container)
 {
-    std::string out(keyStr);
-    out += '#';
-    for (auto const& r : meta.sharddim) { out += fmt::format("{}-{},", r.begin, r.end); }
-    out += '#';
-    for (auto const& d : meta.fulldim) { out += fmt::format("{},", d); }
-    return out;
-}
-
-// Re-materialize the registered ShardedTensor nodes in place on the cached root from a fresh flat
-// list of ShardedTensors (no collective re-registration). Used by warm saves to un-stale the bf16
-// optimizer moment buffers. Matching is by (key, sharddim, fulldim) — NOT key alone, because
-// dp_reshardable buckets register many param/padding ShardedTensors under one key. Asserts a 1:1
-// correspondence (every node matched, every fresh used) so a stale shard can never be re-saved.
-void RefreshShardedTensors(StateTree& self, nb::list const& freshList)
-{
-    nb::gil_scoped_acquire                      acquire;
-    std::unordered_map<std::string, nb::object> byComposite;
-    for (auto const& item : freshList)
-    {
-        auto fresh     = nb::borrow<nb::object>(item);
-        auto dict      = nb::cast<nb::dict>(fresh.attr("__dict__"));
-        auto key       = nb::cast<nb::str>(dict["key"]);
-        auto tmp       = StateTreeShardedTensorHandler::Create(dict, key);    // computes meta via Convert_
-        auto composite = ShardCompositeKey(StrView(tmp->key), tmp->meta);
-        if (!byComposite.emplace(composite, fresh).second)
-        {
-            throw std::runtime_error(fmt::format("RefreshShardedTensors: duplicate fresh shard composite {}", composite));
-        }
-    }
-
-    size_t matched = 0;
-    self.WalkNodes([&](StateNode& node) {
-        if (!node.handler) { return; }
-        auto* handler = dynamic_cast<StateTreeShardedTensorHandler*>(node.handler.get());
-        if (handler == nullptr) { return; }    // skip plain torch tensors (live aliases) and non-tensors
-        auto composite = ShardCompositeKey(StrView(handler->key), handler->meta);
-        auto it        = byComposite.find(composite);
-        if (it == byComposite.end())
-        {
-            throw std::runtime_error(fmt::format("RefreshShardedTensors: registered shard {} has no fresh match", composite));
-        }
-        handler->SetContainer(nb::cast<nb::dict>(it->second.attr("__dict__")));
-        node.handler->Update();    // public virtual on the IHandler base; re-Converts the new container
-        if (static_cast<StateNode::Type>(node.data.index()) == StateNode::Type::TensorShard) { node.data = node.handler->GetTensorState(); }
-        ++matched;
-    });
-    if (matched != byComposite.size())
-    {
-        throw std::runtime_error(
-            fmt::format("RefreshShardedTensors: {} fresh shards but matched {} registered nodes", byComposite.size(), matched));
-    }
-}
-
-static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle node, nb::str const& name, nb::object const& container)
-{
-    auto factoryKey     = nb::cast<nb::str>(container.attr("key"));
+    auto factory        = nb::borrow<nb::object>(container[name]);
+    auto factoryKey     = nb::cast<nb::str>(factory.attr("key"));
     auto factoryKeyView = StrView(factoryKey);
     auto nameView       = StrView(name);
     if (factoryKeyView != nameView)
     {
         throw std::runtime_error(fmt::format("ShardedTensorFactory key mismatch: expected {}, got {}", nameView, factoryKeyView));
     }
-    auto buildFunc      = container.attr("build");
+    auto buildFunc      = factory.attr("build");
     auto shardedTensors = buildFunc();
     if (!nb::isinstance<nb::list>(shardedTensors))
     {
@@ -654,8 +681,9 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
     }
 
     auto shardedTensorsList = nb::cast<nb::list>(shardedTensors);
-    for (auto const& item : shardedTensorsList)
+    for (size_t index = 0; index < shardedTensorsList.size(); ++index)
     {
+        auto const item = shardedTensorsList[index];
         if (!IsMegatronShardedTensor(item))
         {
             throw std::runtime_error(fmt::format("Expected ShardedTensorFactory::build to return a list of ShardedTensors for "
@@ -684,13 +712,12 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
                                                  shtKeyView,
                                                  fqn));
         }
-        self.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(innerContainer, shtKey));
+        self.RegisterStateHandler(node,
+                                  StateTreeShardedTensorHandler::CreateFactoryElement(container, name, index, shtKey, innerContainer));
     }
 }
 
-// Blob/sharded-object behavior is intentionally unchanged for now: opaque
-// values have no global tensor coordinates from which the server can infer
-// replica identity.
+// Only main replicas own checkpoint payloads.
 static bool IsMainReplica(nb::handle replicaId)
 {
     if (replicaId.is_none()) { return true; }
@@ -708,35 +735,13 @@ static bool IsMainReplica(nb::handle replicaId)
     throw std::runtime_error("RegisterShardedObject: unrecognized replica_id type (expected None, int, or tuple/list of int)");
 }
 
-static void RegisterShardedObject(StateTree& root, nb::handle val)
+static void RegisterShardedObject(StateTree& root, nb::dict const& container, nb::str const& key, nb::handle val)
 {
-    // Persist a Megatron ShardedObject (e.g. TransformerEngine `_extra_state`, the
-    // distributed-optimizer object state, rng/rerun state) as a torch-DCP bytes
-    // entry so the standard torch_dist load path can read it back. Serialize it
-    // exactly as the nvrx/dcp writer does — `torch.save([data])`, a one-element
-    // list — so the bytes are identical to the nvrx checkpoint (the cross-provider
-    // md5 baseline) and the loader reconstructs `[data]`. The bytes are held inline
-    // as a Blob node keyed by the object's unique_key (its DCP fqn); rank 0 later
-    // writes them into its `.distcp` shard and emits the BytesStorageMetadata entry.
-    // Persist only the main replica. Every rank that holds a copy carries the same
-    // unique_key but a non-identical serialization, so registering the non-main
-    // replicas too made the cross-node / within-node fqn-dedup keep whichever copy
-    // arrived first — non-deterministic, diverging the 8-node distributed-optimizer
-    // object state run-to-run. DCP/nvrx write only the main replica; match that.
+    // Main-replica objects are serialized fresh for each save as DCP byte entries.
     if (!IsMainReplica(val.attr("replica_id"))) { return; }
-    auto const key   = nb::cast<std::string>(val.attr("unique_key"));
-    nb::object io    = nb::module_::import_("io");
-    nb::object torch = nb::module_::import_("torch");
-    nb::object buf   = io.attr("BytesIO")();
-    nb::list   one;
-    one.append(val.attr("data"));
-    torch.attr("save")(one, buf);
-    auto const  raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
-    char const* p   = raw.c_str();
-
-    auto [childName, parentNode] = root.FindOrAddNodeByFQN(key);
-    auto& child                  = root.AddChild(parentNode, childName);
-    child.data                   = StateNode::Blob(p, p + raw.size());
+    auto uniqueKey = nb::cast<std::string>(val.attr("unique_key"));
+    root.RegisterStateHandler(
+        StateNode::Handle::Root, std::make_unique<StateTreeShardedObjectHandler>(container, key, std::move(uniqueKey)), true);
 }
 
 // After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
@@ -762,11 +767,12 @@ bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nb::
     // and skip the parent-node prefix; otherwise compose the FQN from the
     // parent node id (mirrors `RegisterShardedTorchTensorFactory`).
     auto const fqn = nameView.contains('.') ? std::string(nameView) : fmt::format("{}.{}", root.GetNodeId(node), nameView);
-    for (auto const& item : listObj)
+    for (size_t index = 0; index < listObj.size(); ++index)
     {
-        auto itemContainer = nb::cast<nb::dict>(item.attr("__dict__"));
-        auto shtKey        = nb::cast<nb::str>(itemContainer["key"]);
-        auto shtKeyView    = StrView(shtKey);
+        auto const item          = listObj[index];
+        auto       itemContainer = nb::cast<nb::dict>(item.attr("__dict__"));
+        auto       shtKey        = nb::cast<nb::str>(itemContainer["key"]);
+        auto       shtKeyView    = StrView(shtKey);
         // Each ShardedTensor's `.key` is the canonical FQN. It must equal
         // the surrounding state-dict FQN (rare: a single-element list) or be
         // a dotted child of it. Anything else is a structural surprise we'd
@@ -781,7 +787,7 @@ bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nb::
 
             // throw std::runtime_error("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
-        root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(itemContainer, shtKey));
+        root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(listObj, nb::int_(index), shtKey));
     }
     return true;
 }
@@ -806,20 +812,19 @@ bool TryRegisterTorchStateDict(StateTree&                     root,
     }
     if (IsMegatronShardedTensor(val))
     {
-        auto innerContainer = nb::cast<nb::dict>(val.attr("__dict__"));
-        root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(innerContainer, key));
+        root.RegisterStateHandler(node, StateTreeShardedTensorHandler::Create(container, key, key));
         return true;
     }
     if (IsMegatronShardedTensorFactory(val))
     {
-        RegisterShardedTorchTensorFactory(root, node, key, nb::borrow<nb::object>(val));
+        RegisterShardedTorchTensorFactory(root, node, key, container);
         return true;
     }
     if (IsMegatronShardedObject(val))
     {
         // The object's unique_key is a full FQN, so it reparents to the state-dict
-        // root (like dotted ShardedTensor names) — `node`/`key` are not used.
-        RegisterShardedObject(root, val);
+        // root while its handler continues resolving through container[key].
+        RegisterShardedObject(root, container, key, val);
         return true;
     }
     if (IsTorchGenerator(val))

@@ -398,12 +398,10 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             __init__.py
             ckpt_diag.py
             debug.py
-            mapping.py
-            megatron_integration.py
+            megatron@megatron
+            megatron_stubs@megatron_stubs
             metadata_compare.py
-            native_async.py
             peers.py
-            tools.py
     )
 
     add_pywhl_package(nvrx_checkpointing

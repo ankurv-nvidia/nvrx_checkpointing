@@ -183,10 +183,10 @@ OPTIONS=(
 	--tensorboard-dir "${TENSORBOARD_DIR}"
 )
 
-MEGATRON_LAUNCHER=${MEGATRON_LAUNCHER:-"torchrun --nproc_per_node=${WORLD_SIZE} --module nvrx_checkpointing.megatron_integration"}
+MEGATRON_LAUNCHER=${MEGATRON_LAUNCHER:-"torchrun --nproc_per_node=${WORLD_SIZE} --module nvrx_checkpointing.megatron.integration"}
 
 if [[ $WORLD_SIZE -gt 1 ]]; then
 	PYTHONPATH=${MEGATRON_ROOT}:${REPO_ROOT}/.. ${MEGATRON_LAUNCHER} ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]} 2>&1 | tee ${MY_RUN_DIR}/log.txt
 else
-	PYTHONPATH=${MEGATRON_ROOT}:${REPO_ROOT}/.. MASTER_ADDR=localhost MASTER_PORT=48000 python3 -m nvrx_checkpointing.megatron_integration ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]}  2>&1 | tee ${MY_RUN_DIR}/log.txt
+	PYTHONPATH=${MEGATRON_ROOT}:${REPO_ROOT}/.. MASTER_ADDR=localhost MASTER_PORT=48000 python3 -m nvrx_checkpointing.megatron.integration ${MEGATRON_ROOT}/pretrain_mamba.py ${OPTIONS[@]}  2>&1 | tee ${MY_RUN_DIR}/log.txt
 fi

@@ -40,14 +40,14 @@ python3 -u "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
 to:
 
 ```bash
-python3 -u -m nvrx_checkpointing.megatron_integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
+python3 -u -m nvrx_checkpointing.megatron.integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
 ```
 
 The same substitution works inside `srun`, `numactl`, or an existing Python
 wrapper chain. With `torchrun`, use its module form:
 
 ```bash
-torchrun <torchrun-options> --module nvrx_checkpointing.megatron_integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
+torchrun <torchrun-options> --module nvrx_checkpointing.megatron.integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
 ```
 
 Each rank must invoke the integration module; calling `install()` in a
@@ -58,26 +58,21 @@ separate setup process will not work because the patches are process-local.
 Wrap the existing Megatron entrypoint in the `run_cmd` assignment:
 
 ```bash
-run_cmd="python -u -m nvrx_checkpointing.megatron_integration ${REPO_DIR}/pretrain_hybrid.py ${options}"
+run_cmd="python -u -m nvrx_checkpointing.megatron.integration ${REPO_DIR}/pretrain_hybrid.py ${options}"
 ```
 
 Keep the existing `--ckpt-format torch_dist`, `--save`, `--load`, and
-`--save-interval` arguments. The launcher adds `--ckpt-provider`; it defaults
-to `native`, which selects this repository's checkpoint writer. The native
-provider stages each checkpoint synchronously and lets the checkpoint daemon
-persist it. Saves are chained back-to-back: a later checkpoint waits for the
-previous one to become durable before taking its next snapshot. With
-`--async-save`, the durability wait and tracker-file update run off the
-training thread through Megatron's async queue. If the previous save is still
-running when the next one starts, the native provider emits a flushed warning
-and appends the time spent waiting in milliseconds on the same log line.
+`--save-interval` arguments. This launcher is native-only and does not patch
+Megatron's argument parser or optimizer classes. It stages each checkpoint and
+lets the checkpoint daemon persist it. Saves are chained back-to-back: a later
+checkpoint waits for the previous one to become durable before taking its next
+snapshot. With `--async-save`, the durability wait and tracker-file update run
+off the training thread through the package's rank-local queue. If the previous
+save is still running when the next one starts, the native provider emits a
+flushed warning and appends the time spent waiting in milliseconds on the same
+log line.
 
-For an explicit provider selection, add:
-
-```bash
---ckpt-provider native
-```
-
-Use `--ckpt-provider nvrx` only when intentionally running Megatron's reference
-NVRx path. Loading checkpoints created with the historical patched Megatron
-commit requires no extra flags.
+Comparison harnesses that need a `native`/`nvrx` selector can opt in to
+`nvrx_checkpointing.megatron.provider`; reference runs should not install the
+native integration. Loading checkpoints created with the historical private
+fork and its stringified optimizer dtype keys requires no extra flags.

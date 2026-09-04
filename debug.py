@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import IO
 
+import numpy as np
 import torch
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
@@ -29,7 +30,7 @@ from torch.distributed.checkpoint import (
 from torch.distributed.checkpoint.filesystem import _StorageInfo
 from torch.distributed.checkpoint.metadata import MetadataIndex
 
-from . import mapping
+from .megatron import mapping
 
 
 def transform_complex_obj(obj: object, visited: set[object] | None = None) -> str | dict[str, object] | list[object]:  # noqa: C901, PLR0911, PLR0912
@@ -139,20 +140,23 @@ def dump_state_dir(checkpoint_dir: str, sharded_state_dict: mapping.ShardedState
 
 # import torch
 try:
-    import megatron  # pyright: ignore[reportMissingImports]
     import megatron.core  # pyright: ignore[reportMissingImports]
-except ImportError:
-    from scripts.import_stubs import megatron
-    from scripts.import_stubs.megatron import core as mcore
 
-    # megatron_root_path = Path(__file__).parent.parent.parent.parent
-    # if str(megatron_root_path) not in sys.path:
-    #    sys.path.append(str(megatron_root_path))
+    import megatron  # pyright: ignore[reportMissingImports]
+except ImportError:
+    from .megatron_stubs import megatron
+    from .megatron_stubs.megatron import core as mcore
+
     sys.modules["megatron"] = megatron
     sys.modules["megatron.core"] = mcore
 
 
-def flatten_to_entries(prefix: str, obj: object, entries: dict, visited: set[int] | None = None) -> None:  # noqa: C901, PLR0912
+def flatten_to_entries(  # noqa: C901, PLR0911, PLR0912
+    prefix: str,
+    obj: object,
+    entries: dict,
+    visited: set[int] | None = None,
+) -> None:
     """Recursively flatten an object into dot-separated key=value pairs.
 
     Dicts and objects with __dict__ are descended into; lists/tuples are
@@ -164,6 +168,29 @@ def flatten_to_entries(prefix: str, obj: object, entries: dict, visited: set[int
         visited = set()
     if isinstance(obj, (int, float, str, bool)) or obj is None:
         entries[prefix] = str(obj)
+        return
+    if isinstance(obj, np.generic):
+        entries[prefix] = str(obj.item())
+        return
+    if isinstance(obj, bytes):
+        entries[f"{prefix}.bytes.length"] = str(len(obj))
+        entries[f"{prefix}.bytes.md5sum"] = hashlib.md5(obj).hexdigest()  # noqa: S324
+        return
+    if isinstance(obj, torch.Tensor):
+        tensor = obj.detach().cpu().contiguous()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        entries[f"{prefix}.tensor.shape"] = str(list(tensor.shape))
+        entries[f"{prefix}.tensor.dtype"] = str(tensor.dtype)
+        entries[f"{prefix}.tensor.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+        return
+    if isinstance(obj, torch.Generator):
+        flatten_to_entries(f"{prefix}.generator_state", obj.get_state(), entries, visited)
+        return
+    if isinstance(obj, np.ndarray):
+        array = np.ascontiguousarray(obj)
+        entries[f"{prefix}.ndarray.shape"] = str(list(array.shape))
+        entries[f"{prefix}.ndarray.dtype"] = str(array.dtype)
+        entries[f"{prefix}.ndarray.md5sum"] = hashlib.md5(array.tobytes()).hexdigest()  # noqa: S324
         return
     obj_id = id(obj)
     if obj_id in visited:
@@ -260,6 +287,17 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
     if not isinstance(common_state, dict):
         raise TypeError(f"Expected common state dict, got {type(common_state).__name__}")
     return common_state
+
+
+def _load_bytes_storage_value(raw: bytes) -> object:
+    """Decode both native's direct archive and DCP's BytesIO-wrapped archive."""
+    value = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
+    if isinstance(value, io.BytesIO):
+        value.seek(0)
+        value = torch.load(value, map_location="cpu", weights_only=False)
+    if isinstance(value, list) and len(value) == 1:
+        return value[0]
+    return value
 
 
 def distcp_trace(  # noqa: C901, PLR0912, PLR0915
@@ -389,10 +427,8 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     # chunks are read in ascending-offset order. The original tensor-dict-order
     # traversal seeks back and forth across the file; on lustre that random pattern
     # defeats client readahead and dominates the runtime. "tensor" reads are ZIP64
-    # archives (the raw tensor lives in archive/data/0); "bytes" reads are raw
-    # torch.save bytes for TransformerEngine `_extra_state` ShardedObjects — the only
-    # bytes objects compared, since they are byte-identical across providers, unlike
-    # the optimizer/rng state which the two backends serialize differently.
+    # archives (the raw tensor lives in archive/data/0); "bytes" reads are
+    # torch.save archives decoded into provider-independent logical entries.
     reads_by_file: dict[str, list[tuple]] = {}
     for fqn, meta in tensormeta.items():
         for i, chunk in enumerate(meta.chunks):
@@ -400,7 +436,8 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             data_size = chunk.sizes.numel() * torch.tensor([], dtype=meta.properties.dtype).element_size()
             reads_by_file.setdefault(si.relative_path, []).append(("tensor", si.offset, si.length, fqn, i, data_size))
     for fqn in bytemeta:
-        if "_extra_state" not in fqn:
+        # Embedded common state is compared through common_pt_dump.info.
+        if fqn == _DCP_COMMON_STATE_KEY:
             continue
         si = chunk_storage.get((fqn, ()))
         if si is None:
@@ -419,10 +456,13 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     stats = {"bytes": 0, "chunks": 0, "read_s": 0.0, "md5_s": 0.0}
     stats_lock = threading.Lock()
 
-    def _trace_file(item: tuple[str, list[tuple]]) -> dict[str, str]:
+    raw_blob_entries: dict[str, str] = {}
+
+    def _trace_file(item: tuple[str, list[tuple]]) -> tuple[dict[str, str], dict[str, str]]:
         relative_path, reads = item
         reads.sort(key=lambda r: r[1])  # ascending offset → sequential, readahead-friendly
         local: dict[str, str] = {}
+        raw_blobs: dict[str, str] = {}
         b = c = 0
         read_s = md5_s = 0.0
         with (checkpoint_dir / relative_path).open("rb", buffering=_DCP_READ_BUFFER_BYTES) as dcp_fd:
@@ -439,7 +479,9 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
                     )
                 if kind == "bytes":
                     t1 = time.monotonic()
-                    local[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+                    raw_blobs[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
+                    value = _load_bytes_storage_value(raw)
+                    flatten_to_entries(f"{fqn}.object", value, local)
                     md5_s += time.monotonic() - t1
                     continue
                 # Each chunk is a complete torch.save() ZIP64 archive; the raw tensor
@@ -464,17 +506,20 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             stats["chunks"] += c
             stats["read_s"] += read_s
             stats["md5_s"] += md5_s
-        return local
+        return local, raw_blobs
 
     n_workers = max(1, min(len(reads_by_file), (os.cpu_count() or 8)))
     wall0 = time.monotonic()
     if n_workers > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            for d in ex.map(_trace_file, list(reads_by_file.items())):
-                info_entries.update(d)
+            for entries, raw_blobs in ex.map(_trace_file, list(reads_by_file.items())):
+                info_entries.update(entries)
+                raw_blob_entries.update(raw_blobs)
     else:
         for item in reads_by_file.items():
-            info_entries.update(_trace_file(item))
+            entries, raw_blobs = _trace_file(item)
+            info_entries.update(entries)
+            raw_blob_entries.update(raw_blobs)
     wall = time.monotonic() - wall0
     sys.stderr.write(
         f"[native_ckpt:trace_prof] files={len(reads_by_file)} chunks={stats['chunks']} bytes={stats['bytes']} "
@@ -496,9 +541,13 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
         while not native_info_file.exists():
             time.sleep(1)
         nflines = native_info_file.read_text().splitlines()
+        # Server validation includes raw Blob checksums; persisted manifests contain decoded Blob semantics.
+        server_rflines = [line for line in rflines if ".object" not in line.partition("=")[0]]
+        server_rflines.extend(f"{k}={raw_blob_entries[k]}" for k in sorted(raw_blob_entries))
+        server_rflines.sort()
         diff = list(
             difflib.unified_diff(
-                rflines,
+                server_rflines,
                 nflines,
                 fromfile=str(ref_info_file),
                 tofile=str(native_info_file),
@@ -590,7 +639,7 @@ def compare_reference_metadata(checkpoint_dir: Path | str, baseline_dir: Path | 
     multinode native runs, where replicated chunks are written once per node.
 
     Returns the number of differing entries — 0 means equal. Callers decide
-    whether to warn or hard-fail; see ``metadata_compare.py``.
+    whether to warn or hard-fail; see :mod:`nvrx_checkpointing.metadata_compare`.
 
     Raises:
         FileNotFoundError: when either dir is missing reference.metadata.info.

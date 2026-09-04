@@ -481,6 +481,7 @@ wheel:aarch64:
     - export PYTHONPATH="${CI_PROJECT_DIR}/dev_binaries"
     - /opt/venv/bin/python -m pip show nvrx_checkpointing
     - /opt/venv/bin/python -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
+    - /opt/venv/bin/python -c "import nvrx_checkpointing.debug"
     - /opt/venv/bin/python -m nvrx_checkpointing.metadata_compare --help >/dev/null
     - /opt/venv/bin/python -m pytest tests -v --junitxml=ci/ci-results/pytest.xml
     - chmod +x dev_binaries/ckpttest

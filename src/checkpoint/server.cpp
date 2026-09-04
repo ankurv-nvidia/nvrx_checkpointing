@@ -638,6 +638,12 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
                     addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim), ComputeMd5Hex(data.data(), data.size()));
                 }
             }
+            else if (type == StateNode::Type::Blob)
+            {
+                auto const  localFqn = localState->localRegistry->GetNodeId(node.handle);
+                auto const& blob     = std::get<StateNode::Blob>(node.data);
+                addmd5(std::move(localFqn), ComputeMd5Hex(blob.data(), blob.size()));
+            }
         });
     }
     INFO("[{}#{}] DebugWriteNativeMetadataInfo_ for snapshot={}. Writing global metadata", *server, sessionId, snapshot.name);
@@ -645,16 +651,15 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::Blob)
         {
-            // ShardedObject bytes. Emit the same {fqn}.bytes.md5sum that distcp_trace
-            // derives from the on-disk shard so the server-claim cross-check stays
-            // balanced. Restricted to _extra_state, matching distcp_trace: the
-            // distributed-optimizer dict and rng_state objects are not byte-identical
-            // across checkpoint backends, so they are excluded from the compare.
             auto const nodeId = globalState.GetNodeId(node.handle);
-            if (nodeId.contains("_extra_state"))
+            auto const md5It  = md5Map.find(nodeId);
+            if (md5It == md5Map.end())
             {
-                auto const& blobBytes = std::get<StateNode::Blob>(node.data);
-                emit(nodeId + ".bytes.md5sum", ComputeMd5Hex(blobBytes.data(), blobBytes.size()));
+                ERR("[{}#{}] Global Blob={} has no matching entry in any local registry", *server, sessionId, nodeId);
+            }
+            else
+            {
+                emit(nodeId + ".bytes.md5sum", md5It->second);
             }
             return;
         }
@@ -761,26 +766,23 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     {
         {
             std::scoped_lock lock(mutex);
-            bool const       snapshotBlobsReady = !onCoordinatorPeer || snapshotPtr->localStates.contains(Rank{0});
-            if (recievedFrom.size() >= localNodeWorldSize && recievedFrom.contains(hdr.globalRank) && snapshotBlobsReady)
+            if (recievedFrom.size() >= localNodeWorldSize && recievedFrom.contains(hdr.globalRank))
             {
                 if (onCoordinatorPeer && snapshotPtr->globalRegistry == nullptr)
                 {
                     snapshotPtr->globalRegistry = sessionState.globalRegistry;
-                    for (auto const& blob : snapshotPtr->snapshotBlobs) { snapshotPtr->globalRegistry->SetBlob(blob.fqn, blob.data); }
                 }
                 break;
             }
             auto waitingFor
                 = CalculateWaitingFor(recievedFrom, hdr.globalRank, Rank{static_cast<uint32_t>(hdr.globalRank) + localNodeWorldSize});
             INFO("[{}#{}] FinalizeSnapshot waiting for snapshot={} local-state-registry {} of {} remaining, "
-                 "snapshot-blobs-ready={}... waitingFor=[{}]",
+                 "waitingFor=[{}]",
                  *server,
                  sessionId,
                  hdr.snapshotId,
                  waitingFor.size(),
                  localNodeWorldSize,
-                 snapshotBlobsReady,
                  fmt::join(waitingFor, ","));
         }
         if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
@@ -846,7 +848,18 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    PrepareBlobState_(snapshot, localState, hdr.globalRank);
+    localState.blobs.clear();
+    localState.localRegistry->WalkNodes([&](StateNode const& node) {
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
+        auto        fqn                  = localState.localRegistry->GetNodeId(node.handle);
+        auto const& blob                 = std::get<StateNode::Blob>(node.data);
+        localState.blobs[std::move(fqn)] = std::string_view(blob.data(), blob.size());
+    });
+    if (hdr.globalRank == Rank{0})
+    {
+        std::scoped_lock lock(mutex);
+        snapshot.blobMetadata = blobMetas;
+    }
     checkpoint::distcp::WriteRankShard(
         snapshot.path.parent_path(), hdr.globalRank, *dedupedGlobalRegistry, localState.tensorStorage, localState.blobs);
     if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr); }
@@ -1452,25 +1465,23 @@ void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char c
 
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
-    BufStream                bufStream{buf.data(), buf.size()};
-    auto                     ckptPath         = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
-    auto                     numSnapshotBlobs = serdes::ReadTrivial<uint32_t>(bufStream);
-    StateTree::SnapshotBlobs snapshotBlobs;
+    BufStream bufStream{buf.data(), buf.size()};
+    auto      ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
+
+    auto                         numSnapshotBlobs = serdes::ReadTrivial<uint32_t>(bufStream);
+    std::vector<StateNode::Blob> snapshotBlobs;
     snapshotBlobs.reserve(numSnapshotBlobs);
     auto const startedAt = hdr.startedAt;
     for (uint32_t i = 0; i < numSnapshotBlobs; ++i)
     {
-        snapshotBlobs.push_back(
-            {.fqn = serdes::ReadBlobWithSize<uint16_t>(bufStream), .data = serdes::ReadBlobWithSize<uint32_t>(bufStream)});
+        auto data = serdes::ReadBlobWithSize<uint32_t>(bufStream);
+        snapshotBlobs.emplace_back(data.begin(), data.end());
     }
-    if (hdr.globalRank != Rank{0} && !snapshotBlobs.empty())
-    {
-        throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Nonzero rank={} sent snapshot Blob fields for snapshot={}",
-                                             *server,
-                                             sessionId,
-                                             hdr.globalRank,
-                                             hdr.snapshotId));
-    }
+
+    auto                           numSnapshotScalars = serdes::ReadTrivial<uint32_t>(bufStream);
+    std::vector<StateNode::Scalar> snapshotScalars;
+    snapshotScalars.reserve(numSnapshotScalars);
+    for (uint32_t i = 0; i < numSnapshotScalars; ++i) { snapshotScalars.emplace_back(serdes::ReadTrivial<StateNode::Scalar>(bufStream)); }
     bool                                  beginDurableSpan = false;
     std::chrono::system_clock::time_point durableStartedAt;
     {
@@ -1486,8 +1497,6 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
             beginDurableSpan     = true;
             snapshotIt           = snapshots.insert({hdr.snapshotId, std::move(snapshot)}).first;
         }
-
-        if (hdr.globalRank == Rank{0}) { snapshotIt->second->snapshotBlobs = std::move(snapshotBlobs); }
 
         if (snapshotIt->second->localStates.contains(hdr.globalRank))
         {
@@ -1510,9 +1519,50 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                             hdr.globalRank,
                             hdr.snapshotId));
         }
-        auto localState           = std::make_unique<LocalState>();
-        localState->localRegistry = it->second->localRegistry;
-        localState->startedAt     = startedAt;
+        auto localState            = std::make_unique<LocalState>();
+        localState->localRegistry  = it->second->localRegistry->Clone();
+        localState->startedAt      = startedAt;
+        uint32_t registeredBlobs   = 0;
+        uint32_t registeredScalars = 0;
+        localState->localRegistry->WalkNodes([&](StateNode const& node) {
+            auto const type = static_cast<StateNode::Type>(node.data.index());
+            if (type == StateNode::Type::Blob) { ++registeredBlobs; }
+            else if (type == StateNode::Type::Scalar) { ++registeredScalars; }
+        });
+        if (numSnapshotBlobs != registeredBlobs || numSnapshotScalars != registeredScalars)
+        {
+            throw std::runtime_error(
+                fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot={} rank={} supplied Blob/Scalar counts {}/{}; expected {}/{}",
+                            *server,
+                            sessionId,
+                            hdr.snapshotId,
+                            hdr.globalRank,
+                            numSnapshotBlobs,
+                            numSnapshotScalars,
+                            registeredBlobs,
+                            registeredScalars));
+        }
+        size_t blobIndex   = 0;
+        size_t scalarIndex = 0;
+        localState->localRegistry->WalkNodes([&](StateNode& node) {
+            auto const type = static_cast<StateNode::Type>(node.data.index());
+            if (type == StateNode::Type::Blob)
+            {
+                auto& blob = snapshotBlobs[blobIndex++];
+                if (std::get<StateNode::Blob>(node.data).size() != blob.size())
+                {
+                    throw std::runtime_error(fmt::format(
+                        "[native_ckpt:svr][{}#{}][ERROR] Snapshot={} rank={} Blob '{}' changed size after registry synchronization",
+                        *server,
+                        sessionId,
+                        hdr.snapshotId,
+                        hdr.globalRank,
+                        localState->localRegistry->GetNodeId(node.handle)));
+                }
+                node.data = std::move(blob);
+            }
+            else if (type == StateNode::Type::Scalar) { node.data = snapshotScalars[scalarIndex++]; }
+        });
 
         if (hdr.snapshotSize != it->second->localRegistry->GetTotalTensorStateSizeInBytes())
         {
@@ -1614,9 +1664,7 @@ void Session::HandleStateRegistryFragment(Rank                                  
 {
     std::scoped_lock lock(mutex);
     MergeFragmentToGlobalState_(lock, tensorShards);
-    // recvRank is always a non-coordinator rank here (rank 0 lives on the coordinator
-    // peer and never streams a fragment), so every Blob it reports is local
-    // to that rank. Snapshot-scoped common state is added separately on rank 0.
+    // Blob lengths are fixed by initial registry synchronization.
     for (auto const& [fqn, length] : blobMetasIn) { blobMetas[fqn][recvRank] = {.length = length}; }
     recievedFrom.insert(recvRank);
     INFO("[{}#{}] HandleStateRegistryFragment rank={} shards={} Blobs={} waitingFor=[{}]",
@@ -1635,52 +1683,6 @@ void Session::RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& /* lock
         auto const& blob                                      = std::get<StateNode::Blob>(node.data);
         blobMetas[localRegistry.GetNodeId(node.handle)][rank] = {.length = blob.size()};
     });
-}
-
-void Session::PrepareBlobState_(Snapshot& snapshot, LocalState& localState, Rank rank) const
-{
-    // The snapshot-scoped common state lives only on rank 0 and carries fresh
-    // per-save bytes. Exclude those fqns from the registry walk — its Blob nodes hold
-    // stale registration bytes — and add rank 0's fresh copies from the snapshot.
-    std::unordered_set<std::string> commonFqns;
-    for (auto const& blob : snapshot.snapshotBlobs) { commonFqns.insert(blob.fqn); }
-
-    localState.blobs.clear();
-    localState.localRegistry->WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-        auto fqn = localState.localRegistry->GetNodeId(node.handle);
-        if (commonFqns.contains(fqn)) { return; }
-        auto const& blob                 = std::get<StateNode::Blob>(node.data);
-        localState.blobs[std::move(fqn)] = std::string_view(blob.data(), blob.size());
-    });
-    if (rank == Rank{0})
-    {
-        for (auto const& blob : snapshot.snapshotBlobs) { localState.blobs[blob.fqn] = blob.data; }
-    }
-
-    if (rank != Rank{0}) { return; }
-
-    // The readiness barrier guarantees that all registry fragments are
-    // present. Copy the session template under the same mutex used by fragment
-    // handlers; the snapshot owns all per-save adjustments from this point.
-    {
-        std::scoped_lock lock(mutex);
-        snapshot.blobMetadata = blobMetas;
-    }
-
-    // Ranks on the coordinator peer saw rank 0's fresh snapshot Blob list and
-    // excluded those stale registry values from their writes. Remote peers do
-    // not receive that list and still write their registered copies, so retain
-    // those ranks to keep later offsets aligned with their physical files.
-    for (auto const& blob : snapshot.snapshotBlobs)
-    {
-        auto metadataIt = snapshot.blobMetadata.find(blob.fqn);
-        if (metadataIt == snapshot.blobMetadata.end()) { continue; }
-        for (uint32_t localRank = 0; localRank < topo.ranksPerPeer; ++localRank) { metadataIt->second.erase(Rank{localRank}); }
-        if (metadataIt->second.empty()) { snapshot.blobMetadata.erase(metadataIt); }
-    }
-
-    for (auto const& [fqn, bytes] : localState.blobs) { snapshot.blobMetadata[fqn][Rank{0}] = {.length = bytes.size()}; }
 }
 
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
@@ -2811,10 +2813,7 @@ void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
             MergeFragmentToGlobalState_(lock, tensorShards);
         }
 
-        // Blobs are written per-rank rather than gathered onto the coordinator.
-        // Record only lengths here; rank 0's own and snapshot-scoped values are
-        // assembled once their fresh per-save bytes are known.
-        if (IsCoordinatorPeer() && rank != Rank{0}) { RecordBlobMetasLocked_(lock, rank, *localState.localRegistry); }
+        if (IsCoordinatorPeer()) { RecordBlobMetasLocked_(lock, rank, *localState.localRegistry); }
     }
     {
         // TODO_NOPENDING_STRUCT

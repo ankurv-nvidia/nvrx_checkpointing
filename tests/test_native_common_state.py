@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # ruff: noqa: INP001, S101
 """Daemon-level coverage for embedded native common state."""
 
@@ -13,7 +14,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from nvrx_checkpointing import checkpoint
-from nvrx_checkpointing.mapping import ShardedTensor
+from nvrx_checkpointing.megatron.mapping import ShardedObject, ShardedTensor
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -46,9 +47,20 @@ def _load_common_state(checkpoint_dir: Path) -> dict[str, object]:
     return value[0]
 
 
-def _assert_common_state_layout(checkpoint_dir: Path) -> None:
+def _load_sharded_object(checkpoint_dir: Path) -> dict[str, object]:
+    key = "rng_state/shard_0_1"
+    loaded = {key: io.BytesIO()}
+    dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+    value = loaded[key]
+    if isinstance(value, io.BytesIO):
+        value.seek(0)
+        value = torch.load(value, weights_only=False)
+    return value[0]
+
+
+def _assert_common_state_layout(checkpoint_dir: Path, expected_capacity: int) -> None:
     metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
-    assert set(metadata.state_dict_metadata) == {"weight", _DCP_COMMON_STATE_KEY}
+    assert set(metadata.state_dict_metadata) == {"weight", "rng_state/shard_0_1", _DCP_COMMON_STATE_KEY}
     assert type(metadata.state_dict_metadata[_DCP_COMMON_STATE_KEY]).__name__ == "BytesStorageMetadata"
 
     storage_entries = [
@@ -61,6 +73,7 @@ def _assert_common_state_layout(checkpoint_dir: Path) -> None:
     assert index.offset is None
     assert index.index is None
     assert info.relative_path == "__0_0.distcp"
+    assert info.length == expected_capacity
 
 
 def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
@@ -75,7 +88,8 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             global_offset=(0,),
             axis_fragmentations=None,
         ),
-        _DCP_COMMON_STATE_KEY: b"",
+        "rng_state": ShardedObject("rng_state", {"iteration": 0}, (1,), (0,)),
+        _DCP_COMMON_STATE_KEY: _serialize_common_state(0),
     }
     root.register_state_dict(state_dict)
     root.finalize_registry()
@@ -84,7 +98,13 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
         for iteration in (1, 2):
             checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
             assert not checkpoint_dir.exists()
-            state_dict[_DCP_COMMON_STATE_KEY] = _serialize_common_state(iteration)
+            common_bytes = _serialize_common_state(iteration)
+            root.register_state_dict(
+                {
+                    _DCP_COMMON_STATE_KEY: common_bytes,
+                    "rng_state": ShardedObject("rng_state", {"iteration": iteration}, (1,), (0,)),
+                },
+            )
             root.save_async(iteration, checkpoint_dir)
             root.wait_for_deferred_save()
 
@@ -98,7 +118,10 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
                 "iteration": iteration,
                 "scheduler": {"num_steps": iteration * 10},
             }
-            _assert_common_state_layout(checkpoint_dir)
+            assert _load_sharded_object(checkpoint_dir) == {"iteration": iteration}
+            initial_size = len(_serialize_common_state(0))
+            expected_capacity = ((initial_size + 512 + 1023) // 1024) * 1024
+            _assert_common_state_layout(checkpoint_dir, expected_capacity)
             assert not (checkpoint_dir / "common.pt").exists()
             assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
                 "sharded_backend": "torch_dist",

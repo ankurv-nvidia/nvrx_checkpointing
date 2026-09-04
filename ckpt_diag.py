@@ -1,7 +1,7 @@
 """Diagnostic helpers for the per-node checkpoint server.
 
 Pure-stdlib module — no megatron imports — so it can be imported both from
-training code (tools.py) and from the CI runner
+training code (``megatron/save.py``) and from the CI runner
 (ci/scripts/slurm_job.py) without pulling in heavy deps.
 """
 

@@ -102,7 +102,7 @@ struct Message
         std::chrono::nanoseconds startedAt{};
         /*Message Format
         std::string ckptPath;
-        std::vector<StateTree::SnapshotBlob> snapshotBlobs; // rank 0 only
+        Blob and Scalar counts followed by values in this rank's registered StateTree order;
         */
     };
 

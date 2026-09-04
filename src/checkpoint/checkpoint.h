@@ -15,10 +15,7 @@ void SvcDecrRef();
 
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
 
-void SaveCheckpoint(StateTree const&                         root,
-                    checkpoint::ipc::SnapshotId const&       snapshotId,
-                    std::filesystem::path const&             ckptPath,
-                    std::span<StateTree::SnapshotBlob const> snapshotBlobs = {});
+void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
 void FinalizeStateRegistry(StateTree& self);
 void WaitForCheckpointSave(RankTopology const& topo);
 

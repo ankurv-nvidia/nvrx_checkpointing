@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # ruff: noqa: INP001, S101, SLF001
 
-"""Unit tests for the ordered-peer adapter used by tools.py.
+"""Unit tests for the ordered-peer adapter used by Megatron saves.
 
 Covers the three launch shapes the native checkpoint writer runs under:
 

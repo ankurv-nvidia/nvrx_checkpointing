@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-# ruff: noqa: ANN401, ARG001, C901, INP001, PLR0913, PLR0915, S101, SLF001
+# ruff: noqa: ANN401, ARG001, ARG005, C901, FBT003, INP001, PLR0913, PLR0915, PLR0917, S101, S102
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import argparse
 import ast
 import importlib.util
 import sys
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import pytest
@@ -18,399 +18,210 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_native_save_retains_only_common_checkpoint_state() -> None:
-    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
+def test_native_save_retains_no_function_attribute_checkpoint_state() -> None:
+    tree = ast.parse((REPO_ROOT / "megatron/save.py").read_text())
     retained = {
         node.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "save_checkpoint"
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "save_checkpoint"
     }
-    assert retained == {"common"}
+    assert retained == set()
 
 
-def test_warm_save_refreshes_mutable_common_optimizer_state() -> None:
-    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_refresh_optimizer_state"
-    )
-
-    class FakeShardedTensor:
-        pass
-
-    tensor = FakeShardedTensor()
-    fresh_optimizer = [{"optimizer": {"param_groups": [{"lr": 2.025e-6}]}}]
-
-    class ModelChunk:
-        def sharded_state_dict(self, *, metadata: dict) -> dict:
-            assert metadata == {"sharding": "test"}
-            return {"weight": tensor}
-
-    class Optimizer:
-        def sharded_state_dict(self, state_dict: dict, *, metadata: dict) -> dict:
-            assert state_dict["model"] == {"weight": tensor}
-            assert metadata == {"sharding": "test"}
-            return {"state": tensor}
-
-    def save_preprocess(state_dict: dict, *, validate_access_integrity: bool) -> tuple[dict, dict]:
-        assert state_dict["optimizer"] == {"state": tensor}
-        assert not validate_access_integrity
-        return {"state": tensor}, {"optimizer": fresh_optimizer}
-
-    namespace = {
-        "ShardedTensor": FakeShardedTensor,
-        "nested_values": lambda state: state.values(),
-        "save_preprocess": save_preprocess,
-        "unwrap_model": lambda model: model,
-    }
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "tools.py", "exec"), namespace)
-
-    common = {"optimizer": [{"optimizer": {"param_groups": [{"lr": 1.35e-6}]}}]}
-    refreshed = namespace["_refresh_optimizer_state"](
-        [ModelChunk()], Optimizer(), {"sharding": "test"}, common,
-    )
-
-    assert refreshed == [tensor]
-    assert common["optimizer"] is fresh_optimizer
-
-
-def test_native_save_traces_cpp_enqueue_and_completion() -> None:
-    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_checkpoint_span", "_serialize_common_state", "_snapshot", "save"}
+def test_save_keeps_megatron_imports_at_module_scope() -> None:
+    tree = ast.parse((REPO_ROOT / "megatron/save.py").read_text())
+    imports = [node.module for node in tree.body if isinstance(node, ast.ImportFrom) and node.module]
+    nested_imports = [
+        node.module
+        for function in (node for node in tree.body if isinstance(node, ast.FunctionDef))
+        for node in ast.walk(function)
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(("megatron", "nemo", "opentelemetry"))
     ]
+
+    assert "megatron.training.checkpointing" in imports
+    assert nested_imports == []
+
+
+def _load_provider_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "nvrx_checkpointing.megatron.provider",
+        REPO_ROOT / "megatron/provider.py",
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_optional_provider_args_are_composable(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _load_provider_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+
+    def add_existing_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parser.add_argument("--existing")
+        return parser
+
+    parser = provider.compose_extra_args_provider(add_existing_argument)(parser)
+    args = parser.parse_args(["--existing", "yes", "--ckpt-provider", "nvrx"])
+    assert args.existing == "yes"
+    assert args.ckpt_provider == "nvrx"
+    assert provider.add_arguments(parser) is parser
+    assert provider.selected_provider([]) == "native"
+    assert provider.selected_provider(["--ckpt-provider=nvrx"]) == "nvrx"
+    assert provider.selected_provider(["--ckpt-provider", "native"]) == "native"
+
+
+def test_save_checkpoint_captures_entry_time_before_implementation() -> None:
+    tree = ast.parse((REPO_ROOT / "megatron/save.py").read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "save_checkpoint"]
     events = []
 
     @contextmanager
-    def managed_span(group: str, name: str, **attributes: Any) -> Any:
-        events.append(("begin", group, name, attributes["megatron.iteration"]))
-        yield
-        events.append(("end", group, name, attributes["megatron.iteration"]))
-
-    class Root:
-        def save_async(self, iteration: int, checkpoint_dir: Path) -> None:
-            events.append(("save_async", iteration, checkpoint_dir))
-
-        def wait_for_deferred_save(self) -> None:
-            events.append(("wait_for_deferred_save",))
-
-    namespace = {
-        "AbstractContextManager": AbstractContextManager,
-        "Path": Path,
-        "_otel_managed_span": managed_span,
-        "torch": SimpleNamespace(distributed=SimpleNamespace(get_rank=lambda: 1)),
-        "register_state_dict": SimpleNamespace(root=Root(), snapshot_state=None),
-    }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), "tools.py", "exec"), namespace)
-    checkpoint_dir = Path("/checkpoint")
-
-    namespace["save"]({}, 125, checkpoint_dir)
-
-    assert events == [
-        ("begin", "checkpoint", "nvrx.checkpoint.serialize_common_state", 125),
-        ("end", "checkpoint", "nvrx.checkpoint.serialize_common_state", 125),
-        ("begin", "checkpoint", "nvrx.checkpoint.cpp.save_async", 125),
-        ("save_async", 125, checkpoint_dir),
-        ("end", "checkpoint", "nvrx.checkpoint.cpp.save_async", 125),
-        ("begin", "checkpoint", "nvrx.checkpoint.cpp.wait_for_deferred_save", 125),
-        ("wait_for_deferred_save",),
-        ("end", "checkpoint", "nvrx.checkpoint.cpp.wait_for_deferred_save", 125),
-    ]
-
-
-def test_save_checkpoint_captures_entry_time_before_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
-    tree = ast.parse((REPO_ROOT / "tools.py").read_text())
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_checkpoint_span", "save_checkpoint"}
-    ]
-    events = []
-    root = SimpleNamespace(startedAt=None)
-
-    @contextmanager
-    def managed_span(group: str, name: str, **attributes: Any) -> Any:
+    def checkpoint_span(name: str, iteration: int) -> Any:
+        del iteration
         events.append(("begin", name))
         yield
         events.append(("end", name))
 
-    native_async = ModuleType("nvrx_checkpointing.native_async")
-    native_async.is_previous_save_in_progress = lambda: False
-    native_async.wait_for_previous_save = lambda: events.append(("wait",))
-    package = ModuleType("nvrx_checkpointing")
-    package.__path__ = []
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", package)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.native_async", native_async)
-
-    def prepare(*args: Any, **kwargs: Any) -> tuple[SimpleNamespace, dict]:
-        events.append(("prepare", root.startedAt))
-        return SimpleNamespace(save="/checkpoints"), {}
-
-    def serialize(common: dict, iteration: int) -> None:
-        events.append(("serialize", root.startedAt, iteration, common))
-
-    def snapshot(iteration: int, checkpoint_dir: Path) -> None:
-        events.append(("snapshot", root.startedAt, iteration, checkpoint_dir))
+    def save_impl(*args: Any, **kwargs: Any) -> None:
+        del kwargs
+        events.append(("impl", args[1]))
 
     namespace = {
-        "__package__": "nvrx_checkpointing",
-        "AbstractContextManager": AbstractContextManager,
-        "Path": Path,
-        "_checkpoint_span": None,
-        "_finalize_checkpoint": lambda _args, iteration: events.append(("finalize", iteration)),
-        "_otel_managed_span": managed_span,
-        "_prepare_checkpoint": prepare,
-        "_serialize_common_state": serialize,
-        "_snapshot": snapshot,
+        "_checkpoint_span": checkpoint_span,
+        "_save_checkpoint_impl": save_impl,
+        "SaveCheckpointArgs": SimpleNamespace,
         "diagnose_checkpoint_server_failure": lambda _error: None,
-        "get_checkpoint_name": lambda *_args, **_kwargs: "/checkpoint/iter_0000125",
         "print_rank_0": lambda _message: None,
-        "register_state_dict": SimpleNamespace(root=root),
-        "time": SimpleNamespace(time_ns=lambda: 123, monotonic=lambda: 0.0),
+        "time": SimpleNamespace(time_ns=lambda: 123),
     }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), "tools.py", "exec"), namespace)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "save.py", "exec"), namespace)
 
-    namespace["save_checkpoint"](125, [], None, None, 0)
+    namespace["save_checkpoint"](SimpleNamespace(iteration=125))
 
-    assert root.startedAt == 123  # noqa: PLR2004
     assert events == [
         ("begin", "nvrx.checkpoint.save"),
-        ("begin", "nvrx.checkpoint.prepare"),
-        ("begin", "nvrx.checkpoint.wait_previous"),
-        ("wait",),
-        ("end", "nvrx.checkpoint.wait_previous"),
-        ("begin", "megatron.checkpoint.save.state_dict"),
-        ("prepare", None),
-        ("end", "megatron.checkpoint.save.state_dict"),
-        ("serialize", 123, 125, {}),
-        ("end", "nvrx.checkpoint.prepare"),
-        ("begin", "megatron.checkpoint.save.io_write"),
-        ("snapshot", 123, 125, Path("/checkpoint/iter_0000125")),
-        ("end", "megatron.checkpoint.save.io_write"),
-        ("begin", "nvrx.checkpoint.enqueue_finalize"),
-        ("finalize", 125),
-        ("end", "nvrx.checkpoint.enqueue_finalize"),
+        ("impl", 123),
         ("end", "nvrx.checkpoint.save"),
     ]
 
 
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:
-    class ReferenceRequest(NamedTuple):
-        value: str
-        call_idx: int = 0
-
     calls = SimpleNamespace(
-        empty_cache=0,
-        free_overlap=0,
+        init=[],
+        finalize=[],
         native_saves=[],
-        reference_saves=[],
+        strategy_loads=[],
+        public_loads=[],
         train=0,
-        validate=0,
         warmup=0,
-        gc_collect=0,
-        parsed_provider=None,
-        native_async=[],
-        native_readers=[],
-        reference_async=[],
-        reference_request=ReferenceRequest,
-        reference_readers=[],
-        warnings=[],
+        legacy_only=False,
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
     fake_package.__path__ = [str(REPO_ROOT)]
-    fake_tools = ModuleType("nvrx_checkpointing.tools")
+    fake_megatron_package = ModuleType("nvrx_checkpointing.megatron")
+    fake_megatron_package.__path__ = [str(REPO_ROOT / "megatron")]
+    fake_save = ModuleType("nvrx_checkpointing.megatron.save")
+    fake_save.SaveCheckpointArgs = SimpleNamespace
+    fake_save.save_checkpoint = lambda *args, **kwargs: calls.native_saves.append((args, kwargs)) or "native"
 
-    def native_save_checkpoint(*args: Any, **kwargs: Any) -> str:
-        calls.native_saves.append((args, kwargs))
-        return "native"
+    fake_save.init_persistent_async_worker = lambda *args: calls.init.append(args)
+    fake_save.maybe_finalize_async_save = lambda *args, **kwargs: calls.finalize.append((args, kwargs))
 
     def warmup() -> None:
         calls.warmup += 1
 
-    fake_tools.save_checkpoint = native_save_checkpoint
-    fake_tools.warmup = warmup
-    fake_package.tools = fake_tools
-    fake_native_async = ModuleType("nvrx_checkpointing.native_async")
-
-    def record_native_async(name: str, *args: Any) -> str:
-        calls.native_async.append((name, args))
-        return f"native-{name}"
-
-    fake_native_async.init_persistent_async_worker = lambda *args: record_native_async("init", *args)
-    fake_native_async.schedule_async_save = lambda *args: record_native_async("schedule", *args)
-    fake_native_async.maybe_finalize_async_save = lambda *args: record_native_async("finalize", *args)
-    fake_native_async.is_empty_async_queue = lambda: record_native_async("is-empty") == "not-empty"
-    fake_native_async.reset_persistent_async_worker = lambda *args: record_native_async("reset", *args)
-    fake_native_async.get_filesystem_reader = lambda path, *, cache_metadata: (
-        calls.native_readers.append((path, cache_metadata)) or "native-reader"
-    )
-    fake_package.native_async = fake_native_async
+    fake_save.warmup = warmup
+    fake_megatron_package.save = fake_save
+    fake_package.megatron = fake_megatron_package
 
     megatron = ModuleType("megatron")
     megatron.__path__ = []
     megatron_core = ModuleType("megatron.core")
     megatron_core.__path__ = []
-    dist_checkpointing_package = ModuleType("megatron.core.dist_checkpointing")
-    dist_checkpointing_package.__path__ = []
-    strategies_package = ModuleType("megatron.core.dist_checkpointing.strategies")
-    strategies_package.__path__ = []
-    torch_strategy_module = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
+    dist_checkpointing = ModuleType("megatron.core.dist_checkpointing")
+    dist_checkpointing.__path__ = []
+    strategies = ModuleType("megatron.core.dist_checkpointing.strategies")
+    strategies.__path__ = []
+    torch_strategy = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
 
-    def get_filesystem_reader(
+    class TorchDistLoadShardedStrategy:
+        def load(self, state: dict[str, Any], checkpoint_dir: str, async_strategy: str) -> Any:
+            calls.strategy_loads.append((state, checkpoint_dir, async_strategy))
+            return {"loaded": True}
+
+    torch_strategy.TorchDistLoadShardedStrategy = TorchDistLoadShardedStrategy
+    strategies.torch = torch_strategy
+
+    def _leaf_key(value: Any) -> str:
+        if isinstance(value, dict):
+            for child in value.values():
+                if key := _leaf_key(child):
+                    return key
+        if isinstance(value, list):
+            for child in value:
+                if key := _leaf_key(child):
+                    return key
+        return getattr(value, "key", "")
+
+    def public_load(
+        state: dict[str, Any],
         checkpoint_dir: str,
-        cache_metadata: bool = False,
-        async_strategy: str = "mcore",
-    ) -> str:
-        calls.reference_readers.append((checkpoint_dir, cache_metadata, async_strategy))
-        return "reference-reader"
+        sharded_strategy: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        calls.public_loads.append(state)
+        key = _leaf_key(state.get("optimizer"))
+        if calls.legacy_only:
+            if ".dtype_(torch." in key:
+                raise KeyError(key)
+            if ".dtype_dtype_param_" in key:
+                legacy = next(iter(state["optimizer"][0]))
+                return {"optimizer": {legacy: "loaded"}}
+        return sharded_strategy.load(state, checkpoint_dir, "nvrx")
 
-    torch_strategy_module._get_filesystem_reader = get_filesystem_reader
-    strategies_package.torch = torch_strategy_module
-    dist_checkpointing_package.strategies = strategies_package
-    megatron_core.dist_checkpointing = dist_checkpointing_package
-    optimizer_package = ModuleType("megatron.core.optimizer")
-    optimizer_package.__path__ = []
-    distrib_module = ModuleType("megatron.core.optimizer.distrib_optimizer")
-
-    class FakeDistributedOptimizer:
-        @classmethod
-        def _build_gbuf_range_map(cls, buffer: Any) -> dict[Any, list[Any]]:
-            return {(buffer.param_dtype, buffer.grad_dtype): []}
-
-        def __init__(self, buffers: list[Any]) -> None:
-            self.buffers = buffers
-            self.gbuf_ranges = [self._build_gbuf_range_map(buffer) for buffer in buffers]
-            self.per_bucket_numel = [{(buffer.param_dtype, buffer.grad_dtype): [10]} for buffer in buffers]
-            self.per_bucket_numel_unpadded = [{(buffer.param_dtype, buffer.grad_dtype): [9]} for buffer in buffers]
-
-        def split_state_dict_if_needed(self, state_dict: dict[Any, Any]) -> None:
-            assert all(isinstance(next(iter(entry)), tuple) for entry in self.gbuf_ranges)
-            dtype_map = state_dict[0]
-            assert isinstance(next(iter(dtype_map)), tuple)
-
-    distrib_module.DistributedOptimizer = FakeDistributedOptimizer
-    fake_torch = SimpleNamespace(uint8="torch.uint8", cuda=SimpleNamespace())
-    distrib_module.torch = fake_torch
-    optimizer_package.distrib_optimizer = distrib_module
-    megatron_core.optimizer = optimizer_package
+    dist_checkpointing.load = public_load
+    dist_checkpointing.strategies = strategies
+    megatron_core.dist_checkpointing = dist_checkpointing
+    megatron.core = megatron_core
 
     training_package = ModuleType("megatron.training")
     training_package.__path__ = []
-    arguments_module = ModuleType("megatron.training.arguments")
-    async_utils_module = ModuleType("megatron.training.async_utils")
-    checkpointing_module = ModuleType("megatron.training.checkpointing")
     initialize_module = ModuleType("megatron.training.initialize")
     restart_module = ModuleType("megatron.training.inprocess_restart")
     training_module = ModuleType("megatron.training.training")
-    current_args = SimpleNamespace(
-        ckpt_provider="native",
-        async_save=True,
-        async_strategy="nvrx",
-        ckpt_pg_tensors_cache_path="/run/pg-cache",
-        ckpt_pg_tensors_cache_create=True,
-    )
 
-    def parse_args(extra_args_provider: Any = None, ignore_unknown_args: bool = False) -> Any:
-        parser = argparse.ArgumentParser()
-        if extra_args_provider is not None:
-            parser = extra_args_provider(parser)
-        parsed = parser.parse_args([])
-        calls.parsed_provider = parsed.ckpt_provider
-        return parsed
+    initialize_module.init_persistent_async_worker = lambda *args: "reference-init"
+    restart_module.reset_persistent_async_worker = lambda *args: "reference-reset"
+    training_module.maybe_finalize_async_save = lambda *args, **kwargs: "reference-finalize"
 
-    def validate_args(args: Any, defaults: dict[str, Any]) -> Any:
-        calls.validate += 1
-        if not args.async_save:
-            args.async_strategy = "mcore"
-        return args
-
-    arguments_module.parse_args = parse_args
-    arguments_module.validate_args = validate_args
-    arguments_module.warn_rank_0 = calls.warnings.append
-
-    def record_reference_async(name: str, *args: Any) -> str:
-        calls.reference_async.append((name, args))
-        return f"reference-{name}"
-
-    reference_queue = SimpleNamespace(call_idx=-1)
-    reference_pending = []
-
-    def schedule_reference(request: ReferenceRequest) -> str:
-        reference_queue.call_idx += 1
-        reference_pending.append(request)
-        return record_reference_async("schedule", request)
-
-    def finalize_reference(*args: Any) -> list[int]:
-        record_reference_async("finalize", *args)
-        finalized = [request.call_idx for request in reference_pending]
-        reference_pending.clear()
-        return finalized
-
-    async_utils_module._get_async_calls_queue = lambda: reference_queue
-    async_utils_module.init_persistent_async_worker = lambda *args: record_reference_async("init", *args)
-    async_utils_module.schedule_async_save = schedule_reference
-    async_utils_module.maybe_finalize_async_save = finalize_reference
-    async_utils_module.is_empty_async_queue = lambda: record_reference_async("is-empty") == "empty"
-    async_utils_module.reset_persistent_async_worker = lambda *args: record_reference_async("reset", *args)
-    checkpointing_module.schedule_async_save = async_utils_module.schedule_async_save
-    checkpointing_module.is_empty_async_queue = async_utils_module.is_empty_async_queue
-    initialize_module.init_persistent_async_worker = async_utils_module.init_persistent_async_worker
-    restart_module.reset_persistent_async_worker = async_utils_module.reset_persistent_async_worker
-
-    def empty_cache() -> None:
-        calls.empty_cache += 1
-
-    training_module.torch = SimpleNamespace(cuda=SimpleNamespace(empty_cache=empty_cache))
-    training_module.gc = SimpleNamespace(collect=lambda: setattr(calls, "gc_collect", calls.gc_collect + 1))
-    training_module.get_args = lambda: current_args
-
-    def reference_save(*args: Any, **kwargs: Any) -> str:
-        calls.reference_saves.append((args, kwargs))
-        return "reference"
-
-    training_module.save_checkpoint = reference_save
-    training_module.maybe_finalize_async_save = async_utils_module.maybe_finalize_async_save
-
-    def save_checkpoint_and_time(
+    def reference_save(
         iteration: int,
-        model: list[Any],
+        model: Any,
         optimizer: Any,
-        scheduler: Any,
-        flops: int,
-        checkpointing_context: Any,
-        **kwargs: Any,
-    ) -> Any:
-        for chunk in model:
-            if hasattr(chunk, "free_overlap_buffers"):
-                chunk.free_overlap_buffers()
-        training_module.torch.cuda.empty_cache()
-        return training_module.save_checkpoint(
-            iteration,
-            model,
-            optimizer,
-            scheduler,
-            flops,
-            checkpointing_context,
-            **kwargs,
-        )
-
-    training_module.save_checkpoint_and_time = save_checkpoint_and_time
+        opt_param_scheduler: Any,
+        num_floating_point_operations_so_far: int,
+        checkpointing_context: Any = None,
+        train_data_iterator: Any = None,
+        preprocess_common_state_dict_fn: Any = None,
+        tp_group: Any = None,
+        pp_group: Any = None,
+        dp_cp_group: Any = None,
+        dp_group: Any = None,
+        expt_dp_group: Any = None,
+        rng_state_key_prefix: str = "",
+    ) -> str:
+        return "reference"
 
     def train(*args: Any, **kwargs: Any) -> str:
         calls.train += 1
         return "trained"
 
+    training_module.save_checkpoint = reference_save
     training_module.train = train
-    training_package.arguments = arguments_module
-    training_package.async_utils = async_utils_module
-    training_package.checkpointing = checkpointing_module
     training_package.initialize = initialize_module
     training_package.inprocess_restart = restart_module
     training_package.training = training_module
@@ -418,19 +229,14 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
 
     modules = {
         "nvrx_checkpointing": fake_package,
-        "nvrx_checkpointing.native_async": fake_native_async,
-        "nvrx_checkpointing.tools": fake_tools,
+        "nvrx_checkpointing.megatron": fake_megatron_package,
+        "nvrx_checkpointing.megatron.save": fake_save,
         "megatron": megatron,
         "megatron.core": megatron_core,
-        "megatron.core.dist_checkpointing": dist_checkpointing_package,
-        "megatron.core.dist_checkpointing.strategies": strategies_package,
-        "megatron.core.dist_checkpointing.strategies.torch": torch_strategy_module,
-        "megatron.core.optimizer": optimizer_package,
-        "megatron.core.optimizer.distrib_optimizer": distrib_module,
+        "megatron.core.dist_checkpointing": dist_checkpointing,
+        "megatron.core.dist_checkpointing.strategies": strategies,
+        "megatron.core.dist_checkpointing.strategies.torch": torch_strategy,
         "megatron.training": training_package,
-        "megatron.training.arguments": arguments_module,
-        "megatron.training.async_utils": async_utils_module,
-        "megatron.training.checkpointing": checkpointing_module,
         "megatron.training.initialize": initialize_module,
         "megatron.training.inprocess_restart": restart_module,
         "megatron.training.training": training_module,
@@ -439,8 +245,8 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         monkeypatch.setitem(sys.modules, name, module)
 
     spec = importlib.util.spec_from_file_location(
-        "nvrx_checkpointing.megatron_integration",
-        REPO_ROOT / "megatron_integration.py",
+        "nvrx_checkpointing.megatron.integration",
+        REPO_ROOT / "megatron/integration.py",
     )
     assert spec is not None
     assert spec.loader is not None
@@ -449,38 +255,140 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     spec.loader.exec_module(integration)
     integration.install()
 
-    calls.args = current_args
-    calls.arguments_module = arguments_module
-    calls.async_utils_module = async_utils_module
-    calls.checkpointing_module = checkpointing_module
-    calls.distrib_module = distrib_module
+    calls.dist_checkpointing = dist_checkpointing
     calls.initialize_module = initialize_module
     calls.restart_module = restart_module
     calls.training_module = training_module
-    calls.torch_strategy_module = torch_strategy_module
     return integration, calls
 
 
-def test_argument_provider_composes_and_defaults_to_native(monkeypatch: pytest.MonkeyPatch) -> None:
-    integration, calls = _load_integration(monkeypatch)
-    parser = argparse.ArgumentParser()
+def test_install_patches_only_native_call_sites(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.initialize_module.init_persistent_async_worker(3, "forkserver")
+    calls.training_module.maybe_finalize_async_save(True, terminate=True)
 
-    def add_existing_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser.add_argument("--existing")
-        return parser
-
-    parser = integration.compose_extra_args_provider(add_existing_argument)(parser)
-    args = parser.parse_args(["--existing", "yes", "--ckpt-provider", "nvrx"])
-
-    assert args.existing == "yes"
-    assert args.ckpt_provider == "nvrx"
-    assert integration.add_arguments(parser) is parser
-    parsed = calls.arguments_module.parse_args()
-    assert parsed.ckpt_provider == "native"
-    assert calls.parsed_provider == "native"
+    assert calls.init == [(3, "forkserver")]
+    assert calls.finalize == [((True,), {"terminate": True})]
+    assert calls.restart_module.reset_persistent_async_worker("nvrx") == "reference-reset"
+    integration_source = (REPO_ROOT / "megatron/integration.py").read_text()
+    assert "megatron.training.arguments" not in integration_source
+    assert "megatron.core.optimizer.distrib_optimizer" not in integration_source
 
 
-def test_module_launcher_installs_before_running_entrypoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    result = calls.training_module.save_checkpoint(
+        10,
+        "model",
+        "optimizer",
+        "scheduler",
+        123,
+        {"context": True},
+        train_data_iterator="iterator",
+        tp_group="tp",
+        pp_group="pp",
+        dp_cp_group="dp-cp",
+        dp_group="dp",
+        expt_dp_group="edp",
+        rng_state_key_prefix="grid.",
+    )
+
+    assert result == "native"
+    assert len(calls.native_saves) == 1
+    (save_args,), kwargs = calls.native_saves[0]
+    assert kwargs == {}
+    assert vars(save_args) == {
+        "iteration": 10,
+        "model": "model",
+        "optimizer": "optimizer",
+        "opt_param_scheduler": "scheduler",
+        "num_floating_point_operations_so_far": 123,
+        "train_data_iterator": "iterator",
+        "tp_group": "tp",
+        "pp_group": "pp",
+        "dp_cp_group": "dp-cp",
+        "dp_group": "dp",
+        "rng_state_key_prefix": "grid.",
+    }
+
+
+def test_train_preserves_existing_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    assert calls.training_module.train() == "trained"
+    assert calls.warmup == 1
+
+
+def test_native_load_uses_mcore(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    state = {"model": "tensor"}
+    result = calls.dist_checkpointing.load(state, "/checkpoint")
+
+    assert result == {"loaded": True}
+    assert calls.strategy_loads == [(state, "/checkpoint", "mcore")]
+
+
+class _DType:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __str__(self) -> str:
+        return self.name
+
+    __repr__ = __str__
+
+
+def test_old_string_optimizer_keys_load_without_optimizer_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.legacy_only = True
+    dtype_pair = (_DType("torch.bfloat16"), _DType("torch.float32"))
+    leaf = SimpleNamespace(
+        key=("optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.float32).bucket_idx_0.exp_avg"),
+    )
+    state = {"optimizer": [{dtype_pair: {"exp_avg": leaf}}]}
+
+    result = calls.dist_checkpointing.load(state, "/old-checkpoint")
+
+    legacy = "dtype_param_torch:bfloat16_grad_torch:float32"
+    assert result == {"optimizer": {dtype_pair: "loaded"}}
+    assert len(calls.public_loads) == 2  # noqa: PLR2004
+    assert next(iter(calls.public_loads[0]["optimizer"][0])) == dtype_pair
+    assert next(iter(calls.public_loads[1]["optimizer"][0])) == legacy
+    legacy_leaf = calls.public_loads[1]["optimizer"][0][legacy]["exp_avg"]
+    assert f".dtype_{legacy}." in legacy_leaf.key
+    assert leaf.key.endswith(".dtype_(torch.bfloat16, torch.float32).bucket_idx_0.exp_avg")
+
+
+def test_legacy_optimizer_adapter_restores_strict_load_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_package = ModuleType("nvrx_checkpointing")
+    fake_package.__path__ = [str(REPO_ROOT)]
+    fake_megatron_package = ModuleType("nvrx_checkpointing.megatron")
+    fake_megatron_package.__path__ = [str(REPO_ROOT / "megatron")]
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", fake_package)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron", fake_megatron_package)
+    spec = importlib.util.spec_from_file_location(
+        "nvrx_checkpointing.megatron.legacy_optimizer",
+        REPO_ROOT / "megatron/legacy_optimizer.py",
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    adapter = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, adapter)
+    spec.loader.exec_module(adapter)
+
+    dtype_pair = (_DType("torch.bfloat16"), _DType("torch.float32"))
+    legacy = "dtype_param_torch:bfloat16_grad_torch:float32"
+    result = adapter.restore_optimizer_dtype_keys(
+        ({"optimizer": {legacy: "loaded"}}, {"missing"}, {"unexpected"}),
+        {legacy: dtype_pair},
+    )
+
+    assert result == ({"optimizer": {dtype_pair: "loaded"}}, {"missing"}, {"unexpected"})
+
+
+def test_module_launcher_installs_before_running_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     integration, _ = _load_integration(monkeypatch)
     entrypoint = tmp_path / "pretrain_gpt.py"
     entrypoint.write_text("# fake entrypoint\n")
@@ -495,24 +403,6 @@ def test_module_launcher_installs_before_running_entrypoint(monkeypatch: pytest.
     assert events == ["install", (str(entrypoint), "__main__")]
     assert sys.argv == [str(entrypoint), "--save", "/checkpoints"]
     assert sys.path[0] == str(tmp_path)
-
-
-def test_module_launcher_isolates_compiler_caches_by_rank(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    integration, _ = _load_integration(monkeypatch)
-    monkeypatch.setenv("RANK", "7")
-    for name in ("TRITON_CACHE_DIR", "TRITON_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
-        monkeypatch.setenv(name, str(tmp_path / name.lower()))
-
-    integration._isolate_compiler_caches()
-    integration._isolate_compiler_caches()
-
-    for name in ("TRITON_CACHE_DIR", "TRITON_CACHE_PATH", "TORCHINDUCTOR_CACHE_DIR"):
-        cache = Path(integration.os.environ[name])
-        assert cache == tmp_path / name.lower() / "rank-7"
-        assert cache.is_dir()
 
 
 def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -530,176 +420,3 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
     assert 'local staging="${MEGATRON_ROOT}.cloning-$$"' in resolver
     assert "git_retry git -c protocol.version=1 clone" in resolver
     assert "git_retry git -C" in resolver
-
-
-def test_native_provider_preserves_configured_async_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Native lifecycle hooks are patched separately, so argument validation must
-    # not select either external checkpoint implementation.
-    _, calls = _load_integration(monkeypatch)
-    calls.arguments_module.validate_args(calls.args, {})
-    assert calls.validate == 1
-    assert calls.args.async_save is True
-    assert calls.args.async_strategy == "nvrx"
-    assert calls.args.ckpt_pg_tensors_cache_path is None
-    assert calls.args.ckpt_pg_tensors_cache_create is False
-    assert calls.warnings == [
-        (
-            "--ckpt-pg-tensors-cache-path is ignored when --ckpt-provider=native; "
-            "disabling the process-group cache."
-        ),
-    ]
-
-
-def test_reference_provider_preserves_nvrx_async_queue(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    calls.args.ckpt_provider = "nvrx"
-    calls.arguments_module.validate_args(calls.args, {})
-    assert calls.validate == 1
-    assert calls.args.async_save is True
-    assert calls.args.async_strategy == "nvrx"
-    assert calls.args.ckpt_pg_tensors_cache_path == "/run/pg-cache"
-    assert calls.args.ckpt_pg_tensors_cache_create is True
-    assert calls.warnings == []
-
-
-def test_native_provider_redirects_async_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-
-    calls.initialize_module.init_persistent_async_worker(3, "forkserver")
-    calls.async_utils_module.schedule_async_save("request")
-    calls.training_module.maybe_finalize_async_save(True, True)
-    calls.checkpointing_module.is_empty_async_queue()
-    calls.restart_module.reset_persistent_async_worker("nvrx")
-
-    assert calls.native_async == [
-        ("init", (3, "forkserver")),
-        ("schedule", ("request",)),
-        ("finalize", (True, True)),
-        ("is-empty", ()),
-        ("reset", ("nvrx",)),
-    ]
-    assert calls.reference_async == []
-
-
-def test_reference_provider_keeps_original_async_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    calls.args.ckpt_provider = "nvrx"
-
-    calls.initialize_module.init_persistent_async_worker(3, "forkserver")
-    calls.async_utils_module.schedule_async_save(calls.reference_request("request"))
-    calls.training_module.maybe_finalize_async_save(True, True)
-    calls.checkpointing_module.is_empty_async_queue()
-    calls.restart_module.reset_persistent_async_worker("nvrx")
-
-    assert calls.native_async == []
-    assert calls.reference_async == [
-        ("init", (3, "forkserver")),
-        ("schedule", (calls.reference_request("request", 0),)),
-        ("finalize", (True, True)),
-        ("is-empty", ()),
-        ("reset", ("nvrx",)),
-    ]
-
-
-def test_reference_async_requests_receive_monotonic_call_indices(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    calls.args.ckpt_provider = "nvrx"
-
-    for value in ("first", "second", "third"):
-        calls.async_utils_module.schedule_async_save(calls.reference_request(value))
-
-    scheduled = [args[0] for name, args in calls.reference_async if name == "schedule"]
-    assert [request.call_idx for request in scheduled] == [0, 1, 2]
-    assert calls.training_module.maybe_finalize_async_save() == [0, 1, 2]
-
-
-def test_native_provider_uses_repo_owned_load_reader(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-
-    get_reader = calls.torch_strategy_module._get_filesystem_reader
-    result = get_reader("/checkpoint", cache_metadata=True, async_strategy="nvrx")
-
-    assert result == "native-reader"
-    assert calls.native_readers == [("/checkpoint", True)]
-    assert calls.reference_readers == []
-    assert calls.args.async_strategy == "nvrx"
-
-
-def test_reference_provider_keeps_original_load_reader(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    calls.args.ckpt_provider = "nvrx"
-
-    get_reader = calls.torch_strategy_module._get_filesystem_reader
-    result = get_reader("/checkpoint", cache_metadata=True, async_strategy="nvrx")
-
-    assert result == "reference-reader"
-    assert calls.native_readers == []
-    assert calls.reference_readers == [("/checkpoint", True, "nvrx")]
-
-
-def test_optimizer_uses_legacy_string_dtype_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    buffer = SimpleNamespace(
-        param_dtype="torch.bfloat16",
-        grad_dtype="torch.float32",
-        params=[SimpleNamespace(dtype="torch.bfloat16")],
-    )
-    optimizer = calls.distrib_module.DistributedOptimizer([buffer])
-    expected = "dtype_param_torch:bfloat16_grad_torch:float32"
-    assert list(optimizer.gbuf_ranges[0]) == [expected]
-    assert list(optimizer.per_bucket_numel[0]) == [expected]
-    assert list(optimizer.per_bucket_numel_unpadded[0]) == [expected]
-    state_dict = {0: {expected: {}}, "buckets_coalesced": False}
-    optimizer.split_state_dict_if_needed(state_dict)
-    assert list(state_dict[0]) == [expected]
-    assert list(optimizer.gbuf_ranges[0]) == [expected]
-
-
-def test_training_dispatch_warmup_and_upstream_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-
-    class ModelChunk:
-        def free_overlap_buffers(self) -> None:
-            calls.free_overlap += 1
-
-    model = [ModelChunk()]
-    result = calls.training_module.save_checkpoint_and_time(
-        10,
-        model,
-        "optimizer",
-        "scheduler",
-        123,
-        "context",
-        train_data_iterator="iterator",
-    )
-    assert result == "native"
-    assert calls.empty_cache == 1
-    assert calls.free_overlap == 1
-    assert len(calls.native_saves) == 1
-    assert calls.native_saves[0][1]["train_data_iterator"] == "iterator"
-    assert not calls.reference_saves
-    assert calls.training_module.train() == "trained"
-    assert calls.training_module.train() == "trained"
-    assert calls.warmup == 2  # noqa: PLR2004
-    calls.args.ckpt_provider = "nvrx"
-    assert calls.training_module.save_checkpoint(11, model, None, None, 0) == "reference"
-    assert len(calls.reference_saves) == 1
-
-
-def test_fp8_gc_stays_inside_checkpoint_save(monkeypatch: pytest.MonkeyPatch) -> None:
-    _, calls = _load_integration(monkeypatch)
-    calls.args.fp8 = True
-    observed_during_save: list[int] = []
-    original_native_save = sys.modules["nvrx_checkpointing.tools"].save_checkpoint
-
-    def native_save(*args: Any, **kwargs: Any) -> str:
-        result = original_native_save(*args, **kwargs)
-        observed_during_save.append(calls.gc_collect)
-        return result
-
-    sys.modules["nvrx_checkpointing.tools"].save_checkpoint = native_save
-    calls.training_module.save_checkpoint_and_time(10, [], None, None, 0, None)
-    assert observed_during_save == [0]
-    assert calls.gc_collect == 1
-    calls.training_module.gc.collect()
-    assert calls.gc_collect == 2  # noqa: PLR2004

@@ -1279,15 +1279,18 @@ class PerfReport:
         gpus: int,
         *,
         results_dir: Path | None = None,
+        otel_reporting: bool | None = None,
     ) -> bool:
         flavor_names = flavor.split("-")
         results_dir = results_dir or log.parent
         native = "nvrx" not in flavor_names and (
             "native" in flavor_names or any(results_dir.glob("checkpoint_server.cycle*.log"))
         )
+        if otel_reporting is None:
+            otel_reporting = _otel_reporting_enabled()
         processed = (
             otel_report.post_process(results_dir, gpus, native)
-            if _otel_reporting_enabled()
+            if otel_reporting
             else log_report.post_process(log, results_dir, gpus, native)
         )
         metrics = processed["metrics"]
@@ -1724,6 +1727,8 @@ def _flag(option: str) -> str:
 @dataclass
 class FlavorPolicy:
     phase1_train_iters: int = _PHASE1_TRAIN_ITERS
+    phase1_save_interval: int | None = None
+    phase1_checkpoints: int = 1
     phase2_save_interval: int = 250
     phase2_checkpoints: int = 3
     checkpoint_routines: int = 1
@@ -1758,9 +1763,10 @@ class FlavorPolicy:
         run, phase1 = _run_dir(cfg), _run_dir(cfg) / "phase1-checkpoints"
         extend_training = args.checkpoints_per_run is not None or args.repeat != 1
         if phase == 1:
+            save_interval = self.phase1_save_interval or self.phase1_train_iters
             return TrainConfig(
                 args.nodes, args.gpus_per_node, phase1, None, args.config, provider,
-                1, self.phase1_train_iters, 1, extend_training,
+                1, save_interval, self.phase1_checkpoints, extend_training,
             )
         checkpoints = self.phase2_checkpoints if args.checkpoints_per_run is None else args.checkpoints_per_run
         if checkpoints_override is not None:
@@ -1909,7 +1915,10 @@ class DeterministicFlavor(Flavor):
     def configure(self, policy: FlavorPolicy) -> None:
         policy.reporter = self.report
         policy.requires_finite_run = True
-        policy.phase1_train_iters = 25
+        policy.otel_reporting = False
+        policy.phase1_train_iters = 50
+        policy.phase1_save_interval = 25
+        policy.phase1_checkpoints = 2
         # Determinism compares checkpoint contents, so retain three phase-2
         # checkpoints while shortening the training between them. A job that
         # names two runs trains both, and the former 250-iteration cadence
@@ -1940,6 +1949,7 @@ class DeterministicFlavor(Flavor):
             log.with_name(f"{stem}_report.json"),
             args.gpus_per_node,
             results_dir=source_log.parent,
+            otel_reporting=False,
         ):
             logger.warning("performance baseline failed; determinism comparisons passed")
         return True
@@ -1967,6 +1977,11 @@ class DeterministicFlavor(Flavor):
         _drop(opts, "--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
         env.update(
             PYTHONHASHSEED="0",
+            # OpenTelemetry's Python ID generator advances the application's
+            # global random state once per span. The providers emit different
+            # span sets, so tracing would make their saved RNG states differ.
+            MEGATRON_OTEL_ENABLED="0",
+            NATIVE_CKPT_OTEL_ENABLE="0",
             NCCL_ALGO="Ring",
             NCCL_PROTO="Simple",
             NCCL_NVLS_ENABLE="0",
@@ -2602,6 +2617,12 @@ def _phase_command(
     _toolchain(cfg, args).apply(env, include_nvrx=include_nvrx)
     flavors.transform(opts, env)
     applied = flavors.policy.apply_options(opts, cfg, phase)
+    if provider == "native":
+        # Native comparisons omit MCore's unused process-group cache options.
+        for flag in ("--ckpt-pg-tensors-cache-path", "--ckpt-pg-tensors-cache-create"):
+            if any(_flag(option) == flag for option in opts):
+                _drop(opts, flag)
+                applied.append(f"drop {flag}")
     _print_flavor_options(flavors, phase, applied)
     expert = opts[opts.index("--expert-model-parallel-size") + 1]
     env["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = expert
@@ -2642,7 +2663,7 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             f"[slurm_job:restart] {label or 'run'} resuming phase 2 from iteration {resume_iteration}",
         )
     while phase == 1 or args.repeat == 0 or cycle < args.repeat:
-        expected_checkpoints = 1 if phase == 1 else flavors.policy.phase2_checkpoints
+        expected_checkpoints = flavors.policy.phase1_checkpoints if phase == 1 else flavors.policy.phase2_checkpoints
         if phase == 2 and args.checkpoints_per_run is not None:
             expected_checkpoints = args.checkpoints_per_run
         if checkpoints_override is not None:
@@ -3224,14 +3245,24 @@ def _emit_checkpoint_resource_metrics(
         instrument.set(value)
     meter_provider.shutdown()
 
+def _install_selected_checkpoint_provider() -> ModuleType:
+    """Install native hooks only for a native comparison run."""
+    from nvrx_checkpointing.megatron import provider as megatron_provider  # noqa: PLC0415
+
+    if megatron_provider.selected_provider() == megatron_provider.NATIVE_PROVIDER:
+        from nvrx_checkpointing.megatron import integration as megatron_integration  # noqa: PLC0415
+
+        megatron_integration.install()
+    return megatron_provider
+
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
 
-    from nvrx_checkpointing import megatron_integration  # noqa: PLC0415
-
-    megatron_integration.install()
+    # Reference runs execute without native integration patches.
+    megatron_provider = _install_selected_checkpoint_provider()
     from megatron.core.enums import ModelType  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     from megatron.training import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
         inprocess_restart,
@@ -3266,7 +3297,7 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
     pretrain_module.train_valid_test_datasets_provider.is_distributed = True
     pretrain_fn, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
     args = parse_and_validate_args(
-        extra_args_provider=megatron_integration.compose_extra_args_provider(add_modelopt_args),
+        extra_args_provider=megatron_provider.compose_extra_args_provider(add_modelopt_args),
         args_defaults={"tokenizer_type": "NullTokenizer"},
     )
     model_cfg = hybrid_config_from_args(args) if entrypoint == "hybrid" else gpt_config_from_args(args)

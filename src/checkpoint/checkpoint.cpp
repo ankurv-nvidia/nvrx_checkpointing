@@ -557,9 +557,7 @@ struct CheckpointWriter
         }
     }
 
-    void SendToServer(cipc::SnapshotId const&                  snapshotId,
-                      std::filesystem::path const&             ckptPath,
-                      std::span<StateTree::SnapshotBlob const> snapshotBlobs)
+    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
     {
         SetThreadName("ncc:sendsvr");
 
@@ -573,12 +571,27 @@ struct CheckpointWriter
             // thread, where the current device may have fallen back to device 0.
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
-            serdes::WriteTrivial(sstrm, static_cast<uint32_t>(snapshotBlobs.size()));
-            for (auto const& blob : snapshotBlobs)
-            {
-                serdes::WriteBlobWithSize<uint16_t>(sstrm, blob.fqn);
-                serdes::WriteBlobWithSize<uint32_t>(sstrm, blob.data);
-            }
+            uint32_t numBlobs   = 0;
+            uint32_t numScalars = 0;
+            root.WalkNodes([&](StateNode const& node) {
+                auto const type = static_cast<StateNode::Type>(node.data.index());
+                if (type == StateNode::Type::Blob) { ++numBlobs; }
+                else if (type == StateNode::Type::Scalar) { ++numScalars; }
+            });
+            serdes::WriteTrivial(sstrm, numBlobs);
+            root.WalkNodes([&](StateNode const& node) {
+                auto const type = static_cast<StateNode::Type>(node.data.index());
+                if (type == StateNode::Type::Blob)
+                {
+                    auto const& blob = std::get<StateNode::Blob>(node.data);
+                    serdes::WriteBlobWithSize<uint32_t>(sstrm, std::string_view(blob.data(), blob.size()));
+                }
+            });
+            serdes::WriteTrivial(sstrm, numScalars);
+            root.WalkNodes([&](StateNode const& node) {
+                auto const type = static_cast<StateNode::Type>(node.data.index());
+                if (type == StateNode::Type::Scalar) { serdes::WriteTrivial(sstrm, std::get<StateNode::Scalar>(node.data)); }
+            });
             auto msg = sstrm.str();
             msgQueue.Push({cipc::Message::ActivateSnapshot{.sessionId    = cipc::SessionId{0},
                                                            .snapshotId   = snapshotId,
@@ -627,13 +640,10 @@ struct CheckpointWriter
 };
 }    // namespace
 
-void SaveCheckpoint(StateTree const&                         root,
-                    cipc::SnapshotId const&                  snapshotId,
-                    std::filesystem::path const&             ckptPath,
-                    std::span<StateTree::SnapshotBlob const> snapshotBlobs)
+void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
 {
     CheckpointWriter writer{root};
-    writer.SendToServer(snapshotId, ckptPath, snapshotBlobs);
+    writer.SendToServer(snapshotId, ckptPath);
 }
 
 void WaitForCheckpointSave(RankTopology const& topo)

@@ -6,9 +6,9 @@ from pathlib import Path
 
 sys.path.append(Path(__file__).parent.parent.parent.parent.as_posix())
 
-import nvrx_checkpointing.checkpoint
-import nvrx_checkpointing.mapping
 import numpy as np
+import nvrx_checkpointing.checkpoint
+import nvrx_checkpointing.megatron.mapping
 import torch
 import torch.cuda
 import torch.mps
@@ -59,7 +59,7 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
     }
     state_dict["dict_self"] = {"self": state_dict}
     state_dict["tensor"] = torch.arange(0, 16, dtype=torch.int8, device=device).reshape(4, 4)
-    state_dict["sharded_tensor"] = nvrx_checkpointing.mapping.ShardedTensor(
+    state_dict["sharded_tensor"] = nvrx_checkpointing.megatron.mapping.ShardedTensor(
         key="sharded_tensor",
         data=torch.arange(16.0, 24.0, dtype=torch.float32, device=device).reshape(4, 2),
         dtype=torch.float32,
@@ -68,7 +68,7 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
         global_shape=(8, 4),
         axis_fragmentations=None,
     )
-    state_dict["sharded_tensor_1"] = nvrx_checkpointing.mapping.ShardedTensor(
+    state_dict["sharded_tensor_1"] = nvrx_checkpointing.megatron.mapping.ShardedTensor(
         key="sharded_tensor",
         data=torch.arange(16.0, 24.0, dtype=torch.float16, device=device).reshape(2, 4),
         dtype=torch.float16,
@@ -81,7 +81,7 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
 
     # Multi chunk sharded tensor
     state_dict["multi_shten"] = {
-        f"chunk{x}": nvrx_checkpointing.mapping.ShardedTensor(
+        f"chunk{x}": nvrx_checkpointing.megatron.mapping.ShardedTensor(
             key="reparented.multi_shten.chunks",
             data=torch.arange(16.0, 24.0, dtype=torch.float32, device=device).reshape(1, 4, 2),
             dtype=torch.float32,
@@ -93,11 +93,11 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
         for x in range(11)
     }
 
-    state_dict["shtenfac1"] = nvrx_checkpointing.mapping.ShardedTensorFactory(
+    state_dict["shtenfac1"] = nvrx_checkpointing.megatron.mapping.ShardedTensorFactory(
         key="shtenfac1",
         data=torch.arange(24, 32, dtype=torch.int32, device=device).reshape(2, 4),
         build_fn=lambda *_args: [
-            nvrx_checkpointing.mapping.ShardedTensor(
+            nvrx_checkpointing.megatron.mapping.ShardedTensor(
                 key="k",
                 data=torch.arange(16.0, 24.0, dtype=torch.float16, device=device).reshape(2, 4),
                 dtype=torch.float16,
@@ -114,11 +114,11 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
     )
 
     state_dict["shtenfac2"] = {
-        "k1": nvrx_checkpointing.mapping.ShardedTensorFactory(
+        "k1": nvrx_checkpointing.megatron.mapping.ShardedTensorFactory(
             key="k1",
             data=torch.arange(24, 32, dtype=torch.int32, device=device).reshape(2, 4),
             build_fn=lambda *_args: [
-                nvrx_checkpointing.mapping.ShardedTensor(
+                nvrx_checkpointing.megatron.mapping.ShardedTensor(
                     key="shtenfac2.k1.k",
                     data=torch.arange(16.0, 24.0, dtype=torch.float16, device=device).reshape(2, 4),
                     dtype=torch.float16,
@@ -135,7 +135,7 @@ def workload(_session_id: int, rank: int, world_size: int) -> None:
         ),
     }
 
-    state_dict["sharded_object"] = nvrx_checkpointing.mapping.ShardedObject(
+    state_dict["sharded_object"] = nvrx_checkpointing.megatron.mapping.ShardedObject(
         key="sharded_object",
         data={"a": 1, "b": 2},
         global_offset=(0, 0),
@@ -176,7 +176,6 @@ thrds = [threading.Thread(target=workload, args=(2, rank, world_size)) for rank 
 [t.start() for t in thrds]
 [t.join() for t in thrds]
 
-# root.register_scalars_in_dict(state_dict)
 # root.register_torch_tensor("tensor", state_dict["tensor"])
 # root.register_sharded_torch_tensor(
 #    "sharded_tensor", state_dict["sharded_tensor"].__dict__

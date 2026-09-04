@@ -181,7 +181,7 @@
   eval_micro_batch_size ........................... 1
   evidence_data_path .............................. None
   exit_duration_in_mins ........................... 235
-  exit_interval ................................... 100
+  exit_interval ................................... 125
   exit_on_missing_checkpoint ...................... False
   exit_signal ..................................... 15
   exit_signal_handler ............................. False

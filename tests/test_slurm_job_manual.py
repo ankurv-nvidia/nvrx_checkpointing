@@ -247,6 +247,31 @@ def _load_run_dependency():
 _CONSTANT_STRUCTURE = "--ckpt-assume-constant-structure"
 
 
+@pytest.mark.parametrize(("selected", "expected_installs"), [("native", 1), ("nvrx", 0)])
+def test_comparison_launcher_installs_only_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    selected: str,
+    expected_installs: int,
+) -> None:
+    slurm_job = _load_slurm_job()
+    installs: list[None] = []
+    package = ModuleType("nvrx_checkpointing")
+    megatron_package = ModuleType("nvrx_checkpointing.megatron")
+    megatron_package.provider = SimpleNamespace(
+        NATIVE_PROVIDER="native",
+        selected_provider=lambda: selected,
+    )
+    megatron_package.integration = SimpleNamespace(install=lambda: installs.append(None))
+    package.megatron = megatron_package
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", package)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron", megatron_package)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.provider", megatron_package.provider)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.integration", megatron_package.integration)
+
+    assert slurm_job._install_selected_checkpoint_provider() is megatron_package.provider
+    assert len(installs) == expected_installs
+
+
 def test_node_once_waits_for_local_peers_before_action(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     results = tmp_path / "results"
@@ -1411,9 +1436,13 @@ def test_perf_enables_parallel_checkpoint_optimizations(
             assert "--ckpt-fully-parallel-load-per-rank-objects" in command
             assert "--ckpt-drop-redundant-extra-state" in command
             assert "--no-ckpt-load-validate-sharding-integrity" in command
-            cache = next(option for option in command if option.startswith("--ckpt-pg-tensors-cache-path="))
-            assert cache.endswith("/pg-tensors-cache")
-        assert "--ckpt-pg-tensors-cache-create" in phase1
+            cache_options = [option for option in command if option.startswith("--ckpt-pg-tensors-cache-path=")]
+            if provider == "native":
+                assert not cache_options
+            else:
+                assert len(cache_options) == 1
+                assert cache_options[0].endswith("/pg-tensors-cache")
+        assert ("--ckpt-pg-tensors-cache-create" in phase1) == (provider == "nvrx")
         assert "--ckpt-pg-tensors-cache-create" not in phase2
 
 
@@ -1448,18 +1477,18 @@ def test_both_providers_export_megatron_otel_to_local_daemon(
 @pytest.mark.parametrize(
     "routing",
     [
-        ("native", ["perf", "native"], "0", "worker", None, "collector"),
-        ("nvrx", ["perf"], "0", "worker", "leader:4100", "relay"),
-        ("nvrx", ["perf"], "4", "leader", "file", "collector"),
+        ("native", ["perf", "native"], "0", "worker", None, "collector", 1),
+        ("nvrx", ["perf"], "0", "worker", "leader:4100", "relay", 1),
+        ("nvrx", ["perf"], "4", "leader", "file", "collector", 1),
     ],
 )
 def test_routine_validates_each_collected_cycle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    routing: tuple[str, list[str], str, str, str | None, str],
+    routing: tuple[str, list[str], str, str, str | None, str, int],
 ) -> None:
     slurm_job = _load_slurm_job()
-    provider, flavor_names, rank, host, collector, server_role = routing
+    provider, flavor_names, rank, host, collector, server_role, phase1_checkpoints = routing
     args = _args(tmp_path, repeat=1)
     args.flavors = slurm_job.FlavorSelection(flavor_names)
     child_envs = []
@@ -1531,7 +1560,7 @@ def test_routine_validates_each_collected_cycle(
     ]
     assert validation_calls == (
         [
-            ("native_ckpt_otel.jsonl", "42-otel-run-phase1-sr0-te0", provider, 1),
+            ("native_ckpt_otel.jsonl", "42-otel-run-phase1-sr0-te0", provider, phase1_checkpoints),
             ("native_ckpt_otel.jsonl", "42-otel-run-cycle1-sr0-te0", provider, 3),
         ]
         if rank == "0"
@@ -3618,7 +3647,7 @@ def test_valgrind_epilog_uses_log_reporting(monkeypatch: pytest.MonkeyPatch, tmp
     assert validated
 
 
-def test_deterministic_report_reads_the_native_routines_otel_directory(
+def test_deterministic_report_reads_the_native_routines_log_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3648,7 +3677,10 @@ def test_deterministic_report_reads_the_native_routines_otel_directory(
     assert positional[2] == "detr-native"
     assert positional[4] is baseline
     assert positional[3] == tmp_path / "native.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
-    assert keywords == {"results_dir": tmp_path / "native.cmp" / "logs"}
+    assert keywords == {
+        "results_dir": tmp_path / "native.cmp" / "logs",
+        "otel_reporting": False,
+    }
 
 
 def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
@@ -3679,7 +3711,10 @@ def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
     assert positional[2] == "detr-nvrx"
     assert positional[4] == {}
     assert positional[3] == tmp_path / "nvrx.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
-    assert keywords == {"results_dir": tmp_path / "nvrx.cmp" / "logs"}
+    assert keywords == {
+        "results_dir": tmp_path / "nvrx.cmp" / "logs",
+        "otel_reporting": False,
+    }
 
 
 def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
@@ -3715,11 +3750,13 @@ def test_deterministic_cadence_keeps_three_phase2_saves(tmp_path: Path) -> None:
     exit_iteration = int(opts[opts.index("--exit-interval") + 1])
     first_save = (phase1_iteration // interval + 1) * interval
 
-    assert phase1_iteration == 25  # noqa: PLR2004
-    assert phase1.save_interval == phase1_iteration
-    assert phase1.checkpoints == 1
-    assert interval == phase1_iteration
-    assert list(range(first_save, exit_iteration + 1, interval)) == [50, 75, 100]
+    assert phase1_iteration == 50  # noqa: PLR2004
+    assert phase1.save_interval == 25  # noqa: PLR2004
+    assert phase1.checkpoints == 2  # noqa: PLR2004
+    assert phase2.load == phase1.save
+    assert phase2.start_iteration == phase1_iteration
+    assert interval == 25  # noqa: PLR2004
+    assert list(range(first_save, exit_iteration + 1, interval)) == [75, 100, 125]
     # How many runs happen is --run's business, not the flavor's.
     assert policy.checkpoint_routines == 1
 
@@ -3746,9 +3783,10 @@ def test_one_iteration_deterministic_cadence_keeps_three_phase2_saves(tmp_path: 
     opts = slurm_job._train_options("pico", phase2)
 
     assert phase1.save_interval == 25  # noqa: PLR2004
+    assert phase1.checkpoints == 2  # noqa: PLR2004
     assert phase2.save_interval == 1
     assert phase2.checkpoints == 3  # noqa: PLR2004
-    assert int(opts[opts.index("--exit-interval") + 1]) == 28  # noqa: PLR2004
+    assert int(opts[opts.index("--exit-interval") + 1]) == 53  # noqa: PLR2004
 
 
 def test_deterministic_flavor_uses_the_pipeline_wheel() -> None:
@@ -4381,6 +4419,32 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     assert ("[PASS] wr_tnsr_us: median=10 us (min=8 us, median=10 us, max=12 us); baseline=10.0 us; tolerance=5.0%") in caplog.messages
 
 
+def test_perf_report_explicit_log_reporting_overrides_otel_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "1")
+    monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "1")
+    monkeypatch.setattr(slurm_job.otel_report, "post_process", lambda *_args: pytest.fail("OTLP must be disabled"))
+    monkeypatch.setattr(
+        slurm_job.log_report,
+        "post_process",
+        lambda *_args: {"source": "logs", "metrics": {}, "validation": None},
+    )
+
+    assert slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-nvrx",
+        tmp_path / "run.log",
+        {},
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+    )
+
+
 def test_perf_report_does_not_fall_back_when_otel_is_enabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4812,13 +4876,17 @@ def test_wheel_install_main_installs_from_explicit_dist(
     assert installed_from == [tmp_path]
 
 
-def test_wheel_packages_only_required_metadata_compare() -> None:
+def test_wheel_packages_megatron_modules() -> None:
     cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
     template = (REPO_ROOT / "ci/gitlab-ci-native.template.yml").read_text()
 
+    assert "megatron@megatron" in cmake
+    assert "megatron_stubs@megatron_stubs" in cmake
+    assert "debug.py" in cmake
     assert "metadata_compare.py" in cmake
     assert "peers.py" in cmake
     assert "scripts@scripts" not in cmake
+    assert 'python -c "import nvrx_checkpointing.debug"' in template
     assert "python -m nvrx_checkpointing.metadata_compare --help" in template
 
 
@@ -4995,6 +5063,9 @@ def test_flavor_transforms_are_profile_independent() -> None:
     ]
     assert deterministic_env["PYTHONHASHSEED"] == "0"
     assert deterministic_env["FLA_TILELANG"] == "0"
+    assert deterministic_env["MEGATRON_OTEL_ENABLED"] == "0"
+    assert deterministic_env["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+    assert not slurm_job.FlavorSelection(["detr"]).policy.otel_reporting
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
     mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
     slurm_job.FlavorSelection(["detr"]).transform(mamba_only_opts, {})
