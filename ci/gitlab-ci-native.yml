@@ -783,6 +783,14 @@ wheel-publish:pypi:
   variables:
     JOB_ARGS: "--nodes 64 --config ultra3bf16 --flavor perf+async+native --checkpoint-interval 125"
 
+"[PERF]:gb200:nvrx:ultra3bf16_64x4":
+  extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
+  stage: 64node-ultra3bf16
+  timeout: 1d
+  tags: [gb200, 64n]
+  variables:
+    JOB_ARGS: "--nodes 64 --config ultra3bf16 --flavor perf+async+nvrx --checkpoint-interval 125"
+
 # 64node-ultra3fp8
 
 "[DETR]:gb200:native:ultra3fp8_64x4":
@@ -907,6 +915,7 @@ wheel-publish:pypi:
     - "[DETR]:gb200:nvrx:nano3_8x4"
     - "[PERF]:gb200:nvrx:nano3_8x4"
     - "[PERF]:gb200:nvrx:super3fp4_16x4"
+    - "[PERF]:gb200:nvrx:ultra3bf16_64x4"
     - "[PERF]:gb200:nvrx:ultra3fp8_64x4"
     - "[DETR]:gb300:nvrx:nano4_32x4"
     - "[PERF]:gb300:nvrx:nano4_32x4"

@@ -140,6 +140,10 @@
             [
               "native",
               "perf"
+            ],
+            [
+              "nvrx",
+              "perf"
             ]
           ]
         },

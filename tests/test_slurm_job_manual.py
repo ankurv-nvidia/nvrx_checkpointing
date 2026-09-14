@@ -3014,6 +3014,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
 
     nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
     assert any(":super3fp4_16x4" in name for name in nvrx)
+    assert any(":ultra3bf16_64x4" in name for name in nvrx)
     assert any(":ultra3fp8_64x4" in name for name in nvrx)
     assert all(job["extends"][-1] == ".nvrx_pipeline" for job in nvrx.values())
 
@@ -3553,6 +3554,7 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:nvrx:super3fp4_16x4" in bundles["nvrx"]["dependencies"]
+    assert "[PERF]:gb200:nvrx:ultra3bf16_64x4" in bundles["nvrx"]["dependencies"]
     assert "[DETR]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
     assert "[PERF]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
     assert "[DETR]:gb300:nvrx:nano4_8x4" in bundles["nvrx"]["dependencies"]
