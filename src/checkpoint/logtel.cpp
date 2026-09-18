@@ -317,7 +317,7 @@ struct LogTelState
     {
         SvrFinalize,
         SvrWriteMetadata,
-        SvrDurable
+        SvrDurable,
     };
 
     struct ActiveSpanId
@@ -585,7 +585,7 @@ namespace
 class RoutingAppender : public otlp::OtlpFileAppender
 {
     public:
-    RoutingAppender(std::string const& filePath, LogTelState& state) : _state(state)
+    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state)
     {
         if (!filePath.empty())
         {

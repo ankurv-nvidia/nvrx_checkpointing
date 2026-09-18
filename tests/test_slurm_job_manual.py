@@ -2766,12 +2766,23 @@ def test_enroot_import_requests_runner_gpus(
     assert f"--partition={partition}" in cmd
 
 
-def test_slurm_image_matches_megatron_wheel_base() -> None:
+def test_image_preparation_stack_versions_match() -> None:
     slurm_job = _load_slurm_job()
     prepare_image = (SCRIPTS_DIR / "prepare_image.py").read_text()
+    prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
+    enroot = (REPO_ROOT / "scripts" / "enroot.sh").read_text()
+    dockerfile = (REPO_ROOT / "Dockerfile.ci").read_text()
 
-    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.07-py3"
-    assert 'base_image = image.parent / "pytorch2607.sqsh"' in prepare_image
+    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.08-py3"
+    assert 'base_image = image.parent / "pytorch2608.sqsh"' in prepare_image
+    assert 'DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.08-py3"' in prepare
+    assert 'DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.08-py3"' in enroot
+    assert "pytorch2608.sqsh" in enroot
+    assert "FROM nvcr.io/nvidia/pytorch:26.08-py3" in dockerfile
+    assert "ENV CC=clang-23 CXX=clang++-23" in dockerfile
+    assert "CLANG_VERSION=23" in prepare
+    assert "cuda-toolkit-13-4" in prepare
+    assert "/usr/local/cuda-13.4" in prepare
 
 
 def test_image_build_selects_account_compatible_partition(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2808,7 +2819,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     prepare_image = _load_prepare_image()
-    (tmp_path / "pytorch2607.sqsh").touch()
+    (tmp_path / "pytorch2608.sqsh").touch()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
@@ -2899,18 +2910,14 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
         "when": "on_success",
     }
     assert manual_optional["rules"][2] == {
-        "if": '$RUN_PIPELINE == "true"',
-        "when": "on_success",
-    }
-    assert manual_optional["rules"][3] == {
-        "if": '$CI_OPEN_MERGE_REQUESTS',
+        "if": '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"',
         "when": "on_success",
     }
     # A rule's allow_failure replaces the job's own, so leaving it unset keeps
     # the job's exit_codes: a played job that fails reports a failure, and only
     # the perf-drift exit is tolerated.
-    assert manual_optional["rules"][4] == {"when": "manual"}
-    assert "allow_failure" not in manual_optional["rules"][4]
+    assert manual_optional["rules"][3] == {"when": "manual"}
+    assert "allow_failure" not in manual_optional["rules"][3]
     for suite in ("nvrx", "large_scale", "main_branch_runs"):
         policy = config[f".{suite}_pipeline"]
         assert "allow_failure" not in policy
@@ -3463,7 +3470,7 @@ def test_sacct_job_array_without_indexed_rows_fails_on_any_failed_task(monkeypat
         slurm_job._verify_allocation("123", 0, job_array=True)
 
 
-def test_workflow_reuses_head_pipeline_and_runs_open_mr_pushes() -> None:
+def test_workflow_runs_merge_request_events_without_duplicate_branch_pipelines() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
     rules = config["workflow"]["rules"]
 
@@ -3473,8 +3480,8 @@ def test_workflow_reuses_head_pipeline_and_runs_open_mr_pushes() -> None:
         "large-scale",
         "main-branch-runs",
     ]
-    assert not any('CI_PIPELINE_SOURCE == "merge_request_event"' in rule.get("if", "") for rule in rules)
-    assert {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'} in rules
+    assert {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'} in rules
+    assert not any("CI_OPEN_MERGE_REQUESTS" in rule.get("if", "") for rule in rules)
     assert {"if": '$CI_PIPELINE_SOURCE == "push" && $RUN_PIPELINE == "true"'} in rules
     assert any("pipeline" in rule.get("if", "") and rule.get("when") != "never" for rule in rules)
     assert any(rule.get("when") == "never" and "PIPELINE_SUITE !=" in rule.get("if", "") for rule in rules)
@@ -4833,8 +4840,8 @@ def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
     monkeypatch.setenv("VCPKG_ROOT", str(tmp_path / "vcpkg"))
     tools = {
         "cmake": "/usr/bin/cmake",
-        "clang-22": "/usr/bin/clang-22",
-        "clang++-22": "/usr/bin/clang++-22",
+        "clang-23": "/usr/bin/clang-23",
+        "clang++-23": "/usr/bin/clang++-23",
     }
     monkeypatch.setattr(wheel_install.shutil, "which", tools.get)
     monkeypatch.setattr(
@@ -4849,8 +4856,8 @@ def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
 
     assert "-DVCPKG_BOOTSTRAP_OPTIONS=-skipDependencyChecks" in commands[0]
     assert f"-DVCPKG_ROOT={tmp_path / 'vcpkg'}" in commands[0]
-    assert "-DCMAKE_C_COMPILER=/usr/bin/clang-22" in commands[0]
-    assert "-DCMAKE_CXX_COMPILER=/usr/bin/clang++-22" in commands[0]
+    assert "-DCMAKE_C_COMPILER=/usr/bin/clang-23" in commands[0]
+    assert "-DCMAKE_CXX_COMPILER=/usr/bin/clang++-23" in commands[0]
     assert commands[0][commands[0].index("-B") + 1] == str(build_dir)
     assert commands[1][2] == str(build_dir)
 
@@ -4973,7 +4980,7 @@ def test_source_wheel_build_prepares_ubuntu_when_clang_is_missing(
     prepared = False
 
     def which(name: str) -> str | None:
-        if name in ("clang-22", "clang++-22") and prepared:
+        if name in ("clang-23", "clang++-23") and prepared:
             return f"/usr/bin/{name}"
         return None
 

@@ -117,7 +117,7 @@ inline int GetCurrentNumaNode()
     if (numaCount <= 1) { return 0; }
     hwloc_cpuset_t cpuset       = hwloc_bitmap_alloc();
     auto           cleanup      = [&] { hwloc_bitmap_free(cpuset); };
-    auto           getCpusetStr = [&]() {
+    auto           getCpusetStr = [&] {
         std::array<char, 256> buf{};
         hwloc_bitmap_list_snprintf(buf.data(), buf.size(), cpuset);
         return std::string(buf.data());

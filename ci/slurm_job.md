@@ -55,7 +55,7 @@ Authentication tokens are intentionally not written to the reproducer. If a
 direct re-run has no `CI_JOB_TOKEN`, native wheel setup falls back to a source
 build. Its preparation step uses a writable container overlay and runs
 `scripts/prepare.sh ubuntu2404` when the custom image does not contain
-`clang-22`; the supplied `.sqsh` itself is not overwritten. Native checkpoint
+`clang-23`; the supplied `.sqsh` itself is not overwritten. Native checkpoint
 setup and an exact NVIDIA Resiliency Extension install share one preparation
 `srun`. nvrx_checkpointing is installed with `pip --target` under
 `<run>/deps/python`, so the final `pip list` in `<run>_prep.log` includes its

@@ -133,12 +133,12 @@ static void PutU8(ByteBuffer& b, uint8_t v)
 static void PutU16LE(ByteBuffer& b, uint16_t v)
 {
     b.push_back(static_cast<char>(v & ByteMask));
-    b.push_back(static_cast<char>(v >> 8));
+    b.push_back(static_cast<char>(v >> 8u));
 }
 
 static void PutU32LE(ByteBuffer& b, uint32_t v)
 {
-    for (int i = 0; i < 4; ++i) { b.push_back(static_cast<char>((v >> (i * 8)) & ByteMask)); }
+    for (unsigned i = 0; i < 4; ++i) { b.push_back(static_cast<char>((v >> (i * 8u)) & ByteMask)); }
 }
 
 static void PutBytes(ByteBuffer& b, std::string_view sv)
@@ -169,7 +169,7 @@ static void PickleInt(ByteBuffer& b, uint64_t v)
         while (x != 0)
         {
             tmp[n++] = static_cast<uint8_t>(x & ByteMask);
-            x >>= 8;
+            x >>= 8u;
         }
         if (n > 0 && (tmp[n - 1] & 0x80U) != 0U) { tmp[n++] = 0U; }
         PutU8(b, PickleLong1Opcode);
@@ -234,7 +234,7 @@ static ByteBuffer BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& sha
     out.reserve(InitialPickleReserveBytes);
 
     uint8_t memo    = 0;
-    auto    memoize = [&]() { PickleBinput(out, memo++); };
+    auto    memoize = [&] { PickleBinput(out, memo++); };
 
     PutU8(out, 0x80);
     PutU8(out, 0x02);
@@ -370,7 +370,7 @@ static ByteBuffer BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSi
     extra[0] = 'F';
     extra[1] = 'B';
     extra[2] = static_cast<char>(paddingSize & ByteMask);
-    extra[3] = static_cast<char>((paddingSize >> 8) & ByteMask);
+    extra[3] = static_cast<char>((paddingSize >> 8u) & ByteMask);
     return extra;
 }
 
@@ -627,27 +627,37 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     static constexpr size_t SerialIdIdx   = 6;
 
     std::array<EntryPlan, checkpoint::distcp::EntryFullNames.size() - 1> entries{
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataPklIdx]},
-                  .data     = dataPkl.data(),
-                  .size     = dataPkl.size(),
-                  .padding  = {}},
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[FormatVerIdx]},
-                  .data     = checkpoint::distcp::FormatVersionBytes.data(),
-                  .size     = checkpoint::distcp::FormatVersionBytes.size(),
-                  .padding  = {}},
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[StorageAlnIdx]},
-                  .data     = checkpoint::distcp::StorageAlignmentBytes.data(),
-                  .size     = checkpoint::distcp::StorageAlignmentBytes.size(),
-                  .padding  = {}},
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[ByteOrderIdx]},
-                  .data     = checkpoint::distcp::ByteorderBytes.data(),
-                  .size     = checkpoint::distcp::ByteorderBytes.size(),
-                  .padding  = {}},
+        EntryPlan{
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[DataPklIdx]},
+            .data     = dataPkl.data(),
+            .size     = dataPkl.size(),
+            .padding  = {},
+        },
+        EntryPlan{
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[FormatVerIdx]},
+            .data     = checkpoint::distcp::FormatVersionBytes.data(),
+            .size     = checkpoint::distcp::FormatVersionBytes.size(),
+            .padding  = {},
+        },
+        EntryPlan{
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[StorageAlnIdx]},
+            .data     = checkpoint::distcp::StorageAlignmentBytes.data(),
+            .size     = checkpoint::distcp::StorageAlignmentBytes.size(),
+            .padding  = {},
+        },
+        EntryPlan{
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[ByteOrderIdx]},
+            .data     = checkpoint::distcp::ByteorderBytes.data(),
+            .size     = checkpoint::distcp::ByteorderBytes.size(),
+            .padding  = {},
+        },
         EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataZeroIdx]}, .data = srcPtr, .size = length, .padding = {}},
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[VersionIdx]},
-                  .data     = checkpoint::distcp::VersionBytes.data(),
-                  .size     = checkpoint::distcp::VersionBytes.size(),
-                  .padding  = {}},
+        EntryPlan{
+            .fullName = std::string{checkpoint::distcp::EntryFullNames[VersionIdx]},
+            .data     = checkpoint::distcp::VersionBytes.data(),
+            .size     = checkpoint::distcp::VersionBytes.size(),
+            .padding  = {},
+        },
     };
 
     // Set up a streaming miniz writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD

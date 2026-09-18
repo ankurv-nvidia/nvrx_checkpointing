@@ -21,9 +21,10 @@ declare -A DOCKER_IMAGES=()
 DOCKER_IMAGES["ubuntu2404"]="docker.io/library/ubuntu:24.04"
 DOCKER_IMAGES["fedora44"]="docker.io/library/fedora:44"
 DOCKER_IMAGES["pytorch2412"]="nvcr.io/nvidia/pytorch:24.12-py3"
-DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.07-py3"
+DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.08-py3"
 
 function fedora {
+    # Fedora 44 provides LLVM 22; container compilation uses the Ubuntu path below.
     GCC_VERSION=16
     CLANG_VERSION=22
     export TZ=America/Los_Angeles
@@ -104,7 +105,7 @@ function pytorch {
 }
 
 function ubuntu2404 {
-    CLANG_VERSION=22
+    CLANG_VERSION=23
     GCC_VERSION=13
     UBUNTU_CODENAME=noble
     UBUNTU_VERSION=24.04
@@ -328,7 +329,7 @@ function cuda13 {
     # CUDA stuff
     packages=(
         pciutils
-        cuda-toolkit-13-3
+        cuda-toolkit-13-4
         libcudnn9-cuda-13
         libcutlass-dev
         cudnn9-cuda-13
@@ -343,7 +344,7 @@ function cuda13 {
 
     apt update && apt-get install --yes --no-install-recommends "${packages[@]}"
 
-    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.3}
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.4}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
 }

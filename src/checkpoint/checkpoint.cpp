@@ -283,7 +283,7 @@ struct CheckpointWriter
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
         state->numaNode = numa;
-        std::thread([topo, numa, state, readyP]() {
+        std::thread([topo, numa, state, readyP] {
             SetThreadName("ncc:bufwarm");
             try
             {
@@ -330,7 +330,7 @@ struct CheckpointWriter
 
     TimePoint const start = Clock::now();
 
-    CheckpointWriter(StateTree const& rootIn) : root(rootIn) {}
+    explicit CheckpointWriter(StateTree const& rootIn LFTBND) : root(rootIn) {}
     ~CheckpointWriter() {}    // NOLINT(modernize-use-equals-default) causes GCC warnings
     CLASS_DELETE_COPY_AND_MOVE(CheckpointWriter);
 
@@ -358,11 +358,11 @@ struct CheckpointWriter
         uint64_t                readOffset{};
         size_t                  bufBytesRemaining;    // remaining free space in the current slot; starts at a full slot
 
-        PartitionContext(CheckpointWriter*       thatIn,
-                         uint8_t                 indexIn,
-                         uint64_t                partitionStartIn,
-                         uint64_t                partitionEndIn,
-                         cipc::SnapshotId const& snapshotIdIn) :
+        PartitionContext(CheckpointWriter* thatIn LFTBND,
+                         uint8_t                  indexIn,
+                         uint64_t                 partitionStartIn,
+                         uint64_t                 partitionEndIn,
+                         cipc::SnapshotId const&  snapshotIdIn) :
             that(thatIn),
             index(indexIn),
             partitionStart(partitionStartIn),
@@ -427,11 +427,13 @@ struct CheckpointWriter
 
         void FlushBytes_(size_t sendBytes)
         {
-            auto [slot, slotbuf] = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{.sessionId   = cipc::SessionId{0},
-                                                                                          .snapshotId  = snapshotId,
-                                                                                          .globalRank  = that->root.GlobalRank(),
-                                                                                          .messageSize = static_cast<uint32_t>(sendBytes),
-                                                                                          .offset      = sendOffset});
+            auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{
+                .sessionId   = cipc::SessionId{0},
+                .snapshotId  = snapshotId,
+                .globalRank  = that->root.GlobalRank(),
+                .messageSize = static_cast<uint32_t>(sendBytes),
+                .offset      = sendOffset,
+            });
             auto*                              ptr               = slotbuf;
             DeviceContext*                     lastDeviceContext = nullptr;
             std::unordered_set<DeviceContext*> usedDeviceContexts;
@@ -544,7 +546,7 @@ struct CheckpointWriter
             uint64_t const partitionStart      = partitionBufferSize * index;
             uint64_t const partitionEnd        = std::min(partitionStart + partitionBufferSize, totalTensorStateSizeInBytes);
             if (partitionStart >= partitionEnd) { break; }
-            task = std::async(std::launch::async | std::launch::deferred, [this, index, partitionStart, partitionEnd, snapshotId]() {
+            task = std::async(std::launch::async | std::launch::deferred, [this, index, partitionStart, partitionEnd, snapshotId] {
                 SetThreadName(fmt::format("ncc:wrtn:{}", index).c_str());
                 PartitionContext ctx(this, index, partitionStart, partitionEnd, snapshotId);
                 // On scope exit free the buffer;
@@ -593,13 +595,15 @@ struct CheckpointWriter
                 if (type == StateNode::Type::Scalar) { serdes::WriteTrivial(sstrm, std::get<StateNode::Scalar>(node.data)); }
             });
             auto msg = sstrm.str();
-            msgQueue.Push({cipc::Message::ActivateSnapshot{.sessionId    = cipc::SessionId{0},
-                                                           .snapshotId   = snapshotId,
-                                                           .globalRank   = root.GlobalRank(),
-                                                           .snapshotSize = totalTensorStateSizeInBytes,
-                                                           .messageSize  = static_cast<uint32_t>(msg.size()),
-                                                           .numaNode     = numaNode,
-                                                           .startedAt    = root.startedAt}},
+            msgQueue.Push({cipc::Message::ActivateSnapshot{
+                              .sessionId    = cipc::SessionId{0},
+                              .snapshotId   = snapshotId,
+                              .globalRank   = root.GlobalRank(),
+                              .snapshotSize = totalTensorStateSizeInBytes,
+                              .messageSize  = static_cast<uint32_t>(msg.size()),
+                              .numaNode     = numaNode,
+                              .startedAt    = root.startedAt,
+                          }},
                           msg.data(),
                           msg.size());
         }
@@ -627,13 +631,15 @@ struct CheckpointWriter
                             totalTensorStateSizeInBytes));
         }
 
-        msgQueue.Push({cipc::Message::FinalizeSnapshot{.sessionId          = cipc::SessionId{0},
-                                                       .globalRank         = root.GlobalRank(),
-                                                       .snapshotId         = snapshotId,
-                                                       .snapshotDuration   = stop2 - start,
-                                                       .d2hDuration        = stop2 - stop1,
-                                                       .d2hRequests        = totalD2HRequests.load(),
-                                                       .totalSnapshotBytes = totalWrittenBytes.load()}},
+        msgQueue.Push({cipc::Message::FinalizeSnapshot{
+                          .sessionId          = cipc::SessionId{0},
+                          .globalRank         = root.GlobalRank(),
+                          .snapshotId         = snapshotId,
+                          .snapshotDuration   = stop2 - start,
+                          .d2hDuration        = stop2 - stop1,
+                          .d2hRequests        = totalD2HRequests.load(),
+                          .totalSnapshotBytes = totalWrittenBytes.load(),
+                      }},
                       nullptr,
                       0);
     }

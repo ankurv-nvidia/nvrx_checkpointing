@@ -103,7 +103,7 @@ struct OtelExportMode
     {
         File,
         Daemon,
-        Both
+        Both,
     };
 
     static ValueType Parse(std::string_view value)

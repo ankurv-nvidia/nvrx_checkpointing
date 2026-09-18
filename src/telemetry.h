@@ -1,4 +1,5 @@
 #pragma once
+#include "CommonMacros.h"
 #include "messages.h"
 
 #include <chrono>
@@ -47,14 +48,10 @@ struct SvrFinalize
     static constexpr std::string_view Name = "ckpt.svr.finalize";
 
     struct Begin
-    {
-        Id id{};
-    };
+    { Id id{}; };
 
     struct End
-    {
-        Id id{};
-    };
+    { Id id{}; };
 };
 
 struct SvrWriteMetadata
@@ -62,14 +59,10 @@ struct SvrWriteMetadata
     static constexpr std::string_view Name = "ckpt.svr.write_metadata";
 
     struct Begin
-    {
-        Id id{};
-    };
+    { Id id{}; };
 
     struct End
-    {
-        Id id{};
-    };
+    { Id id{}; };
 };
 
 struct SvrDurable
@@ -82,9 +75,7 @@ struct SvrDurable
         std::chrono::system_clock::time_point startedAt;
     };
     struct End
-    {
-        Id id{};
-    };
+    { Id id{}; };
 };
 
 }    // namespace checkpoint::telemetry::span
@@ -133,7 +124,7 @@ template <> struct Emitter<span::SvrDurable::End>
 
 struct Stream
 {
-    template <typename T> Stream& operator<<(T const& value)
+    template <typename T> Stream& operator<<(T const& value) LFTBND
     {
         Emitter<T>::Emit(value);
         return *this;

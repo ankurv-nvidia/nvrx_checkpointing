@@ -38,21 +38,23 @@ struct DlpackCapsule
     DLTensor const* tnsr;
 };
 
-constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>{{
-    {.name = "torch.float16", .id = 1},
-    {.name = "torch.bfloat16", .id = 2},
-    {.name = "torch.float32", .id = 3},
-    {.name = "torch.float64", .id = 4},
-    {.name = "torch.uint8", .id = 5},
-    {.name = "torch.uint16", .id = 6},
-    {.name = "torch.uint32", .id = 7},
-    {.name = "torch.uint64", .id = 8},
-    {.name = "torch.int8", .id = 9},
-    {.name = "torch.int16", .id = 10},
-    {.name = "torch.int32", .id = 11},
-    {.name = "torch.int64", .id = 12},
-    {.name = "torch.bool", .id = 13},
-}};
+constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>{
+    {
+        {.name = "torch.float16", .id = 1},
+        {.name = "torch.bfloat16", .id = 2},
+        {.name = "torch.float32", .id = 3},
+        {.name = "torch.float64", .id = 4},
+        {.name = "torch.uint8", .id = 5},
+        {.name = "torch.uint16", .id = 6},
+        {.name = "torch.uint32", .id = 7},
+        {.name = "torch.uint64", .id = 8},
+        {.name = "torch.int8", .id = 9},
+        {.name = "torch.int16", .id = 10},
+        {.name = "torch.int32", .id = 11},
+        {.name = "torch.int64", .id = 12},
+        {.name = "torch.bool", .id = 13},
+    },
+};
 
 struct CachedTypes
 {
@@ -194,7 +196,7 @@ static DlpackCapsule ReadDlpack(nb::handle tensor)
 
 static CachedTypes const& CachedTypesGet()
 {
-    static CachedTypes Types = []() {
+    static CachedTypes Types = [] {
         nb::gil_scoped_acquire acquire;
         auto                   torchModule                  = nb::module_::import_("torch");
         auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
@@ -324,7 +326,7 @@ struct StateTreeTorchDTypeHandler : StateTree::StateHandler<StateTree::StateType
         nb::gil_scoped_acquire acquire;
         auto                   obj     = nb::cast<nb::object>(container[key]);
         nb::str                nameObj = nb::str(obj);
-        return {DtypeNameToId(StrView(nameObj))};
+        return StateTree::Scalar{DtypeNameToId(StrView(nameObj))};
     }
 
     void SetScalarState(StateTree::Scalar const& /*value*/) override
@@ -412,7 +414,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
         {
             throw std::runtime_error(fmt::format("ShardedTensor key changed from {} to {}", name, currentName));
         }
-        meta = std::move(current);
+        meta = current;
     }
 
     private:
@@ -490,7 +492,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
                 "global_shape size ([{}]) mismatch with global_offset size ([{}])", nb::str(globalShape), nb::str(globalOffset)));
         }
 
-        auto prependAxisNumValue = [&]() -> size_t {
+        auto prependAxisNumValue = [&] -> size_t {
             auto prependAxisNum = container["prepend_axis_num"];
             if (prependAxisNum.is_none() && globalShape.size() == localShape.size()) { return 0; }
             if (prependAxisNum.is_none() && globalShape.size() != localShape.size())
@@ -512,7 +514,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
             std::unreachable();
         }();
 
-        [&]() {
+        [&] {
             auto allowShapeMismatch = container["allow_shape_mismatch"];
             if (allowShapeMismatch.is_none()) { return; }
             if (!nb::isinstance<bool>(allowShapeMismatch)) { throwError("allow_shape_mismatch is not bool"); }
@@ -531,7 +533,7 @@ struct StateTreeShardedTensorHandler : StateTree::StateHandler<StateTree::StateT
 
         if (!flattenedRange.is_none()) { throwError("flattened_range is not None"); }
 
-        [&]() {
+        [&] {
             auto axisFragmentations = container["axis_fragmentations"];
             if (axisFragmentations.is_none()) { return; }
             if (!nb::isinstance<nb::tuple>(axisFragmentations)) { throwError("axis_fragmentations is not tuple"); }
@@ -712,8 +714,14 @@ static void RegisterShardedTorchTensorFactory(StateTree& self, StateNode::Handle
                                                  shtKeyView,
                                                  fqn));
         }
-        self.RegisterStateHandler(node,
-                                  StateTreeShardedTensorHandler::CreateFactoryElement(container, name, index, shtKey, innerContainer));
+        self.RegisterStateHandler(
+            node,
+            StateTreeShardedTensorHandler::CreateFactoryElement(    // NOLINT(readability-suspicious-call-argument,-warnings-as-errors)
+                container,
+                name,
+                index,
+                shtKey,
+                innerContainer));
     }
 }
 

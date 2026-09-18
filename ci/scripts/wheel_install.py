@@ -214,13 +214,13 @@ def _binaries_installed() -> bool:
 
 
 def _ensure_source_toolchain() -> None:
-    if shutil.which("clang-22") and shutil.which("clang++-22"):
+    if shutil.which("clang-23") and shutil.which("clang++-23"):
         return
     prepare = REPO_ROOT / "scripts" / "prepare.sh"
-    logger.warning("[wheel] clang-22 is unavailable — preparing the Ubuntu build environment")
+    logger.warning("[wheel] clang-23 is unavailable — preparing the Ubuntu build environment")
     subprocess.run(["/bin/bash", str(prepare), "ubuntu2404"], check=True)
-    if not shutil.which("clang-22") or not shutil.which("clang++-22"):
-        raise RuntimeError("scripts/prepare.sh ubuntu2404 did not install clang-22")
+    if not shutil.which("clang-23") or not shutil.which("clang++-23"):
+        raise RuntimeError("scripts/prepare.sh ubuntu2404 did not install clang-23")
 
 
 def build_and_install_from_source() -> None:
@@ -237,7 +237,7 @@ def build_and_install_from_source() -> None:
     cmake = shutil.which("cmake")
     if cmake is None:
         raise RuntimeError("CMake is not installed or not found in PATH.")
-    cc, cxx = shutil.which("clang-22"), shutil.which("clang++-22")
+    cc, cxx = shutil.which("clang-23"), shutil.which("clang++-23")
     build_dir = Path(os.environ.get("MEGATRON_NATIVE_BUILD_DIR", REPO_ROOT / "build" / "wheel-prep")).expanduser().resolve()
     vcpkg_root = os.environ.get("VCPKG_ROOT")
     subprocess.run(

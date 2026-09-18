@@ -319,6 +319,7 @@ macro(EnableStrictCompilation)
                     -Wno-nrvo # clang-21
                     -Wno-thread-safety-negative # clang-21
                     -Wno-shadow-header # clang-22
+                    -Wno-lifetime-safety-invalidation # clang-23
                     )
             else()
                 list(APPEND extracxxflags -Wno-error=stringop-overflow)

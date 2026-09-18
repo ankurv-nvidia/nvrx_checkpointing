@@ -118,12 +118,14 @@ std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, Ran
             if (shTen.shards.size() == 1)
             {
                 auto const& rshard    = *shTen.shards.begin();
-                DS4Tensor   shardTnsr = {.sharddim = rshard.sharddim,
-                                         .fulldim  = shTen.fulldim,
-                                         .dtype    = shTen.dtype,
-                                         .handle   = rshard.handle,
-                                         .device   = rshard.device};
-                node.data             = shardTnsr;
+                DS4Tensor   shardTnsr = {
+                    .sharddim = rshard.sharddim,
+                    .fulldim  = shTen.fulldim,
+                    .dtype    = shTen.dtype,
+                    .handle   = rshard.handle,
+                    .device   = rshard.device,
+                };
+                node.data = shardTnsr;
             }
         }
     });
@@ -207,11 +209,12 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     {
         auto [size, handle] = blobSizes.top();
         blobSizes.pop();
-        auto& blob = std::get<StateNode::Blob>(registry->GetNode(handle).data);
-        blob.resize(size / 2);
-        totalBlobSize = totalBlobSize - size + blob.size();
-        fmt::print(stderr, "fqn={}: blob size={}->{}\n", registry->GetNodeId(handle), size, blob.size());
-        blobSizes.emplace(blob.size(), handle);
+        auto&      blob    = std::get<StateNode::Blob>(registry->GetNode(handle).data);
+        auto const newSize = size / 2;
+        blob.resize(newSize);
+        totalBlobSize = totalBlobSize - size + newSize;
+        fmt::print(stderr, "fqn={}: blob size={}->{}\n", registry->GetNodeId(handle), size, newSize);
+        blobSizes.emplace(newSize, handle);
     }
 
     registry->CloneInto(*ctx.globalRegistry);
@@ -244,7 +247,12 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     for (uint32_t r = 0; r < static_cast<uint32_t>(ctx.worldSize); ++r)
     {
         RankTopology topo{
-            .rank = Rank{r}, .worldSize = ctx.worldSize, .ranksPerPeer = ctx.ranksPerNode, .peersPerNode = requestedNodes, .peers = peers};
+            .rank         = Rank{r},
+            .worldSize    = ctx.worldSize,
+            .ranksPerPeer = ctx.ranksPerNode,
+            .peersPerNode = requestedNodes,
+            .peers        = peers,
+        };
 
         ctx.localRegistries.insert(BuildPerRankStateTree(ctx, std::move(topo), buffer));
     }
@@ -375,7 +383,7 @@ std::vector<std::thread> StartClientThreads(CheckpointTestContext& ctx)
     tasks.reserve(ctx.localRegistries.size());
     for (auto const& tree : ctx.localRegistries)
     {
-        tasks.emplace_back([&ctx, treeptr = tree.get()]() { RunCheckpointClient(ctx, *treeptr); });
+        tasks.emplace_back([&ctx, treeptr = tree.get()] { RunCheckpointClient(ctx, *treeptr); });
     }
     return tasks;
 }

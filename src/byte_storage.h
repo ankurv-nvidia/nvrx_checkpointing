@@ -18,7 +18,7 @@ struct ByteStorage
     }
 
     ByteStorage() = default;
-    ByteStorage(size_t sizeIn) : data(PadAlignedAlloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
+    explicit ByteStorage(size_t sizeIn) : data(PadAlignedAlloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)
     {
         if (sizeIn != 0 && data == nullptr)
         {

@@ -115,7 +115,7 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
                                                                       .snapshotId  = SnapshotId{0},
                                                                       .globalRank  = Rank{rank},
                                                                       .messageSize = static_cast<uint32_t>(slotSize),
-                                                                      .offset      = i * memorySize});
+                                                                      .offset      = i * memorySize,});
 
         std::memcpy(buf, srcptr, slotSize);
         msgQueue.CommitSlot(slot);
@@ -285,7 +285,7 @@ try
 
     if (launchclient || launchserver)
     {
-        tasks.emplace_back([&]() {
+        tasks.emplace_back([&] {
             SetThreadName(launchclient ? "ClientLauncher" : "ServerLauncher");
             if (debug) { fmt::print("Launching {} thread\n", launchclient ? "client" : "server"); }
 
@@ -298,7 +298,7 @@ try
                                            fmt::format("--iter={}", iter),
                                            fmt::format("--size={}", size),
                                            fmt::format("{}", validate ? "--validate" : ""),
-                                           fmt::format("{}", debug ? "--debug" : "")},
+                                           fmt::format("{}", debug ? "--debug" : ""),},
                                           boost::process::process_stdio{.in = {}, .out = stdout, .err = stderr});
             child.wait();
         });

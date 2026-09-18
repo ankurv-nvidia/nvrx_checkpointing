@@ -4,7 +4,7 @@
 # runners and pushed to the project registry. Carries the toolchain and the
 # python env; vcpkg ports are not baked in — the jobs' configures install
 # them per the CMakeLists.txt call sites, against the registry binary cache:
-#   - toolchain via scripts/prepare.sh ubuntu2404 (clang-22, Kitware cmake,
+#   - toolchain via scripts/prepare.sh ubuntu2404 (clang-23, Kitware cmake,
 #     mold, ninja, python3.12 + dev headers, patchelf, vcpkg host deps)
 #   - /opt/venv with the packages the CMake configure pip_install()s
 #     (nanobind, cmake-pywhl), the wheel test jobs run with (pytest,
@@ -14,8 +14,8 @@
 # Build:
 #   docker buildx build -f Dockerfile.ci .
 
-FROM nvcr.io/nvidia/pytorch:26.06-py3 
-#FROM nvcr.io/nvidia/cuda:13.3.0-devel-ubuntu24.04
+FROM nvcr.io/nvidia/pytorch:26.08-py3
+#FROM nvcr.io/nvidia/cuda:13.4.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -35,7 +35,7 @@ RUN python3.12 -m venv --system-site-packages /opt/venv \
 # && uv pip install --python /opt/venv/bin/python \
 #        --index-url https://download.pytorch.org/whl/cpu torch
 
-ENV CC=clang-22 CXX=clang++-22
+ENV CC=clang-23 CXX=clang++-23
 
 COPY cmake/vcpkg-commit.txt /tmp/vcpkg-commit.txt
 RUN git init /opt/vcpkg \

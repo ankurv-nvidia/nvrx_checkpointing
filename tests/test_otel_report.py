@@ -339,6 +339,22 @@ def test_post_process_uses_each_ranks_peak_rss_across_all_phases(tmp_path: Path)
     assert measured["max"] == 130  # noqa: PLR2004
 
 
+def test_post_process_rejects_mismatched_cpu_rss_ranks_and_samples(tmp_path: Path) -> None:
+    source = tmp_path / "otel" / "native_ckpt_otel.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text("not parsed\n")
+    otel_report.write_analysis(
+        source,
+        {
+            "metrics": {"cpu_rss_bytes": {"ranks": [0, 1], "samples": [100]}},
+            "native_spans_valid": True,
+        },
+    )
+
+    with pytest.raises(ValueError, match="cpu_rss_bytes ranks and samples differ in length"):
+        otel_report.post_process(tmp_path, 4, native=True)
+
+
 def test_main_prints_json_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = _write_jsonl(tmp_path / "t.jsonl", [_save_span(0, 100.0, 200, 4096)])
 

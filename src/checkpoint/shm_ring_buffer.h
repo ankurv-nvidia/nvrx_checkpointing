@@ -324,7 +324,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             // This feels like a hack but is necessary because we dont always notify the reader after every write op
             // So its important to do so right before we wait
             _ctrl->canRead.notify_all();
-            auto valid = _ctrl->canWrite.wait_for(lock, WriteWaitTimeout, [this]() { return AvailableForWrite_() > 0 || _stopRequested; });
+            auto valid = _ctrl->canWrite.wait_for(lock, WriteWaitTimeout, [this] { return AvailableForWrite_() > 0 || _stopRequested; });
 #ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             wlatency.Record(PerfMetrics::Clock::now() - start);
 #endif
@@ -376,7 +376,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             // So its important to do so right before we wait
             _ctrl->rtimestamp = Control::Clock::now();
             _ctrl->canWrite.notify_all();
-            _ctrl->canRead.wait_for(lock, HearBeatInterval, [this]() { return AvailableForRead_() > 0 || _stopRequested; });
+            _ctrl->canRead.wait_for(lock, HearBeatInterval, [this] { return AvailableForRead_() > 0 || _stopRequested; });
 #ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             if (AvailableForRead_() > 0)
             {

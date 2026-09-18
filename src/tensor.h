@@ -29,9 +29,10 @@ template <typename T, std::size_t N> struct inplace_vector : std::array<T, N>   
     size_t               size_ = 0;                                                  // NOLINT(readability-identifier-naming)
     void                 push_back(T const& value) { this->at(size_++) = value; }    // NOLINT
     [[nodiscard]] size_t size() const { return size_; }                              // NOLINT(readability-identifier-naming)
-    [[nodiscard]] auto   end() const                                                 // NOLINT(readability-identifier-naming)
+    [[nodiscard]] auto   end() const LFTBND                                          // NOLINT(readability-identifier-naming)
     { return this->begin() + static_cast<std::ptrdiff_t>(size_); }    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-    [[nodiscard]] auto end() { return this->begin() + static_cast<std::ptrdiff_t>(size_); }    // NOLINT(readability-identifier-naming)
+    [[nodiscard]] auto end() LFTBND                                   // NOLINT(readability-identifier-naming)
+    { return this->begin() + static_cast<std::ptrdiff_t>(size_); }    // NOLINT(readability-identifier-naming)
 
     // Element-wise comparisons must respect size_. The inherited std::array operators
     // compare all N slots and would yield wrong answers if any slot beyond size_ ever
@@ -124,9 +125,9 @@ struct DynamicSharded4TensorTraits
 struct DeviceId
 {
     constexpr DeviceId() = default;
-    constexpr DeviceId(std::array<char, 4> const& strIn) : type(strIn) {}
+    constexpr explicit DeviceId(std::array<char, 4> const& strIn) : type(strIn) {}
     template <size_t N> constexpr DeviceId(char const (&strIn)[N]) : DeviceId(std::string_view(strIn, N - 1)) {}    // NOLINT
-    constexpr DeviceId(std::string_view const& sv)
+    constexpr explicit DeviceId(std::string_view const& sv)
     {
         auto it     = sv.find(':');
         it          = (it == std::string_view::npos) ? sv.size() : it;
@@ -148,7 +149,7 @@ struct DeviceId
     constexpr auto operator<=>(DeviceId const& other) const = default;
     // constexpr auto operator<=>(std::string_view const& other) const { return *this <=> DeviceId(other); }
 
-    constexpr operator uint64_t() const
+    constexpr operator uint64_t() const    // NOLINT
     {
         return (static_cast<uint64_t>(*reinterpret_cast<uint32_t const*>(type.data())) << 32) | static_cast<uint64_t>(index);    // NOLINT
     }
@@ -246,7 +247,7 @@ template <ConceptTensorTraits Traits> struct TensorT
 enum class Rank : uint32_t
 {
     Default = 0,
-    Invalid = std::numeric_limits<uint32_t>::max()
+    Invalid = std::numeric_limits<uint32_t>::max(),
 };
 
 struct RankTopology

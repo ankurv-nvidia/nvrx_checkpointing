@@ -1,4 +1,6 @@
 #pragma once
+#include "CommonMacros.h"
+
 #include <istream>
 #include <ostream>
 #include <span>
@@ -18,7 +20,7 @@ template <typename T> T ReadTrivial(std::istream& istrm)
     return obj;
 }
 
-template <typename T> std::ostream& WriteBlob(std::ostream& ostrm, std::span<T> const& obj)
+template <typename T> std::ostream& WriteBlob(std::ostream& ostrm LFTBND, std::span<T> const& obj)
 {
     if (obj.empty()) { return ostrm; }
     return ostrm.write(obj.data(), static_cast<std::streamsize>(obj.size() * sizeof(T)));
@@ -40,7 +42,7 @@ template <typename TSize> inline std::string ReadBlobWithSize(std::istream& is)
     return data;
 }
 
-template <typename TSize> auto WriteBlobWithSize(std::ostream& os, std::string_view const& data) -> std::ostream&
+template <typename TSize> auto WriteBlobWithSize(std::ostream& os LFTBND, std::string_view const& data) -> std::ostream&
 {
     auto size = static_cast<TSize>(data.size());
     os.write(reinterpret_cast<char const*>(&size), sizeof(TSize));    // NOLINT

@@ -63,7 +63,7 @@ namespace bpo   = boost::program_options;
 namespace net   = boost::asio;
 namespace beast = boost::beast;
 namespace http  = boost::beast::http;
-using tcp       = boost::asio::ip::tcp;
+using       boost::asio::ip::tcp;
 using Clock     = std::chrono::steady_clock;
 
 static double ToMs(Clock::duration d)

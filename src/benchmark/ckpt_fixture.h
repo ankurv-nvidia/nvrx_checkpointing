@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CommonMacros.h"
 #include "byte_storage.h"
 #include "state.h"
 #include "tensor.h"

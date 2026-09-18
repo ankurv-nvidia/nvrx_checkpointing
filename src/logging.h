@@ -18,7 +18,7 @@ enum class Level : uint8_t
     Info,
     Warn,
     Error,
-    Critical
+    Critical,
 };
 
 void Init();

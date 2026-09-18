@@ -9,19 +9,13 @@ struct StateSerDes
     using Type = StateNode::Type;
 
     struct DictHeader
-    {
-        uint32_t numChild{};
-    };
+    { uint32_t numChild{}; };
 
     struct BlobHeader
-    {
-        uint32_t dataSize{};
-    };
+    { uint32_t dataSize{}; };
 
     struct ShardedTensorHeader
-    {
-        uint32_t numShards{};
-    };
+    { uint32_t numShards{}; };
 
 // NOLINTBEGIN
 #pragma pack(push, 1)
@@ -39,7 +33,7 @@ struct StateSerDes
 
     private:
     public:
-    static std::ostream& WriteTopology(std::ostream& ostrm, RankTopology const& topo)
+    static std::ostream& WriteTopology(std::ostream& ostrm LFTBND, RankTopology const& topo)
     {
         serdes::WriteTrivial(ostrm, topo.rank);
         serdes::WriteTrivial(ostrm, topo.worldSize);
@@ -70,7 +64,7 @@ struct StateSerDes
         return topo;
     }
 
-    static std::ostream& Write(std::ostream& ostrm, StateTree const& tree, StateNode::Handle nodeHandle)
+    static std::ostream& Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle)
     {
         WriteTopology(ostrm, tree._topo);
 
@@ -80,7 +74,7 @@ struct StateSerDes
             Header hdr{.type    = static_cast<Type>(node.data.index()),
                        .namelen = static_cast<uint8_t>(node.name.size()),
                        .handle  = node.handle,
-                       .parent  = node.parent};
+                       .parent  = node.parent,};
             serdes::WriteTrivial(ostrm, hdr);
             serdes::WriteBlob(ostrm, std::span(node.name));
             switch (hdr.type)
@@ -162,7 +156,7 @@ struct StateSerDes
         return ostrm;
     }
 
-    static StateTree& Read(std::istream& istrm, StateTree& tree)
+    static StateTree& Read(std::istream& istrm, StateTree& tree LFTBND)
     {
         auto numChild = serdes::ReadTrivial<uint32_t>(istrm);
         tree._nodes.clear();

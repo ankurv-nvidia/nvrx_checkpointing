@@ -80,7 +80,7 @@ static std::filesystem::path CkptDir(std::string_view stem)
 static RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
 {
     return RankTopology{
-        .rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"}};
+        .rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"},};
 }
 namespace
 {
@@ -557,7 +557,7 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     };
     auto const durableStartedAt = std::chrono::system_clock::now() - std::chrono::microseconds{30};
     auto const durableId        = checkpoint::telemetry::span::Id{
-        .sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId{2}};
+        .sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId{2},};
     PERF() << checkpoint::telemetry::span::SvrDurable::Begin{.id = durableId, .startedAt = durableStartedAt};
     PERF() << checkpoint::telemetry::span::SvrDurable::End{.id = durableId};
     checkpoint::telemetry::Shutdown();
@@ -666,7 +666,7 @@ TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telem
     checkpoint::telemetry::Collect(R"({"received_remotely":true})");
     checkpoint::telemetry::Collect(R"({"second_remote_line":true})");
     auto const spanId = checkpoint::telemetry::span::Id{
-        .sessionId = checkpoint::ipc::SessionId::Default, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId::Default};
+        .sessionId = checkpoint::ipc::SessionId::Default, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId::Default,};
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::Begin{.id = spanId};
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::End{.id = spanId};
     checkpoint::telemetry::Shutdown();
@@ -1323,11 +1323,6 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     std::vector<std::thread> tasks;
     bool                     serverRunning = false;
 
-    auto cleanup = [&] {
-        if (!tasks.empty()) { JoinClientThreads(ctx, tasks); }
-        if (serverRunning) { StopInprocServer(); }
-    };
-
     try
     {
         // LoadStateRegistryFromPath stands up ctx.nodes in-process servers.
@@ -1342,10 +1337,12 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
         // Real failures (stale shm files, IPC bugs, etc.) propagate — the
         // pre-checks above already SKIP the known "this sandbox can't run
         // it" cases. Anything past that point is a regression worth seeing.
-        cleanup();
+        if (!tasks.empty()) { JoinClientThreads(ctx, tasks); }
+        if (serverRunning) { StopInprocServer(); }
         throw;
     }
-    cleanup();
+    if (!tasks.empty()) { JoinClientThreads(ctx, tasks); }
+    if (serverRunning) { StopInprocServer(); }
 }
 
 // Custom main so we can register `--registry` on the Catch2 CLI. The default

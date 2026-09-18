@@ -1,11 +1,11 @@
 #!/bin/bash
 # Generate an A/A checkpoint pair for the pico Mamba-hybrid MoE model on the
-# PyTorch 26.07 stack using only a Megatron-LM checkout. Submit this file twice
+# PyTorch 26.08 stack using only a Megatron-LM checkout. Submit this file twice
 # with distinct RUN_TAG values:
 #
 #   export DET_WORK_DIR=/lustre/<project>/<user>/determinism
 #   export MEGATRON_ROOT=/lustre/<project>/<user>/Megatron-LM
-#   export ENROOT_IMAGE=/lustre/<project>/<user>/pytorch2607-megatron.sqsh
+#   export ENROOT_IMAGE=/lustre/<project>/<user>/pytorch2608-megatron.sqsh
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
 #

@@ -54,7 +54,7 @@ struct CudaContext : public DeviceContext
             uint64_t                    hash = deviceIn.index << 8 | streamIdx;
             std::lock_guard<std::mutex> lock(Mutex);
             auto                        it = Instances.find(hash);
-            if (it == Instances.end()) { it = Instances.emplace(hash, std::make_shared<CudaStream>(deviceIn)).first; }
+            if (it == Instances.end()) { it = Instances.emplace(hash, std::make_shared<CudaStream>(deviceRankIdx)).first; }
             return it->second;
         }
 

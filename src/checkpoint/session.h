@@ -92,7 +92,7 @@ struct Session
 
     std::vector<std::future<void>> asyncTasks;
 
-    Session(Server* serverIn, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
+    Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
     std::atomic<bool> stopRequested{false};
 
     void Activate();
@@ -132,10 +132,10 @@ struct Session
     bool IsSnapshotDurable(checkpoint::ipc::SnapshotId snapshotId) const;
 
     private:
-    LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank);
-    LocalState& FindOrCreateLocalState_(checkpoint::ipc::Rank rank);
-    Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId);
-    Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId);
+    LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank) LFTBND;
+    LocalState& FindOrCreateLocalState_(checkpoint::ipc::Rank rank) LFTBND;
+    Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 
 #ifdef DEBUG_MD5SUM
     void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;

@@ -87,7 +87,7 @@ static constexpr auto AutoShutdownTimeout = 900s;
 // uint32_t iterations
 using Request = boost::beast::http::request<boost::beast::http::buffer_body>;
 
-using tcp = boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
+using boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
 using tcp_stream
     = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
 
@@ -96,7 +96,7 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    Server(uint16_t index = 0) : _index(index) {}
+    explicit Server(uint16_t index = 0) : _index(index) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
@@ -111,7 +111,7 @@ struct Server
     void QuerySessions(ServerSessionCallback callback, void* cbData);
 
     private:
-    Session& SessionById_(cipc::SessionId sessionId);
+    Session& SessionById_(cipc::SessionId sessionId) LFTBND;
 
     template <typename TLambda>
     void                             FindOrWaitForSessionAndSnapshot_(std::string_view context,
@@ -299,7 +299,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
                                      .fqn        = fqn,
                                      .sharddim   = sharddim,
                                      .sizeBytes  = candidates.front().ShardSizeBytes(tnsr.dtype),
-                                     .candidates = std::move(candidates)});
+                                     .candidates = std::move(candidates),});
         }
     });
 
@@ -511,24 +511,27 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
                                                .fulldim  = tnsr.fulldim,
                                                .dtype    = tnsr.dtype,
                                                .handle   = shard.handle,
-                                               .device   = shard.device},
-                        registry.GetNodeId(node.handle)});
+                                               .device   = shard.device,},
+                        registry.GetNodeId(node.handle),});
             }
         }
     });
 }
 
-Session::Session(Server* serverIn, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
+Session::Session(Server* serverIn LFTBND,
+                 cipc::SessionId       sessionIdIn,
+                 std::filesystem::path workDirIn,
+                 RankTopology          topoIn) :
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
-Session::LocalState& Session::GetSessionLocalState_(cipc::Rank rank)
+Session::LocalState& Session::GetSessionLocalState_(cipc::Rank rank) LFTBND
 {
     std::scoped_lock lock(mutex);
     return *sessionState.localStates[rank];
 }
 
-Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank)
+Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank) LFTBND
 {
     std::scoped_lock lock(mutex);
     auto&            localState = sessionState.localStates[rank];
@@ -536,13 +539,13 @@ Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank)
     return *localState;
 }
 
-Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId)
+Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
 {
     std::scoped_lock lock(mutex);
     return GetSnapshot_(lock, snapshotId);
 }
 
-Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* lock */, cipc::SnapshotId snapshotId)
+Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* lock */, cipc::SnapshotId snapshotId) LFTBND
 {
     auto it = snapshots.find(snapshotId);
     if (it == snapshots.end())
@@ -1001,7 +1004,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{.sharddim = tensorShard.tensorInfo.sharddim,
                                                                        .device   = tensorShard.tensorInfo.device,
                                                                        .handle   = tensorShard.tensorInfo.handle,
-                                                                       .rank     = tensorShard.rank});
+                                                                       .rank     = tensorShard.rank,});
             child.data                    = shTen;
             tensorMap[tensorShard.nodeId] = child.handle;
             continue;
@@ -1036,7 +1039,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         tnsr.AddShard({.sharddim = tensorShard.tensorInfo.sharddim,
                        .device   = tensorShard.tensorInfo.device,
                        .handle   = tensorShard.tensorInfo.handle,
-                       .rank     = tensorShard.rank});
+                       .rank     = tensorShard.rank,});
     }
 }
 
@@ -1591,7 +1594,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
     if (beginDurableSpan && IsCoordinatorPeer())
     {
         PERF() << tel::span::SvrDurable::Begin{.id        = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId},
-                                               .startedAt = durableStartedAt};
+                                               .startedAt = durableStartedAt,};
     }
 
     PERF() << tel::span::CkptSave::Begin{
@@ -1754,7 +1757,7 @@ void Server::Start()
     //_serverThread = std::thread([this]() {
     for (uint8_t i = 0; i < cipc::MaxRanksPerNode; ++i)
     {
-        _threads.emplace_back([this, i, queueSize, &queuesReady]() {
+        _threads.emplace_back([this, i, queueSize, &queuesReady] {
             SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
             // Map queues across host-memory NUMA domains. Pinning around Create
             // places the control page; materializing the data pages in the owner
@@ -1873,7 +1876,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         BufStream bufStream{buf.data(), buf.size()};
         auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
         auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
-        auto      createSession = [&]() {
+        auto      createSession = [&] {
             auto topo                   = StateSerDes::ReadTopology(bufStream);
             auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
             session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, Session::MaxActiveSnapshots);
@@ -2057,7 +2060,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
     }
 }
 
-Session& Server::SessionById_(cipc::SessionId sessionId)
+Session& Server::SessionById_(cipc::SessionId sessionId) LFTBND
 {
     std::scoped_lock lock(_mutex);
     _lastPingTime = PerfClock::now();
@@ -2518,7 +2521,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             throw std::invalid_argument(
                 "Unexpected extra URL segments in globalregistry endpoint; globalregistry requires a /{sessionId}?fwd=<start>:<end> path");
         }
-        auto [fwdRangeStart, fwdRangeEnd] = [&]() -> std::pair<size_t, size_t> {
+        auto [fwdRangeStart, fwdRangeEnd] = [&] -> std::pair<size_t, size_t> {
             auto const fwdParam = url.params().find("fwd");
             if (fwdParam == url.params().end()) { return {0, 0}; }
             auto const fwdValue = (*fwdParam).value;
@@ -2585,7 +2588,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         // accept loop must stay free to service the peer writeckptcomplete/finalizecomplete
         // notifications that idle-ness depends on, otherwise the wait would deadlock.
         std::scoped_lock lock(_mutex);
-        _spinDownThreads.emplace_back([this, s = std::move(stream)]() mutable { SpinDownWaitLoop_(std::move(s)); });
+        _spinDownThreads.emplace_back([this, s = std::move(stream)] mutable { SpinDownWaitLoop_(std::move(s)); });
     }
     // Block until a checkpoint is durable: GET /api/wait-for-ckpt-finalize/{sessionId}/{iteration}.
     // `iteration` is signed — negative values index back from the newest snapshot (-1 = latest).
@@ -2601,7 +2604,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock lock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration]() mutable {
+        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration] mutable {
             FinalizeWaitLoop_(std::move(s), sessionId, iteration);
         }));
     }
@@ -2723,7 +2726,7 @@ void Server::StartTcpAcceptors_()
 
     for (size_t i = 0; i < AcceptorCount; i++)
     {
-        _threads.emplace_back([this, i]() {
+        _threads.emplace_back([this, i] {
             SetThreadName(fmt::format("ncs:ios:{}", i).c_str());
             _ioc.run();
         });
@@ -2751,7 +2754,7 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
             ERR("accept error: {}", ec.message());
             co_return;
         }
-        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)]() mutable {
+        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)] mutable {
             static constexpr auto Timeout = std::chrono::seconds{30};
             tcp_stream            stream(std::move(sock));
             stream.expires_after(Timeout);
@@ -2865,14 +2868,11 @@ void RunServer()    // NOLINT(misc-use-internal-linkage)
 
 void StopInprocServer()
 {
-    for (auto& server : ServerSingletons)
+    for (auto const& server : ServerSingletons)
     {
-        if (server)
-        {
-            server->Stop();
-            server.reset();
-        }
+        if (server) { server->Stop(); }
     }
+    ServerSingletons.clear();
 }
 
 void WaitForInprocServerWrites()

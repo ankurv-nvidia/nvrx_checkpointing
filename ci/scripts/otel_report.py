@@ -660,7 +660,11 @@ def _complete_run_cpu_rss(results_dir: Path) -> dict | None:
         measured = analysis.get("metrics", {}).get("cpu_rss_bytes") if analysis else None
         if not measured or measured.get("ranks") is None:
             continue
-        for rank, value in zip(measured["ranks"], measured["samples"], strict=True):
+        ranks = measured["ranks"]
+        samples = measured["samples"]
+        if len(ranks) != len(samples):
+            raise ValueError("cpu_rss_bytes ranks and samples differ in length")
+        for rank, value in zip(ranks, samples):
             rank_id = int(rank)
             per_rank[rank_id] = max(round(value), per_rank.get(rank_id, 0))
     if not per_rank:

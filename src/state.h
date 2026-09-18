@@ -41,7 +41,7 @@ struct StateNode
         TensorShard   = 4,    // data is decoupled from metadata and not stored inline
         ShardedTensor = 5,
         Unknown       = 6,
-        Count         = Unknown
+        Count         = Unknown,
     };
 
     using Variant = std::variant<std::monostate, Dict, Scalar, Blob, TensorShard, ShardedTensor>;
@@ -62,7 +62,7 @@ struct StateNode
 
     struct IHandler
     {
-        IHandler(std::string_view const& nameIn) : name(nameIn) {}
+        explicit IHandler(std::string_view const& nameIn) : name(nameIn) {}
 
         virtual ~IHandler() = default;
         CLASS_DELETE_COPY_AND_MOVE(IHandler);
@@ -103,7 +103,7 @@ struct StateTree
 {
     using NodeId = std::string;
 
-    StateTree(RankTopology topo) : _topo(std::move(topo))
+    explicit StateTree(RankTopology topo) : _topo(std::move(topo))
     {
 #ifndef NDEBUG
         _topo.AssertValid();
@@ -124,7 +124,7 @@ struct StateTree
     // template <> struct StateHandler<StateType::Scalar>;
     // template <> struct StateHandler<StateType::Scalar>;
 
-    auto& FindOrAddDictChild(StateNode::Handle node, std::string_view const& stateName)
+    auto& FindOrAddDictChild(StateNode::Handle node, std::string_view const& stateName) LFTBND
     {
         auto& parent = _nodes[static_cast<size_t>(node)].data;
         if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
@@ -141,7 +141,7 @@ struct StateTree
         return _nodes.back();
     }
 
-    auto& AddChild(StateNode::Handle node, std::string_view const& stateName, [[maybe_unused]] bool allowDuplicates = true)
+    auto& AddChild(StateNode::Handle node, std::string_view const& stateName, [[maybe_unused]] bool allowDuplicates = true) LFTBND
     {
         auto& parent = _nodes[static_cast<size_t>(node)].data;
         if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
@@ -162,7 +162,7 @@ struct StateTree
         auto newHandle = static_cast<StateNode::Handle>(_nodes.size());
         std::get<StateNode::Dict>(parent).push_back(newHandle);
         // WARNING: push to nodes can invalidate all the other variables here due to a memmove
-        _nodes.push_back({newHandle, node, std::string(stateName), {}});
+        _nodes.push_back({newHandle, node, stateName, {}});
         // Do not reuse any above variables
         return _nodes.back();
     }
@@ -237,7 +237,7 @@ struct StateTree
     }
 
     // Refresh one leaf while preserving the registered structure and Blob capacity.
-    void RefreshNodeDataFromHandler(StateNode& node)
+    void RefreshNodeDataFromHandler(StateNode& node) const
     {
         auto* const handler = node.handler.get();
         if (handler == nullptr) { throw std::logic_error("Cannot refresh a state node without a handler"); }
@@ -278,7 +278,7 @@ struct StateTree
             {
                 throw std::runtime_error(fmt::format("State '{}' changed tensor metadata after registry synchronization", fqn));
             }
-            node.data = std::move(current);
+            node.data = current;
             break;
         }
         case StateType::ShardedTensor: [[fallthrough]];
@@ -339,8 +339,8 @@ struct StateTree
         }
     }
 
-    StateNode const& GetNode(StateNode::Handle handle) const { return _nodes[static_cast<size_t>(handle)]; }
-    StateNode&       GetNode(StateNode::Handle handle) { return _nodes[static_cast<size_t>(handle)]; }
+    StateNode const& GetNode(StateNode::Handle handle) const LFTBND { return _nodes[static_cast<size_t>(handle)]; }
+    StateNode&       GetNode(StateNode::Handle handle) LFTBND { return _nodes[static_cast<size_t>(handle)]; }
 
     auto GlobalRank() const { return _topo.rank; }
     auto GlobalWorldSize() const { return _topo.worldSize; }
@@ -359,7 +359,7 @@ struct StateTree
         if (_async.valid())
         {
             _async = std::async(std::launch::async | std::launch::deferred,
-                                [prev = std::move(_async), lambda1 = std::forward<TLambda>(lambda)]() mutable {
+                                [prev = std::move(_async), lambda1 = std::forward<TLambda>(lambda)] mutable {
                                     prev.get();
                                     lambda1();
                                 });
@@ -454,7 +454,11 @@ struct StateTree
                 {
                     auto& shardedTensor = std::get<StateNode::ShardedTensor>(node1.data);
                     shardedTensor.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                        .sharddim = tnsr.sharddim, .device = tnsr.device, .handle = tnsr.handle, .rank = _topo.rank});
+                        .sharddim = tnsr.sharddim,
+                        .device   = tnsr.device,
+                        .handle   = tnsr.handle,
+                        .rank     = _topo.rank,
+                    });
                     deduped = true;
                     break;
                 }
@@ -468,7 +472,11 @@ struct StateTree
             node.data           = StateNode::ShardedTensor(tnsr.dtype, tnsr.fulldim);
             auto& shardedTensor = std::get<StateNode::ShardedTensor>(node.data);
             shardedTensor.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                .sharddim = tnsr.sharddim, .device = tnsr.device, .handle = tnsr.handle, .rank = _topo.rank});
+                .sharddim = tnsr.sharddim,
+                .device   = tnsr.device,
+                .handle   = tnsr.handle,
+                .rank     = _topo.rank,
+            });
         }
     }
 
@@ -566,7 +574,7 @@ struct StateTree
         node.name   = {};
     }
 
-    auto const& Topo() const { return _topo; }
+    auto const& Topo() const LFTBND { return _topo; }
 
     void Update()
     {
@@ -750,7 +758,7 @@ struct StateTree
 
 template <> struct StateTree::StateHandler<StateTree::StateType::Scalar> : StateTree::IStateHandler
 {
-    StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
+    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
 
     [[nodiscard]] StateType      GetType() override { return StateType::Scalar; }
     [[noreturn]] StateNode::Blob GetBlob() override { throw std::runtime_error("Invalid operation"); }
@@ -762,7 +770,7 @@ template <> struct StateTree::StateHandler<StateTree::StateType::Scalar> : State
 
 template <> struct StateTree::StateHandler<StateTree::StateType::Blob> : StateTree::IStateHandler
 {
-    StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
+    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
 
     [[nodiscard]] StateType GetType() override { return StateType::Blob; }
     [[noreturn]] Scalar     GetScalarState() override { throw std::runtime_error("Invalid operation"); }
@@ -774,7 +782,7 @@ template <> struct StateTree::StateHandler<StateTree::StateType::Blob> : StateTr
 
 template <> struct StateTree::StateHandler<StateTree::StateType::TensorShard> : StateTree::IStateHandler
 {
-    StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
+    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
     [[nodiscard]] StateType GetType() override { return StateType::TensorShard; }
 
     [[noreturn]] Scalar          GetScalarState() override { throw std::runtime_error("Invalid operation"); }

@@ -236,12 +236,7 @@ variables:
       when: never
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: on_success
-    - if: '$RUN_PIPELINE == "true"'
-      when: on_success
-    # MR validation stays on the source branch. This also covers an explicit
-    # API/web pipeline started after the MR is open; workflow rules still decide
-    # whether a pipeline is created, so this cannot duplicate it.
-    - if: '$CI_OPEN_MERGE_REQUESTS'
+    - if: '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
     - when: manual
 
@@ -336,10 +331,8 @@ launch:main-branch-runs:
   variables:
     LAUNCH_PIPELINE_SUITE: main-branch-runs
 
-# Keep pipelines attached to branch commits so opening an MR can reuse a
-# manually validated head instead of creating a detached MR pipeline. Later
-# pushes to an open MR create one branch pipeline; ordinary pushes do not.
-# Explicit web/API runs remain available for pre-MR validation.
+# Run merge request events, but not ordinary branch pushes. Explicit web/API
+# runs remain available for pre-MR validation.
 workflow:
   rules:
     - if: '$UPSTREAM_PIPELINE_SHA && $UPSTREAM_PIPELINE_SHA != $CI_COMMIT_SHA'
@@ -348,9 +341,9 @@ workflow:
       when: never
     - if: '$PIPELINE_SUITE && $PIPELINE_SUITE != "default" && $CI_PIPELINE_SOURCE != "web" && $CI_PIPELINE_SOURCE != "api" && $CI_PIPELINE_SOURCE != "trigger" && $CI_PIPELINE_SOURCE != "pipeline" && $CI_PIPELINE_SOURCE != "parent_pipeline"'
       when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'
     - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api" || $CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"'
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'
     - if: '$CI_PIPELINE_SOURCE == "push" && $RUN_PIPELINE == "true"'
     - when: never
 
