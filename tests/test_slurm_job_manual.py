@@ -3543,6 +3543,7 @@ def test_default_pipeline_has_manual_suite_launchers() -> None:
     assert config[".wheel_publish"]["rules"] == [
         {"if": '$PIPELINE_SUITE != "default"', "when": "never"},
         {"if": '$CI_COMMIT_BRANCH == "main"', "when": "on_success"},
+        {"if": '$PUBLISH_WHEELS == "true"', "when": "on_success"},
         {"when": "never"},
     ]
 
@@ -3649,6 +3650,8 @@ def test_wheel_test_matches_main_and_ctest_is_isolated() -> None:
     assert "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" in publish_script
     assert "packages/generic" not in publish_script
     assert config[".wheel_publish"]["rules"][1]["if"] == '$CI_COMMIT_BRANCH == "main"'
+    assert config[".wheel_publish"]["rules"][2] == {"if": '$PUBLISH_WHEELS == "true"', "when": "on_success"}
+    assert config["variables"]["PUBLISH_WHEELS"]["value"] == "false"
     assert "pyyaml twine" in (REPO_ROOT / "Dockerfile.ci").read_text()
     assert "Description-Content-Type: text/markdown" in (REPO_ROOT / "METADATA").read_text()
     cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
