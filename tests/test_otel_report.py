@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -101,16 +102,12 @@ def _megatron_metrics(rank: int, run_id: str = "run-1") -> dict:
     }
     metrics = [
         {
-            "name": "megatron.training.step_duration_ms",
+            "name": "megatron.training.example_histogram",
             "histogram": {
                 "dataPoints": [
                     {"count": "4", "sum": 80.0, "min": 10.0, "max": 30.0, "timeUnixNano": "10"},
                 ],
             },
-        },
-        {
-            "name": "megatron.training.throughput_tflops",
-            "gauge": {"dataPoints": [{"asDouble": 120.5, "timeUnixNano": "10"}]},
         },
     ]
     return {"resourceMetrics": [{"resource": resource, "scopeMetrics": [{"metrics": metrics}]}]}
@@ -119,6 +116,49 @@ def _megatron_metrics(rank: int, run_id: str = "run-1") -> dict:
 def _write_jsonl(path: Path, objs) -> str:
     path.write_text("\n".join(json.dumps(o) for o in objs) + "\n")
     return str(path)
+
+
+def _memory_event(
+    host: str,
+    pid: int,
+    rss: int,
+    peak: int,
+    *,
+    rank: int | None = None,
+    timestamp: int = 1,
+    service: str = "nvrx-checkpoint-server",
+) -> dict:
+    resource = [
+        {"key": "host.name", "value": {"stringValue": host}},
+        {"key": "service.name", "value": {"stringValue": service}},
+        {"key": "process.pid", "value": _iv(pid)},
+    ]
+    attributes = [
+        {"key": "nvrx.memory.rss_bytes", "value": _iv(rss)},
+        {"key": "nvrx.memory.peak_rss_bytes", "value": _iv(peak)},
+        {"key": "nvrx.memory.shmem_rss_bytes", "value": _iv(rss // 2)},
+        {"key": "nvrx.memory.trigger", "value": {"stringValue": "ckpt.save"}},
+    ]
+    if rank is not None:
+        attributes.append({"key": "nvrx.rank", "value": _iv(rank)})
+    return {
+        "resourceLogs": [
+            {
+                "resource": {"attributes": resource},
+                "scopeLogs": [
+                    {
+                        "logRecords": [
+                            {
+                                "eventName": "process.memory",
+                                "attributes": attributes,
+                                "timeUnixNano": str(timestamp),
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
 
 
 def _checkpoint_timing_span(
@@ -170,6 +210,78 @@ def test_iter_samples_extracts_per_rank(tmp_path):
     assert by_rank[1]["total_written_bytes"] == 4096
 
 
+def test_process_memory_metrics_and_combined_chart(tmp_path: Path) -> None:
+    previous_chart = tmp_path / "process_memory_node-a.svg"
+    previous_chart.write_text("stale")
+    path = _write_jsonl(tmp_path / "telemetry.jsonl", [_save_span(0, 100.0, 200, 4096)])
+    _write_jsonl(
+        Path(f"{path}.logs"),
+        [
+            _memory_event("node-a", 20, 70, 80, timestamp=10),
+            _memory_event("node-a", 20, 75, 85, rank=0, timestamp=20),
+            _memory_event("node-b", 21, 60, 70, timestamp=15),
+            _memory_event("node-b", 21, 65, 75, rank=1, timestamp=25),
+            _memory_event("node-a", 30, 40, 40, rank=0, timestamp=10, service=otel_report.TRAINING_SERVICE),
+            _memory_event("node-a", 30, 50, 50, rank=0, timestamp=20, service=otel_report.TRAINING_SERVICE),
+            _memory_event("node-b", 31, 35, 35, rank=1, timestamp=15, service=otel_report.TRAINING_SERVICE),
+            _memory_event("node-b", 31, 45, 45, rank=1, timestamp=25, service=otel_report.TRAINING_SERVICE),
+        ],
+    )
+    data = otel_report.OtelData([path])
+    samples = otel_report.collect_process_memory(data)
+    metrics = otel_report.process_memory_metrics(samples)
+
+    assert metrics["checkpoint_daemon_peak_rss_bytes"]["max"] == 85
+    outputs = otel_report.write_process_memory_charts(data, tmp_path)
+    assert outputs == [tmp_path / "process_memory_all.svg"]
+    assert not previous_chart.exists()
+    chart = outputs[0].read_text()
+    assert "daemon node-a pid 20" in chart
+    assert "daemon node-b pid 21" in chart
+    assert "training node-a rank 0 pid 30" in chart
+    assert "training node-b rank 1 pid 31" in chart
+    assert {"hsl(215 75% 24.0%)", "hsl(215 75% 72.0%)"} <= set(re.findall(r'hsl\(215 75% [^)]+\)', chart))
+    assert {"hsl(0 75% 24.0%)", "hsl(0 75% 72.0%)"} <= set(re.findall(r'hsl\(0 75% [^)]+\)', chart))
+    assert "shared-memory" not in chart
+    assert chart.count("<polyline") == 4  # two daemon and two training processes
+    assert chart.count('stroke="#d1d5db"') == 6
+    assert ">0.0</text>" in chart
+
+
+def test_process_memory_chart_supports_training_only(tmp_path: Path) -> None:
+    path = _write_jsonl(
+        tmp_path / "telemetry.jsonl",
+        [_memory_event("node-a", 30, 40, 40, rank=0, timestamp=10, service=otel_report.TRAINING_SERVICE)],
+    )
+
+    outputs = otel_report.write_process_memory_charts(otel_report.OtelData([path]), tmp_path)
+
+    assert outputs == [tmp_path / "process_memory_all.svg"]
+    chart = outputs[0].read_text()
+    assert "training node-a rank 0 pid 30" in chart
+    assert "hsl(0 75%" in chart
+    assert "hsl(215 75%" not in chart
+
+
+def test_otel_data_can_recover_a_truncated_final_record(tmp_path: Path) -> None:
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text(
+        json.dumps(
+            _memory_event("node-a", 30, 40, 40, rank=0, timestamp=10, service=otel_report.TRAINING_SERVICE),
+        )
+        + '\n{"resourceLogs":',
+    )
+
+    with pytest.raises(ValueError, match="invalid OTLP JSON"):
+        otel_report.OtelData([path])
+
+    data = otel_report.OtelData([path], tolerate_truncated_tail=True)
+    outputs = otel_report.write_process_memory_charts(data, tmp_path)
+
+    assert outputs == [tmp_path / "process_memory_all.svg"]
+    assert "training node-a rank 0 pid 30" in outputs[0].read_text()
+
+
 def test_non_save_spans_ignored(tmp_path):
     other = {"resourceSpans": [{"scopeSpans": [{"spans": [{"name": "ckpt.finalize_wait", "attributes": []}]}]}]}
     path = _write_jsonl(tmp_path / "t.jsonl", [other, _save_span(0, 100.0, 200, 4096)])
@@ -218,12 +330,12 @@ def test_collect_megatron_metrics_includes_histogram_mean(tmp_path: Path) -> Non
 
     samples = otel_report.collect_megatron_training_metrics([path], "run-1")
 
-    step = [sample for sample in samples if sample["name"] == "megatron.training.step_duration_ms"]
-    assert [(sample["resource"]["dl.rank"], sample["value"]) for sample in step] == [(0, 20.0), (4, 20.0)]
-    assert step[0]["kind"] == "histogram"
-    assert step[0]["count"] == 4
-    assert step[0]["min"] == 10.0
-    assert step[0]["max"] == 30.0
+    histogram = [sample for sample in samples if sample["name"] == "megatron.training.example_histogram"]
+    assert [(sample["resource"]["dl.rank"], sample["value"]) for sample in histogram] == [(0, 20.0), (4, 20.0)]
+    assert histogram[0]["kind"] == "histogram"
+    assert histogram[0]["count"] == 4
+    assert histogram[0]["min"] == 10.0
+    assert histogram[0]["max"] == 30.0
 
 
 def test_summarize_means_and_per_rank(tmp_path):
@@ -337,6 +449,19 @@ def test_post_process_uses_each_ranks_peak_rss_across_all_phases(tmp_path: Path)
     assert measured["samples"] == [130, 120]
     assert measured["per_rank_median"] == {0: 130, 1: 120}
     assert measured["max"] == 130  # noqa: PLR2004
+
+
+def test_complete_run_process_memory_peaks_reads_collected_otlp(tmp_path: Path) -> None:
+    for phase, peak in {"phase1": 80, "cycle1": 95}.items():
+        source = tmp_path / "otel" / phase / "native_ckpt_otel.jsonl"
+        source.parent.mkdir(parents=True)
+        _write_jsonl(source, [_memory_event("node-a", 20, peak - 10, peak, timestamp=10)])
+
+    metrics = otel_report.complete_run_process_memory_peaks(tmp_path)
+
+    daemon = metrics["checkpoint_daemon_peak_rss_bytes"]
+    assert daemon["max"] == 95  # noqa: PLR2004
+    assert daemon["per_node"] == {"node-a": 95}
 
 
 def test_post_process_rejects_mismatched_cpu_rss_ranks_and_samples(tmp_path: Path) -> None:

@@ -2,9 +2,11 @@
 
 #include "byte_storage.h"
 #include "ckpt_fixture.h"
+#include "config.h"
 #include "distcp.h"
 #include "distcp_internal.h"
 #include "logging.h"
+#include "process_memory.h"
 #include "server.h"
 #include "session.h"
 #include "state.h"
@@ -80,7 +82,12 @@ static std::filesystem::path CkptDir(std::string_view stem)
 static RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
 {
     return RankTopology{
-        .rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"},};
+        .rank         = Rank{rank},
+        .worldSize    = Rank{worldSize},
+        .ranksPerPeer = worldSize,
+        .peersPerNode = 1,
+        .peers        = {"localhost"},
+    };
 }
 namespace
 {
@@ -531,7 +538,6 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);                // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);             // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", spansPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_METRICS", "1", 1);               // NOLINT(concurrency-mt-unsafe)
@@ -556,12 +562,14 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
         .totalWrittenBytes = 2048,
     };
     auto const durableStartedAt = std::chrono::system_clock::now() - std::chrono::microseconds{30};
-    auto const durableId        = checkpoint::telemetry::span::Id{
-        .sessionId = checkpoint::ipc::SessionId{3}, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId{2},};
+    auto const durableId        = checkpoint::telemetry::Id{
+        .sessionId  = checkpoint::ipc::SessionId{3},
+        .rank       = Rank{0},
+        .snapshotId = checkpoint::ipc::SnapshotId{2},
+    };
     PERF() << checkpoint::telemetry::span::SvrDurable::Begin{.id = durableId, .startedAt = durableStartedAt};
     PERF() << checkpoint::telemetry::span::SvrDurable::End{.id = durableId};
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
@@ -587,6 +595,47 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     std::filesystem::remove_all(outDir);
 }
 
+TEST_CASE("Process memory samples export through OpenTelemetry", "[telemetry][memory][tier1]")
+{
+    auto const outDir   = CkptDir("otel_process_memory");
+    auto const outPath  = outDir / "telemetry.jsonl";
+    auto const logsPath = std::filesystem::path{outPath.string() + ".logs"};
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);           // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                // NOLINT(concurrency-mt-unsafe)
+    checkpoint::telemetry::Init();
+
+    auto const id = checkpoint::telemetry::Id{
+        .sessionId  = checkpoint::ipc::SessionId{3},
+        .rank       = Rank{1},
+        .snapshotId = checkpoint::ipc::SnapshotId{2},
+    };
+    PERF() << checkpoint::telemetry::span::SvrFinalize::Begin{.id = id};
+    PERF() << checkpoint::telemetry::span::SvrFinalize::End{.id = id};
+    checkpoint::telemetry::Shutdown();
+    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");      // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");      // NOLINT(concurrency-mt-unsafe)
+
+    REQUIRE(std::filesystem::exists(logsPath));
+    auto const bytes = ReadFile(logsPath);
+    auto const json  = std::string(bytes.begin(), bytes.end());
+    REQUIRE(json.contains(checkpoint::telemetry::event::ProcessMemory::Name));
+    REQUIRE(json.contains("nvrx-checkpoint-server"));
+    REQUIRE(json.contains("nvrx.memory.rss_bytes"));
+    REQUIRE(json.contains("nvrx.memory.peak_rss_bytes"));
+    REQUIRE(json.contains("nvrx.memory.trigger"));
+    REQUIRE(json.contains(checkpoint::telemetry::span::SvrFinalize::Name));
+    REQUIRE(json.contains("\"key\":\"nvrx.session_id\",\"value\":{\"intValue\":\"3\"}"));
+    REQUIRE(json.contains("\"key\":\"nvrx.rank\",\"value\":{\"intValue\":\"1\"}"));
+    REQUIRE(json.contains("\"key\":\"nvrx.snapshot_id\",\"value\":{\"intValue\":\"2\"}"));
+    REQUIRE_FALSE(json.contains("nvrx.process.role"));
+    std::filesystem::remove_all(outDir);
+}
+
 TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]")
 {
     auto const outDir     = CkptDir("otel_log_export");
@@ -596,7 +645,6 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);              // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);           // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_METRICS", "0", 1);             // NOLINT(concurrency-mt-unsafe)
@@ -621,7 +669,6 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     ::close(savedStderr);
 
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
@@ -640,6 +687,7 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     REQUIRE_FALSE(logJson.contains("combined sink record 42\\n"));
     REQUIRE_FALSE(logJson.contains("second sink record\\n"));
     REQUIRE_FALSE(logJson.contains("[native_ckpt:svr][INFO] combined sink record 42"));
+    REQUIRE_FALSE(logJson.contains("nvrx.memory.rss_bytes"));
     std::filesystem::remove_all(outDir);
 }
 
@@ -650,7 +698,6 @@ TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telem
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_ENABLE", "1", 1);              // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_EXPORT", "daemon", 1);         // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                // NOLINT(concurrency-mt-unsafe)
@@ -665,13 +712,15 @@ TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telem
     checkpoint::telemetry::Collect(R"({"second_local_line":true})");
     checkpoint::telemetry::Collect(R"({"received_remotely":true})");
     checkpoint::telemetry::Collect(R"({"second_remote_line":true})");
-    auto const spanId = checkpoint::telemetry::span::Id{
-        .sessionId = checkpoint::ipc::SessionId::Default, .rank = Rank{0}, .snapshotId = checkpoint::ipc::SnapshotId::Default,};
+    auto const spanId = checkpoint::telemetry::Id{
+        .sessionId  = checkpoint::ipc::SessionId::Default,
+        .rank       = Rank{0},
+        .snapshotId = checkpoint::ipc::SnapshotId::Default,
+    };
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::Begin{.id = spanId};
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::End{.id = spanId};
     checkpoint::telemetry::Shutdown();
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_ENABLE");    // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");    // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_FILE");      // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_LOGS");      // NOLINT(concurrency-mt-unsafe)
@@ -687,6 +736,43 @@ TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telem
     REQUIRE(writtenOnce != std::string::npos);
     REQUIRE(writtenOnce == json.rfind(R"({"written_once":true})"));
     std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("OpenTelemetry both mode selects file and daemon routes", "[telemetry][tier1]")
+{
+    checkpoint::config::OtelConfig config;
+
+    config.mode = checkpoint::config::OtelExportMode::File;
+    REQUIRE(config.WritesProcessFile());
+    REQUIRE_FALSE(config.RoutesThroughDaemon());
+
+    config.mode = checkpoint::config::OtelExportMode::Daemon;
+    REQUIRE_FALSE(config.WritesProcessFile());
+    REQUIRE(config.RoutesThroughDaemon());
+
+    config.mode = checkpoint::config::OtelExportMode::Both;
+    REQUIRE(config.WritesProcessFile());
+    REQUIRE(config.RoutesThroughDaemon());
+}
+
+TEST_CASE("OpenTelemetry file presence enables telemetry relative to the server log", "[telemetry][tier1]")
+{
+    auto const outDir    = CkptDir("otel_relative_file");
+    auto const serverLog = outDir / "server.%h.%p.log";
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");    // NOLINT(concurrency-mt-unsafe)
+    REQUIRE_FALSE(checkpoint::config::OtelConfig{}.enabled);
+
+    ::setenv("NATIVE_CKPT_SERVER_LOG", serverLog.c_str(), 1);         // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", "telemetry.%h.%p.jsonl", 1);    // NOLINT(concurrency-mt-unsafe)
+    checkpoint::config::OtelConfig const config;
+
+    REQUIRE(config.enabled);
+    REQUIRE(config.ExportFile().parent_path() == outDir);
+    REQUIRE(config.ExportFile().filename() == checkpoint::config::Substitute("telemetry.%h.%p.jsonl"));
+    REQUIRE(config.CollectorFile() == config.ExportFile());
+
+    ::unsetenv("NATIVE_CKPT_SERVER_LOG");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");     // NOLINT(concurrency-mt-unsafe)
 }
 
 TEST_CASE("OTLP HTTP protobuf signals sink as canonical JSONL", "[telemetry][tier1]")

@@ -1,8 +1,10 @@
 #include "CommonMacros.h"
+#include "SetThreadName.h"
 
 #include "config.h"
 #include "logging.h"
 #include "net_utils.h"
+#include "process_memory.h"
 #include "telemetry.h"
 
 #include <boost/beast/core.hpp>
@@ -37,8 +39,10 @@
 #include <expected>
 #include <mutex>
 #include <sstream>
+#include <utility>
 #include <variant>
 
+#include <unistd.h>
 #include <zlib.h>
 
 namespace trace_api     = opentelemetry::trace;
@@ -303,13 +307,12 @@ struct LogTelState
 
     struct SaveStart
     {
-        checkpoint::telemetry::span::Id id;
-        std::chrono::nanoseconds        startedAt;
+        checkpoint::telemetry::Id id;
+        std::chrono::nanoseconds  startedAt;
     };
 
     struct SaveStartState
     {
-        std::mutex                                    mutex;
         boost::container::small_vector<SaveStart, 16> entries;
     };
 
@@ -322,8 +325,8 @@ struct LogTelState
 
     struct ActiveSpanId
     {
-        ActiveSpanKind                  kind{};
-        checkpoint::telemetry::span::Id id{};
+        ActiveSpanKind            kind{};
+        checkpoint::telemetry::Id id{};
 
         bool operator==(ActiveSpanId const&) const = default;
     };
@@ -336,11 +339,11 @@ struct LogTelState
 
     struct ActiveSpanState
     {
-        std::mutex                                     mutex;
         boost::container::small_vector<ActiveSpan, 16> entries;
     };
 
     std::mutex                      mutex;
+    checkpoint::telemetry::Id       lastId{};
     std::once_flag                  poolOnce;
     std::shared_ptr<spdlog::logger> logger;
 
@@ -351,6 +354,7 @@ struct LogTelState
     LogState                                   logs;
     SaveStartState                             saveStarts;
     ActiveSpanState                            activeSpans;
+    checkpoint::telemetry::MemorySampler       sampler;
 
     std::mutex                                                  collectorMutex;
     std::variant<std::monostate, FileCollector, RelayCollector> collector;
@@ -422,7 +426,10 @@ struct LogTelState
         return Instance;
     }
 };
+}    // namespace
 
+namespace
+{
 class LoggingSink final : public spdlog::sinks::sink
 {
     public:
@@ -501,6 +508,7 @@ class LoggingSink final : public spdlog::sinks::sink
 };
 
 }    // namespace
+
 namespace checkpoint::logging
 {
 void Init()
@@ -571,6 +579,51 @@ void LogImpl(Level level, std::string_view message)
 
 namespace checkpoint::telemetry
 {
+MemorySampler::MemorySampler() = default;
+
+MemorySampler::~MemorySampler()
+{ Shutdown(); }
+
+void MemorySampler::Start()
+{
+    if (_thread.joinable()) { return; }
+    auto const seconds = checkpoint::config::GetConfigValue<checkpoint::config::MemorySampleIntervalSeconds>();
+    if (seconds == 0) { return; }
+    _interval = std::chrono::seconds{seconds};
+    _thread   = std::jthread([this](std::stop_token stopToken) { Run_(stopToken); });
+}
+
+void MemorySampler::Shutdown()
+{
+    if (!_thread.joinable()) { return; }
+    _thread.request_stop();
+    _wake.notify_all();
+    _thread.join();
+}
+
+void MemorySampler::Log(std::string_view const& trigger)
+{
+    if (!IsEnabled()) { return; }
+    PERF() << event::ProcessMemory{
+        .usage   = ProcessMemUsageInfo::Get(),
+        .trigger = trigger,
+    };
+}
+
+void MemorySampler::Run_(std::stop_token& stopToken)
+{
+    SetThreadName("nc:memsample");
+    std::unique_lock lock(_waitMutex);
+    while (!stopToken.stop_requested())
+    {
+        _wake.wait_for(lock, stopToken, _interval, [] { return false; });
+        if (stopToken.stop_requested()) { break; }
+        lock.unlock();
+        Log("sampler");
+        lock.lock();
+    }
+}
+
 using UInt32Text = std::array<char, std::numeric_limits<uint32_t>::digits10 + 1>;
 
 static std::string_view ToText(uint32_t value, UInt32Text& text)
@@ -635,41 +688,10 @@ class RoutingAppender : public otlp::OtlpFileAppender
 static std::shared_ptr<otlp::OtlpFileAppender>
 MakeAppender(checkpoint::config::OtelConfig const& cfg, LogTelState& state, std::string_view suffix = {})
 {
-    bool const  writeFile = cfg.mode != checkpoint::config::OtelExportMode::Daemon;
+    bool const  writeFile = cfg.WritesProcessFile();
     std::string file      = writeFile ? cfg.ExportFile().string() : std::string{};
     if (writeFile) { file.append(suffix); }
     return std::make_shared<RoutingAppender>(file, state);
-}
-
-static std::shared_ptr<trace_api::Span> StartSpan(std::string_view name, trace_api::StartSpanOptions const* options = nullptr)
-{
-    LogTelState& state = LogTelState::Get();
-    if (!state.enabled.load(std::memory_order_acquire)) { return {}; }
-    std::scoped_lock lock(state.mutex);
-    if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return {}; }
-    return options == nullptr ? state.tracer->StartSpan(name) : state.tracer->StartSpan(name, *options);
-}
-
-static void StoreActiveSpan(LogTelState::ActiveSpanId const& id, std::shared_ptr<trace_api::Span> span)
-{
-    if (!span) { return; }
-    LogTelState&                  state       = LogTelState::Get();
-    LogTelState::ActiveSpanState& activeSpans = state.activeSpans;
-    std::scoped_lock              lock(activeSpans.mutex);
-    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
-    auto const entry = std::ranges::find_if(activeSpans.entries, [&id](auto const& active) { return active.id == id; });
-    if (entry == activeSpans.entries.end()) { activeSpans.entries.push_back({.id = id, .span = std::move(span)}); }
-}
-
-static std::shared_ptr<trace_api::Span> TakeActiveSpan(LogTelState::ActiveSpanId const& id)
-{
-    LogTelState::ActiveSpanState& activeSpans = LogTelState::Get().activeSpans;
-    std::scoped_lock              lock(activeSpans.mutex);
-    auto const                    entry = std::ranges::find_if(activeSpans.entries, [&id](auto const& active) { return active.id == id; });
-    if (entry == activeSpans.entries.end()) { return {}; }
-    auto span = std::move(entry->span);
-    activeSpans.entries.erase(entry);
-    return span;
 }
 
 void Init()
@@ -685,6 +707,7 @@ void Init()
     otel_res::ResourceAttributes attrs{
         {"service.name", service},
         {"host.name", checkpoint::config::Hostname()},
+        {"process.pid", static_cast<int64_t>(::getpid())},
     };
     if (!cfg.ciPhase.empty()) { attrs.SetAttribute("nvrx.ci_phase", cfg.ciPhase); }
     if (!cfg.runId.empty()) { attrs.SetAttribute("nemo.run.id", cfg.runId); }
@@ -736,11 +759,16 @@ void Init()
     std::call_once(state.shutdownOnce, [] { std::atexit(+[] { Shutdown(); }); });
 
     state.enabled.store(true, std::memory_order_release);
+    state.sampler.Start();
 }
+
+bool IsEnabled() noexcept
+{ return LogTelState::Get().enabled.load(std::memory_order_acquire); }
 
 void Shutdown()
 {
     LogTelState& state = LogTelState::Get();
+    state.sampler.Shutdown();
     {
         std::scoped_lock lock(state.mutex);
         if (state.enabled.exchange(false, std::memory_order_acq_rel))
@@ -753,16 +781,11 @@ void Shutdown()
                 state.metrics.histograms.clear();
                 state.metrics.meter.reset();
                 state.logs.logger.reset();
+                state.lastId = {};
             }
 
-            {
-                std::scoped_lock startsLock(state.saveStarts.mutex);
-                state.saveStarts.entries.clear();
-            }
-            {
-                std::scoped_lock spansLock(state.activeSpans.mutex);
-                state.activeSpans.entries.clear();
-            }
+            state.saveStarts.entries.clear();
+            state.activeSpans.entries.clear();
             state.tracer.reset();
 
             trace_api::Provider::SetTracerProvider(std::make_shared<trace_api::NoopTracerProvider>());
@@ -818,6 +841,37 @@ OtlpResponse ReceiveOtlp(std::string_view const& path,
                          std::string_view const& payload)
 { return LogTelState::Get().ReceiveOtlp(path, contentType, contentEncoding, payload); }
 
+static void EmitProcessMemory(LogTelState& state, std::scoped_lock<std::mutex> const& /* lock */, event::ProcessMemory const& fields)
+{
+    if (!state.logs.logger) { return; }
+    auto record = state.logs.logger->CreateLogRecord();
+    record->SetTimestamp(std::chrono::system_clock::now());
+    record->SetEventId(0, event::ProcessMemory::Name);
+    record->SetAttribute("nvrx.memory.rss_bytes", static_cast<int64_t>(fields.usage.rssBytes));
+    record->SetAttribute("nvrx.memory.peak_rss_bytes", static_cast<int64_t>(fields.usage.peakRssBytes));
+    record->SetAttribute("nvrx.memory.anonymous_rss_bytes", static_cast<int64_t>(fields.usage.anonymousRssBytes));
+    record->SetAttribute("nvrx.memory.file_rss_bytes", static_cast<int64_t>(fields.usage.fileRssBytes));
+    record->SetAttribute("nvrx.memory.shmem_rss_bytes", static_cast<int64_t>(fields.usage.shmemRssBytes));
+    record->SetAttribute("nvrx.memory.locked_bytes", static_cast<int64_t>(fields.usage.lockedBytes));
+    record->SetAttribute("nvrx.memory.pinned_bytes", static_cast<int64_t>(fields.usage.pinnedBytes));
+    record->SetAttribute("nvrx.memory.swap_bytes", static_cast<int64_t>(fields.usage.swapBytes));
+    record->SetAttribute("nvrx.memory.trigger", fields.trigger);
+    record->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(state.lastId.sessionId)));
+    record->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(state.lastId.rank)));
+    record->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(state.lastId.snapshotId)));
+    state.logs.logger->EmitLogRecord(std::move(record));
+}
+
+void Emitter<event::ProcessMemory>::Emit(event::ProcessMemory const& fields)
+{
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+    EmitProcessMemory(state, lock, fields);
+}
+
 void Emitter<span::CkptSave::Begin>::Emit(span::CkptSave::Begin const& fields)
 {
     fmt::print(stderr,
@@ -830,13 +884,12 @@ void Emitter<span::CkptSave::Begin>::Emit(span::CkptSave::Begin const& fields)
 
     LogTelState& state = LogTelState::Get();
     if (!state.enabled.load(std::memory_order_acquire)) { return; }
-    std::scoped_lock lock(state.saveStarts.mutex);
-    auto const       entry = std::ranges::find_if(state.saveStarts.entries, [&fields](auto const& start) { return start.id == fields.id; });
-    if (entry == state.saveStarts.entries.end()) { state.saveStarts.entries.push_back({.id = fields.id, .startedAt = fields.startedAt}); }
-    else
-    {
-        entry->startedAt = fields.startedAt;
-    }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::CkptSave::Name});
+    state.saveStarts.entries.push_back({.id = fields.id, .startedAt = fields.startedAt});
 }
 
 void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
@@ -868,8 +921,11 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
     auto const endSystem   = std::chrono::system_clock::now();
     auto const endSteady   = std::chrono::steady_clock::now();
     auto       startSystem = endSystem - fields.totalDuration;
+    auto const startSteady = endSteady - std::chrono::duration_cast<std::chrono::steady_clock::duration>(fields.totalDuration);
     {
-        std::scoped_lock lock(state.saveStarts.mutex);
+        std::scoped_lock<std::mutex> lock(state.mutex);
+        if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return; }
+
         auto const entry = std::ranges::find_if(state.saveStarts.entries, [&fields](auto const& start) { return start.id == fields.id; });
         if (entry != state.saveStarts.entries.end())
         {
@@ -877,15 +933,13 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
                 = std::chrono::system_clock::time_point{std::chrono::duration_cast<std::chrono::system_clock::duration>(entry->startedAt)};
             state.saveStarts.entries.erase(entry);
         }
-    }
-    auto const startSteady = endSteady - std::chrono::duration_cast<std::chrono::steady_clock::duration>(fields.totalDuration);
+        state.lastId = fields.id;
+        EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::CkptSave::Name});
 
-    trace_api::StartSpanOptions startOptions;
-    startOptions.start_system_time = startSystem;
-    startOptions.start_steady_time = startSteady;
-    auto ckptSpan                  = StartSpan(span::CkptSave::Name, &startOptions);
-    if (ckptSpan)
-    {
+        trace_api::StartSpanOptions startOptions;
+        startOptions.start_system_time = startSystem;
+        startOptions.start_steady_time = startSteady;
+        auto ckptSpan                  = state.tracer->StartSpan(span::CkptSave::Name, startOptions);
         ckptSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
         ckptSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
         ckptSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
@@ -921,60 +975,119 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
 
 void Emitter<span::SvrFinalize::Begin>::Emit(span::SvrFinalize::Begin const& fields)
 {
-    auto finalizeSpan = StartSpan(span::SvrFinalize::Name);
-    if (finalizeSpan)
-    {
-        finalizeSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
-        finalizeSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
-        finalizeSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
-        StoreActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrFinalize, .id = fields.id}, std::move(finalizeSpan));
-    }
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return; }
+
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrFinalize::Name});
+
+    auto finalizeSpan = state.tracer->StartSpan(span::SvrFinalize::Name);
+    finalizeSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
+    finalizeSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
+    finalizeSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
+    state.activeSpans.entries.push_back(
+        {.id = {.kind = LogTelState::ActiveSpanKind::SvrFinalize, .id = fields.id}, .span = std::move(finalizeSpan)});
 }
 
 void Emitter<span::SvrFinalize::End>::Emit(span::SvrFinalize::End const& fields)
 {
-    auto finalizeSpan = TakeActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrFinalize, .id = fields.id});
-    if (finalizeSpan) { finalizeSpan->End(); }
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrFinalize::Name});
+
+    auto const id    = LogTelState::ActiveSpanId{.kind = LogTelState::ActiveSpanKind::SvrFinalize, .id = fields.id};
+    auto const entry = std::ranges::find_if(state.activeSpans.entries, [&id](auto const& active) { return active.id == id; });
+    if (entry == state.activeSpans.entries.end()) { return; }
+    auto finalizeSpan = std::move(entry->span);
+    state.activeSpans.entries.erase(entry);
+    finalizeSpan->End();
 }
 
 void Emitter<span::SvrWriteMetadata::Begin>::Emit(span::SvrWriteMetadata::Begin const& fields)
 {
-    auto metadataSpan = StartSpan(span::SvrWriteMetadata::Name);
-    if (metadataSpan)
-    {
-        metadataSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
-        metadataSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
-        StoreActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrWriteMetadata, .id = fields.id}, std::move(metadataSpan));
-    }
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return; }
+
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrWriteMetadata::Name});
+
+    auto metadataSpan = state.tracer->StartSpan(span::SvrWriteMetadata::Name);
+    metadataSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
+    metadataSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
+    state.activeSpans.entries.push_back(
+        {.id = {.kind = LogTelState::ActiveSpanKind::SvrWriteMetadata, .id = fields.id}, .span = std::move(metadataSpan)});
 }
 
 void Emitter<span::SvrWriteMetadata::End>::Emit(span::SvrWriteMetadata::End const& fields)
 {
-    auto metadataSpan = TakeActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrWriteMetadata, .id = fields.id});
-    if (metadataSpan) { metadataSpan->End(); }
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrWriteMetadata::Name});
+
+    auto const id    = LogTelState::ActiveSpanId{.kind = LogTelState::ActiveSpanKind::SvrWriteMetadata, .id = fields.id};
+    auto const entry = std::ranges::find_if(state.activeSpans.entries, [&id](auto const& active) { return active.id == id; });
+    if (entry == state.activeSpans.entries.end()) { return; }
+    auto metadataSpan = std::move(entry->span);
+    state.activeSpans.entries.erase(entry);
+    metadataSpan->End();
 }
 
 void Emitter<span::SvrDurable::Begin>::Emit(span::SvrDurable::Begin const& fields)
 {
+
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return; }
+
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrDurable::Name});
+
     auto const                  nowSystem = std::chrono::system_clock::now();
     auto const                  nowSteady = std::chrono::steady_clock::now();
     trace_api::StartSpanOptions options;
     options.start_system_time = fields.startedAt;
     options.start_steady_time = nowSteady - std::chrono::duration_cast<std::chrono::steady_clock::duration>(nowSystem - fields.startedAt);
-    auto durableSpan          = StartSpan(span::SvrDurable::Name, &options);
-    if (durableSpan)
-    {
-        durableSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
-        durableSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
-        durableSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
-        StoreActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrDurable, .id = fields.id}, std::move(durableSpan));
-    }
+    auto durableSpan          = state.tracer->StartSpan(span::SvrDurable::Name, options);
+    durableSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
+    durableSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
+    durableSpan->SetAttribute("nvrx.snapshot_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.snapshotId)));
+    state.activeSpans.entries.push_back(
+        {.id = {.kind = LogTelState::ActiveSpanKind::SvrDurable, .id = fields.id}, .span = std::move(durableSpan)});
 }
 
 void Emitter<span::SvrDurable::End>::Emit(span::SvrDurable::End const& fields)
 {
-    auto durableSpan = TakeActiveSpan({.kind = LogTelState::ActiveSpanKind::SvrDurable, .id = fields.id});
-    if (durableSpan) { durableSpan->End(); }
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+    state.lastId = fields.id;
+    EmitProcessMemory(state, lock, {.usage = ProcessMemUsageInfo::Get(), .trigger = span::SvrDurable::Name});
+
+    auto const id    = LogTelState::ActiveSpanId{.kind = LogTelState::ActiveSpanKind::SvrDurable, .id = fields.id};
+    auto const entry = std::ranges::find_if(state.activeSpans.entries, [&id](auto const& active) { return active.id == id; });
+    if (entry == state.activeSpans.entries.end()) { return; }
+    auto durableSpan = std::move(entry->span);
+    state.activeSpans.entries.erase(entry);
+    durableSpan->End();
 }
 
 }    // namespace checkpoint::telemetry

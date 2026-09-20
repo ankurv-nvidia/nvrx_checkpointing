@@ -47,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
@@ -109,6 +110,8 @@ HOST_MEMORY_METRICS = frozenset({
     "checkpoint_daemon_peak_rss_bytes",
     "training_process_peak_rss_bytes",
 })
+GPU_MEMORY_METRICS = frozenset({"gpu_peak_bytes", "gpu_hbm_peak_bytes", "gpu_hbm_peak_pct"})
+MEMORY_REGRESSION_METRICS = HOST_MEMORY_METRICS | GPU_MEMORY_METRICS
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
 # The allocation directory owns every named run.
@@ -123,6 +126,7 @@ _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
 _EPILOG_ENTRY_CMD = "__epilog__"
 _RANK_LOGS_ENTRY_CMD = "__rank_logs__"
 _FAILURE_SUMMARY_ENTRY_CMD = "__failure_summary__"
+_RECOVER_OTEL_ENTRY_CMD = "__recover_otel__"
 # GitLab traces are size limited. Rank 0 is already mirrored in full while the
 # run is active, so retain the failure and traceback tail for the ranks that
 # Slurm reports exiting.
@@ -147,7 +151,7 @@ SYNC_DIR_NAME = ".sync"
 _TORCH_STORAGE_ALIGNMENT = 64
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_PROC_STATUS_HWM_RE = re.compile(r"^VmHWM:\s+(\d+)\s+kB$", re.MULTILINE)
+_PROC_STATUS_RSS_RE = re.compile(r"^VmRSS:\s+(\d+)\s+kB$", re.MULTILINE)
 _PROC_ROOT = Path("/proc")
 _WORKTREE_REVISION = "HEAD"
 # A run directory is named for what it holds: the model it trained, the sources
@@ -169,7 +173,6 @@ _TRAIN_ENV_DEFAULTS = {
     "QUANTIZATION_TYPE_DEBUG": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "MASTER_PORT": "29500",
-    "NATIVE_CKPT_OTEL_ENABLE": "1",
     "NATIVE_CKPT_OTEL_EXPORT": "daemon",
 }
 _MEGATRON_OTEL_ENV_DEFAULTS = {
@@ -192,8 +195,8 @@ _PRETRAIN_ENV_NAMES = {
     "MAMBA_DETERMINISTIC",
     "MASTER_ADDR",
     "NATIVE_CKPT_OTEL_COLLECTOR",
-    "NATIVE_CKPT_OTEL_DIR",
     "NATIVE_CKPT_OTEL_FILE",
+    "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
     "NCCL_NET",
@@ -234,7 +237,7 @@ def sys_path_insert(path: Path) -> None:
 
 def _otel_reporting_enabled(flavors: FlavorSelection | None = None) -> bool:
     return (flavors is None or flavors.policy.otel_reporting) and (
-        os.environ.get("NATIVE_CKPT_OTEL_ENABLE", _TRAIN_ENV_DEFAULTS["NATIVE_CKPT_OTEL_ENABLE"]) == "1"
+        bool(os.environ.get("NATIVE_CKPT_OTEL_FILE"))
         or os.environ.get("MEGATRON_OTEL_ENABLED", _MEGATRON_OTEL_ENV_DEFAULTS["MEGATRON_OTEL_ENABLED"]) == "1"
     )
 
@@ -602,7 +605,7 @@ def ensure_vcpkg_root() -> None:
     )
     sys_path_insert(Path(os.environ["SLURMJOB_OPT_PYTHON_INSTALL_DIR"]))
 
-def uninstall_nvrx_for_native() -> None:
+def uninstall_nvrx_for_native() -> None:  # noqa: C901
     """Hide NVRx inside a marked native worker container and prove it is absent.
 
     ``pip uninstall`` can block indefinitely when several allocated nodes
@@ -903,7 +906,7 @@ def _report_allocation_accounting(job_id: str) -> None:
         "sacct", "-n", "-P", "--local", "-j", job_id,
         "-o", "JobIDRaw,JobName%30,State,Elapsed,Timelimit,ExitCode,DerivedExitCode,NodeList%40,MaxRSS",
     ]
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S607
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
     if proc.returncode:
         logger.warning(
             f"[slurm_job:sacct] accounting unavailable for job {job_id}: "
@@ -1177,51 +1180,23 @@ def tee_run(cmd: list[str], log_file: Path, env: dict | None = None, *, append: 
         raise RuntimeError(f"job failed with exit code {rc}; log: {log_file}")
     return rc
 
-def _process_peak_rss_bytes(pid: str) -> int | None:
-    """Read the kernel-maintained peak RSS for one live Linux process."""
+def _process_rss_bytes(pid: str) -> int | None:
+    """Read the current RSS for one live Linux process."""
     try:
         status = (_PROC_ROOT / pid / "status").read_text()
     except (OSError, UnicodeError):
         return None
-    match = _PROC_STATUS_HWM_RE.search(status)
+    match = _PROC_STATUS_RSS_RE.search(status)
     return int(match[1]) * 1024 if match else None
 
-def _record_daemon_peak_rss(tag: str, pids: list[str]) -> None:
-    """Persist one daemon high-water mark before the process exits."""
-    values = [value for pid in pids if (value := _process_peak_rss_bytes(pid)) is not None]
-    if not values:
-        logger.warning(f"[slurm_job:memory] checkpoint daemon peak RSS unavailable for pids {pids}")
-        return
-    host = socket.gethostname().split(".", 1)[0]
-    safe_tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
-    record = {
-        "node": host,
-        "peak_rss_bytes": max(values),
-        "pids": [int(pid) for pid in pids],
-    }
-    path = RESULTS_DIR / f"host_memory.daemon.{safe_tag}.{host}.json"
-    path.write_text(json.dumps(record, separators=(",", ":")))
 
-def _with_host_memory_metrics(metrics: dict, results_dir: Path) -> dict:
+def _with_host_memory_metrics(metrics: dict, results_dir: Path, *, native: bool) -> dict:
     """Add complete-run peak RSS for the training ranks and daemon nodes."""
     result = dict(metrics)
     if training := result.pop("cpu_rss_bytes", None):
-        result["training_process_peak_rss_bytes"] = training
-
-    per_node: dict[str, int] = {}
-    for path in results_dir.glob("host_memory.daemon.*.json"):
-        try:
-            record = json.loads(path.read_text())
-            node = str(record["node"])
-            value = int(record["peak_rss_bytes"])
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            logger.warning(f"[slurm_job:memory] ignoring malformed daemon memory record {path}")
-            continue
-        per_node[node] = max(value, per_node.get(node, 0))
-    if per_node:
-        daemon = otel_report.metric(list(per_node.values()), "B", higher_is_better=False)
-        daemon["per_node"] = dict(sorted(per_node.items()))
-        result["checkpoint_daemon_peak_rss_bytes"] = daemon
+        result.setdefault("training_process_peak_rss_bytes", training)
+    if native and "checkpoint_daemon_peak_rss_bytes" not in result:
+        result.update(otel_report.complete_run_process_memory_peaks(results_dir))
     return result
 
 class PerfReport:
@@ -1243,7 +1218,10 @@ class PerfReport:
     def baseline(stem: str) -> dict:
         path = BASELINES_DIR / f"{stem}.yaml"
         baseline = dict(_load_yaml(path) if path.exists() else {})
-        baseline["metrics"] = {**baseline.get("metrics", {}), "bw_mbps": PerfReport._platform_bandwidth_baseline(platform_tag())}
+        metrics = dict(baseline.get("metrics", {}))
+        if "nvrx" not in stem:
+            metrics.setdefault("bw_mbps", PerfReport._platform_bandwidth_baseline(platform_tag()))
+        baseline["metrics"] = metrics
         return baseline
 
     @staticmethod
@@ -1276,9 +1254,6 @@ class PerfReport:
         if name in {
             "bw_mbps",
             "wr_tnsr_us",
-            "megatron.training.step_duration_ms",
-            "megatron.training.throughput_tflops",
-            "megatron.training.tokens_per_sec",
         } and "median" in measured:
             return "median"
         return "mean"
@@ -1299,6 +1274,7 @@ class PerfReport:
         for name, measured in metrics.items():
             statistic = PerfReport._statistic(name, measured)
             value, higher = measured[statistic], measured["higher_is_better"]
+            improved_beyond_tolerance = False
             if name == "bw_socket_imbalance":
                 ok, target, tolerance = value <= MAX_BW_SOCKET_IMBALANCE, MAX_BW_SOCKET_IMBALANCE, 0
             elif name not in expected:
@@ -1311,13 +1287,15 @@ class PerfReport:
                 low, high = target * (1 - tolerance), target * (1 + tolerance)
                 if higher is True:
                     ok = value >= low
+                    improved_beyond_tolerance = value > high
                 elif higher is False:
                     ok = value <= high
+                    improved_beyond_tolerance = value < low
                 else:
                     ok = low <= value <= high
             passed &= ok
             result[name] = {
-                "status": "PASS" if ok else "FAIL",
+                "status": "WARN" if improved_beyond_tolerance else ("PASS" if ok else "FAIL"),
                 "measured": value,
                 "baseline": target,
                 "tolerance_pct": tolerance * 100,
@@ -1338,6 +1316,7 @@ class PerfReport:
         *,
         results_dir: Path | None = None,
         otel_reporting: bool | None = None,
+        enforced_metrics: frozenset[str] | None = None,
     ) -> bool:
         flavor_names = flavor.split("-")
         results_dir = results_dir or log.parent
@@ -1351,13 +1330,15 @@ class PerfReport:
             if otel_reporting
             else log_report.post_process(log, results_dir, gpus, native)
         )
-        metrics = _with_host_memory_metrics(processed["metrics"], results_dir)
+        metrics = _with_host_memory_metrics(processed["metrics"], results_dir, native=native)
         PerfReport._log_daemon_durability(metrics)
         if not metrics:
             if processed["source"] == "logs" and not native:
                 return True
             raise RuntimeError(f"no perf metrics found in {processed['source']} report data for {results_dir}")
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
+        if enforced_metrics is not None:
+            passed = all(comparison.get(name, {}).get("status") != "FAIL" for name in enforced_metrics)
         validation = processed["validation"]
         if validation:
             comparison[validation["name"]] = {
@@ -1365,7 +1346,8 @@ class PerfReport:
                 "measured": validation["measured"],
                 "baseline": validation["baseline"],
             }
-            passed &= validation["valid"]
+            if enforced_metrics is None:
+                passed &= validation["valid"]
         for name, value in comparison.items():
             metric = metrics.get(name, {})
             unit = f" {metric['unit']}" if metric.get("unit") else ""
@@ -1382,7 +1364,8 @@ class PerfReport:
                 details.append(f"baseline={value['baseline']}{unit}")
             if "tolerance_pct" in value:
                 details.append(f"tolerance={value['tolerance_pct']}%")
-            logger.info(f"[{value['status']}] {name}: {'; '.join(details)}")
+            report_metric = logger.warning if value["status"] == "WARN" else logger.info
+            report_metric(f"[{value['status']}] {name}: {'; '.join(details)}")
         report = {
             "job": job,
             "config": config,
@@ -1640,16 +1623,19 @@ def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> N
 def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> None:
     """Write measured metrics from the job-level report as a candidate baseline."""
     flavors = _selected_flavors(args)
-    # NVRX does not expose the native writer's bandwidth counters. Keep its
-    # report as raw diagnostic output without pretending the memory-only data
-    # is a comparable checkpoint-performance baseline.
-    if "perf" not in flavors.names or "nvrx" in flavors.names:
+    if not ({"perf", "detr"} & set(flavors.names)):
         return
-    _cfg, _flavor, stem = _identity(args)
+    _cfg, _flavor, report_stem = _identity(args)
+    report_spec = next(
+        (spec for spec in reversed(_run_specs(args)) if _provider(spec.flavors) == "native"),
+        _run_specs(args)[-1],
+    )
+    nvrx = "nvrx" in report_spec.flavors.names
+    stem = _performance_baseline_stem(args)
     output = results_dir / "baselines"
     output.mkdir(parents=True, exist_ok=True)
 
-    report_path = results_dir / f"{stem}_report.json"
+    report_path = results_dir / f"{report_stem}_report.json"
     if not report_path.exists():
         return
     report = json.loads(report_path.read_text())
@@ -1658,12 +1644,17 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
     if source not in {"logs", "otlp"}:
         logger.warning(f"[slurm_job:perf] WARNING refusing baseline candidate with unknown telemetry source: {source!r}")
         return
-    required = otel_report.REQUIRED_PERF_METRICS if source == "otlp" else log_report.REQUIRED_PERF_METRICS
+    required = (
+        GPU_MEMORY_METRICS | {"training_process_peak_rss_bytes"}
+        if nvrx
+        else otel_report.REQUIRED_PERF_METRICS if source == "otlp" else log_report.REQUIRED_PERF_METRICS
+    )
     validation_field = "ckpt_save_spans_valid" if source == "otlp" else "ckpt_save_markers_valid"
     missing = required - measured.keys()
-    if report.get(validation_field) is not True or missing:
+    invalid_save_records = not nvrx and report.get(validation_field) is not True
+    if invalid_save_records or missing:
         details = []
-        if report.get(validation_field) is not True:
+        if invalid_save_records:
             details.append("ckpt.save records were missing or invalid")
         if missing:
             details.append(f"required metrics were absent: {', '.join(sorted(missing))}")
@@ -1673,9 +1664,9 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
     rank_statistics = {}
     for name, value in measured.items():
         # Socket imbalance is an in-job topology diagnostic rather than a
-        # workload baseline. The measured bandwidth belongs in the candidate
-        # even though the shared platform floor remains the enforced gate.
-        if name == "bw_socket_imbalance" or name in HOST_MEMORY_METRICS:
+        # workload baseline. The platform bandwidth value is only a fallback
+        # when a workload has no recorded measurement.
+        if name == "bw_socket_imbalance":
             continue
         statistic = PerfReport._statistic(name, value)
         if statistic in value:
@@ -1690,6 +1681,9 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
             }
     if metrics:
         baseline = {"description": "auto-generated by CI", "source": source, "metrics": metrics}
+        memory_tolerances = {name: PERF_TOLERANCE for name in HOST_MEMORY_METRICS if name in metrics}
+        if memory_tolerances:
+            baseline["tolerances"] = memory_tolerances
         if rank_statistics:
             baseline["rank_statistics"] = rank_statistics
         (output / f"{stem}.yaml").write_text(yaml.safe_dump(baseline, sort_keys=False))
@@ -1764,7 +1758,6 @@ def _base_env() -> dict[str, str]:
             "NATIVE_CKPT_SERVER_LOG",
             str(RESULTS_DIR / "checkpoint_server.%h.%p.log"),
         ),
-        "NATIVE_CKPT_OTEL_DIR": os.environ.get("NATIVE_CKPT_OTEL_DIR", str(RESULTS_DIR / "otel")),
     }
 
 # A run trains phase 1 from scratch and phase 2 resuming from it. A variant
@@ -1857,12 +1850,10 @@ class FlavorPolicy:
     def run_worker(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
         (self.worker or _run_routine)(cfg, args, provider, label)
 
-    def stop_server(self, provider: str, tag: str, graceful: bool = True) -> None:
+    def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server:
             def stop() -> None:
                 pids = CHECKPOINT_SERVER.pids()
-                if provider == "native":
-                    _record_daemon_peak_rss(tag, pids)
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
                     pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]
@@ -1942,8 +1933,6 @@ class PerfFlavor(Flavor):
     def report(self, args: argparse.Namespace, log: Path) -> bool:
         cfg, tag, stem = _identity(args)
         baseline = args.baseline if hasattr(args, "baseline") else PerfReport.baseline(stem)
-        if "nvrx" in _selected_flavors(args).names:
-            baseline = {}
         return PerfReport.report(
             _selected_flavors(args).tag,
             cfg,
@@ -1996,11 +1985,10 @@ class DeterministicFlavor(Flavor):
         # Multi-run determinism keeps each routine's daemon logs beneath that
         # routine, while the batch log and report live at the job root. Report
         # the native routine when one exists; otherwise report the final run.
-        native = _provider(report_spec.flavors) == "native"
-        baseline = args.baseline if native else {}
+        baseline = args.baseline if hasattr(args, "baseline") else PerfReport.baseline(_performance_baseline_stem(args))
         source_log = _argument_log(args, log, report_spec)
         report_tag = "-".join(dict.fromkeys((*_selected_flavors(args).names, *report_spec.flavors.names)))
-        if not PerfReport.report(
+        return PerfReport.report(
             tag,
             cfg,
             report_tag,
@@ -2010,9 +1998,8 @@ class DeterministicFlavor(Flavor):
             args.gpus_per_node,
             results_dir=source_log.parent,
             otel_reporting=False,
-        ):
-            logger.warning("performance baseline failed; determinism comparisons passed")
-        return True
+            enforced_metrics=MEMORY_REGRESSION_METRICS,
+        )
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
         # Deterministic backward graph construction fails with the pinned Megatron and Transformer Engine versions.
@@ -2041,7 +2028,6 @@ class DeterministicFlavor(Flavor):
             # global random state once per span. The providers emit different
             # span sets, so tracing would make their saved RNG states differ.
             MEGATRON_OTEL_ENABLED="0",
-            NATIVE_CKPT_OTEL_ENABLE="0",
             NCCL_ALGO="Ring",
             NCCL_PROTO="Simple",
             NCCL_NVLS_ENABLE="0",
@@ -2051,6 +2037,7 @@ class DeterministicFlavor(Flavor):
             MAMBA_DETERMINISTIC="1",
             FLA_TILELANG="0",
         )
+        env.pop("NATIVE_CKPT_OTEL_FILE", None)
 
 
 class ValgrindFlavor(Flavor):
@@ -2084,7 +2071,8 @@ class ValgrindFlavor(Flavor):
         # even when memcheck does not diagnose it.
         _set(opts, "--rerun-mode", "disabled")
         # Keep third-party OTel/protobuf internals outside the daemon's Memcheck gate.
-        env.update(NATIVE_CKPT_OTEL_ENABLE="0", MEGATRON_OTEL_ENABLED="0")
+        env["MEGATRON_OTEL_ENABLED"] = "0"
+        env.pop("NATIVE_CKPT_OTEL_FILE", None)
         env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
 
     @contextlib.contextmanager
@@ -2115,7 +2103,8 @@ class ValgrindFlavor(Flavor):
             f"--log-file={report}",
             str(nvrx_checkpointing.SERVER_PATH),
         ]
-        server_env = {**os.environ, "NATIVE_CKPT_OTEL_ENABLE": "0"}
+        server_env = dict(os.environ)
+        server_env.pop("NATIVE_CKPT_OTEL_FILE", None)
         with server_log.open("w") as output:
             proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env=server_env)
             deadline = time.monotonic() + 600
@@ -2746,23 +2735,31 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         env["NATIVE_CKPT_SERVER_LOG"] = server_log
         otel_cycle_dir = RESULTS_DIR / "otel" / cycle_tag
         otel_cycle_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["NATIVE_CKPT_OTEL_DIR"] = str(otel_cycle_dir)
-        env["NATIVE_CKPT_OTEL_DIR"] = str(otel_cycle_dir)
         otel_file = otel_cycle_dir / "native_ckpt_otel.jsonl"
-        os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
-        env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
-        otel_enabled = env.get("MEGATRON_OTEL_ENABLED") == "1"
+        megatron_otel_enabled = env.get("MEGATRON_OTEL_ENABLED") == "1"
+        collect_otel = flavors.policy.manages_native_server and (
+            provider == "native" or megatron_otel_enabled or "detr" in flavors.names
+        )
+        if collect_otel:
+            os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
+            env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
+        else:
+            os.environ.pop("NATIVE_CKPT_OTEL_FILE", None)
+            env.pop("NATIVE_CKPT_OTEL_FILE", None)
+        otel_reporting = flavors.policy.otel_reporting and (
+            bool(env.get("NATIVE_CKPT_OTEL_FILE")) or megatron_otel_enabled
+        )
         perfetto_file = otel_cycle_dir / "native_ckpt_perfetto.json"
-        if otel_enabled and rank == "0":
+        if collect_otel and rank == "0":
             perfetto_file.unlink(missing_ok=True)
             otel_report.analysis_path(otel_file).unlink(missing_ok=True)
-        relay_megatron_otel = provider != "native" and otel_enabled
+        relay_otel = provider != "native" and collect_otel
         collector_node = (
             socket.gethostname().split(".", 1)[0] == env["MASTER_ADDR"].split(".", 1)[0]
-            if relay_megatron_otel
+            if relay_otel
             else int(rank) < args.gpus_per_node
         )
-        collector = "" if not relay_megatron_otel else ("file" if collector_node else f"{env['MASTER_ADDR']}:4100")
+        collector = "" if not relay_otel else ("file" if collector_node else f"{env['MASTER_ADDR']}:4100")
         if collector:
             os.environ["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
             env["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
@@ -2775,11 +2772,11 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         run_id = f"{job_id}-{RUN_NAME}-{cycle_tag}-sr{slurm_restart}-te{elastic_restart}"
         env["MEGATRON_OTEL_RUN_ID"] = run_id
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
-        server_enabled = flavors.policy.manages_native_server and (provider == "native" or otel_enabled)
+        server_enabled = collect_otel
         if server_enabled:
             from nvrx_checkpointing import checkpoint  # noqa: PLC0415
 
-            if relay_megatron_otel:
+            if relay_otel:
                 if collector_node:
                     _node_once(f"{label}-{cycle_tag}-otel-collector".strip("-"), checkpoint.ping)
                 _sync_ranks(f"{label}-{cycle_tag}-otel-collector-ready".strip("-"))
@@ -2822,20 +2819,24 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         if server_enabled and collector_node:
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
-        if otel_enabled and rank == "0":
-            if not otel_file.is_file():
-                raise RuntimeError(f"Megatron emitted no collected OTLP file: {otel_file}")
-            otel_data = otel_report.OtelData([otel_file])
-            otel_to_perfetto.convert_records(otel_data.records, perfetto_file)
-            analysis = otel_report.validate_collected(
-                otel_data,
-                run_id,
-                args.nodes,
-                args.gpus_per_node,
-                provider,
-                expected_checkpoints,
-            )
-            otel_report.write_analysis(otel_file, analysis)
+        if rank == "0":
+            otel_data = otel_report.OtelData([])
+            if collect_otel:
+                if not otel_file.is_file():
+                    raise RuntimeError(f"no collected OTLP file: {otel_file}")
+                otel_data = otel_report.OtelData([otel_file])
+                if otel_reporting:
+                    otel_to_perfetto.convert_records(otel_data.records, perfetto_file)
+                    analysis = otel_report.validate_collected(
+                        otel_data,
+                        run_id,
+                        args.nodes,
+                        args.gpus_per_node,
+                        provider,
+                        expected_checkpoints,
+                    )
+                    otel_report.write_analysis(otel_file, analysis)
+            otel_report.write_process_memory_charts(otel_data, otel_cycle_dir)
         if phase == 1:
             phase = 2
         else:
@@ -3234,7 +3235,7 @@ def _print_source_provenance() -> None:
     )
 
 class _PeakHbmSampler:
-    """Sample whole-device HBM use after training initializes its CUDA device."""
+    """Sample whole-device HBM use and training-process RSS."""
 
     def __init__(self, torch_module: ModuleType, interval_seconds: float = 1.0):
         self.torch = torch_module
@@ -3242,10 +3243,13 @@ class _PeakHbmSampler:
         self.peak_bytes = 0
         self.total_bytes = 0
         self.device: int | None = None
+        self.rss_samples: list[tuple[int, int]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="peak-hbm-sampler", daemon=True)
 
     def _sample_once(self) -> None:
+        if (rss_bytes := _process_rss_bytes(str(os.getpid()))) is not None:
+            self.rss_samples.append((time.time_ns(), rss_bytes))
         if not self.torch.cuda.is_initialized():
             return
         if self.device is None:
@@ -3269,6 +3273,69 @@ class _PeakHbmSampler:
         self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
         with contextlib.suppress(Exception):
             self._sample_once()
+
+
+def _emit_training_process_memory(samples: list[tuple[int, int]]) -> None:
+    """Export one training rank's RSS samples through its node-local OTLP daemon."""
+    if not samples:
+        return
+
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (  # noqa: PLC0415
+        ExportLogsServiceRequest,
+    )
+
+    rank = int(os.environ.get("RANK", "0"))
+    request = ExportLogsServiceRequest()
+    resource_logs = request.resource_logs.add()
+    for key, value in {
+        "service.name": otel_report.TRAINING_SERVICE,
+        "host.name": socket.gethostname().split(".", 1)[0],
+        "process.pid": os.getpid(),
+        "nemo.run.id": os.environ["MEGATRON_OTEL_RUN_ID"],
+        "dl.rank": rank,
+    }.items():
+        attribute = resource_logs.resource.attributes.add()
+        attribute.key = key
+        if isinstance(value, int):
+            attribute.value.int_value = value
+        else:
+            attribute.value.string_value = value
+
+    scope_logs = resource_logs.scope_logs.add()
+    scope_logs.scope.name = "nvrx.checkpoint.ci"
+    peak_rss_bytes = 0
+    for timestamp, rss_bytes in samples:
+        peak_rss_bytes = max(peak_rss_bytes, rss_bytes)
+        record = scope_logs.log_records.add()
+        record.time_unix_nano = timestamp
+        record.observed_time_unix_nano = timestamp
+        record.event_name = "process.memory"
+        record.body.string_value = "process.memory"
+        for key, value in {
+            "nvrx.rank": rank,
+            "nvrx.memory.rss_bytes": rss_bytes,
+            "nvrx.memory.peak_rss_bytes": peak_rss_bytes,
+            "nvrx.memory.trigger": "sampler",
+        }.items():
+            attribute = record.attributes.add()
+            attribute.key = key
+            if isinstance(value, int):
+                attribute.value.int_value = value
+            else:
+                attribute.value.string_value = value
+
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    if not endpoint:
+        endpoint = f"{os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://127.0.0.1:4318').rstrip('/')}/v1/logs"
+    http_request = urllib.request.Request(
+        endpoint,
+        data=request.SerializeToString(),
+        headers={"Content-Type": "application/x-protobuf"},
+        method="POST",
+    )
+    with urllib.request.urlopen(http_request, timeout=30) as response:
+        response.read()
+
 
 def _emit_checkpoint_resource_metrics(
     provider: str,
@@ -3384,6 +3451,8 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
         import resource  # noqa: PLC0415
 
         hbm.close()
+        if os.environ.get("NATIVE_CKPT_OTEL_FILE"):
+            _emit_training_process_memory(hbm.rss_samples)
         gpu_peak = torch.cuda.max_memory_allocated(hbm.device) if torch.cuda.is_initialized() else 0
         cpu_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
         if os.environ.get("MEGATRON_OTEL_ENABLED") == "1":
@@ -3433,6 +3502,27 @@ def _identity(args: argparse.Namespace) -> tuple[str, str, str]:
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
     flavors = _selected_flavors(args)
     return cfg, flavors.tag, f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
+
+
+def _provider_baseline_stem(args: argparse.Namespace, report_spec: RunSpec) -> str:
+    """Name a provider-specific baseline for a multi-routine report."""
+    cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
+    names = dict.fromkeys((*_selected_flavors(args).names, *report_spec.flavors.names))
+    return f"{platform_tag()}_{FlavorSelection(tuple(names)).settled_tag}_{cfg}"
+
+
+def _performance_baseline_stem(args: argparse.Namespace) -> str:
+    """Select the baseline for the provider represented by the job report."""
+    stem = _identity(args)[2]
+    flavors = _selected_flavors(args)
+    if "detr" not in flavors.names:
+        return stem
+    specs = _run_specs(args)
+    report_spec = next(
+        (spec for spec in reversed(specs) if _provider(spec.flavors) == "native"),
+        specs[-1],
+    )
+    return stem if _provider(report_spec.flavors) == "native" else _provider_baseline_stem(args, report_spec)
 
 
 def _clean_run_lines(*, lead_only: bool) -> list[str]:
@@ -3749,7 +3839,8 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
            "python3", "-u", str(Path(__file__).resolve()), *worker_args]
     epilog = [
         "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *common_worker_args,
-        "--log-file", str(log), "--baseline-json", json.dumps(PerfReport.baseline(stem), separators=(",", ":")),
+        "--log-file", str(log),
+        "--baseline-json", json.dumps(PerfReport.baseline(_performance_baseline_stem(args)), separators=(",", ":")),
         *run_args,
     ]
     rank_logs = [
@@ -3866,6 +3957,7 @@ _RUN_OPTIONS = {
 }
 _ENV_SCOPES = {
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
+    "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS": "rw",
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",
@@ -3877,7 +3969,7 @@ _ENV_SCOPES = {
     "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
-    "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_DIR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
+    "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
     "MEGATRON_OTEL_RUN_ID": "rw",
     **dict.fromkeys(_MEGATRON_OTEL_ENV_DEFAULTS, "rw"),
 }
@@ -3997,6 +4089,32 @@ def _failure_summary_entry(argv: list[str]) -> None:
     for run in runs:
         for log in sorted((run / "logs").glob("*.log")):
             _report_failure_summary(log)
+
+
+def _recover_otel_entry(argv: list[str]) -> None:
+    """Create missing memory graphs from telemetry left by an interrupted run."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if len(argv) != 1:
+        raise SystemExit(f"usage: {_RECOVER_OTEL_ENTRY_CMD} RUNS_ROOT")
+    root = Path(argv[0])
+    if not root.is_dir():
+        return
+    job_id = os.environ.get("CI_JOB_ID", "").strip()
+    runs = sorted(root.glob(f"{job_id}_*")) if job_id else sorted(root.iterdir())
+    for run in runs:
+        for source in sorted(run.glob("**/logs/otel/*/native_ckpt_otel.jsonl")):
+            output = source.parent / "process_memory_all.svg"
+            if output.is_file() or not source.stat().st_size:
+                continue
+            try:
+                data = otel_report.OtelData([source], tolerate_truncated_tail=True)
+                outputs = otel_report.write_process_memory_charts(data, source.parent)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                logger.warning(f"[slurm_job:otel] WARNING could not recover {source}: {error}")
+                continue
+            if outputs:
+                logger.info(f"[slurm_job:otel] recovered partial memory graph: {outputs[0]}")
+
 
 def _epilog(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -4258,5 +4376,7 @@ if __name__ == "__main__":
         _rank_logs_entry(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == _FAILURE_SUMMARY_ENTRY_CMD:
         _failure_summary_entry(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == _RECOVER_OTEL_ENTRY_CMD:
+        _recover_otel_entry(sys.argv[2:])
     else:
         main()

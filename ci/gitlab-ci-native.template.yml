@@ -138,6 +138,8 @@ variables:
       fi
     - du -ch ci/ci-runs/*/checkpoints/iter_*/*.distcp ci/ci-runs/*/*/checkpoints/iter_*/*.distcp 2>/dev/null | tail -n 1 || true
     - if [[ "${CI_JOB_STATUS:-}" == failed ]]; then python3 "${CI_SCRIPTS_DIR}/slurm_job.py" __failure_summary__ ci/ci-runs || true; fi
+    - python3 "${CI_SCRIPTS_DIR}/slurm_job.py" __recover_otel__ ci/ci-runs || true
+    - find ci/ci-results ci/ci-runs -type f \( -name 'native_ckpt_otel.jsonl' -o -name 'native_ckpt_perfetto.json' \) -exec gzip -f -- {} + 2>/dev/null || true
   artifacts:
     paths:
       - ci/ci-results/*.log
@@ -146,12 +148,15 @@ variables:
       - ci/ci-runs/*/*/logs/*.log
       - ci/ci-runs/*/logs/*_report.json
       - ci/ci-runs/*/*/logs/*_report.json
-      - ci/ci-results/otel/*/*.jsonl
-      - ci/ci-runs/*/logs/otel/*/*.jsonl
-      - ci/ci-runs/*/*/logs/otel/*/*.jsonl
-      - ci/ci-results/otel/*/*perfetto.json
-      - ci/ci-runs/*/logs/otel/*/*perfetto.json
-      - ci/ci-runs/*/*/logs/otel/*/*perfetto.json
+      - ci/ci-results/otel/*/*.jsonl.gz
+      - ci/ci-runs/*/logs/otel/*/*.jsonl.gz
+      - ci/ci-runs/*/*/logs/otel/*/*.jsonl.gz
+      - ci/ci-results/otel/*/*perfetto.json.gz
+      - ci/ci-runs/*/logs/otel/*/*perfetto.json.gz
+      - ci/ci-runs/*/*/logs/otel/*/*perfetto.json.gz
+      - ci/ci-results/otel/*/process_memory_*.svg
+      - ci/ci-runs/*/logs/otel/*/process_memory_*.svg
+      - ci/ci-runs/*/*/logs/otel/*/process_memory_*.svg
       # The submitted sbatch script; its header records the exact submit command, so it
       # doubles as a reproducer for re-running the SLURM job by hand.
       - ci/ci-results/*.sbatch

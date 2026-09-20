@@ -1,15 +1,18 @@
 #pragma once
 #include "CommonMacros.h"
 #include "messages.h"
+#include "process_memory.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <string_view>
-
-namespace checkpoint::telemetry::span
+#include <thread>
+namespace checkpoint::telemetry
 {
 struct Id
 {
@@ -19,6 +22,10 @@ struct Id
 
     constexpr bool operator==(Id const&) const = default;
 };
+}    // namespace checkpoint::telemetry
+
+namespace checkpoint::telemetry::span
+{
 
 struct CkptSave
 {
@@ -80,11 +87,48 @@ struct SvrDurable
 
 }    // namespace checkpoint::telemetry::span
 
+namespace checkpoint::telemetry::event
+{
+struct ProcessMemory
+{
+    static constexpr std::string_view Name = "process.memory";
+
+    ProcessMemUsageInfo usage;
+    std::string_view    trigger;
+};
+}    // namespace checkpoint::telemetry::event
+
 namespace checkpoint::telemetry
 {
 
 void Init();
 void Shutdown();
+
+[[nodiscard]] bool IsEnabled() noexcept;
+
+// Process-memory telemetry. Span events are always sampled; periodic sampling
+// remains opt-in through NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS.
+class MemorySampler
+{
+    public:
+    explicit MemorySampler();
+    ~MemorySampler();
+    CLASS_DELETE_COPY_AND_MOVE(MemorySampler);
+
+    void Shutdown();
+    void Start();
+
+    static void Log(std::string_view const& trigger);
+
+    private:
+    void Run_(std::stop_token& stopToken);
+
+    std::chrono::seconds        _interval{};
+    std::mutex                  _waitMutex;
+    std::condition_variable_any _wake;
+    std::jthread                _thread;
+};
+
 template <typename TSpan> struct Emitter;
 template <> struct Emitter<span::CkptSave::Begin>
 {
@@ -122,6 +166,11 @@ template <> struct Emitter<span::SvrDurable::End>
     static void Emit(span::SvrDurable::End const& fields);
 };
 
+template <> struct Emitter<event::ProcessMemory>
+{
+    static void Emit(event::ProcessMemory const& fields);
+};
+
 struct Stream
 {
     template <typename T> Stream& operator<<(T const& value) LFTBND
@@ -150,5 +199,8 @@ OtlpResponse            ReceiveOtlp(std::string_view const& path,
 }    // namespace checkpoint::telemetry
 
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
+SUPPRESS_WARNINGS_START
+SUPPRESS_CLANG_WARNING("-Wunused-macros")
 #define PERF() (::checkpoint::telemetry::Stream{})
+SUPPRESS_WARNINGS_END
 // NOLINTEND(cppcoreguidelines-macro-usage)

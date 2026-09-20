@@ -53,6 +53,44 @@ torchrun <torchrun-options> --module nvrx_checkpointing.megatron.integration "${
 Each rank must invoke the integration module; calling `install()` in a
 separate setup process will not work because the patches are process-local.
 
+### Enabling OpenTelemetry
+
+Native checkpoint telemetry is disabled by default. To collect it through the
+node-local checkpoint daemon, set its output file for the training ranks and
+daemon. `daemon` is the default export mode:
+
+```bash
+export NATIVE_CKPT_OTEL_FILE=/path/to/native_ckpt_otel.jsonl
+```
+
+The file name accepts the same `%h` (host) and `%p` (process ID)
+substitutions as `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath
+the directory containing `NATIVE_CKPT_SERVER_LOG`.
+
+Native span begin/end events automatically emit standalone `process.memory`
+events recording current and peak RSS plus anonymous, file, shared-memory,
+locked, pinned, and swapped bytes. These events include the most recently seen
+session, rank, and snapshot IDs without adding memory attributes to the spans.
+
+Set `NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS=1` to additionally emit a
+periodic `process.memory` event once per second. Periodic sampling is disabled
+by default.
+
+To include Megatron traces and metrics in the same daemon collector, also set:
+
+```bash
+export MEGATRON_OTEL_ENABLED=1
+export MEGATRON_OTEL_TRACES_ENABLED=1
+export MEGATRON_OTEL_METRICS_ENABLED=1
+export MEGATRON_OTEL_EXPORT_STRATEGY=all_ranks
+export MEGATRON_OTEL_SPAN_GROUPS=default,load_checkpoint
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4100
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+See [OpenTelemetry performance telemetry](docs/OpenTelemetry.md) for export
+modes, collector topology, attributes, and analysis commands.
+
 ### Adapting an existing Megatron workload launcher
 
 Wrap the existing Megatron entrypoint in the `run_cmd` assignment:

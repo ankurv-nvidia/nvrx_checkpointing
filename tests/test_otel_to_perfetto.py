@@ -80,7 +80,7 @@ def test_mixed_otlp_jsonl_converts_to_perfetto_events(tmp_path: Path) -> None:
                                         "gauge": {"dataPoints": [{"timeUnixNano": "5000", "asDouble": 1.25}]},
                                     },
                                     {
-                                        "name": "megatron.training.step_duration_ms",
+                                        "name": "megatron.training.example_histogram",
                                         "unit": "ms",
                                         "histogram": {
                                             "dataPoints": [
@@ -128,7 +128,7 @@ def test_mixed_otlp_jsonl_converts_to_perfetto_events(tmp_path: Path) -> None:
     assert span["args"]["nvrx.snapshot_id"] == _SNAPSHOT_ID
     gauge = next(event for event in events if event.get("name") == "megatron.training.loss")
     assert (gauge["ph"], gauge["ts"], gauge["args"]) == ("C", 4.0, {"value": 1.25})
-    histogram = next(event for event in events if event.get("name") == "megatron.training.step_duration_ms (ms)")
+    histogram = next(event for event in events if event.get("name") == "megatron.training.example_histogram (ms)")
     assert histogram["args"] == {"count": 1, "sum": 8.0, "min": 8.0, "max": 8.0}
     log = next(event for event in events if event.get("cat") == "otel.log.info")
     assert (log["ph"], log["ts"], log["args"]["body"]) == ("I", 6.0, "checkpoint complete")

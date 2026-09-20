@@ -45,10 +45,9 @@ _MUTATED_ENV = (
     "MEGATRON_ROOT",
     "MASTER_PORT",
     "NATIVE_CKPT_SERVER_LOG",
-    "NATIVE_CKPT_OTEL_DIR",
-    "NATIVE_CKPT_OTEL_ENABLE",
     "NATIVE_CKPT_OTEL_EXPORT",
     "NATIVE_CKPT_OTEL_FILE",
+    "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
     "NCCL_IB_TIMEOUT",
     "NCCL_NET",
     "NVTE_BWD_LAYERNORM_SM_MARGIN",
@@ -192,9 +191,6 @@ def _checkpoint_span(
 
 def _megatron_perf_metric_samples(*ranks: int) -> list[dict]:
     values = {
-        "megatron.training.step_duration_ms": 20.0,
-        "megatron.training.throughput_tflops": 120.0,
-        "megatron.training.tokens_per_sec": 8000.0,
         "megatron.training.memory_allocated_gb": 60.0,
     }
     return [
@@ -393,14 +389,13 @@ def test_host_memory_metrics_distinguish_training_process_and_daemon(
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
-    proc = tmp_path / "proc"
-    (proc / "42").mkdir(parents=True)
-    (proc / "42" / "status").write_text("Name:\tcheckpoint_serv\nVmHWM:\t123456 kB\n")
-    monkeypatch.setattr(slurm_job, "_PROC_ROOT", proc)
-    monkeypatch.setattr(slurm_job, "RESULTS_DIR", tmp_path)
-    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node-a.example.com")
-
-    slurm_job._record_daemon_peak_rss("cycle1", ["42"])
+    daemon = slurm_job.otel_report.metric([123456], "B", higher_is_better=False)
+    daemon["per_node"] = {"node-a": 123456}
+    monkeypatch.setattr(
+        slurm_job.otel_report,
+        "complete_run_process_memory_peaks",
+        lambda _results_dir: {"checkpoint_daemon_peak_rss_bytes": daemon},
+    )
     metrics = slurm_job._with_host_memory_metrics(
         {
             "cpu_rss_bytes": slurm_job.otel_report.metric(
@@ -411,12 +406,13 @@ def test_host_memory_metrics_distinguish_training_process_and_daemon(
             ),
         },
         tmp_path,
+        native=True,
     )
 
     assert "cpu_rss_bytes" not in metrics
     assert metrics["training_process_peak_rss_bytes"]["max"] == 104  # noqa: PLR2004
-    assert metrics["checkpoint_daemon_peak_rss_bytes"]["max"] == 123456 * 1024
-    assert metrics["checkpoint_daemon_peak_rss_bytes"]["per_node"] == {"node-a": 123456 * 1024}
+    assert metrics["checkpoint_daemon_peak_rss_bytes"]["max"] == 123456
+    assert metrics["checkpoint_daemon_peak_rss_bytes"]["per_node"] == {"node-a": 123456}
     assert slurm_job.PerfReport._statistic(
         "training_process_peak_rss_bytes",
         metrics["training_process_peak_rss_bytes"],
@@ -436,7 +432,7 @@ def test_log_report_uses_each_ranks_peak_rss_across_all_phases() -> None:
     assert measured["per_rank_median"] == {0: 130, 1: 120}
 
 
-def test_only_native_provider_records_checkpoint_daemon_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stopping_server_does_not_write_custom_memory_files(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     recorded = []
     monkeypatch.setattr(
@@ -444,13 +440,12 @@ def test_only_native_provider_records_checkpoint_daemon_memory(monkeypatch: pyte
         "CHECKPOINT_SERVER",
         SimpleNamespace(pids=lambda: ["42"], stop=lambda graceful: recorded.append(("stop", graceful))),
     )
-    monkeypatch.setattr(slurm_job, "_record_daemon_peak_rss", lambda tag, pids: recorded.append((tag, pids)))
     monkeypatch.setattr(slurm_job, "_node_once", lambda _tag, action: action())
 
     slurm_job.FlavorPolicy().stop_server("nvrx", "reference", graceful=False)
     slurm_job.FlavorPolicy().stop_server("native", "measured", graceful=False)
 
-    assert recorded == [("stop", False), ("measured", ["42"]), ("stop", False)]
+    assert recorded == [("stop", False), ("stop", False)]
 
 
 def test_server_heartbeat_pings_only_from_node_leader(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -501,7 +496,7 @@ def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
     def popen(*_args: object, **kwargs: object) -> None:
         assert "--errors-for-leak-kinds=definite,indirect" in _args[0]
-        assert kwargs["env"]["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+        assert "NATIVE_CKPT_OTEL_FILE" not in kwargs["env"]
         raise RuntimeError("popen reached")
 
     monkeypatch.setattr(slurm_job.subprocess, "Popen", popen)
@@ -1539,6 +1534,26 @@ def test_both_providers_export_megatron_otel_to_local_daemon(
     }
 
 
+def test_periodic_memory_sampling_is_a_manual_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    args = _args(tmp_path, config="nano3", nodes=8, flavors=["perf", "native"])
+    slurm_job._configure_run(args)
+
+    _cmd, default_env = slurm_job._phase_command("nano3_8x4", args, "native", 1)
+    assert "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS" not in default_env
+
+    monkeypatch.setenv("NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS", "7")
+    _cmd, overridden_env = slurm_job._phase_command("nano3_8x4", args, "native", 1)
+    assert overridden_env["NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS"] == "7"
+    assert "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS" in slurm_job._RUN_ENV_NAMES
+
+
 @pytest.mark.parametrize(
     "routing",
     [
@@ -1559,6 +1574,7 @@ def test_routine_validates_each_collected_cycle(
     child_envs = []
     validated = []
     converted = []
+    charts = []
     lifecycle = []
     stops = []
 
@@ -1585,6 +1601,7 @@ def test_routine_validates_each_collected_cycle(
     monkeypatch.setattr(slurm_job, "_sync_ranks", lambda tag: lifecycle.append(("sync", tag)))
     monkeypatch.setattr(slurm_job, "wait_for_file", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(slurm_job.otel_report, "validate_collected", lambda *values: validated.append(values))
+    monkeypatch.setattr(slurm_job.otel_report, "write_process_memory_charts", lambda *values: charts.append(values))
     monkeypatch.setattr(
         slurm_job.otel_report,
         "OtelData",
@@ -1601,6 +1618,7 @@ def test_routine_validates_each_collected_cycle(
         "42-otel-run-phase1-sr0-te0",
         "42-otel-run-cycle1-sr0-te0",
     ]
+    assert all("NATIVE_CKPT_TRAINING_MEMORY_FILE" not in env for env in child_envs)
     assert sum(event == ("ping", "") for event in lifecycle) == 2  # noqa: PLR2004
     if provider == "native":
         expected_startup = [("ping", ""), ("sync", "phase1-otel-listeners-ready")]
@@ -1634,6 +1652,7 @@ def test_routine_validates_each_collected_cycle(
     assert [output.name for _records, output in converted] == (
         ["native_ckpt_perfetto.json", "native_ckpt_perfetto.json"] if rank == "0" else []
     )
+    assert len(charts) == (2 if rank == "0" else 0)
 
 
 def test_otel_checkpoint_timings_are_grouped_at_the_end(
@@ -2162,6 +2181,37 @@ def test_failure_summary_promotes_the_cause_and_digest_details(
     assert "checkpoints differ from reference.xz: cmp (1 differences)" in caplog.text
     assert "changed common/optimizer.lr: baseline='2.025e-06' candidate='1.35e-06'" in caplog.text
     assert "training phase 2 failed" not in caplog.text
+
+
+def test_recover_otel_entry_generates_only_missing_memory_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    cycle = tmp_path / "42_test/logs/otel/cycle1"
+    cycle.mkdir(parents=True)
+    source = cycle / "native_ckpt_otel.jsonl"
+    source.write_text("{}\n")
+    calls = []
+
+    def load(paths: list[Path], *, tolerate_truncated_tail: bool = False) -> SimpleNamespace:
+        calls.append((paths, tolerate_truncated_tail))
+        return SimpleNamespace()
+
+    def write(_data: object, output_dir: Path) -> list[Path]:
+        output = output_dir / "process_memory_all.svg"
+        output.write_text("partial")
+        return [output]
+
+    monkeypatch.setenv("CI_JOB_ID", "42")
+    monkeypatch.setattr(slurm_job.otel_report, "OtelData", load)
+    monkeypatch.setattr(slurm_job.otel_report, "write_process_memory_charts", write)
+
+    slurm_job._recover_otel_entry([str(tmp_path)])
+    slurm_job._recover_otel_entry([str(tmp_path)])
+
+    assert calls == [([source], True)]
+    assert (cycle / "process_memory_all.svg").read_text() == "partial"
 
 
 def test_each_phase_records_the_sources_it_loaded(
@@ -2889,6 +2939,9 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
     assert "du -ch " in after_script
     assert "| tail -n 1 || true" in after_script
     assert "__failure_summary__ ci/ci-runs" in after_script
+    assert "__recover_otel__ ci/ci-runs || true" in after_script
+    assert after_script.index("__recover_otel__") < after_script.index("gzip -f")
+    assert config[".slurm_job"]["artifacts"]["when"] == "always"
     assert config[".slurm_job"]["variables"] == {
         "SLURMJOB_OPT_WORK_DIR": "${CI_PROJECT_DIR}/ci/ci-runs",
         "TRITON_CACHE_DIR": "/tmp/nvrx-${CI_JOB_ID}/triton-cache",
@@ -3580,12 +3633,15 @@ def test_slurm_jobs_upload_otel_and_perfetto_files() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
 
     paths = config[".slurm_job"]["artifacts"]["paths"]
-    assert "ci/ci-results/otel/*/*.jsonl" in paths
-    assert "ci/ci-runs/*/logs/otel/*/*.jsonl" in paths
-    assert "ci/ci-runs/*/*/logs/otel/*/*.jsonl" in paths
-    assert "ci/ci-results/otel/*/*perfetto.json" in paths
-    assert "ci/ci-runs/*/logs/otel/*/*perfetto.json" in paths
-    assert "ci/ci-runs/*/*/logs/otel/*/*perfetto.json" in paths
+    assert "ci/ci-results/otel/*/*.jsonl.gz" in paths
+    assert "ci/ci-runs/*/logs/otel/*/*.jsonl.gz" in paths
+    assert "ci/ci-runs/*/*/logs/otel/*/*.jsonl.gz" in paths
+    assert "ci/ci-results/otel/*/*perfetto.json.gz" in paths
+    assert "ci/ci-runs/*/logs/otel/*/*perfetto.json.gz" in paths
+    assert "ci/ci-runs/*/*/logs/otel/*/*perfetto.json.gz" in paths
+    assert "ci/ci-results/otel/*/process_memory_*.svg" in paths
+    assert "ci/ci-runs/*/logs/otel/*/process_memory_*.svg" in paths
+    assert "ci/ci-runs/*/*/logs/otel/*/process_memory_*.svg" in paths
 
 
 def test_default_native_jobs_use_wheel_artifacts() -> None:
@@ -3687,7 +3743,7 @@ def test_deterministic_flavor_keeps_perf_epilog_unless_valgrind(monkeypatch: pyt
     deterministic_args = _args(tmp_path, flavors=["detr"], baseline={})
     deterministic_args.flavors = slurm_job.FlavorSelection(deterministic_args.flavors)
 
-    assert deterministic_args.flavors.policy.epilog(deterministic_args, tmp_path / "run.log")
+    assert not deterministic_args.flavors.policy.epilog(deterministic_args, tmp_path / "run.log")
     assert len(calls) == 1
     valgrind_args = _args(tmp_path, flavors=["vg", "detr"], baseline={})
     valgrind_args.flavors = slurm_job.FlavorSelection(valgrind_args.flavors)
@@ -3757,15 +3813,19 @@ def test_deterministic_report_reads_the_native_routines_log_directory(
     assert keywords == {
         "results_dir": tmp_path / "native.cmp" / "logs",
         "otel_reporting": False,
+        "enforced_metrics": slurm_job.MEMORY_REGRESSION_METRICS,
     }
 
 
-def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
+def test_nvrx_only_deterministic_report_uses_its_memory_baseline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb300")
     calls = []
+    nvrx_baseline = {"metrics": {"gpu_peak_bytes": 100}}
     monkeypatch.setattr(
         slurm_job.PerfReport,
         "report",
@@ -3775,22 +3835,24 @@ def test_nvrx_only_deterministic_report_has_no_native_performance_baseline(
         tmp_path,
         config="nano4",
         nodes=8,
-        flavors=["detr"],
+        flavors=["detr", "async"],
         run=["ref:nvrx", "cmp:nvrx"],
-        baseline={"metrics": {"bw_mbps": 115000}},
+        baseline=nvrx_baseline,
     )
     args.flavors = slurm_job.FlavorSelection(args.flavors)
 
     assert args.flavors.policy.epilog(args, tmp_path / "logs" / "job.log")
 
     positional, keywords = calls[0]
-    assert positional[0] == "detr"
-    assert positional[2] == "detr-nvrx"
-    assert positional[4] == {}
+    assert positional[0] == "detr-async"
+    assert positional[2] == "detr-async-nvrx"
+    assert positional[4] is nvrx_baseline
+    assert slurm_job._performance_baseline_stem(args) == "gb300_async-detr-nvrx_nano4_8x4"
     assert positional[3] == tmp_path / "nvrx.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
     assert keywords == {
         "results_dir": tmp_path / "nvrx.cmp" / "logs",
         "otel_reporting": False,
+        "enforced_metrics": slurm_job.MEMORY_REGRESSION_METRICS,
     }
 
 
@@ -3966,9 +4028,6 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
             "bw_mbps": 150000,
             "wr_tnsr_us": 10,
             "total_written_bytes": 100,
-            "megatron.training.step_duration_ms": 20,
-            "megatron.training.throughput_tflops": 120,
-            "megatron.training.tokens_per_sec": 8000,
             "megatron.training.memory_allocated_gb": 60,
         },
         "rank_statistics": {
@@ -3977,9 +4036,6 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
                 "bw_mbps": 150000,
                 "wr_tnsr_us": 10,
                 "total_written_bytes": 100,
-                "megatron.training.step_duration_ms": 20.0,
-                "megatron.training.throughput_tflops": 120.0,
-                "megatron.training.tokens_per_sec": 8000.0,
                 "megatron.training.memory_allocated_gb": 60.0,
             }.items()
         },
@@ -4033,7 +4089,7 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
     assert list(tmp_path.glob("*_report.json"))
 
 
-def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
+def test_nvrx_perf_writes_a_baseline_for_every_reported_metric(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -4052,11 +4108,29 @@ def test_nvrx_perf_keeps_raw_report_without_a_baseline_candidate(
     log = tmp_path / "logs" / f"{stem}.log"
     log.parent.mkdir()
     log.write_text("")
-    log.with_name(f"{stem}_report.json").write_text('{"metrics":{"gpu_hbm_peak_pct":{"max":90}}}')
+    report = {
+        "telemetry_source": "otlp",
+        "ckpt_save_spans_valid": False,
+        "metrics": {
+            "ckpt_durable_ms": {"mean": 10, "higher_is_better": False, "unit": "ms"},
+            "gpu_peak_bytes": {"mean": 100, "higher_is_better": False, "unit": "B"},
+            "gpu_hbm_peak_bytes": {"max": 120, "higher_is_better": False, "unit": "B"},
+            "gpu_hbm_peak_pct": {"max": 60, "higher_is_better": False, "unit": "%"},
+            "training_process_peak_rss_bytes": {"max": 200, "higher_is_better": False, "unit": "B"},
+        },
+    }
+    log.with_name(f"{stem}_report.json").write_text(json.dumps(report))
 
     slurm_job._write_performance_baseline(args, log.parent)
 
-    assert not (log.parent / "baselines").exists()
+    candidate = yaml.safe_load((log.parent / "baselines" / f"{stem}.yaml").read_text())
+    assert candidate["metrics"] == {
+        "ckpt_durable_ms": 10,
+        "gpu_peak_bytes": 100,
+        "gpu_hbm_peak_bytes": 120,
+        "gpu_hbm_peak_pct": 60,
+        "training_process_peak_rss_bytes": 200,
+    }
 
 
 def test_native_perf_refuses_an_incomplete_baseline_candidate(
@@ -4121,13 +4195,46 @@ def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPa
 
     candidate = yaml.safe_load((tmp_path / "baselines" / f"{stem}.yaml").read_text())
     assert candidate["source"] == "logs"
-    assert candidate["metrics"] == {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}
+    assert candidate["metrics"] == {
+        "bw_mbps": 150000,
+        "wr_tnsr_us": 10,
+        "total_written_bytes": 100,
+        "checkpoint_daemon_peak_rss_bytes": 200,
+        "training_process_peak_rss_bytes": 300,
+    }
+    assert candidate["tolerances"] == {
+        "checkpoint_daemon_peak_rss_bytes": 0.05,
+        "training_process_peak_rss_bytes": 0.05,
+    }
+
+
+def test_every_workload_baseline_tracks_gpu_peak_memory() -> None:
+    missing = []
+    for path in sorted((REPO_ROOT / "ci" / "baselines").glob("*.yaml")):
+        if path.name == "platform_bw_mbps.yaml":
+            continue
+        if "gpu_peak_bytes" not in yaml.safe_load(path.read_text()).get("metrics", {}):
+            missing.append(path.name)
+
+    assert not missing
+
+
+def test_recorded_bandwidth_takes_precedence_over_the_platform_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    baseline_path = tmp_path / "workload.yaml"
+    baseline_path.write_text("metrics:\n  bw_mbps: 150000\n")
+    monkeypatch.setattr(slurm_job, "BASELINES_DIR", tmp_path)
+    monkeypatch.setattr(slurm_job.PerfReport, "_platform_bandwidth_baseline", lambda _platform: 115000)
+
+    assert slurm_job.PerfReport.baseline("workload")["metrics"]["bw_mbps"] == 150000  # noqa: PLR2004
 
 
 def test_log_report_rejects_incomplete_checkpoint_cycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
-    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     log = tmp_path / "run.log"
     log.write_text(
@@ -4356,7 +4463,6 @@ def test_log_report_requires_both_deterministic_checkpoint_routines(
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
-    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     log = tmp_path / "run.log"
     log.write_text(
@@ -4463,7 +4569,7 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "0")
+    monkeypatch.delenv("NATIVE_CKPT_OTEL_FILE", raising=False)
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     monkeypatch.setattr(slurm_job.otel_report, "post_process", lambda *_args: pytest.fail("OTLP must be disabled"))
     log = tmp_path / "run.log"
@@ -4477,8 +4583,11 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     (tmp_path / "checkpoint_server.cycle1.host.1.log").write_text(
         _perf_span(write_us=8, snapshot=1) + _perf_span(write_us=10, snapshot=2) + _perf_span(write_us=12, snapshot=3),
     )
-    (tmp_path / "host_memory.daemon.cycle1.host.json").write_text(
-        '{"node":"host","peak_rss_bytes":20,"pids":[1]}',
+    daemon = slurm_job.otel_report.metric([20], "B", higher_is_better=False)
+    monkeypatch.setattr(
+        slurm_job.otel_report,
+        "complete_run_process_memory_peaks",
+        lambda _results_dir: {"checkpoint_daemon_peak_rss_bytes": daemon},
     )
     report_path = tmp_path / "report.json"
 
@@ -4510,7 +4619,7 @@ def test_perf_report_explicit_log_reporting_overrides_otel_environment(
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "1")
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_FILE", str(tmp_path / "otel.jsonl"))
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "1")
     monkeypatch.setattr(slurm_job.otel_report, "post_process", lambda *_args: pytest.fail("OTLP must be disabled"))
     monkeypatch.setattr(
@@ -4531,12 +4640,105 @@ def test_perf_report_explicit_log_reporting_overrides_otel_environment(
     )
 
 
+def test_perf_report_can_enforce_only_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {
+        "bw_mbps": slurm_job.otel_report.metric([10], "MB/s", higher_is_better=True),
+        "gpu_peak_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False),
+        "gpu_hbm_peak_bytes": slurm_job.otel_report.metric([120], "B", higher_is_better=False),
+        "gpu_hbm_peak_pct": slurm_job.otel_report.metric([60], "%", higher_is_better=False),
+        "training_process_peak_rss_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False),
+        "checkpoint_daemon_peak_rss_bytes": slurm_job.otel_report.metric([200], "B", higher_is_better=False),
+    }
+    monkeypatch.setattr(
+        slurm_job.log_report,
+        "post_process",
+        lambda *_args: {
+            "source": "logs",
+            "metrics": metrics,
+            "validation": {
+                "name": "ckpt_save_markers",
+                "valid": False,
+                "measured": 0,
+                "baseline": 1,
+                "report_field": "ckpt_save_markers_valid",
+            },
+        },
+    )
+    baseline = {
+        "metrics": {
+            "bw_mbps": 1000,
+            "gpu_peak_bytes": 100,
+            "gpu_hbm_peak_bytes": 120,
+            "gpu_hbm_peak_pct": 60,
+            "training_process_peak_rss_bytes": 100,
+            "checkpoint_daemon_peak_rss_bytes": 200,
+        },
+    }
+
+    assert slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-native",
+        tmp_path / "run.log",
+        baseline,
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+        enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
+    )
+
+    baseline["metrics"]["gpu_peak_bytes"] = 50
+    assert not slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-native",
+        tmp_path / "run.log",
+        baseline,
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+        enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
+    )
+
+    baseline["metrics"]["gpu_peak_bytes"] = 100
+    baseline["metrics"]["training_process_peak_rss_bytes"] = 50
+    assert not slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-native",
+        tmp_path / "run.log",
+        baseline,
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+        enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
+    )
+
+    baseline["metrics"]["training_process_peak_rss_bytes"] = 100
+    baseline["metrics"]["gpu_hbm_peak_bytes"] = 100
+    assert not slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-native",
+        tmp_path / "run.log",
+        baseline,
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+        enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
+    )
+
+
 def test_perf_report_does_not_fall_back_when_otel_is_enabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("NATIVE_CKPT_OTEL_ENABLE", "1")
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_FILE", str(tmp_path / "otel.jsonl"))
     monkeypatch.setenv("MEGATRON_OTEL_ENABLED", "0")
     monkeypatch.setattr(slurm_job.log_report, "post_process", lambda *_args: pytest.fail("logs must not be used"))
     monkeypatch.setattr(slurm_job.otel_report, "load_latest", lambda _path: _otel_data())
@@ -4741,6 +4943,46 @@ def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
     assert result["ckpt_durable_ms"]["status"] == "no_baseline"
 
 
+def test_gpu_peak_regression_fails_the_baseline_comparison() -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {"gpu_peak_bytes": slurm_job.otel_report.metric([106], "B", higher_is_better=False)}
+
+    result, passed = slurm_job.PerfReport._compare_to_baseline(
+        metrics,
+        {"metrics": {"gpu_peak_bytes": 100}},
+        slurm_job.PERF_TOLERANCE,
+    )
+
+    assert not passed
+    assert result["gpu_peak_bytes"]["status"] == "FAIL"
+    assert result["gpu_peak_bytes"]["tolerance_pct"] == 5
+
+
+@pytest.mark.parametrize(
+    ("name", "measured", "higher_is_better"),
+    [
+        ("gpu_peak_bytes", 94, False),
+        ("bw_mbps", 106, True),
+    ],
+)
+def test_improvement_beyond_tolerance_warns_without_failing(
+    name: str,
+    measured: int,
+    higher_is_better: bool,
+) -> None:
+    slurm_job = _load_slurm_job()
+    metrics = {name: slurm_job.otel_report.metric([measured], "B", higher_is_better=higher_is_better)}
+
+    result, passed = slurm_job.PerfReport._compare_to_baseline(
+        metrics,
+        {"metrics": {name: 100}},
+        slurm_job.PERF_TOLERANCE,
+    )
+
+    assert passed
+    assert result[name]["status"] == "WARN"
+
+
 def test_a_required_baseline_metric_missing_from_the_run_fails_the_job(caplog: pytest.LogCaptureFixture) -> None:
     slurm_job = _load_slurm_job()
     metrics = {"gpu_peak_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False)}
@@ -4788,7 +5030,7 @@ def test_megatron_perf_metrics_report_latest_values_across_export_ranks() -> Non
     samples = _megatron_perf_metric_samples(0, 4)
     samples.append(
         {
-            "name": "megatron.training.throughput_tflops",
+            "name": "megatron.training.memory_allocated_gb",
             "resource": {"dl.rank": 0},
             "value": 999.0,
             "time_unix_nano": 1,
@@ -4797,22 +5039,25 @@ def test_megatron_perf_metrics_report_latest_values_across_export_ranks() -> Non
 
     metrics = slurm_job.otel_report.metrics_from_data(_otel_data(megatron_metrics=samples), 4)
 
-    throughput = metrics["megatron.training.throughput_tflops"]
-    assert throughput["per_rank_median"] == {0: 120.0, 4: 124.0}
-    assert throughput["rank_min"] == 120.0
-    assert throughput["rank_median"] == 122.0
-    assert throughput["rank_max"] == 124.0
-    assert throughput["median"] == 122.0
-    assert slurm_job.PerfReport._statistic("megatron.training.throughput_tflops", throughput) == "median"
+    memory_allocated = metrics["megatron.training.memory_allocated_gb"]
+    assert memory_allocated["per_rank_median"] == {0: 60.0, 4: 64.0}
+    assert memory_allocated["rank_min"] == 60.0
+    assert memory_allocated["rank_median"] == 62.0
+    assert memory_allocated["rank_max"] == 64.0
+    assert memory_allocated["median"] == 62.0
     assert slurm_job.PerfReport._statistic(
         "megatron.training.memory_allocated_gb",
         metrics["megatron.training.memory_allocated_gb"],
     ) == "max"
 
 
-def test_hbm_sampler_tracks_whole_device_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hbm_sampler_tracks_hbm_and_training_rss(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setenv("RANK", "7")
+    monkeypatch.setattr(slurm_job, "_process_rss_bytes", lambda _pid: 123)
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node-a.example.com")
+    monkeypatch.setattr(slurm_job.os, "getpid", lambda: 42)
     samples = iter(((20, 100), (5, 100)))
     devices = []
     cuda = SimpleNamespace(
@@ -4829,6 +5074,55 @@ def test_hbm_sampler_tracks_whole_device_usage(monkeypatch: pytest.MonkeyPatch) 
     assert devices == [2, 2]
     assert sampler.peak_bytes == 95  # noqa: PLR2004
     assert sampler.total_bytes == 100  # noqa: PLR2004
+    assert [rss for _timestamp, rss in sampler.rss_samples] == [123, 123]
+
+    assert all(timestamp > 0 for timestamp, _rss in sampler.rss_samples)
+
+
+def test_training_process_memory_is_exported_as_otlp(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    logs_service = pytest.importorskip("opentelemetry.proto.collector.logs.v1.logs_service_pb2")
+    monkeypatch.setenv("RANK", "7")
+    monkeypatch.setenv("MEGATRON_OTEL_RUN_ID", "run-1")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4100")
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node-a.example.com")
+    monkeypatch.setattr(slurm_job.os, "getpid", lambda: 42)
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        @staticmethod
+        def read() -> bytes:
+            return b""
+
+    def urlopen(request: object, *, timeout: int) -> Response:
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(slurm_job.urllib.request, "urlopen", urlopen)
+
+    slurm_job._emit_training_process_memory([(10, 40), (20, 50)])
+
+    http_request, timeout = requests[0]
+    assert http_request.full_url == "http://127.0.0.1:4100/v1/logs"
+    assert timeout == 30  # noqa: PLR2004
+    payload = logs_service.ExportLogsServiceRequest.FromString(http_request.data)
+    resource_logs = payload.resource_logs[0]
+    resource = {attribute.key: attribute.value for attribute in resource_logs.resource.attributes}
+    assert resource["service.name"].string_value == slurm_job.otel_report.TRAINING_SERVICE
+    assert resource["host.name"].string_value == "node-a"
+    assert resource["process.pid"].int_value == 42  # noqa: PLR2004
+    records = resource_logs.scope_logs[0].log_records
+    assert [record.event_name for record in records] == ["process.memory", "process.memory"]
+    assert [
+        next(attribute.value.int_value for attribute in record.attributes if attribute.key == "nvrx.memory.rss_bytes")
+        for record in records
+    ] == [40, 50]
 
 
 def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
@@ -5137,7 +5431,7 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "--overlap-grad-reduce",
         "--overlap-param-gather",
     ]
-    deterministic_env = {}
+    deterministic_env = {"NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl"}
     slurm_job.FlavorSelection(["detr"]).transform(deterministic_opts, deterministic_env)
     assert deterministic_opts == [
         "--moe-permute-fusion",
@@ -5150,7 +5444,7 @@ def test_flavor_transforms_are_profile_independent() -> None:
     assert deterministic_env["PYTHONHASHSEED"] == "0"
     assert deterministic_env["FLA_TILELANG"] == "0"
     assert deterministic_env["MEGATRON_OTEL_ENABLED"] == "0"
-    assert deterministic_env["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+    assert "NATIVE_CKPT_OTEL_FILE" not in deterministic_env
     assert not slurm_job.FlavorSelection(["detr"]).policy.otel_reporting
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
     mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
@@ -5179,13 +5473,13 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
         "moe",
     ]
 
-    env = {}
+    env = {"NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl"}
     slurm_job.FlavorSelection(["vg"]).transform(opts, env)
 
     assert "--check-for-nan-in-loss-and-grad" in opts
     assert "--no-check-for-nan-in-loss-and-grad" not in opts
     assert opts[-2:] == ["--rerun-mode", "disabled"]
-    assert env["NATIVE_CKPT_OTEL_ENABLE"] == "0"
+    assert "NATIVE_CKPT_OTEL_FILE" not in env
     assert env["MEGATRON_OTEL_ENABLED"] == "0"
 
 

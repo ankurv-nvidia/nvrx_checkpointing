@@ -43,7 +43,7 @@ def test_native_bandwidth_is_reported_as_integer_mbps() -> None:
     assert "bw_gbps" not in metrics
 
 
-def test_platform_bandwidth_is_a_floor_not_a_ceiling() -> None:
+def test_bandwidth_improvement_outside_tolerance_warns() -> None:
     baseline = {"metrics": {"bw_mbps": 140000}}
     fast = {"bw_mbps": {"mean": 160000, "higher_is_better": True, "unit": "MB/s"}}
     slow = {"bw_mbps": {"mean": 80000, "higher_is_better": True, "unit": "MB/s"}}
@@ -52,12 +52,12 @@ def test_platform_bandwidth_is_a_floor_not_a_ceiling() -> None:
     slow_comparison, slow_passed = PerfReport._compare_to_baseline(slow, baseline, PERF_TOLERANCE)
 
     assert fast_passed
-    assert fast_comparison["bw_mbps"]["status"] == "PASS"
+    assert fast_comparison["bw_mbps"]["status"] == "WARN"
     assert not slow_passed
     assert slow_comparison["bw_mbps"]["status"] == "FAIL"
 
 
-def test_lower_is_better_metric_is_a_ceiling_not_a_floor() -> None:
+def test_timing_improvement_outside_tolerance_warns() -> None:
     baseline = {"metrics": {"wr_tnsr_us": 37700}}
     faster = {"wr_tnsr_us": {"mean": 34867, "higher_is_better": False, "unit": "us"}}
     slower = {"wr_tnsr_us": {"mean": 41000, "higher_is_better": False, "unit": "us"}}
@@ -66,7 +66,7 @@ def test_lower_is_better_metric_is_a_ceiling_not_a_floor() -> None:
     slower_comparison, slower_passed = PerfReport._compare_to_baseline(slower, baseline, PERF_TOLERANCE)
 
     assert faster_passed
-    assert faster_comparison["wr_tnsr_us"]["status"] == "PASS"
+    assert faster_comparison["wr_tnsr_us"]["status"] == "WARN"
     assert not slower_passed
     assert slower_comparison["wr_tnsr_us"]["status"] == "FAIL"
 

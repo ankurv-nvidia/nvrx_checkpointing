@@ -1,21 +1,26 @@
 #pragma once
+#include "CommonMacros.h"
 #include <fmt/format.h>
 
 #include <cstddef>
 #include <cstdlib>
 #include <new>
 #include <span>
+
 struct ByteStorage
 {
     void*  data{nullptr};
     size_t size{0};
 
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wallocator-wrappers")
     static void* PadAlignedAlloc(size_t alignment, size_t size)
     {
         if (size == 0) { return nullptr; }
         auto paddedSize = (size + alignment - 1) / alignment * alignment;
         return std::aligned_alloc(alignment, paddedSize);    // NOLINT
     }
+    SUPPRESS_WARNINGS_END
 
     ByteStorage() = default;
     explicit ByteStorage(size_t sizeIn) : data(PadAlignedAlloc(alignof(std::max_align_t), sizeIn)), size(sizeIn)

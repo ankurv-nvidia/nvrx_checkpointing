@@ -24,7 +24,7 @@ extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);
 
 static std::string GetLogPath()
-{ return checkpoint::config::GetConfigValue<checkpoint::config::ServerLog>().string(); }
+{ return checkpoint::config::GetConfigValue<checkpoint::config::LogFile>().string(); }
 
 // Detach stdin/stderr so the daemon never blocks on a pipe owned by the departed client.
 // Stdout stays on the launcher pipe for RunServer's "READY\n" handshake (single-write, SIGPIPE ignored).

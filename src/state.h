@@ -389,6 +389,19 @@ struct StateTree
         return totalSize;
     }
 
+    uint64_t GetTotalSnapshotStateSizeInBytes() const
+    {
+        auto totalSize = GetTotalTensorStateSizeInBytes();
+        for (auto const& node : _nodes)
+        {
+            if (node.data.index() != static_cast<size_t>(StateNode::Type::Blob)) { continue; }
+            auto const blobSize = std::get<StateNode::Blob>(node.data).size();
+            if (blobSize > std::numeric_limits<uint64_t>::max() - totalSize) { throw std::overflow_error("Snapshot state size overflow"); }
+            totalSize += blobSize;
+        }
+        return totalSize;
+    }
+
     size_t GetTotalNumTensors() const
     {
         return static_cast<size_t>(std::ranges::count_if(

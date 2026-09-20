@@ -45,7 +45,6 @@ def test_daemon_mode_collects_single_file(tmp_path):
     out = tmp_path / "collected.jsonl"
     env = {
         **os.environ,
-        "NATIVE_CKPT_OTEL_ENABLE": "1",
         "NATIVE_CKPT_OTEL_EXPORT": "daemon",
         "NATIVE_CKPT_OTEL_FILE": str(out),
     }

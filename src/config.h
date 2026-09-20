@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-#include <unistd.h>
+#include <unistd.h>    // for gethostname
 
 namespace checkpoint::config
 {
@@ -66,6 +66,23 @@ struct EnabledByOne
     static ValueType Parse(std::string_view value) { return value == "1"; }
 };
 
+struct UnsignedInteger
+{
+    using ValueType = uint64_t;
+
+    static ValueType Parse(std::string_view value)
+    {
+        if (value.empty() || value.front() < '0' || value.front() > '9')
+        {
+            throw std::invalid_argument("Unsigned integer must start with a digit");
+        }
+        size_t     index  = 0;
+        auto const amount = std::stoull(std::string{value}, &index);
+        if (index != value.size()) { throw std::invalid_argument("Invalid unsigned integer: " + std::string{value}); }
+        return amount;
+    }
+};
+
 struct RFile
 {
     using ValueType = std::filesystem::path;
@@ -83,18 +100,6 @@ struct WFile
     using ValueType = std::filesystem::path;
 
     static ValueType Parse(std::string_view value) { return ValueType{Substitute(value)}; }
-};
-
-struct WDir
-{
-    using ValueType = std::filesystem::path;
-
-    static ValueType Parse(std::string_view value)
-    {
-        ValueType const path{Substitute(value)};
-        if (!path.empty()) { static_cast<void>(std::filesystem::create_directories(path)); }
-        return path;
-    }
 };
 
 struct OtelExportMode
@@ -124,7 +129,7 @@ struct LogLevel
     using Type                                = types::Text;
 };
 
-struct ServerLog
+struct LogFile
 {
     static constexpr std::string_view Name    = "server.log";
     static constexpr std::string_view Default = "/tmp/native_ckpt_server.%h_%p.log";
@@ -136,13 +141,6 @@ struct SvcDisableAutoLaunch
     static constexpr std::string_view Env     = "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH";
     static constexpr std::string_view Default = "0";
     using Type                                = types::EnabledByOne;
-};
-
-struct OtelEnable
-{
-    static constexpr std::string_view Name    = "otel.enable";
-    static constexpr std::string_view Default = "0";
-    using Type                                = types::OptIn;
 };
 
 struct OtelExport
@@ -157,13 +155,6 @@ struct OtelFile
     static constexpr std::string_view Name = "otel.file";
     static constexpr std::string_view Default;
     using Type = types::WFile;
-};
-
-struct OtelDir
-{
-    static constexpr std::string_view Name    = "otel.dir";
-    static constexpr std::string_view Default = "/tmp";
-    using Type                                = types::WDir;
 };
 
 struct OtelService
@@ -208,6 +199,13 @@ struct OtelLogs
     using Type                                = types::OptOut;
 };
 
+struct MemorySampleIntervalSeconds
+{
+    static constexpr std::string_view Name    = "memory.sample.interval.seconds";
+    static constexpr std::string_view Default = "0";
+    using Type                                = types::UnsignedInteger;
+};
+
 namespace detail
 {
 static constexpr std::string_view EnvPrefix = "NATIVE_CKPT_";
@@ -250,10 +248,9 @@ using OtelExportMode = types::OtelExportMode::ValueType;
 
 struct OtelConfig
 {
-    bool                  enabled   = GetConfigValue<OtelEnable>();
     OtelExportMode        mode      = GetConfigValue<OtelExport>();
     std::filesystem::path file      = GetConfigValue<OtelFile>();
-    std::filesystem::path dir       = GetConfigValue<OtelDir>();
+    bool                  enabled   = !file.empty();
     std::string           service   = GetConfigValue<OtelService>();
     std::string           collector = GetConfigValue<OtelCollector>();
     std::string           runId     = GetConfigValue<OtelRunId>();
@@ -261,10 +258,13 @@ struct OtelConfig
     bool                  metrics   = GetConfigValue<OtelMetrics>();
     bool                  logs      = GetConfigValue<OtelLogs>();
 
-    [[nodiscard]] std::filesystem::path ExportFile() const
-    { return file.empty() ? dir / Substitute("native_ckpt_otel_svr_%h_pid%p.jsonl") : file; }
+    [[nodiscard]] constexpr bool WritesProcessFile() const noexcept { return mode != OtelExportMode::Daemon; }
 
-    [[nodiscard]] std::filesystem::path CollectorFile() const
-    { return file.empty() ? std::filesystem::path{"/tmp/native_ckpt_otel.jsonl"} : file; }
+    [[nodiscard]] constexpr bool RoutesThroughDaemon() const noexcept { return mode != OtelExportMode::File; }
+
+    [[nodiscard]] std::filesystem::path ExportFile() const
+    { return file.is_absolute() ? file : GetConfigValue<LogFile>().parent_path() / file; }
+
+    [[nodiscard]] std::filesystem::path CollectorFile() const { return ExportFile(); }
 };
 }    // namespace checkpoint::config

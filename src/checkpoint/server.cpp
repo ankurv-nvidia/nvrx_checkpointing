@@ -295,11 +295,13 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
         auto const fqn = registry.GetNodeId(node.handle);
         for (auto& [sharddim, candidates] : candidatesByRange)
         {
-            logicalShards.push_back({.nodeHandle = node.handle,
-                                     .fqn        = fqn,
-                                     .sharddim   = sharddim,
-                                     .sizeBytes  = candidates.front().ShardSizeBytes(tnsr.dtype),
-                                     .candidates = std::move(candidates),});
+            logicalShards.push_back({
+                .nodeHandle = node.handle,
+                .fqn        = fqn,
+                .sharddim   = sharddim,
+                .sizeBytes  = candidates.front().ShardSizeBytes(tnsr.dtype),
+                .candidates = std::move(candidates),
+            });
         }
     });
 
@@ -506,22 +508,23 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
             for (auto const& shard : tnsr.shards)
             {
                 shard.AssertShardIsValid(tnsr.fulldim);
-                lambda({rank,
-                        StateNode::TensorShard{.sharddim = shard.sharddim,
-                                               .fulldim  = tnsr.fulldim,
-                                               .dtype    = tnsr.dtype,
-                                               .handle   = shard.handle,
-                                               .device   = shard.device,},
-                        registry.GetNodeId(node.handle),});
+                lambda({
+                    rank,
+                    StateNode::TensorShard{
+                        .sharddim = shard.sharddim,
+                        .fulldim  = tnsr.fulldim,
+                        .dtype    = tnsr.dtype,
+                        .handle   = shard.handle,
+                        .device   = shard.device,
+                    },
+                    registry.GetNodeId(node.handle),
+                });
             }
         }
     });
 }
 
-Session::Session(Server* serverIn LFTBND,
-                 cipc::SessionId       sessionIdIn,
-                 std::filesystem::path workDirIn,
-                 RankTopology          topoIn) :
+Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
@@ -1001,10 +1004,12 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             // Add the final node which contains the handler
             auto& child = sessionState.globalRegistry->AddChild(parentNode, childName, true);
             auto  shTen = StateNode::ShardedTensor(tensorShard.tensorInfo.dtype, tensorShard.tensorInfo.fulldim);
-            shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{.sharddim = tensorShard.tensorInfo.sharddim,
-                                                                       .device   = tensorShard.tensorInfo.device,
-                                                                       .handle   = tensorShard.tensorInfo.handle,
-                                                                       .rank     = tensorShard.rank,});
+            shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{
+                .sharddim = tensorShard.tensorInfo.sharddim,
+                .device   = tensorShard.tensorInfo.device,
+                .handle   = tensorShard.tensorInfo.handle,
+                .rank     = tensorShard.rank,
+            });
             child.data                    = shTen;
             tensorMap[tensorShard.nodeId] = child.handle;
             continue;
@@ -1036,10 +1041,12 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
                                                  tensorShard.tensorInfo.fulldim,
                                                  tensorShard.rank));
         }
-        tnsr.AddShard({.sharddim = tensorShard.tensorInfo.sharddim,
-                       .device   = tensorShard.tensorInfo.device,
-                       .handle   = tensorShard.tensorInfo.handle,
-                       .rank     = tensorShard.rank,});
+        tnsr.AddShard({
+            .sharddim = tensorShard.tensorInfo.sharddim,
+            .device   = tensorShard.tensorInfo.device,
+            .handle   = tensorShard.tensorInfo.handle,
+            .rank     = tensorShard.rank,
+        });
     }
 }
 
@@ -1593,8 +1600,10 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
 
     if (beginDurableSpan && IsCoordinatorPeer())
     {
-        PERF() << tel::span::SvrDurable::Begin{.id        = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId},
-                                               .startedAt = durableStartedAt,};
+        PERF() << tel::span::SvrDurable::Begin{
+            .id        = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId},
+            .startedAt = durableStartedAt,
+        };
     }
 
     PERF() << tel::span::CkptSave::Begin{
@@ -1732,7 +1741,7 @@ void Server::Start()
     checkpoint::logging::Init();
     checkpoint::telemetry::Init();
     checkpoint::config::OtelConfig const otelConfig;
-    if (otelConfig.enabled && otelConfig.mode == checkpoint::config::OtelExportMode::Daemon && !otelConfig.collector.empty())
+    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon() && !otelConfig.collector.empty())
     {
         if (otelConfig.collector == "file") { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
         else
@@ -1888,7 +1897,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         auto it = _activeSessions.find(hdr1.sessionId);
         it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
         checkpoint::config::OtelConfig const otelConfig;
-        if (otelConfig.enabled && otelConfig.mode == checkpoint::config::OtelExportMode::Daemon)
+        if (otelConfig.enabled && otelConfig.RoutesThroughDaemon())
         {
             if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
             else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }

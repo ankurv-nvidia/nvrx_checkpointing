@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import math
@@ -16,11 +17,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 SAVE_SPAN = "ckpt.save"
+TRAINING_SERVICE = "nvrx-training"
 _ATTR_PREFIX = "nvrx."
 MEGATRON_PERF_METRICS = {
-    "megatron.training.step_duration_ms": ("ms", False),
-    "megatron.training.throughput_tflops": ("TFLOP/s/GPU", True),
-    "megatron.training.tokens_per_sec": ("tokens/s", True),
     "megatron.training.memory_allocated_gb": ("GB", False),
 }
 REQUIRED_PERF_METRICS = frozenset(
@@ -49,7 +48,11 @@ def _otlp_value(value: dict) -> object:
     return None
 
 
-def _iter_records(paths: list[str | Path]) -> Iterator[tuple[Path, dict]]:
+def _iter_records(
+    paths: list[str | Path],
+    *,
+    tolerate_truncated_tail: bool = False,
+) -> Iterator[tuple[Path, dict]]:
     for path in paths:
         source = Path(path)
         with source.open() as handle:
@@ -59,6 +62,9 @@ def _iter_records(paths: list[str | Path]) -> Iterator[tuple[Path, dict]]:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError as error:
+                    if tolerate_truncated_tail and not any(remaining.strip() for remaining in handle):
+                        logger.warning("ignoring truncated final OTLP record in %s", source)
+                        break
                     raise ValueError(f"{source}:{line_number}: invalid OTLP JSON") from error
                 yield source, obj
 
@@ -87,6 +93,22 @@ def _iter_spans(records: list[tuple[Path, dict]]) -> Iterator[dict]:
                         "attributes": _attributes(span),
                         "start_time_unix_nano": int(span.get("startTimeUnixNano", 0)),
                         "end_time_unix_nano": int(span.get("endTimeUnixNano", 0)),
+                    }
+
+
+def _iter_log_records(records: list[tuple[Path, dict]]) -> Iterator[dict]:
+    for _path, obj in records:
+        for resource_logs in obj.get("resourceLogs", []):
+            resource = _attributes(resource_logs.get("resource", {}))
+            for scope_logs in resource_logs.get("scopeLogs", []):
+                for record in scope_logs.get("logRecords", []):
+                    yield {
+                        "name": record.get("eventName", ""),
+                        "resource": resource,
+                        "attributes": _attributes(record),
+                        "time_unix_nano": int(
+                            record.get("timeUnixNano", record.get("observedTimeUnixNano", 0)),
+                        ),
                     }
 
 
@@ -119,10 +141,18 @@ def _iter_metric_samples(records: list[tuple[Path, dict]]) -> Iterator[dict]:
 
 
 class OtelData:
-    def __init__(self, paths: list[str | Path]) -> None:
+    def __init__(self, paths: list[str | Path], *, tolerate_truncated_tail: bool = False) -> None:
         self.paths = [Path(path) for path in paths]
-        self.records = list(_iter_records(self.paths))
+        inputs = list(self.paths)
+        known = set(inputs)
+        for path in self.paths:
+            logs = Path(f"{path}.logs")
+            if logs.is_file() and logs not in known:
+                inputs.append(logs)
+                known.add(logs)
+        self.records = list(_iter_records(inputs, tolerate_truncated_tail=tolerate_truncated_tail))
         self.spans = list(_iter_spans(self.records))
+        self.log_records = list(_iter_log_records(self.records))
         self.metric_samples = list(_iter_metric_samples(self.records))
 
 
@@ -132,6 +162,10 @@ def _data(source: OtelData | list[str | Path]) -> OtelData:
 
 def iter_spans(source: OtelData | list[str | Path]) -> Iterator[dict]:
     yield from _data(source).spans
+
+
+def iter_log_records(source: OtelData | list[str | Path]) -> Iterator[dict]:
+    yield from _data(source).log_records
 
 
 def iter_span_resources(source: OtelData | list[str | Path], name_prefix: str) -> Iterator[dict]:
@@ -204,6 +238,189 @@ def collect_resource_metrics(source: OtelData | list[str | Path], run_id: str | 
 
 def collect_megatron_training_metrics(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
     return collect_metrics(source, "megatron.training.", run_id)
+
+
+def collect_process_memory(source: OtelData | list[str | Path]) -> list[dict]:
+    """Collect daemon and training process-memory events from OTLP logs."""
+    samples = []
+    for event in iter_log_records(source):
+        if event["name"] != "process.memory":
+            continue
+        attributes, resource = event["attributes"], event["resource"]
+        host = str(resource.get("host.name", "unknown-host"))
+        pid = int(resource.get("process.pid", -1))
+        rank = attributes.get("nvrx.rank", resource.get("dl.rank"))
+        timestamp = event["time_unix_nano"]
+        if attributes.get("nvrx.memory.rss_bytes") is None or timestamp <= 0:
+            continue
+        samples.append(
+            {
+                "timestamp_ns": timestamp,
+                "host": host,
+                "service": str(resource.get("service.name", "unknown-service")),
+                "pid": pid,
+                "rank": int(rank) if rank is not None else None,
+                "trigger": str(attributes.get("nvrx.memory.trigger", "")),
+                **{
+                    name: int(attributes.get(f"nvrx.memory.{name}", 0))
+                    for name in (
+                        "rss_bytes",
+                        "peak_rss_bytes",
+                        "anonymous_rss_bytes",
+                        "file_rss_bytes",
+                        "shmem_rss_bytes",
+                        "locked_bytes",
+                        "pinned_bytes",
+                        "swap_bytes",
+                    )
+                },
+            },
+        )
+    return samples
+
+
+def process_memory_metrics(samples: list[dict]) -> dict:
+    """Summarize checkpoint-daemon high-water RSS by node."""
+    daemon: dict[str, int] = {}
+    for sample in samples:
+        if sample["service"] == TRAINING_SERVICE:
+            continue
+        daemon[sample["host"]] = max(sample["peak_rss_bytes"], daemon.get(sample["host"], 0))
+    result = {}
+    if daemon:
+        measured = metric([daemon[host] for host in sorted(daemon)], "B", higher_is_better=False)
+        measured["per_node"] = dict(sorted(daemon.items()))
+        result["checkpoint_daemon_peak_rss_bytes"] = measured
+    return result
+
+
+def _process_memory_series(daemon_samples: list[dict], training_samples: list[dict]) -> list[tuple[str, tuple, list[dict]]]:
+    series: list[tuple[str, tuple, list[dict]]] = []
+    daemon_series: dict[tuple[str, int], list[dict]] = {}
+    for sample in daemon_samples:
+        daemon_series.setdefault((sample["host"], sample["pid"]), []).append(sample)
+    for key, values in sorted(daemon_series.items()):
+        series.append(("daemon", key, values))
+
+    training_series: dict[tuple[str, int, int], list[dict]] = {}
+    for sample in training_samples:
+        training_series.setdefault((sample["host"], sample["rank"], sample["pid"]), []).append(sample)
+    for key, values in sorted(training_series.items()):
+        series.append(("training", key, values))
+    return series
+
+
+def _process_memory_color(role: str, index: int, count: int) -> str:
+    lightness = 32 if count <= 1 else 24 + 48 * index / (count - 1)
+    hue = 215 if role == "daemon" else 0
+    return f"hsl({hue} 75% {lightness:.1f}%)"
+
+
+def _process_memory_svg(series: list[tuple[str, tuple, list[dict]]], samples: list[dict]) -> str:
+    start = min(sample["timestamp_ns"] for sample in samples)
+    stop = max(sample["timestamp_ns"] for sample in samples)
+    duration = max((stop - start) / 1e9, 1.0)
+    maximum = max((sample["rss_bytes"] for sample in samples), default=1)
+
+    width, plot_height = 1900, 620
+    left, right, top, bottom = 90, 50, 60, 70
+    plot_width = width - left - right
+    legend_columns = min(6, max(1, len(series)))
+    legend_rows = math.ceil(len(series) / legend_columns)
+    legend_top = top + plot_height + bottom
+    height = legend_top + legend_rows * 18 + 40
+
+    def x(timestamp: int) -> float:
+        return left + (((timestamp - start) / 1e9) / duration) * plot_width
+
+    def y(value: int) -> float:
+        return top + plot_height - (value / maximum) * plot_height
+
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{left}" y="30" font-family="sans-serif" font-size="20">Host memory — daemon and training processes</text>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#111827"/>',
+        f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#111827"/>',
+    ]
+    for tick in range(6):
+        value = maximum * tick / 5
+        py = y(value)
+        elements.extend(
+            (
+                f'<line x1="{left}" y1="{py:.1f}" x2="{left + plot_width}" y2="{py:.1f}" stroke="#e5e7eb"/>',
+                (f'<text x="{left - 8}" y="{py + 4:.1f}" text-anchor="end" '
+                f'font-family="sans-serif" font-size="11">{value / (1 << 30):.1f}</text>'),
+            ),
+        )
+    for tick in range(6):
+        seconds = duration * tick / 5
+        px = left + plot_width * tick / 5
+        elements.extend(
+            (
+                f'<line x1="{px:.1f}" y1="{top}" x2="{px:.1f}" y2="{top + plot_height}" stroke="#d1d5db"/>',
+                (f'<text x="{px:.1f}" y="{top + plot_height + 20}" text-anchor="middle" '
+                f'font-family="sans-serif" font-size="11">{seconds:.1f}</text>'),
+            ),
+        )
+    elements.extend(
+        (
+            (f'<text x="18" y="{top + plot_height / 2}" '
+            f'transform="rotate(-90 18 {top + plot_height / 2})" '
+            'font-family="sans-serif" font-size="12">RSS (GiB)</text>'),
+            (f'<text x="{left + plot_width / 2}" y="{top + plot_height + 45}" text-anchor="middle" '
+            'font-family="sans-serif" font-size="12">seconds</text>'),
+        ),
+    )
+
+    role_counts = {
+        role: sum(series_role == role for series_role, _key, _values in series)
+        for role in ("daemon", "training")
+    }
+    role_indices = {"daemon": 0, "training": 0}
+    legend_column_width = plot_width / legend_columns
+    for index, (role, key, values) in enumerate(series):
+        values.sort(key=lambda sample: sample["timestamp_ns"])
+        shade = _process_memory_color(role, role_indices[role], role_counts[role])
+        role_indices[role] += 1
+        points = " ".join(f"{x(sample['timestamp_ns']):.1f},{y(sample['rss_bytes']):.1f}" for sample in values)
+        elements.append(f'<polyline points="{points}" fill="none" stroke="{shade}" stroke-width="1.5"/>')
+        if role == "daemon":
+            host, pid = key
+            label = f"daemon {host} pid {pid}"
+        else:
+            host, rank, pid = key
+            label = f"training {host} rank {rank} pid {pid}"
+        peak = max(sample["rss_bytes"] for sample in values) / (1 << 30)
+        column, row = divmod(index, legend_rows)
+        legend_x = left + column * legend_column_width
+        legend_y = legend_top + row * 18
+        elements.extend(
+            (
+                f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 22}" y2="{legend_y}" stroke="{shade}" stroke-width="2"/>',
+                (f'<text x="{legend_x + 28}" y="{legend_y + 4}" font-family="sans-serif" font-size="10">'
+                f'{html.escape(label)} max {peak:.1f} GiB</text>'),
+            ),
+        )
+    elements.append("</svg>")
+    return "\n".join(elements) + "\n"
+
+
+def write_process_memory_charts(source: OtelData | list[str | Path], output_dir: Path) -> list[Path]:
+    """Write one RSS timeline containing every daemon and training process."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for previous in output_dir.glob("process_memory_*.svg"):
+        previous.unlink()
+
+    samples = collect_process_memory(source)
+    if not samples:
+        return []
+    training_samples = [sample for sample in samples if sample["service"] == TRAINING_SERVICE]
+    daemon_samples = [sample for sample in samples if sample["service"] != TRAINING_SERVICE]
+
+    output = output_dir / "process_memory_all.svg"
+    output.write_text(_process_memory_svg(_process_memory_series(daemon_samples, training_samples), samples))
+    return [output]
 
 
 def collect_samples(
@@ -351,6 +568,7 @@ def load_latest(results_dir: Path) -> dict[str, list]:
         "megatron_spans": [],
         "megatron_metrics": [],
         "resource_metrics": [],
+        "process_memory": [],
     }
     otel_root = results_dir / "otel"
     if not otel_root.is_dir():
@@ -374,6 +592,7 @@ def load_latest(results_dir: Path) -> dict[str, list]:
         "resource_metrics": [
             sample for sample in resource_metrics if run_id is None or str(sample["resource"].get("nemo.run.id")) == run_id
         ],
+        "process_memory": collect_process_memory(source),
     }
 
 
@@ -609,6 +828,7 @@ def metrics_from_data(
         )
     metrics.update(_megatron_metrics(data["megatron_metrics"]))
     metrics.update(_resource_metrics(data["resource_metrics"]))
+    metrics.update(process_memory_metrics(data.get("process_memory", [])))
     return metrics
 
 
@@ -682,6 +902,33 @@ def _load_latest_analysis(results_dir: Path) -> dict | None:
     return _load_analysis(newest / "native_ckpt_otel.jsonl")
 
 
+def complete_run_process_memory_peaks(results_dir: Path) -> dict:
+    """Combine process-memory peaks from every phase's collected OTLP."""
+    per_process: dict[str, int] = {}
+    per_node: dict[str, int] = {}
+    root = results_dir / "otel"
+    sources = [root / "native_ckpt_otel.jsonl", *sorted(root.glob("*/native_ckpt_otel.jsonl"))]
+    for source in sources:
+        analysis = _load_analysis(source)
+        metrics = analysis.get("metrics", {}) if analysis else {}
+        if not analysis and source.is_file():
+            metrics = process_memory_metrics(collect_process_memory([source]))
+        for key, value in metrics.get("training_process_peak_rss_bytes", {}).get("per_process", {}).items():
+            per_process[key] = max(int(value), per_process.get(key, 0))
+        for key, value in metrics.get("checkpoint_daemon_peak_rss_bytes", {}).get("per_node", {}).items():
+            per_node[key] = max(int(value), per_node.get(key, 0))
+    combined = {}
+    if per_process:
+        measured = metric(list(per_process.values()), "B", higher_is_better=False)
+        measured["per_process"] = dict(sorted(per_process.items()))
+        combined["training_process_peak_rss_bytes"] = measured
+    if per_node:
+        measured = metric(list(per_node.values()), "B", higher_is_better=False)
+        measured["per_node"] = dict(sorted(per_node.items()))
+        combined["checkpoint_daemon_peak_rss_bytes"] = measured
+    return combined
+
+
 def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
     if analysis := _load_latest_analysis(results_dir):
         processed = _processed(analysis, native)
@@ -691,6 +938,7 @@ def post_process(results_dir: Path, gpus_per_node: int, native: bool) -> dict:
         processed = _processed({"metrics": metrics_from_data(data, gpus_per_node), "native_spans_valid": valid}, native)
     if cpu_rss := _complete_run_cpu_rss(results_dir):
         processed["metrics"]["cpu_rss_bytes"] = cpu_rss
+    processed["metrics"].update(complete_run_process_memory_peaks(results_dir))
     return processed
 
 
@@ -788,6 +1036,7 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
         "megatron_spans": checkpoint_spans,
         "megatron_metrics": megatron_metrics,
         "resource_metrics": resource_metrics,
+        "process_memory": collect_process_memory(data),
     }
     return {
         "source": "otlp",
@@ -797,6 +1046,8 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
         "metrics": metrics_from_data(report_data, gpus_per_node, durability),
         **_checkpoint_timing_report(data.spans, path, run_id, durability),
     }
+
+
 # Entries define the unit and whether larger values are better.
 _SUMMARY_METRICS = (
     ("bw_mbps", "MB/s", True),
