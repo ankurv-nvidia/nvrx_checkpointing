@@ -1,5 +1,6 @@
 #pragma once
 #include "CommonMacros.h"
+#include "config.h"
 
 #include <boost/interprocess/creation_tags.hpp>
 #include <boost/interprocess/interprocess_fwd.hpp>
@@ -17,6 +18,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -26,21 +28,6 @@
 namespace checkpoint::ipc
 {
 static constexpr size_t MinShmSize = 32ull * 1024ull * 1024ull;    // 32MB
-
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-// Valgrind tracks V-bits/A-bits for every mapped byte and keeps a fixed-size
-// segment table (aspacem). The default sizes below produce 1 GiB of shm per
-// rank plus many 8 MiB writer-thread stacks, which exhausts valgrind's
-// shadow memory / segment table on multi-rank runs. Shrink aggressively when
-// building specifically for a valgrind run.
-static constexpr size_t  MaxShmSize      = 128ull * 1024ull * 1024ull;
-static constexpr size_t  D2HBufferCount  = 4;
-static constexpr uint8_t MaxRanksPerNode = 2;
-#else
-static constexpr size_t  MaxShmSize      = 256ull * 1024ull * 1024ull * 1024ull;    // 256GB
-static constexpr size_t  D2HBufferCount  = 32;
-static constexpr uint8_t MaxRanksPerNode = 4;
-#endif
 
 namespace bip = boost::interprocess;
 
@@ -104,15 +91,10 @@ template <> struct fmt::formatter<checkpoint::ipc::PerfMetrics> : fmt::formatter
 namespace checkpoint::ipc
 {
 // Multi-producer single-consumer ring buffer in shared memory
-template <typename THdr, size_t NSlots> struct ShmRingBuffer
+template <typename THdr> struct ShmRingBuffer
 {
     public:
     static constexpr auto HearBeatInterval = std::chrono::microseconds(1);
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-    static constexpr auto WriteWaitTimeout = std::chrono::minutes(5);
-#else
-    static constexpr auto WriteWaitTimeout = std::chrono::seconds(1);
-#endif
 
     PerfMetrics sendPerf{"SendPerf"}, recvPerf{"RecvPerf"}, rlatency{"RdLatency"}, wlatency{"WrLatency"};    // NOLINT
     struct Control
@@ -128,10 +110,11 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         std::atomic<std::size_t>       rbeg{0};
         std::atomic<std::size_t>       rend{0};
         std::atomic<std::size_t>       wbeg{0};
-        std::atomic<std::size_t>       wend{NSlots};    // Initially set to NSlots
+        std::atomic<std::size_t>       wend{0};
 
         uint64_t shmSize{0};
         uint64_t slotSize{0};
+        uint64_t slotCount{0};
 
         bip::interprocess_mutex     mutex;
         bip::interprocess_condition canRead;     // Signaled when data is available to read
@@ -142,7 +125,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     {
         return fmt::format_to(ctx.out(),
                               "ShmRingBuffer[{}]: rbeg={} rend={} wbeg={} wend={}{}{}{}",
-                              NSlots,
+                              _slotCount,
                               _ctrl->rbeg,
                               _ctrl->rend,
                               _ctrl->wbeg,
@@ -154,14 +137,21 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     }
 
     static constexpr size_t AlignBoundary = 4096;
+    static constexpr size_t MaxSlotCount
+        = (std::numeric_limits<size_t>::max() - sizeof(Control) - (AlignBoundary - 1)) / (sizeof(THdr) + AlignBoundary);
 
-    static constexpr size_t HdrCapacity  = (sizeof(THdr) * NSlots) + sizeof(Control);
-    static constexpr size_t HdrAllocSize = ((HdrCapacity + AlignBoundary - 1) / AlignBoundary) * AlignBoundary;
+    static constexpr size_t HeaderAllocationSize(size_t slotCount)
+    {
+        if (slotCount == 0 || slotCount > MaxSlotCount) { throw std::invalid_argument("Invalid shared-memory slot count"); }
+        auto const capacity = (sizeof(THdr) * slotCount) + sizeof(Control);
+        return ((capacity + AlignBoundary - 1) / AlignBoundary) * AlignBoundary;
+    }
 
-    static constexpr size_t MinTotalShmSize = HdrAllocSize + (NSlots * AlignBoundary);
+    static constexpr size_t MinimumShmSize(size_t slotCount) { return HeaderAllocationSize(slotCount) + (slotCount * AlignBoundary); }
 
-    static ShmRingBuffer Create(std::string name, size_t totalShmSize) { return {std::move(name), true, totalShmSize}; }
-    static ShmRingBuffer Open(std::string name) { return {std::move(name), false, 0}; }
+    static ShmRingBuffer Create(std::string name, size_t totalShmSize, size_t slotCount)
+    { return {std::move(name), true, totalShmSize, slotCount}; }
+    static ShmRingBuffer Open(std::string name) { return {std::move(name), false, 0, 0}; }
 
     // Find the largest per-node budget the shared-memory filesystem accepts:
     // start from maxShmSize and halve on ENOSPC. The probe is a dedicated
@@ -170,9 +160,9 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     // pins whatever size it observes. Filesystems that accept sparse truncation
     // report the full cap; the ring writes pages lazily, and openers wait out
     // the initial pinning, so an optimistic answer is safe.
-    static size_t DetectShmSize(std::string const& name, size_t maxShmSize, size_t minShmSize)
+    static size_t DetectShmSize(std::string const& name, size_t maxShmSize, size_t minShmSize, size_t slotCount)
     {
-        size_t const floor     = std::max(minShmSize, MinTotalShmSize);
+        size_t const floor     = std::max(minShmSize, MinimumShmSize(slotCount));
         size_t       allocSize = std::max(maxShmSize, floor);
         auto const   probeName = name + ".sizeprobe";
         while (true)
@@ -201,6 +191,8 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     }
 
     [[nodiscard]] size_t SlotSize() const noexcept { return _slotSize; }
+    [[nodiscard]] size_t SlotCount() const noexcept { return _slotCount; }
+    [[nodiscard]] size_t HeaderSize() const noexcept { return HeaderAllocationSize(_slotCount); }
 
     CLASS_DELETE_COPY_DEFAULT_MOVE(ShmRingBuffer);
     ~ShmRingBuffer()
@@ -265,7 +257,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         if (recvPerf.Record(PerfMetrics::Clock::now() - readstart))
         {
             // Print Read-Head of queue for debugging.
-            fmt::print("[shm_buf][perf][VERBOSE] Queue: {} Hdr: {}\n", *this, _hdrs[_ctrl->rbeg % NSlots]);
+            fmt::print("[shm_buf][perf][VERBOSE] Queue: {} Hdr: {}\n", *this, _hdrs[_ctrl->rbeg % _slotCount]);
         }
 #endif
     }
@@ -277,14 +269,14 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     // geometry, which bounds what a client may touch and pin.
     std::span<char> GetShmDataRegion()
     {
-        return {reinterpret_cast<char*>(_region.get_address()), HdrAllocSize + (NSlots * _slotSize)};    // NOLINT
+        return {reinterpret_cast<char*>(_region.get_address()), HeaderSize() + (_slotCount * _slotSize)};    // NOLINT
     }
 
     void Flush()
     {
         auto start      = PerfMetrics::Clock::now();
         auto rtimestamp = _ctrl->rtimestamp.load();
-        while (AvailableForWrite_() < NSlots)
+        while (AvailableForWrite_() < _slotCount)
         {
             std::this_thread::sleep_for(HearBeatInterval);
             if (_ctrl->rtimestamp.load() != rtimestamp)
@@ -292,11 +284,11 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
                 rtimestamp = _ctrl->rtimestamp.load();
                 start      = PerfMetrics::Clock::now();
             }
-            else if (PerfMetrics::Clock::now() - start > WriteWaitTimeout)
+            else if (PerfMetrics::Clock::now() - start > _writeWaitTimeout)
             {
                 throw std::runtime_error(fmt::format("Flush: No heartbeat from reader, possible deadlock Queue: {} Queue-Head-Hdr: {}\n",
                                                      *this,
-                                                     _hdrs[_ctrl->wbeg % NSlots]));
+                                                     _hdrs[_ctrl->wbeg % _slotCount]));
             }
         }
     }
@@ -316,7 +308,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             auto start = PerfMetrics::Clock::now();
 #if SHM_RING_BUFFER_ENABLE_PERF_METRICS == 2
             // Print Write-Head of queue for debugging.
-            fmt::print("[shm_buf][perf][VERBOSE] Queue Full: {} Queue-Head-Hdr: {}\n", *this, _hdrs[_ctrl->wbeg % NSlots]);
+            fmt::print("[shm_buf][perf][VERBOSE] Queue Full: {} Queue-Head-Hdr: {}\n", *this, _hdrs[_ctrl->wbeg % _slotCount]);
 #endif
 #endif
 
@@ -324,7 +316,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             // This feels like a hack but is necessary because we dont always notify the reader after every write op
             // So its important to do so right before we wait
             _ctrl->canRead.notify_all();
-            auto valid = _ctrl->canWrite.wait_for(lock, WriteWaitTimeout, [this] { return AvailableForWrite_() > 0 || _stopRequested; });
+            auto valid = _ctrl->canWrite.wait_for(lock, _writeWaitTimeout, [this] { return AvailableForWrite_() > 0 || _stopRequested; });
 #ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
             wlatency.Record(PerfMetrics::Clock::now() - start);
 #endif
@@ -332,7 +324,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             if (!valid && _ctrl->rtimestamp.load() == rtimestamp)
             {
                 throw std::runtime_error(fmt::format(
-                    "No heartbeat from reader, possible deadlock Queue: {} Queue-Head-Hdr: {}\n", *this, _hdrs[_ctrl->wbeg % NSlots]));
+                    "No heartbeat from reader, possible deadlock Queue: {} Queue-Head-Hdr: {}\n", *this, _hdrs[_ctrl->wbeg % _slotCount]));
             }
 
             rtimestamp = _ctrl->rtimestamp.load();
@@ -341,7 +333,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
 
         size_t offset = _ctrl->wbeg;
         _ctrl->wbeg++;
-        return offset % NSlots;
+        return offset % _slotCount;
     }
 
     void FinishWriting_(size_t slot)
@@ -349,7 +341,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         // bool readFull = false;
         {
             bip::scoped_lock<bip::interprocess_mutex> lock(_ctrl->mutex);
-            while ((_ctrl->rend % NSlots) != slot)
+            while ((_ctrl->rend % _slotCount) != slot)
             {
                 lock.unlock();
                 std::this_thread::yield();
@@ -389,7 +381,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         _ctrl->rtimestamp = Control::Clock::now();
         size_t offset     = _ctrl->rbeg;
         _ctrl->rbeg++;
-        return {false, offset % NSlots};
+        return {false, offset % _slotCount};
     }
 
     void FinishReading_()
@@ -409,26 +401,28 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         }
     }
 
-    ShmRingBuffer(std::string&& nameIn, bool resetState, size_t allocSize) : _name(std::move(nameIn)), _resetShm(resetState)
+    ShmRingBuffer(std::string&& nameIn, bool resetState, size_t allocSize, size_t slotCount) :
+        _name(std::move(nameIn)), _slotCount(slotCount), _resetShm(resetState)
     {
         if (_resetShm)
         {
-            if (allocSize < MinTotalShmSize)
+            auto const minimumShmSize = MinimumShmSize(_slotCount);
+            if (allocSize < minimumShmSize)
             {
                 throw std::invalid_argument(
-                    fmt::format("Shared memory '{}': requested {} bytes, need at least {}", _name, allocSize, MinTotalShmSize));
+                    fmt::format("Shared memory '{}': requested {} bytes, need at least {}", _name, allocSize, minimumShmSize));
             }
             _shm = bip::shared_memory_object(bip::open_or_create, _name.c_str(), bip::read_write);
             _shm.truncate(static_cast<bip::offset_t>(allocSize));
 
             _region    = bip::mapped_region(_shm, bip::read_write);
             auto* base = static_cast<char*>(_region.get_address());
-            _ctrl      = reinterpret_cast<Control*>(base);                                            // NOLINT
-            _hdrs      = std::span<THdr>(reinterpret_cast<THdr*>(base + sizeof(Control)), NSlots);    // NOLINT
-            _slotSize  = ((allocSize - HdrAllocSize) / NSlots) & ~(AlignBoundary - 1);
-            _dataBase  = base + HdrAllocSize;    // NOLINT
+            _ctrl      = reinterpret_cast<Control*>(base);                                                // NOLINT
+            _hdrs      = std::span<THdr>(reinterpret_cast<THdr*>(base + sizeof(Control)), _slotCount);    // NOLINT
+            _slotSize  = ((allocSize - HeaderSize()) / _slotCount) & ~(AlignBoundary - 1);
+            _dataBase  = base + HeaderSize();    // NOLINT
             assert(_slotSize >= AlignBoundary);
-            assert(_region.get_size() >= HdrAllocSize + (NSlots * _slotSize));
+            assert(_region.get_size() >= HeaderSize() + (_slotCount * _slotSize));
 
             new (&_ctrl->mutex) bip::interprocess_mutex();
             new (&_ctrl->canRead) bip::interprocess_condition();
@@ -437,9 +431,10 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
             _ctrl->rbeg       = 0;
             _ctrl->rend       = 0;
             _ctrl->wbeg       = 0;
-            _ctrl->wend       = NSlots;
+            _ctrl->wend       = _slotCount;
             _ctrl->shmSize    = allocSize;
             _ctrl->slotSize   = _slotSize;
+            _ctrl->slotCount  = _slotCount;
             _ctrl->rtimestamp = Control::Clock::now();
             _ctrl->wtimestamp = Control::Clock::now();
         }
@@ -475,7 +470,7 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
                 while (true)
                 {
                     [[maybe_unused]] auto const seen = _ctrl->rtimestamp.load();    // acquire: orders the geometry reads below
-                    if (_ctrl->slotSize != 0 && _ctrl->shmSize != 0) { break; }
+                    if (_ctrl->slotSize != 0 && _ctrl->shmSize != 0 && _ctrl->slotCount != 0) { break; }
                     if (PerfMetrics::Clock::now() - start >= MaxWaitDuration) { break; }
                     std::this_thread::yield();
                 }
@@ -493,21 +488,27 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     // Throws logic_error on any inconsistency.
     void AdoptPublishedGeometry_()
     {
-        uint64_t const shmSize  = _ctrl->shmSize;
-        uint64_t const slotSize = _ctrl->slotSize;
+        uint64_t const shmSize   = _ctrl->shmSize;
+        uint64_t const slotSize  = _ctrl->slotSize;
+        uint64_t const slotCount = _ctrl->slotCount;
         if (slotSize == 0 || (slotSize % AlignBoundary) != 0)
         {
             throw std::logic_error(fmt::format("Shared memory '{}': invalid slot size {} reported by creator", _name, slotSize));
         }
-        if (shmSize < HdrAllocSize + (NSlots * slotSize))
+        if (slotCount == 0 || slotCount > MaxSlotCount)
+        {
+            throw std::logic_error(fmt::format("Shared memory '{}': invalid slot count {} reported by creator", _name, slotCount));
+        }
+        _slotCount = static_cast<size_t>(slotCount);
+        if (shmSize < HeaderSize() + (_slotCount * slotSize))
         {
             throw std::logic_error(
                 fmt::format("Shared memory '{}': creator-reported size {} too small for {} slots of {} bytes plus {} byte header",
                             _name,
                             shmSize,
-                            NSlots,
+                            _slotCount,
                             slotSize,
-                            HdrAllocSize));
+                            HeaderSize()));
         }
         bip::offset_t fileSize = 0;
         if (!_shm.get_size(fileSize) || std::cmp_less(fileSize, shmSize))
@@ -519,8 +520,8 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
         auto* base = static_cast<char*>(_region.get_address());
         _ctrl      = reinterpret_cast<Control*>(base);    // NOLINT
         _slotSize  = slotSize;
-        _hdrs      = std::span<THdr>(reinterpret_cast<THdr*>(base + sizeof(Control)), NSlots);    // NOLINT
-        _dataBase  = base + HdrAllocSize;                                                         // NOLINT
+        _hdrs      = std::span<THdr>(reinterpret_cast<THdr*>(base + sizeof(Control)), _slotCount);    // NOLINT
+        _dataBase  = base + HeaderSize();                                                             // NOLINT
     }
 
     std::string               _name;
@@ -529,6 +530,8 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
     Control*                  _ctrl{};
     char*                     _dataBase{};    // start of the slot data region
     size_t                    _slotSize{};    // runtime per-slot stride, from Control::slotSize
+    size_t                    _slotCount{};
+    std::chrono::seconds      _writeWaitTimeout{checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>()};
     std::span<THdr>           _hdrs;
     bool                      _stopRequested{false};
     bool                      _resetShm{false};
@@ -538,10 +541,9 @@ template <typename THdr, size_t NSlots> struct ShmRingBuffer
 };
 }    // namespace checkpoint::ipc
 
-template <typename THdr, size_t NSlots>
-struct fmt::formatter<checkpoint::ipc::ShmRingBuffer<THdr, NSlots>> : fmt::formatter<std::string_view>
+template <typename THdr> struct fmt::formatter<checkpoint::ipc::ShmRingBuffer<THdr>> : fmt::formatter<std::string_view>
 {
-    auto format(checkpoint::ipc::ShmRingBuffer<THdr, NSlots> const& obj, fmt::format_context& ctx) const    // NOLINT
+    auto format(checkpoint::ipc::ShmRingBuffer<THdr> const& obj, fmt::format_context& ctx) const    // NOLINT
     {
         return obj.format_to(ctx);    //
     }

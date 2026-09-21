@@ -3,9 +3,8 @@ source: logs
 metrics:
   ckpt_durable_ms: 10204
   gpu_peak_bytes: 77947789488
-  gpu_hbm_peak_bytes: 94603968512
-  gpu_hbm_peak_pct: 31.85
-  training_process_peak_rss_bytes: 42263969792
+  gpu_hbm_peak_bytes: 99446292480
+  training_process_peak_rss_bytes: 45022707712
 tolerances:
   training_process_peak_rss_bytes: 0.05
 rank_statistics:
@@ -14,14 +13,10 @@ rank_statistics:
     median: 77918865792.0
     max: 78255342080.0
   gpu_hbm_peak_bytes:
-    min: 92458582016.0
-    median: 93516595200.0
-    max: 94319804416.0
-  gpu_hbm_peak_pct:
-    min: 31.13
-    median: 31.48
-    max: 31.76
+    min: 92818243584.0
+    median: 95803539456.0
+    max: 99383377920.0
   training_process_peak_rss_bytes:
-    min: 37326487552
-    median: 38818807808.0
-    max: 42263969792
+    min: 37707776000
+    median: 40582774784.0
+    max: 45022707712

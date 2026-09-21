@@ -496,6 +496,10 @@ def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
     def popen(*_args: object, **kwargs: object) -> None:
         assert "--errors-for-leak-kinds=definite,indirect" in _args[0]
+        assert {
+            name: kwargs["env"][name]
+            for name in slurm_job._VALGRIND_NATIVE_ENV
+        } == slurm_job._VALGRIND_NATIVE_ENV
         assert "NATIVE_CKPT_OTEL_FILE" not in kwargs["env"]
         raise RuntimeError("popen reached")
 
@@ -3871,8 +3875,8 @@ def test_flavors_compose_execution_policy_independent_of_cli_order() -> None:
     assert flavors.policy.phase2_checkpoints == slurm_job.FlavorPolicy.phase2_checkpoints
     assert flavors.policy.checkpoint_routines == 1
     assert not flavors.policy.manages_native_server
-    assert not flavors.policy.install_prebuilt
-    assert flavors.policy.prep_args() == ["--build-from-source", "--define", "PHOENIX_BUILD_FOR_VALGRIND=1"]
+    assert flavors.policy.install_prebuilt
+    assert flavors.policy.prep_args() == ["--ensure-prebuilt"]
     assert flavors.policy.worker is None
     assert flavors.policy.server.__self__.__class__ is slurm_job.ValgrindFlavor
     assert flavors.policy.reporter is None
@@ -4115,7 +4119,6 @@ def test_nvrx_perf_writes_a_baseline_for_every_reported_metric(
             "ckpt_durable_ms": {"mean": 10, "higher_is_better": False, "unit": "ms"},
             "gpu_peak_bytes": {"mean": 100, "higher_is_better": False, "unit": "B"},
             "gpu_hbm_peak_bytes": {"max": 120, "higher_is_better": False, "unit": "B"},
-            "gpu_hbm_peak_pct": {"max": 60, "higher_is_better": False, "unit": "%"},
             "training_process_peak_rss_bytes": {"max": 200, "higher_is_better": False, "unit": "B"},
         },
     }
@@ -4128,7 +4131,6 @@ def test_nvrx_perf_writes_a_baseline_for_every_reported_metric(
         "ckpt_durable_ms": 10,
         "gpu_peak_bytes": 100,
         "gpu_hbm_peak_bytes": 120,
-        "gpu_hbm_peak_pct": 60,
         "training_process_peak_rss_bytes": 200,
     }
 
@@ -4649,7 +4651,6 @@ def test_perf_report_can_enforce_only_memory(
         "bw_mbps": slurm_job.otel_report.metric([10], "MB/s", higher_is_better=True),
         "gpu_peak_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False),
         "gpu_hbm_peak_bytes": slurm_job.otel_report.metric([120], "B", higher_is_better=False),
-        "gpu_hbm_peak_pct": slurm_job.otel_report.metric([60], "%", higher_is_better=False),
         "training_process_peak_rss_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False),
         "checkpoint_daemon_peak_rss_bytes": slurm_job.otel_report.metric([200], "B", higher_is_better=False),
     }
@@ -4673,7 +4674,6 @@ def test_perf_report_can_enforce_only_memory(
             "bw_mbps": 1000,
             "gpu_peak_bytes": 100,
             "gpu_hbm_peak_bytes": 120,
-            "gpu_hbm_peak_pct": 60,
             "training_process_peak_rss_bytes": 100,
             "checkpoint_daemon_peak_rss_bytes": 200,
         },
@@ -5019,10 +5019,8 @@ def test_perf_report_uses_the_largest_rank_hbm_peak() -> None:
     metrics = slurm_job.otel_report.metrics_from_data(_otel_data(resource_metrics=resource_metrics), 4)
 
     assert metrics["gpu_hbm_peak_bytes"]["max"] == 98  # noqa: PLR2004
-    assert metrics["gpu_hbm_peak_pct"]["max"] == 98  # noqa: PLR2004
-    assert metrics["gpu_hbm_peak_pct"]["ranks"] == [0, 58]
+    assert "gpu_hbm_peak_pct" not in metrics
     assert metrics["cpu_rss_bytes"]["max"] == 104  # noqa: PLR2004
-    assert slurm_job.PerfReport._statistic("gpu_hbm_peak_pct", metrics["gpu_hbm_peak_pct"]) == "max"
 
 
 def test_megatron_perf_metrics_report_latest_values_across_export_ranks() -> None:
@@ -5479,6 +5477,10 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
     assert "--check-for-nan-in-loss-and-grad" in opts
     assert "--no-check-for-nan-in-loss-and-grad" not in opts
     assert opts[-2:] == ["--rerun-mode", "disabled"]
+    assert {
+        name: env[name]
+        for name in slurm_job._VALGRIND_NATIVE_ENV
+    } == slurm_job._VALGRIND_NATIVE_ENV
     assert "NATIVE_CKPT_OTEL_FILE" not in env
     assert env["MEGATRON_OTEL_ENABLED"] == "0"
 

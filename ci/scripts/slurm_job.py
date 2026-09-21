@@ -110,7 +110,7 @@ HOST_MEMORY_METRICS = frozenset({
     "checkpoint_daemon_peak_rss_bytes",
     "training_process_peak_rss_bytes",
 })
-GPU_MEMORY_METRICS = frozenset({"gpu_peak_bytes", "gpu_hbm_peak_bytes", "gpu_hbm_peak_pct"})
+GPU_MEMORY_METRICS = frozenset({"gpu_peak_bytes", "gpu_hbm_peak_bytes"})
 MEMORY_REGRESSION_METRICS = HOST_MEMORY_METRICS | GPU_MEMORY_METRICS
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
@@ -1247,7 +1247,6 @@ class PerfReport:
         if name in {
             *HOST_MEMORY_METRICS,
             "gpu_hbm_peak_bytes",
-            "gpu_hbm_peak_pct",
             "megatron.training.memory_allocated_gb",
         } and "max" in measured:
             return "max"
@@ -2040,6 +2039,19 @@ class DeterministicFlavor(Flavor):
         env.pop("NATIVE_CKPT_OTEL_FILE", None)
 
 
+_VALGRIND_NATIVE_ENV = {
+    "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH": "1",
+    "NATIVE_CKPT_SERVER_HANDLER_THREADS": "4",
+    "NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS": "0",
+    "NATIVE_CKPT_SERVER_TCP_ACCEPTORS": "1",
+    "NATIVE_CKPT_SERVER_TCP_REUSE_PORT": "0",
+    "NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES": "2",
+    "NATIVE_CKPT_SHM_RING_BUFFER_SIZE": "128MiB",
+    "NATIVE_CKPT_SHM_RING_BUFFER_SLOTS": "4",
+    "NATIVE_CKPT_SHM_RING_BUFFER_WRITE_TIMEOUT_SECONDS": "300",
+}
+
+
 class ValgrindFlavor(Flavor):
     execution_mode = True
     name = "vg"
@@ -2051,9 +2063,6 @@ class ValgrindFlavor(Flavor):
         policy.phase2_save_interval = 1
         policy.manages_native_server = False
         policy.otel_reporting = False
-        policy.wheel_prep_mode = "--build-from-source"
-        policy.wheel_defines = ("PHOENIX_BUILD_FOR_VALGRIND=1",)
-        policy.install_prebuilt = False
         policy.server = self.server
         policy.reporter = None
 
@@ -2071,9 +2080,9 @@ class ValgrindFlavor(Flavor):
         # even when memcheck does not diagnose it.
         _set(opts, "--rerun-mode", "disabled")
         # Keep third-party OTel/protobuf internals outside the daemon's Memcheck gate.
+        env.update(_VALGRIND_NATIVE_ENV)
         env["MEGATRON_OTEL_ENABLED"] = "0"
         env.pop("NATIVE_CKPT_OTEL_FILE", None)
-        env["CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH"] = "1"
 
     @contextlib.contextmanager
     def server(self, stem: str, phase: int) -> Generator[None, None, None]:
@@ -2103,7 +2112,7 @@ class ValgrindFlavor(Flavor):
             f"--log-file={report}",
             str(nvrx_checkpointing.SERVER_PATH),
         ]
-        server_env = dict(os.environ)
+        server_env = {**os.environ, **_VALGRIND_NATIVE_ENV}
         server_env.pop("NATIVE_CKPT_OTEL_FILE", None)
         with server_log.open("w") as output:
             proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env=server_env)

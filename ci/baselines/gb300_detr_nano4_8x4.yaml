@@ -8,7 +8,6 @@ metrics:
   ckpt_daemon_durable_ms: 7063
   gpu_peak_bytes: 77909645168
   gpu_hbm_peak_bytes: 101604720640
-  gpu_hbm_peak_pct: 34.21
   training_process_peak_rss_bytes: 96617037824
   checkpoint_daemon_peak_rss_bytes: 395429019648
 tolerances:
@@ -35,10 +34,6 @@ rank_statistics:
     min: 97562001408.0
     median: 98856992768.0
     max: 101448482816.0
-  gpu_hbm_peak_pct:
-    min: 32.85
-    median: 33.28
-    max: 34.16
   training_process_peak_rss_bytes:
     min: 92225208320
     median: 93236068352.0

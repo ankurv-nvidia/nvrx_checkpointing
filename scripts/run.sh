@@ -21,13 +21,21 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_GRAPH_REGISTER=0
 # AssertionError: Using tensor model parallelism or context parallelism require setting the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export BUILDENV_DISABLE_MARCH_NATIVE=ON
 
 MY_RUN_DIR="${REPO_ROOT}/ci/ci-runs"
 RUN_DIR="${REPO_ROOT}/ci/ci-runs"
 MEGATRON_LM_DIR="${MEGATRON_ROOT}"
 DATACACHE_DIR="${MY_RUN_DIR}/data-cache/"
 export NATIVE_CKPT_SERVER_LOG="${MY_RUN_DIR}/native_ckpt_server.log"
-export PHOENIX_BUILD_FOR_VALGRIND=1 # lower memory consumption
+export NATIVE_CKPT_SERVER_HANDLER_THREADS=4
+export NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS=0
+export NATIVE_CKPT_SERVER_TCP_ACCEPTORS=1
+export NATIVE_CKPT_SERVER_TCP_REUSE_PORT=0
+export NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES=2
+export NATIVE_CKPT_SHM_RING_BUFFER_SIZE=128MiB
+export NATIVE_CKPT_SHM_RING_BUFFER_SLOTS=4
+export NATIVE_CKPT_SHM_RING_BUFFER_WRITE_TIMEOUT_SECONDS=300
 
 BLEND_PATH="${REPO_ROOT}/../blend_files/superblend1-exposure-filtered.json"
 

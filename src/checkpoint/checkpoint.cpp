@@ -234,14 +234,14 @@ struct CheckpointWriter
     // Resolve this rank's channel and mmap its shm queue (cheap; logs the open time).
     static cipc::MsgQueue OpenMsgQueue(RankTopology const& topo)
     {
-        auto localRank = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
-        // One queue per rank when MaxRanksPerNode covers the node's ranks; if a node
+        auto       localRank  = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
+        auto const queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+        // One queue per rank when queueCount covers the node's ranks; if a node
         // has more ranks than queues, consecutive (same-socket) ranks share one.
-        auto ranksPerQueue = topo.ranksPerPeer / cipc::MaxRanksPerNode;
-        if (ranksPerQueue == 0) { ranksPerQueue = 1; }
-        auto index       = (localRank / ranksPerQueue) % cipc::MaxRanksPerNode;
-        auto peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
-        auto channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
+        auto const ranksPerQueue = std::max<size_t>(1, (topo.ranksPerPeer + queueCount - 1) / queueCount);
+        auto const index         = std::min<size_t>(localRank / ranksPerQueue, queueCount - 1);
+        auto       peerIndex     = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+        auto       channelName   = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
         return cipc::MsgQueue::Open(channelName);
     }
 
@@ -655,7 +655,7 @@ void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, s
 void WaitForCheckpointSave(RankTopology const& topo)
 {
     auto& msgQueue = CheckpointWriter::GetMsgQueue(topo);
-    for (size_t i = 0; i < cipc::D2HBufferCount; ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
+    for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
 void WarmUpCheckpoint(RankTopology const& topo)

@@ -1,12 +1,15 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <unistd.h>    // for gethostname
 
@@ -66,22 +69,77 @@ struct EnabledByOne
     static ValueType Parse(std::string_view value) { return value == "1"; }
 };
 
-struct UnsignedInteger
+struct ByteSize
 {
-    using ValueType = uint64_t;
+    using ValueType = size_t;
 
     static ValueType Parse(std::string_view value)
     {
         if (value.empty() || value.front() < '0' || value.front() > '9')
         {
-            throw std::invalid_argument("Unsigned integer must start with a digit");
+            throw std::invalid_argument("Byte size must start with a digit");
         }
-        size_t     index  = 0;
-        auto const amount = std::stoull(std::string{value}, &index);
-        if (index != value.size()) { throw std::invalid_argument("Invalid unsigned integer: " + std::string{value}); }
-        return amount;
+        size_t     index      = 0;
+        auto const amount     = std::stoull(std::string{value}, &index);
+        auto const suffix     = value.substr(index);
+        uint64_t   multiplier = 1;
+        if (suffix == "K" || suffix == "KB") { multiplier = 1000ull; }
+        else if (suffix == "M" || suffix == "MB") { multiplier = 1000ull * 1000ull; }
+        else if (suffix == "G" || suffix == "GB") { multiplier = 1000ull * 1000ull * 1000ull; }
+        else if (suffix == "KiB") { multiplier = 1ull << 10; }
+        else if (suffix == "MiB") { multiplier = 1ull << 20; }
+        else if (suffix == "GiB") { multiplier = 1ull << 30; }
+        else if (!suffix.empty()) { throw std::invalid_argument("Invalid byte-size suffix: " + std::string{suffix}); }
+        if (amount > std::numeric_limits<ValueType>::max() / multiplier) { throw std::overflow_error("Byte size is too large"); }
+        return static_cast<ValueType>(amount * multiplier);
     }
 };
+
+template <std::integral TValue, TValue Minimum = std::numeric_limits<TValue>::lowest()> struct Integer
+{
+    static_assert(!std::same_as<TValue, bool>);
+
+    using ValueType = TValue;
+
+    static ValueType Parse(std::string_view value)
+    {
+        auto const isDigit = [](char character) { return character >= '0' && character <= '9'; };
+        if (value.empty() || (std::is_unsigned_v<ValueType> && !isDigit(value.front()))
+            || (std::is_signed_v<ValueType> && !isDigit(value.front()) && value.front() != '-' && value.front() != '+'))
+        {
+            throw std::invalid_argument("Invalid integer: " + std::string{value});
+        }
+
+        size_t index = 0;
+        try
+        {
+            if constexpr (std::is_unsigned_v<ValueType>)
+            {
+                auto const parsed = std::stoull(std::string{value}, &index);
+                if (index != value.size()) { throw std::invalid_argument("Invalid integer: " + std::string{value}); }
+                if (parsed > std::numeric_limits<ValueType>::max()) { throw std::overflow_error("Integer is too large"); }
+                if (parsed < Minimum) { throw std::invalid_argument("Integer is below the configured minimum"); }
+                return static_cast<ValueType>(parsed);
+            }
+            else
+            {
+                auto const parsed = std::stoll(std::string{value}, &index);
+                if (index != value.size()) { throw std::invalid_argument("Invalid integer: " + std::string{value}); }
+                if (parsed > std::numeric_limits<ValueType>::max() || parsed < std::numeric_limits<ValueType>::lowest())
+                {
+                    throw std::overflow_error("Integer is outside the supported range");
+                }
+                if (parsed < Minimum) { throw std::invalid_argument("Integer is below the configured minimum"); }
+                return static_cast<ValueType>(parsed);
+            }
+        } catch (std::out_of_range const&) { throw std::overflow_error("Integer is outside the supported range"); }
+    }
+};
+
+using PositiveSize    = Integer<uint32_t, 1>;
+using PositiveUint8   = Integer<uint8_t, 1>;
+using NonNegativeSize = Integer<uint32_t, 0>;
+using UnsignedInteger = Integer<uint64_t>;
 
 struct RFile
 {
@@ -197,6 +255,62 @@ struct OtelLogs
     static constexpr std::string_view Name    = "otel.logs";
     static constexpr std::string_view Default = "1";
     using Type                                = types::OptOut;
+};
+
+struct ShmRingBufferSize
+{
+    static constexpr std::string_view Name    = "shm.ring.buffer.size";
+    static constexpr std::string_view Default = "256GiB";
+    using Type                                = types::ByteSize;
+};
+
+struct ShmRingBufferSlots
+{
+    static constexpr std::string_view Name    = "shm.ring.buffer.slots";
+    static constexpr std::string_view Default = "32";
+    using Type                                = types::PositiveSize;
+};
+
+struct ShmRingBufferNumQueues
+{
+    static constexpr std::string_view Name    = "shm.ring.buffer.num.queues";
+    static constexpr std::string_view Default = "4";
+    using Type                                = types::PositiveUint8;
+};
+
+struct ShmRingBufferWriteTimeoutSeconds
+{
+    static constexpr std::string_view Name    = "shm.ring.buffer.write.timeout.seconds";
+    static constexpr std::string_view Default = "1";
+    using Type                                = types::PositiveSize;
+};
+
+struct ServerTcpReusePort
+{
+    static constexpr std::string_view Name    = "server.tcp.reuse.port";
+    static constexpr std::string_view Default = "1";
+    using Type                                = types::OptIn;
+};
+
+struct ServerTcpAcceptors
+{
+    static constexpr std::string_view Name    = "server.tcp.acceptors";
+    static constexpr std::string_view Default = "8";
+    using Type                                = types::PositiveSize;
+};
+
+struct ServerHandlerThreads
+{
+    static constexpr std::string_view Name    = "server.handler.threads";
+    static constexpr std::string_view Default = "64";
+    using Type                                = types::PositiveSize;
+};
+
+struct ServerMaxActiveSnapshots
+{
+    static constexpr std::string_view Name    = "server.max.active.snapshots";
+    static constexpr std::string_view Default = "4";
+    using Type                                = types::NonNegativeSize;
 };
 
 struct MemorySampleIntervalSeconds

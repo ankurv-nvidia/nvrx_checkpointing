@@ -68,6 +68,47 @@ SUPPRESS_WARNINGS_END
 static std::filesystem::path const& TestRegistryPath()
 { return GRegistryPath; }
 
+TEST_CASE("shared-memory configuration parses sizes and positive counts", "[shmem][config][tier1]")
+{
+    using checkpoint::config::types::ByteSize;
+    using checkpoint::config::types::Integer;
+    using checkpoint::config::types::NonNegativeSize;
+    using checkpoint::config::types::PositiveSize;
+    using checkpoint::config::types::PositiveUint8;
+    CHECK(ByteSize::Parse("48GiB") == 48ull * (1ull << 30));
+    CHECK(ByteSize::Parse("5GB") == 5'000'000'000ull);
+    CHECK_THROWS_AS(ByteSize::Parse("5gib"), std::invalid_argument);
+    CHECK_THROWS_AS(ByteSize::Parse("-1"), std::invalid_argument);
+    CHECK(PositiveSize::Parse("32") == 32);
+    CHECK_THROWS_AS(PositiveSize::Parse("0"), std::invalid_argument);
+    CHECK_THROWS_AS(PositiveSize::Parse("4x"), std::invalid_argument);
+    CHECK(PositiveUint8::Parse("255") == 255);
+    CHECK_THROWS_AS(PositiveUint8::Parse("256"), std::overflow_error);
+    CHECK(NonNegativeSize::Parse("0") == 0);
+    CHECK_THROWS_AS(NonNegativeSize::Parse("-1"), std::invalid_argument);
+    CHECK(Integer<int8_t>::Parse("-128") == -128);
+    CHECK(Integer<int8_t>::Parse("+127") == 127);
+    CHECK_THROWS_AS(Integer<int8_t>::Parse("128"), std::overflow_error);
+    CHECK_THROWS_AS(Integer<int8_t>::Parse("-129"), std::overflow_error);
+}
+
+TEST_CASE("shared-memory ring geometry supports runtime slot counts", "[shmem][config][tier1]")
+{
+    using Queue = checkpoint::ipc::MsgQueue;
+    CHECK(Queue::HeaderAllocationSize(4) >= sizeof(Queue::Control) + (4 * sizeof(checkpoint::ipc::Message::Header)));
+    CHECK(Queue::HeaderAllocationSize(32) >= sizeof(Queue::Control) + (32 * sizeof(checkpoint::ipc::Message::Header)));
+    CHECK(Queue::MinimumShmSize(32) == Queue::HeaderAllocationSize(32) + (32 * Queue::AlignBoundary));
+    CHECK_THROWS_AS(Queue::HeaderAllocationSize(0), std::invalid_argument);
+
+    auto const name = fmt::format("nvrx_ckpttest_runtime_slots_{}", ::getpid());
+    boost::interprocess::shared_memory_object::remove(name.c_str());
+    auto created = Queue::Create(name, Queue::MinimumShmSize(4), 4);
+    auto opened  = Queue::Open(name);
+    CHECK(created.SlotCount() == 4);
+    CHECK(opened.SlotCount() == 4);
+    CHECK(opened.SlotSize() == Queue::AlignBoundary);
+}
+
 // Stem-based subdirectory under the test temp root. Not strictly unique across
 // concurrent ctest workers, but every call site `remove_all`s before use, so
 // single-process runs are safe and `ctest -jN` only collides if two distinct
@@ -1361,10 +1402,10 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     }
     if (!std::filesystem::exists(registryPath)) { SKIP(fmt::format("registry path does not exist: {}", registryPath.string())); }
 
-    // Conservative RAM threshold. Each IPC ring buffer sizes its shared memory
-    // at runtime, requesting up to MaxShmSize/MaxRanksPerNode per queue and
-    // halving toward MinShmSize/MaxRanksPerNode when `/dev/shm` (tmpfs) is short
-    // on space; only touched slots become resident. A worldSize=2 registry uses
+    // Conservative RAM threshold. The daemon requests the configured size for
+    // every IPC ring and halves the node-wide total toward the minimum viable
+    // geometry when `/dev/shm` (tmpfs) is short on space; only touched slots
+    // become resident. A worldSize=2 registry uses
     // empirically 8 queues. Add slack for the test process and the checkpoint
     // working set. Tune up if a larger registry comes along.
     constexpr uint64_t kMinPhysRamBytes = 16ull * 1024 * 1024 * 1024;

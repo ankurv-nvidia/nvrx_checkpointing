@@ -74,14 +74,10 @@ namespace tel  = checkpoint::telemetry;
 // Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
 
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-static constexpr auto AutoShutdownTimeout = 900s;
-#else
 // TODO_CLI_SVR_RESPAWN
 // Must exceed the longest inter-save training stretch a job produces since the client
 // cannot handle cleanly if a daemon spinsdown and respaws.
 static constexpr auto AutoShutdownTimeout = 900s;
-#endif
 
 // uint32_t ranks
 // uint32_t iterations
@@ -135,7 +131,7 @@ struct Server
     bool IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, cipc::SnapshotId& snapshotId, bool& resolved);
     void HandleRequest_(tcp_stream& stream);
 
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+#if defined(SO_REUSEPORT)
     void AcquireInstanceLock_();
     class ReusePortOption
     {
@@ -152,7 +148,7 @@ struct Server
     };
 #endif
 
-    void StartTcpListener_();
+    void StartTcpListener_(bool reusePort, size_t acceptorCount);
     void StartTcpAcceptors_();
 
     // The accept loop only accepts and hands each connection to `_handlerPool`, then
@@ -178,14 +174,6 @@ struct Server
     std::vector<std::future<void>> _finalizeWaits;
 
     boost::asio::io_context _ioc;
-    // N acceptors share the port via SO_REUSEPORT where available, so the kernel spreads
-    // inbound connections across N accept queues. Without SO_REUSEPORT, fall back to one
-    // acceptor and keep the offloaded handler pool.
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-    static constexpr size_t AcceptorCount = 8;
-#else
-    static constexpr size_t AcceptorCount = 1;
-#endif
     std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
 
     // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
@@ -193,12 +181,8 @@ struct Server
 
     // Connection handlers run here, off the accept loop. Declared after _ioc so it is
     // joined (destroyed) before the io_context the handlers' sockets are bound to.
-#ifdef PHOENIX_BUILD_FOR_VALGRIND
-    static constexpr size_t HandlerThreads = 4;
-#else
-    static constexpr size_t HandlerThreads = 64;
-#endif
     std::unique_ptr<boost::asio::thread_pool> _handlerPool;
+    uint32_t                                  _maxActiveSnapshots{};
 
     // TODO_NOPENDING_STRUCT
     struct PendingSessionData
@@ -1755,18 +1739,32 @@ void Server::Start()
     if (_running) { return; }
     _ioc.restart();
 
-    _handlerPool = std::make_unique<boost::asio::thread_pool>(HandlerThreads);
-    StartTcpListener_();
-    _running             = true;
-    auto       queueSize = cipc::MsgQueue::DetectShmSize(
-                               cipc::Message::RequestChannelName(_index, cipc::MaxRanksPerNode + 1), cipc::MaxShmSize, cipc::MinShmSize)
-                           / cipc::MaxRanksPerNode;
-    std::latch queuesReady{cipc::MaxRanksPerNode};
+    auto const configuredTotalSize = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
+    auto const slotCount           = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
+    auto const queueCount          = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    auto const handlerThreads      = checkpoint::config::GetConfigValue<checkpoint::config::ServerHandlerThreads>();
+    auto const reusePort           = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpReusePort>();
+    auto const acceptorCount       = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpAcceptors>();
+    auto const maxActiveSnapshots  = checkpoint::config::GetConfigValue<checkpoint::config::ServerMaxActiveSnapshots>();
+    static_cast<void>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>());
+    if (cipc::MsgQueue::MinimumShmSize(slotCount) > std::numeric_limits<size_t>::max() / queueCount)
+    {
+        throw std::overflow_error("configured shared-memory ring-buffer geometry is too large");
+    }
+    _maxActiveSnapshots = maxActiveSnapshots;
+    _handlerPool        = std::make_unique<boost::asio::thread_pool>(handlerThreads);
+    StartTcpListener_(reusePort, acceptorCount);
+    auto const minimumTotal = std::max(cipc::MinShmSize, cipc::MsgQueue::MinimumShmSize(slotCount) * queueCount);
+    auto const totalSize    = cipc::MsgQueue::DetectShmSize(
+        cipc::Message::RequestChannelName(_index, static_cast<uint8_t>(queueCount)), configuredTotalSize, minimumTotal, slotCount);
+    auto const queueSize = totalSize / queueCount;
+    _running = true;
+    std::latch queuesReady{queueCount};
     // Start server thread
     //_serverThread = std::thread([this]() {
-    for (uint8_t i = 0; i < cipc::MaxRanksPerNode; ++i)
+    for (uint8_t i = 0; i < queueCount; ++i)
     {
-        _threads.emplace_back([this, i, queueSize, &queuesReady] {
+        _threads.emplace_back([this, i, queueSize, slotCount, queueCount, &queuesReady] {
             SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
             // Map queues across host-memory NUMA domains. Pinning around Create
             // places the control page; materializing the data pages in the owner
@@ -1776,18 +1774,18 @@ void Server::Start()
             int        queueNuma = numaNodes.front();
             if (numaNodes.size() > 1)
             {
-                size_t queuesPerDomain = static_cast<size_t>(cipc::MaxRanksPerNode) / numaNodes.size();
+                size_t queuesPerDomain = queueCount / numaNodes.size();
                 if (queuesPerDomain == 0) { queuesPerDomain = 1; }
                 size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
                 queueNuma           = numaNodes[domain];
                 BindThreadCpuToNumaNode(queueNuma);
             }
-            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize);
+            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize, slotCount);
             if (numaNodes.size() > 1)
             {
                 auto region = msgQueue.GetShmDataRegion();
                 BindRegionToNumaNode(queueNuma, region.data(), region.size());
-                std::fill(region.begin() + static_cast<std::ptrdiff_t>(cipc::MsgQueue::HdrAllocSize), region.end(), char{});
+                std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
             }
             UnbindThreadCpu();
             // Create publishes the queue geometry. Only after every queue reaches
@@ -1888,7 +1886,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         auto      createSession = [&] {
             auto topo                   = StateSerDes::ReadTopology(bufStream);
             auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
-            session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, Session::MaxActiveSnapshots);
+            session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, _maxActiveSnapshots);
             session->Activate();
             return session;
         };
@@ -2665,7 +2663,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     SetThreadName("ncs:w");
 }
 
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+#if defined(SO_REUSEPORT)
 void Server::AcquireInstanceLock_()
 {
     if (_instanceLock) { return; }
@@ -2686,29 +2684,35 @@ void Server::AcquireInstanceLock_()
 
 #endif
 
-void Server::StartTcpListener_()
+void Server::StartTcpListener_(bool reusePort, size_t acceptorCount)
 {
     using boost::asio::ip::tcp;
     auto const    address = boost::asio::ip::make_address("0.0.0.0");
     tcp::endpoint endpoint(address, Port + _index);
 
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
+#if defined(SO_REUSEPORT)
     // When SO_REUSEPORT is enabled, the TCP port no longer elects a single owner.
     // Losers must throw before touching acceptors or shm rings; Start() spawns the
     // shm consumer threads only after this returns.
-    AcquireInstanceLock_();
+    if (reusePort) { AcquireInstanceLock_(); }
+#else
+    reusePort = false;
 #endif
 
+    if (!reusePort) { acceptorCount = 1; }
     _tcpAcceptors.clear();
-    _tcpAcceptors.reserve(AcceptorCount);
-    for (size_t i = 0; i < AcceptorCount; ++i)
+    _tcpAcceptors.reserve(acceptorCount);
+    for (size_t i = 0; i < acceptorCount; ++i)
     {
         auto& acceptor = _tcpAcceptors.emplace_back(_ioc);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::socket_base::reuse_address(true));
-#if defined(SO_REUSEPORT) && !defined(PHOENIX_BUILD_FOR_VALGRIND)
-        int const enable = 1;
-        ::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
+#if defined(SO_REUSEPORT)
+        if (reusePort)
+        {
+            int const enable = 1;
+            ::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable));
+        }
 #endif
         boost::system::error_code ec;
         ec = acceptor.bind(endpoint, ec);
@@ -2733,7 +2737,7 @@ void Server::StartTcpAcceptors_()
         });
     }
 
-    for (size_t i = 0; i < AcceptorCount; i++)
+    for (size_t i = 0; i < _tcpAcceptors.size(); i++)
     {
         _threads.emplace_back([this, i] {
             SetThreadName(fmt::format("ncs:ios:{}", i).c_str());

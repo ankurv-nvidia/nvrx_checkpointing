@@ -228,12 +228,6 @@ def _metrics(text: str, daemon_text: str, gpus_per_node: int | None) -> dict:
                 higher_is_better=False,
                 ranks=hbm_ranks,
             )
-            metrics["gpu_hbm_peak_pct"] = _metric(
-                [used * 100 / total for used, total in hbm],
-                "%",
-                higher_is_better=False,
-                ranks=hbm_ranks,
-            )
         cpu_rss = [int(match[5]) for match in memory]
         if memory_ranks is not None:
             per_rank = {

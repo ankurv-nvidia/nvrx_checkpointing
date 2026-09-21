@@ -1,5 +1,6 @@
 #include "SetThreadName.h"
 #include "byte_storage.h"
+#include "config.h"
 #include "messages.h"
 #include "shm_ring_buffer.h"
 
@@ -28,6 +29,9 @@ static constexpr size_t BenchSlotSize = 32ull * 1024 * 1024;
 static constexpr size_t DefaultMessageSize = BenchSlotSize;
 static constexpr size_t DefaultRanks       = 2;
 
+static size_t SlotCount()
+{ return checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>(); }
+
 static std::atomic<PerfMetrics::Clock::time_point> StartTime{};    // NOLINT
 static std::atomic<PerfMetrics::Clock::duration>   Duration{};     // NOLINT
 using namespace std::chrono_literals;
@@ -41,13 +45,14 @@ static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool valida
 {
     SetThreadName("ncs:server");
     if (debug) { fmt::print("[s] starting\n"); }
-    auto msgQueue = MsgQueue::Create(QueueName, MsgQueue::HdrAllocSize + (D2HBufferCount * BenchSlotSize));
+    auto const slotCount = SlotCount();
+    auto       msgQueue  = MsgQueue::Create(QueueName, MsgQueue::HeaderAllocationSize(slotCount) + (slotCount * BenchSlotSize), slotCount);
     if (debug) { fmt::print("[s] created queue {}\n", QueueName); }
     auto const slotSize      = msgQueue.SlotSize();
     auto       totalBytes    = msgCount * memorySize * ranks;
     auto       totalMessages = totalBytes / slotSize;
 
-    ByteStorage buffer(slotSize * D2HBufferCount);
+    ByteStorage buffer(slotSize * slotCount);
 
     for (size_t i = 0; i < totalBytes; i += slotSize)
     {
@@ -111,11 +116,13 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
     {
         auto  msgIndex   = i / slotSize;
         auto* srcptr     = data.data() + (i % memorySize);
-        auto [slot, buf] = msgQueue.AllocSlot(Message::LocalStateData{.sessionId   = SessionId{0},
-                                                                      .snapshotId  = SnapshotId{0},
-                                                                      .globalRank  = Rank{rank},
-                                                                      .messageSize = static_cast<uint32_t>(slotSize),
-                                                                      .offset      = i * memorySize,});
+        auto [slot, buf] = msgQueue.AllocSlot(Message::LocalStateData{
+            .sessionId   = SessionId{0},
+            .snapshotId  = SnapshotId{0},
+            .globalRank  = Rank{rank},
+            .messageSize = static_cast<uint32_t>(slotSize),
+            .offset      = i * memorySize,
+        });
 
         std::memcpy(buf, srcptr, slotSize);
         msgQueue.CommitSlot(slot);
@@ -165,7 +172,8 @@ static void MemcpyBounceBufferBenchmark(size_t ranks, size_t msgCount, size_t me
 {
     ByteStorage dst{memorySize};
     ByteStorage src{memorySize};
-    ByteStorage buf{BenchSlotSize * D2HBufferCount};
+    auto const  slotCount = SlotCount();
+    ByteStorage buf{BenchSlotSize * slotCount};
 
     for (size_t j = 0; j < memorySize; ++j) { src.At<uint8_t>(j) = 1u; }
 
@@ -178,14 +186,14 @@ static void MemcpyBounceBufferBenchmark(size_t ranks, size_t msgCount, size_t me
         uint64_t currentSlot = 0;
         for (size_t i = 0; i < totalBytes; i += BenchSlotSize, currentSlot++)
         {
-            auto  slot    = currentSlot % D2HBufferCount;
+            auto  slot    = currentSlot % slotCount;
             auto* slotptr = buf[slot * BenchSlotSize];
             auto* srcptr  = src[i % memorySize];
             auto* dstptr  = dst[i % memorySize];
             std::memcpy(slotptr, srcptr, BenchSlotSize);
             std::memcpy(dstptr, slotptr, BenchSlotSize);
             //  buffers.push_back(std::move(buffer));
-            //  if (buffers.size() == D2HBufferCount) { buffers.clear(); }
+            //  if (buffers.size() == slotCount) { buffers.clear(); }
         }
     }
 

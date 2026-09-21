@@ -172,7 +172,7 @@ struct Message
     // static_assert(std::is_same_v<StateDataFragment, std::variant_alternative_t<static_cast<size_t>(Type::StateDataFragment), Header>>);
 };
 
-using MsgQueue = checkpoint::ipc::ShmRingBuffer<Message::Header, D2HBufferCount>;
+using MsgQueue = checkpoint::ipc::ShmRingBuffer<Message::Header>;
 
 struct ErrorAlreadyRunning : std::runtime_error
 {

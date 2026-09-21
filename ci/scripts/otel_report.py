@@ -774,21 +774,12 @@ def _resource_metrics(samples: list[dict]) -> dict:
             ranks=list(gpu),
         )
     hbm = by_name.get("nvrx.checkpoint.run.gpu_hbm_peak_bytes", {})
-    total = by_name.get("nvrx.checkpoint.run.gpu_total_bytes", {})
     if hbm:
         metrics["gpu_hbm_peak_bytes"] = metric(
             [round(value) for value in hbm.values()],
             "B",
             higher_is_better=False,
             ranks=list(hbm),
-        )
-    hbm_pct = {rank: value * 100 / total[rank] for rank, value in hbm.items() if total.get(rank, 0) > 0}
-    if hbm_pct:
-        metrics["gpu_hbm_peak_pct"] = metric(
-            list(hbm_pct.values()),
-            "%",
-            higher_is_better=False,
-            ranks=list(hbm_pct),
         )
     cpu = by_name.get("nvrx.checkpoint.run.cpu_rss_bytes", {})
     if cpu:

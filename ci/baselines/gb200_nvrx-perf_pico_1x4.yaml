@@ -5,7 +5,6 @@ metrics:
   megatron.training.memory_allocated_gb: 9.36
   gpu_peak_bytes: 10046894080
   gpu_hbm_peak_bytes: 20495728640
-  gpu_hbm_peak_pct: 10.36
   training_process_peak_rss_bytes: 11060183040
 tolerances:
   training_process_peak_rss_bytes: 0.05
@@ -26,10 +25,6 @@ rank_statistics:
     min: 19176620032
     median: 19492241408.0
     max: 20495728640
-  gpu_hbm_peak_pct:
-    min: 9.69
-    median: 9.85
-    max: 10.36
   training_process_peak_rss_bytes:
     min: 10907484160
     median: 10981081088.0

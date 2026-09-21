@@ -175,10 +175,7 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
     prep_cmd = _set_partition(prep_cmd, _valid_partition(prep_cmd))
-    # scripts/run.sh intentionally enables the low-memory Valgrind build for its
-    # image smoke test. Keep that build out of the workload's default build/
-    # directory; otherwise a cold-image job silently reuses its reduced SHM
-    # constants while cached-image jobs build the normal configuration.
+    # Keep image-preparation smoke artifacts out of the workload's build directory.
     native_smoke_build = container_root / ".image-prep-native-build"
     _remove_native_smoke_build(native_smoke_build)
     prep_env = os.environ.copy()

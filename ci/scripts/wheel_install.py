@@ -226,12 +226,9 @@ def _ensure_source_toolchain() -> None:
 def build_and_install_from_source() -> None:
     """Build the wheel from the checkout and install the package.
 
-    The srun prep step runs this for flavors whose build config the CI wheel
-    cannot match (deterministic runs the plain build, valgrind needs
-    PHOENIX_BUILD_FOR_VALGRIND): the flavor's build env is already exported
-    (CMake's DetectVar reads it), the build runs on the machine that executes
-    the workload (so -march=native stays), and the run step then starts from
-    installed binaries exactly like a perf-flavor job.
+    The srun prep step runs this when a flavor explicitly requests a local
+    build. Its build env is already exported, and the run step then starts from
+    installed binaries exactly like a prebuilt-wheel job.
     """
     _ensure_source_toolchain()
     cmake = shutil.which("cmake")

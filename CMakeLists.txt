@@ -39,19 +39,10 @@ set(PHOENIX_WHEEL_VERSION "0.0.1" CACHE STRING "Python wheel version")
 
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
 option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"      OFF)
-option(PHOENIX_BUILD_FOR_VALGRIND       "Build with reduced memory usage"   OFF)
 option(PHOENIX_REQUIRE_CUDA             "Fail if CUDA is unavailable"       OFF)
-
-DetectVar(PHOENIX_BUILD_FOR_VALGRIND OFF)
 
 if (PHOENIX_BUILD_WHEEL AND NOT PHOENIX_BUILD_PYTHON_BINDINGS)
     message(FATAL_ERROR "PHOENIX_BUILD_WHEEL requires PHOENIX_BUILD_PYTHON_BINDINGS")
-endif()
-
-if (PHOENIX_BUILD_FOR_VALGRIND)
-    message(STATUS "PHOENIX_BUILD_FOR_VALGRIND is set: disabling -march=native and shrinking D2H buffer sizes")
-    set(BUILDENV_DISABLE_MARCH_NATIVE ON)
-    add_compile_definitions(PHOENIX_BUILD_FOR_VALGRIND=1)
 endif()
 
 # The pure-C++ distcp writer no longer requires Python; the Python bindings

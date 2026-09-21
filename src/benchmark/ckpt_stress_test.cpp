@@ -22,6 +22,7 @@
 // drives an already-running server (a real checkpoint_server or remote host).
 
 #include "CommonMacros.h"
+#include "config.h"
 #include "messages.h"
 #include "server.h"
 
@@ -373,9 +374,10 @@ static void RaiseFdLimit()
 // forced-exit path below.
 static void CleanStaleShm()
 {
-    for (uint8_t r = 0; r < checkpoint::ipc::MaxRanksPerNode; ++r)
+    auto const queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    for (size_t r = 0; r < queueCount; ++r)
     {
-        auto name = checkpoint::ipc::Message::RequestChannelName(0, r);
+        auto name = checkpoint::ipc::Message::RequestChannelName(0, static_cast<uint8_t>(r));
         boost::interprocess::shared_memory_object::remove(name.c_str());
     }
 }
