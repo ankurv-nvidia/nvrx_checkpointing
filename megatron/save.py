@@ -14,12 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-
-try:
-    from nemo.lens.helpers import managed_span as _otel_managed_span
-except ImportError:
-    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span  # type: ignore[import-not-found]
-
 from megatron.core import mpu  # type: ignore[import-not-found]
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  # type: ignore[import-not-found]
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
@@ -38,6 +32,7 @@ from megatron.training.utils import print_rank_0  # type: ignore[import-not-foun
 from .. import checkpoint  # noqa: TID252
 from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
 from ..peers import OrderedPeers, detect_environment_peers  # noqa: TID252
+from ..telemetry import managed_span  # noqa: TID252
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -77,7 +72,7 @@ _executor: ThreadPoolExecutor | None = None
 
 def _checkpoint_span(name: str, iteration: int) -> AbstractContextManager[object]:
     """Create a checkpoint span with the iteration and native snapshot ID."""
-    return _otel_managed_span(
+    return managed_span(
         "checkpoint",
         name,
         is_goodput_span=True,

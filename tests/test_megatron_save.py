@@ -26,7 +26,6 @@ def _module(name: str, **attributes: object) -> ModuleType:
 
 @pytest.fixture
 def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
-    telemetry_fallbacks = _module("megatron.core.telemetry.fallbacks", managed_span=lambda *_args, **_kwargs: nullcontext())
     state_dict_utils = _module("megatron.core.dist_checkpointing.state_dict_utils", save_preprocess=lambda state, **_kwargs: (state, {}))
     msc_utils = _module("megatron.core.msc_utils", maybe_msc=SimpleNamespace())
     rerun = _module("megatron.core.rerun_state_machine", get_rerun_state_machine=SimpleNamespace)
@@ -59,7 +58,6 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         "megatron.core.dist_checkpointing.state_dict_utils": state_dict_utils,
         "megatron.core.msc_utils": msc_utils,
         "megatron.core.rerun_state_machine": rerun,
-        "megatron.core.telemetry.fallbacks": telemetry_fallbacks,
         "megatron.core.utils": core_utils,
         "megatron.training": training,
         "megatron.training.checkpointing": checkpointing,
@@ -90,6 +88,27 @@ def _queue(
 ) -> None:
     future = save._get_executor().submit(async_fn)
     save._pending = save._PendingSave(future, finalize_fn)
+
+
+def test_checkpoint_span_preserves_names_and_attributes(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def managed_span(scope: str, name: str, **attributes: object) -> nullcontext[None]:
+        calls.append((scope, name, attributes))
+        return nullcontext()
+
+    monkeypatch.setattr(save, "managed_span", managed_span)
+
+    with save._checkpoint_span("nvrx.checkpoint.save", 42):
+        pass
+
+    assert calls == [
+        (
+            "checkpoint",
+            "nvrx.checkpoint.save",
+            {"is_goodput_span": True, "megatron.iteration": 42, "nvrx.snapshot_id": 42},
+        ),
+    ]
 
 
 def test_native_async_save_runs_and_finalizes_off_thread(save: ModuleType) -> None:

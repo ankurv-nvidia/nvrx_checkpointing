@@ -88,6 +88,10 @@ OTLP/HTTP protobuf ─────────────── terminal decode
   remain human-readable diagnostics. CI parses them only when OTel is disabled.
 - Resource attributes: `service.name`, `host.name`, `process.pid`,
   `nvrx.process.role`, `nvrx.ci_phase`, and, when supplied by CI, `nemo.run.id`.
+- Python checkpoint boundary spans use the application's process-global OpenTelemetry
+  provider. They are no-ops when `MEGATRON_OTEL_ENABLED` is not `1` or the
+  OpenTelemetry Python API is unavailable; otherwise the training job's provider owns
+  sampling, OTLP export, resource attributes, and shutdown.
 
 ## Analysis
 

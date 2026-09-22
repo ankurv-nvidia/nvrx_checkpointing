@@ -393,6 +393,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             megatron_stubs@megatron_stubs
             metadata_compare.py
             peers.py
+            telemetry.py
     )
 
     add_pywhl_package(nvrx_checkpointing

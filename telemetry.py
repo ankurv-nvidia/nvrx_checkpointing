@@ -1,0 +1,23 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+
+"""Optional OpenTelemetry tracing for native checkpoint integration."""
+
+from __future__ import annotations
+
+import os
+from contextlib import AbstractContextManager, nullcontext
+
+try:
+    from opentelemetry import trace
+except ImportError:
+    trace = None  # type: ignore[assignment]
+
+
+def managed_span(scope: str, name: str, **attributes: object) -> AbstractContextManager[object]:
+    """Create a span through the application's provider, or an empty context."""
+    if os.environ.get("MEGATRON_OTEL_ENABLED") != "1" or trace is None:
+        return nullcontext()
+    return trace.get_tracer(scope).start_as_current_span(name, attributes=attributes)
+
+
+__all__ = ["managed_span"]
