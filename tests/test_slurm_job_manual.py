@@ -48,6 +48,7 @@ _MUTATED_ENV = (
     "NATIVE_CKPT_OTEL_EXPORT",
     "NATIVE_CKPT_OTEL_FILE",
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
+    "NVRX_OTEL_USE_SYSTEM_RANDOM",
     "NCCL_IB_TIMEOUT",
     "NCCL_NET",
     "NVTE_BWD_LAYERNORM_SM_MARGIN",
@@ -3816,7 +3817,6 @@ def test_deterministic_report_reads_the_native_routines_log_directory(
     assert positional[3] == tmp_path / "native.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
     assert keywords == {
         "results_dir": tmp_path / "native.cmp" / "logs",
-        "otel_reporting": False,
         "enforced_metrics": slurm_job.MEMORY_REGRESSION_METRICS,
     }
 
@@ -3855,7 +3855,6 @@ def test_nvrx_only_deterministic_report_uses_its_memory_baseline(
     assert positional[3] == tmp_path / "nvrx.cmp" / "logs" / "nano4_8x4_cmp-routine_rank0.log"
     assert keywords == {
         "results_dir": tmp_path / "nvrx.cmp" / "logs",
-        "otel_reporting": False,
         "enforced_metrics": slurm_job.MEMORY_REGRESSION_METRICS,
     }
 
@@ -5429,7 +5428,10 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "--overlap-grad-reduce",
         "--overlap-param-gather",
     ]
-    deterministic_env = {"NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl"}
+    deterministic_env = {
+        "MEGATRON_OTEL_ENABLED": "1",
+        "NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl",
+    }
     slurm_job.FlavorSelection(["detr"]).transform(deterministic_opts, deterministic_env)
     assert deterministic_opts == [
         "--moe-permute-fusion",
@@ -5440,11 +5442,15 @@ def test_flavor_transforms_are_profile_independent() -> None:
         "--deterministic-mode",
     ]
     assert deterministic_env["PYTHONHASHSEED"] == "0"
+    assert deterministic_env["NVRX_OTEL_USE_SYSTEM_RANDOM"] == "1"
     assert deterministic_env["FLA_TILELANG"] == "0"
-    assert deterministic_env["MEGATRON_OTEL_ENABLED"] == "0"
-    assert "NATIVE_CKPT_OTEL_FILE" not in deterministic_env
-    assert not slurm_job.FlavorSelection(["detr"]).policy.otel_reporting
+    assert deterministic_env["MEGATRON_OTEL_ENABLED"] == "1"
+    assert deterministic_env["NATIVE_CKPT_OTEL_FILE"] == "/tmp/otel.jsonl"
+    assert slurm_job.FlavorSelection(["detr"]).policy.otel_reporting
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
+    disabled_env = {"MEGATRON_OTEL_ENABLED": "0"}
+    slurm_job.FlavorSelection(["detr"]).transform([], disabled_env)
+    assert disabled_env["MEGATRON_OTEL_ENABLED"] == "0"
     mamba_only_opts = ["--cuda-graph-impl", "local", "--cuda-graph-modules", "mamba"]
     slurm_job.FlavorSelection(["detr"]).transform(mamba_only_opts, {})
     assert mamba_only_opts == [

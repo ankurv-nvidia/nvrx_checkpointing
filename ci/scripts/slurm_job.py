@@ -203,6 +203,7 @@ _PRETRAIN_ENV_NAMES = {
     "NCCL_NVLS_ENABLE",
     "NCCL_PROTO",
     "NCCL_TUNER_PLUGIN",
+    "NVRX_OTEL_USE_SYSTEM_RANDOM",
     "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
     "NVRX_CURRENT_CYCLE_INFO",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
@@ -1963,7 +1964,6 @@ class DeterministicFlavor(Flavor):
     def configure(self, policy: FlavorPolicy) -> None:
         policy.reporter = self.report
         policy.requires_finite_run = True
-        policy.otel_reporting = False
         policy.phase1_train_iters = 50
         policy.phase1_save_interval = 25
         policy.phase1_checkpoints = 2
@@ -1996,7 +1996,6 @@ class DeterministicFlavor(Flavor):
             log.with_name(f"{stem}_report.json"),
             args.gpus_per_node,
             results_dir=source_log.parent,
-            otel_reporting=False,
             enforced_metrics=MEMORY_REGRESSION_METRICS,
         )
 
@@ -2023,10 +2022,10 @@ class DeterministicFlavor(Flavor):
         _drop(opts, "--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
         env.update(
             PYTHONHASHSEED="0",
-            # OpenTelemetry's Python ID generator advances the application's
-            # global random state once per span. The providers emit different
-            # span sets, so tracing would make their saved RNG states differ.
-            MEGATRON_OTEL_ENABLED="0",
+            # The OTel SDK uses Python's process-global random module for IDs,
+            # exemplar sampling, and HTTP retry jitter. Deterministic training
+            # saves that state, so isolate OTel's draws.
+            NVRX_OTEL_USE_SYSTEM_RANDOM="1",
             NCCL_ALGO="Ring",
             NCCL_PROTO="Simple",
             NCCL_NVLS_ENABLE="0",
@@ -2036,7 +2035,6 @@ class DeterministicFlavor(Flavor):
             MAMBA_DETERMINISTIC="1",
             FLA_TILELANG="0",
         )
-        env.pop("NATIVE_CKPT_OTEL_FILE", None)
 
 
 _VALGRIND_NATIVE_ENV = {
@@ -3392,8 +3390,20 @@ def _install_selected_checkpoint_provider() -> ModuleType:
     return megatron_provider
 
 
+def _prepare_otel_randomness() -> None:
+    if os.environ.get("NVRX_OTEL_USE_SYSTEM_RANDOM") != "1":
+        return
+
+    from nvrx_checkpointing.telemetry import isolate_opentelemetry_randomness  # noqa: PLC0415
+
+    isolated = isolate_opentelemetry_randomness()
+    if isolated and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
+        print(f"[slurm_job:otel] isolated_rng={','.join(isolated)}", flush=True)  # noqa: T201
+
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
+    _prepare_otel_randomness()
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
 
