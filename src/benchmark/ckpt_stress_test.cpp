@@ -374,7 +374,8 @@ static void RaiseFdLimit()
 // forced-exit path below.
 static void CleanStaleShm()
 {
-    auto const queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    auto const queueCount           = configuredQueueCount == 0 ? std::numeric_limits<uint8_t>::max() : configuredQueueCount;
     for (size_t r = 0; r < queueCount; ++r)
     {
         auto name = checkpoint::ipc::Message::RequestChannelName(0, static_cast<uint8_t>(r));

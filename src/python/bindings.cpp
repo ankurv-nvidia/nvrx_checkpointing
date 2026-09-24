@@ -2,368 +2,456 @@
 #include "binding.h"
 #include "checkpoint.h"
 #include "state.h"
-#include "stateserdes.h"
-#include "tensor.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/filesystem.h>
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstring>
+#include <functional>
+#include <future>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <utility>
 
 namespace nb   = nanobind;
 namespace cipc = checkpoint::ipc;
+
+static std::string StatePath(StateTree const& tree, StateNode::Handle parent, std::string_view name)
+{
+    auto const parentPath = tree.GetNodeId(parent);
+    return parentPath.empty() ? std::string(name) : fmt::format("{}.{}", parentPath, name);
+}
 namespace
 {
-struct StateTreeScalarHandler : StateTree::StateHandler<StateTree::StateType::Scalar>
+struct PythonStateTree : PyStateDictAccessor
 {
-    StateTreeScalarHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Scalar>(StrView(nameIn)), key(nameIn)
-    {}
+    explicit PythonStateTree(RankTopology topology) : _tree(std::move(topology)) {}
 
-    void Update() override {};
-
-    StateTree::Scalar GetScalarState() override
+    ~PythonStateTree() override
     {
-        nanobind::gil_scoped_acquire acquire;
-
-        auto obj = container[key];
-        if (nb::isinstance<int64_t>(obj)) { return StateTree::Scalar{nb::cast<int64_t>(obj)}; }
-        if (nb::isinstance<double>(obj)) { return StateTree::Scalar{nb::cast<double>(obj)}; }
-        if (nb::isinstance<bool>(obj)) { return StateTree::Scalar{nb::cast<bool>(obj)}; }
-        throw std::out_of_range("Conversion of nanobind::object to Scalar failed");
-    }
-
-    void SetScalarState(StateTree::Scalar const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-
-        if (nb::isinstance<int64_t>(container)) { container[key] = value.Cast<int64_t>(); }
-        else if (nb::isinstance<double>(container)) { container[key] = value.Cast<double>(); }
-        else if (nb::isinstance<bool>(container)) { container[key] = value.Cast<bool>(); }
+        if (Py_IsInitialized() != 0)
+        {
+            {
+                nb::gil_scoped_release release;
+                try
+                {
+                    WaitForAsyncCalls();
+                } catch (std::exception const& ex)
+                {
+                    fmt::print(stderr, "Unhandled asynchronous state registration error: {}\n", ex.what());
+                }
+            }
+            OnSnapshotComplete_();
+        }
         else
         {
-            throw std::out_of_range("Conversion of Scalar to nanobind::object failed");
+            for (auto& object : _tensorRefObjects) { static_cast<void>(object.second.release()); }
+            static_cast<void>(_dictToScan.release());
         }
     }
 
-    nb::dict container;
-    nb::str  key;
-};
+    CLASS_DELETE_COPY_AND_MOVE(PythonStateTree);
 
-struct StateTreeEnumHandler : StateTree::StateHandler<StateTree::StateType::Scalar>
-{
-    StateTreeEnumHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Scalar>(StrView(nameIn)), key(nameIn)
-    {}
+    StateNode& AddDictionaryChild(StateNode::Handle parent, std::string_view name) override;
+    StateNode& RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) override;
+    StateNode& RegisterStateByFQN(std::string_view fqn, StateNode::Variant data) override;
+    void       AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nb::object const& obj) override;
 
-    void Update() override {};
+    [[nodiscard]] std::string GetNodeId(StateNode::Handle node) const override;
 
-    StateTree::Scalar GetScalarState() override
+    void Scan(nb::dict stateDict);
+    void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
+
+    void FinalizeRegistry()
     {
-        nanobind::gil_scoped_acquire acquire;
-
-        auto obj = container[key];
-        auto val = obj.attr("value");
-        return StateTree::Scalar{nb::cast<int64_t>(val)};
+        ChainAsyncCall([this] {
+            if (!_finalized)
+            {
+                _tree.FinalizeRegistry();
+                _finalized = true;
+                InitializeQueueAsync(_tree);
+            }
+            OnSnapshotComplete_();
+        });
     }
 
-    void SetScalarState(StateTree::Scalar const& value) override
+    template <typename TCall> void ChainAsyncCall(TCall&& call)
     {
-        nanobind::gil_scoped_acquire acquire;
+        std::scoped_lock lock(_asyncMutex);
+        _async = std::async(std::launch::async,
+                            [previous = std::move(_async), next = std::function<void()>(std::forward<TCall>(call))]() mutable {
+                                try
+                                {
+                                    if (previous.valid()) { previous.get(); }
+                                    next();
+                                } catch (...)
+                                {
+                                    nb::gil_scoped_acquire acquire;
+                                    next = {};
+                                    throw;
+                                }
+                                {
+                                    nb::gil_scoped_acquire acquire;
+                                    next = {};
+                                }
+                            });
+    }
 
-        if (nb::isinstance<int64_t>(container)) { container[key] = value.Cast<int64_t>(); }
-        else if (nb::isinstance<double>(container)) { container[key] = value.Cast<double>(); }
-        else if (nb::isinstance<bool>(container)) { container[key] = value.Cast<bool>(); }
-        else
+    void WaitForAsyncCalls()
+    {
+        std::scoped_lock lock(_asyncMutex);
+        if (_async.valid()) { _async.get(); }
+    }
+
+    [[nodiscard]] StateTree const& Tree() const { return _tree; }
+    void                           SetStartedAt(int64_t startedAt) { _tree.startedAt = std::chrono::nanoseconds{startedAt}; }
+
+    private:
+    StateNode& MatchStateChild_(StateNode::Handle parent, std::string_view name, StateNode::Variant const& data);
+    void       ClearTensorHandles_();
+    void       ValidateTensorHandles_() const;
+    void       ReleasePythonObjects_();
+
+    void OnSnapshotComplete_()
+    {
+        ClearTensorHandles_();
         {
-            throw std::out_of_range("Conversion of Scalar to nanobind::object failed");
+            nb::gil_scoped_acquire acquire;
+            ReleasePythonObjects_();
         }
     }
 
-    nb::dict container;
-    nb::str  key;
-};
+    StateTree _tree;
 
-struct StateTreeSliceHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeSliceHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
+    bool     _finalized{false};
+    nb::dict _dictToScan;
 
-    void Update() override {};
+    std::unordered_map<StateNode::Handle, nb::object> _tensorRefObjects;
 
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-
-        auto obj                      = nb::cast<nb::slice>(container[key]);
-        auto [start, stop, step, len] = obj.compute(std::numeric_limits<long>::max());
-        data.start                    = start;
-        data.stop                     = stop;
-        data.step                     = step;
-        return std::vector<char>(reinterpret_cast<char*>(&data), reinterpret_cast<char*>(&data) + sizeof(data));    // NOLINT
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-    }
-
-    struct SliceData
-    {
-        int64_t start;
-        int64_t stop;
-        int64_t step;
-    } data{};
-
-    nb::dict container;
-    nb::str  key;
-};
-
-struct StateTreeStringHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeStringHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void Update() override {};
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-
-        auto       value = nb::cast<nb::str>(container[key]);
-        Py_ssize_t len   = 0;
-        auto*      ptr   = PyUnicode_AsWideCharString(value.ptr(), &len);
-        return std::vector<char>(reinterpret_cast<char*>(ptr), reinterpret_cast<char*>(ptr) + static_cast<size_t>(len * 2));    // NOLINT
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-        // if (nb::isinstance<nb::str>(container)) { container[key] = std::string(value); }
-        // else
-        // {
-        //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
-        // }
-    }
-
-    nb::dict container;
-    nb::str  key;
-};
-
-struct StateTreeBytesHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeBytesHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void               Update() override {}
-    [[nodiscard]] bool IsSnapshotScoped() const override { return true; }
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-        auto const                   value = nb::cast<nb::bytes>(container[key]);
-        return {value.c_str(), value.c_str() + value.size()};
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        container[key] = nb::bytes(value.data(), value.size());
-    }
-
-    nb::dict container;
-    nb::str  key;
-};
-
-template <typename T, typename TPy> struct StateTreeTrivialTupleHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeTrivialTupleHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void Update() override {};
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-        auto                         obj = nb::cast<TPy>(container[key]);
-        std::vector<char>            data(sizeof(T) * obj.size());
-        auto*                        ptr = reinterpret_cast<T*>(data.data());        // NOLINT
-        for (size_t i = 0; i < obj.size(); ++i) { ptr[i] = nb::cast<T>(obj[i]); }    // NOLINT
-        return data;
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-        // if (nb::isinstance<nb::str>(container)) { container[key] = std::string(value); }
-        // else
-        //{
-        //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
-        // }
-    }
-
-    nb::dict container;
-    nb::str  key;
-};
-
-template <typename TPy> struct StateTreeStringTupleHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeStringTupleHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void Update() override {};
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-        auto                         obj  = nb::cast<TPy>(container[key]);
-        size_t                       size = 0;
-        for (size_t i = 0; i < obj.size(); ++i) { size += (PyObject_Length(obj[i].ptr()) * sizeof(wchar_t)); }
-        std::vector<char> data(size);
-        auto              it = data.begin();
-        for (size_t i = 0; i < obj.size(); ++i)
-        {
-            Py_ssize_t len = 0;
-            auto*      ptr = reinterpret_cast<char*>(PyUnicode_AsWideCharString(obj[i].ptr(), &len));    // NOLINT
-            it             = std::copy(ptr, ptr + (len * 2), it);                                        // NOLINT
-        }
-        return data;
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-        // if (nb::isinstance<nb::str>(container)) { container[key] = std::string(value); }
-        // else
-        //{
-        //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
-        // }
-    }
-
-    nb::dict container;
-    nb::str  key;
-};
-
-struct StateTreePythonRngStateHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreePythonRngStateHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void Update() override {};
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-        auto                         tup   = nb::cast<nb::tuple>(container[key]);
-        auto                         tup1  = nb::cast<nb::tuple>(tup[1]);
-        size_t                       count = tup1.size() + 1;
-        std::vector<char>            data(count * sizeof(int64_t));
-        auto*                        ptr = reinterpret_cast<int64_t*>(data.data());    // NOLINT
-        ptr[0]                           = nb::cast<int64_t>(tup[0]);                  // NOLINT
-        for (size_t i = 0; i < tup1.size(); i++)
-        {
-            ptr[i + 1] = nb::cast<int64_t>(tup1[i]);    // NOLINT
-        }
-        return data;
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-        // if (nb::isinstance<nb::str>(container)) { container[key] = std::string(value); }
-        // else
-        //{
-        //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
-        // }
-    }
-
-    nb::dict container;
-    nb::str  key;
-};
-
-struct StateTreeNumPyRngStateHandler : StateTree::StateHandler<StateTree::StateType::Blob>
-{
-    StateTreeNumPyRngStateHandler(nb::dict containerIn, nb::str const& nameIn) :
-        container(std::move(containerIn)), StateTree::StateHandler<StateTree::StateType::Blob>(StrView(nameIn)), key(nameIn)
-    {}
-
-    void Update() override {};
-
-    StateNode::Blob GetBlob() override
-    {
-        // TODO_BG_SERIALIZE: Measure this GIL-held snapshot serialization and move it behind immutable capture.
-        nanobind::gil_scoped_acquire acquire;
-
-        auto       tup        = nb::cast<nb::tuple>(container[key]);
-        auto       name       = nb::cast<nb::str>(tup[0]);
-        auto       state      = nb::cast<nb::ndarray<uint32_t>>(tup[1]);
-        auto       state1     = nb::cast<int64_t>(tup[2]);
-        auto       state2     = nb::cast<int64_t>(tup[3]);
-        auto       state3     = nb::cast<float>(tup[4]);
-        Py_ssize_t len        = 0;
-        auto*      nameptr    = reinterpret_cast<char*>(PyUnicode_AsWideCharString(name.ptr(), &len));    // NOLINT
-        auto       rngNameLen = static_cast<uint16_t>(len);
-
-        auto size = sizeof(rngNameLen) + (rngNameLen * sizeof(wchar_t)) + (state.size() * sizeof(uint32_t)) + (sizeof(int64_t) * 2)
-                    + sizeof(float);
-        std::vector<char> data(size);
-
-        auto it = data.begin();
-        it      = std::copy(&rngNameLen, (&rngNameLen + sizeof(uint16_t)), it);                   // NOLINT
-        it      = std::copy(nameptr, nameptr + (rngNameLen * sizeof(wchar_t)), it);               // NOLINT
-        it      = std::copy(state.data(), state.data() + state.size() * sizeof(uint32_t), it);    // NOLINT
-        it      = std::copy(&state1, &state1 + sizeof(int64_t), it);                              // NOLINT
-        it      = std::copy(&state2, &state2 + sizeof(int64_t), it);                              // NOLINT
-        it      = std::copy(&state3, &state3 + sizeof(float), it);                                // NOLINT
-
-        assert(std::distance(data.begin(), it) == static_cast<std::ptrdiff_t>(size));
-
-        return data;
-    }
-
-    void SetBlob(std::string_view const& value) override
-    {
-        nanobind::gil_scoped_acquire acquire;
-        throw std::runtime_error("TODO");
-        // if (nb::isinstance<nb::str>(container)) { container[key] = std::string(value); }
-        // else
-        //{
-        //     throw std::out_of_range("Conversion of Blob to nanobind::object failed");
-        // }
-    }
-
-    nb::dict container;
-    nb::str  key;
+    std::mutex        _asyncMutex;
+    std::future<void> _async;
 };
 }    // namespace
+
+StateNode& PythonStateTree::MatchStateChild_(StateNode::Handle parent, std::string_view name, StateNode::Variant const& data)
+{
+    auto& parentData = _tree.GetNode(parent).data;
+    if (parentData.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
+    StateNode* namedChild          = nullptr;
+    StateNode* matchingTensorChild = nullptr;
+    for (auto const childHandle : std::get<StateNode::Dict>(parentData))
+    {
+        auto& child = _tree.GetNode(childHandle);
+        if (child.name != name) { continue; }
+        if (namedChild == nullptr) { namedChild = &child; }
+        if (data.index() != static_cast<size_t>(StateNode::Type::TensorShard)
+            || child.data.index() != static_cast<size_t>(StateNode::Type::TensorShard))
+        {
+            return child;
+        }
+        auto const& previous = std::get<StateNode::TensorShard>(child.data);
+        auto const& current  = std::get<StateNode::TensorShard>(data);
+        if (current.dtype == previous.dtype && current.device == previous.device && current.fulldim == previous.fulldim
+            && current.sharddim == previous.sharddim)
+        {
+            if (matchingTensorChild == nullptr) { matchingTensorChild = &child; }
+            if (previous.handle == 0) { return child; }
+        }
+    }
+    if (matchingTensorChild != nullptr) { return *matchingTensorChild; }
+    if (namedChild != nullptr) { return *namedChild; }
+    throw std::runtime_error(fmt::format("supplied state '{}' is not registered", StatePath(_tree, parent, name)));
+}
+
+StateNode& PythonStateTree::AddDictionaryChild(StateNode::Handle parent, std::string_view name)
+{
+    if (_finalized)
+    {
+        auto& child = _tree.FindChildNode(parent, name);
+        if (child.data.index() != static_cast<size_t>(StateNode::Type::Dict))
+        {
+            throw std::runtime_error(fmt::format("supplied state '{}' changed container type", _tree.GetNodeId(child.handle)));
+        }
+        return child;
+    }
+    auto& child = _tree.AddChild(parent, name);
+    child.data  = StateNode::Dict{};
+    return child;
+}
+
+StateNode& PythonStateTree::RegisterStateByFQN(std::string_view fqn, StateNode::Variant data)
+{
+    auto [name, parent] = [&]() -> std::pair<std::string_view, StateNode::Handle> {
+        if (!_finalized) { return _tree.FindOrAddNodeByFQN(fqn); }
+        return _tree.FindParentDictNodeByFQN(fqn);
+    }();
+    return RegisterState(parent, name, std::move(data));
+}
+
+StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_view stateName, StateNode::Variant data)
+{
+    if (!_finalized)
+    {
+        auto& child = _tree.AddChild(parent, stateName);
+        child.data  = std::move(data);
+        return child;
+    }
+
+    auto& child = MatchStateChild_(parent, stateName, data);
+    if (child.data.index() != data.index())
+    {
+        throw std::runtime_error(fmt::format("supplied state '{}' changed registered type", _tree.GetNodeId(child.handle)));
+    }
+    auto const path = _tree.GetNodeId(child.handle);
+    if (data.index() == static_cast<size_t>(StateNode::Type::Scalar))
+    {
+        auto const previous = std::get<StateNode::Scalar>(child.data);
+        auto const current  = std::get<StateNode::Scalar>(data);
+        if (current.GetType() != previous.GetType())
+        {
+            throw std::runtime_error(fmt::format("State '{}' changed scalar type after registry synchronization", path));
+        }
+    }
+    else if (data.index() == static_cast<size_t>(StateNode::Type::Blob))
+    {
+        auto const currentSize    = std::get<StateNode::Blob>(data).size();
+        auto const registeredSize = std::get<StateNode::Blob>(child.data).size();
+        if (currentSize != registeredSize)
+        {
+            throw std::runtime_error(fmt::format(
+                "State '{}' changed serialized size after registry synchronization: {} != {} bytes", path, currentSize, registeredSize));
+        }
+    }
+    else if (data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+    {
+        auto const& previous = std::get<StateNode::TensorShard>(child.data);
+        auto const& current  = std::get<StateNode::TensorShard>(data);
+        if (current.dtype != previous.dtype || current.device != previous.device || current.fulldim != previous.fulldim
+            || current.sharddim != previous.sharddim)
+        {
+            throw std::runtime_error(fmt::format("State '{}' changed tensor metadata after registry synchronization", path));
+        }
+    }
+    child.data = std::move(data);
+    return child;
+}
+
+void PythonStateTree::AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nb::object const& obj)
+{ _tensorRefObjects.insert_or_assign(node, obj); }
+
+std::string PythonStateTree::GetNodeId(StateNode::Handle node) const
+{ return _tree.GetNodeId(node); }
+
+void PythonStateTree::ClearTensorHandles_()
+{
+    _tree.WalkNodes([](StateNode& node) {
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        {
+            std::get<StateNode::TensorShard>(node.data).handle = 0;
+        }
+    });
+}
+
+void PythonStateTree::ValidateTensorHandles_() const
+{
+    _tree.WalkNodes([this](StateNode const& node) {
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard)
+            && std::get<StateNode::TensorShard>(node.data).handle == 0)
+        {
+            throw std::runtime_error(
+                fmt::format("registered tensor '{}' was not supplied for this snapshot", _tree.GetNodeId(node.handle)));
+        }
+    });
+}
+
+void PythonStateTree::ReleasePythonObjects_()
+{
+    _tensorRefObjects.clear();
+    _dictToScan.reset();
+}
+
+void PythonStateTree::Scan(nb::dict stateDict)
+{
+    ClearTensorHandles_();
+    {
+        nb::gil_scoped_acquire acquire;
+        ReleasePythonObjects_();
+        _dictToScan = std::move(stateDict);
+    }
+    std::unordered_set<PyObject*> visited;
+    try
+    {
+        RegisterStateDictRecr(*this, StateNode::Handle::Root, _dictToScan, true, visited);
+    } catch (nb::python_error const& error)
+    {
+        auto const message = std::string(error.what());
+        OnSnapshotComplete_();
+        throw std::runtime_error(message);
+    } catch (...)
+    {
+        OnSnapshotComplete_();
+        throw;
+    }
+}
+
+void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath)
+{
+    try
+    {
+        if (!_finalized)
+        {
+            _tree.FinalizeRegistry();
+            _finalized = true;
+        }
+        ValidateTensorHandles_();
+        InitializeQueueAsync(_tree);
+        ::SaveCheckpoint(_tree, iteration, dirpath);
+    } catch (...)
+    {
+        OnSnapshotComplete_();
+        throw;
+    }
+    OnSnapshotComplete_();
+}
+
+static StateNode::Scalar ScalarState(nb::handle obj)
+{
+    if (nb::isinstance<int64_t>(obj)) { return StateNode::Scalar{nb::cast<int64_t>(obj)}; }
+    if (nb::isinstance<double>(obj)) { return StateNode::Scalar{nb::cast<double>(obj)}; }
+    if (nb::isinstance<bool>(obj)) { return StateNode::Scalar{nb::cast<bool>(obj)}; }
+    throw std::out_of_range("Conversion of nanobind::object to Scalar failed");
+}
+
+static StateNode::Blob SliceBlob(nb::handle value)
+{
+    struct SliceData
+    {
+        int64_t start{};
+        int64_t stop{};
+        int64_t step{};
+    } data{};
+    auto obj                      = nb::cast<nb::slice>(value);
+    auto [start, stop, step, len] = obj.compute(std::numeric_limits<long>::max());
+    data.start                    = start;
+    data.stop                     = stop;
+    data.step                     = step;
+    auto const* begin             = reinterpret_cast<char const*>(&data);    // NOLINT
+    return {begin, begin + sizeof(data)};
+}
+
+static StateNode::Blob StringBlob(nb::handle value)
+{
+    auto       string = nb::cast<nb::str>(value);
+    Py_ssize_t len    = 0;
+    auto*      ptr    = PyUnicode_AsWideCharString(string.ptr(), &len);
+    if (ptr == nullptr) { throw nb::python_error(); }
+    auto const*     begin = reinterpret_cast<char const*>(ptr);    // NOLINT
+    StateNode::Blob blob(begin, begin + static_cast<size_t>(len * 2));
+    PyMem_Free(ptr);
+    return blob;
+}
+
+static StateNode::Blob BytesBlob(nb::handle value)
+{
+    auto const bytes = nb::cast<nb::bytes>(value);
+    return {bytes.c_str(), bytes.c_str() + bytes.size()};
+}
+
+template <typename T, typename TPy> static StateNode::Blob TrivialTupleBlob(nb::handle value)
+{
+    auto            obj = nb::cast<TPy>(value);
+    StateNode::Blob data(sizeof(T) * obj.size());
+    auto*           ptr = reinterpret_cast<T*>(data.data());                     // NOLINT
+    for (size_t i = 0; i < obj.size(); ++i) { ptr[i] = nb::cast<T>(obj[i]); }    // NOLINT
+    return data;
+}
+
+template <typename TPy> static StateNode::Blob StringTupleBlob(nb::handle value)
+{
+    auto   obj  = nb::cast<TPy>(value);
+    size_t size = 0;
+    for (size_t i = 0; i < obj.size(); ++i) { size += (PyObject_Length(obj[i].ptr()) * sizeof(wchar_t)); }
+    StateNode::Blob data(size);
+    auto            it = data.begin();
+    for (size_t i = 0; i < obj.size(); ++i)
+    {
+        Py_ssize_t len  = 0;
+        auto*      wide = PyUnicode_AsWideCharString(obj[i].ptr(), &len);
+        if (wide == nullptr) { throw nb::python_error(); }
+        auto* ptr = reinterpret_cast<char*>(wide);          // NOLINT
+        it        = std::copy(ptr, ptr + (len * 2), it);    // NOLINT
+        PyMem_Free(wide);
+    }
+    return data;
+}
+
+static StateNode::Blob EnumListBlob(nb::list const& obj)
+{
+    std::vector<int64_t> values(obj.size());
+    for (size_t i = 0; i < obj.size(); ++i) { values[i] = nb::cast<int64_t>(obj[i].attr("value")); }
+    auto const* data = reinterpret_cast<char const*>(values.data());    // NOLINT
+    return {data, data + (sizeof(int64_t) * values.size())};
+}
+
+static StateNode::Blob PythonRngStateBlob(nb::tuple const& tuple)
+{
+    auto            state = nb::cast<nb::tuple>(tuple[1]);
+    StateNode::Blob data((state.size() + 1) * sizeof(int64_t));
+    auto*           ptr = reinterpret_cast<int64_t*>(data.data());    // NOLINT
+    ptr[0]              = nb::cast<int64_t>(tuple[0]);                // NOLINT
+    for (size_t i = 0; i < state.size(); i++)
+    {
+        ptr[i + 1] = nb::cast<int64_t>(state[i]);    // NOLINT
+    }
+    return data;
+}
+
+static StateNode::Blob NumPyRngStateBlob(nb::tuple const& tuple)
+{
+    auto       name    = nb::cast<nb::str>(tuple[0]);
+    auto       state   = nb::cast<nb::ndarray<uint32_t>>(tuple[1]);
+    auto       state1  = nb::cast<int64_t>(tuple[2]);
+    auto       state2  = nb::cast<int64_t>(tuple[3]);
+    auto       state3  = nb::cast<float>(tuple[4]);
+    Py_ssize_t len     = 0;
+    auto*      nameptr = reinterpret_cast<char*>(PyUnicode_AsWideCharString(name.ptr(), &len));    // NOLINT
+    if (nameptr == nullptr) { throw nb::python_error(); }
+    auto rngNameLen = static_cast<uint16_t>(len);
+
+    auto size
+        = sizeof(rngNameLen) + (rngNameLen * sizeof(wchar_t)) + (state.size() * sizeof(uint32_t)) + (sizeof(int64_t) * 2) + sizeof(float);
+    StateNode::Blob data(size);
+    size_t          offset = 0;
+    auto            append = [&](void const* source, size_t bytes) {
+        std::memcpy(data.data() + offset, source, bytes);
+        offset += bytes;
+    };
+    append(&rngNameLen, sizeof(rngNameLen));
+    append(nameptr, rngNameLen * sizeof(wchar_t));
+    append(state.data(), state.size() * sizeof(uint32_t));
+    append(&state1, sizeof(state1));
+    append(&state2, sizeof(state2));
+    append(&state3, sizeof(state3));
+
+    assert(offset == size);
+    PyMem_Free(nameptr);
+    return data;
+}
 
 static bool IsEnum(nb::handle const& obj)
 {
     static auto Enum = nb::module_::import_("enum").attr("Enum");
     return nb::isinstance(obj, Enum);
+}
+
+static bool IsEnumList(nb::list const& obj)
+{
+    return std::ranges::all_of(obj, [](auto const& item) { return IsEnum(item) && nb::isinstance<int64_t>(item.attr("value")); });
 }
 
 static bool IsSimpleNamespace(nb::handle obj)
@@ -380,151 +468,6 @@ static bool IsArgParseNamespace(nb::handle obj)
 
 static bool IsNamespace(nb::handle obj)
 { return IsSimpleNamespace(obj) || IsArgParseNamespace(obj); }
-
-namespace
-{
-struct RegisteredStateDict final : StateTree::IStateHandler
-{
-    private:
-    struct MergeState
-    {
-        std::unordered_set<PyObject*>   visited;
-        std::unordered_set<std::string> supplied;
-    };
-
-    public:
-    explicit RegisteredStateDict(nb::dict stateIn) : StateTree::IStateHandler(""), _state(std::move(stateIn)) {}
-
-    StateTree::StateType GetType() override { return StateTree::StateType::Dict; }
-    void                 Update() override {}
-
-    void Merge(nb::dict const& fresh)
-    {
-        MergeState mergeState;
-        MergeDictionary_(_state, fresh, "", mergeState);
-    }
-
-    [[noreturn]] StateTree::Scalar GetScalarState() override { throw std::logic_error("registered state dictionary has no scalar value"); }
-    [[noreturn]] StateNode::Blob   GetBlob() override { throw std::logic_error("registered state dictionary has no blob value"); }
-    [[noreturn]] DS4Tensor         GetTensorState() override { throw std::logic_error("registered state dictionary has no tensor value"); }
-    [[noreturn]] void              SetScalarState(StateTree::Scalar const& /*unused*/) override
-    { throw std::logic_error("registered state dictionary has no scalar value"); }
-    [[noreturn]] void SetBlob(std::string_view const& /*unused*/) override { throw std::logic_error("registered state dictionary has no blob value"); }
-    [[noreturn]] void SetTensorState(DS4Tensor const& /*unused*/) override
-    { throw std::logic_error("registered state dictionary has no tensor value"); }
-
-    private:
-    static std::string JoinStatePath_(std::string_view prefix, nb::handle key)
-    {
-        auto const keyString = Str(nb::str(key));
-        return prefix.empty() ? keyString : fmt::format("{}.{}", prefix, keyString);
-    }
-
-    static bool IsEmptySequence_(nb::handle value)
-    {
-        if (nb::isinstance<nb::list>(value)) { return nb::cast<nb::list>(value).empty(); }
-        if (nb::isinstance<nb::tuple>(value)) { return nb::cast<nb::tuple>(value).empty(); }
-        return false;
-    }
-
-    static void MarkSupplied_(MergeState& mergeState, std::string const& path)
-    {
-        if (!mergeState.supplied.insert(path).second) { throw std::runtime_error(fmt::format("duplicate normalized state '{}'", path)); }
-    }
-
-    bool MergeValue_(nb::handle cached, nb::handle fresh, std::string const& path, MergeState& mergeState)
-    {
-        if (fresh.is_none() || IsEmptySequence_(fresh)) { return false; }
-        if (cached.ptr() == fresh.ptr()) { return false; }
-
-        auto cachedDict = [&] -> std::optional<nb::dict> {
-            if (nb::isinstance<nb::dict>(cached)) { return nb::cast<nb::dict>(cached); }
-            if (IsNamespace(cached)) { return nb::cast<nb::dict>(cached.attr("__dict__")); }
-            return std::nullopt;
-        }();
-        auto freshDict = [&] -> std::optional<nb::dict> {
-            if (nb::isinstance<nb::dict>(fresh)) { return nb::cast<nb::dict>(fresh); }
-            if (IsNamespace(fresh)) { return nb::cast<nb::dict>(fresh.attr("__dict__")); }
-            return std::nullopt;
-        }();
-        if (cachedDict || freshDict)
-        {
-            if (!cachedDict || !freshDict) { throw std::runtime_error(fmt::format("supplied state '{}' changed container type", path)); }
-            MergeDictionary_(*cachedDict, *freshDict, path, mergeState);
-            return false;
-        }
-
-        if (nb::isinstance<nb::list>(cached) || nb::isinstance<nb::list>(fresh))
-        {
-            if (!nb::isinstance<nb::list>(cached) || !nb::isinstance<nb::list>(fresh))
-            {
-                throw std::runtime_error(fmt::format("supplied state '{}' changed container type", path));
-            }
-            auto cachedList = nb::cast<nb::list>(cached);
-            auto freshList  = nb::cast<nb::list>(fresh);
-            if (cachedList.size() != freshList.size())
-            {
-                throw std::runtime_error(
-                    fmt::format("supplied state '{}' changed list length from {} to {}", path, cachedList.size(), freshList.size()));
-            }
-            if (!mergeState.visited.insert(freshList.ptr()).second) { return false; }
-            for (size_t i = 0; i < freshList.size(); ++i)
-            {
-                auto const itemPath = fmt::format("{}.[list]#{}", path, i);
-                if (MergeValue_(cachedList[i], freshList[i], itemPath, mergeState)) { cachedList[i] = freshList[i]; }
-            }
-            return false;
-        }
-
-        MarkSupplied_(mergeState, path);
-        return true;
-    }
-
-    bool MergeDottedKey_(nb::dict const& cached, nb::str const& key, nb::handle fresh, std::string_view prefix, MergeState& mergeState)
-    {
-        auto const keyString = Str(key);
-        auto       current   = cached;
-        size_t     begin     = 0;
-        while (true)
-        {
-            auto const end       = keyString.find('.', begin);
-            auto const component = std::string_view(keyString).substr(begin, end == std::string::npos ? end : end - begin);
-            nb::str    componentKey(component.data(), component.size());
-            if (!current.contains(componentKey)) { return false; }
-            if (end == std::string::npos)
-            {
-                auto const path = prefix.empty() ? keyString : fmt::format("{}.{}", prefix, keyString);
-                if (MergeValue_(current[componentKey], fresh, path, mergeState)) { current[componentKey] = fresh; }
-                return true;
-            }
-            auto value = current[componentKey];
-            if (!nb::isinstance<nb::dict>(value)) { return false; }
-            current = nb::cast<nb::dict>(value);
-            begin   = end + 1;
-        }
-    }
-
-    void MergeDictionary_(nb::dict const& cached, nb::dict const& fresh, std::string_view prefix, MergeState& mergeState)
-    {
-        if (cached.ptr() == fresh.ptr() || !mergeState.visited.insert(fresh.ptr()).second) { return; }
-        for (auto const& item : fresh)
-        {
-            auto const key   = item.first;
-            auto const value = item.second;
-            if (cached.contains(key))
-            {
-                auto const path = JoinStatePath_(prefix, key);
-                if (MergeValue_(cached[key], value, path, mergeState)) { cached[key] = value; }
-                continue;
-            }
-            if (nb::isinstance<nb::str>(key) && MergeDottedKey_(cached, nb::cast<nb::str>(key), value, prefix, mergeState)) { continue; }
-            throw std::runtime_error(fmt::format("supplied state '{}' is not registered", JoinStatePath_(prefix, key)));
-        }
-    }
-
-    nb::dict _state;
-};
-}    // namespace
 
 static bool IsPythonRngState(nb::tuple const& tupleObj)
 {
@@ -548,9 +491,7 @@ static bool IsNumPyRngState(nb::tuple const& tupleObj)
     return true;
 }
 
-bool RegisterTorchStateDict(StateTree& state, nb::handle val);
-
-static void RegisterStateDictRecrContainerItem(StateTree&                     root,    // NOLINT(readability-function-cognitive-complexity)
+static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           scan,    // NOLINT(readability-function-cognitive-complexity)
                                                StateNode::Handle              node,
                                                nb::dict const&                container,
                                                bool                           recursive,
@@ -564,55 +505,43 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
     if (!nb::isinstance<nb::str>(key) && !nb::isinstance<int64_t>(key))
     {
         throw std::runtime_error(
-            fmt::format("[TODO]StateDict::Register] {} key = {} is not string or int\n", root.GetNodeId(node), keyView));
+            fmt::format("[TODO]StateDict::Register] {} key = {} is not string or int\n", scan.GetNodeId(node), keyView));
     }
 
     if (nb::isinstance<int64_t>(val) || nb::isinstance<double>(val) || nb::isinstance<bool>(val))
     {    //
-        root.RegisterStateHandler(node, std::make_unique<StateTreeScalarHandler>(container, key));
+        scan.RegisterState(node, keyView, ScalarState(val));
     }
-    else if (nb::isinstance<nb::str>(val)) { root.RegisterStateHandler(node, std::make_unique<StateTreeStringHandler>(container, key)); }
-    else if (nb::isinstance<nb::bytes>(val)) { root.RegisterStateHandler(node, std::make_unique<StateTreeBytesHandler>(container, key)); }
+    else if (nb::isinstance<nb::str>(val)) { scan.RegisterState(node, keyView, StringBlob(val)); }
+    else if (nb::isinstance<nb::bytes>(val)) { scan.RegisterState(node, keyView, BytesBlob(val)); }
     else if (IsEnum(val))
     {
         if (!nb::isinstance<int64_t>(val.attr("value")))
         {
             throw std::runtime_error("[TODO][StateDict::Register] Only Integer enums supported");
         }
-        root.RegisterStateHandler(node, std::make_unique<StateTreeEnumHandler>(container, key));
+        scan.RegisterState(node, keyView, StateNode::Scalar{nb::cast<int64_t>(val.attr("value"))});
     }
     else if (nb::isinstance<nb::tuple>(val))
     {
         auto tupleSize = nb::cast<nb::tuple>(val).size();
         auto tupleObj  = nb::cast<nb::tuple>(val);
         if (tupleSize == 0) { return; }
-        if (IsPythonRngState(tupleObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreePythonRngStateHandler>(container, key));
-        }
-        else if (IsNumPyRngState(tupleObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeNumPyRngStateHandler>(container, key));
-        }
-        else if (IsTuple<nb::str, nb::tuple>(tupleObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeStringTupleHandler<nb::tuple>>(container, key));
-        }
+        if (IsPythonRngState(tupleObj)) { scan.RegisterState(node, keyView, PythonRngStateBlob(tupleObj)); }
+        else if (IsNumPyRngState(tupleObj)) { scan.RegisterState(node, keyView, NumPyRngStateBlob(tupleObj)); }
+        else if (IsTuple<nb::str, nb::tuple>(tupleObj)) { scan.RegisterState(node, keyView, StringTupleBlob<nb::tuple>(tupleObj)); }
         else if (IsTuple<int64_t, nb::tuple>(tupleObj))
         {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeTrivialTupleHandler<int64_t, nb::tuple>>(container, key));
+            scan.RegisterState(node, keyView, TrivialTupleBlob<int64_t, nb::tuple>(tupleObj));
         }
-        else if (IsTuple<double, nb::tuple>(tupleObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeTrivialTupleHandler<double, nb::tuple>>(container, key));
-        }
+        else if (IsTuple<double, nb::tuple>(tupleObj)) { scan.RegisterState(node, keyView, TrivialTupleBlob<double, nb::tuple>(tupleObj)); }
         else
         {
             throw std::runtime_error(
                 fmt::format("[TODO]StateDict::Register] Unsupported tuple element type for key: {} obj = {}", key, nb::str(tupleObj)));
         }
     }
-    else if (nb::isinstance<nb::slice>(val)) { root.RegisterStateHandler(node, std::make_unique<StateTreeSliceHandler>(container, key)); }
+    else if (nb::isinstance<nb::slice>(val)) { scan.RegisterState(node, keyView, SliceBlob(val)); }
     else if (nb::isinstance<nb::list>(val))
     {
         auto listObj = nb::cast<nb::list>(val);
@@ -621,30 +550,22 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
         // element under its own FQN before the generic per-element-type checks
         // below get a chance to mis-classify them (a list of ShardedTensor
         // instances trips `Unsupported list element type`).
-        if (TryRegisterTorchStateDictList(root, node, key, listObj)) { return; }
-        if (IsTuple<nb::str, nb::list>(listObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeStringTupleHandler<nb::list>>(container, key));
-        }
-        else if (IsTuple<int64_t, nb::list>(listObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeTrivialTupleHandler<int64_t, nb::list>>(container, key));
-        }
-        else if (IsTuple<double, nb::list>(listObj))
-        {
-            root.RegisterStateHandler(node, std::make_unique<StateTreeTrivialTupleHandler<double, nb::list>>(container, key));
-        }
+        if (TryRegisterTorchStateDictList(scan, node, key, listObj)) { return; }
+        if (IsTuple<nb::str, nb::list>(listObj)) { scan.RegisterState(node, keyView, StringTupleBlob<nb::list>(listObj)); }
+        else if (IsTuple<int64_t, nb::list>(listObj)) { scan.RegisterState(node, keyView, TrivialTupleBlob<int64_t, nb::list>(listObj)); }
+        else if (IsTuple<double, nb::list>(listObj)) { scan.RegisterState(node, keyView, TrivialTupleBlob<double, nb::list>(listObj)); }
+        else if (IsEnumList(listObj)) { scan.RegisterState(node, keyView, EnumListBlob(listObj)); }
         else if (IsTuple<nb::dict, nb::list>(listObj))
         {
             if (recursive)
             {
                 for (size_t i = 0; i < listObj.size(); ++i)
                 {
-                    auto  item  = listObj[i];
-                    auto& child = root.AddChild(node, fmt::format("{}.[list]#{}", keyView, i));
-                    child.data  = StateNode::Dict{};
-                    // nanobind::gil_scoped_release release;
-                    RegisterStateDictRecr(root, child.handle, nb::cast<nb::dict>(item), recursive, visited);
+                    auto                   item      = listObj[i];
+                    auto&                  child     = scan.AddDictionaryChild(node, fmt::format("{}.[list]#{}", keyView, i));
+                    auto                   childDict = nb::cast<nb::dict>(item);
+                    nb::gil_scoped_release release;
+                    RegisterStateDictRecr(scan, child.handle, childDict, recursive, visited);
                 }
             }
         }
@@ -658,8 +579,7 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
                     for (size_t j = 0; j < item.size(); ++j)
                     {
                         auto  item1 = item[j];
-                        auto& child = root.AddChild(node, fmt::format("{}.[list]#{}.[list]#{}", key, i, j));
-                        child.data  = StateNode::Dict{};
+                        auto& child = scan.AddDictionaryChild(node, fmt::format("{}.[list]#{}.[list]#{}", key, i, j));
                         if (!nb::isinstance<nb::dict>(item1))
                         {
                             throw std::runtime_error(
@@ -667,8 +587,9 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
                                             child.name,
                                             nb::str(item1.type())));
                         }
-                        // nanobind::gil_scoped_release release;
-                        RegisterStateDictRecr(root, child.handle, nb::cast<nb::dict>(item1), recursive, visited);
+                        auto                   childDict = nb::cast<nb::dict>(item1);
+                        nb::gil_scoped_release release;
+                        RegisterStateDictRecr(scan, child.handle, childDict, recursive, visited);
                     }
                 }
             }
@@ -679,23 +600,23 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
                 fmt::format("[TODO]StateDict::Register] Unsupported list element type for key: {} obj = {}", key, nb::str(listObj)));
         }
     }
-    else if (TryRegisterTorchStateDict(root, node, container, recursive, visited, key, val)) {}
+    else if (TryRegisterTorchStateDict(scan, node, container, key, val)) {}
     else if (recursive)
     {
         if (nb::isinstance<nb::dict>(val))
         {
-            // nanobind::gil_scoped_release release;
-            auto& child = root.AddChild(node, keyView);
-            child.data  = StateNode::Dict{};
-            RegisterStateDictRecr(root, child.handle, nb::cast<nb::dict>(val), recursive, visited);
+            auto&                  child     = scan.AddDictionaryChild(node, keyView);
+            auto                   childDict = nb::cast<nb::dict>(val);
+            nb::gil_scoped_release release;
+            RegisterStateDictRecr(scan, child.handle, childDict, recursive, visited);
         }
         // if namespace
         else if (IsNamespace(val))
         {
-            // nanobind::gil_scoped_release release;
-            auto& child = root.AddChild(node, keyView);
-            child.data  = StateNode::Dict{};
-            RegisterStateDictRecr(root, child.handle, nb::cast<nb::dict>(val.attr("__dict__")), recursive, visited);
+            auto&                  child     = scan.AddDictionaryChild(node, keyView);
+            auto                   childDict = nb::cast<nb::dict>(val.attr("__dict__"));
+            nb::gil_scoped_release release;
+            RegisterStateDictRecr(scan, child.handle, childDict, recursive, visited);
         }
     }
     else
@@ -707,7 +628,7 @@ static void RegisterStateDictRecrContainerItem(StateTree&                     ro
     }
 }
 
-void RegisterStateDictRecr(StateTree&                     root,
+void RegisterStateDictRecr(PyStateDictAccessor&           scan,
                            StateNode::Handle              node,
                            nb::dict const&                container,
                            bool                           recursive,
@@ -716,74 +637,60 @@ void RegisterStateDictRecr(StateTree&                     root,
     if (visited.contains(container.ptr())) { return; }
     visited.insert(container.ptr());
 
-    for (auto const& item : container)
+    std::optional<nb::list> keys;
+    size_t                  keyCount = 0;
     {
-        nanobind::gil_scoped_acquire acquire;
-        try
+        nb::gil_scoped_acquire acquire;
+        keys.emplace(container.attr("keys")());
+        keyCount = keys->size();
+    }
+    try
+    {
+        for (size_t index = 0; index < keyCount; ++index)
         {
-            RegisterStateDictRecrContainerItem(root, node, container, recursive, visited, nb::str(item.first), item.second);
-        } catch (std::exception const& e)
-        {
-            fmt::print(stderr,
-                       "[native_ckpt:cli][ERROR] Error processing prefix = {}, key: {}: {}\n",
-                       root.GetNodeId(node),
-                       nb::str(item.first),
-                       e.what());
-            throw;
+            nb::gil_scoped_acquire acquire;
+            auto                   key   = nb::borrow<nb::object>((*keys)[index]);
+            auto                   value = nb::borrow<nb::object>(container[key]);
+            try
+            {
+                RegisterStateDictRecrContainerItem(scan, node, container, recursive, visited, nb::str(key), value);
+            } catch (std::exception const& e)
+            {
+                fmt::print(stderr,
+                           "[native_ckpt:cli][ERROR] Error processing prefix = {}, key: {}: {}\n",
+                           scan.GetNodeId(node),
+                           nb::str(key),
+                           e.what());
+                throw;
+            }
         }
-    }
-}
-
-static void RegisterStateDict(StateTree& self, nb::dict const& container)
-{
-    if (self.GetNode(StateNode::Handle::Root).handler == nullptr)
+    } catch (...)
     {
-        std::unordered_set<PyObject*> visited;
-        RegisterStateDictRecr(self, StateNode::Handle::Root, container, true, visited);
-        self.GetNode(StateNode::Handle::Root).handler = std::make_unique<RegisteredStateDict>(container);
-        return;
+        nb::gil_scoped_acquire acquire;
+        keys.reset();
+        throw;
     }
-
-    auto* registered = dynamic_cast<RegisteredStateDict*>(self.GetNode(StateNode::Handle::Root).handler.get());
-    if (registered == nullptr) { throw std::logic_error("state tree root already has a non-dictionary handler"); }
-
-    registered->Merge(container);
-    self.WalkNodes([&](StateNode& node) {
-        if (node.handle != StateNode::Handle::Root && node.handler != nullptr) { self.RefreshNodeDataFromHandler(node); }
-    });
+    {
+        nb::gil_scoped_acquire acquire;
+        keys.reset();
+    }
 }
 
-static void FinalizeRegistry(StateTree& self)
-{ FinalizeStateRegistry(self); }
-
-static void WaitForDeferredSave(StateTree& self)
+static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
 {
-    nanobind::gil_scoped_release release;
-    self.WaitForAsyncCalls();
+    self.ChainAsyncCall([&self, stateDict = nb::dict(stateDict)]() mutable { self.Scan(std::move(stateDict)); });
 }
 
-static void SaveAsync(StateTree& self, int iteration, std::filesystem::path const& dirpath)
+static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
 {
-    auto                         snapshot = self.Clone();
-    nanobind::gil_scoped_release release;
-
-    self.ChainAsyncCall([iteration, dirpath, snapshot = std::move(snapshot)] {
-        SaveCheckpoint(*snapshot, static_cast<cipc::SnapshotId>(iteration), dirpath);
-    });
-}
-
-static void Save(StateTree& self, int iteration, std::filesystem::path const& dirpath)
-{
-    auto                         snapshot = self.Clone();
-    nanobind::gil_scoped_release release;
-    SaveCheckpoint(*snapshot, static_cast<cipc::SnapshotId>(iteration), dirpath);
+    self.ChainAsyncCall([&self, iteration, dirpath] { self.SaveCheckpoint(static_cast<cipc::SnapshotId>(iteration), dirpath); });
 }
 
 NB_MODULE(checkpoint, m)    // NOLINT
 {
     m.def("ping", &SvcPing);
     m.def("svc_stop", &SvcStop);
-    m.def("svc_spindown", &SvcSpinDown /* , nanobind::arg("timeout") = nanobind::none() */);
+    m.def("svc_spindown", &SvcSpinDown);
     m.def(
         "wait_for_ckpt_finalize",
         [](uint32_t sessionId, int64_t iteration) {
@@ -792,7 +699,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
         },
         nb::arg("session_id"),
         nb::arg("iteration"));
-    auto cls = nb::class_<StateTree>(std::move(m), "model_state");
+    auto cls = nb::class_<PythonStateTree>(std::move(m), "model_state");
 
     cls.def_static(
            "create_root",
@@ -826,7 +733,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
                                        ranksPerPeer));
                    }
                }
-               return std::make_unique<StateTree>(RankTopology{
+               return std::make_unique<PythonStateTree>(RankTopology{
                    .rank         = Rank{globalRank},
                    .worldSize    = Rank{globalWorldSize},
                    .ranksPerPeer = ranksPerPeer,
@@ -839,47 +746,32 @@ NB_MODULE(checkpoint, m)    // NOLINT
            nb::arg("peers"),
            nb::arg("ranks_per_peer") = 0,
            nb::arg("peers_per_node") = 1)
-        .def_static(
-            "warmup",
-            [](uint32_t                 globalRank,
-               uint32_t                 globalWorldSize,
-               std::vector<std::string> peers,
-               uint32_t                 ranksPerPeer,
-               uint32_t                 peersPerNode) {
-                WarmUpCheckpoint(RankTopology{
-                    .rank         = Rank{globalRank},
-                    .worldSize    = Rank{globalWorldSize},
-                    .ranksPerPeer = ranksPerPeer,
-                    .peersPerNode = peersPerNode,
-                    .peers        = std::move(peers),
-                });
-            },
-            nb::arg("global_rank"),
-            nb::arg("global_world_size"),
-            nb::arg("peers"),
-            nb::arg("ranks_per_peer"),
-            nb::arg("peers_per_node") = 1)
-        .def("add_child", &StateTree::AddChild, nb::rv_policy::reference)
-        .def_prop_ro("globalRank", &StateTree::GlobalRank)
-        .def_prop_ro("globalWorldSize", &StateTree::GlobalWorldSize)
+        .def_prop_ro("globalRank", [](PythonStateTree const& self) { return self.Tree().GlobalRank(); })
+        .def_prop_ro("globalWorldSize", [](PythonStateTree const& self) { return self.Tree().GlobalWorldSize(); })
         .def_prop_rw(
             "startedAt",
-            [](StateTree const& self) { return self.startedAt.count(); },
-            [](StateTree& self, int64_t startedAt) { self.startedAt = std::chrono::nanoseconds{startedAt}; })
+            [](PythonStateTree const& self) { return self.Tree().startedAt.count(); },
+            [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
         .def("register_state_dict", &RegisterStateDict)
-        .def("finalize_registry", &FinalizeRegistry)
+        .def("finalize_registry", [](PythonStateTree& self) { self.FinalizeRegistry(); })
+        .def_prop_ro("snapshot_size",
+                     [](PythonStateTree& self) {
+                         nb::gil_scoped_release release;
+                         self.WaitForAsyncCalls();
+                         return self.Tree().GetTotalSnapshotStateSizeInBytes();
+                     })
         .def("save_async", &SaveAsync, nb::arg("iteration"), nb::arg("dirpath"))
-        .def("save", &Save, nb::arg("iteration"), nb::arg("dirpath"))
-        .def("wait_for_deferred_save", &WaitForDeferredSave)
-
-        // Save/Load convenience methods that block until complete
-        //.def("save",
-        //     [](std::shared_ptr<StateTree> const& self, std::string const& path) {
-        //     self->SaveAsync(std::filesystem::path(path)).get(); })
-        //.def("load",
-        //     [](std::shared_ptr<StateTree> const& self, std::string const& path) {
-        //     self->LoadAsync(std::filesystem::path(path)).get(); })
-
-        // Return list of named states' names (as Python list of strings)
-        ;
+        .def(
+            "save",
+            [](PythonStateTree& self, int iteration, std::filesystem::path const& dirpath) {
+                SaveAsync(self, iteration, dirpath);
+                nb::gil_scoped_release release;
+                self.WaitForAsyncCalls();
+            },
+            nb::arg("iteration"),
+            nb::arg("dirpath"))
+        .def("wait_for_deferred_save", [](PythonStateTree& self) {
+            nb::gil_scoped_release release;
+            self.WaitForAsyncCalls();
+        });
 }

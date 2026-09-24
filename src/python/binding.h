@@ -39,20 +39,36 @@ template <> struct fmt::formatter<nanobind::str> : fmt::formatter<std::string_vi
     { return fmt::format_to(ctx.out(), "{}", StrView(obj, "<null>")); }
 };
 
-bool TryRegisterTorchStateDict(StateTree&                     root,
-                               StateNode::Handle              node,
-                               nanobind::dict const&          container,
-                               bool                           recursive,
-                               std::unordered_set<PyObject*>& visited,
-                               nanobind::str const&           key,
-                               nanobind::handle               val);
+class PyStateDictAccessor
+{
+    public:
+    PyStateDictAccessor()          = default;
+    virtual ~PyStateDictAccessor() = default;
+    CLASS_DELETE_COPY_AND_MOVE(PyStateDictAccessor);
+
+    virtual StateNode& AddDictionaryChild(StateNode::Handle parent, std::string_view name)                     = 0;
+    virtual StateNode& RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) = 0;
+    virtual StateNode& RegisterStateByFQN(std::string_view name, StateNode::Variant data)                      = 0;
+    virtual void       AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nanobind::object const& obj)  = 0;
+
+    [[nodiscard]] virtual std::string GetNodeId(StateNode::Handle node) const = 0;
+};
+
+bool TryRegisterTorchStateDict(PyStateDictAccessor&  scan,
+                               StateNode::Handle     node,
+                               nanobind::dict const& container,
+                               nanobind::str const&  key,
+                               nanobind::handle      val);
 
 // Detect a list-of-ShardedTensor (what `apply_factories` produces in place of a
 // ShardedTensorFactory) and register every element. Returns false on any other
 // list shape so the generic walker keeps owning the existing list cases.
-bool TryRegisterTorchStateDictList(StateTree& root, StateNode::Handle node, nanobind::str const& key, nanobind::list const& listObj);
+bool TryRegisterTorchStateDictList(PyStateDictAccessor&  scan,
+                                   StateNode::Handle     node,
+                                   nanobind::str const&  key,
+                                   nanobind::list const& listObj);
 
-void RegisterStateDictRecr(StateTree&                     root,
+void RegisterStateDictRecr(PyStateDictAccessor&           scan,
                            StateNode::Handle              node,
                            nanobind::dict const&          container,
                            bool                           recursive,

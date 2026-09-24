@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import threading
+from concurrent.futures import Future
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -76,6 +77,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     yield module
+    module._root = None
     module._pending = None
     if module._executor is not None:
         module._executor.shutdown(wait=True)
@@ -165,21 +167,206 @@ def test_native_async_save_propagates_background_failure(save: ModuleType) -> No
     assert isinstance(error.value.__cause__, ValueError)
 
 
-def test_warmup_initializes_finalize_executor(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[object] = []
-    peers = SimpleNamespace(checkpoint_args=lambda: {"local_world_size": 2})
-    monkeypatch.setattr(save, "_get_executor", lambda: events.append("executor"))
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 3)
-    monkeypatch.setattr(save.torch.distributed, "get_world_size", lambda: 8)
-    monkeypatch.setattr(save, "detect_peers", lambda _rank, _world_size: peers)
+def test_async_finalize_wait_starts_after_client_send(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
+            events.append("save_async")
+
+        def wait_for_deferred_save(self) -> None:
+            events.append("client_send_complete")
+
+    class ImmediateExecutor:
+        @staticmethod
+        def submit(fn: Callable[..., None], *args: object) -> Future[None]:
+            events.append("submit_finalize_wait")
+            future: Future[None] = Future()
+            future.set_result(fn(*args))
+            return future
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=True, save=tmp_path)
+    save_args = save.SaveCheckpointArgs(
+        iteration=40,
+        model=object(),
+        optimizer=None,
+        opt_param_scheduler=None,
+        num_floating_point_operations_so_far=0,
+    )
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000040")
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+    monkeypatch.setattr(save, "_get_executor", ImmediateExecutor)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(
-        save.checkpoint.model_state,
-        "warmup",
-        lambda rank, world_size, **kwargs: events.append((rank, world_size, kwargs)),
+        save.checkpoint,
+        "wait_for_ckpt_finalize",
+        lambda _session, _iteration: events.append("wait_for_finalize"),
     )
 
-    save.init_persistent_async_worker(3)
-    assert events == []
+    save._save_checkpoint_impl(save_args, 123)
 
-    save.warmup()
-    assert events == ["executor", (3, 8, {"local_world_size": 2})]
+    assert events == ["save_async", "client_send_complete", "submit_finalize_wait", "wait_for_finalize"]
+
+
+def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Root:
+        def __init__(self) -> None:
+            self.registered = []
+
+        def register_state_dict(self, state_dict) -> None:  # noqa: ANN001
+            self.registered.append(state_dict)
+
+    root = Root()
+    save._root = root
+    monkeypatch.setattr(save, "_prepare_registration_state_dict", lambda state, iteration: {"prepared": state, "iteration": iteration})
+    loaded_state = {"model.weight": "loaded tensor"}
+    saved_state = {"model.weight": "saved tensor"}
+
+    assert save.register_state_dict(loaded_state, 0) is root
+    assert save.register_state_dict(saved_state, 12) is root
+
+    assert root.registered == [
+        {"prepared": loaded_state, "iteration": 0},
+        {"prepared": saved_state, "iteration": 12},
+    ]
+    assert save._root is root
+
+
+def test_registration_adds_the_stable_rerun_state_when_load_omits_it(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    rerun_state = {"sharded": "rerun handler"}
+    rerun = SimpleNamespace(
+        state_dict=lambda **kwargs: calls.append(kwargs) or rerun_state,
+    )
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: rerun)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    state = {"model": "model handler"}
+
+    prepared = save._prepare_registration_state_dict(state, 0)
+    prepared_save = save._prepare_registration_state_dict(
+        {"model": "fresh model handler", "rerun_state_machine": rerun_state},
+        12,
+    )
+
+    assert prepared == {"model": "model handler", "rerun_state_machine": rerun_state}
+    assert prepared_save == {"model": "fresh model handler", "rerun_state_machine": rerun_state}
+    assert state == {"model": "model handler"}
+    assert calls == [{"data_iterator": None, "ckpt_format": "torch_dist", "force": True}]
+
+
+def test_registration_adds_rng_state_when_load_skips_restoring_it(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    rng_state = {"sharded": "rng handler"}
+    monkeypatch.setattr(save.mpu, "get_tensor_model_parallel_group", lambda: "tp")
+    monkeypatch.setattr(save.mpu, "get_pipeline_model_parallel_group", lambda: "pp")
+    monkeypatch.setattr(
+        save,
+        "get_rng_state",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or rng_state,
+    )
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    state = {
+        "args": SimpleNamespace(no_save_rng=False),
+        "model": "model handler",
+        "rerun_state_machine": "rerun handler",
+    }
+
+    prepared = save._prepare_registration_state_dict(state, 0)
+
+    assert prepared == {**state, "rng_state": rng_state}
+    assert state == {
+        "args": SimpleNamespace(no_save_rng=False),
+        "model": "model handler",
+        "rerun_state_machine": "rerun handler",
+    }
+    assert calls == [(("torch_dist", "tp", "pp"), {})]
+
+
+def test_registration_respects_no_save_rng(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        save,
+        "get_rng_state",
+        lambda *_args, **_kwargs: pytest.fail("RNG state should not be generated"),
+    )
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    state = {
+        "args": SimpleNamespace(no_save_rng=True),
+        "model": "model handler",
+        "rerun_state_machine": "rerun handler",
+    }
+
+    assert save._prepare_registration_state_dict(state, 0) == state
+
+
+def test_common_state_padding_is_local_to_megatron_serialization(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
+
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.torch, "save", lambda _value, buffer: buffer.write(next(payloads)))
+    state = {"rerun_state_machine": "rerun handler"}
+
+    first = save._prepare_registration_state_dict(state, 0)[save._DCP_COMMON_STATE_KEY]
+    second = save._prepare_registration_state_dict(state, 1)[save._DCP_COMMON_STATE_KEY]
+    expected_capacity = save._COMMON_STATE_ALIGNMENT
+
+    assert len(first) == len(second) == expected_capacity
+    assert first[:100] == b"a" * 100
+    assert second[:200] == b"b" * 200
+    with pytest.raises(
+        RuntimeError,
+        match=rf"common state serialized to 2048 bytes, exceeding its registered {expected_capacity}-byte capacity",
+    ):
+        save._prepare_registration_state_dict(state, 2)
+
+
+def test_rng_sharded_object_padding_is_local_to_megatron_serialization(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ShardedObject:
+        replica_id = 0
+
+        def __init__(self, data: object) -> None:
+            self.data = data
+            self.unique_key = "rng_state/shard_0_1"
+
+    payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch, "save", lambda _value, buffer: buffer.write(next(payloads)))
+
+    first = ShardedObject({"iteration": 0})
+    second = ShardedObject({"iteration": 1})
+    save._prepare_registration_state_dict({"rng_state": first, "rerun_state_machine": {}}, 0)
+    save._prepare_registration_state_dict({"rng_state": second, "rerun_state_machine": {}}, 1)
+    expected_capacity = save._COMMON_STATE_ALIGNMENT
+
+    first_blob = getattr(first, save._SERIALIZED_SHARDED_OBJECT_ATTR)
+    second_blob = getattr(second, save._SERIALIZED_SHARDED_OBJECT_ATTR)
+    assert len(first_blob) == len(second_blob) == expected_capacity
+    assert first_blob[:100] == b"a" * 100
+    assert second_blob[:200] == b"b" * 200
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"sharded object 'rng_state/shard_0_1' serialized to 2048 bytes, exceeding its registered {expected_capacity}-byte capacity",
+    ):
+        save._prepare_registration_state_dict(
+            {"rng_state": ShardedObject({"iteration": 2}), "rerun_state_machine": {}},
+            2,
+        )

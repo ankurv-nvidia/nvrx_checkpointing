@@ -123,7 +123,7 @@ struct Message
     struct LocalStateRegistry
     {
         SessionId sessionId;
-        uint32_t  messageSize;
+        uint64_t  messageSize;
     };
 
     struct StateRegistryFragment

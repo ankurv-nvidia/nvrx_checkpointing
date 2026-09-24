@@ -136,11 +136,6 @@ template <std::integral TValue, TValue Minimum = std::numeric_limits<TValue>::lo
     }
 };
 
-using PositiveSize    = Integer<uint32_t, 1>;
-using PositiveUint8   = Integer<uint8_t, 1>;
-using NonNegativeSize = Integer<uint32_t, 0>;
-using UnsignedInteger = Integer<uint64_t>;
-
 struct RFile
 {
     using ValueType = std::filesystem::path;
@@ -260,29 +255,29 @@ struct OtelLogs
 struct ShmRingBufferSize
 {
     static constexpr std::string_view Name    = "shm.ring.buffer.size";
-    static constexpr std::string_view Default = "256GiB";
+    static constexpr std::string_view Default = "0";
     using Type                                = types::ByteSize;
 };
 
 struct ShmRingBufferSlots
 {
     static constexpr std::string_view Name    = "shm.ring.buffer.slots";
-    static constexpr std::string_view Default = "32";
-    using Type                                = types::PositiveSize;
+    static constexpr std::string_view Default = "0";
+    using Type                                = types::Integer<uint32_t>;
 };
 
 struct ShmRingBufferNumQueues
 {
     static constexpr std::string_view Name    = "shm.ring.buffer.num.queues";
-    static constexpr std::string_view Default = "4";
-    using Type                                = types::PositiveUint8;
+    static constexpr std::string_view Default = "0";
+    using Type                                = types::Integer<uint8_t>;
 };
 
 struct ShmRingBufferWriteTimeoutSeconds
 {
     static constexpr std::string_view Name    = "shm.ring.buffer.write.timeout.seconds";
     static constexpr std::string_view Default = "1";
-    using Type                                = types::PositiveSize;
+    using Type                                = types::Integer<uint32_t, 1>;
 };
 
 struct ServerTcpReusePort
@@ -296,28 +291,28 @@ struct ServerTcpAcceptors
 {
     static constexpr std::string_view Name    = "server.tcp.acceptors";
     static constexpr std::string_view Default = "8";
-    using Type                                = types::PositiveSize;
+    using Type                                = types::Integer<uint32_t, 1>;
 };
 
 struct ServerHandlerThreads
 {
     static constexpr std::string_view Name    = "server.handler.threads";
     static constexpr std::string_view Default = "64";
-    using Type                                = types::PositiveSize;
+    using Type                                = types::Integer<uint32_t, 1>;
 };
 
 struct ServerMaxActiveSnapshots
 {
     static constexpr std::string_view Name    = "server.max.active.snapshots";
     static constexpr std::string_view Default = "4";
-    using Type                                = types::NonNegativeSize;
+    using Type                                = types::Integer<uint32_t>;
 };
 
 struct MemorySampleIntervalSeconds
 {
     static constexpr std::string_view Name    = "memory.sample.interval.seconds";
     static constexpr std::string_view Default = "0";
-    using Type                                = types::UnsignedInteger;
+    using Type                                = types::Integer<uint64_t>;
 };
 
 namespace detail

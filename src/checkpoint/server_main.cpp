@@ -240,9 +240,7 @@ try
     return 0;
 } catch (checkpoint::ipc::ErrorAlreadyRunning const& e)
 {
-    // Another candidate won the instance election. Do not let this candidate's
-    // launcher observe EOF until the elected daemon is actually answering pings;
-    // otherwise several ranks can race ahead while its queues are still booting.
+    // Losing candidates wait for the elected daemon's listener before releasing their launchers.
     fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
     if (!TryConnectToCheckpointService())
     {

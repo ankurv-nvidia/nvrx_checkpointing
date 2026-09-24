@@ -1,19 +1,19 @@
 #pragma once
 #include "CommonMacros.h"
+
 #include "fmttensor.h"
 #include "primitives64bit.h"
 #include "tensor.h"
 
-#include <chrono>
 #include <fmt/std.h>
 
 #include <algorithm>
 #include <cassert>
-#include <future>
-#include <mutex>
+#include <chrono>
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
 // #define NATIVE_CKPT_TRACE_NODE "chained_0.optimizer.distributed.dp_group_idx_0"
 // #define NATIVE_CKPT_WARN_FQN
 
@@ -60,31 +60,8 @@ struct StateNode
 
     CLASS_DELETE_COPY_DEFAULT_MOVE(StateNode);
 
-    struct IHandler
-    {
-        explicit IHandler(std::string_view const& nameIn) : name(nameIn) {}
-
-        virtual ~IHandler() = default;
-        CLASS_DELETE_COPY_AND_MOVE(IHandler);
-        virtual Type GetType() = 0;
-
-        virtual void               Update() = 0;
-        [[nodiscard]] virtual bool IsSnapshotScoped() const { return false; }
-
-        virtual Scalar    GetScalarState() = 0;
-        virtual Blob      GetBlob()        = 0;
-        virtual DS4Tensor GetTensorState() = 0;
-
-        virtual void SetScalarState(Scalar const&)    = 0;
-        virtual void SetBlob(std::string_view const&) = 0;
-        virtual void SetTensorState(DS4Tensor const&) = 0;
-
-        std::string name;
-    };
-
-    std::unique_ptr<IHandler> handler{nullptr};
-    Handle                    handle{};    // root handle is always 0; This should be non-zero
-    Handle                    parent{};
+    Handle handle{};    // root handle is always 0; This should be non-zero
+    Handle parent{};
 
     std::string name;
     Variant     data;
@@ -110,19 +87,8 @@ struct StateTree
 #endif
         _nodes.emplace_back(StateNode::Handle::Root, StateNode::Handle::Root, "", StateNode::Dict{});    //
     }
-
-    ~StateTree() { WaitForAsyncCalls(); }
-
+    ~StateTree() = default;
     CLASS_DELETE_COPY_AND_MOVE(StateTree);
-
-    using StateType     = StateNode::Type;
-    using Scalar        = StateNode::Scalar;
-    using IStateHandler = StateNode::IHandler;
-
-    template <StateType T> struct StateHandler;
-    // template <> struct StateHandler<StateType::Scalar>;
-    // template <> struct StateHandler<StateType::Scalar>;
-    // template <> struct StateHandler<StateType::Scalar>;
 
     auto& FindOrAddDictChild(StateNode::Handle node, std::string_view const& stateName) LFTBND
     {
@@ -189,7 +155,40 @@ struct StateTree
         return std::make_pair(std::string_view(itb, ite), node);
     }
 
-    StateNode::Handle FindNodeByFQN(std::string_view const& fqn) const
+    auto FindParentDictNodeByFQN(std::string_view const& fqn)
+    {
+        auto const separator = fqn.rfind('.');
+        if (separator == std::string_view::npos) { return std::make_pair(fqn, StateNode::Handle::Root); }
+
+        auto const parentPath   = fqn.substr(0, separator);
+        auto const parentHandle = FindNodeByFQN(parentPath);
+        if (parentHandle == StateNode::Handle::Invalid)
+        {
+            throw std::runtime_error(fmt::format("State '{}' is not registered", parentPath));
+        }
+        if (GetNode(parentHandle).data.index() != static_cast<size_t>(StateNode::Type::Dict))
+        {
+            throw std::runtime_error(fmt::format("State '{}' is not a Dict", parentPath));
+        }
+        return std::make_pair(fqn.substr(separator + 1), parentHandle);
+    }
+
+    StateNode& FindChildNode(StateNode::Handle parent, std::string_view const& name) LFTBND
+    {
+        auto& parentData = GetNode(parent).data;
+        if (parentData.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
+        auto const& children = std::get<StateNode::Dict>(parentData);
+        auto const child = std::ranges::find_if(children, [&](StateNode::Handle childHandle) { return GetNode(childHandle).name == name; });
+        if (child == children.end())
+        {
+            auto const parentPath = GetNodeId(parent);
+            auto const nodePath   = parentPath.empty() ? std::string(name) : fmt::format("{}.{}", parentPath, name);
+            throw std::runtime_error(fmt::format("State '{}' is not registered", nodePath));
+        }
+        return GetNode(*child);
+    }
+
+    [[nodiscard]] StateNode::Handle FindNodeByFQN(std::string_view const& fqn) const
     {
         if (fqn.empty()) { return StateNode::Handle::Root; }
 
@@ -236,116 +235,13 @@ struct StateTree
         node.data = data;
     }
 
-    // Refresh one leaf while preserving the registered structure and Blob capacity.
-    void RefreshNodeDataFromHandler(StateNode& node) const
-    {
-        auto* const handler = node.handler.get();
-        if (handler == nullptr) { throw std::logic_error("Cannot refresh a state node without a handler"); }
-        handler->Update();
-        auto const fqn = GetNodeId(node.handle);
-        switch (handler->GetType())
-        {
-        case StateType::Blob:
-        {
-            auto const registeredSize = std::get<StateNode::Blob>(node.data).size();
-            auto       blob           = handler->GetBlob();
-            if (handler->IsSnapshotScoped())
-            {
-                if (blob.size() > registeredSize)
-                {
-                    throw std::runtime_error(
-                        fmt::format("State '{}' serialized to {} bytes, exceeding its registered {}-byte snapshot capacity",
-                                    fqn,
-                                    blob.size(),
-                                    registeredSize));
-                }
-                blob.resize(registeredSize);
-            }
-            else if (blob.size() != registeredSize)
-            {
-                throw std::runtime_error(fmt::format(
-                    "State '{}' changed serialized size after registry synchronization: {} != {} bytes", fqn, blob.size(), registeredSize));
-            }
-            node.data = std::move(blob);
-            break;
-        }
-        case StateType::Scalar: node.data = handler->GetScalarState(); break;
-        case StateType::TensorShard:
-        {
-            auto const previous = std::get<StateNode::TensorShard>(node.data);
-            auto       current  = handler->GetTensorState();
-            if (current.dtype != previous.dtype || current.fulldim != previous.fulldim || current.sharddim != previous.sharddim)
-            {
-                throw std::runtime_error(fmt::format("State '{}' changed tensor metadata after registry synchronization", fqn));
-            }
-            node.data = current;
-            break;
-        }
-        case StateType::ShardedTensor: [[fallthrough]];
-        case StateType::Dict: [[fallthrough]];
-        case StateType::Invalid: [[fallthrough]];
-        case StateType::Unknown: [[fallthrough]];
-        default: throw std::logic_error("Unknown state type");
-        }
-    }
+    StateNode& GetNode(StateNode::Handle handle) LFTBND { return _nodes[static_cast<size_t>(handle)]; }
 
-    void RegisterStateHandler(StateNode::Handle node, std::unique_ptr<IStateHandler> handler, bool allowFQN = false)
-    {
-        auto const&      stateName = handler->name;
-        std::string_view childName = stateName;
-        bool             allowDuplicates{false};
-        if (stateName.contains('.'))
-        {
-#ifdef NATIVE_CKPT_WARN_FQN
-            auto parentFQN = GetNodeId(node);
-            fmt::print(stderr,
-                       "[native_ckpt:cli][WARN] StateName contains dots. Treating it as a fqn. Will be reparented to root of state-dict"
-                       "This can cause unexpected behavior.\n"
-                       "\tparent = {}\n"
-                       "\tname   = {}\n",
-                       parentFQN,
-                       stateName);
-#endif
-            if (handler->GetType() != StateNode::Type::TensorShard && !allowFQN)
-            {
-                throw std::runtime_error(fmt::format(
-                    "StateName with dots only allowed for TensorShard or explicitly qualified handlers. Invalid stateName: {}", stateName));
-            }
+    [[nodiscard]] StateNode const& GetNode(StateNode::Handle handle) const LFTBND { return _nodes[static_cast<size_t>(handle)]; }
+    [[nodiscard]] auto             GlobalRank() const { return _topo.rank; }
+    [[nodiscard]] auto             GlobalWorldSize() const { return _topo.worldSize; }
 
-            auto [fqnChildName, parentNode] = FindOrAddNodeByFQN(stateName);
-            node                            = parentNode;
-            childName                       = fqnChildName;
-            allowDuplicates                 = true;
-        }
-
-        auto& child   = AddChild(node, childName, allowDuplicates);
-        child.handler = std::move(handler);
-        switch (child.handler->GetType())
-        {
-        case StateType::Blob:
-        {
-            auto blob = child.handler->GetBlob();
-            if (child.handler->IsSnapshotScoped()) { blob.resize(SnapshotBlobCapacity_(blob.size())); }
-            child.data = std::move(blob);
-            break;
-        }
-        case StateType::Scalar: child.data = child.handler->GetScalarState(); break;
-        case StateType::TensorShard: child.data = child.handler->GetTensorState(); break;
-        case StateType::ShardedTensor: [[fallthrough]];
-        case StateType::Dict: [[fallthrough]];
-        case StateType::Invalid: [[fallthrough]];
-        case StateType::Unknown: [[fallthrough]];
-        default: throw std::logic_error("Unknown state type");
-        }
-    }
-
-    StateNode const& GetNode(StateNode::Handle handle) const LFTBND { return _nodes[static_cast<size_t>(handle)]; }
-    StateNode&       GetNode(StateNode::Handle handle) LFTBND { return _nodes[static_cast<size_t>(handle)]; }
-
-    auto GlobalRank() const { return _topo.rank; }
-    auto GlobalWorldSize() const { return _topo.worldSize; }
-
-    std::string GetNodeId(StateNode::Handle nodeHandle) const
+    [[nodiscard]] std::string GetNodeId(StateNode::Handle nodeHandle) const
     {
         if (nodeHandle == StateNode::Handle::Root) { return ""; }
         auto const& node = GetNode(nodeHandle);
@@ -353,24 +249,7 @@ struct StateTree
         return GetNodeId(node.parent) + "." + node.name;
     }
 
-    template <typename TLambda> void ChainAsyncCall(TLambda&& lambda)
-    {
-        std::scoped_lock lock(_mutex);
-        if (_async.valid())
-        {
-            _async = std::async(std::launch::async | std::launch::deferred,
-                                [prev = std::move(_async), lambda1 = std::forward<TLambda>(lambda)] mutable {
-                                    prev.get();
-                                    lambda1();
-                                });
-        }
-        else
-        {
-            _async = std::async(std::launch::async | std::launch::deferred, std::forward<TLambda>(lambda));
-        }
-    }
-
-    uint64_t GetTotalTensorStateSizeInBytes() const
+    [[nodiscard]] uint64_t GetTotalTensorStateSizeInBytes() const
     {
         uint64_t totalSize = 0;
         for (auto const& node : _nodes)
@@ -389,7 +268,7 @@ struct StateTree
         return totalSize;
     }
 
-    uint64_t GetTotalSnapshotStateSizeInBytes() const
+    [[nodiscard]] uint64_t GetTotalSnapshotStateSizeInBytes() const
     {
         auto totalSize = GetTotalTensorStateSizeInBytes();
         for (auto const& node : _nodes)
@@ -402,13 +281,13 @@ struct StateTree
         return totalSize;
     }
 
-    size_t GetTotalNumTensors() const
+    [[nodiscard]] size_t GetTotalNumTensors() const
     {
         return static_cast<size_t>(std::ranges::count_if(
             _nodes, [](StateNode const& node) { return node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard); }));
     }
 
-    std::string FindTensorStateByHandle(uint64_t handle) const;
+    [[nodiscard]] std::string FindTensorStateByHandle(uint64_t handle) const;
 
     void PrintShardedTensor(StateNode::Handle nodeHandle) const
     {
@@ -513,20 +392,9 @@ struct StateTree
         }
     }
 
-    void WaitForAsyncCalls()
-    {
-        std::scoped_lock lock(_mutex);
-        if (_async.valid())
-        {
-            _async.get();
-            _async = std::future<void>{};
-        }
-    }
-
     void FinalizeRegistry()
     {
-        std::scoped_lock lock(_mutex);
-        auto&            root = _nodes[0];
+        auto& root = _nodes[0];
         try
         {
             SortDictionaryNode_(root);
@@ -557,7 +425,7 @@ struct StateTree
         clone.startedAt = startedAt;
     }
 
-    auto Clone() const
+    [[nodiscard]] auto Clone() const
     {
         auto clonedTree = std::make_shared<StateTree>(_topo);
         CloneInto(*clonedTree);
@@ -587,40 +455,9 @@ struct StateTree
         node.name   = {};
     }
 
-    auto const& Topo() const LFTBND { return _topo; }
-
-    void Update()
-    {
-        WalkNodes([](StateNode& node) {
-            if (node.handler) { node.handler->Update(); }
-            auto type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::TensorShard) { node.data = node.handler->GetTensorState(); }
-            else if (type == StateNode::Type::ShardedTensor)
-            {
-                auto                                                  shTen = std::get<StateNode::ShardedTensor>(node.data);
-                std::set<StateNode::ShardedTensor::RankedTensorShard> updatedShards;
-                for (auto shard : shTen.shards)
-                {
-                    shard.handle = node.handler->GetTensorState().handle;
-                    updatedShards.insert(shard);
-                }
-                std::swap(shTen.shards, updatedShards);
-            }
-        });
-    }
+    [[nodiscard]] auto const& Topo() const LFTBND { return _topo; }
 
     private:
-    static size_t SnapshotBlobCapacity_(size_t serializedSize)
-    {
-        static constexpr size_t Padding   = 512;
-        static constexpr size_t Alignment = 1024;
-        if (serializedSize > std::numeric_limits<size_t>::max() - Padding - (Alignment - 1))
-        {
-            throw std::overflow_error("Snapshot Blob capacity overflow");
-        }
-        return ((serializedSize + Padding + Alignment - 1) / Alignment) * Alignment;
-    }
-
     void DebugPrintRecr_(size_t depth, StateNode::Handle nodeHandle, std::unordered_set<StateNode::Handle>& visited) const
     {
         if (visited.contains(nodeHandle))
@@ -759,52 +596,12 @@ struct StateTree
 
     RankTopology const _topo{};
 
-    mutable std::mutex _mutex;
-    std::future<void>  _async;
     friend struct StateSerDes;
 
     public:
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/
         = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
-};
-
-template <> struct StateTree::StateHandler<StateTree::StateType::Scalar> : StateTree::IStateHandler
-{
-    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
-
-    [[nodiscard]] StateType      GetType() override { return StateType::Scalar; }
-    [[noreturn]] StateNode::Blob GetBlob() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] DS4Tensor       GetTensorState() override { throw std::runtime_error("Invalid operation"); }
-
-    [[noreturn]] void SetBlob(std::string_view const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] void SetTensorState(DS4Tensor const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-};
-
-template <> struct StateTree::StateHandler<StateTree::StateType::Blob> : StateTree::IStateHandler
-{
-    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
-
-    [[nodiscard]] StateType GetType() override { return StateType::Blob; }
-    [[noreturn]] Scalar     GetScalarState() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] DS4Tensor  GetTensorState() override { throw std::runtime_error("Invalid operation"); }
-
-    [[noreturn]] void SetScalarState(Scalar const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] void SetTensorState(DS4Tensor const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-};
-
-template <> struct StateTree::StateHandler<StateTree::StateType::TensorShard> : StateTree::IStateHandler
-{
-    explicit StateHandler(std::string_view const& nameIn) : IStateHandler(nameIn) {}
-    [[nodiscard]] StateType GetType() override { return StateType::TensorShard; }
-
-    [[noreturn]] Scalar          GetScalarState() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] StateNode::Blob GetBlob() override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] DS4Tensor       GetTensorState() override { throw std::runtime_error("Invalid operation"); }
-
-    [[noreturn]] void SetScalarState(Scalar const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] void SetBlob(std::string_view const& /* data */) override { throw std::runtime_error("Invalid operation"); }
-    [[noreturn]] void SetTensorState(DS4Tensor const& /* data */) override { throw std::runtime_error("Invalid operation"); }
 };
 
 template <> struct fmt::formatter<StateNode::Variant> : fmt::formatter<std::string>

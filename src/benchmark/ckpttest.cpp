@@ -1,6 +1,7 @@
 #include "CommonMacros.h"
 
 #include "byte_storage.h"
+#include "checkpoint.h"
 #include "ckpt_fixture.h"
 #include "config.h"
 #include "distcp.h"
@@ -8,8 +9,11 @@
 #include "logging.h"
 #include "process_memory.h"
 #include "server.h"
+#include "service_client.h"
 #include "session.h"
+#include "shm_ring_buffer.h"
 #include "state.h"
+#include "stateserdes.h"
 #include "telemetry.h"
 #include "tensor.h"
 
@@ -40,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -48,8 +53,10 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // NOLINTBEGIN(readability-magic-numbers)
@@ -65,27 +72,111 @@ SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 static std::filesystem::path GRegistryPath;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
 
+static constexpr std::string_view ShmTestServerArg = "--shmem-test-server";
+
 static std::filesystem::path const& TestRegistryPath()
 { return GRegistryPath; }
 
-TEST_CASE("shared-memory configuration parses sizes and positive counts", "[shmem][config][tier1]")
+class TestServerProcess
+{
+    public:
+    TestServerProcess()                                    = default;
+    TestServerProcess(TestServerProcess const&)            = delete;
+    TestServerProcess& operator=(TestServerProcess const&) = delete;
+
+    ~TestServerProcess()
+    {
+        if (_pid > 0) { Stop(); }
+    }
+
+    void Start()
+    {
+        // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
+        if (TryConnectToCheckpointService())
+        {
+            SvcStop();
+            static constexpr size_t MaxStopAttempts = 50;
+            using namespace std::chrono_literals;
+            for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
+            {
+                if (!TryConnectToCheckpointService()) { break; }
+                if (attempt + 1 == MaxStopAttempts) { throw std::runtime_error("existing checkpoint test server did not stop"); }
+                std::this_thread::sleep_for(100ms);
+            }
+        }
+
+        auto const executable = std::filesystem::read_symlink("/proc/self/exe");
+        _pid                  = ::fork();
+        if (_pid < 0) { throw std::runtime_error("failed to fork checkpoint test server"); }
+        if (_pid == 0)
+        {
+            ::execl(executable.c_str(), executable.c_str(), ShmTestServerArg.data(), nullptr);
+            ::_exit(EXIT_FAILURE);
+        }
+
+        static constexpr size_t MaxAttempts = 50;
+        using namespace std::chrono_literals;
+        for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
+        {
+            if (TryConnectToCheckpointService()) { return; }
+            std::this_thread::sleep_for(100ms);
+        }
+        Stop();
+        throw std::runtime_error("checkpoint test server did not become ready");
+    }
+
+    bool Stop()
+    {
+        SvcStop();
+        static constexpr size_t MaxAttempts = 50;
+        using namespace std::chrono_literals;
+        int status = 0;
+        for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
+        {
+            auto const waitResult = ::waitpid(_pid, &status, WNOHANG);
+            if (waitResult == _pid)
+            {
+                _pid = -1;
+                return WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+            }
+            if (waitResult < 0)
+            {
+                _pid = -1;
+                return false;
+            }
+            std::this_thread::sleep_for(100ms);
+        }
+
+        ::kill(_pid, SIGTERM);
+        auto const waitResult = ::waitpid(_pid, &status, 0);
+        _pid                  = -1;
+        return waitResult >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+    }
+
+    private:
+    pid_t _pid = -1;
+};
+TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[shmem][config][tier1]")
 {
     using checkpoint::config::types::ByteSize;
     using checkpoint::config::types::Integer;
-    using checkpoint::config::types::NonNegativeSize;
-    using checkpoint::config::types::PositiveSize;
-    using checkpoint::config::types::PositiveUint8;
+    using UInt32Integer1 = checkpoint::config::types::Integer<uint32_t, 1>;
+    using UInt8Integer   = checkpoint::config::types::Integer<uint8_t>;
     CHECK(ByteSize::Parse("48GiB") == 48ull * (1ull << 30));
     CHECK(ByteSize::Parse("5GB") == 5'000'000'000ull);
     CHECK_THROWS_AS(ByteSize::Parse("5gib"), std::invalid_argument);
     CHECK_THROWS_AS(ByteSize::Parse("-1"), std::invalid_argument);
-    CHECK(PositiveSize::Parse("32") == 32);
-    CHECK_THROWS_AS(PositiveSize::Parse("0"), std::invalid_argument);
-    CHECK_THROWS_AS(PositiveSize::Parse("4x"), std::invalid_argument);
-    CHECK(PositiveUint8::Parse("255") == 255);
-    CHECK_THROWS_AS(PositiveUint8::Parse("256"), std::overflow_error);
-    CHECK(NonNegativeSize::Parse("0") == 0);
-    CHECK_THROWS_AS(NonNegativeSize::Parse("-1"), std::invalid_argument);
+    CHECK(UInt32Integer1::Parse("32") == 32);
+    CHECK_THROWS_AS(UInt32Integer1::Parse("0"), std::invalid_argument);
+    CHECK_THROWS_AS(UInt32Integer1::Parse("4x"), std::invalid_argument);
+    CHECK(UInt8Integer::Parse("0") == 0);
+    CHECK(UInt8Integer::Parse("255") == 255);
+    CHECK_THROWS_AS(UInt8Integer::Parse("256"), std::overflow_error);
+    CHECK(Integer<uint32_t>::Parse("0") == 0);
+    CHECK_THROWS_AS(Integer<uint32_t>::Parse("-1"), std::invalid_argument);
+    CHECK(checkpoint::config::ShmRingBufferSize::Default == "0");
+    CHECK(checkpoint::config::ShmRingBufferSlots::Default == "0");
+    CHECK(checkpoint::config::ShmRingBufferNumQueues::Default == "0");
     CHECK(Integer<int8_t>::Parse("-128") == -128);
     CHECK(Integer<int8_t>::Parse("+127") == 127);
     CHECK_THROWS_AS(Integer<int8_t>::Parse("128"), std::overflow_error);
@@ -276,6 +367,144 @@ TEST_CASE("state registry permits distinct local shards under one tensor key", "
     REQUIRE(ranges[2][1].begin == 0);
     REQUIRE(ranges[3][0].begin == 1);
     REQUIRE(ranges[3][1].begin == 1);
+}
+
+TEST_CASE("snapshot shared memory keeps bounded growth room", "[shmem][tier1]")
+{
+    using checkpoint::ipc::RoundSnapshotShmSize;
+    static constexpr size_t GiB = 1ull << 30;
+    CHECK(RoundSnapshotShmSize(1) == checkpoint::ipc::MinSnapshotShmSize);
+    CHECK(RoundSnapshotShmSize(3 * GiB) == 10 * GiB);
+    CHECK(RoundSnapshotShmSize(5 * GiB) == 10 * GiB);
+    CHECK(RoundSnapshotShmSize(33 * GiB) == 48 * GiB);
+    CHECK(RoundSnapshotShmSize(25'842'932'288ull) == 32 * GiB);
+    CHECK(RoundSnapshotShmSize(28'322'409'024ull) == 40 * GiB);
+}
+
+TEST_CASE("shared memory queues retain large transfer slots as their budgets grow", "[shmem][tier1]")
+{
+    using Queue                 = checkpoint::ipc::MsgQueue;
+    static constexpr size_t GiB = 1ull << 30;
+
+    auto const headerSize = Queue::HeaderAllocationSize(Queue::DefaultSlotCount);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (128 * 1024), Queue::DefaultSlotCount, 1) == 6);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (256 * 1024), Queue::DefaultSlotCount, 2) == 12);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (4 * GiB), Queue::DefaultSlotCount, 1) == 2);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (8 * GiB), Queue::DefaultSlotCount, 1) == 4);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (12 * GiB), Queue::DefaultSlotCount, 2) == 6);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (16 * GiB), Queue::DefaultSlotCount, 2) == 8);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (32 * GiB), Queue::DefaultSlotCount, 1) == 16);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (64 * GiB), Queue::DefaultSlotCount, 1) == 32);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (128 * GiB), Queue::DefaultSlotCount, 1) == 32);
+}
+
+TEST_CASE("shared memory sizing aggregates unequal local snapshots per queue", "[shmem][tier1]")
+{
+    using checkpoint::ipc::QueueSnapshotShmSizes;
+    static constexpr size_t GiB = 1ull << 30;
+
+    auto const fourRanks = QueueSnapshotShmSizes(std::array<size_t, 4>{5 * GiB, 33 * GiB, 5 * GiB, 1}, 4, 4);
+    CHECK(fourRanks[0] == 10 * GiB);
+    CHECK(fourRanks[1] == 48 * GiB);
+    CHECK(fourRanks[2] == 10 * GiB);
+    CHECK(fourRanks[3] == checkpoint::ipc::MinSnapshotShmSize);
+
+    auto const sixRanks = QueueSnapshotShmSizes(std::array<size_t, 6>{5 * GiB, 5 * GiB, 1, 1, 33 * GiB, 5 * GiB}, 6, 4);
+    CHECK(sixRanks[0] == 24 * GiB);
+    CHECK(sixRanks[1] == checkpoint::ipc::MinSnapshotShmSize);
+    CHECK(sixRanks[2] == 50 * GiB + checkpoint::ipc::MinSnapshotShmSize);
+    CHECK(sixRanks[3] == 10 * GiB);
+    CHECK(checkpoint::ipc::QueueProducerCount(0, 6, 4) == 2);
+    CHECK(checkpoint::ipc::QueueProducerCount(1, 6, 4) == 1);
+    CHECK(checkpoint::ipc::QueueProducerCount(2, 6, 4) == 2);
+    CHECK(checkpoint::ipc::QueueProducerCount(3, 6, 4) == 1);
+    CHECK(checkpoint::ipc::QueueD2HConcurrency(4, 1) == 4);
+    CHECK(checkpoint::ipc::QueueD2HConcurrency(6, 2) == 3);
+    CHECK(checkpoint::ipc::QueueD2HConcurrency(32, 2) == 4);
+    CHECK(checkpoint::ipc::QueueD2HConcurrency(1, 2) == 1);
+
+    auto const automaticQueueCount = checkpoint::ipc::ResolveQueueCount(8, 0);
+    CHECK(automaticQueueCount == 8);
+    CHECK(checkpoint::ipc::ResolveQueueCount(8, 4) == 4);
+    CHECK(checkpoint::ipc::ResolveQueueCount(4, 8) == 4);
+    auto const automaticQueues = QueueSnapshotShmSizes(
+        std::array<size_t, 8>{
+            2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616},
+        8,
+        automaticQueueCount);
+    REQUIRE(automaticQueues.size() == automaticQueueCount);
+    CHECK(std::ranges::all_of(automaticQueues, [=](size_t queueSize) { return queueSize == 10 * GiB; }));
+
+    auto const twoQueues = QueueSnapshotShmSizes(std::array<size_t, 4>{5 * GiB, 33 * GiB, 5 * GiB, 1}, 4, 2);
+    CHECK(twoQueues[0] == 62 * GiB);
+    CHECK(twoQueues[1] == 12 * GiB + checkpoint::ipc::MinSnapshotShmSize);
+}
+
+TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier2]")
+{
+    static constexpr uint32_t        RanksPerPeer = 4;
+    static constexpr size_t          MiB          = 1ull << 20;
+    std::array<size_t, RanksPerPeer> snapshotSizes{5 * MiB, 9 * MiB, 17 * MiB, 33 * MiB};
+
+    auto post = [](std::string const& target, std::string body) {
+        boost::asio::io_context        ioc;
+        boost::beast::tcp_stream       stream(ioc);
+        boost::asio::ip::tcp::resolver resolver(ioc);
+        auto const                     endpoints = resolver.resolve("localhost", std::to_string(checkpoint::ipc::Message::Port));
+        stream.connect(endpoints);
+
+        boost::beast::http::request<boost::beast::http::string_body> request{boost::beast::http::verb::post, target, 11};
+        request.set(boost::beast::http::field::host, "localhost");
+        request.body() = std::move(body);
+        request.prepare_payload();
+        boost::beast::http::write(stream, request);
+
+        boost::beast::flat_buffer                                     buffer;
+        boost::beast::http::response<boost::beast::http::string_body> response;
+        boost::beast::http::read(stream, buffer, response);
+        return response.result();
+    };
+
+    auto uploadRegistry = [&](uint32_t rank) {
+        StateTree tree(SingleRankTopo(rank, RanksPerPeer));
+        auto&     node = tree.AddChild(StateNode::Handle::Root, "payload");
+        if (rank == 1)
+        {
+            // Exercise a large registry body on the HTTP path rather than the
+            // shared-memory message path that previously constrained its size.
+            node.data = StateNode::Blob(snapshotSizes[rank], char{});
+        }
+        else
+        {
+            DS4Tensor tensor;
+            tensor.dtype  = DS4Tensor::DType::UInt8;
+            tensor.device = DeviceId{"cpu"};
+            tensor.fulldim.push_back(snapshotSizes[rank]);
+            tensor.sharddim.push_back({.begin = 0, .end = snapshotSizes[rank]});
+            node.data = tensor;
+        }
+        tree.FinalizeRegistry();
+        std::stringstream body;
+        StateSerDes::Write(body, tree, StateNode::Handle::Root);
+        return post(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), body.str());
+    };
+
+    TestServerProcess server;
+    REQUIRE_NOTHROW(server.Start());
+    std::stringstream activation;
+    serdes::WriteBlobWithSize<uint16_t>(activation, "");
+    StateSerDes::WriteTopology(activation, SingleRankTopo(0, RanksPerPeer));
+    CHECK(post(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
+          == boost::beast::http::status::accepted);
+
+    CHECK(uploadRegistry(0) == boost::beast::http::status::accepted);
+    for (uint8_t queueIndex = 0; queueIndex < RanksPerPeer; ++queueIndex)
+    {
+        auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, queueIndex));
+        CHECK(queue.SlotCount() > 0);
+    }
+    for (uint32_t rank = 1; rank < RanksPerPeer; ++rank) { CHECK(uploadRegistry(rank) == boost::beast::http::status::accepted); }
+    CHECK(server.Stop());
 }
 
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
@@ -1386,13 +1615,7 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
 }
 #endif
 
-// Drives the inproc server + registry round-trip end-to-end. Preconditions:
-// (a) `/dev/shm` is large enough for the IPC ring buffers (~1 GiB per queue,
-// several queues per rank), (b) the host has enough physical RAM to back
-// that tmpfs allocation plus the checkpoint working set, and (c) a registry
-// file readable by `StateSerDes::ReadTopology` is passed via `--registry`.
-// When any precondition fails the test SKIPs cleanly; ctest reports skips
-// separately from passes/failures.
+// Runs the in-process server and registry round trip when a serialized registry is supplied.
 TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 {
     auto const& registryPath = TestRegistryPath();
@@ -1477,6 +1700,12 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 // `EXTRA_ARGS --registry <path>` we feed in from CMake.
 int main(int argc, char* argv[])
 {
+    if (argc == 2 && std::string_view{argv[1]} == ShmTestServerArg)
+    {
+        RunServer();
+        return EXIT_SUCCESS;
+    }
+
     Catch::Session session;
     std::string    registry;
     using namespace Catch::Clara;

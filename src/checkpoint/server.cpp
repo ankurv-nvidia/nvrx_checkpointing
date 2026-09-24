@@ -60,6 +60,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -126,6 +127,11 @@ struct Server
                                         boost::beast::flat_buffer&                                           buffer,
                                         boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser);
 
+    void InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */, size_t totalSize, uint8_t queueCount, size_t slotCount);
+    void InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo);
+    void ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf);
+    void ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf);
+
     void SpinDownWaitLoop_(tcp_stream stream);
     void FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration);
     bool IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, cipc::SnapshotId& snapshotId, bool& resolved);
@@ -162,18 +168,18 @@ struct Server
     uint16_t   _index{};
     std::mutex _mutex;
 
-    PerfClock::time_point               _lastPingTime{PerfClock::now()};
-    std::atomic<bool>                   _stopRequested{false};
-    std::unordered_set<cipc::MsgQueue*> _msgQueue{nullptr};
-    bool                                _running{false};
-    std::vector<std::thread>            _threads;
+    PerfClock::time_point        _lastPingTime{PerfClock::now()};
+    std::atomic<bool>            _stopRequested{false};
+    std::vector<cipc::MsgQueue*> _msgQueue;
+    bool                         _running{false};
+    std::vector<std::thread>     _threads;
     // Live spin-down waiter threads, each holding one client connection open until idle.
     std::vector<std::thread> _spinDownThreads;
     // Live wait-for-ckpt-finalize handlers, one per client wait connection. Reaped when new waits
     // arrive and drained on Stop().
     std::vector<std::future<void>> _finalizeWaits;
 
-    boost::asio::io_context _ioc;
+    boost::asio::io_context                     _ioc;
     std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
 
     // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
@@ -187,7 +193,7 @@ struct Server
     // TODO_NOPENDING_STRUCT
     struct PendingSessionData
     {
-        PerfClock::time_point                         recievedAt;
+        PerfClock::time_point                         receivedAt;
         Rank                                          recvFrom{Rank::Invalid};
         std::vector<TensorShardInfo>                  tensorShards;
         std::vector<std::pair<std::string, uint64_t>> blobMetas;
@@ -1364,9 +1370,16 @@ void Session::Activate()
 
 void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf)
 {
-    BufStream istrm{buf.data(), hdr.messageSize};
+    if (hdr.messageSize > buf.size())
+    {
+        throw std::invalid_argument(
+            fmt::format("Local state registry declares {} bytes but only {} bytes were received", hdr.messageSize, buf.size()));
+    }
+    BufStream istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
     auto      localRegistry  = StateSerDes::Read(istrm);
     Rank      rank           = localRegistry->Topo().rank;
+    auto      snapshotSize   = localRegistry->GetTotalSnapshotStateSizeInBytes();
+    auto      registryTopo   = localRegistry->Topo();
     auto&     localState     = FindOrCreateLocalState_(rank);
     localState.localRegistry = std::move(localRegistry);
     // Reset tensor handles to be offsets in the local tensor storage.
@@ -1414,6 +1427,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
                                             topo.peers[0]));
         }
     }
+    server->InitializeShmFromRegistry_(snapshotSize, registryTopo);
 }
 
 void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
@@ -1649,7 +1663,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
 
     {
-        std::scoped_lock lock(mutex);    // see Handle(LocalStateRegistry): the task list is shared across concurrent handlers
+        std::scoped_lock lock(mutex);    // local registry uploads can arrive on concurrent HTTP handlers
         asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::OnFinalizeSnapshotAsync_, this, hdr));
     }
 }
@@ -1739,26 +1753,46 @@ void Server::Start()
     if (_running) { return; }
     _ioc.restart();
 
-    auto const configuredTotalSize = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
-    auto const slotCount           = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
-    auto const queueCount          = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-    auto const handlerThreads      = checkpoint::config::GetConfigValue<checkpoint::config::ServerHandlerThreads>();
-    auto const reusePort           = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpReusePort>();
-    auto const acceptorCount       = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpAcceptors>();
-    auto const maxActiveSnapshots  = checkpoint::config::GetConfigValue<checkpoint::config::ServerMaxActiveSnapshots>();
-    static_cast<void>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>());
+    auto const handlerThreads     = checkpoint::config::GetConfigValue<checkpoint::config::ServerHandlerThreads>();
+    auto const reusePort          = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpReusePort>();
+    auto const acceptorCount      = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpAcceptors>();
+    auto const maxActiveSnapshots = checkpoint::config::GetConfigValue<checkpoint::config::ServerMaxActiveSnapshots>();
+    // static_cast<void>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>());
+
+    _maxActiveSnapshots = maxActiveSnapshots;
+    _handlerPool        = std::make_unique<boost::asio::thread_pool>(handlerThreads);
+    StartTcpListener_(reusePort, acceptorCount);
+    _running = true;
+    StartTcpAcceptors_();
+    auto const shmSize = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
+    if (shmSize != 0)
+    {
+        auto queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+        auto slotCount  = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
+        if (queueCount == 0) { queueCount = cipc::ExplicitSizeDefaultQueueCount; }
+        if (slotCount == 0) { slotCount = cipc::ExplicitSizeDefaultSlotCount; }
+        InitializeShm_(lock, shmSize, queueCount, slotCount);
+    }
+}
+
+void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
+                            size_t  configuredTotalSize,
+                            uint8_t queueCount,
+                            size_t  slotCount)
+{
+    if (!_msgQueue.empty()) { return; }
+    if (queueCount == 0) { throw std::invalid_argument("at least one shared-memory queue is required"); }
     if (cipc::MsgQueue::MinimumShmSize(slotCount) > std::numeric_limits<size_t>::max() / queueCount)
     {
         throw std::overflow_error("configured shared-memory ring-buffer geometry is too large");
     }
-    _maxActiveSnapshots = maxActiveSnapshots;
-    _handlerPool        = std::make_unique<boost::asio::thread_pool>(handlerThreads);
-    StartTcpListener_(reusePort, acceptorCount);
+
     auto const minimumTotal = std::max(cipc::MinShmSize, cipc::MsgQueue::MinimumShmSize(slotCount) * queueCount);
     auto const totalSize    = cipc::MsgQueue::DetectShmSize(
         cipc::Message::RequestChannelName(_index, static_cast<uint8_t>(queueCount)), configuredTotalSize, minimumTotal, slotCount);
     auto const queueSize = totalSize / queueCount;
-    _running = true;
+    _running             = true;
+    _msgQueue.assign(queueCount, nullptr);
     std::latch queuesReady{queueCount};
     // Start server thread
     //_serverThread = std::thread([this]() {
@@ -1788,14 +1822,11 @@ void Server::Start()
                 std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
             }
             UnbindThreadCpu();
-            // Create publishes the queue geometry. Only after every queue reaches
-            // this point may a ping report the service as ready: clients start their
-            // fixed shared-memory open window immediately after SvcPing returns.
+            // The caller holds _mutex until every queue publishes its geometry.
+            // Each thread owns one pre-sized vector element, and the latch makes
+            // those writes visible before InitializeShm_ returns.
+            _msgQueue[i] = &msgQueue;
             queuesReady.count_down();
-            {
-                std::scoped_lock lock1(_mutex);
-                _msgQueue.insert(&msgQueue);
-            }
             INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
             std::fflush(stderr);
             while (true) try
@@ -1805,7 +1836,7 @@ void Server::Start()
                     {
                         std::scoped_lock lock1(_mutex);
                         INFO("[{}] Stop requested. Shutting down server thread.", *this);
-                        _msgQueue.erase(&msgQueue);
+                        _msgQueue[i] = nullptr;
                         return;
                     }
                     // The slot returns to the writer even on a throw; a skipped EndRead
@@ -1820,7 +1851,6 @@ void Server::Start()
         });
     }
     queuesReady.wait();
-    StartTcpAcceptors_();
 }
 
 bool Server::AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
@@ -1876,30 +1906,8 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     // break;
     case cipc::Message::Type::ActivateSession:
     {
-        std::scoped_lock lock(_mutex);
-        _lastPingTime = PerfClock::now();
-
-        auto      hdr1 = std::get<cipc::Message::ActivateSession>(hdr);
-        BufStream bufStream{buf.data(), buf.size()};
-        auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
-        auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
-        auto      createSession = [&] {
-            auto topo                   = StateSerDes::ReadTopology(bufStream);
-            auto session                = std::make_unique<Session>(this, hdr1.sessionId, std::move(workDir), std::move(topo));
-            session->numActiveSnapshots = std::min(hdr1.numActiveSnapshots, _maxActiveSnapshots);
-            session->Activate();
-            return session;
-        };
-
-        INFO("[{}#{}] ActivateSession workDir={}", *this, hdr1.sessionId, workDir);
-        auto it = _activeSessions.find(hdr1.sessionId);
-        it      = it != _activeSessions.end() ? it : _activeSessions.insert({hdr1.sessionId, createSession()}).first;
-        checkpoint::config::OtelConfig const otelConfig;
-        if (otelConfig.enabled && otelConfig.RoutesThroughDaemon())
-        {
-            if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
-            else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
-        }
+        auto const& hdr1 = std::get<cipc::Message::ActivateSession>(hdr);
+        ActivateSession_(hdr1.sessionId, hdr1.numActiveSnapshots, {buf.data(), buf.size()});
     }
     break;
     case cipc::Message::Type::FinalizeSession:
@@ -2041,6 +2049,8 @@ void Server::Stop()
     }
     {
         std::scoped_lock<std::mutex> lock(_mutex);
+        _msgQueue.clear();
+        _threads.clear();
         _running = false;
     }
 }
@@ -2163,6 +2173,63 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotI
         sessionId,
         snapshotId,
         [&](Session& /* session */, Session::Snapshot& snapshot) { snapshot.writeCkptCompletedRanks.insert(fromRank); });
+}
+
+void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
+{
+    std::scoped_lock lock(_mutex);
+    _lastPingTime = PerfClock::now();
+
+    BufStream bufStream{buf.data(), buf.size()};
+    auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
+    auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
+    auto      createSession = [&] {
+        auto topo                   = StateSerDes::ReadTopology(bufStream);
+        auto session                = std::make_unique<Session>(this, sessionId, std::move(workDir), std::move(topo));
+        session->numActiveSnapshots = std::min(numActiveSnapshots, _maxActiveSnapshots);
+        session->Activate();
+        return session;
+    };
+
+    INFO("[{}#{}] ActivateSession workDir={}", *this, sessionId, workDir);
+    auto it = _activeSessions.find(sessionId);
+    it      = it != _activeSessions.end() ? it : _activeSessions.insert({sessionId, createSession()}).first;
+    checkpoint::config::OtelConfig const otelConfig;
+    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon())
+    {
+        if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
+        else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
+    }
+}
+
+void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf)
+{
+    FindOrWaitForSession_("ReceiveLocalRegistry", sessionId, [&](Session& session) {
+        session.Handle(cipc::Message::LocalStateRegistry{.sessionId = sessionId, .messageSize = buf.size()}, buf);
+    });
+}
+
+void Server::InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo)
+{
+    if (topo.ranksPerPeer == 0) { throw std::invalid_argument("local registry has no ranks per peer"); }
+    if (snapshotSize > std::numeric_limits<size_t>::max() / topo.ranksPerPeer)
+    {
+        throw std::overflow_error("automatic shared-memory size exceeds the supported range");
+    }
+    auto const totalSize = static_cast<size_t>(snapshotSize) * topo.ranksPerPeer;
+
+    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    auto const queueCount           = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+    auto       slotCount            = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
+    if (slotCount == 0)
+    {
+        auto const queueSize     = totalSize / queueCount;
+        auto const producerCount = (topo.ranksPerPeer + queueCount - 1) / queueCount;
+        slotCount                = cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, producerCount);
+    }
+
+    std::scoped_lock<std::mutex> lock(_mutex);
+    InitializeShm_(lock, totalSize, queueCount, slotCount);
 }
 
 void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd)
@@ -2288,7 +2355,7 @@ void Server::RecieveStateRegistryFragments_(cipc::SessionId const&              
             pendingData->tensorShards = std::move(tensorShards);
             pendingData->blobMetas    = std::move(blobMetas);
             pendingData->recvFrom     = fromRank;
-            pendingData->recievedAt   = PerfClock::now();
+            pendingData->receivedAt   = PerfClock::now();
             _pendingSessionData[sessionId].push_back(std::move(pendingData));
             return;
         }
@@ -2558,6 +2625,68 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::write(stream, res);
 
         ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
+    }
+    else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in local registry endpoint"); }
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        auto const& body = bodyParser.get().body();
+
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, version};
+        try
+        {
+            ActivateSession_(sessionId, 1, body);
+            res.result(boost::beast::http::status::accepted);
+            res.body() = "{}";
+        } catch (std::exception const& e)
+        {
+            res.result(boost::beast::http::status::insufficient_storage);
+            res.body() = e.what();
+        }
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(keepAlive);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        Ping();
+    }
+    else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in local registry endpoint"); }
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+
+        // Registries are no longer constrained to a shared-memory slot and may
+        // legitimately take longer than the ordinary control-request timeout.
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        auto const& body = bodyParser.get().body();
+
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, version};
+        try
+        {
+            ReceiveLocalRegistry_(sessionId, body);
+            res.result(boost::beast::http::status::accepted);
+            res.body() = "{}";
+        } catch (std::exception const& e)
+        {
+            res.result(boost::beast::http::status::insufficient_storage);
+            res.body() = e.what();
+        }
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(keepAlive);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        Ping();
     }
     else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
     {

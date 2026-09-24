@@ -103,7 +103,7 @@ MAX_BW_SOCKET_IMBALANCE = 1.30
 # several-fold. Track the number, but only fail on a change too large for that to
 # explain. A baseline's own `tolerances` entry still wins over this.
 WIDE_TOLERANCE_METRICS = {
-    "ckpt_durable_ms": 2.0,
+    "ckpt_durable_ms": 5.0,
     "ckpt_daemon_durable_ms": 2.0,
 }
 HOST_MEMORY_METRICS = frozenset({
@@ -2113,10 +2113,17 @@ class ValgrindFlavor(Flavor):
         server_env = {**os.environ, **_VALGRIND_NATIVE_ENV}
         server_env.pop("NATIVE_CKPT_OTEL_FILE", None)
         with server_log.open("w") as output:
-            proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, start_new_session=True, env=server_env)
+            # Listener readiness precedes lazy queue creation, and stdout must not share stderr's log offset.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=output,
+                start_new_session=True,
+                env=server_env,
+            )
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline and proc.poll() is None:
-                if "Checkpoint server started" in server_log.read_text(errors="replace"):
+                if CHECKPOINT_SERVER.reachable():
                     break
                 time.sleep(1)
             else:

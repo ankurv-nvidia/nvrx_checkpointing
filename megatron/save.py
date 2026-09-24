@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+
 from megatron.core import mpu  # type: ignore[import-not-found]
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  # type: ignore[import-not-found]
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
@@ -40,7 +41,14 @@ if TYPE_CHECKING:
 
 _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 _CONTENT_METADATA_KEY = "content_metadata"
+_RERUN_STATE_KEY = "rerun_state_machine"
+_RNG_STATE_KEY = "rng_state"
+_SERIALIZED_SHARDED_OBJECT_ATTR = "_nvrx_serialized_blob"
+_COMMON_STATE_PADDING = 512
+_COMMON_STATE_ALIGNMENT = 1024
 _root = None
+_common_state_capacity: int | None = None
+_sharded_object_capacities: dict[str, int] = {}
 
 
 @dataclass
@@ -92,6 +100,84 @@ def detect_peers(rank: int, world_size: int) -> OrderedPeers:
     raise RuntimeError("Unable to detect peers for distributed run")
 
 
+def _snapshot_blob_capacity(serialized_size: int) -> int:
+    padded_size = serialized_size + _COMMON_STATE_PADDING
+    return ((padded_size + _COMMON_STATE_ALIGNMENT - 1) // _COMMON_STATE_ALIGNMENT) * _COMMON_STATE_ALIGNMENT
+
+
+def _prepare_rng_sharded_object_blobs(value: object) -> None:
+    """Serialize variable-size RNG ShardedObjects into a stable slot."""
+    if isinstance(value, dict):
+        for child in value.values():
+            _prepare_rng_sharded_object_blobs(child)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            _prepare_rng_sharded_object_blobs(child)
+        return
+    if type(value).__name__ != "ShardedObject" or not hasattr(value, "data") or not hasattr(value, "unique_key"):
+        return
+
+    replica_id = getattr(value, "replica_id", 0)
+    if (isinstance(replica_id, int) and replica_id != 0) or (
+        not isinstance(replica_id, int) and any(component != 0 for component in replica_id)
+    ):
+        return
+
+    buffer = io.BytesIO()
+    torch.save([value.data], buffer)
+    serialized = buffer.getvalue()
+    unique_key = str(value.unique_key)
+    capacity = _sharded_object_capacities.setdefault(unique_key, _snapshot_blob_capacity(len(serialized)))
+    if len(serialized) > capacity:
+        raise RuntimeError(
+            f"sharded object '{unique_key}' serialized to {len(serialized)} bytes, exceeding its registered {capacity}-byte capacity",
+        )
+    setattr(value, _SERIALIZED_SHARDED_OBJECT_ATTR, serialized.ljust(capacity, b"\0"))
+
+
+def _prepare_registration_state_dict(state_dict: dict, iteration: int) -> dict:
+    """Convert Megatron's generated state into the representation native saves."""
+    args = state_dict.get("args")
+    needs_rerun_state = _RERUN_STATE_KEY not in state_dict
+    needs_rng_state = _RNG_STATE_KEY not in state_dict and args is not None and not getattr(args, "no_save_rng", False)
+    if needs_rerun_state or needs_rng_state:
+        state_dict = dict(state_dict)
+    if needs_rerun_state:
+        state_dict[_RERUN_STATE_KEY] = get_rerun_state_machine().state_dict(
+            data_iterator=None,
+            ckpt_format="torch_dist",
+            force=True,
+        )
+    if needs_rng_state:
+        state_dict[_RNG_STATE_KEY] = get_rng_state(
+            "torch_dist",
+            mpu.get_tensor_model_parallel_group(),
+            mpu.get_pipeline_model_parallel_group(),
+        )
+    sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
+    _prepare_rng_sharded_object_blobs(sharded_part.get(_RNG_STATE_KEY))
+    snapshot_state = {}
+    if torch.distributed.get_rank() == 0:
+        with _checkpoint_span("nvrx.checkpoint.register_state_dict.serialize_common_state", iteration):
+            global _common_state_capacity  # noqa: PLW0603
+            buffer = io.BytesIO()
+            # TODO_BG_SERIALIZE: Measure and move this GIL-held archive creation.  # noqa: FIX002, TD002, TD003, TD004
+            torch.save([common], buffer)
+            common_state = buffer.getvalue()
+            if _common_state_capacity is None:
+                _common_state_capacity = _snapshot_blob_capacity(len(common_state))
+            if len(common_state) > _common_state_capacity:
+                raise RuntimeError(
+                    f"common state serialized to {len(common_state)} bytes, exceeding its "
+                    f"registered {_common_state_capacity}-byte capacity",
+                )
+            snapshot_state[_DCP_COMMON_STATE_KEY] = common_state.ljust(_common_state_capacity, b"\0")
+    prepared_state = dict(sharded_part)
+    prepared_state.update(snapshot_state)
+    return prepared_state
+
+
 def _get_executor() -> ThreadPoolExecutor:
     """Return the single worker that waits for native durability."""
     global _executor  # noqa: PLW0603
@@ -126,17 +212,16 @@ def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -
         _executor = None
 
 
-def warmup() -> None:
-    """Initialize native save resources before training begins."""
-    _get_executor()
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    ordered_peers = detect_peers(rank, world_size)
-    checkpoint.model_state.warmup(
-        rank,
-        world_size,
-        **ordered_peers.checkpoint_args(),
-    )
+def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_state:
+    """Register the current state dictionary on the process-global state tree."""
+    global _root  # noqa: PLW0603
+    if _root is None:
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        ordered_peers = detect_peers(rank, world_size)
+        _root = checkpoint.model_state.create_root(rank, world_size, **ordered_peers.checkpoint_args())
+    _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
+    return _root
 
 
 # The writer and finalizer use the same fixed session.
@@ -167,16 +252,16 @@ def save_checkpoint(save_args: SaveCheckpointArgs) -> None:
             raise
 
 
-def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> None:  # noqa: C901, PLR0915
+def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> None:  # noqa: PLR0915
     """Build the current Megatron state and submit one native checkpoint.
 
-    The first save registers the state tree. Later saves merge the newly built state
-    dictionary into the cached Python dictionary before refreshing the registered nodes.
+    The load path or first save creates the process-global state tree. Every save
+    rescans the complete dictionary and refreshes the registered values and tensor pointers.
 
     Dataloader resume, logging hooks, fault tolerance, retention cleanup, and
     ModelOpt state are outside this provider's state contract.
     """
-    global _pending, _root  # noqa: PLW0603
+    global _pending  # noqa: PLW0603
     iteration = save_args.iteration
     with _checkpoint_span("nvrx.checkpoint.prepare", iteration):
         with _checkpoint_span("nvrx.checkpoint.wait_previous", iteration):
@@ -226,17 +311,15 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 rerun_state=rerun_state,
             )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
-            # Native validates exact 1:1 refresh correspondence after the first traversal.
-            sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
-            if "args" in common:
+            if "args" in state_dict:
                 # Saved arguments describe the synchronous reader used for native loads.
-                saved_args = copy.copy(common["args"])
+                saved_args = copy.copy(state_dict["args"])
                 saved_args.async_strategy = "mcore"
-                common["args"] = saved_args
+                state_dict["args"] = saved_args
             rank = torch.distributed.get_rank()
             if rank == 0:
                 # Rank 0 stores portable optimizer-sharding metadata without the process group.
-                common[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
+                state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
             # Native checkpoints always use the torch_dist format.
             print_rank_0(
@@ -246,26 +329,9 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
     with _checkpoint_span("megatron.checkpoint.save.io_write", iteration):
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
-            root = _root
-            first_registration = root is None
-            if root is None:
-                world_size = torch.distributed.get_world_size()
-                ordered_peers = detect_peers(rank, world_size)
-                root = checkpoint.model_state.create_root(rank, world_size, **ordered_peers.checkpoint_args())
+            with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
+                root = register_state_dict(state_dict, iteration)
             root.startedAt = started_at_ns
-            with _checkpoint_span("nvrx.checkpoint.serialize_common_state", iteration):
-                snapshot_state = {}
-                if rank == 0:
-                    buffer = io.BytesIO()
-                    # TODO_BG_SERIALIZE: Measure and move this GIL-held archive creation.  # noqa: FIX002, TD002, TD003, TD004
-                    torch.save([common], buffer)
-                    snapshot_state[_DCP_COMMON_STATE_KEY] = buffer.getvalue()
-            refreshed_state = dict(sharded_part)
-            refreshed_state.update(snapshot_state)
-            root.register_state_dict(refreshed_state)
-            if first_registration:
-                root.finalize_registry()
-                _root = root
             root.save_async(iteration, checkpoint_dir)
 
         if not getattr(args, "async_save", False):
@@ -286,20 +352,20 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                     f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
                 )
 
+            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_deferred_save", iteration):
+                root.wait_for_deferred_save()
             with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
                 future = _get_executor().submit(checkpoint.wait_for_ckpt_finalize, _SESSION_ID, iteration)
                 _pending = _PendingSave(future, finalize_fn)
                 print_rank_0(
                     f"  [{_timestamp()}] scheduled an async checkpoint save at iteration {iteration:7d} to {args.save}",
                 )
-            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_deferred_save", iteration):
-                root.wait_for_deferred_save()
 
 
 __all__ = [
     "SaveCheckpointArgs",
     "init_persistent_async_worker",
     "maybe_finalize_async_save",
+    "register_state_dict",
     "save_checkpoint",
-    "warmup",
 ]

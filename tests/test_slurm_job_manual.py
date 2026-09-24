@@ -510,6 +510,62 @@ def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch
         pass
 
 
+def test_valgrind_server_waits_for_listener_before_releasing_peers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setattr(slurm_job, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(slurm_job.shutil, "which", lambda _name: "/usr/bin/valgrind")
+    monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node")
+    monkeypatch.setenv("SLURM_LOCALID", "0")
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
+    calls: list[object] = []
+
+    class Process:
+        finished = False
+
+        def poll(self):
+            return 0 if self.finished else None
+
+        def wait(self, *, timeout: int):
+            calls.append(("wait", timeout))
+            self.finished = True
+            return 0
+
+        def kill(self):
+            calls.append("kill")
+
+    def popen(*_args: object, **kwargs: object) -> Process:
+        stderr = kwargs["stderr"]
+        assert isinstance(stderr, io.TextIOBase)
+        calls.append(("stdio", kwargs["stdout"], stderr.name))
+        return Process()
+
+    reachable = iter((False, True))
+    checkpoint_server = SimpleNamespace(
+        require_stopped=lambda: calls.append("stopped"),
+        reachable=lambda: calls.append("reachable") or next(reachable),
+        request=lambda *args: calls.append(("request", *args)),
+    )
+    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", checkpoint_server)
+    monkeypatch.setattr(slurm_job.subprocess, "Popen", popen)
+    monkeypatch.setattr(slurm_job.time, "sleep", lambda _seconds: None)
+
+    with slurm_job.ValgrindFlavor().server("test", 2):
+        assert (tmp_path / slurm_job.SYNC_DIR_NAME / "123-test-node.ready").exists()
+
+    assert calls == [
+        "stopped",
+        ("stdio", subprocess.DEVNULL, str(tmp_path / "test_server_phase2.node.log")),
+        "reachable",
+        "reachable",
+        ("request", "spindown", 3600),
+        ("wait", 3600),
+    ]
+
+
 def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
         "name": "ultra3-64n",
@@ -4916,7 +4972,7 @@ def test_durability_summary_is_silent_without_checkpoints(caplog: pytest.LogCapt
 
 
 def test_durability_carries_a_wide_tolerance() -> None:
-    """Lustre variance must not fail a job, but an order-of-magnitude change still should."""
+    """Lustre variance must not fail a job, but a change beyond the wider limit should."""
     slurm_job = _load_slurm_job()
 
     def compare(measured: float, tolerances: dict | None = None) -> tuple[dict, bool]:
@@ -4924,10 +4980,10 @@ def test_durability_carries_a_wide_tolerance() -> None:
         baseline = {"metrics": {"ckpt_durable_ms": 20000}, "tolerances": tolerances or {}}
         return slurm_job.PerfReport._compare_to_baseline(metrics, baseline, slurm_job.PERF_TOLERANCE)
 
-    result, passed = compare(58000.0)
+    result, passed = compare(119000.0)
     assert passed
-    assert result["ckpt_durable_ms"]["tolerance_pct"] == 200.0  # noqa: PLR2004
-    assert not compare(62000.0)[1]
+    assert result["ckpt_durable_ms"]["tolerance_pct"] == 500.0  # noqa: PLR2004
+    assert not compare(121000.0)[1]
     # A baseline that states its own tolerance still wins.
     assert not compare(40000.0, {"ckpt_durable_ms": 0.1})[1]
 

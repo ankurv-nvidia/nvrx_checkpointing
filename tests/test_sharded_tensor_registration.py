@@ -4,10 +4,25 @@
 
 from __future__ import annotations
 
+import gc
+import threading
+import weakref
+from enum import Enum, auto
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
 from nvrx_checkpointing import checkpoint
 from nvrx_checkpointing.megatron.mapping import ShardedObject, ShardedTensor, ShardedTensorFactory
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+class _CudaGraphModule(Enum):
+    MAMBA = auto()
+    ATTN = auto()
+    MOE_ROUTER = auto()
 
 
 def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
@@ -25,6 +40,7 @@ def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
 
     root.register_state_dict({"weight_shards": tensors})
+    assert root.snapshot_size == sum(tensor.data.numel() * tensor.data.element_size() for tensor in tensors)
 
 
 def test_register_state_dict_repoints_sharded_tensor_data() -> None:
@@ -33,30 +49,73 @@ def test_register_state_dict_repoints_sharded_tensor_data() -> None:
     fresh = ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32) + 10, (0, 0, 1))
     state = {"weight": initial}
     root.register_state_dict(state)
+    root.finalize_registry()
 
-    root.register_state_dict({"weight": fresh})
+    refreshed = {"weight": fresh}
+    root.register_state_dict(refreshed)
+    assert root.snapshot_size == fresh.data.numel() * fresh.data.element_size()
 
-    assert state["weight"] is fresh
+    assert state["weight"] is initial
+    assert refreshed["weight"] is fresh
+
+
+def test_register_state_dict_releases_superseded_python_objects() -> None:
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    tensor = torch.arange(4, dtype=torch.float32)
+    tensor_ref = weakref.ref(tensor)
+    state = {"weight": ShardedTensor.from_rank_offsets("weight", tensor, (0, 0, 1))}
+
+    root.register_state_dict(state)
+    root.finalize_registry()
+    root.register_state_dict(
+        {"weight": ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32), (0, 0, 1))},
+    )
+    assert root.snapshot_size == 4 * 4
+    del state, tensor
+    gc.collect()
+
+    assert tensor_ref() is None
 
 
 def test_register_state_dict_refreshes_when_the_same_dictionary_is_reused() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     state = {"rng_state": ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))}
     root.register_state_dict(state)
+    assert root.snapshot_size > 0
+    root.finalize_registry()
     state["rng_state"] = ShardedObject("rng_state", {"iteration": 2, "payload": "x" * 4096}, (1,), (0,))
 
-    with pytest.raises(RuntimeError, match=r"exceeding its registered .* snapshot capacity"):
-        root.register_state_dict(state)
+    root.register_state_dict(state)
+    with pytest.raises(RuntimeError, match=r"changed serialized size after registry synchronization"):
+        _ = root.snapshot_size
 
 
 def test_register_state_dict_accepts_dotted_sharded_object_key() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     state = {"rng_state": ShardedObject("nested.rng_state", {"iteration": 1}, (1,), (0,))}
     root.register_state_dict(state)
+    root.finalize_registry()
 
-    root.register_state_dict({"rng_state": ShardedObject("nested.rng_state", {"iteration": 2}, (1,), (0,))})
+    refreshed = {"rng_state": ShardedObject("nested.rng_state", {"iteration": 2}, (1,), (0,))}
+    root.register_state_dict(refreshed)
+    assert root.snapshot_size > 0
 
-    assert state["rng_state"].data == {"iteration": 2}
+    assert state["rng_state"].data == {"iteration": 1}
+    assert refreshed["rng_state"].data == {"iteration": 2}
+
+
+def test_register_state_dict_uses_prepared_sharded_object_blob() -> None:
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
+    setattr(initial, "_nvrx_serialized_blob", b"a" * 2048)
+    root.register_state_dict({"rng_state": initial})
+    root.finalize_registry()
+
+    refreshed = ShardedObject("rng_state", {"iteration": 2}, (1,), (0,))
+    setattr(refreshed, "_nvrx_serialized_blob", b"b" * 2048)
+    root.register_state_dict({"rng_state": refreshed})
+
+    assert root.snapshot_size == 2048
 
 
 def test_register_state_dict_is_the_only_state_registration_method() -> None:
@@ -68,6 +127,9 @@ def test_register_state_dict_is_the_only_state_registration_method() -> None:
     assert not hasattr(root, "register_scalars_in_dict")
     assert not hasattr(root, "register_weight_tensor")
     assert not hasattr(root, "register_immediate_tensor")
+    assert not hasattr(root, "add_child")
+    assert not hasattr(root, "warmup_for_snapshot")
+    assert not hasattr(checkpoint.model_state, "warmup")
 
 
 def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
@@ -82,12 +144,38 @@ def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
 
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     root.register_state_dict({"weight": factory(torch.float32)})
+    assert root.snapshot_size == 4 * 4
+    root.finalize_registry()
 
+    root.register_state_dict({"weight": factory(torch.float64)})
     with pytest.raises(RuntimeError, match=r"changed tensor metadata"):
-        root.register_state_dict({"weight": factory(torch.float64)})
+        _ = root.snapshot_size
 
 
-def test_register_state_dict_accepts_nested_and_dotted_partial_state() -> None:
+def test_state_registration_runs_asynchronously() -> None:
+    calls: list[tuple[int, float]] = []
+
+    def factory(value: float) -> ShardedTensorFactory:
+        tensor = torch.full((4,), value, dtype=torch.float32)
+
+        def build(key: str, data: torch.Tensor, *_args: object) -> list[ShardedTensor]:
+            calls.append((threading.get_ident(), value))
+            return [ShardedTensor.from_rank_offsets(key, data, (0, 0, 1))]
+
+        return ShardedTensorFactory(key="weight", data=tensor, build_fn=build, merge_fn=None)
+
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict({"weight": factory(1)})
+    assert root.snapshot_size == 4 * 4
+    root.finalize_registry()
+    root.register_state_dict({"weight": factory(2)})
+    assert root.snapshot_size == 4 * 4
+
+    assert [value for _, value in calls] == [1, 2]
+    assert all(thread != threading.get_ident() for thread, _ in calls)
+
+
+def test_register_state_dict_rebinds_a_complete_nested_state() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {
@@ -95,18 +183,20 @@ def test_register_state_dict_accepts_nested_and_dotted_partial_state() -> None:
         "nested": {"step": 1, "untouched": 2, "none": None, "empty": []},
     }
     root.register_state_dict(state)
+    root.finalize_registry()
 
-    root.register_state_dict(
-        {
-            "rng_state": ShardedObject("rng_state", {"iteration": 2}, (1,), (0,)),
-            "nested.step": 3,
-            "nested": {"none": None, "empty": []},
-        },
-    )
+    refreshed = {
+        "rng_state": ShardedObject("rng_state", {"iteration": 2}, (1,), (0,)),
+        "nested": {"step": 3, "untouched": 2, "none": None, "empty": []},
+    }
+    root.register_state_dict(refreshed)
+    assert root.snapshot_size > 0
 
-    assert state["rng_state"].data == {"iteration": 2}
-    assert state["nested"]["step"] == 3
+    assert state["rng_state"].data == {"iteration": 1}
+    assert state["nested"]["step"] == 1
     assert state["nested"]["untouched"] == 2
+    assert refreshed["rng_state"].data == {"iteration": 2}
+    assert refreshed["nested"]["step"] == 3
 
 
 def test_register_state_dict_matches_optimizer_tuple_keys() -> None:
@@ -114,9 +204,13 @@ def test_register_state_dict_matches_optimizer_tuple_keys() -> None:
     dtype_pair = (torch.bfloat16, torch.float32)
     state = {"optimizer": {dtype_pair: {"step": 1}}}
     root.register_state_dict(state)
+    root.finalize_registry()
 
-    root.register_state_dict({"optimizer": {dtype_pair: {"step": 2}}})
-    assert state["optimizer"][dtype_pair]["step"] == 2
+    refreshed = {"optimizer": {dtype_pair: {"step": 2}}}
+    root.register_state_dict(refreshed)
+    assert root.snapshot_size == 0
+    assert state["optimizer"][dtype_pair]["step"] == 1
+    assert refreshed["optimizer"][dtype_pair]["step"] == 2
 
 
 def test_register_state_dict_matches_nested_optimizer_bucket_lists() -> None:
@@ -124,47 +218,118 @@ def test_register_state_dict_matches_nested_optimizer_bucket_lists() -> None:
     dtype_pair = (torch.bfloat16, torch.float32)
     initial = {"optimizer": {"param_state": {0: {dtype_pair: [[{"step": 1}]]}}}}
     root.register_state_dict(initial)
+    root.finalize_registry()
 
     refreshed = {"optimizer": {"param_state": {0: {dtype_pair: [[{"step": 2}]]}}}}
     root.register_state_dict(refreshed)
-    assert initial["optimizer"]["param_state"][0][dtype_pair][0][0]["step"] == 2
+    assert root.snapshot_size == 0
+    assert initial["optimizer"]["param_state"][0][dtype_pair][0][0]["step"] == 1
+    assert refreshed["optimizer"]["param_state"][0][dtype_pair][0][0]["step"] == 2
+
+
+def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
+    """Accept Megatron's Mamba conv1d state-name compatibility mapping."""
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    checkpoint_key = "decoder.layers.0.mixer.conv1d.weight"
+    factory = ShardedTensorFactory(
+        key=checkpoint_key,
+        data=tensor,
+        build_fn=lambda key, data, replica_id, _flattened_range: [
+            ShardedTensor.from_rank_offsets(key, data, replica_id=replica_id),
+        ],
+        merge_fn=lambda values: values,
+    )
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+
+    root.register_state_dict({"decoder.layers.0.mixer.conv1d_weight": factory})
+
+    assert root.snapshot_size == tensor.numel() * tensor.element_size()
+
+
+def test_state_registration_accepts_integer_enum_list() -> None:
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+
+    root.register_state_dict(
+        {
+            "args": {
+                "cuda_graph_modules": [
+                    _CudaGraphModule.MAMBA,
+                    _CudaGraphModule.ATTN,
+                    _CudaGraphModule.MOE_ROUTER,
+                ],
+            },
+        },
+    )
+
+    assert root.snapshot_size == 3 * 8
+    with pytest.raises(AttributeError):
+        root.snapshot_size = 0
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_register_state_dict_rejects_snapshot_capacity_overflow(rank: int) -> None:
+def test_register_state_dict_rejects_blob_size_changes(rank: int) -> None:
     root = checkpoint.model_state.create_root(rank, 2, ["coordinator", "remote"], 1)
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {"rng_state": initial}
     root.register_state_dict(state)
+    assert root.snapshot_size > 0
+    root.finalize_registry()
     fresh = ShardedObject("rng_state", {"iteration": 2, "payload": "x" * 4096}, (1,), (0,))
 
-    with pytest.raises(RuntimeError, match=r"exceeding its registered .* snapshot capacity"):
-        root.register_state_dict({"rng_state": fresh})
+    root.register_state_dict({"rng_state": fresh})
+    with pytest.raises(RuntimeError, match=r"changed serialized size after registry synchronization"):
+        _ = root.snapshot_size
 
 
-def test_register_state_dict_rejects_duplicate_normalized_paths() -> None:
+def test_register_state_dict_accepts_repeated_normalized_paths() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
-    state = {"a": {"b": 1}}
-    root.register_state_dict(state)
+    initial = ShardedTensor.from_rank_offsets("a.b", torch.arange(4, dtype=torch.float32), (0, 0, 1))
+    root.register_state_dict({"a": {"b": initial}})
+    root.finalize_registry()
+    direct = ShardedTensor.from_rank_offsets("a.b", torch.arange(4, dtype=torch.float32), (0, 0, 1))
+    nested = ShardedTensor.from_rank_offsets("a.b", torch.arange(4, dtype=torch.float32), (0, 0, 1))
 
-    with pytest.raises(RuntimeError, match=r"duplicate normalized state 'a.b'"):
-        root.register_state_dict({"a.b": 2, "a": {"b": 3}})
+    root.register_state_dict({"direct": direct, "a": {"b": nested}})
+    assert root.snapshot_size == 4 * 4
 
 
 @pytest.mark.parametrize(
     ("fresh", "path"),
     [
         ({"unknown": 2}, "unknown"),
-        ({"unknown": None}, "unknown"),
-        ({"unknown": []}, "unknown"),
-        ({"unknown": ()}, "unknown"),
-        ({"known": {"unknown": None}}, "known.unknown"),
+        ({"known": {"value": 1}, "unknown": 2}, "unknown"),
+        ({"known": {"value": 1, "unknown": 2}}, "known.unknown"),
     ],
 )
 def test_register_state_dict_rejects_unregistered_path(fresh: dict, path: str) -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     state = {"known": {"value": 1}}
     root.register_state_dict(state)
+    assert root.snapshot_size == 0
+    root.finalize_registry()
 
+    root.register_state_dict(fresh)
     with pytest.raises(RuntimeError, match=rf"supplied state '{path}' is not registered"):
-        root.register_state_dict(fresh)
+        _ = root.snapshot_size
+
+
+def test_register_state_dict_allows_missing_registered_path() -> None:
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict({"known": {"value": 1}})
+    assert root.snapshot_size == 0
+    root.finalize_registry()
+
+    root.register_state_dict({"known": {}})
+    assert root.snapshot_size == 0
+
+
+def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict({"weight": torch.arange(4, dtype=torch.float32), "step": 1})
+    assert root.snapshot_size == 4 * 4
+    root.finalize_registry()
+
+    root.register_state_dict({"step": 2})
+    root.save_async(1, tmp_path / "iter_0000001")
+    with pytest.raises(RuntimeError, match=r"registered tensor 'weight' was not supplied for this snapshot"):
+        root.wait_for_deferred_save()

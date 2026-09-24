@@ -91,6 +91,79 @@ void SvcPing()
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
 }
 
+static void SvcRegisterLocalState(std::shared_ptr<StateTree> registry)
+{
+    SvcPing();
+
+    auto const topo        = registry->Topo();
+    auto const serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+    auto const port        = cipc::Message::Port + serverIndex;
+    auto       send        = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
+        static constexpr int      MaxAttempts = 5;
+        boost::system::error_code ec;
+        for (int attempt = 0; attempt < MaxAttempts; ++attempt)
+        {
+            ec.clear();
+            boost::asio::io_context        ioc;
+            boost::beast::tcp_stream       stream(ioc);
+            boost::asio::ip::tcp::resolver resolver(ioc);
+            auto                           results = resolver.resolve("localhost", std::to_string(port), ec);
+            if (ec) { continue; }
+            [[maybe_unused]] auto endpoint = stream.connect(results, ec);
+            if (ec) { continue; }
+
+            static constexpr int                                         HttpVersion11 = 11;
+            boost::beast::http::request<boost::beast::http::string_body> req{method, target, HttpVersion11};
+            req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", port));
+            req.set(boost::beast::http::field::content_type, "application/octet-stream");
+            req.body() = body;
+            req.prepare_payload();
+            boost::beast::http::write(stream, req, ec);
+            if (ec) { continue; }
+
+            boost::beast::flat_buffer                                     buffer;
+            boost::beast::http::response<boost::beast::http::string_body> res;
+            boost::beast::http::read(stream, buffer, res, ec);
+            if (ec) { continue; }
+            TryCleanShutdown(stream);
+            return res;
+        }
+        throw boost::system::system_error(ec);
+    };
+
+    auto requireSuccess = [port](auto const& response, std::string_view operation) {
+        if (response.result() != boost::beast::http::status::ok && response.result() != boost::beast::http::status::accepted)
+        {
+            throw std::runtime_error(
+                fmt::format("{} failed on port {}: HTTP {}: {}", operation, port, response.result_int(), response.body()));
+        }
+    };
+
+    std::stringstream activationStream;
+    serdes::WriteBlobWithSize<uint16_t>(activationStream, "");
+    StateSerDes::WriteTopology(activationStream, topo);
+    auto response
+        = send(boost::beast::http::verb::post, fmt::format("/api/activatesession/{}", cipc::SessionId::Default), activationStream.str());
+    requireSuccess(response, "session activation");
+
+    std::stringstream registryStream;
+    StateSerDes::Write(registryStream, *registry, StateNode::Handle::Root);
+    auto registryBody = registryStream.str();
+    registry.reset();
+    response = send(boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", cipc::SessionId::Default), registryBody);
+    requireSuccess(response, "local registry upload");
+}
+
+static uint8_t ResolveClientQueueCount(RankTopology const& topo)
+{
+    auto configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    if (configuredQueueCount == 0 && checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>() != 0)
+    {
+        configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount;
+    }
+    return cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+}
+
 void SvcStop()
 {
     SUPPRESS_WARNINGS_START
@@ -235,14 +308,22 @@ struct CheckpointWriter
     static cipc::MsgQueue OpenMsgQueue(RankTopology const& topo)
     {
         auto       localRank  = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
-        auto const queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-        // One queue per rank when queueCount covers the node's ranks; if a node
-        // has more ranks than queues, consecutive (same-socket) ranks share one.
-        auto const ranksPerQueue = std::max<size_t>(1, (topo.ranksPerPeer + queueCount - 1) / queueCount);
-        auto const index         = std::min<size_t>(localRank / ranksPerQueue, queueCount - 1);
-        auto       peerIndex     = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
-        auto       channelName   = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), static_cast<uint8_t>(index));
+        auto const queueCount = ResolveClientQueueCount(topo);
+        // Distribute consecutive local ranks as evenly as possible over the
+        // configured queues. Daemon-side sizing uses the same mapping.
+        auto const index       = cipc::QueueIndex(localRank, topo.ranksPerPeer, queueCount);
+        auto const peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+        auto const channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), index);
         return cipc::MsgQueue::Open(channelName);
+    }
+
+    static size_t D2HConcurrencyForQueue(RankTopology const& topo, cipc::MsgQueue const& queue)
+    {
+        auto const queueCount    = ResolveClientQueueCount(topo);
+        auto const localRank     = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
+        auto const queueIndex    = cipc::QueueIndex(localRank, topo.ranksPerPeer, queueCount);
+        auto const producerCount = cipc::QueueProducerCount(queueIndex, topo.ranksPerPeer, queueCount);
+        return cipc::QueueD2HConcurrency(queue.SlotCount(), producerCount);
     }
 
     // Note: a queue can be shared by multiple ranks
@@ -267,14 +348,17 @@ struct CheckpointWriter
         return Registry;
     }
 
-    static void WarmUpCheckpoint(RankTopology const& topo)
+    static void InitializeQueueAsync(StateTree const& root)
     {
+        auto const& topo = root.Topo();
+        if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::scoped_lock lock(reg.mu);
         if (reg.states.contains(topo.rank)) { return; }
-        auto state   = std::make_shared<QueueState>();
-        auto readyP  = std::make_shared<std::promise<void>>();
-        state->ready = readyP->get_future().share();
+        auto state         = std::make_shared<QueueState>();
+        auto readyP        = std::make_shared<std::promise<void>>();
+        auto registryClone = root.Clone();
+        state->ready       = readyP->get_future().share();
         reg.states.emplace(topo.rank, state);
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -283,12 +367,13 @@ struct CheckpointWriter
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
         state->numaNode = numa;
-        std::thread([topo, numa, state, readyP] {
-            SetThreadName("ncc:bufwarm");
+        std::thread([registryCopy = std::move(registryClone), numa, state, readyP]() {
+            SetThreadName("ncc:qinit");
             try
             {
-                SvcPing();
-                state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(topo));
+                auto const queueTopo = registryCopy->Topo();
+                SvcRegisterLocalState(std::move(registryCopy));
+                state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(queueTopo));
 #ifdef PHOENIX_HAVE_CUDA
                 auto region = state->queue->GetShmDataRegion();
                 BindRegionToNumaNode(numa, region.data(), region.size());
@@ -305,32 +390,52 @@ struct CheckpointWriter
         }).detach();
     }
 
-    static std::shared_ptr<QueueState> GetQueueState(RankTopology const& topo)
+    static std::shared_ptr<QueueState> GetQueueState(StateTree const& root)
     {
-        WarmUpCheckpoint(topo);
+        InitializeQueueAsync(root);
         std::shared_ptr<QueueState> state;
         {
             auto&            reg = Registry();
             std::scoped_lock lock(reg.mu);
-            state = reg.states.at(topo.rank);
+            state = reg.states.at(root.Topo().rank);
         }
-        state->ready.get();    // rethrows if the warmup failed to open/pin
+        state->ready.get();    // rethrows if queue initialization failed
         return state;
     }
 
-    static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo) { return *GetQueueState(topo)->queue; }
+    static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo)
+    {
+        std::shared_ptr<QueueState> state;
+        {
+            auto&            reg = Registry();
+            std::scoped_lock lock(reg.mu);
+            auto const       it = reg.states.find(topo.rank);
+            if (it == reg.states.end()) { throw std::logic_error("checkpoint queue was not initialized from a state registry"); }
+            state = it->second;
+        }
+        state->ready.get();
+        return *state->queue;
+    }
 
-    std::shared_ptr<QueueState> queueState = GetQueueState(root.Topo());
-    cipc::MsgQueue&             msgQueue   = *queueState->queue;
-    int const                   numaNode   = queueState->numaNode;
-    size_t const                slotSize   = msgQueue.SlotSize();    // runtime shm slot capacity, set by the server
+    std::shared_ptr<QueueState> queueState;
+    cipc::MsgQueue&             msgQueue;
+    int const                   numaNode;
+    size_t const                slotSize;    // runtime shm slot capacity, set by the server
+    size_t const                d2hConcurrency;
     std::atomic<uint32_t>       totalD2HRequests{0};
     std::atomic<uint32_t>       smallD2HRequests{0};
     std::atomic<uint64_t>       totalWrittenBytes{0};
 
     TimePoint const start = Clock::now();
 
-    explicit CheckpointWriter(StateTree const& rootIn LFTBND) : root(rootIn) {}
+    explicit CheckpointWriter(StateTree const& rootIn LFTBND) :
+        root(rootIn),
+        queueState(GetQueueState(root)),
+        msgQueue(*queueState->queue),
+        numaNode(queueState->numaNode),
+        slotSize(msgQueue.SlotSize()),
+        d2hConcurrency(D2HConcurrencyForQueue(root.Topo(), msgQueue))
+    {}
     ~CheckpointWriter() {}    // NOLINT(modernize-use-equals-default) causes GCC warnings
     CLASS_DELETE_COPY_AND_MOVE(CheckpointWriter);
 
@@ -527,19 +632,17 @@ struct CheckpointWriter
 
     void WriteTensors(cipc::SnapshotId const& snapshotId)
     {
-        static constexpr size_t D2HNumConcurrency = 4;
-
         auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
         if (totalTensorStateSizeInBytes == 0) { return; }
 
-        std::array<std::future<void>, D2HNumConcurrency> writerTasks{};
+        std::array<std::future<void>, cipc::D2HConcurrency> writerTasks{};
 
-        auto buffersChunksPerPartition
-            = (totalTensorStateSizeInBytes + (slotSize * D2HNumConcurrency) - 1) / (slotSize * D2HNumConcurrency);
+        auto const concurrentBufferBytes     = slotSize * d2hConcurrency;
+        auto const buffersChunksPerPartition = (totalTensorStateSizeInBytes + concurrentBufferBytes - 1) / concurrentBufferBytes;
         // std::views::enumerate not yet available in libc++ 21.1.7 as of (2026-01-05)
         // https://github.com/llvm/llvm-project/pull/73617 for (auto [index, task] : std::views::enumerate(writerTasks))
 
-        for (uint8_t index = 0; index < D2HNumConcurrency; ++index)
+        for (uint8_t index = 0; index < d2hConcurrency; ++index)
         {
             auto&          task                = writerTasks[index];    // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
             uint64_t const partitionBufferSize = (buffersChunksPerPartition * slotSize);
@@ -658,74 +761,13 @@ void WaitForCheckpointSave(RankTopology const& topo)
     for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
-void WarmUpCheckpoint(RankTopology const& topo)
-{ CheckpointWriter::WarmUpCheckpoint(topo); }
-
-void FinalizeStateRegistry(StateTree& self)
-{
-    SetThreadName("ncc:finst");
-    auto const& topo     = self.Topo();
-    auto&       msgQueue = CheckpointWriter::GetMsgQueue(topo);
-
-    self.FinalizeRegistry();
-    {
-        std::stringstream sstrm;
-        serdes::WriteBlobWithSize<uint16_t>(sstrm, "");
-        StateSerDes::WriteTopology(sstrm, topo);
-        auto msg = sstrm.str();
-        msgQueue.Push({cipc::Message::ActivateSession{.sessionId = cipc::SessionId{0}, .messageSize = static_cast<uint32_t>(msg.size())}},
-                      msg.data(),
-                      msg.size());
-    }
-    {
-        std::stringstream sstrm;
-
-        StateSerDes::Write(sstrm, self, StateNode::Handle::Root);
-        auto msg = sstrm.str();
-        msgQueue.Push(cipc::Message::LocalStateRegistry{.sessionId = cipc::SessionId{0}, .messageSize = static_cast<uint32_t>(msg.size())},
-                      msg.data(),
-                      msg.size());
-    }
-}
+void InitializeQueueAsync(StateTree const& registry)
+{ CheckpointWriter::InitializeQueueAsync(registry); }
 
 // For now, we don't have any deferred tensors to save, so this is a no-op. In the future, we can add logic here to save any remaining
 // tensors that were deferred during registration.
 [[noreturn]] static void LoadCheckpointforStateTreeFromStream(StateTree& /* tree */, std::istream& /* stream */)
-{
-    throw std::logic_error("TODO");
-#ifdef TODO_LOAD_CHECKPOINT
-    StateSerDes::ReadIntoNode(stream, tree, 0);
-    for (auto& node : tree.nodes)
-    {
-        auto& handler = tree.handlers[node.handle];
-        switch (static_cast<StateNode::Type>(node.data.index()))
-        {
-        case StateTree::StateType::Scalar:
-        {
-            handler->SetScalarState(std::get<StateNode::Scalar>(node.data));
-            break;
-        }
-        case StateTree::StateType::Blob:
-        {
-            handler->SetBlob(std::string_view(std::get<StateNode::Blob>(node.data)));
-            break;
-        }
-        case StateTree::StateType::Tensor:
-        {
-            handler->SetTensorState(std::get<StateNode::Tensor>(node.data));
-            break;
-        }
-        case StateTree::StateType::Dict:
-        {
-            break;
-        }
-        case StateTree::StateType::Unknown: [[fallthrough]];
-        case StateTree::StateType::Invalid: [[fallthrough]];
-        default: throw std::runtime_error("Unsupported state type in checkpoint");
-        }
-    }
-#endif
-}
+{ throw std::logic_error("TODO"); }
 
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath)
 {

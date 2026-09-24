@@ -15,6 +15,8 @@
 #include <fmt/std.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -24,10 +26,110 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace checkpoint::ipc
 {
-static constexpr size_t MinShmSize = 32ull * 1024ull * 1024ull;    // 32MB
+static constexpr size_t  MinShmSize                    = 32ull * 1024ull * 1024ull;    // 32MB
+static constexpr size_t  D2HConcurrency                = 4;
+static constexpr size_t  TargetShmSlotSize             = 2ull * 1024ull * 1024ull * 1024ull;
+static constexpr uint8_t ExplicitSizeDefaultQueueCount = 4;
+static constexpr size_t  ExplicitSizeDefaultSlotCount  = 4;
+
+#ifdef PHOENIX_BUILD_FOR_VALGRIND
+// Valgrind tracks V-bits/A-bits for every mapped byte and keeps a fixed-size
+// segment table (aspacem). The default sizes below produce 1 GiB of shm per
+// rank plus many 8 MiB writer-thread stacks, which exhausts valgrind's
+// shadow memory / segment table on multi-rank runs. Shrink aggressively when
+// building specifically for a valgrind run.
+static constexpr size_t MaxShmSize = 128ull * 1024ull * 1024ull;
+#else
+static constexpr size_t MaxShmSize = 256ull * 1024ull * 1024ull * 1024ull;    // 256GB
+#endif
+static constexpr size_t MinSnapshotShmSize = MinShmSize / 4;
+
+inline size_t RoundSnapshotShmSize(size_t snapshotSize)
+{
+    if (snapshotSize == 0) { return MinSnapshotShmSize; }
+    snapshotSize        = std::min(snapshotSize, MaxShmSize);
+    auto const half     = std::max<size_t>(snapshotSize / 2, 1);
+    auto const quantum  = std::max<size_t>(std::bit_floor(half), 1ull << 20);
+    auto const withRoom = snapshotSize + ((snapshotSize + 3) / 4);
+    auto       rounded  = std::max(((withRoom + quantum - 1) / quantum) * quantum, MinSnapshotShmSize);
+    if (snapshotSize >= TargetShmSlotSize)
+    {
+        auto const dataSlots        = std::max(D2HConcurrency, 1 + ((snapshotSize - 1) / TargetShmSlotSize));
+        auto const slotsWithControl = std::min(dataSlots + 1, MaxShmSize / TargetShmSlotSize);
+        rounded                     = std::max(rounded, slotsWithControl * TargetShmSlotSize);
+    }
+    return std::min(rounded, MaxShmSize);
+}
+
+inline uint8_t ResolveQueueCount(uint32_t ranksPerPeer, uint8_t configuredQueueCount)
+{
+    if (ranksPerPeer == 0 || ranksPerPeer > std::numeric_limits<uint8_t>::max())
+    {
+        throw std::invalid_argument("ranks per peer must fit in the queue index");
+    }
+    return configuredQueueCount == 0 ? static_cast<uint8_t>(ranksPerPeer)
+                                     : static_cast<uint8_t>(std::min<uint32_t>(ranksPerPeer, configuredQueueCount));
+}
+
+inline uint8_t QueueIndex(uint32_t localRank, uint32_t ranksPerPeer, uint8_t queueCount)
+{
+    if (localRank >= ranksPerPeer || queueCount == 0 || queueCount > ranksPerPeer)
+    {
+        throw std::invalid_argument("rank and queue counts are inconsistent");
+    }
+    return static_cast<uint8_t>((static_cast<uint64_t>(localRank) * queueCount) / ranksPerPeer);
+}
+
+inline size_t QueueProducerCount(uint8_t queueIndex, uint32_t ranksPerPeer, uint8_t queueCount)
+{
+    if (queueCount == 0 || queueCount > ranksPerPeer || queueIndex >= queueCount)
+    {
+        throw std::invalid_argument("queue index must be less than the active queue count");
+    }
+    size_t producers = 0;
+    for (uint32_t localRank = 0; localRank < ranksPerPeer; ++localRank)
+    {
+        if (QueueIndex(localRank, ranksPerPeer, queueCount) == queueIndex) { ++producers; }
+    }
+    return producers;
+}
+
+inline size_t QueueD2HConcurrency(size_t slotCount, size_t producerCount)
+{
+    if (slotCount == 0 || producerCount == 0) { throw std::invalid_argument("slot and producer counts must be nonzero"); }
+    return std::min(D2HConcurrency, std::max<size_t>(1, slotCount / producerCount));
+}
+
+inline std::vector<size_t> QueueSnapshotShmSizes(std::span<size_t const> snapshotSizes, uint32_t ranksPerPeer, uint8_t queueCount)
+{
+    if (ranksPerPeer == 0 || snapshotSizes.size() != ranksPerPeer || queueCount == 0 || queueCount > ranksPerPeer)
+    {
+        throw std::invalid_argument("snapshot sizes and queue count must match the local ranks");
+    }
+    std::vector<size_t> queueSizes(queueCount);
+    for (uint32_t localRank = 0; localRank < ranksPerPeer; ++localRank)
+    {
+        auto const queueIndex    = QueueIndex(localRank, ranksPerPeer, queueCount);
+        auto const producerCount = QueueProducerCount(queueIndex, ranksPerPeer, queueCount);
+        auto       rounded       = std::min(RoundSnapshotShmSize(snapshotSizes[localRank]), MaxShmSize);
+        // A shared queue can receive ActivateSnapshot and FinalizeSnapshot from
+        // every producer around the same data burst. The ordinary snapshot
+        // headroom covers one control slot; retain a second per producer so a
+        // rank never blocks its save completion behind another rank's data.
+        if (producerCount > 1 && snapshotSizes[localRank] >= TargetShmSlotSize)
+        {
+            rounded
+                = TargetShmSlotSize >= MaxShmSize || rounded > MaxShmSize - TargetShmSlotSize ? MaxShmSize : rounded + TargetShmSlotSize;
+        }
+        auto& queue = queueSizes[queueIndex];
+        queue       = rounded > MaxShmSize - queue ? MaxShmSize : queue + rounded;
+    }
+    return queueSizes;
+}
 
 namespace bip = boost::interprocess;
 
@@ -136,7 +238,9 @@ template <typename THdr> struct ShmRingBuffer
                               wlatency.count == 0 ? "" : fmt::format("{}", wlatency));
     }
 
-    static constexpr size_t AlignBoundary = 4096;
+    static constexpr size_t AlignBoundary    = 4096;
+    static constexpr size_t TargetSlotSize   = TargetShmSlotSize;
+    static constexpr size_t DefaultSlotCount = 32;
     static constexpr size_t MaxSlotCount
         = (std::numeric_limits<size_t>::max() - sizeof(Control) - (AlignBoundary - 1)) / (sizeof(THdr) + AlignBoundary);
 
@@ -145,6 +249,24 @@ template <typename THdr> struct ShmRingBuffer
         if (slotCount == 0 || slotCount > MaxSlotCount) { throw std::invalid_argument("Invalid shared-memory slot count"); }
         auto const capacity = (sizeof(THdr) * slotCount) + sizeof(Control);
         return ((capacity + AlignBoundary - 1) / AlignBoundary) * AlignBoundary;
+    }
+
+    // Automatic geometry uses roughly 2 GiB transfers. Small queues retain
+    // four data slots and two control slots per producer so small checkpoints
+    // can still use the full D2H concurrency without delaying finalization.
+    static constexpr size_t SlotCountForShmSize(size_t totalShmSize, size_t maximumSlotCount, size_t producerCount)
+    {
+        if (maximumSlotCount == 0 || maximumSlotCount > MaxSlotCount || producerCount == 0)
+        {
+            throw std::invalid_argument("Invalid automatic shared-memory slot geometry");
+        }
+        auto const minimumSlotCount = std::min(maximumSlotCount, producerCount * (D2HConcurrency + 2));
+        auto const headerSize       = HeaderAllocationSize(maximumSlotCount);
+        if (totalShmSize <= headerSize) { return minimumSlotCount; }
+        auto const dataSize           = totalShmSize - headerSize;
+        auto const slotsForTargetSize = 1 + ((dataSize - 1) / TargetSlotSize);
+        if (slotsForTargetSize < 2 * producerCount) { return minimumSlotCount; }
+        return std::min(slotsForTargetSize, maximumSlotCount);
     }
 
     static constexpr size_t MinimumShmSize(size_t slotCount) { return HeaderAllocationSize(slotCount) + (slotCount * AlignBoundary); }
@@ -463,10 +585,7 @@ template <typename THdr> struct ShmRingBuffer
                 _region    = bip::mapped_region(_shm, bip::read_write);
                 auto* base = static_cast<char*>(_region.get_address());
                 _ctrl      = reinterpret_cast<Control*>(base);    // NOLINT
-                // The creator publishes shmSize/slotSize before its first heartbeat, so
-                // published geometry is the initialization signal. Waiting on heartbeat
-                // movement instead would race the warmup pinning of the other ranks,
-                // which can starve the reader threads far longer than this window.
+                // Published queue geometry is the readiness signal for concurrent initialization.
                 while (true)
                 {
                     [[maybe_unused]] auto const seen = _ctrl->rtimestamp.load();    // acquire: orders the geometry reads below
@@ -519,6 +638,7 @@ template <typename THdr> struct ShmRingBuffer
         if (_region.get_size() != shmSize) { _region = bip::mapped_region(_shm, bip::read_write, 0, shmSize); }
         auto* base = static_cast<char*>(_region.get_address());
         _ctrl      = reinterpret_cast<Control*>(base);    // NOLINT
+        _slotCount = slotCount;
         _slotSize  = slotSize;
         _hdrs      = std::span<THdr>(reinterpret_cast<THdr*>(base + sizeof(Control)), _slotCount);    // NOLINT
         _dataBase  = base + HeaderSize();                                                             // NOLINT

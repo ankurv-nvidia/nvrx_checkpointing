@@ -113,10 +113,11 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         init=[],
         finalize=[],
         native_saves=[],
+        native_loads=[],
         strategy_loads=[],
         public_loads=[],
         train=0,
-        warmup=0,
+        registry_finalized=0,
         legacy_only=False,
     )
 
@@ -128,13 +129,15 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     fake_save.SaveCheckpointArgs = SimpleNamespace
     fake_save.save_checkpoint = lambda *args, **kwargs: calls.native_saves.append((args, kwargs)) or "native"
 
+    class Root:
+        def finalize_registry(self) -> None:
+            calls.registry_finalized += 1
+
+    root = Root()
+    fake_save.register_state_dict = lambda state, iteration: calls.native_loads.append((state, iteration)) or root
+
     fake_save.init_persistent_async_worker = lambda *args: calls.init.append(args)
     fake_save.maybe_finalize_async_save = lambda *args, **kwargs: calls.finalize.append((args, kwargs))
-
-    def warmup() -> None:
-        calls.warmup += 1
-
-    fake_save.warmup = warmup
     fake_megatron_package.save = fake_save
     fake_package.megatron = fake_megatron_package
 
@@ -312,19 +315,21 @@ def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPat
     }
 
 
-def test_train_preserves_existing_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_train_does_not_register_state_without_a_load(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     assert calls.training_module.train() == "trained"
-    assert calls.warmup == 1
+    assert calls.native_loads == []
 
 
-def test_native_load_uses_mcore(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_uses_mcore_and_registers_constructed_state(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     state = {"model": "tensor"}
     result = calls.dist_checkpointing.load(state, "/checkpoint")
 
     assert result == {"loaded": True}
     assert calls.strategy_loads == [(state, "/checkpoint", "mcore")]
+    assert calls.native_loads == [(state, 0)]
+    assert calls.registry_finalized == 1
 
 
 class _DType:
@@ -356,6 +361,7 @@ def test_old_string_optimizer_keys_load_without_optimizer_patch(monkeypatch: pyt
     legacy_leaf = calls.public_loads[1]["optimizer"][0][legacy]["exp_avg"]
     assert f".dtype_{legacy}." in legacy_leaf.key
     assert leaf.key.endswith(".dtype_(torch.bfloat16, torch.float32).bucket_idx_0.exp_avg")
+    assert calls.native_loads == [(state, 0)]
 
 
 def test_legacy_optimizer_adapter_restores_strict_load_result(monkeypatch: pytest.MonkeyPatch) -> None:

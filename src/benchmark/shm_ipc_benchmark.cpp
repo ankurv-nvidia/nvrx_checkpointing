@@ -25,12 +25,15 @@ static constexpr size_t      DefaultIter = 128;
 // actual slot size back from the queue; the pure-memcpy baselines (no queue)
 // use this constant directly.
 static constexpr size_t BenchSlotSize = 32ull * 1024 * 1024;
-// Total shm to request so the queue's runtime slot size equals BenchSlotSize.
+// Per-slot size to request for every active queue slot.
 static constexpr size_t DefaultMessageSize = BenchSlotSize;
 static constexpr size_t DefaultRanks       = 2;
 
 static size_t SlotCount()
-{ return checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>(); }
+{
+    auto const configured = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
+    return configured == 0 ? MsgQueue::DefaultSlotCount : configured;
+}
 
 static std::atomic<PerfMetrics::Clock::time_point> StartTime{};    // NOLINT
 static std::atomic<PerfMetrics::Clock::duration>   Duration{};     // NOLINT
@@ -300,13 +303,15 @@ try
             boost::asio::io_context ctx;
             boost::process::process child(ctx,
                                           argv[0],    // NOLINT
-                                          {launchclient ? "--client" : "--server",
-                                           "--nocloneproc",
-                                           fmt::format("--ranks={}", ranks),
-                                           fmt::format("--iter={}", iter),
-                                           fmt::format("--size={}", size),
-                                           fmt::format("{}", validate ? "--validate" : ""),
-                                           fmt::format("{}", debug ? "--debug" : ""),},
+                                          {
+                                              launchclient ? "--client" : "--server",
+                                              "--nocloneproc",
+                                              fmt::format("--ranks={}", ranks),
+                                              fmt::format("--iter={}", iter),
+                                              fmt::format("--size={}", size),
+                                              fmt::format("{}", validate ? "--validate" : ""),
+                                              fmt::format("{}", debug ? "--debug" : ""),
+                                          },
                                           boost::process::process_stdio{.in = {}, .out = stdout, .err = stderr});
             child.wait();
         });

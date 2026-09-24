@@ -77,6 +77,8 @@ def _assert_common_state_layout(checkpoint_dir: Path, expected_capacity: int) ->
 
 
 def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
+    initial_common = _serialize_common_state(0)
+    common_capacity = ((len(initial_common) + 512 + 1023) // 1024) * 1024
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     state_dict = {
         "weight": ShardedTensor(
@@ -89,7 +91,7 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             axis_fragmentations=None,
         ),
         "rng_state": ShardedObject("rng_state", {"iteration": 0}, (1,), (0,)),
-        _DCP_COMMON_STATE_KEY: _serialize_common_state(0),
+        _DCP_COMMON_STATE_KEY: initial_common.ljust(common_capacity, b"\0"),
     }
     root.register_state_dict(state_dict)
     root.finalize_registry()
@@ -98,9 +100,10 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
         for iteration in (1, 2):
             checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
             assert not checkpoint_dir.exists()
-            common_bytes = _serialize_common_state(iteration)
+            common_bytes = _serialize_common_state(iteration).ljust(common_capacity, b"\0")
             root.register_state_dict(
                 {
+                    "weight": state_dict["weight"],
                     _DCP_COMMON_STATE_KEY: common_bytes,
                     "rng_state": ShardedObject("rng_state", {"iteration": iteration}, (1,), (0,)),
                 },
@@ -119,9 +122,7 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
                 "scheduler": {"num_steps": iteration * 10},
             }
             assert _load_sharded_object(checkpoint_dir) == {"iteration": iteration}
-            initial_size = len(_serialize_common_state(0))
-            expected_capacity = ((initial_size + 512 + 1023) // 1024) * 1024
-            _assert_common_state_layout(checkpoint_dir, expected_capacity)
+            _assert_common_state_layout(checkpoint_dir, common_capacity)
             assert not (checkpoint_dir / "common.pt").exists()
             assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
                 "sharded_backend": "torch_dist",

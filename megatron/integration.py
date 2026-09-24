@@ -3,10 +3,11 @@
 
 """Minimal runtime integration for an unmodified Megatron-LM checkout.
 
-The native provider owns checkpoint saves, its rank-local durability queue, and
-load compatibility. Provider selection is intentionally kept out of this
-module: callers that compare native with another provider can opt in to
-:mod:`nvrx_checkpointing.megatron.provider` before installing this module.
+The native provider owns checkpoint saves, its rank-local durability queue,
+load compatibility, and post-load shared-memory registration. Provider
+selection is intentionally kept out of this module: callers that compare native
+with another provider can opt in to :mod:`nvrx_checkpointing.megatron.provider`
+before installing this module.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ SUPPORTED_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
 _NATIVE_SAVE_MARKER = "_nvrx_checkpointing_native_save_installed"
 _NATIVE_ASYNC_MARKER = "_nvrx_checkpointing_native_async_installed"
 _NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
-_NATIVE_WARMUP_MARKER = "_nvrx_checkpointing_native_warmup_installed"
+
 
 class _MCoreLoadStrategy:
     """Per-load proxy that keeps native independent of an external async reader."""
@@ -68,7 +69,7 @@ def _mcore_load_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tup
 
 
 def _install_load_wrapper() -> None:
-    """Use MCore's public reader and retain old optimizer compatibility."""
+    """Register the constructed load state and retain old optimizer compatibility."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
 
     if getattr(dist_checkpointing, _NATIVE_LOAD_MARKER, False):
@@ -97,6 +98,10 @@ def _install_load_wrapper() -> None:
                 raise current_error from legacy_error
             result = restore_optimizer_dtype_keys(result, dtype_lookup)
 
+        from . import save as native_save
+
+        root = native_save.register_state_dict(sharded_state_dict, 0)
+        root.finalize_registry()
         return result
 
     dist_checkpointing.load = load
@@ -157,33 +162,11 @@ def _install_save_wrapper() -> None:
     setattr(training_module, _NATIVE_SAVE_MARKER, True)
 
 
-def _install_warmup() -> None:
-    """Preserve the existing pre-training shared-memory warmup."""
-    from megatron.training import training as training_module  # type: ignore[import-not-found]
-
-    if getattr(training_module, _NATIVE_WARMUP_MARKER, False):
-        return
-
-    original_train = training_module.train
-
-    @wraps(original_train)
-    def train(*args: Any, **kwargs: Any) -> Any:
-        from . import save as native_save
-
-        native_save.warmup()
-        return original_train(*args, **kwargs)
-
-    training_module.train = train
-
-    setattr(training_module, _NATIVE_WARMUP_MARKER, True)
-
-
 def install() -> None:
     """Install native checkpointing into the current Megatron process."""
     _install_async_queue_bindings()
     _install_load_wrapper()
     _install_save_wrapper()
-    _install_warmup()
 
 
 def main(argv: list[str] | None = None) -> None:
