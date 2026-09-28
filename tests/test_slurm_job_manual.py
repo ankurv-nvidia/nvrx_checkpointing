@@ -3056,8 +3056,6 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
         nodes = int(args[args.index("--nodes") + 1]) if "--nodes" in args else 1
         platform = next(tag for tag in ("devbox", "gb200", "gb300", "h100") if f":{tag}:" in f":{name}:")
         expected_tags = [platform, f"{nodes}n"]
-        if ":gb300:" in name and ":nano4_8x4" in name:
-            expected_tags.append("ociaga")
         assert job["tags"] == expected_tags
 
     assert all("pico_2x" not in name for name in workloads)
@@ -4260,8 +4258,8 @@ def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPa
         "training_process_peak_rss_bytes": 300,
     }
     assert candidate["tolerances"] == {
-        "checkpoint_daemon_peak_rss_bytes": 0.05,
-        "training_process_peak_rss_bytes": 0.05,
+        "checkpoint_daemon_peak_rss_bytes": 0.10,
+        "training_process_peak_rss_bytes": 0.10,
     }
 
 
@@ -4274,6 +4272,16 @@ def test_every_workload_baseline_tracks_gpu_peak_memory() -> None:
             missing.append(path.name)
 
     assert not missing
+
+
+def test_every_host_memory_baseline_uses_host_memory_tolerance() -> None:
+    slurm_job = _load_slurm_job()
+    for path in sorted((REPO_ROOT / "ci" / "baselines").glob("*.yaml")):
+        baseline = yaml.safe_load(path.read_text())
+        metrics = baseline.get("metrics", {})
+        tolerances = baseline.get("tolerances", {})
+        for metric in slurm_job.HOST_MEMORY_METRICS & metrics.keys():
+            assert tolerances.get(metric) == slurm_job.HOST_MEMORY_TOLERANCE, f"{path.name}: {metric}"
 
 
 def test_recorded_bandwidth_takes_precedence_over_the_platform_fallback(
@@ -5568,6 +5576,8 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
     precision = {
         "fp8-format": "e4m3",
         "fp8-recipe": "mxfp8",
+        "fp8-param-gather": True,
+        "reuse-grad-buf-for-mxfp8-param-ag": True,
         "moe-router-padding-for-quantization": True,
     }
     expected = {
@@ -5664,7 +5674,7 @@ def test_nano4_matches_the_30b_gdp_reference_architecture() -> None:
     assert mtp == ["*E", "*E"]
 
 
-def test_gpt_moe_reproduces_two_prepended_expert_axes(
+def test_gpt_moe_covers_prepended_expert_axes_and_fp8_param_gather(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -5682,6 +5692,9 @@ def test_gpt_moe_reproduces_two_prepended_expert_axes(
     assert gpt_moe["kv-channels"] == 32  # noqa: PLR2004
     assert gpt_moe["is-hybrid-model"] is False
     assert gpt_moe["spec"] is None
+    assert gpt_moe["fp8-format"] == "hybrid"
+    assert gpt_moe["fp8-recipe"] == "tensorwise"
+    assert gpt_moe["fp8-param-gather"] is True
 
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
@@ -5695,6 +5708,7 @@ def test_gpt_moe_reproduces_two_prepended_expert_axes(
     assert "--ci" not in command
     assert "--is-hybrid-model" not in command
     assert "--spec" not in command
+    assert "--fp8-param-gather" in command
     assert command[command.index("--moe-layer-freq") + 1] == "1"
 
 

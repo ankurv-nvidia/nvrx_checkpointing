@@ -308,6 +308,14 @@ struct ServerMaxActiveSnapshots
     using Type                                = types::Integer<uint32_t>;
 };
 
+struct ServerAutoShutdownTimeoutSeconds
+{
+    // TODO_CLI_SVR_RESPAWN: The default exceeds normal inter-save training stretches because clients cannot respawn the daemon.
+    static constexpr std::string_view Name    = "server.auto.shutdown.timeout.seconds";
+    static constexpr std::string_view Default = "900";
+    using Type                                = types::Integer<uint32_t>;
+};
+
 struct MemorySampleIntervalSeconds
 {
     static constexpr std::string_view Name    = "memory.sample.interval.seconds";

@@ -224,9 +224,7 @@
           "scale": "8x4",
           "group": "8node-nano4",
           "checkpoint_interval": 25,
-          "runner_tags": [
-            "ociaga"
-          ],
+          "runner_tags": [],
           "timeout": "1d",
           "jobs": [
             [

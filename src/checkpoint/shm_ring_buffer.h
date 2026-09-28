@@ -15,7 +15,6 @@
 #include <fmt/std.h>
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -26,7 +25,6 @@
 #include <string>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace checkpoint::ipc
 {
@@ -102,33 +100,6 @@ inline size_t QueueD2HConcurrency(size_t slotCount, size_t producerCount)
 {
     if (slotCount == 0 || producerCount == 0) { throw std::invalid_argument("slot and producer counts must be nonzero"); }
     return std::min(D2HConcurrency, std::max<size_t>(1, slotCount / producerCount));
-}
-
-inline std::vector<size_t> QueueSnapshotShmSizes(std::span<size_t const> snapshotSizes, uint32_t ranksPerPeer, uint8_t queueCount)
-{
-    if (ranksPerPeer == 0 || snapshotSizes.size() != ranksPerPeer || queueCount == 0 || queueCount > ranksPerPeer)
-    {
-        throw std::invalid_argument("snapshot sizes and queue count must match the local ranks");
-    }
-    std::vector<size_t> queueSizes(queueCount);
-    for (uint32_t localRank = 0; localRank < ranksPerPeer; ++localRank)
-    {
-        auto const queueIndex    = QueueIndex(localRank, ranksPerPeer, queueCount);
-        auto const producerCount = QueueProducerCount(queueIndex, ranksPerPeer, queueCount);
-        auto       rounded       = std::min(RoundSnapshotShmSize(snapshotSizes[localRank]), MaxShmSize);
-        // A shared queue can receive ActivateSnapshot and FinalizeSnapshot from
-        // every producer around the same data burst. The ordinary snapshot
-        // headroom covers one control slot; retain a second per producer so a
-        // rank never blocks its save completion behind another rank's data.
-        if (producerCount > 1 && snapshotSizes[localRank] >= TargetShmSlotSize)
-        {
-            rounded
-                = TargetShmSlotSize >= MaxShmSize || rounded > MaxShmSize - TargetShmSlotSize ? MaxShmSize : rounded + TargetShmSlotSize;
-        }
-        auto& queue = queueSizes[queueIndex];
-        queue       = rounded > MaxShmSize - queue ? MaxShmSize : queue + rounded;
-    }
-    return queueSizes;
 }
 
 namespace bip = boost::interprocess;

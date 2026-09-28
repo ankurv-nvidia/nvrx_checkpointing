@@ -135,6 +135,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
 
     root = Root()
     fake_save.register_state_dict = lambda state, iteration: calls.native_loads.append((state, iteration)) or root
+    fake_save._wrap_load_checkpoint = lambda fn: fn  # noqa: SLF001
 
     fake_save.init_persistent_async_worker = lambda *args: calls.init.append(args)
     fake_save.maybe_finalize_async_save = lambda *args, **kwargs: calls.finalize.append((args, kwargs))
@@ -214,6 +215,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         pp_group: Any = None,
         dp_cp_group: Any = None,
         dp_group: Any = None,
+        dp_gtp_remat_group: Any = None,
         expt_dp_group: Any = None,
         rng_state_key_prefix: str = "",
     ) -> str:
@@ -223,6 +225,21 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         calls.train += 1
         return "trained"
 
+    def reference_load_checkpoint(
+        state: dict[str, Any],
+        optimizer: Any,
+        opt_param_scheduler: Any,
+        *,
+        tp_group: Any = None,
+        pp_group: Any = None,
+        dp_cp_group: Any = None,
+        dp_group: Any = None,
+        rng_state_key_prefix: str = "",
+    ) -> Any:
+        del optimizer, opt_param_scheduler, tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
+        return dist_checkpointing.load(state, "/checkpoint")
+
+    training_module.load_checkpoint = reference_load_checkpoint
     training_module.save_checkpoint = reference_save
     training_module.train = train
     training_package.initialize = initialize_module
@@ -292,6 +309,7 @@ def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPat
         pp_group="pp",
         dp_cp_group="dp-cp",
         dp_group="dp",
+        dp_gtp_remat_group="dp-gtp-remat",
         expt_dp_group="edp",
         rng_state_key_prefix="grid.",
     )
@@ -311,6 +329,7 @@ def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPat
         "pp_group": "pp",
         "dp_cp_group": "dp-cp",
         "dp_group": "dp",
+        "dp_gtp_remat_group": "dp-gtp-remat",
         "rng_state_key_prefix": "grid.",
     }
 

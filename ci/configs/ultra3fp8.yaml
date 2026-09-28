@@ -73,6 +73,8 @@ grad-reduce-in-bf16: true
 # Intentional precision-only divergence from ultra3bf16.
 fp8-format: e4m3
 fp8-recipe: mxfp8
+fp8-param-gather: true
+reuse-grad-buf-for-mxfp8-param-ag: true
 moe-router-padding-for-quantization: true
 
 job_time_in_mins:

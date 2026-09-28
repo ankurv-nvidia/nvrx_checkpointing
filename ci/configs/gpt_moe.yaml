@@ -1,4 +1,4 @@
-# One-node homogeneous GPT-MoE reproducer for the two prepended layer/expert axes in NVBug 6683329.
+# One-node homogeneous GPT-MoE checkpoint regression for NVBugs 6683329 and 6713815.
 
 ci:
   pretrain-entry: gpt
@@ -28,6 +28,13 @@ max-position-embeddings: 128
 position-embedding-type: rope
 rotary-base: 500000
 vocab-size: 32000
+
+# Keep this small checkpoint smoke on the storage-less parameter path. The
+# native phase writes three asynchronous checkpoints, covering NVBug 6713815
+# without adding a separate multi-node FP8 workload.
+fp8-format: hybrid
+fp8-recipe: tensorwise
+fp8-param-gather: true
 
 # Homogeneous grouped experts create both prepended axes; the layer frequency remains explicit.
 num-experts: 8

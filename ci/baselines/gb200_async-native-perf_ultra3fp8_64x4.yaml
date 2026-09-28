@@ -9,11 +9,11 @@ metrics:
   megatron.training.memory_allocated_gb: 70.31
   gpu_peak_bytes: 71962792270
   gpu_hbm_peak_bytes: 95291834368
-  checkpoint_daemon_peak_rss_bytes: 370304024576
-  training_process_peak_rss_bytes: 127721472000
+  checkpoint_daemon_peak_rss_bytes: 418901655552
+  training_process_peak_rss_bytes: 149981233152
 tolerances:
-  training_process_peak_rss_bytes: 0.05
-  checkpoint_daemon_peak_rss_bytes: 0.05
+  training_process_peak_rss_bytes: 0.10
+  checkpoint_daemon_peak_rss_bytes: 0.10
 rank_statistics:
   bw_mbps:
     min: 146702
@@ -44,6 +44,6 @@ rank_statistics:
     median: 91772813312.0
     max: 95291834368
   training_process_peak_rss_bytes:
-    min: 113443078144
-    median: 119585472512.0
-    max: 127721472000
+    min: 135584022528
+    median: 143330148352.0
+    max: 149981233152

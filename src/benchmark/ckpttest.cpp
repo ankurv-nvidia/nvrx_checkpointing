@@ -183,6 +183,15 @@ TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[
     CHECK_THROWS_AS(Integer<int8_t>::Parse("-129"), std::overflow_error);
 }
 
+TEST_CASE("server auto-shutdown configuration accepts a disabled sentinel", "[server][config][tier1]")
+{
+    using Config           = checkpoint::config::ServerAutoShutdownTimeoutSeconds;
+    constexpr auto envName = checkpoint::config::detail::EnvName<Config>();
+    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS");
+    CHECK(Config::Default == "900");
+    CHECK(Config::Type::Parse("0") == 0);
+}
+
 TEST_CASE("shared-memory ring geometry supports runtime slot counts", "[shmem][config][tier1]")
 {
     using Queue = checkpoint::ipc::MsgQueue;
@@ -352,6 +361,9 @@ TEST_CASE("state registry permits distinct local shards under one tensor key", "
     addShard(0, 1);
     addShard(1, 0);
     addShard(0, 0);
+    CHECK_FALSE(tree.IsFinalized());
+    REQUIRE_NOTHROW(tree.FinalizeRegistry());
+    CHECK(tree.IsFinalized());
     REQUIRE_NOTHROW(tree.FinalizeRegistry());
 
     std::vector<DS4Tensor::DimRange> ranges;
@@ -396,48 +408,6 @@ TEST_CASE("shared memory queues retain large transfer slots as their budgets gro
     CHECK(Queue::SlotCountForShmSize(headerSize + (32 * GiB), Queue::DefaultSlotCount, 1) == 16);
     CHECK(Queue::SlotCountForShmSize(headerSize + (64 * GiB), Queue::DefaultSlotCount, 1) == 32);
     CHECK(Queue::SlotCountForShmSize(headerSize + (128 * GiB), Queue::DefaultSlotCount, 1) == 32);
-}
-
-TEST_CASE("shared memory sizing aggregates unequal local snapshots per queue", "[shmem][tier1]")
-{
-    using checkpoint::ipc::QueueSnapshotShmSizes;
-    static constexpr size_t GiB = 1ull << 30;
-
-    auto const fourRanks = QueueSnapshotShmSizes(std::array<size_t, 4>{5 * GiB, 33 * GiB, 5 * GiB, 1}, 4, 4);
-    CHECK(fourRanks[0] == 10 * GiB);
-    CHECK(fourRanks[1] == 48 * GiB);
-    CHECK(fourRanks[2] == 10 * GiB);
-    CHECK(fourRanks[3] == checkpoint::ipc::MinSnapshotShmSize);
-
-    auto const sixRanks = QueueSnapshotShmSizes(std::array<size_t, 6>{5 * GiB, 5 * GiB, 1, 1, 33 * GiB, 5 * GiB}, 6, 4);
-    CHECK(sixRanks[0] == 24 * GiB);
-    CHECK(sixRanks[1] == checkpoint::ipc::MinSnapshotShmSize);
-    CHECK(sixRanks[2] == 50 * GiB + checkpoint::ipc::MinSnapshotShmSize);
-    CHECK(sixRanks[3] == 10 * GiB);
-    CHECK(checkpoint::ipc::QueueProducerCount(0, 6, 4) == 2);
-    CHECK(checkpoint::ipc::QueueProducerCount(1, 6, 4) == 1);
-    CHECK(checkpoint::ipc::QueueProducerCount(2, 6, 4) == 2);
-    CHECK(checkpoint::ipc::QueueProducerCount(3, 6, 4) == 1);
-    CHECK(checkpoint::ipc::QueueD2HConcurrency(4, 1) == 4);
-    CHECK(checkpoint::ipc::QueueD2HConcurrency(6, 2) == 3);
-    CHECK(checkpoint::ipc::QueueD2HConcurrency(32, 2) == 4);
-    CHECK(checkpoint::ipc::QueueD2HConcurrency(1, 2) == 1);
-
-    auto const automaticQueueCount = checkpoint::ipc::ResolveQueueCount(8, 0);
-    CHECK(automaticQueueCount == 8);
-    CHECK(checkpoint::ipc::ResolveQueueCount(8, 4) == 4);
-    CHECK(checkpoint::ipc::ResolveQueueCount(4, 8) == 4);
-    auto const automaticQueues = QueueSnapshotShmSizes(
-        std::array<size_t, 8>{
-            2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616, 2'791'741'616},
-        8,
-        automaticQueueCount);
-    REQUIRE(automaticQueues.size() == automaticQueueCount);
-    CHECK(std::ranges::all_of(automaticQueues, [=](size_t queueSize) { return queueSize == 10 * GiB; }));
-
-    auto const twoQueues = QueueSnapshotShmSizes(std::array<size_t, 4>{5 * GiB, 33 * GiB, 5 * GiB, 1}, 4, 2);
-    CHECK(twoQueues[0] == 62 * GiB);
-    CHECK(twoQueues[1] == 12 * GiB + checkpoint::ipc::MinSnapshotShmSize);
 }
 
 TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier2]")

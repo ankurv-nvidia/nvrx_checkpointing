@@ -38,6 +38,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         get_checkpoint_name=lambda *_args, **_kwargs: "checkpoint",
         get_checkpoint_tracker_filename=lambda *_args, **_kwargs: "tracker",
         get_rng_state=lambda *_args, **_kwargs: {},
+        maybe_save_dataloader_state=lambda *_args, **_kwargs: None,
     )
     global_vars = _module("megatron.training.global_vars", get_args=SimpleNamespace)
     training_utils = _module("megatron.training.utils", print_rank_0=lambda _message: None)
@@ -46,6 +47,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         mpu=SimpleNamespace(
             get_tensor_model_parallel_group=lambda: None,
             get_pipeline_model_parallel_group=lambda: None,
+            get_data_parallel_group=lambda **_kwargs: None,
         ),
     )
     core.__path__ = []
@@ -218,6 +220,71 @@ def test_async_finalize_wait_starts_after_client_send(
     assert events == ["save_async", "client_send_complete", "submit_finalize_wait", "wait_for_finalize"]
 
 
+@pytest.mark.parametrize(
+    ("dp_gtp_remat_group", "expected_dp_group"),
+    [("dp-gtp-remat", "dp-gtp-remat"), (None, "dp")],
+)
+def test_dataloader_state_is_saved_before_snapshot_submission(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dp_gtp_remat_group: str | None,
+    expected_dp_group: str,
+) -> None:
+    events: list[object] = []
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
+            events.append("save_async")
+
+        def wait_for_deferred_save(self) -> None:
+            events.append("client_send_complete")
+
+    def maybe_save_dataloader_state(iterator: object, iteration: int, save_path: object, **groups: object) -> None:
+        events.append(("dataloader_state", iterator, iteration, save_path, groups))
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=False, save=tmp_path, dataloader_save=tmp_path)
+    save_args = save.SaveCheckpointArgs(
+        iteration=20,
+        model=object(),
+        optimizer=None,
+        opt_param_scheduler=None,
+        num_floating_point_operations_so_far=0,
+        train_data_iterator="iterator",
+        tp_group="tp",
+        pp_group="pp",
+        dp_group="dp",
+        dp_gtp_remat_group=dp_gtp_remat_group,
+    )
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000020")
+    monkeypatch.setattr(save, "maybe_save_dataloader_state", maybe_save_dataloader_state)
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or Root())
+    monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, _iteration: events.append("tracker"))
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        save.checkpoint,
+        "wait_for_ckpt_finalize",
+        lambda _session, _iteration: events.append("wait_for_finalize"),
+    )
+
+    save._save_checkpoint_impl(save_args, 123)
+
+    assert events == [
+        ("dataloader_state", "iterator", 20, tmp_path, {"tp_group": "tp", "pp_group": "pp", "dp_group": expected_dp_group}),
+        "register",
+        "save_async",
+        "client_send_complete",
+        "wait_for_finalize",
+        "tracker",
+    ]
+
+
 def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     class Root:
         def __init__(self) -> None:
@@ -240,6 +307,76 @@ def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, mo
         {"prepared": saved_state, "iteration": 12},
     ]
     assert save._root is root
+
+
+def test_load_registration_synthesizes_rng_with_role_specific_groups(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    rng_state = {"sharded": "placeholder rng handler"}
+    monkeypatch.setattr(
+        save,
+        "get_rng_state",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or rng_state,
+    )
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    state = {
+        "args": SimpleNamespace(no_load_rng=True, no_save_rng=False),
+        "model": "model handler",
+        "rerun_state_machine": "rerun handler",
+    }
+
+    def load_checkpoint(
+        *,
+        tp_group=None,  # noqa: ANN001
+        pp_group=None,  # noqa: ANN001
+        dp_cp_group=None,  # noqa: ANN001
+        dp_group=None,  # noqa: ANN001
+        rng_state_key_prefix="",  # noqa: ANN001
+    ) -> dict:
+        del tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
+        return save._prepare_registration_state_dict(state, 0)
+
+    prepared = save._wrap_load_checkpoint(load_checkpoint)(
+        tp_group="tp",
+        pp_group="pp",
+        dp_cp_group="dp-cp",
+        dp_group="dp",
+        rng_state_key_prefix="language.",
+    )
+
+    assert calls == [
+        (
+            ("torch_dist", "tp", "pp"),
+            {"dp_cp_group": "dp-cp", "dp_group": "dp", "key_prefix": "language."},
+        ),
+    ]
+    assert prepared == {**state, "rng_state": rng_state}
+    assert "rng_state" not in state
+    assert save._LOAD_CONTEXT is None
+
+
+def test_load_registration_warns_and_uses_singleton_dp_groups_when_rng_is_unexpectedly_missing(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get_rng_state(_format: str, tp_group: object, pp_group: object, **kwargs: object) -> dict[str, str]:
+        assert tp_group is None
+        assert pp_group is None
+        groups = (kwargs["dp_cp_group"], kwargs["dp_group"])
+        assert all(group.rank() == 0 and group.size() == 1 for group in groups)
+        return {"sharded": "placeholder rng handler"}
+
+    monkeypatch.setattr(save, "get_rng_state", get_rng_state)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    state = {
+        "args": SimpleNamespace(no_load_rng=False, no_save_rng=False),
+        "rerun_state_machine": "rerun handler",
+    }
+
+    with pytest.warns(RuntimeWarning, match="omitted rng_state without no_load_rng"):
+        save._prepare_registration_state_dict(state, 0)
 
 
 def test_registration_adds_the_stable_rerun_state_when_load_omits_it(
@@ -267,7 +404,7 @@ def test_registration_adds_the_stable_rerun_state_when_load_omits_it(
     assert calls == [{"data_iterator": None, "ckpt_format": "torch_dist", "force": True}]
 
 
-def test_registration_adds_rng_state_when_load_skips_restoring_it(
+def test_registration_adds_rng_state_with_default_groups_during_save(
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -287,7 +424,7 @@ def test_registration_adds_rng_state_when_load_skips_restoring_it(
         "rerun_state_machine": "rerun handler",
     }
 
-    prepared = save._prepare_registration_state_dict(state, 0)
+    prepared = save._prepare_registration_state_dict(state, 12)
 
     assert prepared == {**state, "rng_state": rng_state}
     assert state == {

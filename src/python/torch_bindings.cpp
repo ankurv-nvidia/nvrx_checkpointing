@@ -156,6 +156,15 @@ static uint64_t DataPtrFromDlTensor(DLTensor const& t)
     return (base + static_cast<uintptr_t>(t.byte_offset));
 }
 
+static bool HasElements(DLTensor const& t)
+{
+    for (int i = 0; i < t.ndim; ++i)
+    {
+        if (t.shape[i] == 0) { return false; }
+    }
+    return true;
+}
+
 static DlpackCapsule ReadDlpack(nb::handle tensor)
 {
     // `.detach()` first: tensors with `requires_grad=True` (i.e. live model
@@ -261,6 +270,32 @@ static bool IsMegatronShardedObject(nb::handle obj)
 
 // === State extraction ===
 
+struct TensorState
+{
+    DS4Tensor  meta;
+    nb::object owner;
+};
+
+static nb::object AddressableTensor(std::string_view name, nb::handle value)
+{
+    auto owner = nb::borrow<nb::object>(value);
+    auto dlp   = ReadDlpack(owner);
+    if (DataPtrFromDlTensor(*dlp.tnsr) != 0 || !HasElements(*dlp.tnsr)) { return owner; }
+
+    int const hasDequantize = PyObject_HasAttrString(owner.ptr(), "dequantize");
+    if (hasDequantize < 0) { throw nb::python_error(); }
+    if (hasDequantize == 0) { throw std::runtime_error(fmt::format("Tensor {} has no addressable storage", name)); }
+
+    // TODO_HOST_DEQUANT: Revisit this for host-based dequantization.
+    owner = owner.attr("detach")().attr("dequantize")();
+    dlp   = ReadDlpack(owner);
+    if (DataPtrFromDlTensor(*dlp.tnsr) == 0 && HasElements(*dlp.tnsr))
+    {
+        throw std::runtime_error(fmt::format("Tensor {} still has no addressable storage after dequantization", name));
+    }
+    return owner;
+}
+
 static DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
 {
     DS4Tensor meta{};
@@ -292,10 +327,11 @@ static DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
     return meta;
 }
 
-static DS4Tensor TorchTensorState(std::string_view name, nb::handle value)
+static TensorState TorchTensorState(std::string_view name, nb::handle value)
 {
-    auto dlp = ReadDlpack(value);
-    return BareTensorMeta(name, *dlp.tnsr);
+    auto owner = AddressableTensor(name, value);
+    auto dlp   = ReadDlpack(owner);
+    return {.meta = BareTensorMeta(name, *dlp.tnsr), .owner = std::move(owner)};
 }
 
 static StateNode::Scalar TorchDtypeState(nb::handle value)
@@ -328,7 +364,7 @@ static StateNode::Blob TorchGeneratorBlob(std::string_view name, nb::handle valu
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static DS4Tensor ShardedTensorState(nb::str& name, nb::dict const& container)
+static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
 {
     using Range = DS4Tensor::Range;
     DS4Tensor ds4tensor{};
@@ -354,7 +390,8 @@ static DS4Tensor ShardedTensorState(nb::str& name, nb::dict const& container)
     };
     auto throwError = [&](std::string_view const& message) { throw ShardedTensorError(shtKey, container, message); };
 
-    auto dlp = ReadDlpack(container["data"]);
+    auto owner = AddressableTensor(shtKeyView, container["data"]);
+    auto dlp   = ReadDlpack(owner);
     if (!IsRowMajorContiguous(*dlp.tnsr)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", shtKeyView)); }
     ds4tensor.dtype  = DlpackDtypeToDs4(dlp.tnsr->dtype);
     ds4tensor.device = DlpackDeviceToId(dlp.tnsr->device);
@@ -483,7 +520,7 @@ static DS4Tensor ShardedTensorState(nb::str& name, nb::dict const& container)
             "Tensor {} size mismatch: sharddim implies {} bytes, DLPack shape implies {}", shtKeyView, shardBytes, dlpackBytes));
     }
     ds4tensor.AssertShardIsValid();
-    return ds4tensor;
+    return {.meta = std::move(ds4tensor), .owner = std::move(owner)};
 }
 
 static StateNode::Blob ShardedObjectBlob(nb::handle value)
@@ -565,8 +602,9 @@ RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNode::Handle n
                                                  shtKeyView,
                                                  fqn));
         }
-        auto tensorName = shtKey;
-        RegisterTensorState(scan, node, StrView(tensorName), ShardedTensorState(tensorName, innerContainer), item);
+        auto tensorName  = shtKey;
+        auto tensorState = ShardedTensorState(tensorName, innerContainer);
+        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
     }
 }
 
@@ -637,8 +675,9 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
 
             // throw std::runtime_error("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
-        auto tensorName = shtKey;
-        RegisterTensorState(scan, node, StrView(tensorName), ShardedTensorState(tensorName, itemContainer), item);
+        auto tensorName  = shtKey;
+        auto tensorState = ShardedTensorState(tensorName, itemContainer);
+        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
     }
     return true;
 }
@@ -651,7 +690,8 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
 {
     if (IsTorchTensor(val))
     {
-        RegisterTensorState(scan, node, StrView(key), TorchTensorState(StrView(key), val), val);
+        auto tensorState = TorchTensorState(StrView(key), val);
+        RegisterTensorState(scan, node, StrView(key), std::move(tensorState.meta), tensorState.owner);
         return true;
     }
     if (IsTorchDtype(val))
@@ -661,9 +701,9 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
     }
     if (IsMegatronShardedTensor(val))
     {
-        auto tensorName = key;
-        auto tensor     = ShardedTensorState(tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
-        RegisterTensorState(scan, node, StrView(tensorName), tensor, val);
+        auto tensorName  = key;
+        auto tensorState = ShardedTensorState(tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
+        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
         return true;
     }
     if (IsMegatronShardedTensorFactory(val))

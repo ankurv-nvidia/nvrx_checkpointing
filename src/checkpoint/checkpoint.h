@@ -13,13 +13,13 @@
 void SvcIncrRef();
 void SvcDecrRef();
 
+void FinalizeStateRegistry(StateTree& root);
+
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
 
 void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
 void WaitForCheckpointSave(RankTopology const& topo);
 
-// Upload the finalized registry, then initialize and pin the MsgQueue without blocking the caller.
-void InitializeQueueAsync(StateTree const& registry);
 void SvcPing();
 void SvcStop();
 

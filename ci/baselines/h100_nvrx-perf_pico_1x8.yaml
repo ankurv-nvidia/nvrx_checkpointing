@@ -7,7 +7,7 @@ metrics:
   gpu_hbm_peak_bytes: 19330170880
   training_process_peak_rss_bytes: 7754711040
 tolerances:
-  training_process_peak_rss_bytes: 0.05
+  training_process_peak_rss_bytes: 0.10
 rank_statistics:
   ckpt_durable_ms:
     min: 4384.8

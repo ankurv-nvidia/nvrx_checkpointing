@@ -70,8 +70,13 @@ struct CudaContext : public DeviceContext
         DeviceContext(deviceIn, streamIdxIn), stream(CudaStream::GetInstance(deviceIn, streamIdxIn))
     {
         lock = std::unique_lock<std::mutex>(stream->mutex);
-        lock.unlock();
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "Failed to create CUDA event");
+        CUDA_CHECK(cudaEventRecord(event, cudaStreamLegacy), "Failed to record CUDA readiness event on the default stream");
+        CUDA_CHECK(cudaStreamWaitEvent(stream->stream, event, 0),
+                   "Failed to wait for the default stream on D2H stream {} for device {}",
+                   streamIdx,
+                   device);
+        lock.unlock();
     }
 
     void StreamAcquire() override { lock.lock(); }
@@ -88,6 +93,8 @@ struct CudaContext : public DeviceContext
 
     void Flush() override
     {
+        // The constructor's stream wait captured the earlier default-stream record;
+        // CUDA permits re-recording the event here for D2H completion.
         CUDA_CHECK(cudaEventRecord(event, stream->stream), "Failed to record CUDA event");
         lock.unlock();
         CUDA_CHECK(cudaEventSynchronize(event), "Failed to synchronize CUDA event");

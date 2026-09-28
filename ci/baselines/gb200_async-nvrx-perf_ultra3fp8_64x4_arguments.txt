@@ -260,7 +260,7 @@
   fp8_interval .................................... 1
   fp8_margin ...................................... 0
   fp8_output_proj ................................. False
-  fp8_param_gather ................................ False
+  fp8_param_gather ................................ True
   fp8_quantizer_factory ........................... None
   fp8_recipe ...................................... mxfp8
   fp8_wgrad ....................................... True
@@ -690,7 +690,7 @@
   result_rejected_tracker_filename ................ None
   retriever_report_topk_accuracies ................ []
   retriever_score_scaling ......................... False
-  reuse_grad_buf_for_mxfp8_param_ag ............... False
+  reuse_grad_buf_for_mxfp8_param_ag ............... True
   rl_consumption_granularity ...................... B
   rl_default_temperature .......................... 1.0
   rl_default_top_k ................................ -1

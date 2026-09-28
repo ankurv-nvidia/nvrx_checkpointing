@@ -56,9 +56,9 @@ struct Message
         ActivateSnapshot,
         FinalizeSnapshot,
 
-        // Recieved from local client or from peers
+        // Received from local client or from peers
         LocalStateRegistry,    // Combination of Replicated and Sharded State Registry
-        LocalStateData,        // Could be recieved multiple times in chunked manner
+        LocalStateData,        // Could be received multiple times in chunked manner
 
         StateRegistryFragment,    // The format is differnt from StateRegistry.
         // ShardedStateData,
@@ -67,9 +67,7 @@ struct Message
     };
 
     struct Ping
-    {
-        SessionId sessionId;
-    };
+    { SessionId sessionId; };
 
     struct Shutdown
     {};
@@ -86,9 +84,7 @@ struct Message
     };
 
     struct FinalizeSession
-    {
-        SessionId sessionId;
-    };
+    { SessionId sessionId; };
 
     struct ActivateSnapshot
     {

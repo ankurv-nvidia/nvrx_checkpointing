@@ -828,7 +828,7 @@ wheel-publish:pypi:
   extends: [.slurm_job, .runner_gb300, .manual_optional]
   stage: 8node-nano4
   timeout: 1d
-  tags: [gb300, 8n, ociaga]
+  tags: [gb300, 8n]
   needs:
     - job: wheel:aarch64
       artifacts: true
@@ -839,7 +839,7 @@ wheel-publish:pypi:
   extends: [.slurm_job, .runner_gb300, .manual_optional]
   stage: 8node-nano4
   timeout: 1d
-  tags: [gb300, 8n, ociaga]
+  tags: [gb300, 8n]
   needs:
     - job: wheel:aarch64
       artifacts: true
@@ -850,7 +850,7 @@ wheel-publish:pypi:
   extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
   stage: 8node-nano4
   timeout: 1d
-  tags: [gb300, 8n, ociaga]
+  tags: [gb300, 8n]
   variables:
     JOB_ARGS: "--nodes 8 --config nano4 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
 

@@ -394,6 +394,7 @@ struct StateTree
 
     void FinalizeRegistry()
     {
+        if (_finalized) { return; }
         auto& root = _nodes[0];
         try
         {
@@ -415,7 +416,10 @@ struct StateTree
             }
             throw;
         }
+        _finalized = true;
     }
+
+    [[nodiscard]] bool IsFinalized() const { return _finalized; }
 
     void CloneInto(StateTree& clone) const
     {
@@ -593,6 +597,8 @@ struct StateTree
     }
 
     std::vector<StateNode> _nodes;
+
+    bool _finalized{false};
 
     RankTopology const _topo{};
 

@@ -348,7 +348,7 @@ struct CheckpointWriter
         return Registry;
     }
 
-    static void InitializeQueueAsync(StateTree const& root)
+    static void SendStateRegistry(StateTree const& root)
     {
         auto const& topo = root.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
@@ -392,7 +392,6 @@ struct CheckpointWriter
 
     static std::shared_ptr<QueueState> GetQueueState(StateTree const& root)
     {
-        InitializeQueueAsync(root);
         std::shared_ptr<QueueState> state;
         {
             auto&            reg = Registry();
@@ -761,8 +760,12 @@ void WaitForCheckpointSave(RankTopology const& topo)
     for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
-void InitializeQueueAsync(StateTree const& registry)
-{ CheckpointWriter::InitializeQueueAsync(registry); }
+void FinalizeStateRegistry(StateTree& root)
+{
+    if (root.IsFinalized()) { return; }
+    root.FinalizeRegistry();
+    CheckpointWriter::SendStateRegistry(root);
+}
 
 // For now, we don't have any deferred tensors to save, so this is a no-op. In the future, we can add logic here to save any remaining
 // tensors that were deferred during registration.

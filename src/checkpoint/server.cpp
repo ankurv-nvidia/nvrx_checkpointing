@@ -75,10 +75,7 @@ namespace tel  = checkpoint::telemetry;
 // Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
 
-// TODO_CLI_SVR_RESPAWN
-// Must exceed the longest inter-save training stretch a job produces since the client
-// cannot handle cleanly if a daemon spinsdown and respaws.
-static constexpr auto AutoShutdownTimeout = 900s;
+static constexpr auto ServerWaitTimeout = 900s;
 
 // uint32_t ranks
 // uint32_t iterations
@@ -121,7 +118,7 @@ struct Server
     void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank);
     void ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd);
 
-    void RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
+    void ReceiveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
                                         cipc::Rank                                                           fromRank,
                                         tcp_stream&                                                          stream,
                                         boost::beast::flat_buffer&                                           buffer,
@@ -723,12 +720,12 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
 }
 #endif
 
-static std::vector<Rank> CalculateWaitingFor(std::unordered_set<Rank> const& recievedFrom, Rank begin, Rank end)
+static std::vector<Rank> CalculateWaitingFor(std::unordered_set<Rank> const& receivedFrom, Rank begin, Rank end)
 {
     std::vector<Rank> waitingFor;
     for (auto rank = static_cast<uint32_t>(begin); rank < static_cast<uint32_t>(end); ++rank)
     {
-        if (!recievedFrom.contains(Rank{rank})) { waitingFor.push_back(Rank{rank}); }
+        if (!receivedFrom.contains(Rank{rank})) { waitingFor.push_back(Rank{rank}); }
     }
     return waitingFor;
 }
@@ -762,7 +759,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     {
         {
             std::scoped_lock lock(mutex);
-            if (recievedFrom.size() >= localNodeWorldSize && recievedFrom.contains(hdr.globalRank))
+            if (receivedFrom.size() >= localNodeWorldSize && receivedFrom.contains(hdr.globalRank))
             {
                 if (onCoordinatorPeer && snapshotPtr->globalRegistry == nullptr)
                 {
@@ -771,7 +768,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                 break;
             }
             auto waitingFor
-                = CalculateWaitingFor(recievedFrom, hdr.globalRank, Rank{static_cast<uint32_t>(hdr.globalRank) + localNodeWorldSize});
+                = CalculateWaitingFor(receivedFrom, hdr.globalRank, Rank{static_cast<uint32_t>(hdr.globalRank) + localNodeWorldSize});
             INFO("[{}#{}] FinalizeSnapshot waiting for snapshot={} local-state-registry {} of {} remaining, "
                  "waitingFor=[{}]",
                  *server,
@@ -1414,9 +1411,9 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         // Concurrent handlers push here; an unlocked emplace corrupts sibling futures.
         std::scoped_lock lock(mutex);
         asyncTasks.emplace_back(
-            std::async(std::launch::async | std::launch::deferred, &Session::OnRecieveLocalStateRegistryAsync_, this, rank));
+            std::async(std::launch::async | std::launch::deferred, &Session::OnReceiveLocalStateRegistryAsync_, this, rank));
 
-        // Coordinator-peer ranks merge into the global registry locally (OnRecieve); only
+        // Coordinator-peer ranks merge into the global registry locally (OnReceive); only
         // ranks on other peers forward their fragment to the coordinator (peers[0]).
         if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
         {
@@ -1676,14 +1673,14 @@ void Session::HandleStateRegistryFragment(Rank                                  
     MergeFragmentToGlobalState_(lock, tensorShards);
     // Blob lengths are fixed by initial registry synchronization.
     for (auto const& [fqn, length] : blobMetasIn) { blobMetas[fqn][recvRank] = {.length = length}; }
-    recievedFrom.insert(recvRank);
+    receivedFrom.insert(recvRank);
     INFO("[{}#{}] HandleStateRegistryFragment rank={} shards={} Blobs={} waitingFor=[{}]",
          *server,
          sessionId,
          recvRank,
          tensorShards.size(),
          blobMetasIn.size(),
-         fmt::join(CalculateWaitingFor(recievedFrom, Rank{0}, topo.worldSize), ","));
+         fmt::join(CalculateWaitingFor(receivedFrom, Rank{0}, topo.worldSize), ","));
 }
 
 void Session::RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& /* lock */, Rank rank, StateTree const& localRegistry)
@@ -1789,7 +1786,7 @@ void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
 
     auto const minimumTotal = std::max(cipc::MinShmSize, cipc::MsgQueue::MinimumShmSize(slotCount) * queueCount);
     auto const totalSize    = cipc::MsgQueue::DetectShmSize(
-        cipc::Message::RequestChannelName(_index, static_cast<uint8_t>(queueCount)), configuredTotalSize, minimumTotal, slotCount);
+        cipc::Message::RequestChannelName(_index, queueCount), configuredTotalSize, minimumTotal, slotCount);
     auto const queueSize = totalSize / queueCount;
     _running             = true;
     _msgQueue.assign(queueCount, nullptr);
@@ -1872,12 +1869,13 @@ bool Server::HasSessionsAndAllSessionsComplete()
 
 void Server::WaitForShutdown()
 {
+    auto const autoShutdownTimeout
+        = std::chrono::seconds{checkpoint::config::GetConfigValue<checkpoint::config::ServerAutoShutdownTimeoutSeconds>()};
     while (true)
     {
-        if (_stopRequested || (((_lastPingTime + AutoShutdownTimeout) < PerfClock::now()) && HasSessionsAndAllSessionsComplete()))
-        {
-            break;
-        }
+        auto const autoShutdown
+            = autoShutdownTimeout != 0s && (_lastPingTime + autoShutdownTimeout) < PerfClock::now() && HasSessionsAndAllSessionsComplete();
+        if (_stopRequested || autoShutdown) { break; }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     Stop();
@@ -2212,20 +2210,21 @@ void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view c
 void Server::InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo)
 {
     if (topo.ranksPerPeer == 0) { throw std::invalid_argument("local registry has no ranks per peer"); }
-    if (snapshotSize > std::numeric_limits<size_t>::max() / topo.ranksPerPeer)
+    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    auto const queueCount           = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+    auto const maxProducerCount     = (topo.ranksPerPeer + queueCount - 1) / queueCount;
+    auto const snapshotSizePerQueue = cipc::RoundSnapshotShmSize(static_cast<size_t>(snapshotSize));
+    if (snapshotSizePerQueue > std::numeric_limits<size_t>::max() / maxProducerCount / queueCount)
     {
         throw std::overflow_error("automatic shared-memory size exceeds the supported range");
     }
-    auto const totalSize = static_cast<size_t>(snapshotSize) * topo.ranksPerPeer;
+    auto const totalSize = snapshotSizePerQueue * maxProducerCount * queueCount;
 
-    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-    auto const queueCount           = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
-    auto       slotCount            = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
+    auto slotCount = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
     if (slotCount == 0)
     {
-        auto const queueSize     = totalSize / queueCount;
-        auto const producerCount = (topo.ranksPerPeer + queueCount - 1) / queueCount;
-        slotCount                = cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, producerCount);
+        auto const queueSize = totalSize / queueCount;
+        slotCount            = cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, maxProducerCount);
     }
 
     std::scoped_lock<std::mutex> lock(_mutex);
@@ -2253,7 +2252,7 @@ void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view 
     });
 }
 
-void Server::RecieveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
+void Server::ReceiveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
                                             cipc::Rank                                                           fromRank,
                                             tcp_stream&                                                          stream,
                                             boost::beast::flat_buffer&                                           buffer,
@@ -2369,10 +2368,9 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
 {
     SetThreadName("ncs:spindown");
     static constexpr auto HeartbeatInterval = 2s;
-    // No explicit timeout falls back to a generous default so a wedged server can't hang
-    // a caller forever — matched to WaitForShutdown's idle auto-shutdown window.
+    // The bounded wait prevents a wedged server from hanging a caller forever.
 
-    auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
+    auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
 
     // No deadline on the synchronous writes; the heartbeat cadence, not a socket timeout,
     // bounds how long we hold the connection.
@@ -2437,7 +2435,7 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
 {
     SetThreadName("ncs:finwait");
     static constexpr auto HeartbeatInterval = 2s;
-    auto const            deadline          = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(AutoShutdownTimeout);
+    auto const            deadline          = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
     stream.expires_never();
 
     boost::system::error_code                                    ec;
@@ -2542,7 +2540,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
 
         boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
-        RecieveStateRegistryFragments_(sessionId, rank, stream, buffer, bufferParser);
+        ReceiveStateRegistryFragments_(sessionId, rank, stream, buffer, bufferParser);
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
@@ -2916,17 +2914,17 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
     }
 }
 
-void Session::OnRecieveLocalStateRegistryAsync_(Rank const& rank)
+void Session::OnReceiveLocalStateRegistryAsync_(Rank const& rank)
 {
     {
         std::scoped_lock lock(mutex);
         auto&            localState = *sessionState.localStates[rank];
-        recievedFrom.insert(rank);
-        INFO("[{}#{}] OnRecieveLocalStateRegistryAsync_  rank={} waitingFor=[{}]",
+        receivedFrom.insert(rank);
+        INFO("[{}#{}] OnReceiveLocalStateRegistryAsync_  rank={} waitingFor=[{}]",
              *server,
              sessionId,
              rank,
-             fmt::join(CalculateWaitingFor(recievedFrom, Rank{0}, topo.worldSize), ","));
+             fmt::join(CalculateWaitingFor(receivedFrom, Rank{0}, topo.worldSize), ","));
 
         if (sessionState.globalRegistry == nullptr)
         {
@@ -3020,7 +3018,7 @@ void StopInprocServer()
 void WaitForInprocServerWrites()
 {
     static constexpr auto WaitDuration = 50ms;
-    auto const            deadline     = PerfClock::now() + AutoShutdownTimeout;
+    auto const            deadline     = PerfClock::now() + ServerWaitTimeout;
     while (true)
     {
         bool foundServer = false;

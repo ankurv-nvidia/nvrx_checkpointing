@@ -335,7 +335,7 @@ void SaveCheckpointAndValidate(StateTree& tree, std::filesystem::path const& ckp
 
 void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree)
 {
-    tree.FinalizeRegistry();
+    FinalizeStateRegistry(tree);
     while (!ctx.stopRequested.load(std::memory_order_acquire))
     {
         FixtureFunc           func{nullptr};

@@ -70,12 +70,7 @@ struct PythonStateTree : PyStateDictAccessor
     void FinalizeRegistry()
     {
         ChainAsyncCall([this] {
-            if (!_finalized)
-            {
-                _tree.FinalizeRegistry();
-                _finalized = true;
-                InitializeQueueAsync(_tree);
-            }
+            FinalizeStateRegistry(_tree);
             OnSnapshotComplete_();
         });
     }
@@ -128,7 +123,6 @@ struct PythonStateTree : PyStateDictAccessor
 
     StateTree _tree;
 
-    bool     _finalized{false};
     nb::dict _dictToScan;
 
     std::unordered_map<StateNode::Handle, nb::object> _tensorRefObjects;
@@ -170,7 +164,7 @@ StateNode& PythonStateTree::MatchStateChild_(StateNode::Handle parent, std::stri
 
 StateNode& PythonStateTree::AddDictionaryChild(StateNode::Handle parent, std::string_view name)
 {
-    if (_finalized)
+    if (_tree.IsFinalized())
     {
         auto& child = _tree.FindChildNode(parent, name);
         if (child.data.index() != static_cast<size_t>(StateNode::Type::Dict))
@@ -187,7 +181,7 @@ StateNode& PythonStateTree::AddDictionaryChild(StateNode::Handle parent, std::st
 StateNode& PythonStateTree::RegisterStateByFQN(std::string_view fqn, StateNode::Variant data)
 {
     auto [name, parent] = [&]() -> std::pair<std::string_view, StateNode::Handle> {
-        if (!_finalized) { return _tree.FindOrAddNodeByFQN(fqn); }
+        if (!_tree.IsFinalized()) { return _tree.FindOrAddNodeByFQN(fqn); }
         return _tree.FindParentDictNodeByFQN(fqn);
     }();
     return RegisterState(parent, name, std::move(data));
@@ -195,7 +189,7 @@ StateNode& PythonStateTree::RegisterStateByFQN(std::string_view fqn, StateNode::
 
 StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_view stateName, StateNode::Variant data)
 {
-    if (!_finalized)
+    if (!_tree.IsFinalized())
     {
         auto& child = _tree.AddChild(parent, stateName);
         child.data  = std::move(data);
@@ -303,13 +297,8 @@ void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem
 {
     try
     {
-        if (!_finalized)
-        {
-            _tree.FinalizeRegistry();
-            _finalized = true;
-        }
+        FinalizeStateRegistry(_tree);
         ValidateTensorHandles_();
-        InitializeQueueAsync(_tree);
         ::SaveCheckpoint(_tree, iteration, dirpath);
     } catch (...)
     {

@@ -7,14 +7,15 @@ from __future__ import annotations
 import copy
 import io
 import time
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-
 from megatron.core import mpu  # type: ignore[import-not-found]
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  # type: ignore[import-not-found]
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
@@ -26,6 +27,7 @@ from megatron.training.checkpointing import (  # type: ignore[import-not-found]
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
     get_rng_state,
+    maybe_save_dataloader_state,
 )
 from megatron.training.global_vars import get_args  # type: ignore[import-not-found]
 from megatron.training.utils import print_rank_0  # type: ignore[import-not-found]
@@ -65,6 +67,7 @@ class SaveCheckpointArgs:
     pp_group: object | None = None
     dp_cp_group: object | None = None
     dp_group: object | None = None
+    dp_gtp_remat_group: object | None = None
     rng_state_key_prefix: str = ""
 
 
@@ -76,6 +79,36 @@ class _PendingSave:
 
 _pending: _PendingSave | None = None
 _executor: ThreadPoolExecutor | None = None
+_LOAD_CONTEXT: dict[str, object] | None = None
+
+
+class _SingletonProcessGroup:
+    @staticmethod
+    def rank() -> int:
+        return 0
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
+
+_SINGLETON_PROCESS_GROUP = _SingletonProcessGroup()
+
+
+def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
+    """Expose Megatron's role-specific groups while its DCP load is running."""
+
+    @wraps(load_checkpoint)
+    def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        global _LOAD_CONTEXT  # noqa: PLW0603
+        previous = _LOAD_CONTEXT
+        _LOAD_CONTEXT = {name: kwargs.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
+        try:
+            return load_checkpoint(*args, **kwargs)
+        finally:
+            _LOAD_CONTEXT = previous
+
+    return wrapped
 
 
 def _checkpoint_span(name: str, iteration: int) -> AbstractContextManager[object]:
@@ -150,11 +183,28 @@ def _prepare_registration_state_dict(state_dict: dict, iteration: int) -> dict:
             force=True,
         )
     if needs_rng_state:
-        state_dict[_RNG_STATE_KEY] = get_rng_state(
-            "torch_dist",
-            mpu.get_tensor_model_parallel_group(),
-            mpu.get_pipeline_model_parallel_group(),
-        )
+        if iteration == 0:
+            if not getattr(args, "no_load_rng", False):
+                warnings.warn(
+                    "load registration omitted rng_state without no_load_rng; synthesizing placeholder state",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            context = _LOAD_CONTEXT or {}
+            state_dict[_RNG_STATE_KEY] = get_rng_state(
+                "torch_dist",
+                context.get("tp_group"),
+                context.get("pp_group"),
+                dp_cp_group=context.get("dp_cp_group") or _SINGLETON_PROCESS_GROUP,
+                dp_group=context.get("dp_group") or _SINGLETON_PROCESS_GROUP,
+                key_prefix=str(context.get("rng_state_key_prefix") or ""),
+            )
+        else:
+            state_dict[_RNG_STATE_KEY] = get_rng_state(
+                "torch_dist",
+                mpu.get_tensor_model_parallel_group(),
+                mpu.get_pipeline_model_parallel_group(),
+            )
     sharded_part, common = save_preprocess(state_dict, validate_access_integrity=False)
     _prepare_rng_sharded_object_blobs(sharded_part.get(_RNG_STATE_KEY))
     snapshot_state = {}
@@ -258,8 +308,9 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
     The load path or first save creates the process-global state tree. Every save
     rescans the complete dictionary and refreshes the registered values and tensor pointers.
 
-    Dataloader resume, logging hooks, fault tolerance, retention cleanup, and
-    ModelOpt state are outside this provider's state contract.
+    Dataloader state is written as Megatron's per-iteration sidecar file. Logging
+    hooks, fault tolerance, retention cleanup, and ModelOpt state are outside this
+    provider's state contract.
     """
     global _pending  # noqa: PLW0603
     iteration = save_args.iteration
@@ -328,6 +379,17 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             checkpoint_dir = Path(get_checkpoint_name(args.save, iteration, return_base_dir=True))
 
     with _checkpoint_span("megatron.checkpoint.save.io_write", iteration):
+        # Loader state lands before snapshot submission, so the tracker never names an iteration without it.
+        with _checkpoint_span("megatron.checkpoint.save.dataloader_state", iteration):
+            maybe_save_dataloader_state(
+                save_args.train_data_iterator,
+                iteration,
+                getattr(args, "dataloader_save", None),
+                tp_group=save_args.tp_group,
+                pp_group=save_args.pp_group,
+                # Loader state is indexed on the full data-distribution axis when that group is provided.
+                dp_group=save_args.dp_gtp_remat_group if save_args.dp_gtp_remat_group is not None else save_args.dp_group,
+            )
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
                 root = register_state_dict(state_dict, iteration)

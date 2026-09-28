@@ -8,7 +8,7 @@ import gc
 import threading
 import weakref
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import pytest
 import torch
@@ -23,6 +23,36 @@ class _CudaGraphModule(Enum):
     MAMBA = auto()
     ATTN = auto()
     MOE_ROUTER = auto()
+
+
+class _StorageLessQuantizedTensor(torch.Tensor):
+    dequantized: ClassVar[list[weakref.ReferenceType[torch.Tensor]]] = []
+
+    @staticmethod
+    def __new__(cls: type[Self], source: torch.Tensor) -> Self:
+        tensor = torch.Tensor._make_wrapper_subclass(  # noqa: SLF001
+            cls,
+            source.shape,
+            dtype=source.dtype,
+            device=source.device,
+            requires_grad=False,
+        )
+        tensor.source = source
+        return tensor
+
+    @classmethod
+    def __torch_dispatch__(cls, func, _types, args=(), kwargs=None):  # noqa: ANN001, ANN206
+        del kwargs
+        if func == torch.ops.aten.detach.default:
+            return args[0]
+        if func == torch.ops.aten.is_pinned.default:
+            return False
+        raise NotImplementedError(func)
+
+    def dequantize(self) -> torch.Tensor:
+        result = self.source.clone()
+        self.dequantized.append(weakref.ref(result))
+        return result
 
 
 def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
@@ -75,6 +105,64 @@ def test_register_state_dict_releases_superseded_python_objects() -> None:
     gc.collect()
 
     assert tensor_ref() is None
+
+
+def test_register_state_dict_materializes_storage_less_quantized_tensor() -> None:
+    _StorageLessQuantizedTensor.dequantized.clear()
+    data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16))
+    assert data.data_ptr() == 0
+    state = {
+        "weight": ShardedTensor.from_rank_offsets("weight", data, (0, 0, 1)),
+    }
+
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict(state)
+    assert root.snapshot_size == 16
+
+    assert len(_StorageLessQuantizedTensor.dequantized) == 1
+    gc.collect()
+    assert _StorageLessQuantizedTensor.dequantized[0]() is not None
+
+    root.finalize_registry()
+    fresh_data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16) + 1)
+    root.register_state_dict(
+        {"weight": ShardedTensor.from_rank_offsets("weight", fresh_data, (0, 0, 1))},
+    )
+    assert root.snapshot_size == 16
+
+    assert len(_StorageLessQuantizedTensor.dequantized) == 2
+    gc.collect()
+    assert _StorageLessQuantizedTensor.dequantized[0]() is None
+    assert _StorageLessQuantizedTensor.dequantized[1]() is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires one CUDA GPU")
+def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
+    _StorageLessQuantizedTensor.dequantized.clear()
+    source = torch.arange(8, dtype=torch.bfloat16, device="cuda")
+    data = _StorageLessQuantizedTensor(source)
+    assert data.data_ptr() == 0
+
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict(
+        {"weight": ShardedTensor.from_rank_offsets("weight", data, (0, 0, 1))},
+    )
+    assert root.snapshot_size == 16
+
+    assert len(_StorageLessQuantizedTensor.dequantized) == 1
+    materialized = _StorageLessQuantizedTensor.dequantized[0]()
+    assert materialized is not None
+    assert materialized.is_cuda
+
+    try:
+        root.save(1, tmp_path / "iter_0000001")
+    finally:
+        checkpoint.svc_spindown()
+
+    torch.testing.assert_close(materialized, source)
+    del materialized
+    gc.collect()
+    assert _StorageLessQuantizedTensor.dequantized[0]() is None
 
 
 def test_register_state_dict_refreshes_when_the_same_dictionary_is_reused() -> None:

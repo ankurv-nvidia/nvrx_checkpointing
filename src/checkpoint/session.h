@@ -75,7 +75,7 @@ struct Session
     // Session State variables
     Snapshot                                                 sessionState;    // The tensor storage on this is empty
     std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
-    std::unordered_set<checkpoint::ipc::Rank>                recievedFrom;    // Ranks from which data has been recieved.
+    std::unordered_set<checkpoint::ipc::Rank>                receivedFrom;    // Ranks from which data has been received.
 
     checkpoint::distcp::BlobMetadataByFqn blobMetas;
 
@@ -134,7 +134,7 @@ struct Session
     void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;
 #endif
 
-    void OnRecieveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
+    void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);

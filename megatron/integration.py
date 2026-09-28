@@ -71,10 +71,12 @@ def _mcore_load_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tup
 def _install_load_wrapper() -> None:
     """Register the constructed load state and retain old optimizer compatibility."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
+    from megatron.training import training as training_module  # type: ignore[import-not-found]
 
     if getattr(dist_checkpointing, _NATIVE_LOAD_MARKER, False):
         return
 
+    from . import save as native_save
     from .legacy_optimizer import adapt_legacy_optimizer_request, restore_optimizer_dtype_keys
 
     original_load = dist_checkpointing.load
@@ -98,14 +100,13 @@ def _install_load_wrapper() -> None:
                 raise current_error from legacy_error
             result = restore_optimizer_dtype_keys(result, dtype_lookup)
 
-        from . import save as native_save
-
         root = native_save.register_state_dict(sharded_state_dict, 0)
         root.finalize_registry()
         return result
 
     dist_checkpointing.load = load
     setattr(dist_checkpointing, _NATIVE_LOAD_MARKER, True)
+    training_module.load_checkpoint = native_save._wrap_load_checkpoint(training_module.load_checkpoint)  # noqa: SLF001
 
 
 def _install_async_queue_bindings() -> None:
@@ -153,6 +154,7 @@ def _install_save_wrapper() -> None:
                 pp_group=values.get("pp_group"),
                 dp_cp_group=values.get("dp_cp_group"),
                 dp_group=values.get("dp_group"),
+                dp_gtp_remat_group=values.get("dp_gtp_remat_group"),
                 rng_state_key_prefix=values.get("rng_state_key_prefix", ""),
             ),
         )
