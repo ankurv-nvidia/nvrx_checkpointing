@@ -315,6 +315,62 @@ def test_register_state_dict_matches_nested_optimizer_bucket_lists() -> None:
     assert refreshed["optimizer"]["param_state"][0][dtype_pair][0][0]["step"] == 2
 
 
+def _fp32_master_weight(name: str, data: torch.Tensor) -> ShardedTensor:
+    return ShardedTensor.from_rank_offsets(f"optimizer.state.fp32_param.{name}", data, (0, 0, 1))
+
+
+def _float16_optimizer_state(offset: float) -> dict:
+    """Megatron's non-distributed mixed-precision optimizer state after save preprocessing.
+
+    ``fp32_from_fp16_params`` holds one list per parameter group with one
+    ShardedTensor per parameter; the Adam moments live under the parameter index.
+    """
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3) + offset
+    bias = torch.arange(2, dtype=torch.float32) + offset
+    return {
+        "optimizer": {
+            "optimizer": {
+                "state": {
+                    0: {"exp_avg": ShardedTensor.from_rank_offsets("optimizer.state.exp_avg.decoder.weight", weight.clone(), (0, 0, 1))},
+                },
+                "param_groups": [{"params": [0, 1], "lr": 0.1}],
+            },
+            "fp32_from_fp16_params": [
+                [_fp32_master_weight("decoder.weight", weight)],
+                [_fp32_master_weight("decoder.bias", bias)],
+            ],
+        },
+    }
+
+
+def test_register_state_dict_accepts_float16_optimizer_master_weights() -> None:
+    # Two 6-element and one 2-element fp32 tensors plus the two int64 parameter indices.
+    expected_size = (6 + 6 + 2) * 4 + 2 * 8
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict(_float16_optimizer_state(0.0))
+    assert root.snapshot_size == expected_size
+    root.finalize_registry()
+
+    root.register_state_dict(_float16_optimizer_state(1.0))
+    assert root.snapshot_size == expected_size
+
+
+def test_register_state_dict_accepts_factory_shards_inside_nested_lists() -> None:
+    fc1_key = "optimizer.state.fp32_param.decoder.mlp.linear_fc1.weight"
+    swiglu_halves = [ShardedTensor.from_rank_offsets(fc1_key, torch.arange(4, dtype=torch.float32), (0, half, 2)) for half in range(2)]
+    in_proj = ShardedTensorFactory(
+        key="optimizer.state.fp32_param.decoder.mixer.in_proj.weight",
+        data=torch.arange(4, dtype=torch.float32),
+        build_fn=lambda key, data, *_args: [ShardedTensor.from_rank_offsets(f"{key}.z", data, (0, 0, 1))],
+        merge_fn=None,
+    )
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+
+    root.register_state_dict({"optimizer": {"fp32_from_fp16_params": [[swiglu_halves, in_proj], [{"step": 1}]]}})
+
+    assert root.snapshot_size == 3 * 4 * 4
+
+
 def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
     """Accept Megatron's Mamba conv1d state-name compatibility mapping."""
     tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)

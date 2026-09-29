@@ -551,10 +551,8 @@ RegisterTensorState(PyStateDictAccessor& scan, StateNode::Handle parent, std::st
     return node;
 }
 
-static void
-RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& name, nb::dict const& container)
+static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& name, nb::handle factory)
 {
-    auto factory        = nb::borrow<nb::object>(container[name]);
     auto factoryKey     = nb::cast<nb::str>(factory.attr("key"));
     auto factoryKeyView = StrView(factoryKey);
     auto nameView       = StrView(name);
@@ -680,11 +678,7 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
     return true;
 }
 
-bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
-                               StateNode::Handle    node,
-                               nb::dict const&      container,
-                               nb::str const&       key,
-                               nb::handle           val)
+bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::handle val)
 {
     if (IsTorchTensor(val))
     {
@@ -706,7 +700,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
     }
     if (IsMegatronShardedTensorFactory(val))
     {
-        RegisterShardedTorchTensorFactory(scan, node, key, container);
+        RegisterShardedTorchTensorFactory(scan, node, key, val);
         return true;
     }
     if (IsMegatronShardedObject(val))

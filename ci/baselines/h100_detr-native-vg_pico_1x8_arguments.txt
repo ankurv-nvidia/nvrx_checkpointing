@@ -808,7 +808,7 @@
   use_cpu_initialization .......................... None
   use_dist_ckpt ................................... True
   use_dist_ckpt_deprecated ........................ False
-  use_distributed_optimizer ....................... True
+  use_distributed_optimizer ....................... False
   use_flash_attn .................................. False
   use_fused_weighted_squared_relu ................. False
   use_gigatoken ................................... False

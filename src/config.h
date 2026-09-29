@@ -207,37 +207,37 @@ struct OtelExport
 
 struct OtelFile
 {
-    static constexpr std::string_view Name = "otel.file";
-    static constexpr std::string_view Default;
-    using Type = types::WFile;
+    static constexpr std::string_view Name    = "otel.file";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::WFile;
 };
 
 struct OtelService
 {
-    static constexpr std::string_view Name = "otel.service";
-    static constexpr std::string_view Default;
-    using Type = types::Text;
+    static constexpr std::string_view Name    = "otel.service";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::Text;
 };
 
 struct OtelCollector
 {
-    static constexpr std::string_view Name = "otel.collector";
-    static constexpr std::string_view Default;
-    using Type = types::Text;
+    static constexpr std::string_view Name    = "otel.collector";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::Text;
 };
 
 struct OtelRunId
 {
-    static constexpr std::string_view Env = "MEGATRON_OTEL_RUN_ID";
-    static constexpr std::string_view Default;
-    using Type = types::Text;
+    static constexpr std::string_view Env     = "MEGATRON_OTEL_RUN_ID";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::Text;
 };
 
 struct CiPhase
 {
-    static constexpr std::string_view Name = "ci.phase";
-    static constexpr std::string_view Default;
-    using Type = types::Text;
+    static constexpr std::string_view Name    = "ci.phase";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::Text;
 };
 
 struct OtelMetrics

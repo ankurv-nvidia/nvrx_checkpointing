@@ -3,6 +3,9 @@
 # global batch size are left unpinned so they scale with the runner's GPU count
 # (the dynamic defaults supplied in code).
 
+use-distributed-optimizer: false
+overlap-param-gather: false # Needs distributed optimizer
+
 # Model size
 num-layers: 3
 hidden-size: 2048

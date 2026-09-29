@@ -5712,6 +5712,30 @@ def test_gpt_moe_covers_prepended_expert_axes_and_fp8_param_gather(
     assert command[command.index("--moe-layer-freq") + 1] == "1"
 
 
+def test_pico_trains_with_the_mixed_precision_optimizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    pico = slurm_job._model_config("pico")
+
+    assert pico["use-distributed-optimizer"] is False
+    assert pico["overlap-param-gather"] is False
+    for path in sorted(slurm_job.CONFIGS_DIR.glob("*.yaml")):
+        if path.stem not in ("base", "pico"):
+            assert slurm_job._model_config(path.stem)["use-distributed-optimizer"] is True, path.stem
+
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    args = _args(tmp_path, config="pico", nodes=1, gpus_per_node=4, flavors=["perf", "native"])
+    slurm_job._configure_run(args)
+    command, _env = slurm_job._phase_command("pico_1x4", args, "native", 1)
+
+    assert "--use-distributed-optimizer" not in command
+    assert "--overlap-param-gather" not in command
+    assert "--bf16" in command
+    assert "--overlap-grad-reduce" in command
+    assert command[command.index("--num-experts") + 1] == "32"
+
+
 def test_super3_profiles_share_reference_architecture() -> None:
     slurm_job = _load_slurm_job()
     common = slurm_job._model_config("super3")

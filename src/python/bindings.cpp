@@ -482,7 +482,6 @@ static bool IsNumPyRngState(nb::tuple const& tupleObj)
 
 static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           scan,    // NOLINT(readability-function-cognitive-complexity)
                                                StateNode::Handle              node,
-                                               nb::dict const&                container,
                                                bool                           recursive,
                                                std::unordered_set<PyObject*>& visited,
                                                nb::str const&                 key,
@@ -567,18 +566,10 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
                     auto item = nb::cast<nb::list>(listObj[i]);
                     for (size_t j = 0; j < item.size(); ++j)
                     {
-                        auto  item1 = item[j];
-                        auto& child = scan.AddDictionaryChild(node, fmt::format("{}.[list]#{}.[list]#{}", key, i, j));
-                        if (!nb::isinstance<nb::dict>(item1))
-                        {
-                            throw std::runtime_error(
-                                fmt::format("[TODO]StateDict::Register] Unsupported list element type for {}. Expected dict, got {}",
-                                            child.name,
-                                            nb::str(item1.type())));
-                        }
-                        auto                   childDict = nb::cast<nb::dict>(item1);
-                        nb::gil_scoped_release release;
-                        RegisterStateDictRecr(scan, child.handle, childDict, recursive, visited);
+                        auto const elementKey = fmt::format("{}.[list]#{}.[list]#{}", keyView, i, j);
+                        auto const element    = nb::borrow<nb::object>(item[j]);
+                        RegisterStateDictRecrContainerItem(
+                            scan, node, recursive, visited, nb::str(elementKey.c_str(), elementKey.size()), element);
                     }
                 }
             }
@@ -589,7 +580,7 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
                 fmt::format("[TODO]StateDict::Register] Unsupported list element type for key: {} obj = {}", key, nb::str(listObj)));
         }
     }
-    else if (TryRegisterTorchStateDict(scan, node, container, key, val)) {}
+    else if (TryRegisterTorchStateDict(scan, node, key, val)) {}
     else if (recursive)
     {
         if (nb::isinstance<nb::dict>(val))
@@ -642,7 +633,7 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
             auto                   value = nb::borrow<nb::object>(container[key]);
             try
             {
-                RegisterStateDictRecrContainerItem(scan, node, container, recursive, visited, nb::str(key), value);
+                RegisterStateDictRecrContainerItem(scan, node, recursive, visited, nb::str(key), value);
             } catch (std::exception const& e)
             {
                 fmt::print(stderr,

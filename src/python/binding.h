@@ -54,11 +54,7 @@ class PyStateDictAccessor
     [[nodiscard]] virtual std::string GetNodeId(StateNode::Handle node) const = 0;
 };
 
-bool TryRegisterTorchStateDict(PyStateDictAccessor&  scan,
-                               StateNode::Handle     node,
-                               nanobind::dict const& container,
-                               nanobind::str const&  key,
-                               nanobind::handle      val);
+bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nanobind::str const& key, nanobind::handle val);
 
 // Detect a list-of-ShardedTensor (what `apply_factories` produces in place of a
 // ShardedTensorFactory) and register every element. Returns false on any other
