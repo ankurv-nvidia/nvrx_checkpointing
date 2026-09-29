@@ -65,6 +65,11 @@ struct CachedTypes
     nb::object megatronShardedObject;
 };
 
+struct TensorState
+{
+    DS4Tensor  meta;
+    nb::object owner;
+};
 }    // namespace
 
 static bool IsMainReplica(nb::handle replicaId);
@@ -269,12 +274,6 @@ static bool IsMegatronShardedObject(nb::handle obj)
 }
 
 // === State extraction ===
-
-struct TensorState
-{
-    DS4Tensor  meta;
-    nb::object owner;
-};
 
 static nb::object AddressableTensor(std::string_view name, nb::handle value)
 {
@@ -520,7 +519,7 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
             "Tensor {} size mismatch: sharddim implies {} bytes, DLPack shape implies {}", shtKeyView, shardBytes, dlpackBytes));
     }
     ds4tensor.AssertShardIsValid();
-    return {.meta = std::move(ds4tensor), .owner = std::move(owner)};
+    return {.meta = ds4tensor, .owner = std::move(owner)};
 }
 
 static StateNode::Blob ShardedObjectBlob(nb::handle value)
@@ -604,7 +603,7 @@ RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNode::Handle n
         }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(tensorName, innerContainer);
-        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
     }
 }
 
@@ -657,8 +656,7 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
     // and skip the parent-node prefix; otherwise compose the FQN from the
     // parent node id (mirrors `RegisterShardedTorchTensorFactory`).
     auto const parentPath = scan.GetNodeId(node);
-    auto const fqn = nameView.contains('.') ? std::string(nameView)
-                                            : (parentPath.empty() ? std::string(nameView) : fmt::format("{}.{}", parentPath, nameView));
+    auto const fqn = (nameView.contains('.') || parentPath.empty()) ? std::string(nameView) : fmt::format("{}.{}", parentPath, nameView);
     for (auto const& item : listObj)
     {
         auto itemContainer = nb::cast<nb::dict>(item.attr("__dict__"));
@@ -677,7 +675,7 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
         }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(tensorName, itemContainer);
-        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
     }
     return true;
 }
@@ -691,7 +689,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
     if (IsTorchTensor(val))
     {
         auto tensorState = TorchTensorState(StrView(key), val);
-        RegisterTensorState(scan, node, StrView(key), std::move(tensorState.meta), tensorState.owner);
+        RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner);
         return true;
     }
     if (IsTorchDtype(val))
@@ -703,7 +701,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan,
     {
         auto tensorName  = key;
         auto tensorState = ShardedTensorState(tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
-        RegisterTensorState(scan, node, StrView(tensorName), std::move(tensorState.meta), tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
         return true;
     }
     if (IsMegatronShardedTensorFactory(val))

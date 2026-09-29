@@ -134,7 +134,7 @@ struct Server
     bool IsFinalizeComplete_(cipc::SessionId sessionId, int64_t iteration, cipc::SnapshotId& snapshotId, bool& resolved);
     void HandleRequest_(tcp_stream& stream);
 
-#if defined(SO_REUSEPORT)
+#ifdef SO_REUSEPORT
     void AcquireInstanceLock_();
     class ReusePortOption
     {
@@ -2790,7 +2790,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     SetThreadName("ncs:w");
 }
 
-#if defined(SO_REUSEPORT)
+#ifdef SO_REUSEPORT
 void Server::AcquireInstanceLock_()
 {
     if (_instanceLock) { return; }
@@ -2817,7 +2817,7 @@ void Server::StartTcpListener_(bool reusePort, size_t acceptorCount)
     auto const    address = boost::asio::ip::make_address("0.0.0.0");
     tcp::endpoint endpoint(address, Port + _index);
 
-#if defined(SO_REUSEPORT)
+#ifdef SO_REUSEPORT
     // When SO_REUSEPORT is enabled, the TCP port no longer elects a single owner.
     // Losers must throw before touching acceptors or shm rings; Start() spawns the
     // shm consumer threads only after this returns.
@@ -2834,7 +2834,7 @@ void Server::StartTcpListener_(bool reusePort, size_t acceptorCount)
         auto& acceptor = _tcpAcceptors.emplace_back(_ioc);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::socket_base::reuse_address(true));
-#if defined(SO_REUSEPORT)
+#ifdef SO_REUSEPORT
         if (reusePort)
         {
             int const enable = 1;

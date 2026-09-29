@@ -1,7 +1,7 @@
 #pragma once
 #include "CommonMacros.h"
 
-#include "fmttensor.h"
+#include "fmttensor.h"    // IWYU pragma: keep
 #include "primitives64bit.h"
 #include "tensor.h"
 

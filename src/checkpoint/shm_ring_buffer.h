@@ -29,7 +29,7 @@
 namespace checkpoint::ipc
 {
 static constexpr size_t  MinShmSize                    = 32ull * 1024ull * 1024ull;    // 32MB
-static constexpr size_t  D2HConcurrency                = 4;
+static constexpr uint8_t D2HConcurrency                = 4;
 static constexpr size_t  TargetShmSlotSize             = 2ull * 1024ull * 1024ull * 1024ull;
 static constexpr uint8_t ExplicitSizeDefaultQueueCount = 4;
 static constexpr size_t  ExplicitSizeDefaultSlotCount  = 4;
@@ -51,12 +51,12 @@ inline size_t RoundSnapshotShmSize(size_t snapshotSize)
     if (snapshotSize == 0) { return MinSnapshotShmSize; }
     snapshotSize        = std::min(snapshotSize, MaxShmSize);
     auto const half     = std::max<size_t>(snapshotSize / 2, 1);
-    auto const quantum  = std::max<size_t>(std::bit_floor(half), 1ull << 20);
+    auto const quantum  = std::max<size_t>(std::bit_floor(half), 1ull << 20u);
     auto const withRoom = snapshotSize + ((snapshotSize + 3) / 4);
     auto       rounded  = std::max(((withRoom + quantum - 1) / quantum) * quantum, MinSnapshotShmSize);
     if (snapshotSize >= TargetShmSlotSize)
     {
-        auto const dataSlots        = std::max(D2HConcurrency, 1 + ((snapshotSize - 1) / TargetShmSlotSize));
+        auto const dataSlots        = std::max<size_t>(D2HConcurrency, 1 + ((snapshotSize - 1) / TargetShmSlotSize));
         auto const slotsWithControl = std::min(dataSlots + 1, MaxShmSize / TargetShmSlotSize);
         rounded                     = std::max(rounded, slotsWithControl * TargetShmSlotSize);
     }
@@ -96,10 +96,12 @@ inline size_t QueueProducerCount(uint8_t queueIndex, uint32_t ranksPerPeer, uint
     return producers;
 }
 
-inline size_t QueueD2HConcurrency(size_t slotCount, size_t producerCount)
+inline uint8_t QueueD2HConcurrency(size_t slotCount, size_t producerCount)
 {
     if (slotCount == 0 || producerCount == 0) { throw std::invalid_argument("slot and producer counts must be nonzero"); }
-    return std::min(D2HConcurrency, std::max<size_t>(1, slotCount / producerCount));
+    return std::min(
+        D2HConcurrency,
+        std::max<uint8_t>(1u, static_cast<uint8_t>(std::min<size_t>(std::numeric_limits<uint8_t>::max(), slotCount / producerCount))));
 }
 
 namespace bip = boost::interprocess;

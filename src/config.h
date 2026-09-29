@@ -83,15 +83,17 @@ struct ByteSize
         auto const amount     = std::stoull(std::string{value}, &index);
         auto const suffix     = value.substr(index);
         uint64_t   multiplier = 1;
+        // NOLINTBEGIN(readability-magic-numbers)
         if (suffix == "K" || suffix == "KB") { multiplier = 1000ull; }
         else if (suffix == "M" || suffix == "MB") { multiplier = 1000ull * 1000ull; }
         else if (suffix == "G" || suffix == "GB") { multiplier = 1000ull * 1000ull * 1000ull; }
-        else if (suffix == "KiB") { multiplier = 1ull << 10; }
-        else if (suffix == "MiB") { multiplier = 1ull << 20; }
-        else if (suffix == "GiB") { multiplier = 1ull << 30; }
+        else if (suffix == "KiB") { multiplier = 1ull << 10u; }
+        else if (suffix == "MiB") { multiplier = 1ull << 20u; }
+        else if (suffix == "GiB") { multiplier = 1ull << 30u; }
         else if (!suffix.empty()) { throw std::invalid_argument("Invalid byte-size suffix: " + std::string{suffix}); }
         if (amount > std::numeric_limits<ValueType>::max() / multiplier) { throw std::overflow_error("Byte size is too large"); }
         return static_cast<ValueType>(amount * multiplier);
+        // NOLINTEND(readability-magic-numbers)
     }
 };
 

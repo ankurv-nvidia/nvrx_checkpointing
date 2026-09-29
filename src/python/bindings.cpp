@@ -75,11 +75,11 @@ struct PythonStateTree : PyStateDictAccessor
         });
     }
 
-    template <typename TCall> void ChainAsyncCall(TCall&& call)
+    template <typename TCall> void ChainAsyncCall(TCall&& call)    // NOLINT(cppcoreguidelines-missing-std-forward)
     {
         std::scoped_lock lock(_asyncMutex);
         _async = std::async(std::launch::async,
-                            [previous = std::move(_async), next = std::function<void()>(std::forward<TCall>(call))]() mutable {
+                            [previous = std::move(_async), next = std::function<void()>(std::forward<TCall>(call))] mutable {
                                 try
                                 {
                                     if (previous.valid()) { previous.get(); }
@@ -180,7 +180,7 @@ StateNode& PythonStateTree::AddDictionaryChild(StateNode::Handle parent, std::st
 
 StateNode& PythonStateTree::RegisterStateByFQN(std::string_view fqn, StateNode::Variant data)
 {
-    auto [name, parent] = [&]() -> std::pair<std::string_view, StateNode::Handle> {
+    auto [name, parent] = [&] -> std::pair<std::string_view, StateNode::Handle> {
         if (!_tree.IsFinalized()) { return _tree.FindOrAddNodeByFQN(fqn); }
         return _tree.FindParentDictNodeByFQN(fqn);
     }();
@@ -667,7 +667,7 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
 
 static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
 {
-    self.ChainAsyncCall([&self, stateDict = nb::dict(stateDict)]() mutable { self.Scan(std::move(stateDict)); });
+    self.ChainAsyncCall([&self, stateDict = nb::dict(stateDict)] mutable { self.Scan(std::move(stateDict)); });
 }
 
 static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)

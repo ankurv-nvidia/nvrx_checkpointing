@@ -7,7 +7,6 @@
 #include "distcp.h"
 #include "distcp_internal.h"
 #include "logging.h"
-#include "process_memory.h"
 #include "server.h"
 #include "service_client.h"
 #include "session.h"
@@ -52,8 +51,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <csignal>
 #include <fcntl.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
@@ -72,22 +71,22 @@ SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 static std::filesystem::path GRegistryPath;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
 
-static constexpr std::string_view ShmTestServerArg = "--shmem-test-server";
+static constexpr char const* ShmTestServerArg = "--shmem-test-server";
 
 static std::filesystem::path const& TestRegistryPath()
 { return GRegistryPath; }
 
+namespace
+{
 class TestServerProcess
 {
     public:
-    TestServerProcess()                                    = default;
-    TestServerProcess(TestServerProcess const&)            = delete;
-    TestServerProcess& operator=(TestServerProcess const&) = delete;
-
+    TestServerProcess() = default;
     ~TestServerProcess()
     {
         if (_pid > 0) { Stop(); }
     }
+    CLASS_DELETE_COPY_AND_MOVE(TestServerProcess);
 
     void Start()
     {
@@ -110,7 +109,10 @@ class TestServerProcess
         if (_pid < 0) { throw std::runtime_error("failed to fork checkpoint test server"); }
         if (_pid == 0)
         {
-            ::execl(executable.c_str(), executable.c_str(), ShmTestServerArg.data(), nullptr);
+            auto                 executableString = executable.string();
+            auto                 serverArg        = std::string{ShmTestServerArg};
+            std::array<char*, 3> args{executableString.data(), serverArg.data(), nullptr};
+            ::execv(executableString.c_str(), args.data());
             ::_exit(EXIT_FAILURE);
         }
 
@@ -156,13 +158,15 @@ class TestServerProcess
     private:
     pid_t _pid = -1;
 };
+}    // namespace
+
 TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[shmem][config][tier1]")
 {
     using checkpoint::config::types::ByteSize;
     using checkpoint::config::types::Integer;
     using UInt32Integer1 = checkpoint::config::types::Integer<uint32_t, 1>;
     using UInt8Integer   = checkpoint::config::types::Integer<uint8_t>;
-    CHECK(ByteSize::Parse("48GiB") == 48ull * (1ull << 30));
+    CHECK(ByteSize::Parse("48GiB") == 48ull * (1ull << 30u));
     CHECK(ByteSize::Parse("5GB") == 5'000'000'000ull);
     CHECK_THROWS_AS(ByteSize::Parse("5gib"), std::invalid_argument);
     CHECK_THROWS_AS(ByteSize::Parse("-1"), std::invalid_argument);
@@ -384,7 +388,7 @@ TEST_CASE("state registry permits distinct local shards under one tensor key", "
 TEST_CASE("snapshot shared memory keeps bounded growth room", "[shmem][tier1]")
 {
     using checkpoint::ipc::RoundSnapshotShmSize;
-    static constexpr size_t GiB = 1ull << 30;
+    static constexpr size_t GiB = 1ull << 30u;
     CHECK(RoundSnapshotShmSize(1) == checkpoint::ipc::MinSnapshotShmSize);
     CHECK(RoundSnapshotShmSize(3 * GiB) == 10 * GiB);
     CHECK(RoundSnapshotShmSize(5 * GiB) == 10 * GiB);
@@ -396,11 +400,11 @@ TEST_CASE("snapshot shared memory keeps bounded growth room", "[shmem][tier1]")
 TEST_CASE("shared memory queues retain large transfer slots as their budgets grow", "[shmem][tier1]")
 {
     using Queue                 = checkpoint::ipc::MsgQueue;
-    static constexpr size_t GiB = 1ull << 30;
+    static constexpr size_t GiB = 1ull << 30u;
 
     auto const headerSize = Queue::HeaderAllocationSize(Queue::DefaultSlotCount);
-    CHECK(Queue::SlotCountForShmSize(headerSize + (128 * 1024), Queue::DefaultSlotCount, 1) == 6);
-    CHECK(Queue::SlotCountForShmSize(headerSize + (256 * 1024), Queue::DefaultSlotCount, 2) == 12);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (128ull * 1024u), Queue::DefaultSlotCount, 1) == 6);
+    CHECK(Queue::SlotCountForShmSize(headerSize + (256ull * 1024u), Queue::DefaultSlotCount, 2) == 12);
     CHECK(Queue::SlotCountForShmSize(headerSize + (4 * GiB), Queue::DefaultSlotCount, 1) == 2);
     CHECK(Queue::SlotCountForShmSize(headerSize + (8 * GiB), Queue::DefaultSlotCount, 1) == 4);
     CHECK(Queue::SlotCountForShmSize(headerSize + (12 * GiB), Queue::DefaultSlotCount, 2) == 6);
@@ -413,7 +417,7 @@ TEST_CASE("shared memory queues retain large transfer slots as their budgets gro
 TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier2]")
 {
     static constexpr uint32_t        RanksPerPeer = 4;
-    static constexpr size_t          MiB          = 1ull << 20;
+    static constexpr size_t          MiB          = 1ull << 20u;
     std::array<size_t, RanksPerPeer> snapshotSizes{5 * MiB, 9 * MiB, 17 * MiB, 33 * MiB};
 
     auto post = [](std::string const& target, std::string body) {

@@ -3,9 +3,8 @@
 
 #include "checkpoint.h"
 #include "config.h"
-#include "fmttensor.h"
 #include "messages.h"
-#include "numa_utils.h"
+#include "numa_utils.h"    // IWYU pragma: keep
 #include "service_client.h"
 #include "state.h"
 #include "stateserdes.h"
@@ -317,7 +316,7 @@ struct CheckpointWriter
         return cipc::MsgQueue::Open(channelName);
     }
 
-    static size_t D2HConcurrencyForQueue(RankTopology const& topo, cipc::MsgQueue const& queue)
+    static uint8_t D2HConcurrencyForQueue(RankTopology const& topo, cipc::MsgQueue const& queue)
     {
         auto const queueCount    = ResolveClientQueueCount(topo);
         auto const localRank     = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
@@ -367,12 +366,12 @@ struct CheckpointWriter
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
         state->numaNode = numa;
-        std::thread([registryCopy = std::move(registryClone), numa, state, readyP]() {
+        std::thread([registryCopy = std::move(registryClone), numa, state, readyP] {
             SetThreadName("ncc:qinit");
             try
             {
                 auto const queueTopo = registryCopy->Topo();
-                SvcRegisterLocalState(std::move(registryCopy));
+                SvcRegisterLocalState(registryCopy);
                 state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(queueTopo));
 #ifdef PHOENIX_HAVE_CUDA
                 auto region = state->queue->GetShmDataRegion();
@@ -420,7 +419,7 @@ struct CheckpointWriter
     cipc::MsgQueue&             msgQueue;
     int const                   numaNode;
     size_t const                slotSize;    // runtime shm slot capacity, set by the server
-    size_t const                d2hConcurrency;
+    uint8_t const               d2hConcurrency;
     std::atomic<uint32_t>       totalD2HRequests{0};
     std::atomic<uint32_t>       smallD2HRequests{0};
     std::atomic<uint64_t>       totalWrittenBytes{0};
