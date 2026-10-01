@@ -3703,6 +3703,46 @@ def test_slurm_jobs_upload_otel_and_perfetto_files() -> None:
     assert "ci/ci-runs/*/*/logs/otel/*/process_memory_*.svg" in paths
 
 
+@pytest.mark.parametrize("status", ["success", "failed"])
+def test_slurm_jobs_keep_registries_and_upload_them_only_when_failed(tmp_path: Path, status: str) -> None:
+    job = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())[".slurm_job"]
+    registries = [
+        "ci/ci-runs/456_run/logs/registry.0.bin",
+        "ci/ci-runs/456_run/logs/registry.global.bin",
+        "ci/ci-runs/456_run/variant/logs/registry.1.bin",
+        "ci/ci-runs/456_run/variant/logs/registry.global.bin.tmp",
+    ]
+    shards = [
+        "ci/ci-runs/456_run/checkpoints/iter_0000010/__0_0.distcp",
+        "ci/ci-runs/456_run/variant/phase1-checkpoints/iter_0000005/__1_0.distcp",
+    ]
+    untouched = [
+        "ci/ci-runs/456_run/checkpoints/iter_0000010/.metadata",
+        "ci/ci-runs/789_other/checkpoints/iter_0000010/__0_0.distcp",
+    ]
+    for path in (*registries, *shards, *untouched):
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(path)
+    steps = [line for line in job["after_script"] if "registries" in line or "-name '*.distcp' -delete" in line]
+    assert len(steps) == 2  # noqa: PLR2004
+
+    subprocess.run(
+        ["bash", "-c", "\n".join(steps)],
+        cwd=tmp_path,
+        env={"CI_JOB_ID": "456", "CI_JOB_STATUS": status, "PATH": "/usr/bin:/bin"},
+        check=True,
+    )
+
+    assert all((tmp_path / path).read_text() == path for path in (*registries, *untouched))
+    assert [(tmp_path / path).exists() for path in shards] == [status != "success"] * len(shards)
+    staging = tmp_path / "ci/ci-results/registries"
+    staged = {path.relative_to(staging).as_posix(): path.read_text() for path in staging.rglob("*") if path.is_file()}
+    expected = {path.removeprefix("ci/ci-runs/"): path for path in registries} if status == "failed" else {}
+    assert staged == expected
+    assert "ci/ci-results/registries/" in job["artifacts"]["paths"]
+    assert not any("registry" in pattern for pattern in job["artifacts"]["paths"])
+
+
 def test_default_native_jobs_use_wheel_artifacts() -> None:
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
 

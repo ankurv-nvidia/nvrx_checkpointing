@@ -140,6 +140,15 @@ variables:
     - if [[ "${CI_JOB_STATUS:-}" == failed ]]; then python3 "${CI_SCRIPTS_DIR}/slurm_job.py" __failure_summary__ ci/ci-runs || true; fi
     - python3 "${CI_SCRIPTS_DIR}/slurm_job.py" __recover_otel__ ci/ci-runs || true
     - find ci/ci-results ci/ci-runs -type f \( -name 'native_ckpt_otel.jsonl' -o -name 'native_ckpt_perfetto.json' \) -exec gzip -f -- {} + 2>/dev/null || true
+    - |
+      if [[ "${CI_JOB_STATUS:-}" == failed && -n "${CI_JOB_ID:-}" ]]; then
+        while IFS= read -r -d '' registry; do
+          staged="ci/ci-results/registries/${registry#ci/ci-runs/}"
+          mkdir -p "${staged%/*}"
+          ln -f -- "${registry}" "${staged}" 2>/dev/null || cp -f -- "${registry}" "${staged}"
+        done < <(find ci/ci-runs/"${CI_JOB_ID}"_* -type f \( -name 'registry*.bin' -o -name 'registry*.bin.tmp' \) -print0 2>/dev/null)
+      fi
+    - if [[ "${CI_JOB_STATUS:-}" == success && -n "${CI_JOB_ID:-}" ]]; then find ci/ci-runs/"${CI_JOB_ID}"_* -type f -name '*.distcp' -delete 2>/dev/null || true; fi
   artifacts:
     paths:
       - ci/ci-results/*.log
@@ -172,9 +181,9 @@ variables:
       # and from the job's measured checkpoint metrics.
       - ci/ci-runs/*/logs/baselines/*
       - ci/ci-runs/*/*/logs/baselines/*
+      # Registries a failed job staged for upload.
+      - ci/ci-results/registries/
       # Per-iter artifacts: snapshotted into the baselines and read by the offline trace.
-      - ci/ci-runs/*/checkpoints/iter_*/registry.bin
-      - ci/ci-runs/*/*/checkpoints/iter_*/registry.bin
       - ci/ci-runs/*/checkpoints/iter_*/reference.metadata.info
       - ci/ci-runs/*/*/checkpoints/iter_*/reference.metadata.info
       - ci/ci-runs/*/checkpoints/iter_*/*.txt

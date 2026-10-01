@@ -151,6 +151,4 @@ struct Session
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
-
-    void WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const;
 };

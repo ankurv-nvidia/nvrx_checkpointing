@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -414,30 +416,42 @@ TEST_CASE("shared memory queues retain large transfer slots as their budgets gro
     CHECK(Queue::SlotCountForShmSize(headerSize + (128 * GiB), Queue::DefaultSlotCount, 1) == 32);
 }
 
+static boost::beast::http::status PostToTestServer(std::string const& target, std::string body)
+{
+    boost::asio::io_context        ioc;
+    boost::beast::tcp_stream       stream(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    auto const                     endpoints = resolver.resolve("localhost", std::to_string(checkpoint::ipc::Message::Port));
+    stream.connect(endpoints);
+
+    boost::beast::http::request<boost::beast::http::string_body> request{boost::beast::http::verb::post, target, 11};
+    request.set(boost::beast::http::field::host, "localhost");
+    request.body() = std::move(body);
+    request.prepare_payload();
+    boost::beast::http::write(stream, request);
+
+    boost::beast::flat_buffer                                     buffer;
+    boost::beast::http::response<boost::beast::http::string_body> response;
+    boost::beast::http::read(stream, buffer, response);
+    return response.result();
+}
+
+// The forked server inherits the log location, which also places its registry dumps.
+static void StartTestServer(TestServerProcess& server, std::filesystem::path const& serverLog)
+{
+    ::setenv("NATIVE_CKPT_SERVER_LOG", serverLog.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    REQUIRE_NOTHROW(server.Start());
+    ::unsetenv("NATIVE_CKPT_SERVER_LOG");    // NOLINT(concurrency-mt-unsafe)
+}
+
 TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier2]")
 {
     static constexpr uint32_t        RanksPerPeer = 4;
     static constexpr size_t          MiB          = 1ull << 20u;
     std::array<size_t, RanksPerPeer> snapshotSizes{5 * MiB, 9 * MiB, 17 * MiB, 33 * MiB};
-
-    auto post = [](std::string const& target, std::string body) {
-        boost::asio::io_context        ioc;
-        boost::beast::tcp_stream       stream(ioc);
-        boost::asio::ip::tcp::resolver resolver(ioc);
-        auto const                     endpoints = resolver.resolve("localhost", std::to_string(checkpoint::ipc::Message::Port));
-        stream.connect(endpoints);
-
-        boost::beast::http::request<boost::beast::http::string_body> request{boost::beast::http::verb::post, target, 11};
-        request.set(boost::beast::http::field::host, "localhost");
-        request.body() = std::move(body);
-        request.prepare_payload();
-        boost::beast::http::write(stream, request);
-
-        boost::beast::flat_buffer                                     buffer;
-        boost::beast::http::response<boost::beast::http::string_body> response;
-        boost::beast::http::read(stream, buffer, response);
-        return response.result();
-    };
+    auto const                       logDir = CkptDir("first_registry_upload");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
 
     auto uploadRegistry = [&](uint32_t rank) {
         StateTree tree(SingleRankTopo(rank, RanksPerPeer));
@@ -460,15 +474,15 @@ TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier
         tree.FinalizeRegistry();
         std::stringstream body;
         StateSerDes::Write(body, tree, StateNode::Handle::Root);
-        return post(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), body.str());
+        return PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), body.str());
     };
 
     TestServerProcess server;
-    REQUIRE_NOTHROW(server.Start());
+    StartTestServer(server, logDir / "server.log");
     std::stringstream activation;
     serdes::WriteBlobWithSize<uint16_t>(activation, "");
     StateSerDes::WriteTopology(activation, SingleRankTopo(0, RanksPerPeer));
-    CHECK(post(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
+    CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
           == boost::beast::http::status::accepted);
 
     CHECK(uploadRegistry(0) == boost::beast::http::status::accepted);
@@ -479,6 +493,129 @@ TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier
     }
     for (uint32_t rank = 1; rank < RanksPerPeer; ++rank) { CHECK(uploadRegistry(rank) == boost::beast::http::status::accepted); }
     CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+// Each rank owns one slice of a tensor shared by the whole world.
+static DS4Tensor SliceOfSharedTensor(uint32_t rank, uint32_t worldSize)
+{
+    DS4Tensor tensor;
+    tensor.dtype  = DS4Tensor::DType::Float32;
+    tensor.device = DeviceId{"cpu"};
+    tensor.fulldim.push_back(size_t{4} * worldSize);
+    tensor.sharddim.push_back({.begin = size_t{4} * rank, .end = size_t{4} * (rank + 1)});
+    return tensor;
+}
+
+static std::string SerializedSliceRegistry(RankTopology topo)
+{
+    auto const rank      = static_cast<uint32_t>(topo.rank);
+    auto const worldSize = static_cast<uint32_t>(topo.worldSize);
+    StateTree  tree(std::move(topo));
+    auto [leafName, parent]              = tree.FindOrAddNodeByFQN("weight");
+    tree.AddChild(parent, leafName).data = SliceOfSharedTensor(rank, worldSize);
+    tree.FinalizeRegistry();
+    std::stringstream body;
+    StateSerDes::Write(body, tree, StateNode::Handle::Root);
+    return body.str();
+}
+
+// One tensor-shard record of the stream a peer forwards to the coordinator.
+static std::string SerializedSliceFragment(uint32_t rank, uint32_t worldSize)
+{
+    std::stringstream body;
+    serdes::WriteTrivial(body, uint8_t{0});
+    serdes::WriteTrivial(body, Rank{rank});
+    serdes::WriteTrivial(body, SliceOfSharedTensor(rank, worldSize));
+    serdes::WriteBlobWithSize<uint32_t>(body, "weight");
+    return body.str();
+}
+
+static void ActivateAndUploadRegistries(RankTopology const& topo, std::vector<std::string> const& registries)
+{
+    std::stringstream activation;
+    serdes::WriteBlobWithSize<uint16_t>(activation, "");
+    StateSerDes::WriteTopology(activation, topo);
+    CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
+          == boost::beast::http::status::accepted);
+    for (auto const& registry : registries)
+    {
+        CHECK(PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), registry)
+              == boost::beast::http::status::accepted);
+    }
+}
+
+// The merged dump appears while the server keeps running; returns the ranks owning a slice in it.
+static std::set<uint32_t> GlobalDumpSliceOwners(std::filesystem::path const& logDir)
+{
+    auto const path = logDir / "registry.global.bin";
+    for (size_t attempt = 0; attempt < 100 && !std::filesystem::exists(path); ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    std::ifstream file(path, std::ios::binary);
+    REQUIRE(file.good());
+    auto const global = StateSerDes::Read(file);
+    auto const weight = global->FindNodeByFQN("weight");
+    REQUIRE(weight != StateNode::Handle::Invalid);
+    std::set<uint32_t> owners;
+    for (auto const& shard : std::get<StateNode::ShardedTensor>(global->GetNode(weight).data).shards)
+    {
+        owners.insert(static_cast<uint32_t>(shard.rank));
+    }
+    return owners;
+}
+
+TEST_CASE("received registries are dumped beside the server log", "[server][tier2]")
+{
+    auto const logDir = CkptDir("registry_dumps");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    std::ofstream(logDir / "registry.0.bin") << "stale";
+    std::vector<std::string> const registries{SerializedSliceRegistry(SingleRankTopo(0, 2)), SerializedSliceRegistry(SingleRankTopo(1, 2))};
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.%h.%p.log");
+    ActivateAndUploadRegistries(SingleRankTopo(0, 2), registries);
+    for (size_t rank = 0; rank < registries.size(); ++rank)
+    {
+        std::ifstream     dump(logDir / fmt::format("registry.{}.bin", rank), std::ios::binary);
+        std::string const bytes((std::istreambuf_iterator<char>(dump)), std::istreambuf_iterator<char>());
+        CHECK(bytes == registries[rank]);
+    }
+    CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+// Hidden: the merged registry is dumped at checkpoint finalize, which this registration-only harness never reaches.
+TEST_CASE("a peer's registry fragment completes the coordinator's merged dump", "[server][tier2][.]")
+{
+    auto const logDir = CkptDir("registry_dumps_from_peer");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    RankTopology const topo{.rank = Rank{0}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost", "peer"}};
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log");
+    ActivateAndUploadRegistries(topo, {SerializedSliceRegistry(topo)});
+    CHECK(PostToTestServer(fmt::format("/api/peer/shardedstateregistry/{}/1", checkpoint::ipc::SessionId::Default),
+                           SerializedSliceFragment(1, 2))
+          == boost::beast::http::status::ok);
+    CHECK(GlobalDumpSliceOwners(logDir) == std::set<uint32_t>{0, 1});
+    CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("registries are not dumped without a server log directory", "[server][tier2]")
+{
+    auto const logDir = CkptDir("registry_dumps_without_log_dir");
+    std::filesystem::remove_all(logDir);
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log");
+    ActivateAndUploadRegistries(SingleRankTopo(0, 1), {SerializedSliceRegistry(SingleRankTopo(0, 1))});
+    CHECK(server.Stop());
+    CHECK_FALSE(std::filesystem::exists(logDir));
 }
 
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")

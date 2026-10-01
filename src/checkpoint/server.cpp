@@ -46,10 +46,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <latch>
 #include <limits>
 #include <map>
@@ -239,6 +241,68 @@ struct TensorReplicaDeduplicationResult
 };
 }    // namespace
 
+// Every rank of a run pads to the digit count of the world size so a plain name sort orders the dumps by rank.
+static std::string RankRegistryDumpName(Rank rank, Rank worldSize)
+{
+    auto const digits = static_cast<size_t>(std::log10(std::max(static_cast<double>(static_cast<uint32_t>(worldSize)), 1.0))) + 1;
+    return fmt::format("registry.{:0{}}.bin", static_cast<uint32_t>(rank), digits);
+}
+
+static void DumpRegistry(std::string_view fileName, std::function<void(std::ostream&)> const& write)
+{
+    std::error_code ec;
+    auto const      logDir = std::filesystem::absolute(checkpoint::config::GetConfigValue<checkpoint::config::LogFile>(), ec).parent_path();
+    if (!std::filesystem::is_directory(logDir, ec)) { return; }
+    auto const path    = logDir / fileName;
+    auto const tmpPath = logDir / fmt::format("{}.tmp", fileName);
+    try
+    {
+        std::ofstream ostrm(tmpPath, std::ios::binary | std::ios::trunc);
+        write(ostrm);
+        ostrm.close();
+        if (!ostrm) { throw std::runtime_error(fmt::format("cannot write {}", tmpPath)); }
+
+        std::filesystem::rename(tmpPath, path);
+    } catch (std::exception const& ex) { WARN("Failed to dump registry {}: {}", fileName, ex.what()); }
+}
+
+static void
+WriteGlobalStateTreeToFile(std::ostream& ostrm, Server const* const server, cipc::SessionId sessionId, Session::Snapshot const& snapshot)
+{
+    auto start1 = PerfClock::now();
+    StateSerDes::Write(ostrm, *snapshot.globalRegistry, StateNode::Handle::Root);
+    INFO("[{}#{}] Accumulated all localState for global State: Dumped states in {}", *server, sessionId, (PerfClock::now() - start1));
+}
+
+static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId sessionId, Session::Snapshot const& snapshot)
+{
+    snapshot.globalRegistry->WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::TensorShard)
+        {
+            throw std::runtime_error(fmt::format(
+                "[native_ckpt:svr][{}#{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
+                *server,
+                sessionId,
+                snapshot.globalRegistry->GetNodeId(node.handle)));
+        }
+        if (type == StateNode::Type::ShardedTensor)
+        {
+            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
+            if (tnsr.shards.empty())
+            {
+                WARN("[{}#{}] empty sharded tensor='{}' in metadata output",
+                     *server,
+                     sessionId,
+                     snapshot.globalRegistry->GetNodeId(node.handle));
+                return;
+            }
+            snapshot.globalRegistry->AssertShardedTensorHasNoHoles(node.handle);
+        }
+    });
+}
+
 // Build a separate storage registry with one deterministic owner for every
 // logical tensor shard. The merged source registry remains unchanged. Replica
 // identity comes exclusively from normalized server metadata (FQN + dtype +
@@ -340,7 +404,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
     return {.dedupedRegistry = std::move(dedupedRegistry), .stats = std::move(stats)};
 }
 
-static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, StateTree const& state)
+[[maybe_unused]] static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, StateTree const& state)
 {
 
     std::ofstream ostrm(fname);
@@ -782,7 +846,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    // Rank 0 writes registry.bin once every rank has finalized.
+    // Rank 0 dumps and validates the merged registry once every rank has finalized.
     // TODO_MULTILOCAL_CKPT : For multinode local checkpointing this needs to happen once on each node so designate one rank
     if (hdr.globalRank == Rank{0})
     {
@@ -809,7 +873,8 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
 
         PERF() << tel::span::SvrWriteMetadata::Begin{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
-        WriteGlobalStateTreeToFile_(sessionState, snapshot.path.parent_path() / "registry.bin");
+        DumpRegistry("registry.global.bin", [&](std::ostream& ostrm) { WriteGlobalStateTreeToFile(ostrm, server, sessionId, snapshot); });
+        ValidateGlobalStateTree(server, sessionId, snapshot);
         PERF() << tel::span::SvrWriteMetadata::End{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
         BroadcastGlobalRegistryToPeers_(*globalRegistry);
 
@@ -1273,95 +1338,6 @@ void Session::SendGlobalRegistryToPeers(std::string_view const& registry, size_t
     SendGlobalRegistryToPeers(registry, startPeerIndex, delegateStart);
 }
 
-void Session::WriteGlobalStateTreeToFile_(Snapshot const& snapshot, std::filesystem::path const& ckptPath) const
-{
-    auto start1 = PerfClock::now();
-    std::filesystem::create_directories(ckptPath.parent_path());
-    snapshot.globalRegistry->WalkNodes([&](StateNode const& node) {
-        auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type == StateNode::Type::TensorShard)
-        {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
-                *server,
-                sessionId,
-                snapshot.globalRegistry->GetNodeId(node.handle)));
-        }
-        if (type == StateNode::Type::ShardedTensor)
-        {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
-            if (tnsr.shards.empty())
-            {
-                WARN("[{}#{}] empty sharded tensor='{}' in metadata output",
-                     *server,
-                     sessionId,
-                     snapshot.globalRegistry->GetNodeId(node.handle));
-                return;
-            }
-            snapshot.globalRegistry->AssertShardedTensorHasNoHoles(node.handle);
-        }
-    });
-    {
-        std::ofstream sstrm(ckptPath, std::ios::binary);
-        if (!sstrm.good())
-        {
-            throw std::runtime_error(
-                fmt::format("[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for writing: {}", *server, sessionId, ckptPath));
-        }
-        StateSerDes::Write(sstrm, *snapshot.globalRegistry, StateNode::Handle::Root);
-        INFO("[{}#{}] Finished writing metadata to file={} ", *server, sessionId, ckptPath);
-    }
-    // Verify if this was written correctly
-    // Note because of empty nodes not being serialized this might not be a perfect match
-    {
-// #define NATIVE_CKPT_VERIFY_METADATA
-#ifdef NATIVE_CKPT_VERIFY_METADATA
-        std::ifstream sstrm(ckptPath, std::ios::binary);
-        if (!sstrm.good())
-        {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Failed to open metadata file for verification: {}", *server, sessionId, ckptPath));
-        }
-        auto readBack = StateSerDes::Read(snapshot.globalRegistry->GlobalRank(), snapshot.globalRegistry->GlobalWorldSize(), sstrm);
-
-        // Walk the original tree and compare every node against the read-back tree.
-        // Nodes are stored at stable indices, so the same Handle addresses the same node in both trees.
-        // StateNode::Variant supports operator== for all alternatives (Primitives64Bit included).
-        bool mismatch = false;
-        snapshot.globalRegistry->WalkNodes([&](StateNode const& origNode) {
-            auto const& readBackNode = readBack->GetNode(origNode.handle);
-            if (origNode.data != readBackNode.data)
-            {
-                ERR("[{}#{}] Node='{}' mismatch after roundtrip\n\tOriginal={}\n\tReadBack={}",
-                    *server,
-                    sessionId,
-                    snapshot.globalRegistry->GetNodeId(origNode.handle),
-                    origNode.data,
-                    readBackNode.data);
-                mismatch = true;
-            }
-        });
-
-        if (mismatch)
-        {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Metadata roundtrip verification failed for {}",
-                                                 *server,
-                                                 sessionId,
-                                                 snapshot.globalRegistry->GlobalRank(),
-                                                 ckptPath));
-        }
-        INFO("[{}#{}] Metadata roundtrip verification passed for: {}", *server, sessionId, ckptPath);
-#endif
-    }
-    for (auto const& [localStateRank, localState] : snapshot.localStates)
-    {
-        DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata_{}.txt", localStateRank), *localState->localRegistry);
-    }
-    DebugDumpLocalStateTreeKVP(workDir / fmt::format("cpp_metadata.txt"), *sessionState.globalRegistry);
-    INFO("[{}#{}] Accumulated all localState for global State: Dumped states in {}", *server, sessionId, (PerfClock::now() - start1));
-}
-
 void Session::Activate()
 { start = PerfClock::now(); }
 
@@ -1425,6 +1401,8 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         }
     }
     server->InitializeShmFromRegistry_(snapshotSize, registryTopo);
+    DumpRegistry(RankRegistryDumpName(rank, registryTopo.worldSize),
+                 [&](std::ostream& ostrm) { ostrm.write(buf.data(), static_cast<std::streamsize>(buf.size())); });
 }
 
 void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
@@ -1674,13 +1652,22 @@ void Session::HandleStateRegistryFragment(Rank                                  
     // Blob lengths are fixed by initial registry synchronization.
     for (auto const& [fqn, length] : blobMetasIn) { blobMetas[fqn][recvRank] = {.length = length}; }
     receivedFrom.insert(recvRank);
-    INFO("[{}#{}] HandleStateRegistryFragment rank={} shards={} Blobs={} waitingFor=[{}]",
-         *server,
-         sessionId,
-         recvRank,
-         tensorShards.size(),
-         blobMetasIn.size(),
-         fmt::join(CalculateWaitingFor(receivedFrom, Rank{0}, topo.worldSize), ","));
+    auto                    waitingFor           = CalculateWaitingFor(receivedFrom, Rank{0}, topo.worldSize);
+    static constexpr size_t MaxWaitingForVerbose = 10;
+    if (waitingFor.size() > MaxWaitingForVerbose)
+    {
+        INFO("[{}#{}] HandleStateRegistryFragment rank={} waitingFor=[{} rank(s)]", *server, sessionId, recvRank, waitingFor.size());
+    }
+    else
+    {
+        INFO("[{}#{}] HandleStateRegistryFragment rank={} shards={} Blobs={} waitingFor=[{}]",
+             *server,
+             sessionId,
+             recvRank,
+             tensorShards.size(),
+             blobMetasIn.size(),
+             fmt::join(waitingFor, ","));
+    }
 }
 
 void Session::RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& /* lock */, Rank rank, StateTree const& localRegistry)
@@ -1915,12 +1902,6 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;
-    case cipc::Message::Type::LocalStateRegistry:
-    {
-        auto const& hdr1 = std::get<cipc::Message::LocalStateRegistry>(hdr);
-        SessionById_(hdr1.sessionId).Handle(hdr1, buf);
-    }
-    break;
     case cipc::Message::Type::LocalStateData:
     {
         auto const& hdr1 = std::get<cipc::Message::LocalStateData>(hdr);
@@ -1940,6 +1921,8 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;
+    case cipc::Message::Type::LocalStateRegistry:
+        throw std::logic_error("LocalStateRegistry messages are not expected via shared memory-queue at the server");
     case cipc::Message::Type::StateRegistryFragment:
         throw std::logic_error("StateRegistryFragment messages are not expected at the server");
     // case cipc::Message::Type::ShardedStateData: [[fallthrough]];
