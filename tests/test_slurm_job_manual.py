@@ -20,7 +20,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
-DEFAULT_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
+DEFAULT_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
 # A cross-source determinism run materializes one checkout of each dependency
 # per routine.
@@ -206,7 +206,7 @@ def _megatron_perf_metric_samples(*ranks: int) -> list[dict]:
     ]
 
 
-def _load_slurm_job():
+def _load_slurm_job(*, gpu_probe: bool = False):
     sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location("slurm_job_manual_test", SCRIPTS_DIR / "slurm_job.py")
     assert spec is not None
@@ -218,6 +218,9 @@ def _load_slurm_job():
     # does the module names a path inside the checkout, so a test exercising a
     # routine directly would write results into the source tree.
     module.RESULTS_DIR = _SCRATCH_RESULTS
+    if not gpu_probe:
+        # Commands build the same environment on any host unless a test asks for the driver's answer.
+        module._gpu_compute_capability = lambda: ""
     return module
 
 
@@ -1616,6 +1619,94 @@ def test_periodic_memory_sampling_is_a_manual_override(
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        ("9.0", None, "0"),
+        ("9.0", "1", "1"),
+        ("10.0", None, None),
+        ("", None, None),
+    ],
+)
+def test_hopper_training_uses_flash_attention_2(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    case: tuple[str, str | None, str | None],
+) -> None:
+    capability, preset, expected = case
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.delenv("NVTE_FLASH_ATTN_V4", raising=False)
+    if preset is not None:
+        monkeypatch.setenv("NVTE_FLASH_ATTN_V4", preset)
+    monkeypatch.setattr(slurm_job, "_gpu_compute_capability", lambda: capability)
+    args = _args(tmp_path, config="nano3", nodes=8, flavors=["perf", "native"])
+    slurm_job._configure_run(args)
+
+    for provider in ("native", "nvrx"):
+        _cmd, env = slurm_job._phase_command("nano3_8x4", args, provider, 1)
+        assert env.get("NVTE_FLASH_ATTN_V4") == expected
+        capsys.readouterr()
+        slurm_job._print_pretrain_env(env, "phase1")
+        dumped = [line for line in capsys.readouterr().out.splitlines() if "NVTE_FLASH_ATTN_V4" in line]
+        assert dumped == ([] if expected is None else [f"[slurm_job:env] NVTE_FLASH_ATTN_V4={expected}"])
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (subprocess.CompletedProcess([], 0, stdout="9.0\n"), "9.0"),
+        (subprocess.CompletedProcess([], 0, stdout="10.0\n"), "10.0"),
+        (subprocess.CompletedProcess([], 9, stdout="NVIDIA-SMI has failed to communicate with the driver\n"), ""),
+        (FileNotFoundError("nvidia-smi"), ""),
+        (subprocess.TimeoutExpired(["nvidia-smi"], 60), ""),
+    ],
+)
+def test_gpu_compute_capability_reads_the_first_gpu_from_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    result: subprocess.CompletedProcess[str] | Exception,
+    expected: str,
+) -> None:
+    slurm_job = _load_slurm_job(gpu_probe=True)
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        if isinstance(result, Exception):
+            raise result
+        if kwargs.get("check") and result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout)
+        return result
+
+    monkeypatch.setattr(slurm_job.subprocess, "run", run)
+
+    with caplog.at_level("WARNING", logger="native_ci"):
+        assert slurm_job._gpu_compute_capability() == expected
+    assert [command for command, _kwargs in calls] == [
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader", "--id=0"],
+    ]
+    assert calls[0][1]["timeout"]
+    warned = "GPU compute capability unavailable" in caplog.text
+    assert warned == (expected == "")
+
+
+@pytest.mark.parametrize("deterministic", [True, False])
+def test_only_deterministic_runs_fill_uninitialized_memory(deterministic: bool) -> None:
+    slurm_job = _load_slurm_job()
+    settings = SimpleNamespace(fill_uninitialized_memory=False)
+    torch = SimpleNamespace(utils=SimpleNamespace(deterministic=settings))
+
+    slurm_job._fill_uninitialized_memory_if_deterministic(SimpleNamespace(deterministic_mode=deterministic), torch)
+
+    assert settings.fill_uninitialized_memory is deterministic
+
+
+@pytest.mark.parametrize(
     "routing",
     [
         ("native", ["perf", "native"], "0", "worker", None, "collector", 1),
@@ -2884,12 +2975,12 @@ def test_image_preparation_stack_versions_match() -> None:
     enroot = (REPO_ROOT / "scripts" / "enroot.sh").read_text()
     dockerfile = (REPO_ROOT / "Dockerfile.ci").read_text()
 
-    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.08-py3"
-    assert 'base_image = image.parent / "pytorch2608.sqsh"' in prepare_image
-    assert 'DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.08-py3"' in prepare
-    assert 'DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.08-py3"' in enroot
-    assert "pytorch2608.sqsh" in enroot
-    assert "FROM nvcr.io/nvidia/pytorch:26.08-py3" in dockerfile
+    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.09-py3"
+    assert 'base_image = image.parent / "pytorch2609.sqsh"' in prepare_image
+    assert 'DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.09-py3"' in prepare
+    assert 'DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.09-py3"' in enroot
+    assert "pytorch2609.sqsh" in enroot
+    assert "FROM nvcr.io/nvidia/pytorch:26.09-py3" in dockerfile
     assert "ENV CC=clang-23 CXX=clang++-23" in dockerfile
     assert "CLANG_VERSION=23" in prepare
     assert "cuda-toolkit-13-4" in prepare
@@ -2930,7 +3021,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     prepare_image = _load_prepare_image()
-    (tmp_path / "pytorch2608.sqsh").touch()
+    (tmp_path / "pytorch2609.sqsh").touch()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
@@ -2961,10 +3052,13 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     assert build_values[-1]["time_minutes"] == 240  # noqa: PLR2004
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
-    assert '"nvidia-cudnn-frontend[cutedsl]==1.26.0"' in prepare
+    assert '"nvidia-cudnn-frontend[cutedsl]==1.28.0"' in prepare
     assert '"${MEGATRON_ROOT}[training,dev,otel,te,ssm]"' in prepare
     assert 'export TMS_CUDA_MAJOR="${BASH_REMATCH[1]}"' in prepare
     assert "nvidia-nvshmem-cu13==3.7.2" in prepare
+    assert "DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95" in prepare
+    assert 'patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"' in prepare
+    assert (REPO_ROOT / "scripts" / "deepep-nvshmem.patch").is_file()
     assert built[-1][2] == {}
     assert validated == ["backfill", "interactive"]
     assert "--partition=interactive" in runs[-1][0]
@@ -5860,7 +5954,8 @@ def test_cuda_graph_selection_is_profile_scoped() -> None:
 
     nano3 = slurm_job._model_config("nano3")
     assert nano3["cuda-graph-impl"] == "local"
-    assert nano3["cuda-graph-modules"] == ["mamba", "attn", "moe_router"]
+    assert nano3["moe-router-force-load-balancing"] is True
+    assert nano3["cuda-graph-modules"] == ["mamba", "attn"]
 
     nano4 = slurm_job._model_config("nano4")
     assert nano4["cuda-graph-impl"] == "local"

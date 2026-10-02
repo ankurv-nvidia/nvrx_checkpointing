@@ -4,10 +4,10 @@
 """Minimal runtime integration for an unmodified Megatron-LM checkout.
 
 The native provider owns checkpoint saves, its rank-local durability queue,
-load compatibility, and post-load shared-memory registration. Provider
-selection is intentionally kept out of this module: callers that compare native
-with another provider can opt in to :mod:`nvrx_checkpointing.megatron.provider`
-before installing this module.
+loads that do not require NVIDIA Resiliency Extension, and post-load
+shared-memory registration. Provider selection is intentionally kept out of
+this module: callers that compare native with another provider can opt in to
+:mod:`nvrx_checkpointing.megatron.provider` before installing this module.
 """
 
 from __future__ import annotations
@@ -19,57 +19,27 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
+SUPPORTED_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 
 _NATIVE_SAVE_MARKER = "_nvrx_checkpointing_native_save_installed"
 _NATIVE_ASYNC_MARKER = "_nvrx_checkpointing_native_async_installed"
 _NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
 
 
-class _MCoreLoadStrategy:
-    """Per-load proxy that keeps native independent of an external async reader."""
+def _read_metadata_uncached(strategy: Any) -> None:
+    """Make a load strategy chain read checkpoint metadata directly.
 
-    def __init__(self, strategy: Any) -> None:
-        self._strategy = strategy
-
-    def load(
-        self,
-        sharded_state_dict: dict[str, Any],
-        checkpoint_dir: str | Path,
-        async_strategy: str = "mcore",
-    ) -> Any:
-        del async_strategy
-        return self._strategy.load(sharded_state_dict, checkpoint_dir, "mcore")
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._strategy, name)
+    Megatron's only cached metadata reader belongs to NVIDIA Resiliency
+    Extension, and a training process loads its checkpoint once.
+    """
+    while strategy is not None:
+        if getattr(strategy, "cache_metadata", False):
+            strategy.cache_metadata = False
+        strategy = getattr(strategy, "base_strategy", None)
 
 
-def _mcore_load_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Wrap the strategy for one public ``dist_checkpointing.load`` call."""
-    from megatron.core.dist_checkpointing.strategies.torch import (  # type: ignore[import-not-found]
-        TorchDistLoadShardedStrategy,
-    )
-
-    args = list(args)
-    kwargs = dict(kwargs)
-    if len(args) >= 2:  # noqa: PLR2004 # checkpoint_dir, sharded_strategy
-        strategy = args[1]
-        if strategy is None:
-            strategy = TorchDistLoadShardedStrategy()
-        args[1] = _MCoreLoadStrategy(strategy)
-    elif "sharded_strategy" in kwargs:
-        strategy = kwargs["sharded_strategy"]
-        if strategy is None:
-            strategy = TorchDistLoadShardedStrategy()
-        kwargs["sharded_strategy"] = _MCoreLoadStrategy(strategy)
-    else:
-        kwargs["sharded_strategy"] = _MCoreLoadStrategy(TorchDistLoadShardedStrategy())
-    return tuple(args), kwargs
-
-
-def _install_load_wrapper() -> None:
-    """Register the constructed load state and retain old optimizer compatibility."""
+def _install_load_registration() -> None:
+    """Load without NVIDIA Resiliency Extension, then register the constructed state."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
     from megatron.training import training as training_module  # type: ignore[import-not-found]
 
@@ -77,29 +47,13 @@ def _install_load_wrapper() -> None:
         return
 
     from . import save as native_save
-    from .legacy_optimizer import adapt_legacy_optimizer_request, restore_optimizer_dtype_keys
 
     original_load = dist_checkpointing.load
 
     @wraps(original_load)
     def load(sharded_state_dict: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        load_args, load_kwargs = _mcore_load_args(args, kwargs)
-        try:
-            result = original_load(sharded_state_dict, *load_args, **load_kwargs)
-        except BaseException as current_error:  # PyTorch CheckpointException derives from BaseException.
-            if isinstance(current_error, (KeyboardInterrupt, SystemExit)):
-                raise
-            legacy_request, dtype_lookup = adapt_legacy_optimizer_request(sharded_state_dict)
-            if not dtype_lookup:
-                raise
-            try:
-                result = original_load(legacy_request, *load_args, **load_kwargs)
-            except BaseException as legacy_error:
-                if isinstance(legacy_error, (KeyboardInterrupt, SystemExit)):
-                    raise
-                raise current_error from legacy_error
-            result = restore_optimizer_dtype_keys(result, dtype_lookup)
-
+        _read_metadata_uncached(args[1] if len(args) > 1 else kwargs.get("sharded_strategy"))
+        result = original_load(sharded_state_dict, *args, **kwargs)
         root = native_save.register_state_dict(sharded_state_dict, 0)
         root.finalize_registry()
         return result
@@ -155,6 +109,7 @@ def _install_save_wrapper() -> None:
                 dp_cp_group=values.get("dp_cp_group"),
                 dp_group=values.get("dp_group"),
                 dp_gtp_remat_group=values.get("dp_gtp_remat_group"),
+                cp_group=values.get("cp_group"),
                 rng_state_key_prefix=values.get("rng_state_key_prefix", ""),
             ),
         )
@@ -167,7 +122,7 @@ def _install_save_wrapper() -> None:
 def install() -> None:
     """Install native checkpointing into the current Megatron process."""
     _install_async_queue_bindings()
-    _install_load_wrapper()
+    _install_load_registration()
     _install_save_wrapper()
 
 

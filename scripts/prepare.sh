@@ -21,7 +21,7 @@ declare -A DOCKER_IMAGES=()
 DOCKER_IMAGES["ubuntu2404"]="docker.io/library/ubuntu:24.04"
 DOCKER_IMAGES["fedora44"]="docker.io/library/fedora:44"
 DOCKER_IMAGES["pytorch2412"]="nvcr.io/nvidia/pytorch:24.12-py3"
-DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.08-py3"
+DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.09-py3"
 
 function fedora {
     # Fedora 44 provides LLVM 22; container compilation uses the Ubuntu path below.
@@ -262,14 +262,34 @@ function megatron {
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
     # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
-    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.26.0"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.28.0"
+    # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
+    UV_OVERRIDES="${UV_CACHE_DIR}/megatron-overrides.txt"
+    python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
+        "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}"
+    cat "${UV_OVERRIDES}"
+
+    # The image's torch requires C++20, so Mamba and causal-conv1d are built from source with it.
+    read -r MAMBA_GIT MAMBA_REV <<< "$(python -c 'import sys, tomllib; s = tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"]["sources"]["mamba-ssm"]; print(s["git"], s["rev"])' "${MEGATRON_ROOT}/pyproject.toml")"
+    export MAMBA_FORCE_BUILD=TRUE
+    for spec in "causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git v1.7.0" "mamba ${MAMBA_GIT} ${MAMBA_REV}"; do
+        read -r name url ref <<< "${spec}"
+        git clone --quiet "${url}" "${name}"
+        git -C "${name}" checkout --quiet "${ref}"
+        sed -i 's/-std=c++17/-std=c++20/g' "${name}/setup.py"
+        grep -q -- '-std=c++20' "${name}/setup.py"
+        uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" "./${name}"
+        rm -rf "${name}"
+    done
+    printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
+
+    uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
     # Keep the DeepEP HybridEP installation symmetric with Megatron-LM's CI image.
-    DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+    DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
     export HYBRID_EP_MULTINODE=1
     export RDMA_CORE_HOME=/opt/rdma-core/build
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
@@ -298,6 +318,8 @@ function megatron {
         git fetch origin "${DEEPEP_COMMIT}"
         git checkout FETCH_HEAD
         patch -p1 < "${SCRIPT_DIR}/deepep.patch"
+        # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
+        patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"
     popd
 
     # DeepEP compiles against nvml.h from libnvidia-ml-dev. Installing that package
@@ -310,7 +332,8 @@ function megatron {
     apt-get download libnvidia-ml-dev
     dpkg-deb -x libnvidia-ml-dev_*.deb /
     rm -f libnvidia-ml-dev_*.deb
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
+    # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
+    ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
     rm -rf /var/lib/apt/lists/*
     rm -rf DeepEP
 

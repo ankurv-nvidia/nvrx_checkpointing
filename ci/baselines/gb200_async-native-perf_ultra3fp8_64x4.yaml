@@ -6,11 +6,11 @@ metrics:
   total_written_bytes: 30801810040
   ckpt_durable_ms: 229
   ckpt_daemon_durable_ms: 13470
-  megatron.training.memory_allocated_gb: 70.31
+  megatron.training.memory_allocated_gb: 66.01
   gpu_peak_bytes: 71962792270
   gpu_hbm_peak_bytes: 95291834368
   checkpoint_daemon_peak_rss_bytes: 418901655552
-  training_process_peak_rss_bytes: 149981233152
+  training_process_peak_rss_bytes: 95117705216
 tolerances:
   training_process_peak_rss_bytes: 0.10
   checkpoint_daemon_peak_rss_bytes: 0.10
@@ -32,9 +32,9 @@ rank_statistics:
     median: 232.39
     max: 246.74
   megatron.training.memory_allocated_gb:
-    min: 66.82
-    median: 66.92
-    max: 70.31
+    min: 66.01
+    median: 66.01
+    max: 66.01
   gpu_peak_bytes:
     min: 71744549888
     median: 71856732928.0
@@ -44,6 +44,6 @@ rank_statistics:
     median: 91772813312.0
     max: 95291834368
   training_process_peak_rss_bytes:
-    min: 135584022528
-    median: 143330148352.0
-    max: 149981233152
+    min: 83423395840
+    median: 88541626368.0
+    max: 95117705216

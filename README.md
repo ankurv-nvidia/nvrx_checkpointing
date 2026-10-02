@@ -26,7 +26,7 @@ python3 -m pip install \
 ```
 
 Use the public Megatron-LM checkout pinned by this repository
-(`aac9b2db7f0d203940f6c0a7f2852a094c18c12e`) and make sure the
+(`16251ac1221f4814cd39350def05cefa3c36734a`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every
 node.
 
@@ -112,5 +112,4 @@ log line.
 
 Comparison harnesses that need a `native`/`nvrx` selector can opt in to
 `nvrx_checkpointing.megatron.provider`; reference runs should not install the
-native integration. Loading checkpoints created with the historical private
-fork and its stringified optimizer dtype keys requires no extra flags.
+native integration.

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Generate an A/A checkpoint pair for the pico Mamba-hybrid MoE model on the
-# PyTorch 26.08 stack using only a Megatron-LM checkout. Submit this file twice
+# PyTorch 26.09 stack using only a Megatron-LM checkout. Submit this file twice
 # with distinct RUN_TAG values:
 #
 #   export DET_WORK_DIR=/lustre/<project>/<user>/determinism
 #   export MEGATRON_ROOT=/lustre/<project>/<user>/Megatron-LM
-#   export ENROOT_IMAGE=/lustre/<project>/<user>/pytorch2608-megatron.sqsh
+#   export ENROOT_IMAGE=/lustre/<project>/<user>/pytorch2609-megatron.sqsh
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
 #   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
 #
@@ -44,7 +44,7 @@ set -Eeuo pipefail
 : "${MEGATRON_ROOT:?set MEGATRON_ROOT to a Megatron-LM checkout}"
 : "${ENROOT_IMAGE:?set ENROOT_IMAGE to an image containing Megatron-LM dependencies}"
 : "${RUN_TAG:=det-cudagraph-${SLURM_JOB_ID}}"
-: "${MEGATRON_COMMIT:=aac9b2db7f0d203940f6c0a7f2852a094c18c12e}"
+: "${MEGATRON_COMMIT:=16251ac1221f4814cd39350def05cefa3c36734a}"
 : "${GPUS_PER_NODE:=4}"
 : "${SAVE_INTERVAL:=250}"
 : "${CHECKPOINTS:=3}"

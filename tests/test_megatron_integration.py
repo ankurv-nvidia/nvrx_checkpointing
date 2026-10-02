@@ -10,10 +10,9 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -114,11 +113,11 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         finalize=[],
         native_saves=[],
         native_loads=[],
-        strategy_loads=[],
         public_loads=[],
+        metadata_cache_at_load=[],
+        public_load_error=None,
         train=0,
         registry_finalized=0,
-        legacy_only=False,
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
@@ -148,28 +147,6 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     megatron_core.__path__ = []
     dist_checkpointing = ModuleType("megatron.core.dist_checkpointing")
     dist_checkpointing.__path__ = []
-    strategies = ModuleType("megatron.core.dist_checkpointing.strategies")
-    strategies.__path__ = []
-    torch_strategy = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
-
-    class TorchDistLoadShardedStrategy:
-        def load(self, state: dict[str, Any], checkpoint_dir: str, async_strategy: str) -> Any:
-            calls.strategy_loads.append((state, checkpoint_dir, async_strategy))
-            return {"loaded": True}
-
-    torch_strategy.TorchDistLoadShardedStrategy = TorchDistLoadShardedStrategy
-    strategies.torch = torch_strategy
-
-    def _leaf_key(value: Any) -> str:
-        if isinstance(value, dict):
-            for child in value.values():
-                if key := _leaf_key(child):
-                    return key
-        if isinstance(value, list):
-            for child in value:
-                if key := _leaf_key(child):
-                    return key
-        return getattr(value, "key", "")
 
     def public_load(
         state: dict[str, Any],
@@ -177,18 +154,14 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         sharded_strategy: Any = None,
         **kwargs: Any,
     ) -> Any:
-        calls.public_loads.append(state)
-        key = _leaf_key(state.get("optimizer"))
-        if calls.legacy_only:
-            if ".dtype_(torch." in key:
-                raise KeyError(key)
-            if ".dtype_dtype_param_" in key:
-                legacy = next(iter(state["optimizer"][0]))
-                return {"optimizer": {legacy: "loaded"}}
-        return sharded_strategy.load(state, checkpoint_dir, "nvrx")
+        calls.public_loads.append((state, checkpoint_dir, sharded_strategy, kwargs))
+        base = getattr(sharded_strategy, "base_strategy", sharded_strategy)
+        calls.metadata_cache_at_load.append(getattr(base, "cache_metadata", None))
+        if calls.public_load_error is not None:
+            raise calls.public_load_error
+        return {"loaded": True}
 
     dist_checkpointing.load = public_load
-    dist_checkpointing.strategies = strategies
     megatron_core.dist_checkpointing = dist_checkpointing
     megatron.core = megatron_core
 
@@ -218,6 +191,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         dp_gtp_remat_group: Any = None,
         expt_dp_group: Any = None,
         rng_state_key_prefix: str = "",
+        cp_group: Any = None,
     ) -> str:
         return "reference"
 
@@ -254,8 +228,6 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         "megatron": megatron,
         "megatron.core": megatron_core,
         "megatron.core.dist_checkpointing": dist_checkpointing,
-        "megatron.core.dist_checkpointing.strategies": strategies,
-        "megatron.core.dist_checkpointing.strategies.torch": torch_strategy,
         "megatron.training": training_package,
         "megatron.training.initialize": initialize_module,
         "megatron.training.inprocess_restart": restart_module,
@@ -293,6 +265,9 @@ def test_install_patches_only_native_call_sites(monkeypatch: pytest.MonkeyPatch)
     integration_source = (REPO_ROOT / "megatron/integration.py").read_text()
     assert "megatron.training.arguments" not in integration_source
     assert "megatron.core.optimizer.distrib_optimizer" not in integration_source
+    assert "megatron.core.dist_checkpointing.strategies" not in integration_source
+    assert "legacy_optimizer" not in integration_source
+    assert not (REPO_ROOT / "megatron/legacy_optimizer.py").exists()
 
 
 def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -312,6 +287,7 @@ def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPat
         dp_gtp_remat_group="dp-gtp-remat",
         expt_dp_group="edp",
         rng_state_key_prefix="grid.",
+        cp_group="cp",
     )
 
     assert result == "native"
@@ -330,6 +306,7 @@ def test_training_save_forwards_constructed_groups(monkeypatch: pytest.MonkeyPat
         "dp_cp_group": "dp-cp",
         "dp_group": "dp",
         "dp_gtp_remat_group": "dp-gtp-remat",
+        "cp_group": "cp",
         "rng_state_key_prefix": "grid.",
     }
 
@@ -340,74 +317,56 @@ def test_train_does_not_register_state_without_a_load(monkeypatch: pytest.Monkey
     assert calls.native_loads == []
 
 
-def test_native_load_uses_mcore_and_registers_constructed_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_registers_constructed_state(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     state = {"model": "tensor"}
     result = calls.dist_checkpointing.load(state, "/checkpoint")
 
     assert result == {"loaded": True}
-    assert calls.strategy_loads == [(state, "/checkpoint", "mcore")]
+    assert calls.public_loads == [(state, "/checkpoint", None, {})]
     assert calls.native_loads == [(state, 0)]
     assert calls.registry_finalized == 1
 
 
-class _DType:
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def __str__(self) -> str:
-        return self.name
-
-    __repr__ = __str__
-
-
-def test_old_string_optimizer_keys_load_without_optimizer_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_forwards_the_caller_arguments_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
-    calls.legacy_only = True
-    dtype_pair = (_DType("torch.bfloat16"), _DType("torch.float32"))
-    leaf = SimpleNamespace(
-        key=("optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.float32).bucket_idx_0.exp_avg"),
-    )
-    state = {"optimizer": [{dtype_pair: {"exp_avg": leaf}}]}
+    state = {"optimizer": [{"param_torch:bfloat16": {"exp_avg": "shard"}}]}
+    strategy = object()
 
-    result = calls.dist_checkpointing.load(state, "/old-checkpoint")
+    result = calls.dist_checkpointing.load(state, "/checkpoint", strategy, strict="assume_ok_unexpected")
 
-    legacy = "dtype_param_torch:bfloat16_grad_torch:float32"
-    assert result == {"optimizer": {dtype_pair: "loaded"}}
-    assert len(calls.public_loads) == 2  # noqa: PLR2004
-    assert next(iter(calls.public_loads[0]["optimizer"][0])) == dtype_pair
-    assert next(iter(calls.public_loads[1]["optimizer"][0])) == legacy
-    legacy_leaf = calls.public_loads[1]["optimizer"][0][legacy]["exp_avg"]
-    assert f".dtype_{legacy}." in legacy_leaf.key
-    assert leaf.key.endswith(".dtype_(torch.bfloat16, torch.float32).bucket_idx_0.exp_avg")
+    assert result == {"loaded": True}
+    assert calls.public_loads == [(state, "/checkpoint", strategy, {"strict": "assume_ok_unexpected"})]
     assert calls.native_loads == [(state, 0)]
 
 
-def test_legacy_optimizer_adapter_restores_strict_load_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_package = ModuleType("nvrx_checkpointing")
-    fake_package.__path__ = [str(REPO_ROOT)]
-    fake_megatron_package = ModuleType("nvrx_checkpointing.megatron")
-    fake_megatron_package.__path__ = [str(REPO_ROOT / "megatron")]
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", fake_package)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron", fake_megatron_package)
-    spec = importlib.util.spec_from_file_location(
-        "nvrx_checkpointing.megatron.legacy_optimizer",
-        REPO_ROOT / "megatron/legacy_optimizer.py",
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    adapter = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, adapter)
-    spec.loader.exec_module(adapter)
+@pytest.mark.parametrize("as_keyword", [False, True])
+def test_native_load_reads_metadata_without_the_extension_cache(monkeypatch: pytest.MonkeyPatch, as_keyword: bool) -> None:
+    _, calls = _load_integration(monkeypatch)
+    base = SimpleNamespace(cache_metadata=True)
+    strategy = SimpleNamespace(base_strategy=base)
+    state = {"model": "tensor"}
 
-    dtype_pair = (_DType("torch.bfloat16"), _DType("torch.float32"))
-    legacy = "dtype_param_torch:bfloat16_grad_torch:float32"
-    result = adapter.restore_optimizer_dtype_keys(
-        ({"optimizer": {legacy: "loaded"}}, {"missing"}, {"unexpected"}),
-        {legacy: dtype_pair},
-    )
+    if as_keyword:
+        calls.dist_checkpointing.load(state, "/checkpoint", sharded_strategy=strategy)
+    else:
+        calls.dist_checkpointing.load(state, "/checkpoint", strategy)
 
-    assert result == ({"optimizer": {dtype_pair: "loaded"}}, {"missing"}, {"unexpected"})
+    assert calls.metadata_cache_at_load == [False]
+    assert calls.public_loads == [(state, "/checkpoint", strategy, {})]
+    assert calls.native_loads == [(state, 0)]
+
+
+def test_native_load_registers_nothing_when_the_public_load_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.public_load_error = KeyError("missing shard")
+
+    with pytest.raises(KeyError, match="missing shard"):
+        calls.dist_checkpointing.load({"model": "tensor"}, "/checkpoint")
+
+    assert len(calls.public_loads) == 1
+    assert calls.native_loads == []
+    assert calls.registry_finalized == 0
 
 
 def test_module_launcher_installs_before_running_entrypoint(

@@ -6,9 +6,9 @@ metrics:
   total_written_bytes: 30801810040
   ckpt_durable_ms: 18323
   ckpt_daemon_durable_ms: 17234
-  gpu_peak_bytes: 89663240832
-  gpu_hbm_peak_bytes: 107967021056
-  training_process_peak_rss_bytes: 150520594432
+  gpu_peak_bytes: 75321310982
+  gpu_hbm_peak_bytes: 95333777408
+  training_process_peak_rss_bytes: 99235069952
   checkpoint_daemon_peak_rss_bytes: 418855714816
 tolerances:
   training_process_peak_rss_bytes: 0.10
@@ -27,14 +27,14 @@ rank_statistics:
     median: 30801812032.0
     max: 30801812032
   gpu_peak_bytes:
-    min: 86688514304.0
-    median: 89473317888.0
-    max: 94060713728.0
+    min: 71819723776
+    median: 75145954304.0
+    max: 83077016576
   gpu_hbm_peak_bytes:
-    min: 94411030528
-    median: 98223652864.0
-    max: 107967021056
+    min: 81966530560
+    median: 86584459264.0
+    max: 95333777408
   training_process_peak_rss_bytes:
-    min: 139567104000
-    median: 144687824896.0
-    max: 150520594432
+    min: 85805760512
+    median: 91339390976.0
+    max: 99235069952

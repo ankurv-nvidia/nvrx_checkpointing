@@ -257,6 +257,7 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
         pp_group="pp",
         dp_group="dp",
         dp_gtp_remat_group=dp_gtp_remat_group,
+        cp_group="cp",
     )
     monkeypatch.setattr(save, "get_args", lambda: args)
     monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
@@ -276,7 +277,13 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
     save._save_checkpoint_impl(save_args, 123)
 
     assert events == [
-        ("dataloader_state", "iterator", 20, tmp_path, {"tp_group": "tp", "pp_group": "pp", "dp_group": expected_dp_group}),
+        (
+            "dataloader_state",
+            "iterator",
+            20,
+            tmp_path,
+            {"tp_group": "tp", "pp_group": "pp", "dp_group": expected_dp_group, "cp_group": "cp"},
+        ),
         "register",
         "save_async",
         "client_send_complete",

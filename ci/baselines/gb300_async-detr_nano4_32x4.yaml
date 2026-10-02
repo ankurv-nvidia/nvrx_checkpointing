@@ -10,7 +10,7 @@ metrics:
   gpu_peak_bytes: 71726567500
   gpu_hbm_peak_bytes: 98236694528
   checkpoint_daemon_peak_rss_bytes: 122010796032
-  training_process_peak_rss_bytes: 50352357376
+  training_process_peak_rss_bytes: 35758931968
 tolerances:
   training_process_peak_rss_bytes: 0.10
   checkpoint_daemon_peak_rss_bytes: 0.10
@@ -44,6 +44,6 @@ rank_statistics:
     median: 92431319040.0
     max: 98236694528
   training_process_peak_rss_bytes:
-    min: 44958089216
-    median: 45849051136.0
-    max: 50352357376
+    min: 31298748416
+    median: 32378585088.0
+    max: 35758931968

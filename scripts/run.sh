@@ -21,6 +21,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_GRAPH_REGISTER=0
 # AssertionError: Using tensor model parallelism or context parallelism require setting the environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+# FlashAttention 4's Hopper backward pass stalls, so Hopper trains with FlashAttention 2.
+if [[ $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader --id=0) == 9.0 ]]; then
+	export NVTE_FLASH_ATTN_V4=${NVTE_FLASH_ATTN_V4:-0}
+fi
 export BUILDENV_DISABLE_MARCH_NATIVE=ON
 
 MY_RUN_DIR="${REPO_ROOT}/ci/ci-runs"
@@ -108,7 +112,6 @@ OPTIONS=(
 	--ckpt-fully-parallel-save
 	--ckpt-fully-parallel-load
 	--ckpt-assume-constant-structure
-	--ckpt-provider nvrx
 #	--async-save
 #	--use-persistent-ckpt-worker
 

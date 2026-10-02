@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import copy
 import io
 import time
 import warnings
@@ -68,6 +67,7 @@ class SaveCheckpointArgs:
     dp_cp_group: object | None = None
     dp_group: object | None = None
     dp_gtp_remat_group: object | None = None
+    cp_group: object | None = None
     rng_state_key_prefix: str = ""
 
 
@@ -362,11 +362,6 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 rerun_state=rerun_state,
             )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
-            if "args" in state_dict:
-                # Saved arguments describe the synchronous reader used for native loads.
-                saved_args = copy.copy(state_dict["args"])
-                saved_args.async_strategy = "mcore"
-                state_dict["args"] = saved_args
             rank = torch.distributed.get_rank()
             if rank == 0:
                 # Rank 0 stores portable optimizer-sharding metadata without the process group.
@@ -389,6 +384,7 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 pp_group=save_args.pp_group,
                 # Loader state is indexed on the full data-distribution axis when that group is provided.
                 dp_group=save_args.dp_gtp_remat_group if save_args.dp_gtp_remat_group is not None else save_args.dp_group,
+                cp_group=save_args.cp_group,
             )
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):

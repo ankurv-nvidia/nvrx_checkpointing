@@ -88,9 +88,9 @@ FLAVORS_FILE = SCRIPT_DIR / "flavors.yaml"
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
-DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.08-py3")
+DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.09-py3")
 DEFAULT_MEGATRON_REPO_URL = "https://github.com/NVIDIA/Megatron-LM.git"
-DEFAULT_MEGATRON_COMMIT = "aac9b2db7f0d203940f6c0a7f2852a094c18c12e"
+DEFAULT_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"
 DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
 _NVRX_DISTRIBUTION = "nvidia-resiliency-ext"
@@ -209,6 +209,7 @@ _PRETRAIN_ENV_NAMES = {
     "NVRX_CURRENT_CYCLE_INFO",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
     "NVTE_CPU_OFFLOAD_V1",
+    "NVTE_FLASH_ATTN_V4",
     "RANK",
     "PYTHONDONTWRITEBYTECODE",
     "SLURM_JOB_ID",
@@ -393,6 +394,21 @@ def platform_gpus_per_node() -> int | None:
         if entry["name"] == platform:
             return int(str(entry["gpus"]).rpartition("x")[2])
     return None
+
+def _gpu_compute_capability() -> str:
+    """Compute capability of this node's first GPU, read from the driver without initializing CUDA."""
+    try:
+        return subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader", "--id=0"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        if _rank_env("SLURM_PROCID", "RANK", "0") == "0":
+            logger.warning(f"[slurm_job:env] GPU compute capability unavailable ({error}); attention backend defaults unchanged")
+        return ""
 
 def cluster_tag() -> str:
     return os.environ.get("CLUSTER", "").strip()
@@ -2677,6 +2693,9 @@ def _phase_command(
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
     for name, value in _MEGATRON_OTEL_ENV_DEFAULTS.items():
         env.setdefault(name, value)
+    if "NVTE_FLASH_ATTN_V4" not in env and _gpu_compute_capability() == "9.0":
+        # FlashAttention 4's Hopper backward pass stalls, so Hopper trains with FlashAttention 2.
+        env["NVTE_FLASH_ATTN_V4"] = "0"
     include_nvrx = not (provider == "native" and flavors.policy.requires_nvrx_absent)
     _toolchain(cfg, args).apply(env, include_nvrx=include_nvrx)
     flavors.transform(opts, env)
@@ -3409,6 +3428,17 @@ def _prepare_otel_randomness() -> None:
         print(f"[slurm_job:otel] isolated_rng={','.join(isolated)}", flush=True)  # noqa: T201
 
 
+def _fill_uninitialized_memory_if_deterministic(args: argparse.Namespace, torch_module: ModuleType) -> None:
+    """Fill uninitialized allocations in deterministic runs.
+
+    Checkpoints carry optimizer padding that is allocated but never written, so
+    only a filled allocation keeps a deterministic run's checkpoint bytes
+    reproducible. Other runs keep the setting Megatron chose.
+    """
+    if args.deterministic_mode:
+        torch_module.utils.deterministic.fill_uninitialized_memory = True
+
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
     _prepare_otel_randomness()
@@ -3423,8 +3453,12 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
         pretrain,
         set_startup_timestamps,
     )
-    from megatron.training.argument_utils import pretrain_cfg_container_from_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    from megatron.training.argument_utils import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+        pretrain_cfg_container_from_args,
+        resolve_tokenizer_vocab_size,
+    )
     from megatron.training.arguments import parse_and_validate_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
+    from megatron.training.global_vars import initialize_runtime_services  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
 
     try:
         from megatron.post_training.arguments import add_modelopt_args  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
@@ -3454,8 +3488,13 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
         extra_args_provider=megatron_provider.compose_extra_args_provider(add_modelopt_args),
         args_defaults={"tokenizer_type": "NullTokenizer"},
     )
-    model_cfg = hybrid_config_from_args(args) if entrypoint == "hybrid" else gpt_config_from_args(args)
     import torch  # noqa: PLC0415
+
+    _fill_uninitialized_memory_if_deterministic(args, torch)
+    model_cfg = hybrid_config_from_args(args) if entrypoint == "hybrid" else gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
 
     hbm = _PeakHbmSampler(torch)
     hbm.start()
@@ -3470,10 +3509,7 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
             pretrain_kwargs["get_embedding_ranks"] = pretrain_module.get_embedding_ranks
         else:
             pretrain_kwargs["model_provider"] = partial(model_provider, model_builder)
-        pretrain_fn(
-            pretrain_cfg_container_from_args(args, model_cfg),
-            **pretrain_kwargs,
-        )
+        pretrain_fn(full_config, **pretrain_kwargs)
     finally:
         import resource  # noqa: PLC0415
 

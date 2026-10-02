@@ -69,6 +69,8 @@ grad-reduce-in-bf16: true
 moe-router-topk: 6
 moe-router-topk-scaling-factor: "2.5"
 moe-router-force-load-balancing: true
+# The router runs eagerly: graph capture cannot record its forced-balancing RNG without generator registration.
+cuda-graph-modules: [mamba, attn]
 moe-router-fusion: true
 high-priority-stream-groups: [ep]
 moe-single-grouped-bias: false

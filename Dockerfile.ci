@@ -14,7 +14,7 @@
 # Build:
 #   docker buildx build -f Dockerfile.ci .
 
-FROM nvcr.io/nvidia/pytorch:26.08-py3
+FROM nvcr.io/nvidia/pytorch:26.09-py3
 #FROM nvcr.io/nvidia/cuda:13.4.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
