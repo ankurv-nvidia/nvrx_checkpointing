@@ -307,6 +307,8 @@ static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId 
 // logical tensor shard. The merged source registry remains unchanged. Replica
 // identity comes exclusively from normalized server metadata (FQN + dtype +
 // full shape + global shard range).
+// TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
+// This information should be used to correctly identify and deduplicate tensor replicas and identify the tensors needing snapshots
 static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree const& registry, uint32_t worldSize)
 {
     if (worldSize == 0) { throw std::invalid_argument("Cannot deduplicate tensor replicas with worldSize=0"); }
@@ -583,14 +585,6 @@ Session::LocalState& Session::GetSessionLocalState_(cipc::Rank rank) LFTBND
 {
     std::scoped_lock lock(mutex);
     return *sessionState.localStates[rank];
-}
-
-Session::LocalState& Session::FindOrCreateLocalState_(cipc::Rank rank) LFTBND
-{
-    std::scoped_lock lock(mutex);
-    auto&            localState = sessionState.localStates[rank];
-    if (localState == nullptr) { localState = std::make_unique<LocalState>(); }
-    return *localState;
 }
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
@@ -1349,15 +1343,14 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
             fmt::format("Local state registry declares {} bytes but only {} bytes were received", hdr.messageSize, buf.size()));
     }
     BufStream istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
-    auto      localRegistry  = StateSerDes::Read(istrm);
-    Rank      rank           = localRegistry->Topo().rank;
-    auto      snapshotSize   = localRegistry->GetTotalSnapshotStateSizeInBytes();
-    auto      registryTopo   = localRegistry->Topo();
-    auto&     localState     = FindOrCreateLocalState_(rank);
-    localState.localRegistry = std::move(localRegistry);
+    auto      localRegistry = StateSerDes::Read(istrm);
+    Rank      rank          = localRegistry->Topo().rank;
+    auto      snapshotSize  = localRegistry->GetTotalSnapshotStateSizeInBytes();
+    auto      registryTopo  = localRegistry->Topo();
+
     // Reset tensor handles to be offsets in the local tensor storage.
     uint64_t offset = 0;
-    localState.localRegistry->WalkNodes([&](auto& node) {
+    localRegistry->WalkNodes([&](auto& node) {
         if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
         {
             auto& tnsr  = std::get<StateNode::TensorShard>(node.data);
@@ -1386,6 +1379,10 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     {
         // Concurrent handlers push here; an unlocked emplace corrupts sibling futures.
         std::scoped_lock lock(mutex);
+        auto&            localState = sessionState.localStates[rank];
+        if (localState == nullptr) { localState = std::make_unique<LocalState>(); }
+        localState->localRegistry = std::move(localRegistry);
+        largestSnapshotSize       = std::max(largestSnapshotSize, snapshotSize);
         asyncTasks.emplace_back(
             std::async(std::launch::async | std::launch::deferred, &Session::OnReceiveLocalStateRegistryAsync_, this, rank));
 
@@ -1400,9 +1397,29 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
                                             topo.peers[0]));
         }
     }
-    server->InitializeShmFromRegistry_(snapshotSize, registryTopo);
     DumpRegistry(RankRegistryDumpName(rank, registryTopo.worldSize),
                  [&](std::ostream& ostrm) { ostrm.write(buf.data(), static_cast<std::streamsize>(buf.size())); });
+    // Each reply waits for the node's last registry, so every rank opens finished queues sized for the largest local snapshot.
+    auto const firstLocalRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
+    auto const localRanks     = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstLocalRank);
+    auto const deadline       = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
+    auto const waitId         = tel::Id{.sessionId = sessionId, .rank = rank, .snapshotId = cipc::SnapshotId::Invalid};
+    PERF() << tel::span::SvrWaitLocalRegistries::Begin{.id = waitId};
+    while (true)
+    {
+        {
+            std::scoped_lock lock(mutex);
+            if (PerfClock::now() >= deadline)
+            {
+                WARN("[native_ckpt:svr][{}#{}][WARN] Wait for local registries timed out", *server, sessionId);
+                break;
+            }
+            if (sessionState.localStates.size() >= localRanks || stopRequested) { break; }
+        }
+        std::this_thread::sleep_for(IntervalBetweenRetries);
+    }
+    PERF() << tel::span::SvrWaitLocalRegistries::End{.id = waitId};
+    server->InitializeShmFromRegistry_(largestSnapshotSize, registryTopo);
 }
 
 void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)

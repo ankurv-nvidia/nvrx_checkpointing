@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copyreg
 import datetime
 import functools
 import gzip
@@ -45,6 +46,7 @@ import pickle
 import re
 import struct
 import sys
+import types
 import zipfile
 from array import array
 from collections import Counter, defaultdict
@@ -164,6 +166,8 @@ class _Opaque:
 
     module = "builtins"
     qualname = "object"
+    # REDUCE calls the class, while NEWOBJ only calls __new__.
+    called = False
 
     def __new__(cls, *args: object, **kwargs: object) -> Self:
         obj = super().__new__(cls)
@@ -175,7 +179,7 @@ class _Opaque:
         return obj
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
+        self.called = True
 
     def __setstate__(self, state: object) -> None:
         self.state = state
@@ -191,8 +195,14 @@ class _Opaque:
 
 
 @functools.cache
+def _global_class(base: type, module: str, qualname: str) -> type:
+    """Return a placeholder class, derived from base, that pickles back as the global module.qualname."""
+    namespace = {"__slots__": (), "__module__": module, "__qualname__": qualname, "module": module, "qualname": qualname}
+    return type(qualname.rsplit(".", 1)[-1] or "object", (base,), namespace)
+
+
 def _opaque_class(module: str, qualname: str) -> type[_Opaque]:
-    return type(qualname.rsplit(".", 1)[-1] or "object", (_Opaque,), {"module": module, "qualname": qualname})
+    return _global_class(_Opaque, module, qualname)
 
 
 def _state_fields(state: object) -> dict:
@@ -209,14 +219,35 @@ def _state_fields(state: object) -> dict:
     return {}
 
 
-class _Record:
-    """Slotted placeholder for a checkpoint metadata dataclass."""
+_KEY_ORDERS: dict[tuple[str, ...], tuple[str, ...]] = {}
 
-    __slots__ = ()
+
+def _key_order(state: object) -> tuple[str, ...] | str:
+    """Return a shared tuple of a field dict's keys, in order, or "unknown" for another state form."""
+    if not isinstance(state, dict):
+        return "unknown"
+    keys = tuple(state)
+    return _KEY_ORDERS.setdefault(keys, keys)
+
+
+class _Record:
+    """Slotted placeholder for a checkpoint metadata dataclass.
+
+    ``_keys`` records the form of the pickled state so the record writes it back unchanged: the
+    field dict's keys in order, a string naming another form, or None when there was no state.
+    """
+
+    __slots__ = ("_keys",)
+    _fields: tuple[str, ...] = ()
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._fields += cls.__dict__.get("__slots__", ())
 
     def __new__(cls, *_args: object, **_kwargs: object) -> Self:
         obj = super().__new__(cls)
-        for name in cls.__slots__:
+        obj._keys = None
+        for name in cls._fields:
             setattr(obj, name, None)
         return obj
 
@@ -225,12 +256,24 @@ class _Record:
 
     def __setstate__(self, state: object) -> None:
         values = _state_fields(state)
-        for name in self.__slots__:
+        for name in self._fields:
             setattr(self, name, values.get(name))
+        self._keys = _key_order(state)
+
+    def pickled_state(self) -> object:
+        """Return the state this record was unpickled from, rebuilt from its fields."""
+        if self._keys is None:
+            return None
+        if not isinstance(self._keys, tuple):
+            raise pickle.PicklingError(f"{type(self).__qualname__} was unpickled from a state it cannot write back")
+        try:
+            return {key: getattr(self, key) for key in self._keys}
+        except AttributeError as error:
+            raise pickle.PicklingError(f"{type(self).__qualname__} does not keep the field {error.name!r}") from error
 
 
 class _MetadataIndex(_Record):
-    __slots__ = ("fqn", "offset")
+    __slots__ = ("fqn", "index", "offset")
 
 
 class _StorageInfo(_Record):
@@ -266,15 +309,35 @@ class _DType:
         return f"torch.{self.name}"
 
 
+class _Size(tuple):
+    """Placeholder for a torch.Size."""
+
+    __slots__ = ()
+
+
+class _Layout(str):
+    """Placeholder for a torch layout, as its name."""
+
+    __slots__ = ()
+
+
 class _TensorProperties(_Record):
-    __slots__ = ("dtype",)
+    __slots__ = ("dtype", "layout", "memory_format", "pin_memory", "requires_grad")
+    _POSITIONAL = ("dtype", "layout", "requires_grad", "memory_format", "pin_memory")
 
     def __setstate__(self, state: object) -> None:
-        # The tuple form starts with the dtype.
+        # The tuple form starts with the dtype and lists the fields in _POSITIONAL order.
         if isinstance(state, tuple) and state and isinstance(state[0], _DType):
-            self.dtype = state[0]
+            for name, value in zip(self._POSITIONAL, state, strict=False):
+                setattr(self, name, value)
+            self._keys = "tuple" if len(state) == len(self._POSITIONAL) else "unknown"
         else:
             super().__setstate__(state)
+
+    def pickled_state(self) -> object:
+        if self._keys == "tuple":
+            return tuple(getattr(self, name) for name in self._POSITIONAL)
+        return super().pickled_state()
 
 
 _DCP_RECORDS: dict[str, type[_Record]] = {
@@ -484,7 +547,6 @@ _GLOBALS: dict[tuple[str, str], object] = {
     ("_codecs", "encode"): _codecs_encode,
     ("_io", "BytesIO"): _BytesIO,
     ("io", "BytesIO"): _BytesIO,
-    ("torch", "Size"): tuple,
     ("torch._utils", "_rebuild_tensor"): _rebuild_tensor_v2,
     ("torch._utils", "_rebuild_tensor_v2"): _rebuild_tensor_v2,
     ("torch._utils", "_rebuild_tensor_v3"): _rebuild_tensor_v3,
@@ -495,7 +557,6 @@ _GLOBALS: dict[tuple[str, str], object] = {
     ("torch._utils", "_rebuild_wrapper_subclass"): _rebuild_wrapper_subclass,
     ("torch._tensor", "_rebuild_from_type"): _rebuild_from_type,
     ("torch._tensor", "_rebuild_from_type_v2"): _rebuild_from_type,
-    ("torch.serialization", "_get_layout"): _first_arg,
     ("numpy", "dtype"): _NumpyDType,
 }
 for _numpy_module in ("numpy.core.multiarray", "numpy._core.multiarray"):
@@ -504,20 +565,32 @@ for _numpy_module in ("numpy.core.multiarray", "numpy._core.multiarray"):
 for _numpy_module in ("numpy.core.numeric", "numpy._core.numeric"):
     _GLOBALS[(_numpy_module, "_frombuffer")] = _numpy_frombuffer
 
+# Globals whose placeholder class derives from a base other than _Opaque.
+_GLOBAL_BASES: dict[tuple[str, str], type] = {
+    ("torch", "Size"): _Size,
+    ("torch.serialization", "_get_layout"): _Layout,
+}
+
+# Placeholders that pickle back as globals, by module and name.
+_PLACEHOLDER_GLOBALS: dict[str, dict[str, object]] = defaultdict(dict)
+
 
 @functools.cache
 def _resolve_global(module: str, name: str) -> object:
     known = _BUILTINS.get(name) if module == "builtins" else _GLOBALS.get((module, name))
     if known is not None:
         return known
-    if module == "torch" and name in DTYPE_ITEMSIZE:
-        return _DType(name)
     if module in ("torch", "torch.storage") and (name in _STORAGE_DTYPES or name in ("UntypedStorage", "TypedStorage")):
         dtype = _STORAGE_DTYPES.get(name)
         return _StorageType(_resolve_global("torch", dtype) if dtype else None)
-    if "checkpoint" in module and name in _DCP_RECORDS:
-        return _DCP_RECORDS[name]
-    return _opaque_class(module, name)
+    if module == "torch" and name in DTYPE_ITEMSIZE:
+        placeholder = _global_class(_DType, module, name)(name)
+    elif "checkpoint" in module and name in _DCP_RECORDS:
+        placeholder = _global_class(_DCP_RECORDS[name], module, name)
+    else:
+        placeholder = _global_class(_GLOBAL_BASES.get((module, name), _Opaque), module, name)
+    _PLACEHOLDER_GLOBALS[module][name] = placeholder
+    return placeholder
 
 
 class _RestrictedUnpickler(pickle.Unpickler):
@@ -535,6 +608,79 @@ class _RestrictedUnpickler(pickle.Unpickler):
 
 def _unpickle(stream: IO[bytes]) -> object:
     return _RestrictedUnpickler(stream).load()
+
+
+def _reduce_opaque(obj: _Opaque) -> tuple:
+    cls = type(obj)
+    items = iter(obj.items) if obj.items else None
+    mapping = iter(obj.mapping.items()) if obj.mapping else None
+    if obj.called:
+        return cls, obj.args, obj.state, items, mapping
+    if obj.kwargs:
+        return copyreg.__newobj_ex__, (cls, obj.args, obj.kwargs), obj.state, items, mapping
+    return copyreg.__newobj__, (cls, *obj.args), obj.state, items, mapping
+
+
+class _RestrictedPickler(pickle.Pickler):
+    """Pickler that writes every placeholder back as the object it replaced and never imports a module.
+
+    Pickle saves a global by looking it up in its module, so while dumping, each placeholder's module
+    is served by a stub module holding the placeholders, shadowing any real module of that name; dump
+    from one thread at a time. A distcp ``.metadata`` round-trips byte for byte, while the placeholders
+    for blob payloads (tensors, storages, numpy values) keep too little to be written back.
+    """
+
+    def dump(self, obj: object) -> None:
+        self._shadowed: dict[str, types.ModuleType | None] = {}
+        try:
+            super().dump(obj)
+        finally:
+            for module, original in self._shadowed.items():
+                if original is None:
+                    sys.modules.pop(module, None)
+                else:
+                    sys.modules[module] = original
+
+    def reducer_override(self, obj: object) -> object:
+        if isinstance(obj, _Size):
+            return type(obj), (tuple(obj),)
+        if isinstance(obj, _Record):
+            return copyreg.__newobj__, (type(obj),), obj.pickled_state()
+        if isinstance(obj, _Opaque):
+            return _reduce_opaque(obj)
+        if isinstance(obj, type):
+            self._serve(obj.__module__)
+            return NotImplemented
+        if isinstance(obj, _DType):
+            self._serve(type(obj).__module__)
+            return obj.name
+        if isinstance(obj, _Layout):
+            return type(obj), (str(obj),)
+        if type(obj).__module__ == __name__:
+            raise pickle.PicklingError(f"a {type(obj).__name__} placeholder keeps too little to be written back")
+        return NotImplemented
+
+    def _serve(self, module: str) -> None:
+        """Serve module, and its top-level package, from stub modules until the dump ends."""
+        if module in _PLACEHOLDER_GLOBALS:
+            # Importing a dotted module name also imports its top-level package.
+            self._stub(module.partition(".")[0])
+            self._stub(module)
+
+    def _stub(self, module: str) -> None:
+        original = sys.modules.get(module)
+        if module in self._shadowed or (original is not None and module not in _PLACEHOLDER_GLOBALS):
+            return
+        stub = types.ModuleType(module)
+        if original is not None:
+            stub.__dict__.update(vars(original))
+        stub.__dict__.update(_PLACEHOLDER_GLOBALS.get(module, {}))
+        self._shadowed[module] = original
+        sys.modules[module] = stub
+
+
+def _pickle(obj: object, stream: IO[bytes]) -> None:
+    _RestrictedPickler(stream).dump(obj)
 
 
 # Checkpoint metadata.

@@ -76,6 +76,7 @@ struct Session
     Snapshot                                                 sessionState;    // The tensor storage on this is empty
     std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
     std::unordered_set<checkpoint::ipc::Rank>                receivedFrom;    // Ranks from which data has been received.
+    uint64_t                                                 largestSnapshotSize{0};
 
     checkpoint::distcp::BlobMetadataByFqn blobMetas;
 
@@ -126,7 +127,6 @@ struct Session
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank) LFTBND;
-    LocalState& FindOrCreateLocalState_(checkpoint::ipc::Rank rank) LFTBND;
     Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
     Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 

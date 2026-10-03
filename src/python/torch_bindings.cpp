@@ -599,6 +599,8 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
                                                  shtKeyView,
                                                  fqn));
         }
+        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
+        if (!IsMainReplica(innerContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(tensorName, innerContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
@@ -606,6 +608,7 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
 }
 
 // Only main replicas own checkpoint payloads.
+// TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
 static bool IsMainReplica(nb::handle replicaId)
 {
     if (replicaId.is_none()) { return true; }
@@ -620,7 +623,7 @@ static bool IsMainReplica(nb::handle replicaId)
         auto list = nb::cast<nb::list>(replicaId);
         return std::ranges::all_of(list, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
     }
-    throw std::runtime_error("RegisterShardedObject: unrecognized replica_id type (expected None, int, or tuple/list of int)");
+    throw std::runtime_error("Unrecognized replica_id type (expected None, int, or tuple/list of int)");
 }
 
 static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
@@ -634,7 +637,7 @@ static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
 // After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
 // gets replaced with `[ShardedTensor(...weight.z), ShardedTensor(...weight.x),
 // ShardedTensor(...weight.B), ShardedTensor(...weight.C), ShardedTensor(...weight.dt)]`.
-// Register each element using its own `.key` as the FQN — same shape as nvrx's
+// Register each main-replica element using its own `.key` as the FQN — same shape as nvrx's
 // post-`save_preprocess` state_dict, so the cross-provider tensor compare can
 // match tensors per-FQN. Returns false when the list isn't an all-ShardedTensor
 // list so the generic walker can fall through to its existing per-element-type
@@ -671,6 +674,8 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
 
             // throw std::runtime_error("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
+        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
+        if (!IsMainReplica(itemContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(tensorName, itemContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
@@ -693,6 +698,8 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     if (IsMegatronShardedTensor(val))
     {
+        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
+        if (!IsMainReplica(val.attr("replica_id"))) { return true; }
         auto tensorName  = key;
         auto tensorState = ShardedTensorState(tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);

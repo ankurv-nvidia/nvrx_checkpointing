@@ -89,6 +89,37 @@ def test_register_state_dict_repoints_sharded_tensor_data() -> None:
     assert refreshed["weight"] is fresh
 
 
+def test_register_state_dict_skips_non_main_tensor_replicas() -> None:
+    def state(offset: float) -> dict:
+        def tensor(numel: int) -> torch.Tensor:
+            return torch.arange(numel, dtype=torch.float32) + offset
+
+        return {
+            "weight": ShardedTensor.from_rank_offsets("weight", tensor(1), replica_id=(0, 0, 0)),
+            "bias": ShardedTensor.from_rank_offsets("bias", tensor(2), replica_id=(0, 1, 0)),
+            "experts": [ShardedTensor.from_rank_offsets("experts", tensor(4), (0, expert, 3), replica_id=expert) for expert in range(3)],
+            "norm": ShardedTensorFactory(
+                key="norm",
+                data=tensor(8),
+                build_fn=lambda key, data, replica_id, _flattened_range: [
+                    ShardedTensor.from_rank_offsets(key, data, replica_id=replica_id),
+                ],
+                merge_fn=None,
+                replica_id=(1, 0, 0),
+            ),
+        }
+
+    # The one-element weight and the first four-element expert shard are the only main replicas.
+    expected_size = (1 + 4) * 4
+    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root.register_state_dict(state(0.0))
+    assert root.snapshot_size == expected_size
+    root.finalize_registry()
+
+    root.register_state_dict(state(1.0))
+    assert root.snapshot_size == expected_size
+
+
 def test_register_state_dict_releases_superseded_python_objects() -> None:
     root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
     tensor = torch.arange(4, dtype=torch.float32)

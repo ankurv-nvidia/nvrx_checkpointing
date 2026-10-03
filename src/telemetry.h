@@ -72,6 +72,17 @@ struct SvrWriteMetadata
     { Id id{}; };
 };
 
+struct SvrWaitLocalRegistries
+{
+    static constexpr std::string_view Name = "ckpt.svr.wait_local_registries";
+
+    struct Begin
+    { Id id{}; };
+
+    struct End
+    { Id id{}; };
+};
+
 struct SvrDurable
 {
     static constexpr std::string_view Name = "ckpt.svr.durable";
@@ -155,6 +166,15 @@ template <> struct Emitter<span::SvrWriteMetadata::Begin>
 template <> struct Emitter<span::SvrWriteMetadata::End>
 {
     static void Emit(span::SvrWriteMetadata::End const& fields);
+};
+
+template <> struct Emitter<span::SvrWaitLocalRegistries::Begin>
+{
+    static void Emit(span::SvrWaitLocalRegistries::Begin const& fields);
+};
+template <> struct Emitter<span::SvrWaitLocalRegistries::End>
+{
+    static void Emit(span::SvrWaitLocalRegistries::End const& fields);
 };
 
 template <> struct Emitter<span::SvrDurable::Begin>

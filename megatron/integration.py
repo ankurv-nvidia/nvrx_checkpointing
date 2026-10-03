@@ -41,6 +41,8 @@ def _read_metadata_uncached(strategy: Any) -> None:
 def _install_load_registration() -> None:
     """Load without NVIDIA Resiliency Extension, then register the constructed state."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
+    from megatron.core.dist_checkpointing.dict_utils import nested_values  # type: ignore[import-not-found]
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor  # type: ignore[import-not-found]
     from megatron.training import training as training_module  # type: ignore[import-not-found]
 
     if getattr(dist_checkpointing, _NATIVE_LOAD_MARKER, False):
@@ -53,7 +55,12 @@ def _install_load_registration() -> None:
     @wraps(original_load)
     def load(sharded_state_dict: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
         _read_metadata_uncached(args[1] if len(args) > 1 else kwargs.get("sharded_strategy"))
+        # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
+        # replica_ids are overwritten by the fully parallel loading process. We need to preserve the original values.
+        replica_ids = [(value, value.replica_id) for value in nested_values(sharded_state_dict) if isinstance(value, ShardedTensor)]
         result = original_load(sharded_state_dict, *args, **kwargs)
+        for value, replica_id in replica_ids:
+            value.replica_id = replica_id
         root = native_save.register_state_dict(sharded_state_dict, 0)
         root.finalize_registry()
         return result

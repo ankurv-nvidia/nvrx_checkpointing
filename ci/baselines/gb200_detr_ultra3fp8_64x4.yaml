@@ -3,7 +3,7 @@ source: otlp
 metrics:
   bw_mbps: 149852
   wr_tnsr_us: 196026
-  total_written_bytes: 30801810040
+  total_written_bytes: 17300480930
   ckpt_durable_ms: 18323
   ckpt_daemon_durable_ms: 17234
   gpu_peak_bytes: 75321310982
@@ -23,8 +23,8 @@ rank_statistics:
     median: 196050.5
     max: 209717
   total_written_bytes:
-    min: 30801748288
-    median: 30801812032.0
+    min: 14876722944
+    median: 14876786688.0
     max: 30801812032
   gpu_peak_bytes:
     min: 71819723776

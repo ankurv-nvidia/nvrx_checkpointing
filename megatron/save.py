@@ -151,6 +151,7 @@ def _prepare_rng_sharded_object_blobs(value: object) -> None:
     if type(value).__name__ != "ShardedObject" or not hasattr(value, "data") or not hasattr(value, "unique_key"):
         return
 
+    # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
     replica_id = getattr(value, "replica_id", 0)
     if (isinstance(replica_id, int) and replica_id != 0) or (
         not isinstance(replica_id, int) and any(component != 0 for component in replica_id)

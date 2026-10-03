@@ -320,6 +320,7 @@ struct LogTelState
     {
         SvrFinalize,
         SvrWriteMetadata,
+        SvrWaitLocalRegistries,
         SvrDurable,
     };
 
@@ -1046,6 +1047,39 @@ void Emitter<span::SvrWriteMetadata::End>::Emit(span::SvrWriteMetadata::End cons
     auto metadataSpan = std::move(entry->span);
     state.activeSpans.entries.erase(entry);
     metadataSpan->End();
+}
+
+void Emitter<span::SvrWaitLocalRegistries::Begin>::Emit(span::SvrWaitLocalRegistries::Begin const& fields)
+{
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed) || !state.tracer) { return; }
+
+    state.lastId  = fields.id;
+    auto waitSpan = state.tracer->StartSpan(span::SvrWaitLocalRegistries::Name);
+    waitSpan->SetAttribute("nvrx.session_id", static_cast<int64_t>(static_cast<uint32_t>(fields.id.sessionId)));
+    waitSpan->SetAttribute("nvrx.rank", static_cast<int64_t>(static_cast<uint32_t>(fields.id.rank)));
+    state.activeSpans.entries.push_back(
+        {.id = {.kind = LogTelState::ActiveSpanKind::SvrWaitLocalRegistries, .id = fields.id}, .span = std::move(waitSpan)});
+}
+
+void Emitter<span::SvrWaitLocalRegistries::End>::Emit(span::SvrWaitLocalRegistries::End const& fields)
+{
+    LogTelState& state = LogTelState::Get();
+    if (!state.enabled.load(std::memory_order_acquire)) { return; }
+
+    std::scoped_lock<std::mutex> lock(state.mutex);
+    if (!state.enabled.load(std::memory_order_relaxed)) { return; }
+
+    state.lastId     = fields.id;
+    auto const id    = LogTelState::ActiveSpanId{.kind = LogTelState::ActiveSpanKind::SvrWaitLocalRegistries, .id = fields.id};
+    auto const entry = std::ranges::find_if(state.activeSpans.entries, [&id](auto const& active) { return active.id == id; });
+    if (entry == state.activeSpans.entries.end()) { return; }
+    auto waitSpan = std::move(entry->span);
+    state.activeSpans.entries.erase(entry);
+    waitSpan->End();
 }
 
 void Emitter<span::SvrDurable::Begin>::Emit(span::SvrDurable::Begin const& fields)

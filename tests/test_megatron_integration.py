@@ -118,6 +118,8 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         public_load_error=None,
         train=0,
         registry_finalized=0,
+        rewrite_replica_ids=False,
+        registered_replica_ids=[],
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
@@ -133,7 +135,25 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
             calls.registry_finalized += 1
 
     root = Root()
-    fake_save.register_state_dict = lambda state, iteration: calls.native_loads.append((state, iteration)) or root
+
+    def nested_values(value: Any) -> Any:
+        for child in value.values() if isinstance(value, dict) else value:
+            if isinstance(child, (dict, list)):
+                yield from nested_values(child)
+            else:
+                yield child
+
+    class ShardedTensor:
+        def __init__(self, key: str, replica_id: Any) -> None:
+            self.key = key
+            self.replica_id = replica_id
+
+    def register_state_dict(state: dict[str, Any], iteration: int) -> Root:
+        calls.native_loads.append((state, iteration))
+        calls.registered_replica_ids.append([value.replica_id for value in nested_values(state) if isinstance(value, ShardedTensor)])
+        return root
+
+    fake_save.register_state_dict = register_state_dict
     fake_save._wrap_load_checkpoint = lambda fn: fn  # noqa: SLF001
 
     fake_save.init_persistent_async_worker = lambda *args: calls.init.append(args)
@@ -147,6 +167,10 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     megatron_core.__path__ = []
     dist_checkpointing = ModuleType("megatron.core.dist_checkpointing")
     dist_checkpointing.__path__ = []
+    dict_utils = ModuleType("megatron.core.dist_checkpointing.dict_utils")
+    dict_utils.nested_values = nested_values
+    mapping = ModuleType("megatron.core.dist_checkpointing.mapping")
+    mapping.ShardedTensor = ShardedTensor
 
     def public_load(
         state: dict[str, Any],
@@ -159,9 +183,15 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         calls.metadata_cache_at_load.append(getattr(base, "cache_metadata", None))
         if calls.public_load_error is not None:
             raise calls.public_load_error
+        if calls.rewrite_replica_ids:
+            for value in nested_values(state):
+                if isinstance(value, ShardedTensor):
+                    value.replica_id = 1
         return {"loaded": True}
 
     dist_checkpointing.load = public_load
+    dist_checkpointing.dict_utils = dict_utils
+    dist_checkpointing.mapping = mapping
     megatron_core.dist_checkpointing = dist_checkpointing
     megatron.core = megatron_core
 
@@ -228,6 +258,8 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         "megatron": megatron,
         "megatron.core": megatron_core,
         "megatron.core.dist_checkpointing": dist_checkpointing,
+        "megatron.core.dist_checkpointing.dict_utils": dict_utils,
+        "megatron.core.dist_checkpointing.mapping": mapping,
         "megatron.training": training_package,
         "megatron.training.initialize": initialize_module,
         "megatron.training.inprocess_restart": restart_module,
@@ -248,6 +280,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     integration.install()
 
     calls.dist_checkpointing = dist_checkpointing
+    calls.sharded_tensor = ShardedTensor
     calls.initialize_module = initialize_module
     calls.restart_module = restart_module
     calls.training_module = training_module
@@ -326,6 +359,19 @@ def test_native_load_registers_constructed_state(monkeypatch: pytest.MonkeyPatch
     assert calls.public_loads == [(state, "/checkpoint", None, {})]
     assert calls.native_loads == [(state, 0)]
     assert calls.registry_finalized == 1
+
+
+def test_native_load_registers_the_replica_ids_assigned_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.rewrite_replica_ids = True
+    main = calls.sharded_tensor("decoder.weight", (0, 0, 0))
+    replica = calls.sharded_tensor("decoder.bias", (0, 0, 1))
+    state = {"model": {"decoder.weight": main, "biases": [replica]}}
+
+    calls.dist_checkpointing.load(state, "/checkpoint")
+
+    assert calls.registered_replica_ids == [[(0, 0, 0), (0, 0, 1)]]
+    assert (main.replica_id, replica.replica_id) == ((0, 0, 0), (0, 0, 1))
 
 
 def test_native_load_forwards_the_caller_arguments_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -41,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -444,12 +445,12 @@ static void StartTestServer(TestServerProcess& server, std::filesystem::path con
     ::unsetenv("NATIVE_CKPT_SERVER_LOG");    // NOLINT(concurrency-mt-unsafe)
 }
 
-TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier2]")
+TEST_CASE("registry replies wait for every local registry and fit queues to the largest", "[shmem][tier2]")
 {
-    static constexpr uint32_t        RanksPerPeer = 4;
+    static constexpr uint32_t        RanksPerPeer = 2;
     static constexpr size_t          MiB          = 1ull << 20u;
-    std::array<size_t, RanksPerPeer> snapshotSizes{5 * MiB, 9 * MiB, 17 * MiB, 33 * MiB};
-    auto const                       logDir = CkptDir("first_registry_upload");
+    std::array<size_t, RanksPerPeer> snapshotSizes{1 * MiB, 16 * MiB};
+    auto const                       logDir = CkptDir("largest_registry_sizes_shm");
     std::filesystem::remove_all(logDir);
     std::filesystem::create_directories(logDir);
 
@@ -485,13 +486,15 @@ TEST_CASE("first local registry upload initializes shared memory", "[shmem][tier
     CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
           == boost::beast::http::status::accepted);
 
-    CHECK(uploadRegistry(0) == boost::beast::http::status::accepted);
+    auto smaller = std::async(std::launch::async, uploadRegistry, 0);
+    CHECK(smaller.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
+    CHECK(uploadRegistry(1) == boost::beast::http::status::accepted);
+    CHECK(smaller.get() == boost::beast::http::status::accepted);
     for (uint8_t queueIndex = 0; queueIndex < RanksPerPeer; ++queueIndex)
     {
         auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, queueIndex));
-        CHECK(queue.SlotCount() > 0);
+        CHECK(queue.SlotSize() * queue.SlotCount() >= snapshotSizes[1]);
     }
-    for (uint32_t rank = 1; rank < RanksPerPeer; ++rank) { CHECK(uploadRegistry(rank) == boost::beast::http::status::accepted); }
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);
 }
@@ -538,11 +541,15 @@ static void ActivateAndUploadRegistries(RankTopology const& topo, std::vector<st
     StateSerDes::WriteTopology(activation, topo);
     CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
           == boost::beast::http::status::accepted);
+    std::vector<std::future<boost::beast::http::status>> uploads;
+    uploads.reserve(registries.size());
     for (auto const& registry : registries)
     {
-        CHECK(PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), registry)
-              == boost::beast::http::status::accepted);
+        uploads.push_back(std::async(std::launch::async, [&registry] {
+            return PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), registry);
+        }));
     }
+    for (auto& upload : uploads) { CHECK(upload.get() == boost::beast::http::status::accepted); }
 }
 
 // The merged dump appears while the server keeps running; returns the ranks owning a slice in it.
