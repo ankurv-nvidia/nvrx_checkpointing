@@ -63,6 +63,7 @@ def _install_load_registration() -> None:
             value.replica_id = replica_id
         root = native_save.register_state_dict(sharded_state_dict, 0)
         root.finalize_registry()
+        root.wait_for_async_completion()
         return result
 
     dist_checkpointing.load = load

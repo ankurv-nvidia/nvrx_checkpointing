@@ -67,7 +67,7 @@ struct CachedTypes
 
 struct TensorState
 {
-    DS4Tensor  meta;
+    DTensor    meta;
     nb::object owner;
 };
 }    // namespace
@@ -85,7 +85,7 @@ static int64_t DtypeNameToId(std::string_view name)
 
 // === DLPack metadata conversion ===
 
-static DS4Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
+static Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
 {
     if (dt.lanes != 1) { throw std::runtime_error(fmt::format("Unsupported DLPack dtype lanes={}", dt.lanes)); }
     switch (dt.code)
@@ -93,32 +93,32 @@ static DS4Tensor::DType DlpackDtypeToDs4(DLDataType const& dt)
     case kDLFloat:
         switch (dt.bits)
         {
-        case 16: return DS4Tensor::DType::Float16;
-        case 32: return DS4Tensor::DType::Float32;
-        case 64: return DS4Tensor::DType::Float64;
+        case 16: return Tensor::DType::Float16;
+        case 32: return Tensor::DType::Float32;
+        case 64: return Tensor::DType::Float64;
         default: break;
         }
         break;
     case kDLBfloat:
-        if (dt.bits == 16) { return DS4Tensor::DType::BFloat16; }
+        if (dt.bits == 16) { return Tensor::DType::BFloat16; }
         break;
     case kDLInt:
         switch (dt.bits)
         {
-        case 8: return DS4Tensor::DType::Int8;
-        case 16: return DS4Tensor::DType::Int16;
-        case 32: return DS4Tensor::DType::Int32;
-        case 64: return DS4Tensor::DType::Int64;
+        case 8: return Tensor::DType::Int8;
+        case 16: return Tensor::DType::Int16;
+        case 32: return Tensor::DType::Int32;
+        case 64: return Tensor::DType::Int64;
         default: break;
         }
         break;
     case kDLUInt:
         switch (dt.bits)
         {
-        case 8: return DS4Tensor::DType::UInt8;
-        case 16: return DS4Tensor::DType::UInt16;
-        case 32: return DS4Tensor::DType::UInt32;
-        case 64: return DS4Tensor::DType::UInt64;
+        case 8: return Tensor::DType::UInt8;
+        case 16: return Tensor::DType::UInt16;
+        case 32: return Tensor::DType::UInt32;
+        case 64: return Tensor::DType::UInt64;
         default: break;
         }
         break;
@@ -295,22 +295,24 @@ static nb::object AddressableTensor(std::string_view name, nb::handle value)
     return owner;
 }
 
-static DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
+static DTensor BareTensorMeta(RankTopology const& topo, std::string_view name, DLTensor const& t)
 {
-    DS4Tensor meta{};
-    meta.dtype  = DlpackDtypeToDs4(t.dtype);
-    meta.device = DlpackDeviceToId(t.device);
-    meta.handle = DataPtrFromDlTensor(t);
-
+    DTensor        meta{};
+    DTensor::Shard shard;
+    shard.rank     = topo.rank;
+    meta.dtype     = DlpackDtypeToDs4(t.dtype);
+    shard.device   = DlpackDeviceToId(t.device);
+    shard.handle   = DataPtrFromDlTensor(t);
+    uint64_t nelem = 1;
     if (!IsRowMajorContiguous(t)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", name)); }
-    if (std::cmp_greater(t.ndim, DS4Tensor::MaxDims))
+    if (std::cmp_greater(t.ndim, Tensor::MaxDims))
     {
         throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, t.ndim));
     }
     if (t.ndim == 0)
     {
         meta.fulldim.push_back(1);
-        meta.sharddim.push_back(DS4Tensor::Range{.begin = 0, .end = 1});
+        shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
     }
     else
     {
@@ -318,19 +320,22 @@ static DS4Tensor BareTensorMeta(std::string_view name, DLTensor const& t)
         {
             auto dim = t.shape[i];    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
             if (dim <= 0) { throw std::runtime_error(fmt::format("Tensor {} has non-positive dim[{}]: {}", name, i, dim)); }
-            meta.fulldim.push_back(static_cast<DS4Tensor::SizeT>(dim));
-            meta.sharddim.push_back(DS4Tensor::Range{.begin = 0, .end = static_cast<DS4Tensor::SizeT>(dim)});
+            nelem = nelem * static_cast<uint64_t>(dim);
+            meta.fulldim.push_back(static_cast<uint64_t>(dim));
+            shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = static_cast<uint64_t>(dim)});
         }
     }
-    meta.AssertShardIsValid();
+    shard.storageSize = nelem * Tensor::GetDTypeSize(meta.dtype);
+    shard.AssertShardIsValid(meta.fulldim);
+    meta.AddShard(shard);
     return meta;
 }
 
-static TensorState TorchTensorState(std::string_view name, nb::handle value)
+static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
 {
     auto owner = AddressableTensor(name, value);
     auto dlp   = ReadDlpack(owner);
-    return {.meta = BareTensorMeta(name, *dlp.tnsr), .owner = std::move(owner)};
+    return {.meta = BareTensorMeta(topo, name, *dlp.tnsr), .owner = std::move(owner)};
 }
 
 static StateNode::Scalar TorchDtypeState(nb::handle value)
@@ -363,10 +368,10 @@ static StateNode::Blob TorchGeneratorBlob(std::string_view name, nb::handle valu
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
+static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, nb::dict const& container)
 {
-    using Range = DS4Tensor::Range;
-    DS4Tensor ds4tensor{};
+    using Range = Tensor::Range;
+    DTensor ds4tensor{};
 
     auto shtKey     = nb::cast<nb::str>(container["key"]);
     auto nameView   = StrView(name);
@@ -374,7 +379,7 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
     if (!nameView.starts_with(shtKeyView))
     {
         // Match the prior C++ walker's TODO_SHTEN_KEY policy: when
-        // the dict-path name doesn't match the ShardedTensor's own
+        // the dict-path name doesn't match the DTensor's own
         // `key`, the sharded key wins.
         name     = shtKey;
         nameView = shtKeyView;
@@ -384,7 +389,7 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
     {
         ShardedTensorError(nb::str const& key, nb::dict const& container, std::string_view const& message) :
             std::runtime_error(
-                fmt::format("Error Registering StateDict ShardedTensor::{} key = {} sharded_tensor = {}", message, key, nb::str(container)))
+                fmt::format("Error Registering StateDict DTensor::{} key = {} sharded_tensor = {}", message, key, nb::str(container)))
         {}
     };
     auto throwError = [&](std::string_view const& message) { throw ShardedTensorError(shtKey, container, message); };
@@ -392,9 +397,11 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
     auto owner = AddressableTensor(shtKeyView, container["data"]);
     auto dlp   = ReadDlpack(owner);
     if (!IsRowMajorContiguous(*dlp.tnsr)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", shtKeyView)); }
-    ds4tensor.dtype  = DlpackDtypeToDs4(dlp.tnsr->dtype);
-    ds4tensor.device = DlpackDeviceToId(dlp.tnsr->device);
-    ds4tensor.handle = DataPtrFromDlTensor(*dlp.tnsr);
+    ds4tensor.dtype = DlpackDtypeToDs4(dlp.tnsr->dtype);
+    DTensor::Shard shard{};
+    shard.rank   = topo.rank;
+    shard.handle = DataPtrFromDlTensor(*dlp.tnsr);
+    shard.device = DlpackDeviceToId(dlp.tnsr->device);
 
     auto globalShape    = nb::cast<nb::tuple>(container["global_shape"]);
     auto localShape     = nb::cast<nb::tuple>(container["local_shape"]);
@@ -436,7 +443,7 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
         if (!nb::cast<bool>(allowShapeMismatch)) { return; }
 #ifdef TODO_ALLOW_SHAPE_MISMATCH
         fmt::print(stderr,
-                   "[native_ckpt:cli][TODO][StateDict::Register::ShardedTensor] key = {}, "
+                   "[native_ckpt:cli][TODO][StateDict::Register::DTensor] key = {}, "
                    "allow_shape_mismatch = {} globalShape = [{}] localShape=[{}] globalOffset=[{}]\n",
                    shtKeyView,
                    true,
@@ -490,7 +497,8 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
         }
     }();
 
-    for (auto const& val : globalShape) { ds4tensor.fulldim.push_back(nb::cast<DS4Tensor::SizeT>(val)); }
+    for (auto const& val : globalShape) { ds4tensor.fulldim.push_back(nb::cast<uint64_t>(val)); }
+    shard.storageSize = 1;
     for (size_t i = 0; i < globalShape.size(); ++i)
     {
         auto    start = nb::cast<int64_t>(globalOffset[i]);
@@ -500,25 +508,23 @@ static TensorState ShardedTensorState(nb::str& name, nb::dict const& container)
         {
             end = start + nb::cast<int64_t>(localShape[i - prependAxisNumValue]);
         }
-        ds4tensor.sharddim.push_back(Range{.begin = static_cast<size_t>(start), .end = static_cast<size_t>(end)});
+        shard.sharddim.push_back(Range{.begin = static_cast<size_t>(start), .end = static_cast<size_t>(end)});
+        shard.storageSize *= (end - start);
     }
-
-    // Compare the sharddim-implied byte count against the DLPack
-    // shape's byte count. Matches the prior `nbytes()` check.
-    size_t shardBytes = DynamicSharded4TensorTraits::GetDTypeSize(ds4tensor.dtype);
-    for (auto const& r : ds4tensor.sharddim) { shardBytes *= (r.end - r.begin); }
+    shard.storageSize = shard.storageSize * Tensor::GetDTypeSize(ds4tensor.dtype);
 
     size_t dlpackBytes = static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * dlp.tnsr->dtype.lanes;    // NOLINT
     for (int i = 0; i < dlp.tnsr->ndim; ++i)
     {
         dlpackBytes *= static_cast<size_t>(dlp.tnsr->shape[i]);    // NOLINT
     }
-    if (shardBytes != dlpackBytes)
+    if (shard.storageSize != dlpackBytes)
     {
         throw std::runtime_error(fmt::format(
-            "Tensor {} size mismatch: sharddim implies {} bytes, DLPack shape implies {}", shtKeyView, shardBytes, dlpackBytes));
+            "Tensor {} size mismatch: sharddim implies {} bytes, DLPack shape implies {}", shtKeyView, shard.storageSize, dlpackBytes));
     }
-    ds4tensor.AssertShardIsValid();
+    ds4tensor.AddShard(shard);
+    // ds4tensor.AssertShardIsValid();
     return {.meta = ds4tensor, .owner = std::move(owner)};
 }
 
@@ -544,7 +550,7 @@ static StateNode::Blob ShardedObjectBlob(nb::handle value)
 }
 
 static StateNode&
-RegisterTensorState(PyStateDictAccessor& scan, StateNode::Handle parent, std::string_view name, DS4Tensor tensor, nb::handle owner)
+RegisterTensorState(PyStateDictAccessor& scan, StateNode::Handle parent, std::string_view name, DTensor tensor, nb::handle owner)
 {
     auto& node = name.contains('.') ? scan.RegisterStateByFQN(name, tensor) : scan.RegisterState(parent, name, tensor);
     scan.AcquireTensorObjectRefForSnapshot(node.handle, nb::borrow<nb::object>(owner));
@@ -594,7 +600,7 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
         }
         if (shtKeyView != fqn && (!shtKeyView.starts_with(fqn) || shtKeyView.size() <= fqn.size() || shtKeyView[fqn.size()] != '.'))
         {
-            throw std::runtime_error(fmt::format("ShardedTensorFactory::build returned ShardedTensor with key {} that is not a child of "
+            throw std::runtime_error(fmt::format("ShardedTensorFactory::build returned DTensor with key {} that is not a child of "
                                                  "the factory obj fqn {}",
                                                  shtKeyView,
                                                  fqn));
@@ -602,7 +608,7 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
         // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
         if (!IsMainReplica(innerContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
-        auto tensorState = ShardedTensorState(tensorName, innerContainer);
+        auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, innerContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
     }
 }
@@ -635,11 +641,11 @@ static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
 }
 
 // After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
-// gets replaced with `[ShardedTensor(...weight.z), ShardedTensor(...weight.x),
-// ShardedTensor(...weight.B), ShardedTensor(...weight.C), ShardedTensor(...weight.dt)]`.
+// gets replaced with `[DTensor(...weight.z), DTensor(...weight.x),
+// DTensor(...weight.B), DTensor(...weight.C), DTensor(...weight.dt)]`.
 // Register each main-replica element using its own `.key` as the FQN — same shape as nvrx's
 // post-`save_preprocess` state_dict, so the cross-provider tensor compare can
-// match tensors per-FQN. Returns false when the list isn't an all-ShardedTensor
+// match tensors per-FQN. Returns false when the list isn't an all-DTensor
 // list so the generic walker can fall through to its existing per-element-type
 // handling.
 bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::list const& listObj)
@@ -672,12 +678,12 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
             //  for param_name, checkpoint_name in conv_checkpoint_key_map.items():
             //      sharded_state_dict[f"{prefix}{param_name}"].key = f"{prefix}{checkpoint_name}"
 
-            // throw std::runtime_error("ShardedTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
+            // throw std::runtime_error("DTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
         // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
         if (!IsMainReplica(itemContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
-        auto tensorState = ShardedTensorState(tensorName, itemContainer);
+        auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, itemContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
     }
     return true;
@@ -687,7 +693,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
 {
     if (IsTorchTensor(val))
     {
-        auto tensorState = TorchTensorState(StrView(key), val);
+        auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
         RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner);
         return true;
     }
@@ -701,7 +707,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
         // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
         if (!IsMainReplica(val.attr("replica_id"))) { return true; }
         auto tensorName  = key;
-        auto tensorState = ShardedTensorState(tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
+        auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
         return true;
     }

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <string_view>
@@ -22,12 +23,44 @@
 
 namespace cipc = checkpoint::ipc;
 
+namespace
+{
+uint64_t NativeShardSize(Tensor::DType dtype, Tensor::DimRange const& sharddim)
+{
+    if (sharddim.empty()) { return 0; }
+    uint64_t size = Tensor::GetDTypeSize(dtype);
+    for (auto const& range : sharddim)
+    {
+        if (range.begin >= range.end) { return 0; }
+        size *= range.end - range.begin;
+    }
+    return size;
+}
+
+uint64_t TensorStorageSize(DTensor const& tensor)
+{
+    return std::accumulate(tensor.shards.begin(), tensor.shards.end(), uint64_t{0}, [](uint64_t size, TensorShard const& shard) {
+        return size + shard.storageSize;
+    });
+}
+
+bool CoversFullTensor(DTensor const& tensor, TensorShard const& shard)
+{
+    if (tensor.fulldim.size() != shard.sharddim.size()) { return false; }
+    for (size_t dim = 0; dim < tensor.fulldim.size(); ++dim)
+    {
+        if (shard.sharddim[dim].begin != 0 || shard.sharddim[dim].end != tensor.fulldim[dim]) { return false; }
+    }
+    return true;
+}
+}    // namespace
+
 Rank InferWorldSize(StateTree const& tree)
 {
     uint maxRankPlus1 = 1;
     tree.WalkNodes([&](StateNode const& node) {
-        if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor)) { return; }
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)) { return; }
+        auto const& tnsr = std::get<DTensor>(node.data);
         for (auto const& rankShard : tnsr.shards) { maxRankPlus1 = std::max(maxRankPlus1, static_cast<uint32_t>(rankShard.rank) + 1u); }
         tree.AssertShardedTensorHasNoHoles(node.handle);
     });
@@ -36,20 +69,20 @@ Rank InferWorldSize(StateTree const& tree)
 
 std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo, std::vector<char>& buffer)
 {
-    std::unique_ptr<StateTree> tree = std::make_unique<StateTree>(std::move(topo));
+    std::unique_ptr<StateTree> tree = std::make_unique<StateTree>(checkpoint::ipc::SessionId::Default, std::move(topo));
     ctx.globalRegistry->CloneInto(*tree);
     std::unordered_map<DeviceId, std::unique_ptr<DeviceContext>> devCtxMap;
 
     size_t totalAllocSize = 0;
 
-    auto calculateSize
-        = [&](DS4Tensor& tnsr, std::string_view /* shardFqn */) { totalAllocSize += static_cast<size_t>(tnsr.ShardSizeBytes()); };
+    auto calculateSize = [&](DTensor::Shard const& tnsr, std::string_view /* shardFqn */) {
+        totalAllocSize += static_cast<size_t>(tnsr.StorageSizeBytes());
+    };
 
     size_t currentOffset = 0;
-
-    auto allocAndCopy = [&](DS4Tensor& tnsr, [[maybe_unused]] std::string_view shardFqn) {
+    auto   allocAndCopy  = [&](DTensor::Shard& tnsr, [[maybe_unused]] std::string_view shardFqn) {
         tnsr.handle = 0;
-        if (tnsr.ShardSizeBytes() == 0) { return; }
+        if (tnsr.StorageSizeBytes() == 0) { return; }
         auto it = devCtxMap.find(tnsr.device);
         if (it == devCtxMap.end())
         {
@@ -58,7 +91,7 @@ std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, Ran
         }
 
         auto& devCtx  = *it->second;
-        auto  bufSize = static_cast<size_t>(tnsr.ShardSizeBytes());
+        auto  bufSize = static_cast<size_t>(tnsr.StorageSizeBytes());
         auto  devAddr = devCtx.Allocate(bufSize);
         auto* dataptr = buffer.data() + currentOffset;
 #ifdef NDEBUG
@@ -79,21 +112,27 @@ std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, Ran
 
     auto pass = [&](auto execFn) {
         tree->WalkNodes([&](StateNode& node) {
-            if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+            if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
             {
-                execFn(std::get<StateNode::TensorShard>(node.data), tree->GetNodeId(node.handle));
+                auto& tnsr  = std::get<Tensor>(node.data);
+                auto  shard = DTensor::Shard{
+                    .rank        = topo.rank,
+                    .handle      = tnsr.handle,
+                    .storageSize = tnsr.storageSize,
+                    .sharddim    = {},
+                    .device      = tnsr.device,
+                };
+                execFn(shard, tree->GetNodeId(node.handle));
+                tnsr.handle = shard.handle;
             }
-            else if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
             {
-                auto&                    tnsr = std::get<StateNode::ShardedTensor>(node.data);
-                StateNode::ShardedTensor newTnsr{tnsr.dtype, tnsr.fulldim};
+                auto&   tnsr = std::get<DTensor>(node.data);
+                DTensor newTnsr{tnsr.dtype, tnsr.fulldim};
                 for (auto rshard : tnsr.shards)
                 {
                     if (tree->Topo().rank != rshard.rank) { continue; }
-                    DS4Tensor shardTnsr
-                        = {.sharddim = rshard.sharddim, .fulldim = tnsr.fulldim, .dtype = tnsr.dtype, .device = rshard.device};
-                    execFn(shardTnsr, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim));
-                    rshard.handle = shardTnsr.handle;
+                    execFn(rshard, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim));
                     newTnsr.AddShard(rshard);
                 }
                 if (newTnsr.shards.empty()) { tree->RemoveNode(node.handle); }
@@ -109,21 +148,21 @@ std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, Ran
     if (totalAllocSize > buffer.size()) { buffer.resize(totalAllocSize); }
     pass(allocAndCopy);
 
-    for (auto& [device, devCtx] : devCtxMap) { devCtx->Flush(); }
+    for (auto& [deviceId, devCtx] : devCtxMap) { devCtx->Flush(); }
 
     tree->WalkNodes([&](StateNode& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
-            auto& shTen = std::get<StateNode::ShardedTensor>(node.data);
-            if (shTen.shards.size() == 1)
+            auto& shTen = std::get<DTensor>(node.data);
+            if (shTen.shards.size() == 1 && CoversFullTensor(shTen, *shTen.shards.begin()))
             {
                 auto const& rshard    = *shTen.shards.begin();
-                DS4Tensor   shardTnsr = {
-                    .sharddim = rshard.sharddim,
-                    .fulldim  = shTen.fulldim,
-                    .dtype    = shTen.dtype,
-                    .handle   = rshard.handle,
-                    .device   = rshard.device,
+                Tensor      shardTnsr = {
+                    .dtype       = shTen.dtype,
+                    .handle      = rshard.handle,
+                    .storageSize = rshard.storageSize,
+                    .fulldim     = shTen.fulldim,
+                    .device      = rshard.device,
                 };
                 node.data = shardTnsr;
             }
@@ -138,6 +177,7 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) { throw std::runtime_error(fmt::format("Failed to open state registry: {}", path.string())); }
     ctx.globalRegistry = std::make_unique<StateTree>(
+        checkpoint::ipc::SessionId::Default,
         RankTopology{.rank = Rank{0}, .worldSize = Rank{1}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost"}});
     auto registry = StateSerDes::Read(ifs);
 
@@ -148,14 +188,14 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     uint64_t                                                    totalTensorSize = 0;
 
     registry->WalkNodes([&](StateNode& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
         {
             throw std::runtime_error("LoadStateRegistryFromPath: unexpected TensorShard in global registry");
         }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
-            auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
-            auto  size = tnsr.FullDimSizeBytes();
+            auto& tnsr = std::get<DTensor>(node.data);
+            auto  size = TensorStorageSize(tnsr);
             totalTensorSize += size;
             tensorSizes.emplace(size, node.handle);
         }
@@ -183,23 +223,33 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
         auto [size, handle] = tensorSizes.top();
         tensorSizes.pop();
         registry->AssertShardedTensorHasNoHoles(handle);
-        auto& tnsr     = std::get<StateNode::ShardedTensor>(registry->GetNode(handle).data);
+        auto& tnsr     = std::get<DTensor>(registry->GetNode(handle).data);
         auto  olddim   = tnsr.fulldim;
         auto* maxDimIt = std::ranges::max_element(tnsr.fulldim);
         auto  index    = static_cast<size_t>(std::distance(tnsr.fulldim.begin(), maxDimIt));
-        if (*maxDimIt <= 1) { throw std::runtime_error("LoadStateRegistryFromPath: ShardedTensor has no dimension > 1 to halve"); }
+        if (*maxDimIt <= 1) { throw std::runtime_error("LoadStateRegistryFromPath: DTensor has no dimension > 1 to halve"); }
+        for (auto const& shard : tnsr.shards)
+        {
+            if (shard.storageSize != NativeShardSize(tnsr.dtype, shard.sharddim))
+            {
+                throw std::runtime_error(
+                    fmt::format("LoadStateRegistryFromPath: cannot resize tensor {} with opaque storage", registry->GetNodeId(handle)));
+            }
+        }
         *maxDimIt /= 2;
-        std::set<StateNode::ShardedTensor::RankedTensorShard> oldShards{};
+        std::set<DTensor::Shard> oldShards{};
         std::swap(tnsr.shards, oldShards);
         for (auto const& shard : oldShards)
         {
             auto newShard = shard;
             newShard.sharddim[index].end /= 2;
             newShard.sharddim[index].begin /= 2;
+            newShard.storageSize = NativeShardSize(tnsr.dtype, newShard.sharddim);
+            if (newShard.storageSize == 0) { continue; }
             tnsr.AddShard(newShard);
         }
         registry->AssertShardedTensorHasNoHoles(handle);
-        auto newSize    = tnsr.FullDimSizeBytes();
+        auto newSize    = TensorStorageSize(tnsr);
         totalTensorSize = totalTensorSize - size + newSize;
         fmt::print(stderr, "fqn={}: dim={}->{} size={}->{}\n", registry->GetNodeId(handle), olddim, tnsr.fulldim, size, newSize);
         tensorSizes.emplace(newSize, handle);
@@ -262,11 +312,11 @@ void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorSto
 {
     auto localRank = localState.Topo().rank;
     localState.WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
         {
-            auto& tnsr          = std::get<StateNode::TensorShard>(node.data);
+            auto& tnsr          = std::get<Tensor>(node.data);
             auto* data          = &tensorStorage.At<char>(tnsr.handle);    // NOLINT
-            auto  size          = tnsr.ShardSizeBytes();
+            auto  size          = tnsr.StorageSizeBytes();
             auto  shardFqn      = localState.GetNodeId(node.handle);
             auto  actualPattern = std::string_view(static_cast<char const*>(data), std::min(size, static_cast<uint64_t>(shardFqn.size())));
             if (actualPattern != shardFqn)
@@ -278,14 +328,14 @@ void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorSto
                                                      actualPattern));
             }
         }
-        else if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
-            auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
                 auto* data          = &tensorStorage.At<char>(shard.handle);    // NOLINT
                 auto  shardFqn      = fmt::format("{}[{}]", localState.GetNodeId(node.handle), shard.sharddim);
-                auto  size          = std::min(shard.ShardSizeBytes(tnsr.dtype), static_cast<uint64_t>(shardFqn.size()));
+                auto  size          = std::min(shard.StorageSizeBytes(), static_cast<uint64_t>(shardFqn.size()));
                 auto  actualPattern = std::string_view(static_cast<char const*>(data), size);
                 if (actualPattern != std::string_view(shardFqn.data(), size))
                 {
@@ -306,7 +356,7 @@ void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
     for (uint32_t i = 1; i <= NumSnapshots; i++)
     {
         SaveCheckpoint(tree, cipc::SnapshotId{i}, ckptDir);
-        WaitForCheckpointSave(tree.Topo());
+        WaitForCheckpointSave(tree);
     }
 }
 

@@ -90,14 +90,14 @@ void SvcPing()
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
 }
 
-static void SvcRegisterLocalState(std::shared_ptr<StateTree> registry)
+static void SvcRegisterLocalState(StateTree const& registry)
 {
     SvcPing();
 
-    auto const topo        = registry->Topo();
-    auto const serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
-    auto const port        = cipc::Message::Port + serverIndex;
-    auto       send        = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
+    auto const& topo        = registry.Topo();
+    auto const  serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+    auto const  port        = cipc::Message::Port + serverIndex;
+    auto        send        = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
         static constexpr int      MaxAttempts = 5;
         boost::system::error_code ec;
         for (int attempt = 0; attempt < MaxAttempts; ++attempt)
@@ -142,14 +142,13 @@ static void SvcRegisterLocalState(std::shared_ptr<StateTree> registry)
     serdes::WriteBlobWithSize<uint16_t>(activationStream, "");
     StateSerDes::WriteTopology(activationStream, topo);
     auto response
-        = send(boost::beast::http::verb::post, fmt::format("/api/activatesession/{}", cipc::SessionId::Default), activationStream.str());
+        = send(boost::beast::http::verb::post, fmt::format("/api/activatesession/{}", registry.SessionId()), activationStream.str());
     requireSuccess(response, "session activation");
 
     std::stringstream registryStream;
-    StateSerDes::Write(registryStream, *registry, StateNode::Handle::Root);
+    StateSerDes::Write(registryStream, registry, StateNode::Handle::Root);
     auto registryBody = registryStream.str();
-    registry.reset();
-    response = send(boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", cipc::SessionId::Default), registryBody);
+    response          = send(boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", registry.SessionId()), registryBody);
     requireSuccess(response, "local registry upload");
 }
 
@@ -304,7 +303,7 @@ struct CheckpointWriter
     StateTree const& root;    // NOLINT
 
     // Resolve this rank's channel and mmap its shm queue (cheap; logs the open time).
-    static cipc::MsgQueue OpenMsgQueue(RankTopology const& topo)
+    static auto OpenMsgQueue(RankTopology const& topo)
     {
         auto       localRank  = static_cast<uint32_t>(topo.rank) % topo.ranksPerPeer;
         auto const queueCount = ResolveClientQueueCount(topo);
@@ -313,7 +312,7 @@ struct CheckpointWriter
         auto const index       = cipc::QueueIndex(localRank, topo.ranksPerPeer, queueCount);
         auto const peerIndex   = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
         auto const channelName = cipc::Message::RequestChannelName(static_cast<uint16_t>(peerIndex), index);
-        return cipc::MsgQueue::Open(channelName);
+        return cipc::MsgQueue::OpenUniquePtr(channelName);
     }
 
     static uint8_t D2HConcurrencyForQueue(RankTopology const& topo, cipc::MsgQueue const& queue)
@@ -338,6 +337,7 @@ struct CheckpointWriter
         std::mutex                                            mu;
         std::unordered_map<Rank, std::shared_ptr<QueueState>> states;
     };
+
     static QueueRegistry& Registry()
     {
         SUPPRESS_WARNINGS_START
@@ -352,13 +352,13 @@ struct CheckpointWriter
         auto const& topo = root.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
-        std::scoped_lock lock(reg.mu);
+        std::unique_lock lock(reg.mu);
         if (reg.states.contains(topo.rank)) { return; }
-        auto state         = std::make_shared<QueueState>();
-        auto readyP        = std::make_shared<std::promise<void>>();
-        auto registryClone = root.Clone();
-        state->ready       = readyP->get_future().share();
+        auto               state = std::make_shared<QueueState>();
+        std::promise<void> readyPromise;
+        state->ready = readyPromise.get_future().share();
         reg.states.emplace(topo.rank, state);
+        lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
         // Need to determine numa for current device since once cudaHostRegister has faulted+pinned the pages, a later mbind is a no-op
@@ -366,27 +366,23 @@ struct CheckpointWriter
         numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
 #endif
         state->numaNode = numa;
-        std::thread([registryCopy = std::move(registryClone), numa, state, readyP] {
-            SetThreadName("ncc:qinit");
-            try
-            {
-                auto const queueTopo = registryCopy->Topo();
-                SvcRegisterLocalState(registryCopy);
-                state->queue = std::make_unique<cipc::MsgQueue>(OpenMsgQueue(queueTopo));
+        try
+        {
+            auto const& queueTopo = root.Topo();
+            state->queue          = OpenMsgQueue(queueTopo);
 #ifdef PHOENIX_HAVE_CUDA
-                auto region = state->queue->GetShmDataRegion();
-                BindRegionToNumaNode(numa, region.data(), region.size());
-                DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            auto region = state->queue->GetShmDataRegion();
+            BindRegionToNumaNode(numa, region.data(), region.size());
+            DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
 #else
-                (void)numa;
+            (void)numa;
 #endif
-            } catch (...)
-            {
-                readyP->set_exception(std::current_exception());
-                return;
-            }
-            readyP->set_value();
-        }).detach();
+        } catch (...)
+        {
+            readyPromise.set_exception(std::current_exception());
+            return;
+        }
+        readyPromise.set_value();
     }
 
     static std::shared_ptr<QueueState> GetQueueState(StateTree const& root)
@@ -531,7 +527,7 @@ struct CheckpointWriter
         void FlushBytes_(size_t sendBytes)
         {
             auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{
-                .sessionId   = cipc::SessionId{0},
+                .sessionId   = that->root.SessionId(),
                 .snapshotId  = snapshotId,
                 .globalRank  = that->root.GlobalRank(),
                 .messageSize = static_cast<uint32_t>(sendBytes),
@@ -584,20 +580,20 @@ struct CheckpointWriter
         {
             that->root.WalkNodes([&](StateNode const& node) {
                 auto type = static_cast<StateNode::Type>(node.data.index());
-                if (type != StateNode::Type::TensorShard && type != StateNode::Type::ShardedTensor) { return; }
+                if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
                 try
                 {
-                    if (type == StateNode::Type::TensorShard)
+                    if (type == StateNode::Type::Tensor)
                     {
-                        auto const& tensor = std::get<StateNode::TensorShard>(node.data);
-                        ProcessTensor_(node.handle, tensor.device, tensor.ShardSizeBytes(), tensor.handle);
+                        auto const& tensor = std::get<Tensor>(node.data);
+                        ProcessTensor_(node.handle, tensor.device, tensor.StorageSizeBytes(), tensor.handle);
                     }
-                    else if (type == StateNode::Type::ShardedTensor)
+                    else if (type == StateNode::Type::DTensor)
                     {
-                        auto const& tensor = std::get<StateNode::ShardedTensor>(node.data);
+                        auto const& tensor = std::get<DTensor>(node.data);
                         for (auto const& shard : tensor.shards)
                         {
-                            ProcessTensor_(node.handle, shard.device, shard.ShardSizeBytes(tensor.dtype), shard.handle);
+                            ProcessTensor_(node.handle, shard.device, shard.StorageSizeBytes(), shard.handle);
                         }
                     }
                 } catch (std::exception& e)
@@ -697,7 +693,7 @@ struct CheckpointWriter
             });
             auto msg = sstrm.str();
             msgQueue.Push({cipc::Message::ActivateSnapshot{
-                              .sessionId    = cipc::SessionId{0},
+                              .sessionId    = root.SessionId(),
                               .snapshotId   = snapshotId,
                               .globalRank   = root.GlobalRank(),
                               .snapshotSize = totalTensorStateSizeInBytes,
@@ -733,7 +729,7 @@ struct CheckpointWriter
         }
 
         msgQueue.Push({cipc::Message::FinalizeSnapshot{
-                          .sessionId          = cipc::SessionId{0},
+                          .sessionId          = root.SessionId(),
                           .globalRank         = root.GlobalRank(),
                           .snapshotId         = snapshotId,
                           .snapshotDuration   = stop2 - start,
@@ -753,9 +749,9 @@ void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, s
     writer.SendToServer(snapshotId, ckptPath);
 }
 
-void WaitForCheckpointSave(RankTopology const& topo)
+void WaitForCheckpointSave(StateTree const& root)
 {
-    auto& msgQueue = CheckpointWriter::GetMsgQueue(topo);
+    auto& msgQueue = CheckpointWriter::GetMsgQueue(root.Topo());
     for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
@@ -763,6 +759,7 @@ void FinalizeStateRegistry(StateTree& root)
 {
     if (root.IsFinalized()) { return; }
     root.FinalizeRegistry();
+    SvcRegisterLocalState(root);
     CheckpointWriter::SendStateRegistry(root);
 }
 

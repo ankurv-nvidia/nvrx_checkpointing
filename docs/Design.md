@@ -109,7 +109,7 @@ root.load(<checkpoint-dir>)
 # TODO: Refine this
 
 # stalls the python thread until the async-save completes
-root.wait_for_deferred_save()
+root.wait_for_async_completion()
 
 # Injects a stream.wait_event into the default kernel launch stream for the optimizer kernel exec to be queued behind
 root.wait_for_save_event(defaultstream)

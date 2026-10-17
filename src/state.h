@@ -2,6 +2,7 @@
 #include "CommonMacros.h"
 
 #include "fmttensor.h"    // IWYU pragma: keep
+#include "messages.h"
 #include "primitives64bit.h"
 #include "tensor.h"
 
@@ -10,7 +11,9 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <memory>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -25,32 +28,29 @@ struct StateNode
         Invalid = std::numeric_limits<uint32_t>::max(),
     };
 
-    using Dict        = std::vector<Handle>;
-    using Blob        = std::vector<char>;
-    using Scalar      = Primitives64Bit;
-    using TensorShard = DS4Tensor;
-
-    using ShardedTensor = DS4TensorShardMap;
+    using Dict   = std::vector<Handle>;
+    using Blob   = std::vector<char>;
+    using Scalar = Primitives64Bit;
 
     enum class Type : uint8_t
     {
-        Invalid       = 0,
-        Dict          = 1,    // Data comprises of nested State
-        Scalar        = 2,    // 64bit data
-        Blob          = 3,    // data stored inline. if its a large blob, use tensor
-        TensorShard   = 4,    // data is decoupled from metadata and not stored inline
-        ShardedTensor = 5,
-        Unknown       = 6,
-        Count         = Unknown,
+        Invalid = 0,
+        Dict    = 1,    // Data comprises of nested State
+        Scalar  = 2,    // 64bit data
+        Blob    = 3,    // data stored inline. if its a large blob, use tensor
+        Tensor  = 4,    // data is decoupled from metadata and not stored inline
+        DTensor = 5,
+        Unknown = 6,
+        Count   = Unknown,
     };
 
-    using Variant = std::variant<std::monostate, Dict, Scalar, Blob, TensorShard, ShardedTensor>;
+    using Variant = std::variant<std::monostate, Dict, Scalar, Blob, Tensor, DTensor>;
     static_assert(std::is_same_v<std::monostate, std::variant_alternative_t<static_cast<size_t>(Type::Invalid), Variant>>);
     static_assert(std::is_same_v<Dict, std::variant_alternative_t<static_cast<size_t>(Type::Dict), Variant>>);
     static_assert(std::is_same_v<Scalar, std::variant_alternative_t<static_cast<size_t>(Type::Scalar), Variant>>);
     static_assert(std::is_same_v<Blob, std::variant_alternative_t<static_cast<size_t>(Type::Blob), Variant>>);
-    static_assert(std::is_same_v<TensorShard, std::variant_alternative_t<static_cast<size_t>(Type::TensorShard), Variant>>);
-    static_assert(std::is_same_v<ShardedTensor, std::variant_alternative_t<static_cast<size_t>(Type::ShardedTensor), Variant>>);
+    static_assert(std::is_same_v<Tensor, std::variant_alternative_t<static_cast<size_t>(Type::Tensor), Variant>>);
+    static_assert(std::is_same_v<DTensor, std::variant_alternative_t<static_cast<size_t>(Type::DTensor), Variant>>);
 
     StateNode()  = default;
     ~StateNode() = default;
@@ -80,7 +80,7 @@ struct StateTree
 {
     using NodeId = std::string;
 
-    explicit StateTree(RankTopology topo) : _topo(std::move(topo))
+    explicit StateTree(checkpoint::ipc::SessionId sessionId, RankTopology topo) : _sessionId(sessionId), _topo(std::move(topo))
     {
 #ifndef NDEBUG
         _topo.AssertValid();
@@ -173,6 +173,16 @@ struct StateTree
         return std::make_pair(fqn.substr(separator + 1), parentHandle);
     }
 
+    auto FindChildNodeIfExists(StateNode::Handle parent, std::string_view const& name)
+    {
+        auto& parentData = GetNode(parent).data;
+        if (parentData.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
+        auto const& children = std::get<StateNode::Dict>(parentData);
+        auto const child = std::ranges::find_if(children, [&](StateNode::Handle childHandle) { return GetNode(childHandle).name == name; });
+        if (child == children.end()) { return std::make_pair(false, StateNode::Handle::Invalid); }
+        return std::make_pair(true, *child);
+    }
+
     StateNode& FindChildNode(StateNode::Handle parent, std::string_view const& name) LFTBND
     {
         auto& parentData = GetNode(parent).data;
@@ -237,6 +247,8 @@ struct StateTree
 
     StateNode& GetNode(StateNode::Handle handle) LFTBND { return _nodes[static_cast<size_t>(handle)]; }
 
+    [[nodiscard]] auto SessionId() const { return _sessionId; }
+
     [[nodiscard]] StateNode const& GetNode(StateNode::Handle handle) const LFTBND { return _nodes[static_cast<size_t>(handle)]; }
     [[nodiscard]] auto             GlobalRank() const { return _topo.rank; }
     [[nodiscard]] auto             GlobalWorldSize() const { return _topo.worldSize; }
@@ -254,15 +266,15 @@ struct StateTree
         uint64_t totalSize = 0;
         for (auto const& node : _nodes)
         {
-            if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+            if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
             {
-                auto const& tensor = std::get<StateNode::TensorShard>(node.data);
-                totalSize += tensor.ShardSizeBytes();
+                auto const& tensor = std::get<Tensor>(node.data);
+                totalSize += tensor.StorageSizeBytes();
             }
-            if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+            if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
             {
-                auto const& tensor = std::get<StateNode::ShardedTensor>(node.data);
-                for (auto const& shard : tensor.shards) { totalSize += shard.ShardSizeBytes(tensor.dtype); }
+                auto const& tensor = std::get<DTensor>(node.data);
+                for (auto const& shard : tensor.shards) { totalSize += shard.StorageSizeBytes(); }
             }
         }
         return totalSize;
@@ -283,8 +295,16 @@ struct StateTree
 
     [[nodiscard]] size_t GetTotalNumTensors() const
     {
-        return static_cast<size_t>(std::ranges::count_if(
-            _nodes, [](StateNode const& node) { return node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard); }));
+        size_t count = 0;
+        for (auto const& node : _nodes)
+        {
+            if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor)) { ++count; }
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
+            {
+                count += std::get<DTensor>(node.data).shards.size();
+            }
+        }
+        return count;
     }
 
     [[nodiscard]] std::string FindTensorStateByHandle(uint64_t handle) const;
@@ -292,7 +312,7 @@ struct StateTree
     void PrintShardedTensor(StateNode::Handle nodeHandle) const
     {
         auto        fqn  = GetNodeId(nodeHandle);
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(GetNode(nodeHandle).data);
+        auto const& tnsr = std::get<DTensor>(GetNode(nodeHandle).data);
         fmt::print(stderr,
                    "[native_ckpt:cli][{}][WARN] sharded tensor {}[{}] holes={}\n\t{}\n",
                    GlobalRank(),
@@ -304,7 +324,8 @@ struct StateTree
 
     void AssertShardedTensorHasNoHoles(StateNode::Handle nodeHandle) const
     {
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(GetNode(nodeHandle).data);
+        auto const& node = GetNode(nodeHandle);
+        auto const& tnsr = std::get<DTensor>(node.data);
         if (tnsr.shards.empty())
         {
             throw std::runtime_error(fmt::format("[native_ckpt:cli][{}] sharded tensor {}[{}] has no shards in metadata output\n",
@@ -322,8 +343,32 @@ struct StateTree
         }
     }
 
-    void ConvertTensorShardsToShardedTensors()
+    void ConvertTensorsToDTensor()
     {
+        std::unordered_set<NodeId> tensorNodeIds;
+        for (auto const& node : _nodes)
+        {
+            auto const type = static_cast<StateNode::Type>(node.data.index());
+            if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { continue; }
+
+            auto const nodeId = GetNodeId(node.handle);
+            if (!tensorNodeIds.insert(nodeId).second)
+            {
+                throw std::runtime_error(
+                    fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
+            }
+            if (type != StateNode::Type::DTensor) { continue; }
+
+            for (auto const& shard : std::get<DTensor>(node.data).shards)
+            {
+                if (shard.rank != _topo.rank)
+                {
+                    throw std::runtime_error(
+                        fmt::format("Local tensor '{}' has shard rank={} but registry rank={}", nodeId, shard.rank, _topo.rank));
+                }
+            }
+        }
+
         for (auto& node : _nodes)
         {
 #ifdef NATIVE_CKPT_TRACE_NODE
@@ -334,40 +379,19 @@ struct StateTree
                     stderr, "ConvertTensorShardsToShardedTensors: Found trace node NATIVE_CKPT_TRACE_NODE: {}\n", NATIVE_CKPT_TRACE_NODE);
             }
 #endif
-            if (node.data.index() != static_cast<size_t>(StateNode::Type::TensorShard)) { continue; }
-            bool       deduped = false;
-            auto const tnsr    = std::get<StateNode::TensorShard>(node.data);
-            tnsr.AssertShardIsValid();
-
-            for (auto& node1 : _nodes)
-            {
-                if (node1.parent == node.parent && node1.handle != node.handle && node1.name == node.name
-                    && node1.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
-                {
-                    auto& shardedTensor = std::get<StateNode::ShardedTensor>(node1.data);
-                    shardedTensor.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                        .sharddim = tnsr.sharddim,
-                        .device   = tnsr.device,
-                        .handle   = tnsr.handle,
-                        .rank     = _topo.rank,
-                    });
-                    deduped = true;
-                    break;
-                }
-            }
-            if (deduped)
-            {
-                RemoveNode(node.handle);
-                continue;
-            }
+            if (node.data.index() != static_cast<size_t>(StateNode::Type::Tensor)) { continue; }
+            auto const       tnsr = std::get<Tensor>(node.data);
+            Tensor::DimRange sharddim;
+            for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
             // Do not do a ref. We will be overwriting the mem location shortly
-            node.data           = StateNode::ShardedTensor(tnsr.dtype, tnsr.fulldim);
-            auto& shardedTensor = std::get<StateNode::ShardedTensor>(node.data);
-            shardedTensor.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                .sharddim = tnsr.sharddim,
-                .device   = tnsr.device,
-                .handle   = tnsr.handle,
-                .rank     = _topo.rank,
+            node.data           = DTensor(tnsr.dtype, tnsr.fulldim);
+            auto& shardedTensor = std::get<DTensor>(node.data);
+            shardedTensor.AddShard(DTensor::Shard{
+                .rank        = _topo.rank,
+                .handle      = tnsr.handle,
+                .storageSize = tnsr.storageSize,
+                .sharddim    = sharddim,
+                .device      = tnsr.device,
             });
         }
     }
@@ -431,7 +455,7 @@ struct StateTree
 
     [[nodiscard]] auto Clone() const
     {
-        auto clonedTree = std::make_shared<StateTree>(_topo);
+        auto clonedTree = std::make_shared<StateTree>(_sessionId, _topo);
         CloneInto(*clonedTree);
         return clonedTree;
     }
@@ -552,23 +576,9 @@ struct StateTree
                 if (childJ.data.index() == static_cast<size_t>(StateNode::Type::Invalid)) { continue; }
                 if (cmp == 0)
                 {
-                    auto const tensorShardType = static_cast<size_t>(StateNode::Type::TensorShard);
-                    if (childI.data.index() != tensorShardType || childJ.data.index() != tensorShardType)
-                    {
-                        fmt::print(stderr,
-                                   "Duplicate state name {} found in root registry. Parent Node: {} \n",
-                                   childI.name,
-                                   GetNodeId(node.handle));
-                        throw std::runtime_error(fmt::format("Duplicate state name {} found in root registry", childI.name));
-                    }
-                    auto const& shardI = std::get<StateNode::TensorShard>(childI.data);
-                    auto const& shardJ = std::get<StateNode::TensorShard>(childJ.data);
-                    if (shardI.dtype != shardJ.dtype || shardI.fulldim != shardJ.fulldim || shardI.sharddim == shardJ.sharddim)
-                    {
-                        throw std::runtime_error(fmt::format("Duplicate tensor shard {} found in root registry", childI.name));
-                    }
-                    // Megatron emits stacked layers and experts as distinct local shards under one FQN.
-                    cmp = shardJ.sharddim < shardI.sharddim ? 1 : -1;
+                    fmt::print(
+                        stderr, "Duplicate state name {} found in root registry. Parent Node: {} \n", childI.name, GetNodeId(node.handle));
+                    throw std::runtime_error(fmt::format("Duplicate state name {} found in root registry", childI.name));
                 }
                 if (cmp > 0)
                 {
@@ -600,7 +610,8 @@ struct StateTree
 
     bool _finalized{false};
 
-    RankTopology const _topo{};
+    checkpoint::ipc::SessionId _sessionId{};
+    RankTopology const         _topo{};
 
     friend struct StateSerDes;
 
@@ -635,10 +646,9 @@ template <> struct fmt::formatter<StateNode::Variant> : fmt::formatter<std::stri
             return fmt::format_to(ctx.out(), "node:scalar {}", scalar.Cast<bool>());
         }
         case static_cast<size_t>(StateNode::Type::Blob): return fmt::format_to(ctx.out(), "node:blob");
-        case static_cast<size_t>(StateNode::Type::TensorShard):
-            return fmt::format_to(ctx.out(), "node:tensorshard {}", std::get<StateNode::TensorShard>(var));
-        case static_cast<size_t>(StateNode::Type::ShardedTensor):
-            return fmt::format_to(ctx.out(), "node:shardedtensor {}", std::get<StateNode::ShardedTensor>(var));
+        case static_cast<size_t>(StateNode::Type::Tensor): return fmt::format_to(ctx.out(), "node:tensorshard {}", std::get<Tensor>(var));
+        case static_cast<size_t>(StateNode::Type::DTensor):
+            return fmt::format_to(ctx.out(), "node:shardedtensor {}", std::get<DTensor>(var));
         default: break;
         }
         throw std::runtime_error(fmt::format("Unknown state node type: {}", var.index()));

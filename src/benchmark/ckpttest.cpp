@@ -44,6 +44,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -63,10 +64,7 @@
 
 // NOLINTBEGIN(readability-magic-numbers)
 
-// Populated from --registry on the command line in main(). Tests that need
-// it (the [round-trip] case) assert non-empty before use; ctest wires the
-// path via catch_discover_tests(... EXTRA_ARGS --registry <path>) so the
-// binary itself stays portable.
+// Set when the optional --registry argument is supplied.
 
 SUPPRESS_WARNINGS_START
 SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
@@ -241,12 +239,12 @@ namespace
 {
 struct TestShardEntry
 {
-    char const*         srcPtr;
-    uint64_t            length;
-    StateTree::NodeId   fqn;
-    DS4Tensor::DType    dtype;
-    DS4Tensor::DimRange sharddim;
-    DS4Tensor::Dim      shape;
+    char const*       srcPtr;
+    uint64_t          length;
+    StateTree::NodeId fqn;
+    Tensor::DType     dtype;
+    Tensor::DimRange  sharddim;
+    Tensor::Dim       shape;
 };
 }    // namespace
 static std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, Rank rank, ByteStorage const& tensorStorage)
@@ -256,34 +254,36 @@ static std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, R
     tree.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         auto const fqn  = tree.GetNodeId(node.handle);
-        if (type == StateNode::Type::TensorShard)
+        if (type == StateNode::Type::Tensor)
         {
-            // Per-rank TensorShards belong to the tree's rank — no per-shard
-            // rank field to filter on. Tests build single-rank or per-rank
-            // trees, so emit unconditionally.
-            auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
-            auto const  size = tnsr.ShardSizeBytes();
+            auto const& tnsr = std::get<Tensor>(node.data);
+            auto const  size = tnsr.StorageSizeBytes();
             if (size == 0) { return; }
-            DS4Tensor::Dim shape{};
-            for (auto const& r : tnsr.sharddim) { shape.push_back(r.end - r.begin); }
+            Tensor::Dim      shape{};
+            Tensor::DimRange sharddim;
+            for (auto const dim : tnsr.fulldim)
+            {
+                shape.push_back(dim);
+                sharddim.push_back({.begin = 0, .end = dim});
+            }
             out.push_back(TestShardEntry{
                 .srcPtr   = base + tnsr.handle,
                 .length   = size,
                 .fqn      = fqn,
                 .dtype    = tnsr.dtype,
-                .sharddim = tnsr.sharddim,
+                .sharddim = sharddim,
                 .shape    = shape,
             });
         }
-        else if (type == StateNode::Type::ShardedTensor)
+        else if (type == StateNode::Type::DTensor)
         {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto const& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
                 if (shard.rank != rank) { continue; }
-                auto const size = shard.ShardSizeBytes(tnsr.dtype);
+                auto const size = shard.StorageSizeBytes();
                 if (size == 0) { continue; }
-                DS4Tensor::Dim shape{};
+                Tensor::Dim shape{};
                 for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
                 out.push_back(TestShardEntry{
                     .srcPtr   = base + shard.handle,
@@ -299,33 +299,33 @@ static std::vector<TestShardEntry> CollectShardsForTest(StateTree const& tree, R
     return out;
 }
 
-// Attaches a fully-occupied (sharddim == fulldim) TensorShard leaf at the
-// given FQN. `handle` is the byte offset into the surrounding ByteStorage.
+// Attaches a tensor leaf whose handle is an offset into the surrounding storage.
 static void
-AddTensorShardLeaf(StateTree& tree, std::string_view fqn, DS4Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
+AddTensorShardLeaf(StateTree& tree, std::string_view fqn, Tensor::DType dtype, std::vector<size_t> const& shape, uint64_t handle)
 {
     auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-    auto&     leaf          = tree.AddChild(parent, leafName);
-    DS4Tensor tnsr;
-    tnsr.dtype  = dtype;
-    tnsr.handle = handle;
-    tnsr.device = DeviceId{"cpu"};
+    auto&  leaf             = tree.AddChild(parent, leafName);
+    Tensor tnsr;
+    tnsr.dtype       = dtype;
+    tnsr.handle      = handle;
+    tnsr.device      = DeviceId{"cpu"};
+    tnsr.storageSize = Tensor::GetDTypeSize(dtype);
     for (auto d : shape)
     {
         tnsr.fulldim.push_back(d);
-        tnsr.sharddim.push_back({.begin = 0, .end = d});
+        tnsr.storageSize *= d;
     }
-    leaf.data = StateNode::TensorShard{tnsr};
+    leaf.data = tnsr;
 }
 
 static void AddShardedTensorLeaf(StateTree&                 tree,
                                  std::string_view           fqn,
-                                 DS4Tensor::DType           dtype,
+                                 Tensor::DType              dtype,
                                  std::vector<size_t> const& shape,
                                  Rank                       rank,
                                  uint64_t                   handle)
 {
-    DS4Tensor::Dim fulldim;
+    Tensor::Dim fulldim;
     for (auto d : shape) { fulldim.push_back(d); }
 
     auto nodeHandle = tree.FindNodeByFQN(fqn);
@@ -333,59 +333,197 @@ static void AddShardedTensorLeaf(StateTree&                 tree,
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
         auto& leaf              = tree.AddChild(parent, leafName);
-        leaf.data               = StateNode::ShardedTensor(dtype, fulldim);
+        leaf.data               = DTensor(dtype, fulldim);
         nodeHandle              = leaf.handle;
     }
-    auto& st = std::get<StateNode::ShardedTensor>(tree.GetNode(nodeHandle).data);
+    auto& st = std::get<DTensor>(tree.GetNode(nodeHandle).data);
     if (st.dtype != dtype || st.fulldim != fulldim) { throw std::runtime_error("Incompatible test tensor replica"); }
 
-    DS4Tensor::DimRange sharddim;
+    Tensor::DimRange sharddim;
     for (auto d : shape) { sharddim.push_back({.begin = 0, .end = d}); }
-    st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = handle, .rank = rank});
+    uint64_t storageSize = Tensor::GetDTypeSize(dtype);
+    for (auto d : shape) { storageSize *= d; }
+    st.AddShard({.rank = rank, .handle = handle, .storageSize = storageSize, .sharddim = sharddim, .device = DeviceId{"cpu"}});
 }
 
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
 
-TEST_CASE("state registry permits distinct local shards under one tensor key", "[state][tier1]")
+TEST_CASE("state serialization preserves logical and physical tensor metadata", "[state][tier1]")
 {
-    StateTree tree(SingleRankTopo());
+    StateTree tree(checkpoint::ipc::SessionId{17}, SingleRankTopo());
 
-    auto addShard = [&](size_t layer, size_t expert) {
-        auto [leafName, parent] = tree.FindOrAddNodeByFQN("weight");
-        auto&     leaf          = tree.AddChild(parent, leafName);
-        DS4Tensor tensor;
-        tensor.dtype  = DS4Tensor::DType::Float32;
-        tensor.device = DeviceId{"cpu"};
-        for (auto dim : {size_t{2}, size_t{2}, size_t{4}}) { tensor.fulldim.push_back(dim); }
-        tensor.sharddim.push_back({.begin = layer, .end = layer + 1});
-        tensor.sharddim.push_back({.begin = expert, .end = expert + 1});
-        tensor.sharddim.push_back({.begin = 0, .end = 4});
-        leaf.data = tensor;
+    Tensor tensor;
+    tensor.dtype       = Tensor::DType::Float32;
+    tensor.handle      = 23;
+    tensor.storageSize = 13;
+    tensor.fulldim.push_back(8);
+    tensor.device                                         = DeviceId{"cpu"};
+    tree.AddChild(StateNode::Handle::Root, "tensor").data = tensor;
+
+    Tensor::Dim fulldim;
+    fulldim.push_back(16);
+    DTensor          dtensor(Tensor::DType::BFloat16, fulldim);
+    Tensor::DimRange sharddim;
+    sharddim.push_back({.begin = 4, .end = 8});
+    dtensor.AddShard({
+        .rank        = Rank{0},
+        .handle      = 41,
+        .storageSize = 7,
+        .sharddim    = sharddim,
+        .device      = DeviceId{"cpu"},
+    });
+    tree.AddChild(StateNode::Handle::Root, "dtensor").data = dtensor;
+
+    CHECK(tree.GetTotalTensorStateSizeInBytes() == 20);
+    CHECK(tree.GetTotalNumTensors() == 2);
+
+    std::stringstream stream;
+    StateSerDes::Write(stream, tree, StateNode::Handle::Root);
+    auto restored = StateSerDes::Read(stream);
+
+    CHECK(restored->SessionId() == checkpoint::ipc::SessionId{17});
+    CHECK(std::get<Tensor>(restored->GetNode(restored->FindNodeByFQN("tensor")).data) == tensor);
+    CHECK(std::get<DTensor>(restored->GetNode(restored->FindNodeByFQN("dtensor")).data) == dtensor);
+    CHECK(restored->GetTotalTensorStateSizeInBytes() == 20);
+    CHECK(restored->GetTotalNumTensors() == 2);
+}
+
+TEST_CASE("registry fixture resizes native tensor storage", "[state][fixture][tier1]")
+{
+    auto const registryPath = CkptDir("resize_registry") / "registry.bin";
+    std::filesystem::remove_all(registryPath.parent_path());
+    std::filesystem::create_directories(registryPath.parent_path());
+
+    StateTree source(checkpoint::ipc::SessionId::Default, SingleRankTopo());
+    AddShardedTensorLeaf(source, "weight", Tensor::DType::BFloat16, {8}, Rank{0}, 0);
+    {
+        std::ofstream stream(registryPath, std::ios::binary);
+        REQUIRE(stream);
+        StateSerDes::Write(stream, source, StateNode::Handle::Root);
+    }
+
+    CheckpointTestContext ctx;
+    ctx.outofproc    = true;
+    ctx.ranksPerNode = 1;
+    ctx.memLimit     = 40;
+    LoadStateRegistryFromPath(ctx, registryPath);
+
+    auto const& tensor = std::get<DTensor>(ctx.globalRegistry->GetNode(ctx.globalRegistry->FindNodeByFQN("weight")).data);
+    REQUIRE(tensor.fulldim.size() == 1);
+    CHECK(tensor.fulldim[0] == 4);
+    REQUIRE(tensor.shards.size() == 1);
+    auto const& shard = *tensor.shards.begin();
+    CHECK(shard.sharddim[0] == Tensor::Range{.begin = 0, .end = 4});
+    CHECK(shard.storageSize == 8);
+
+    REQUIRE(ctx.localRegistries.size() == 1);
+    auto const& local       = **ctx.localRegistries.begin();
+    auto const& localTensor = std::get<Tensor>(local.GetNode(local.FindNodeByFQN("weight")).data);
+    CHECK(localTensor.handle != 0);
+    CHECK(localTensor.storageSize == 8);
+    CHECK(localTensor.device == DeviceId{"cpu"});
+}
+
+TEST_CASE("tensor metadata initializes its complete representation", "[state][tier1]")
+{
+    auto representation = []<typename T>(uint8_t poison, auto const& initialize) {
+        alignas(T) std::array<uint8_t, sizeof(T)> storage{};
+        storage.fill(poison);
+        auto* value = ::new (static_cast<void*>(storage.data())) T;    // NOLINT(cppcoreguidelines-owning-memory)
+        initialize(*value);
+        std::array<uint8_t, sizeof(T)> result{};
+        std::memcpy(result.data(), value, sizeof(T));
+        std::destroy_at(value);
+        return result;
     };
 
-    addShard(1, 1);
-    addShard(0, 1);
-    addShard(1, 0);
-    addShard(0, 0);
-    CHECK_FALSE(tree.IsFinalized());
-    REQUIRE_NOTHROW(tree.FinalizeRegistry());
-    CHECK(tree.IsFinalized());
-    REQUIRE_NOTHROW(tree.FinalizeRegistry());
+    auto initializeDim = [](Tensor::Dim& dim) { dim.push_back(8); };
+    CHECK(representation.template operator()<Tensor::Dim>(0x5a, initializeDim)
+          == representation.template operator()<Tensor::Dim>(0xa5, initializeDim));
 
-    std::vector<DS4Tensor::DimRange> ranges;
-    tree.WalkNodes([&](StateNode const& node) {
-        if (tree.GetNodeId(node.handle) == "weight") { ranges.push_back(std::get<StateNode::TensorShard>(node.data).sharddim); }
-    });
-    REQUIRE(ranges.size() == 4);
-    REQUIRE(ranges[0][0].begin == 0);
-    REQUIRE(ranges[0][1].begin == 0);
-    REQUIRE(ranges[1][0].begin == 0);
-    REQUIRE(ranges[1][1].begin == 1);
-    REQUIRE(ranges[2][0].begin == 1);
-    REQUIRE(ranges[2][1].begin == 0);
-    REQUIRE(ranges[3][0].begin == 1);
-    REQUIRE(ranges[3][1].begin == 1);
+    auto initializeDimRange = [](Tensor::DimRange& dim) { dim.push_back({.begin = 4, .end = 8}); };
+    CHECK(representation.template operator()<Tensor::DimRange>(0x5a, initializeDimRange)
+          == representation.template operator()<Tensor::DimRange>(0xa5, initializeDimRange));
+
+    auto initializeTensor = [](Tensor& tensor) {
+        tensor.dtype       = Tensor::DType::Float32;
+        tensor.handle      = 23;
+        tensor.storageSize = 13;
+        tensor.fulldim.push_back(8);
+        tensor.device = DeviceId{"cpu"};
+    };
+    CHECK(representation.template operator()<Tensor>(0x5a, initializeTensor)
+          == representation.template operator()<Tensor>(0xa5, initializeTensor));
+
+    auto initializeShard = [](TensorShard& shard) {
+        shard.rank        = Rank{0};
+        shard.handle      = 41;
+        shard.storageSize = 7;
+        shard.sharddim.push_back({.begin = 4, .end = 8});
+        shard.device = DeviceId{"cpu"};
+    };
+    CHECK(representation.template operator()<TensorShard>(0x5a, initializeShard)
+          == representation.template operator()<TensorShard>(0xa5, initializeShard));
+
+    std::array<uint8_t, sizeof(Tensor::Dim)> invalidRepresentation{};
+    invalidRepresentation[sizeof(uint64_t) * Tensor::MaxDims] = static_cast<uint8_t>(Tensor::MaxDims + 1);
+    Tensor::Dim invalidDim;
+    std::memcpy(&invalidDim, invalidRepresentation.data(), sizeof(invalidDim));
+    CHECK_THROWS_AS(invalidDim.size(), std::length_error);
+
+    Tensor::Dim protectedDim;
+    protectedDim.push_back(8);
+    CHECK_THROWS_AS(protectedDim[1], std::out_of_range);
+}
+
+TEST_CASE("bare tensor conversion preserves a full physical shard", "[state][tier1]")
+{
+    StateTree tree(checkpoint::ipc::SessionId{18}, SingleRankTopo());
+    Tensor    tensor;
+    tensor.dtype       = Tensor::DType::BFloat16;
+    tensor.handle      = 29;
+    tensor.storageSize = 11;
+    tensor.fulldim.push_back(3);
+    tensor.fulldim.push_back(7);
+    tensor.device                                         = DeviceId{"cuda:2"};
+    tree.AddChild(StateNode::Handle::Root, "weight").data = tensor;
+
+    tree.ConvertTensorsToDTensor();
+
+    auto const& dtensor = std::get<DTensor>(tree.GetNode(tree.FindNodeByFQN("weight")).data);
+    REQUIRE(dtensor.shards.size() == 1);
+    auto const& shard = *dtensor.shards.begin();
+    CHECK(dtensor.dtype == tensor.dtype);
+    CHECK(dtensor.fulldim == tensor.fulldim);
+    CHECK(shard.rank == Rank{0});
+    CHECK(shard.handle == tensor.handle);
+    CHECK(shard.storageSize == tensor.storageSize);
+    CHECK(shard.device == tensor.device);
+    REQUIRE(shard.sharddim.size() == 2);
+    CHECK(shard.sharddim[0] == (Tensor::Range{.begin = 0, .end = 3}));
+    CHECK(shard.sharddim[1] == (Tensor::Range{.begin = 0, .end = 7}));
+    CHECK(tree.GetTotalTensorStateSizeInBytes() == tensor.storageSize);
+    CHECK(tree.GetTotalNumTensors() == 1);
+}
+
+TEST_CASE("registries reject duplicate tensor names before conversion", "[state][tier1]")
+{
+    StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
+    AddTensorShardLeaf(tree, "weight", Tensor::DType::Float32, {2}, 0);
+    AddTensorShardLeaf(tree, "weight", Tensor::DType::Float32, {2}, 8);
+
+    CHECK_THROWS_AS(tree.FinalizeRegistry(), std::runtime_error);
+    CHECK_THROWS_AS(tree.ConvertTensorsToDTensor(), std::runtime_error);
+    CHECK(tree.GetTotalNumTensors() == 2);
+}
+
+TEST_CASE("bare tensor conversion rejects nonlocal DTensor shards", "[state][tier1]")
+{
+    StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
+    AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2}, Rank{1}, 0);
+
+    CHECK_THROWS_AS(tree.ConvertTensorsToDTensor(), std::runtime_error);
 }
 
 TEST_CASE("snapshot shared memory keeps bounded growth room", "[shmem][tier1]")
@@ -455,7 +593,7 @@ TEST_CASE("registry replies wait for every local registry and fit queues to the 
     std::filesystem::create_directories(logDir);
 
     auto uploadRegistry = [&](uint32_t rank) {
-        StateTree tree(SingleRankTopo(rank, RanksPerPeer));
+        StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(rank, RanksPerPeer));
         auto&     node = tree.AddChild(StateNode::Handle::Root, "payload");
         if (rank == 1)
         {
@@ -465,12 +603,12 @@ TEST_CASE("registry replies wait for every local registry and fit queues to the 
         }
         else
         {
-            DS4Tensor tensor;
-            tensor.dtype  = DS4Tensor::DType::UInt8;
+            Tensor tensor;
+            tensor.dtype  = Tensor::DType::UInt8;
             tensor.device = DeviceId{"cpu"};
             tensor.fulldim.push_back(snapshotSizes[rank]);
-            tensor.sharddim.push_back({.begin = 0, .end = snapshotSizes[rank]});
-            node.data = tensor;
+            tensor.storageSize = snapshotSizes[rank];
+            node.data          = tensor;
         }
         tree.FinalizeRegistry();
         std::stringstream body;
@@ -500,13 +638,20 @@ TEST_CASE("registry replies wait for every local registry and fit queues to the 
 }
 
 // Each rank owns one slice of a tensor shared by the whole world.
-static DS4Tensor SliceOfSharedTensor(uint32_t rank, uint32_t worldSize)
+static DTensor SliceOfSharedTensor(uint32_t rank, uint32_t worldSize)
 {
-    DS4Tensor tensor;
-    tensor.dtype  = DS4Tensor::DType::Float32;
-    tensor.device = DeviceId{"cpu"};
-    tensor.fulldim.push_back(size_t{4} * worldSize);
-    tensor.sharddim.push_back({.begin = size_t{4} * rank, .end = size_t{4} * (rank + 1)});
+    Tensor::Dim fulldim;
+    fulldim.push_back(size_t{4} * worldSize);
+    DTensor          tensor(Tensor::DType::Float32, fulldim);
+    Tensor::DimRange sharddim;
+    sharddim.push_back({.begin = size_t{4} * rank, .end = size_t{4} * (rank + 1)});
+    tensor.AddShard({
+        .rank        = Rank{rank},
+        .handle      = 0,
+        .storageSize = 4 * Tensor::GetDTypeSize(Tensor::DType::Float32),
+        .sharddim    = sharddim,
+        .device      = DeviceId{"cpu"},
+    });
     return tensor;
 }
 
@@ -514,7 +659,7 @@ static std::string SerializedSliceRegistry(RankTopology topo)
 {
     auto const rank      = static_cast<uint32_t>(topo.rank);
     auto const worldSize = static_cast<uint32_t>(topo.worldSize);
-    StateTree  tree(std::move(topo));
+    StateTree  tree(checkpoint::ipc::SessionId::Default, std::move(topo));
     auto [leafName, parent]              = tree.FindOrAddNodeByFQN("weight");
     tree.AddChild(parent, leafName).data = SliceOfSharedTensor(rank, worldSize);
     tree.FinalizeRegistry();
@@ -526,10 +671,12 @@ static std::string SerializedSliceRegistry(RankTopology topo)
 // One tensor-shard record of the stream a peer forwards to the coordinator.
 static std::string SerializedSliceFragment(uint32_t rank, uint32_t worldSize)
 {
+    auto const        tensor = SliceOfSharedTensor(rank, worldSize);
     std::stringstream body;
     serdes::WriteTrivial(body, uint8_t{0});
-    serdes::WriteTrivial(body, Rank{rank});
-    serdes::WriteTrivial(body, SliceOfSharedTensor(rank, worldSize));
+    serdes::WriteTrivial(body, tensor.dtype);
+    serdes::WriteTrivial(body, tensor.fulldim);
+    serdes::WriteTrivial(body, *tensor.shards.begin());
     serdes::WriteBlobWithSize<uint32_t>(body, "weight");
     return body.str();
 }
@@ -566,10 +713,7 @@ static std::set<uint32_t> GlobalDumpSliceOwners(std::filesystem::path const& log
     auto const weight = global->FindNodeByFQN("weight");
     REQUIRE(weight != StateNode::Handle::Invalid);
     std::set<uint32_t> owners;
-    for (auto const& shard : std::get<StateNode::ShardedTensor>(global->GetNode(weight).data).shards)
-    {
-        owners.insert(static_cast<uint32_t>(shard.rank));
-    }
+    for (auto const& shard : std::get<DTensor>(global->GetNode(weight).data).shards) { owners.insert(static_cast<uint32_t>(shard.rank)); }
     return owners;
 }
 
@@ -609,6 +753,64 @@ TEST_CASE("a peer's registry fragment completes the coordinator's merged dump", 
                            SerializedSliceFragment(1, 2))
           == boost::beast::http::status::ok);
     CHECK(GlobalDumpSliceOwners(logDir) == std::set<uint32_t>{0, 1});
+    CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("peer registry fragments reject invalid tensor dimensions", "[server][tier2]")
+{
+    auto const logDir = CkptDir("invalid_peer_registry_fragment");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    auto       fragment     = SerializedSliceFragment(1, 2);
+    auto const sizeOffset   = sizeof(uint8_t) + sizeof(Tensor::DType) + (sizeof(uint64_t) * Tensor::MaxDims);
+    fragment.at(sizeOffset) = static_cast<char>(Tensor::MaxDims + 1);
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log");
+    CHECK_THROWS(
+        PostToTestServer(fmt::format("/api/peer/shardedstateregistry/{}/1", checkpoint::ipc::SessionId::Default), std::move(fragment)));
+    CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("peer registry fragments reject mismatched shard ranks", "[server][tier2]")
+{
+    auto const logDir = CkptDir("mismatched_peer_registry_rank");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log");
+    CHECK_THROWS(PostToTestServer(fmt::format("/api/peer/shardedstateregistry/{}/1", checkpoint::ipc::SessionId::Default),
+                                  SerializedSliceFragment(0, 2)));
+    CHECK(server.Stop());
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("local registries reject nonlocal DTensor shards", "[server][tier2]")
+{
+    auto const logDir = CkptDir("nonlocal_local_registry_shard");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    auto const topology = SingleRankTopo();
+    StateTree  tree(checkpoint::ipc::SessionId::Default, topology);
+    AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2}, Rank{1}, 0);
+    tree.FinalizeRegistry();
+    std::stringstream registry;
+    StateSerDes::Write(registry, tree, StateNode::Handle::Root);
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log");
+    std::stringstream activation;
+    serdes::WriteBlobWithSize<uint16_t>(activation, "");
+    StateSerDes::WriteTopology(activation, topology);
+    CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
+          == boost::beast::http::status::accepted);
+    CHECK(PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), registry.str())
+          == boost::beast::http::status::insufficient_storage);
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);
 }
@@ -713,12 +915,12 @@ TEST_CASE("snapshot completion is global on the coordinator and local on peers",
 
 TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(64);
 
-    AddTensorShardLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, 0);    // 16 B
-    AddTensorShardLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, 16);         //  4 B
-    AddTensorShardLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, 32);      // 16 B
+    AddTensorShardLeaf(tree, "a", Tensor::DType::Float32, {2, 2}, 0);    // 16 B
+    AddTensorShardLeaf(tree, "b", Tensor::DType::Int8, {4}, 16);         //  4 B
+    AddTensorShardLeaf(tree, "c", Tensor::DType::Float64, {2}, 32);      // 16 B
 
     auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
@@ -727,9 +929,9 @@ TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[di
     REQUIRE(entries[1].fqn == "b");
     REQUIRE(entries[2].fqn == "c");
 
-    REQUIRE(entries[0].dtype == DS4Tensor::DType::Float32);
-    REQUIRE(entries[1].dtype == DS4Tensor::DType::Int8);
-    REQUIRE(entries[2].dtype == DS4Tensor::DType::Float64);
+    REQUIRE(entries[0].dtype == Tensor::DType::Float32);
+    REQUIRE(entries[1].dtype == Tensor::DType::Int8);
+    REQUIRE(entries[2].dtype == Tensor::DType::Float64);
 
     REQUIRE(entries[0].length == 16);
     REQUIRE(entries[1].length == 4);
@@ -743,25 +945,31 @@ TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[di
 
 TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(128);
 
     // Fully-occupied 1-D tensor — shape matches fulldim.
-    AddTensorShardLeaf(tree, "full", DS4Tensor::DType::Float32, {4}, 0);
+    AddTensorShardLeaf(tree, "full", Tensor::DType::Float32, {4}, 0);
 
     // Non-full 2-D slice: fulldim is 8x4 but this shard covers rows [2,6) and cols [1,3).
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN("slice");
-        auto&     leaf          = tree.AddChild(parent, leafName);
-        DS4Tensor tnsr;
-        tnsr.dtype  = DS4Tensor::DType::Int32;
-        tnsr.handle = 16;
-        tnsr.device = DeviceId{"cpu"};
-        tnsr.fulldim.push_back(8);
-        tnsr.fulldim.push_back(4);
-        tnsr.sharddim.push_back({.begin = 2, .end = 6});
-        tnsr.sharddim.push_back({.begin = 1, .end = 3});
-        leaf.data = StateNode::TensorShard{tnsr};
+        auto&       leaf        = tree.AddChild(parent, leafName);
+        Tensor::Dim fulldim;
+        fulldim.push_back(8);
+        fulldim.push_back(4);
+        DTensor          tnsr(Tensor::DType::Int32, fulldim);
+        Tensor::DimRange sharddim;
+        sharddim.push_back({.begin = 2, .end = 6});
+        sharddim.push_back({.begin = 1, .end = 3});
+        tnsr.AddShard({
+            .rank        = Rank{0},
+            .handle      = 16,
+            .storageSize = 4ull * 2u * Tensor::GetDTypeSize(Tensor::DType::Int32),
+            .sharddim    = sharddim,
+            .device      = DeviceId{"cpu"},
+        });
+        leaf.data = std::move(tnsr);
     }
 
     auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
@@ -777,23 +985,23 @@ TEST_CASE("distcp shard walk derives shape from sharddim for partial slices", "[
     REQUIRE(entries[1].length == 4ull * 2u * 4u);    // 8 int32 elements
 }
 
-TEST_CASE("distcp shard walk expands ShardedTensor into per-rank entries", "[distcp][tier1]")
+TEST_CASE("distcp shard walk expands DTensor into per-rank entries", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo(0, 2));
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
     ByteStorage tensorStorage(64);
 
     auto [leafName, parent] = tree.FindOrAddNodeByFQN("shrd");
-    auto&          leaf     = tree.AddChild(parent, leafName);
-    DS4Tensor::Dim fulldim;
+    auto&       leaf        = tree.AddChild(parent, leafName);
+    Tensor::Dim fulldim;
     fulldim.push_back(8);
-    StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
+    DTensor tnsr(Tensor::DType::Float32, fulldim);
 
-    DS4Tensor::DimRange r0;
+    Tensor::DimRange r0;
     r0.push_back({.begin = 0, .end = 4});
-    DS4Tensor::DimRange r1;
+    Tensor::DimRange r1;
     r1.push_back({.begin = 4, .end = 8});
-    tnsr.AddShard({.sharddim = r0, .device = DeviceId{"cpu"}, .handle = 0, .rank = Rank{0}});
-    tnsr.AddShard({.sharddim = r1, .device = DeviceId{"cpu"}, .handle = 16, .rank = Rank{1}});
+    tnsr.AddShard({.rank = Rank{0}, .handle = 0, .storageSize = 16, .sharddim = r0, .device = DeviceId{"cpu"}});
+    tnsr.AddShard({.rank = Rank{1}, .handle = 16, .storageSize = 16, .sharddim = r1, .device = DeviceId{"cpu"}});
     leaf.data = std::move(tnsr);
 
     auto const rank0 = CollectShardsForTest(tree, Rank{0}, tensorStorage);
@@ -811,23 +1019,23 @@ TEST_CASE("distcp shard walk expands ShardedTensor into per-rank entries", "[dis
 
 TEST_CASE("distcp shard walk orders same-rank shards by sharddim", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo(0, 2));
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
     ByteStorage tensorStorage(64);
 
     auto [leafName, parent] = tree.FindOrAddNodeByFQN("shrd");
-    auto&          leaf     = tree.AddChild(parent, leafName);
-    DS4Tensor::Dim fulldim;
+    auto&       leaf        = tree.AddChild(parent, leafName);
+    Tensor::Dim fulldim;
     fulldim.push_back(8);
-    StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
+    DTensor tnsr(Tensor::DType::Float32, fulldim);
 
-    DS4Tensor::DimRange r0low;
+    Tensor::DimRange r0low;
     r0low.push_back({.begin = 0, .end = 4});
-    DS4Tensor::DimRange r0high;
+    Tensor::DimRange r0high;
     r0high.push_back({.begin = 4, .end = 8});
     // Insertion order intentionally inverted vs. the std::set order so the
     // test only passes if `tnsr.shards` is iterated in (rank, sharddim) order.
-    tnsr.AddShard({.sharddim = r0high, .device = DeviceId{"cpu"}, .handle = 32, .rank = Rank{0}});
-    tnsr.AddShard({.sharddim = r0low, .device = DeviceId{"cpu"}, .handle = 0, .rank = Rank{0}});
+    tnsr.AddShard({.rank = Rank{0}, .handle = 32, .storageSize = 16, .sharddim = r0high, .device = DeviceId{"cpu"}});
+    tnsr.AddShard({.rank = Rank{0}, .handle = 0, .storageSize = 16, .sharddim = r0low, .device = DeviceId{"cpu"}});
 
     leaf.data = std::move(tnsr);
 
@@ -838,26 +1046,26 @@ TEST_CASE("distcp shard walk orders same-rank shards by sharddim", "[distcp][tie
     REQUIRE(entries[1].sharddim[0].begin == 4);
 }
 
-TEST_CASE("distcp shard walk handles mixed TensorShard and ShardedTensor nodes", "[distcp][tier1]")
+TEST_CASE("distcp shard walk handles mixed TensorShard and DTensor nodes", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo(0, 2));
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
     ByteStorage tensorStorage(128);
 
-    AddTensorShardLeaf(tree, "before", DS4Tensor::DType::Float32, {4}, 0);
+    AddTensorShardLeaf(tree, "before", Tensor::DType::Float32, {4}, 0);
 
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN("middle");
-        auto&          leaf     = tree.AddChild(parent, leafName);
-        DS4Tensor::Dim fulldim;
+        auto&       leaf        = tree.AddChild(parent, leafName);
+        Tensor::Dim fulldim;
         fulldim.push_back(8);
-        StateNode::ShardedTensor tnsr(DS4Tensor::DType::Float32, fulldim);
-        DS4Tensor::DimRange      r;
+        DTensor          tnsr(Tensor::DType::Float32, fulldim);
+        Tensor::DimRange r;
         r.push_back({.begin = 0, .end = 8});
-        tnsr.AddShard({.sharddim = r, .device = DeviceId{"cpu"}, .handle = 16, .rank = Rank{0}});
+        tnsr.AddShard({.rank = Rank{0}, .handle = 16, .storageSize = 32, .sharddim = r, .device = DeviceId{"cpu"}});
         leaf.data = std::move(tnsr);
     }
 
-    AddTensorShardLeaf(tree, "after", DS4Tensor::DType::Float32, {2}, 48);
+    AddTensorShardLeaf(tree, "after", Tensor::DType::Float32, {2}, 48);
 
     auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
@@ -869,12 +1077,12 @@ TEST_CASE("distcp shard walk handles mixed TensorShard and ShardedTensor nodes",
 
 TEST_CASE("distcp shard walk joins nested dict names with dots", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(64);
 
-    AddTensorShardLeaf(tree, "model.layer0.weight", DS4Tensor::DType::Float32, {2}, 0);
-    AddTensorShardLeaf(tree, "model.layer0.bias", DS4Tensor::DType::Float32, {2}, 8);
-    AddTensorShardLeaf(tree, "model.layer1.weight", DS4Tensor::DType::Float32, {2}, 16);
+    AddTensorShardLeaf(tree, "model.layer0.weight", Tensor::DType::Float32, {2}, 0);
+    AddTensorShardLeaf(tree, "model.layer0.bias", Tensor::DType::Float32, {2}, 8);
+    AddTensorShardLeaf(tree, "model.layer1.weight", Tensor::DType::Float32, {2}, 16);
 
     auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
 
@@ -886,20 +1094,21 @@ TEST_CASE("distcp shard walk joins nested dict names with dots", "[distcp][tier1
 
 TEST_CASE("distcp shard walk skips zero-length shards", "[distcp][tier1]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(16);
 
-    AddTensorShardLeaf(tree, "non_empty", DS4Tensor::DType::Float32, {2}, 0);
+    AddTensorShardLeaf(tree, "non_empty", Tensor::DType::Float32, {2}, 0);
 
-    // Empty sharddim — ShardSizeBytes() returns 0.
+    // Empty sharddim — StorageSizeBytes() returns 0.
     {
         auto [leafName, parent] = tree.FindOrAddNodeByFQN("empty");
-        auto&     leaf          = tree.AddChild(parent, leafName);
-        DS4Tensor tnsr;
-        tnsr.dtype  = DS4Tensor::DType::Float32;
-        tnsr.handle = 8;
-        tnsr.device = DeviceId{"cpu"};
-        leaf.data   = StateNode::TensorShard{tnsr};
+        auto&  leaf             = tree.AddChild(parent, leafName);
+        Tensor tnsr;
+        tnsr.dtype       = Tensor::DType::Float32;
+        tnsr.handle      = 8;
+        tnsr.storageSize = 0;
+        tnsr.device      = DeviceId{"cpu"};
+        leaf.data        = tnsr;
     }
 
     auto const entries = CollectShardsForTest(tree, Rank{0}, tensorStorage);
@@ -1349,25 +1558,24 @@ static std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
     uint64_t                     cursor = 0;
     tree.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type == StateNode::Type::TensorShard)
+        if (type == StateNode::Type::Tensor)
         {
-            auto const& tnsr    = std::get<StateNode::TensorShard>(node.data);
-            auto const  shardSz = tnsr.ShardSizeBytes();
+            auto const& tnsr    = std::get<Tensor>(node.data);
+            auto const  shardSz = tnsr.StorageSizeBytes();
             if (shardSz == 0) { return; }
-            DS4Tensor::Dim shape;
-            for (auto const& r : tnsr.sharddim) { shape.push_back(r.end - r.begin); }
+            Tensor::Dim    shape      = tnsr.fulldim;
             uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(tnsr.dtype, shape, shardSz);
             out.push_back({.fqn = tree.GetNodeId(node.handle), .fileOffset = cursor, .length = archiveLen});
             cursor += archiveLen;
         }
-        else if (type == StateNode::Type::ShardedTensor)
+        else if (type == StateNode::Type::DTensor)
         {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto const& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
-                auto const shardSz = shard.ShardSizeBytes(tnsr.dtype);
+                auto const shardSz = shard.StorageSizeBytes();
                 if (shardSz == 0) { continue; }
-                DS4Tensor::Dim shape;
+                Tensor::Dim shape;
                 for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
                 uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(tnsr.dtype, shape, shardSz);
                 out.push_back({.fqn = tree.GetNodeId(node.handle), .fileOffset = cursor, .length = archiveLen});
@@ -1380,16 +1588,16 @@ static std::vector<PredictedRecord> PredictRankLayout(StateTree const& tree)
 
 TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs", "[distcp][tier2]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(64);
     // Deterministic source bytes — keep them simple so any future stride/dtype
     // bug shows up as a torch.load mismatch on inspection.
     auto* bytes = static_cast<unsigned char*>(tensorStorage.data);
     for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
 
-    AddShardedTensorLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);    // 16 B
-    AddShardedTensorLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, Rank{0}, 16);         //  4 B
-    AddShardedTensorLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, Rank{0}, 32);      // 16 B
+    AddShardedTensorLeaf(tree, "a", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);    // 16 B
+    AddShardedTensorLeaf(tree, "b", Tensor::DType::Int8, {4}, Rank{0}, 16);         //  4 B
+    AddShardedTensorLeaf(tree, "c", Tensor::DType::Float64, {2}, Rank{0}, 32);      // 16 B
 
     auto outDir = CkptDir("tier2_layout");
     std::filesystem::remove_all(outDir);
@@ -1420,8 +1628,8 @@ TEST_CASE("distcp::WriteRankShard produces a contiguous file of torch.save ZIPs"
 
 TEST_CASE("distcp::WriteRankShard omits ranks with no local payload", "[distcp][tier1][dedup]")
 {
-    StateTree globalTree(SingleRankTopo(0, 2));
-    AddShardedTensorLeaf(globalTree, "weight", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+    StateTree globalTree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
+    AddShardedTensorLeaf(globalTree, "weight", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
 
     auto outDir = CkptDir("empty_rank_omitted");
     std::filesystem::remove_all(outDir);
@@ -1468,10 +1676,10 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
         // as bogus payload at a recorded (offset, length).
         auto* bytes = static_cast<unsigned char*>(ls.tensorStorage->data);
         for (size_t i = 0; i < ls.tensorStorage->size; ++i) { bytes[i] = static_cast<unsigned char>(((size_t{r} * 17u) + i) & 0xffu); }
-        ls.tree = std::make_unique<StateTree>(SingleRankTopo(r, kWorldSize));
-        AddShardedTensorLeaf(*ls.tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{r}, 0);    // 16 B
-        AddShardedTensorLeaf(*ls.tree, "b", DS4Tensor::DType::Int8, {4}, Rank{r}, 16);         //  4 B
-        AddShardedTensorLeaf(*ls.tree, "c", DS4Tensor::DType::Float64, {2}, Rank{r}, 32);      // 16 B
+        ls.tree = std::make_unique<StateTree>(checkpoint::ipc::SessionId::Default, SingleRankTopo(r, kWorldSize));
+        AddShardedTensorLeaf(*ls.tree, "a", Tensor::DType::Float32, {2, 2}, Rank{r}, 0);    // 16 B
+        AddShardedTensorLeaf(*ls.tree, "b", Tensor::DType::Int8, {4}, Rank{r}, 16);         //  4 B
+        AddShardedTensorLeaf(*ls.tree, "c", Tensor::DType::Float64, {2}, Rank{r}, 32);      // 16 B
     }
 
     auto outDir = CkptDir("tier6_concurrent");
@@ -1544,7 +1752,7 @@ TEST_CASE("distcp::WriteRankShard runs concurrently across ranks", "[distcp][tie
 
 TEST_CASE("ComputeShardArchiveSize matches WriteRankShard's on-disk layout", "[distcp][tier1][predict]")
 {
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(256);
     auto*       bytes = static_cast<unsigned char*>(tensorStorage.data);
     for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
@@ -1552,11 +1760,11 @@ TEST_CASE("ComputeShardArchiveSize matches WriteRankShard's on-disk layout", "[d
     // Mix of dtypes that produce different `data.pkl` sizes and shard byte
     // counts. FB padding is offset-dependent, so any shape arrangement gets
     // exercised once the prior shards' cumulative size shifts the cursor.
-    AddShardedTensorLeaf(tree, "a", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);    // 16 B
-    AddShardedTensorLeaf(tree, "b", DS4Tensor::DType::Int8, {4}, Rank{0}, 16);         //  4 B
-    AddShardedTensorLeaf(tree, "c", DS4Tensor::DType::Float64, {2}, Rank{0}, 32);      // 16 B
-    AddShardedTensorLeaf(tree, "d", DS4Tensor::DType::Int32, {4}, Rank{0}, 64);        // 16 B
-    AddShardedTensorLeaf(tree, "e", DS4Tensor::DType::Float32, {8}, Rank{0}, 128);     // 32 B
+    AddShardedTensorLeaf(tree, "a", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);    // 16 B
+    AddShardedTensorLeaf(tree, "b", Tensor::DType::Int8, {4}, Rank{0}, 16);         //  4 B
+    AddShardedTensorLeaf(tree, "c", Tensor::DType::Float64, {2}, Rank{0}, 32);      // 16 B
+    AddShardedTensorLeaf(tree, "d", Tensor::DType::Int32, {4}, Rank{0}, 64);        // 16 B
+    AddShardedTensorLeaf(tree, "e", Tensor::DType::Float32, {8}, Rank{0}, 128);     // 32 B
 
     auto outDir = CkptDir("predict_consistency");
     std::filesystem::remove_all(outDir);
@@ -1596,30 +1804,32 @@ TEST_CASE("distcp::WriteMetadata emits .metadata for shards rank 0 never wrote",
     // — i.e. its own __0_0.distcp. Rank 1's local registry is intentionally
     // never constructed: WriteMetadata has to emit a valid `.metadata` pickle
     // without it, by analytically reconstructing rank 1's layout from the
-    // global ShardedTensor entries. The empty manifest skips per-shard
+    // global DTensor entries. The empty manifest skips per-shard
     // verification (the multi-node case where rank 0 has no view into other
     // ranks' writeLogs).
-    StateTree globalTree(SingleRankTopo(0, 2));
+    StateTree globalTree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
     auto      addShard = [&](std::string_view                                                            fqn,
-                             DS4Tensor::DType                                                            dtype,
+                             Tensor::DType                                                               dtype,
                              std::vector<size_t> const&                                                  fullShape,
                              std::vector<std::pair<Rank, std::vector<std::pair<size_t, size_t>>>> const& shards) {
-        DS4Tensor::Dim fulldim;
+        Tensor::Dim fulldim;
         for (auto d : fullShape) { fulldim.push_back(d); }
-        auto [leafName, parent]       = globalTree.FindOrAddNodeByFQN(fqn);
-        auto&                    leaf = globalTree.AddChild(parent, leafName);
-        StateNode::ShardedTensor st(dtype, fulldim);
+        auto [leafName, parent] = globalTree.FindOrAddNodeByFQN(fqn);
+        auto&   leaf            = globalTree.AddChild(parent, leafName);
+        DTensor st(dtype, fulldim);
         for (auto const& [r, ranges] : shards)
         {
-            DS4Tensor::DimRange sharddim;
+            Tensor::DimRange sharddim;
             for (auto const& [b, e] : ranges) { sharddim.push_back({.begin = b, .end = e}); }
-            st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = r});
+            uint64_t storageSize = Tensor::GetDTypeSize(dtype);
+            for (auto const& range : sharddim) { storageSize *= range.end - range.begin; }
+            st.AddShard({.rank = r, .handle = 0, .storageSize = storageSize, .sharddim = sharddim, .device = DeviceId{"cpu"}});
         }
         leaf.data = std::move(st);
     };
     // Tensor of full shape (8,) split into two halves across ranks 0 and 1.
-    addShard("weight", DS4Tensor::DType::Float32, {8}, {{Rank{0}, {{0, 4}}}, {Rank{1}, {{4, 8}}}});
-    addShard("bias", DS4Tensor::DType::Int64, {4}, {{Rank{0}, {{0, 2}}}, {Rank{1}, {{2, 4}}}});
+    addShard("weight", Tensor::DType::Float32, {8}, {{Rank{0}, {{0, 4}}}, {Rank{1}, {{4, 8}}}});
+    addShard("bias", Tensor::DType::Int64, {4}, {{Rank{0}, {{0, 2}}}, {Rank{1}, {{2, 4}}}});
 
     auto outDir = CkptDir("metadata_multi_rank_inference");
     std::filesystem::remove_all(outDir);
@@ -1634,7 +1844,7 @@ TEST_CASE("distcp Blobs live in their rank's shard file", "[distcp][tier1][metad
 {
     // Each rank appends its Blobs in fqn order after its tensor region.
     // The coordinator's FQN-grouped metadata view points at those local files.
-    StateTree globalTree(SingleRankTopo(0, 2));
+    StateTree globalTree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
 
     std::vector<char> const alphaBytes{'a', 'l', 'p', 'h', 'a'};
     std::vector<char> const gammaBytes{'g'};
@@ -1701,12 +1911,12 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
     // single-shard ShardedTensors. WriteRankShard requires the global-
     // registry shape (asserted internally), and WriteMetadata consumes the
     // resulting writeLog as a verification side-channel.
-    StateTree   tree(SingleRankTopo());
+    StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     ByteStorage tensorStorage(64);
     auto*       bytes = static_cast<unsigned char*>(tensorStorage.data);
     for (size_t i = 0; i < tensorStorage.size; ++i) { bytes[i] = static_cast<unsigned char>(i); }
-    AddShardedTensorLeaf(tree, "weight", DS4Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
-    AddShardedTensorLeaf(tree, "block.weight", DS4Tensor::DType::Int64, {3}, Rank{0}, 16);
+    AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+    AddShardedTensorLeaf(tree, "block.weight", Tensor::DType::Int64, {3}, Rank{0}, 16);
 
     auto outDir = CkptDir("metadata_unpickle");
     std::filesystem::remove_all(outDir);
@@ -1737,10 +1947,7 @@ TEST_CASE("distcp::WriteMetadata emits an unpickle-able .metadata", "[distcp][ti
 TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 {
     auto const& registryPath = TestRegistryPath();
-    if (registryPath.empty())
-    {
-        SKIP("no --registry path provided (pass `--registry <path>` or use ctest, which wires it via EXTRA_ARGS)");
-    }
+    if (registryPath.empty()) { SKIP("no --registry path provided"); }
     if (!std::filesystem::exists(registryPath)) { SKIP(fmt::format("registry path does not exist: {}", registryPath.string())); }
 
     // Conservative RAM threshold. The daemon requests the configured size for
@@ -1813,9 +2020,7 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
     if (serverRunning) { StopInprocServer(); }
 }
 
-// Custom main so we can register `--registry` on the Catch2 CLI. The default
-// `Catch2WithMain` errors on unknown args, which would break the
-// `EXTRA_ARGS --registry <path>` we feed in from CMake.
+// Custom main registers the optional --registry argument.
 int main(int argc, char* argv[])
 {
     if (argc == 2 && std::string_view{argv[1]} == ShmTestServerArg)

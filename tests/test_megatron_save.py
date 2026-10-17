@@ -182,7 +182,7 @@ def test_async_finalize_wait_starts_after_client_send(
         def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
             events.append("save_async")
 
-        def wait_for_deferred_save(self) -> None:
+        def wait_for_async_completion(self) -> None:
             events.append("client_send_complete")
 
     class ImmediateExecutor:
@@ -239,7 +239,7 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
         def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
             events.append("save_async")
 
-        def wait_for_deferred_save(self) -> None:
+        def wait_for_async_completion(self) -> None:
             events.append("client_send_complete")
 
     def maybe_save_dataloader_state(iterator: object, iteration: int, save_path: object, **groups: object) -> None:

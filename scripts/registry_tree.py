@@ -5,13 +5,14 @@
 Reads the daemon's binary state registries: per-rank registries named
 ``registry.<rank>.bin`` or ``registry.rank<rank>.bin``, or the merged global
 registry ``registry.bin`` that the daemon writes beside each checkpoint. Both
-hold a rank topology followed by the flattened state tree, whose leaves are
-tensor shards, blobs and 64-bit scalars.
+hold a session ID, rank topology and flattened state tree, whose leaves are
+tensors, distributed tensor shards, blobs and scalars.
 
-Sizes are logical bytes as registered: ``numel * itemsize`` for each tensor
-shard, the inline length of each blob and the value width of each scalar. A
-rank's size is what that rank registered, replicas included. "All ranks" sums
-every rank and "Unique" counts each distinct shard range, blob and scalar once.
+Tensor sizes are physical storage bytes as registered. Their dtype, full shape
+and shard ranges describe the logical tensor and can imply a different size for
+packed or quantized storage. Blob sizes are their inline length and scalar sizes
+are their value width. A rank's size includes replicas. "All ranks" sums every
+rank and "Unique" counts each distinct shard range, blob and scalar once.
 
 Per-rank registries hold every entry. The global registry holds every rank's
 tensor shards, but its blob and scalar nodes come from the first rank that
@@ -30,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import math
 import re
 import struct
 import sys
@@ -60,7 +60,7 @@ def _page_module() -> ModuleType:
 
 page = _page_module()
 
-_INVALID, _DICT, _SCALAR, _BLOB, _TENSOR_SHARD, _SHARDED_TENSOR = range(6)
+_INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR = range(6)
 _DTYPES = {
     1: "float16",
     2: "bfloat16",
@@ -85,17 +85,21 @@ _TOPOLOGY = struct.Struct("<IIII")
 _U32 = struct.Struct("<I")
 _NODE = struct.Struct("<BBHII")
 _SCALAR_VALUE = struct.Struct("<B7xQ")
-_TENSOR_SHARD_VALUE = struct.Struct("<9Q5QB7xQ4sI")
-_SHARDED_HEADER = struct.Struct("<IB5Q")
-_RANKED_SHARD = struct.Struct("<9Q16xI4x")
+_TENSOR_PREFIX = struct.Struct("<B7xQQ")
+_DTENSOR_PREFIX = struct.Struct("<IB")
+_SHARD_PREFIX = struct.Struct("<I4xQQ")
+_DIM = struct.Struct("<5Q")
+_RANGES = struct.Struct("<9Q")
+_DEVICE = struct.Struct("<4sI")
 _DOUBLE = struct.Struct("<d")
 _LOCAL_NAME = re.compile(r"registry\.(?:rank)?(\d+)\.bin")
 _GLOBAL_NAMES = frozenset({"registry.bin", "registry.global.bin"})
 _PREFETCH = 16
 _SIZES_NOTE = (
-    "Sizes are logical bytes as registered with the checkpoint daemon: numel times dtype size for each tensor shard, "
-    "the inline length of each blob and the value width of each scalar. A rank's size is what that rank registered, "
-    "replicas included; All ranks sums every rank and Unique counts each distinct shard range, blob and scalar once."
+    "Tensor sizes are explicit physical storage bytes registered with the checkpoint daemon. Dtype, full shape and shard "
+    "ranges are logical metadata, so their implied size can differ for packed or quantized storage. Blob sizes are their "
+    "inline length and scalar sizes are their value width. A rank's size includes replicas; All ranks sums every rank and "
+    "Unique counts each distinct shard range, blob and scalar once."
 )
 
 
@@ -129,20 +133,69 @@ class Registry:
     world_size: int
     ranks_per_peer: int
     peers: list[str]
+    session_id: int = 0
     names: dict[int, str] = field(default_factory=dict)
     parents: dict[int, int] = field(default_factory=dict)
     entries: list[tuple[int, int, object]] = field(default_factory=list)
     trailing: int = 0
 
 
+@dataclass(frozen=True)
+class _TensorValue:
+    dtype: int
+    storage_size: int
+    full_dim: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ShardValue:
+    rank: int
+    storage_size: int
+    ranges: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _DTensorValue:
+    dtype: int
+    full_dim: tuple[int, ...]
+    shards: tuple[_ShardValue, ...]
+
+
+def _dim(reader: _Reader) -> tuple[int, ...]:
+    values = reader.unpack(_DIM)
+    count = _ndim(values[-1])
+    return values[:count]
+
+
+def _ranges(reader: _Reader) -> tuple[tuple[int, int], ...]:
+    values = reader.unpack(_RANGES)
+    count = _ndim(values[-1])
+    return tuple((values[index], values[index + 1]) for index in range(0, 2 * count, 2))
+
+
+def _tensor_value(reader: _Reader) -> _TensorValue:
+    dtype, _, storage_size = reader.unpack(_TENSOR_PREFIX)
+    full_dim = _dim(reader)
+    reader.take(_DEVICE.size)
+    return _TensorValue(dtype, storage_size, full_dim)
+
+
+def _shard_value(reader: _Reader) -> _ShardValue:
+    rank, _, storage_size = reader.unpack(_SHARD_PREFIX)
+    ranges = _ranges(reader)
+    reader.take(_DEVICE.size)
+    return _ShardValue(rank, storage_size, ranges)
+
+
 def read_registry(path: Path, data: bytes | None = None) -> Registry:
     """Parse a registry file into its topology and tree entries."""
     raw = path.read_bytes() if data is None else data
     reader = _Reader(path, memoryview(raw))
+    (session_id,) = reader.unpack(_U32)
     rank, world_size, ranks_per_peer, _ = reader.unpack(_TOPOLOGY)
     peer_count = -(-world_size // ranks_per_peer) if ranks_per_peer else 0
     peers = [reader.text(reader.unpack(_U32)[0]) for _ in range(peer_count)]
-    registry = Registry(path, len(raw), rank, world_size, ranks_per_peer, peers)
+    registry = Registry(path, len(raw), rank, world_size, ranks_per_peer, peers, session_id=session_id)
     (count,) = reader.unpack(_U32)
     for _ in range(count):
         start = reader.pos
@@ -156,11 +209,13 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
             registry.entries.append((handle, kind, reader.unpack(_SCALAR_VALUE)))
         elif kind == _BLOB:
             registry.entries.append((handle, kind, reader.take(reader.unpack(_U32)[0])))
-        elif kind == _TENSOR_SHARD:
-            registry.entries.append((handle, kind, reader.unpack(_TENSOR_SHARD_VALUE)))
-        elif kind == _SHARDED_TENSOR:
-            header = reader.unpack(_SHARDED_HEADER)
-            registry.entries.append((handle, kind, (header, reader.take(_RANKED_SHARD.size * header[0]))))
+        elif kind == _TENSOR:
+            registry.entries.append((handle, kind, _tensor_value(reader)))
+        elif kind == _DTENSOR:
+            shard_count, dtype = reader.unpack(_DTENSOR_PREFIX)
+            full_dim = _dim(reader)
+            shards = tuple(_shard_value(reader) for _ in range(shard_count))
+            registry.entries.append((handle, kind, _DTensorValue(dtype, full_dim, shards)))
         else:
             raise ValueError(f"{path}: node at byte {start} has unknown type {kind}")
         registry.names[handle] = name
@@ -195,14 +250,6 @@ def _ndim(ndim: int) -> int:
     if ndim > _MAX_DIMS:
         raise ValueError(f"dimension count {ndim} exceeds {_MAX_DIMS}")
     return ndim
-
-
-def _dims(fields: tuple, start: int, ndim: int) -> tuple[int, ...]:
-    return fields[start : start + _ndim(ndim)]
-
-
-def _pairs(fields: tuple, ndim: int) -> tuple[int, ...]:
-    return fields[: 2 * _ndim(ndim)]
 
 
 def _decode_scalar(bits: int, raw: int) -> tuple[str, int, str]:
@@ -253,36 +300,36 @@ class _Builder:
             for other in self.leaves.values():
                 other.chunks.clear()
 
-    def _dtype(self, code: int) -> tuple[str, int]:
+    def _dtype(self, code: int) -> str:
         name = _DTYPES.get(code)
         if name is None:
-            self.problems[f"tensors with unknown dtype code {code} (counted as 0 bytes)"] += 1
-            return f"dtype{code}", 0
-        return name, page.DTYPE_ITEMSIZE[name]
+            self.problems[f"tensors with unknown logical dtype code {code}"] += 1
+            return f"dtype{code}"
+        return name
 
-    def _tensor(self, fqn: str, dtype_code: int, fulldim: tuple[int, ...], storage: str) -> tuple[page.Leaf, int]:
-        dtype, itemsize = self._dtype(dtype_code)
-        return self._leaf(fqn, "tensor" if fulldim else "scalar", storage, dtype, fulldim), itemsize
+    def _tensor(self, fqn: str, dtype_code: int, fulldim: tuple[int, ...], storage: str) -> page.Leaf:
+        return self._leaf(fqn, "tensor" if fulldim else "scalar", storage, self._dtype(dtype_code), fulldim)
 
-    def _shard(self, leaf: page.Leaf, itemsize: int, pairs: tuple[int, ...], rank: int) -> None:
+    def _shard(self, leaf: page.Leaf, pairs: tuple[int, ...], rank: int, storage_size: int) -> None:
         offsets = pairs[0::2]
         sizes = tuple(end - begin for begin, end in zip(offsets, pairs[1::2]))
-        nbytes = math.prod(sizes) * itemsize if sizes else 0
-        leaf.add(rank, nbytes, sizes)
+        leaf.add(rank, storage_size, sizes)
         if self._first(leaf.fqn, hash(pairs)):
-            leaf.unique += nbytes
+            leaf.unique += storage_size
         if self.keep_chunks:
             self._keep(leaf, rank, offsets, sizes)
 
-    def tensor_shard(self, fqn: str, fields: tuple, rank: int) -> None:
-        leaf, itemsize = self._tensor(fqn, fields[14], _dims(fields, 9, fields[13]), "tensor shards from per-rank registries")
-        self._shard(leaf, itemsize, _pairs(fields, fields[8]), rank)
+    def tensor(self, fqn: str, value: _TensorValue, rank: int, where: str) -> None:
+        leaf = self._tensor(fqn, value.dtype, value.full_dim, f"physical tensor storage bytes in {where}")
+        pairs = tuple(coordinate for size in value.full_dim for coordinate in (0, size))
+        self._shard(leaf, pairs, rank, value.storage_size)
 
-    def sharded_tensor(self, fqn: str, header: tuple, shards: memoryview) -> None:
-        leaf, itemsize = self._tensor(fqn, header[1], _dims(header, 2, header[6]), "sharded tensor in the global registry")
-        for record in _RANKED_SHARD.iter_unpack(shards):
-            rank = page.UNKNOWN_RANK if record[9] == _INVALID_RANK else record[9]
-            self._shard(leaf, itemsize, _pairs(record, record[8]), rank)
+    def dtensor(self, fqn: str, value: _DTensorValue, where: str) -> None:
+        leaf = self._tensor(fqn, value.dtype, value.full_dim, f"physical tensor shard storage bytes in {where}")
+        for shard in value.shards:
+            rank = page.UNKNOWN_RANK if shard.rank == _INVALID_RANK else shard.rank
+            pairs = tuple(coordinate for bounds in shard.ranges for coordinate in bounds)
+            self._shard(leaf, pairs, rank, shard.storage_size)
 
     def blob(self, fqn: str, data: memoryview, rank: int, storage: str) -> None:
         leaf = self._leaf(fqn, "blob", storage)
@@ -312,10 +359,10 @@ class _Builder:
         where = "per-rank registries" if per_rank else "the global registry"
         for handle, kind, payload in registry.entries:
             fqn = resolve(handle)
-            if kind == _TENSOR_SHARD:
-                self.tensor_shard(fqn, payload, registry.rank)
-            elif kind == _SHARDED_TENSOR:
-                self.sharded_tensor(fqn, *payload)
+            if kind == _TENSOR:
+                self.tensor(fqn, payload, rank, where)
+            elif kind == _DTENSOR:
+                self.dtensor(fqn, payload, where)
             elif kind == _BLOB:
                 self.blob(fqn, payload, rank, f"inline blob bytes in {where}")
             else:
@@ -403,12 +450,14 @@ def analyze(
     problems: Counter = Counter()
     builder = _Builder(expand_blobs=expand_blobs, chunk_limit=chunk_details_limit, problems=problems)
     seen: dict[int, Path] = {}
+    session_ids: set[int] = set()
     world_sizes: set[int] = set()
     first: Registry | None = None
     total_bytes = 0
     for registry in _read_all(files):
         first = first or registry
         total_bytes += registry.size
+        session_ids.add(registry.session_id)
         world_sizes.add(registry.world_size)
         if registry.trailing:
             problems["registry files with trailing bytes after the tree"] += 1
@@ -417,6 +466,8 @@ def analyze(
         else:
             _describe_global(registry, notes, warnings)
         builder.add(registry, per_rank=bool(per_rank))
+    if len(session_ids) > 1:
+        raise ValueError(f"registries disagree on the session ID: {sorted(session_ids)}")
     world = max(world_sizes)
     if len(world_sizes) > 1:
         warnings.append(f"registries disagree on the world size: {sorted(world_sizes)}")

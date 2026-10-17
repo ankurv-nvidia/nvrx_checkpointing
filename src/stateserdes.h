@@ -1,4 +1,5 @@
 #pragma once
+#include "messages.h"
 #include "primitives64bit.h"
 #include "serdes_utils.h"
 #include "state.h"
@@ -51,6 +52,8 @@ struct StateSerDes
         return ostrm;
     }
 
+    static checkpoint::ipc::SessionId ReadSessionId(std::istream& istrm) { return serdes::ReadTrivial<checkpoint::ipc::SessionId>(istrm); }
+
     static RankTopology ReadTopology(std::istream& istrm)
     {
         RankTopology topo;
@@ -66,15 +69,18 @@ struct StateSerDes
 
     static std::ostream& Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle)
     {
+        serdes::WriteTrivial(ostrm, tree.SessionId());
         WriteTopology(ostrm, tree._topo);
 
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
         {
-            Header hdr{.type    = static_cast<Type>(node.data.index()),
-                       .namelen = static_cast<uint8_t>(node.name.size()),
-                       .handle  = node.handle,
-                       .parent  = node.parent,};
+            Header hdr{
+                .type    = static_cast<Type>(node.data.index()),
+                .namelen = static_cast<uint8_t>(node.name.size()),
+                .handle  = node.handle,
+                .parent  = node.parent,
+            };
             serdes::WriteTrivial(ostrm, hdr);
             serdes::WriteBlob(ostrm, std::span(node.name));
             switch (hdr.type)
@@ -92,32 +98,30 @@ struct StateSerDes
                 serdes::WriteTrivial(ostrm, std::get<StateNode::Scalar>(node.data));
             }
             break;
-            case Type::TensorShard:
+            case Type::Tensor:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(nodeHandle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
-                    fmt::print(
-                        stderr, "StateSerDes::Write!TensorShard: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
+                    fmt::print(stderr, "StateSerDes::Write!Tensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
-                auto const& shard = std::get<StateNode::TensorShard>(node.data);
-                shard.AssertShardIsValid();
+                auto const& shard = std::get<Tensor>(node.data);
                 serdes::WriteTrivial(ostrm, shard);
             }
             break;
-            case Type::ShardedTensor:
+            case Type::DTensor:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(nodeHandle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
                     fmt::print(
-                        stderr, "StateSerDes::Write!ShardedTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
+                        stderr, "StateSerDes::Write!DTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
-                auto const&         shTen = std::get<StateNode::ShardedTensor>(node.data);
+                auto const&         shTen = std::get<DTensor>(node.data);
                 ShardedTensorHeader typehdr{.numShards = static_cast<uint32_t>(shTen.shards.size())};
                 if (shTen.shards.empty())
                 {
@@ -201,43 +205,39 @@ struct StateSerDes
                 node.data = serdes::ReadTrivial<Primitives64Bit>(istrm);
             }
             break;
-            case Type::TensorShard:
+            case Type::Tensor:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
-                    fmt::print(
-                        stderr, "StateSerDes::Read!TensorShard: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
+                    fmt::print(stderr, "StateSerDes::Read!Tensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
-                auto tnsr = serdes::ReadTrivial<DS4Tensor>(istrm);
-                node.data = tnsr;
-                tnsr.AssertShardIsValid();
+                node.data = serdes::ReadTrivial<Tensor>(istrm);
             }
             break;
-            case Type::ShardedTensor:
+            case Type::DTensor:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(node.handle);
                 if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
                 {
-                    fmt::print(
-                        stderr, "StateSerDes::Read!ShardedTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
+                    fmt::print(stderr, "StateSerDes::Read!DTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
                 auto typehdr = serdes::ReadTrivial<ShardedTensorHeader>(istrm);
-                auto dtype   = serdes::ReadTrivial<DS4Tensor::DType>(istrm);
-                auto fulldim = serdes::ReadTrivial<DS4Tensor::Dim>(istrm);
+                auto dtype   = serdes::ReadTrivial<Tensor::DType>(istrm);
+                auto fulldim = serdes::ReadTrivial<Tensor::Dim>(istrm);
 
-                StateNode::ShardedTensor shTen{dtype, fulldim};
+                DTensor shTen{dtype, fulldim};
                 if (typehdr.numShards == 0)
                 {
                     throw std::runtime_error(fmt::format("Sharded tensor {} has no shards in metadata output\n", node.name));
                 }
                 for (uint32_t j = 0; j < typehdr.numShards; ++j)
                 {
-                    auto rankshard = serdes::ReadTrivial<StateNode::ShardedTensor::RankedTensorShard>(istrm);
+                    auto rankshard = serdes::ReadTrivial<TensorShard>(istrm);
                     rankshard.AssertShardIsValid(shTen.fulldim);
                     shTen.AddShard(rankshard);
                 }
@@ -260,7 +260,9 @@ struct StateSerDes
 
     static std::unique_ptr<StateTree> Read(std::istream& istrm)
     {
-        auto state = std::make_unique<StateTree>(ReadTopology(istrm));
+        auto sessionId = ReadSessionId(istrm);
+        auto topo      = ReadTopology(istrm);
+        auto state     = std::make_unique<StateTree>(sessionId, topo);
         Read(istrm, *state);
         return state;
     }
@@ -293,25 +295,22 @@ struct StateSerDes
                 }
             }
             else if (type == StateNode::Type::Blob) { fmt::print(ostrm, "{}: [blob]\n", name); }
-            else if (type == StateNode::Type::TensorShard)
+            else if (type == StateNode::Type::Tensor)
             {
-                auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
-                fmt::print(ostrm, "{}.sharddim: [{}]\n", name, tnsr.sharddim);
+                auto const& tnsr = std::get<Tensor>(node.data);
                 fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
                 fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
-                fmt::print(ostrm, "{}.device: {}\n", name, tnsr.device);
                 fmt::print(ostrm, "{}.handle: {}\n", name, tnsr.handle);
             }
-            else if (type == StateNode::Type::ShardedTensor)
+            else if (type == StateNode::Type::DTensor)
             {
-                auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+                auto const& tnsr = std::get<DTensor>(node.data);
                 if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor : {}", name));
                 fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
                 fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
 
                 for (auto const& rshard : tnsr.shards)
                 {
-                    fmt::print(ostrm, "{}.sharddim@{}.device: {}\n", name, rshard.rank, rshard.device);
                     fmt::print(ostrm, "{}.sharddim@{}.shards: [{}]\n", name, rshard.rank, rshard.sharddim);
                     fmt::print(ostrm, "{}.sharddim@{}.handle: {}\n", name, rshard.rank, rshard.handle);
                 }

@@ -63,11 +63,7 @@ def _assert_common_state_layout(checkpoint_dir: Path, expected_capacity: int) ->
     assert set(metadata.state_dict_metadata) == {"weight", "rng_state/shard_0_1", _DCP_COMMON_STATE_KEY}
     assert type(metadata.state_dict_metadata[_DCP_COMMON_STATE_KEY]).__name__ == "BytesStorageMetadata"
 
-    storage_entries = [
-        (index, info)
-        for index, info in metadata.storage_data.items()
-        if index.fqn == _DCP_COMMON_STATE_KEY
-    ]
+    storage_entries = [(index, info) for index, info in metadata.storage_data.items() if index.fqn == _DCP_COMMON_STATE_KEY]
     assert len(storage_entries) == 1
     index, info = storage_entries[0]
     assert index.offset is None
@@ -79,7 +75,7 @@ def _assert_common_state_layout(checkpoint_dir: Path, expected_capacity: int) ->
 def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
     initial_common = _serialize_common_state(0)
     common_capacity = ((len(initial_common) + 512 + 1023) // 1024) * 1024
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = checkpoint.model_state.create_root(2000, 0, 1, ["localhost"], 1)
     state_dict = {
         "weight": ShardedTensor(
             key="weight",
@@ -109,7 +105,7 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
                 },
             )
             root.save_async(iteration, checkpoint_dir)
-            root.wait_for_deferred_save()
+            root.wait_for_async_completion()
 
             deadline = time.monotonic() + 30
             while not (checkpoint_dir / ".metadata").is_file() or not (checkpoint_dir / "metadata.json").is_file():

@@ -278,7 +278,7 @@ static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId 
 {
     snapshot.globalRegistry->WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type == StateNode::Type::TensorShard)
+        if (type == StateNode::Type::Tensor)
         {
             throw std::runtime_error(fmt::format(
                 "[native_ckpt:svr][{}#{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
@@ -286,9 +286,9 @@ static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId 
                 sessionId,
                 snapshot.globalRegistry->GetNodeId(node.handle)));
         }
-        if (type == StateNode::Type::ShardedTensor)
+        if (type == StateNode::Type::DTensor)
         {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto const& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
             if (tnsr.shards.empty())
             {
@@ -315,22 +315,21 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
 
     auto dedupedRegistry = registry.Clone();
 
-    using RankedTensorShard = StateNode::ShardedTensor::RankedTensorShard;
     struct LogicalShard
     {
-        StateNode::Handle              nodeHandle{StateNode::Handle::Invalid};
-        std::string                    fqn;
-        DS4Tensor::DimRange            sharddim;
-        uint64_t                       sizeBytes{};
-        std::vector<RankedTensorShard> candidates;
+        StateNode::Handle           nodeHandle{StateNode::Handle::Invalid};
+        std::string                 fqn;
+        Tensor::DimRange            sharddim;
+        uint64_t                    sizeBytes{};
+        std::vector<DTensor::Shard> candidates;
     };
 
     std::vector<LogicalShard> logicalShards;
     registry.WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
+        auto const& tnsr = std::get<DTensor>(node.data);
 
-        std::map<DS4Tensor::DimRange, std::vector<RankedTensorShard>> candidatesByRange;
+        std::map<Tensor::DimRange, std::vector<DTensor::Shard>> candidatesByRange;
         for (auto const& shard : tnsr.shards)
         {
             auto const rank = static_cast<uint32_t>(shard.rank);
@@ -352,7 +351,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
                 .nodeHandle = node.handle,
                 .fqn        = fqn,
                 .sharddim   = sharddim,
-                .sizeBytes  = candidates.front().ShardSizeBytes(tnsr.dtype),
+                .sizeBytes  = candidates.front().StorageSizeBytes(),
                 .candidates = std::move(candidates),
             });
         }
@@ -371,7 +370,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
     TensorReplicaDeduplicationStats stats;
     stats.logicalShards = logicalShards.size();
     stats.assignedBytesPerRank.resize(worldSize, 0);
-    std::map<StateNode::Handle, std::vector<RankedTensorShard>> selectedByNode;
+    std::map<StateNode::Handle, std::vector<DTensor::Shard>> selectedByNode;
 
     for (auto const& logicalShard : logicalShards)
     {
@@ -394,11 +393,11 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
     }
 
     dedupedRegistry->WalkNodes([&](StateNode& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
-        auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
+        auto& tnsr = std::get<DTensor>(node.data);
         if (tnsr.shards.empty()) { return; }
 
-        StateNode::ShardedTensor selected(tnsr.dtype, tnsr.fulldim);
+        DTensor selected(tnsr.dtype, tnsr.fulldim);
         for (auto const& shard : selectedByNode.at(node.handle)) { selected.AddShard(shard); }
         tnsr = std::move(selected);
     });
@@ -434,24 +433,24 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
             }
         }
         else if (type == StateNode::Type::Blob) { fmt::print(ostrm, "{}: [blob]\n", name); }
-        else if (type == StateNode::Type::TensorShard)
+        else if (type == StateNode::Type::Tensor)
         {
-            auto const& tnsr = std::get<StateNode::TensorShard>(node.data);
-            fmt::print(ostrm, "{}.sharddim: [{}]\n", name, tnsr.sharddim);
+            auto const& tnsr = std::get<Tensor>(node.data);
+            // fmt::print(ostrm, "{}.sharddim: [{}]\n", name, tnsr.sharddim);
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
             fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
-            fmt::print(ostrm, "{}.device: {}\n", name, tnsr.device);
+            // fmt::print(ostrm, "{}.device: {}\n", name, tnsr.device);
         }
-        else if (type == StateNode::Type::ShardedTensor)
+        else if (type == StateNode::Type::DTensor)
         {
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto const& tnsr = std::get<DTensor>(node.data);
             if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor={}", name));
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
             fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
 
             for (auto const& rshard : tnsr.shards)
             {
-                fmt::print(ostrm, "{}.sharddim@{}.device: {}\n", name, rshard.rank, rshard.device);
+                // fmt::print(ostrm, "{}.sharddim@{}.device: {}\n", name, rshard.rank, rshard.device);
                 fmt::print(ostrm, "{}.sharddim@{}.shards: [{}]\n", name, rshard.rank, rshard.sharddim);
             }
         }
@@ -471,8 +470,8 @@ static std::string ComputeMd5Hex(char const* data, size_t size)
     return result;
 }
 
-// Format DS4Tensor::Dim as "[v0, v1, ...]" matching Python's str(list(tensor.size)).
-static std::string FormatDim(DS4Tensor::Dim const& dim)
+// Match Python's list-shaped dimension representation.
+static std::string FormatDim(Tensor::Dim const& dim)
 {
     std::string s = "[";
     for (size_t i = 0; i < dim.size(); ++i)
@@ -484,7 +483,7 @@ static std::string FormatDim(DS4Tensor::Dim const& dim)
 }
 
 // Format sharddim begin values as "[b0, b1, ...]" — matches chunk.offsets in distcp.
-static std::string FormatShardOffsets(DS4Tensor::DimRange const& sharddim)
+static std::string FormatShardOffsets(Tensor::DimRange const& sharddim)
 {
     std::string s = "[";
     for (size_t i = 0; i < sharddim.size(); ++i)
@@ -496,7 +495,7 @@ static std::string FormatShardOffsets(DS4Tensor::DimRange const& sharddim)
 }
 
 // Format sharddim extents as "[e0, e1, ...]" where e = end-begin — matches chunk.sizes in distcp.
-static std::string FormatShardSizes(DS4Tensor::DimRange const& sharddim)
+static std::string FormatShardSizes(Tensor::DimRange const& sharddim)
 {
     std::string s = "[";
     for (size_t i = 0; i < sharddim.size(); ++i)
@@ -508,24 +507,24 @@ static std::string FormatShardSizes(DS4Tensor::DimRange const& sharddim)
 }
 
 // Map native DType to the torch.dtype string produced by Python's str(dtype).
-static std::string_view DTypeToTorchStr(DS4Tensor::DType dtype)
+static std::string_view DTypeToTorchStr(Tensor::DType dtype)
 {
     switch (dtype)
     {
-    case DS4Tensor::DType::Float16: return "torch.float16";
-    case DS4Tensor::DType::BFloat16: return "torch.bfloat16";
-    case DS4Tensor::DType::Float32: return "torch.float32";
-    case DS4Tensor::DType::Float64: return "torch.float64";
-    case DS4Tensor::DType::Int8: return "torch.int8";
-    case DS4Tensor::DType::Int16: return "torch.int16";
-    case DS4Tensor::DType::Int32: return "torch.int32";
-    case DS4Tensor::DType::Int64: return "torch.int64";
-    case DS4Tensor::DType::UInt8: return "torch.uint8";
-    case DS4Tensor::DType::UInt16: return "torch.uint16";
-    case DS4Tensor::DType::UInt32: return "torch.uint32";
-    case DS4Tensor::DType::UInt64: return "torch.uint64";
-    case DS4Tensor::DType::Bool: return "torch.bool";
-    case DS4Tensor::DType::Invalid: return "torch.unknown";
+    case Tensor::DType::Float16: return "torch.float16";
+    case Tensor::DType::BFloat16: return "torch.bfloat16";
+    case Tensor::DType::Float32: return "torch.float32";
+    case Tensor::DType::Float64: return "torch.float64";
+    case Tensor::DType::Int8: return "torch.int8";
+    case Tensor::DType::Int16: return "torch.int16";
+    case Tensor::DType::Int32: return "torch.int32";
+    case Tensor::DType::Int64: return "torch.int64";
+    case Tensor::DType::UInt8: return "torch.uint8";
+    case Tensor::DType::UInt16: return "torch.uint16";
+    case Tensor::DType::UInt32: return "torch.uint32";
+    case Tensor::DType::UInt64: return "torch.uint64";
+    case Tensor::DType::Bool: return "torch.bool";
+    case Tensor::DType::Invalid: return "torch.unknown";
     default: throw std::runtime_error(fmt::format("Invalid DType={}", static_cast<int>(dtype)));
     }
 }
@@ -540,38 +539,63 @@ static constexpr uint8_t PeerRecordBlob   = 1;
 
 static void WriteTensorShardInfo(std::ostream& ostrm, TensorShardInfo const& info)
 {
-    serdes::WriteTrivial(ostrm, info.rank);
+    serdes::WriteTrivial(ostrm, info.dtype);
+    serdes::WriteTrivial(ostrm, info.fulldim);
     serdes::WriteTrivial(ostrm, info.tensorInfo);
     serdes::WriteBlobWithSize<uint32_t>(ostrm, info.nodeId);
+}
+
+static void ValidateLocalTensorMetadata(StateTree const& registry)
+{
+    std::unordered_set<StateTree::NodeId> tensorNodeIds;
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
+
+        auto const nodeId = registry.GetNodeId(node.handle);
+        if (!tensorNodeIds.insert(nodeId).second)
+        {
+            throw std::runtime_error(
+                fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
+        }
+        if (type != StateNode::Type::DTensor) { return; }
+
+        for (auto const& shard : std::get<DTensor>(node.data).shards)
+        {
+            if (shard.rank != registry.Topo().rank)
+            {
+                throw std::runtime_error(
+                    fmt::format("Local tensor '{}' has shard rank={} but registry rank={}", nodeId, shard.rank, registry.Topo().rank));
+            }
+        }
+    });
 }
 
 template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& registry, TLambda const& lambda)
 {
     auto rank = registry.Topo().rank;
     registry.WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
         {
-            auto& tnsr = std::get<StateNode::TensorShard>(node.data);
-            tnsr.AssertShardIsValid();
-            lambda({rank, tnsr, registry.GetNodeId(node.handle)});
+            auto&            tnsr = std::get<Tensor>(node.data);
+            Tensor::DimRange sharddim;
+            for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
+            auto shard = TensorShard{
+                .rank        = rank,
+                .handle      = tnsr.handle,
+                .storageSize = tnsr.storageSize,
+                .sharddim    = sharddim,
+                .device      = tnsr.device,
+            };
+            lambda({tnsr.dtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
         }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
-            auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
                 shard.AssertShardIsValid(tnsr.fulldim);
-                lambda({
-                    rank,
-                    StateNode::TensorShard{
-                        .sharddim = shard.sharddim,
-                        .fulldim  = tnsr.fulldim,
-                        .dtype    = tnsr.dtype,
-                        .handle   = shard.handle,
-                        .device   = shard.device,
-                    },
-                    registry.GetNodeId(node.handle),
-                });
+                lambda({tnsr.dtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
             }
         }
     });
@@ -660,7 +684,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
     // the handle the owning rank actually wrote, catching drift between the two views.
     std::unordered_map<std::string, uint64_t> localShardHandleMap;
     auto                                      makeShardHandleKey    //
-        = [](cipc::Rank rank, std::string_view fqn, StateNode::ShardedTensor::DimRange const& sharddim) {
+        = [](cipc::Rank rank, std::string_view fqn, DTensor::DimRange const& sharddim) {
               return fmt::format("rank{}:{}[{}]", rank, fqn, sharddim);
           };
 
@@ -668,21 +692,23 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
     {
         localState->localRegistry->WalkNodes([&](StateNode const& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::TensorShard)
+            if (type == StateNode::Type::Tensor)
             {
-                auto const& tnsr     = std::get<StateNode::TensorShard>(node.data);
-                auto const  size     = tnsr.ShardSizeBytes();
+                auto const&      tnsr = std::get<Tensor>(node.data);
+                Tensor::DimRange sharddim;
+                for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
+                auto const  size     = tnsr.StorageSizeBytes();
                 auto const* data     = static_cast<char const*>(localState->tensorStorage.data) + tnsr.handle;    // NOLINT
                 auto const  localFqn = localState->localRegistry->GetNodeId(node.handle);
-                localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, tnsr.sharddim), tnsr.handle);
-                addmd5(fmt::format("{}[{}]", localFqn, tnsr.sharddim), ComputeMd5Hex(data, size));
+                localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, sharddim), tnsr.handle);
+                addmd5(fmt::format("{}[{}]", localFqn, sharddim), ComputeMd5Hex(data, size));
             }
-            else if (type == StateNode::Type::ShardedTensor)
+            else if (type == StateNode::Type::DTensor)
             {
-                auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+                auto const& tnsr = std::get<DTensor>(node.data);
                 for (auto const& shard : tnsr.shards)
                 {
-                    auto const size     = shard.ShardSizeBytes(tnsr.dtype);
+                    auto const size     = shard.StorageSizeBytes();
                     auto const data     = localState->tensorStorage.AsSpan<char const>(shard.handle, size);
                     auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
                     localShardHandleMap.emplace(makeShardHandleKey(shard.rank, localFqn, shard.sharddim), shard.handle);
@@ -714,11 +740,11 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
             }
             return;
         }
-        if (type != StateNode::Type::ShardedTensor) { return; }
+        if (type != StateNode::Type::DTensor) { return; }
         auto const  nodeName = globalState.GetNodeId(node.handle);
         std::string name     = nodeName.starts_with("model.") ? nodeName.substr(std::string_view("model.").size()) : nodeName;
 
-        auto const& shardedTnsr = std::get<StateNode::ShardedTensor>(node.data);
+        auto const& shardedTnsr = std::get<DTensor>(node.data);
         if (shardedTnsr.shards.empty())
         {
             throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", name));
@@ -730,8 +756,8 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
         emit(name + ".properties.pin_memory", "False");
         emit(name + ".properties.requires_grad", "False");
 
-        StateNode::ShardedTensor::DimRange lastShard{};
-        size_t                             i = 0;
+        DTensor::DimRange lastShard{};
+        size_t            i = 0;
         for (auto const& rankShard : shardedTnsr.shards)
         {
             // Verify the per-rank handle recorded in the merged global registry matches
@@ -1040,8 +1066,8 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
 
     for (auto const& tensorShard : tensorShards)
     {
-        tensorShard.tensorInfo.AssertShardIsValid();
-        // Look up the node by its string NodeId
+        // tensorShard.tensorInfo.AssertShardIsValid();
+        //  Look up the node by its string NodeId
         auto it = tensorMap.find(tensorShard.nodeId);
         if (it == tensorMap.end())
         {
@@ -1049,50 +1075,39 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             auto [childName, parentNode] = sessionState.globalRegistry->FindOrAddNodeByFQN(stateName);
             // Add the final node which contains the handler
             auto& child = sessionState.globalRegistry->AddChild(parentNode, childName, true);
-            auto  shTen = StateNode::ShardedTensor(tensorShard.tensorInfo.dtype, tensorShard.tensorInfo.fulldim);
-            shTen.AddShard(StateNode::ShardedTensor::RankedTensorShard{
-                .sharddim = tensorShard.tensorInfo.sharddim,
-                .device   = tensorShard.tensorInfo.device,
-                .handle   = tensorShard.tensorInfo.handle,
-                .rank     = tensorShard.rank,
-            });
+            auto  shTen = DTensor(tensorShard.dtype, tensorShard.fulldim);
+            shTen.AddShard(tensorShard.tensorInfo);
             child.data                    = shTen;
             tensorMap[tensorShard.nodeId] = child.handle;
             continue;
         }
         auto  nodeHandle = it->second;
         auto& node       = sessionState.globalRegistry->GetNode(nodeHandle);
-        if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor))
+        if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor))
         {
             throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor='{}' expected-type={} != actual-type={}",
                                                  tensorShard.nodeId,
-                                                 static_cast<size_t>(StateNode::Type::ShardedTensor),
+                                                 static_cast<size_t>(StateNode::Type::DTensor),
                                                  node.data.index()));
         }
-        auto& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        auto& tnsr = std::get<DTensor>(node.data);
         if (tnsr.shards.empty())
         {
             throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", tensorShard.nodeId));
         }
 
-        tensorShard.tensorInfo.AssertShardIsValid();
-        if (tnsr.dtype != tensorShard.tensorInfo.dtype || tnsr.fulldim != tensorShard.tensorInfo.fulldim)
+        if (tnsr.dtype != tensorShard.dtype || tnsr.fulldim != tensorShard.fulldim)
         {
             throw std::runtime_error(fmt::format("Received incompatible replicas for tensor='{}': expected dtype={} full-shape=[{}], got "
                                                  "dtype={} full-shape=[{}] on rank={}",
                                                  tensorShard.nodeId,
                                                  tnsr.dtype,
                                                  tnsr.fulldim,
-                                                 tensorShard.tensorInfo.dtype,
-                                                 tensorShard.tensorInfo.fulldim,
-                                                 tensorShard.rank));
+                                                 tensorShard.dtype,
+                                                 tensorShard.fulldim,
+                                                 tensorShard.tensorInfo.rank));
         }
-        tnsr.AddShard({
-            .sharddim = tensorShard.tensorInfo.sharddim,
-            .device   = tensorShard.tensorInfo.device,
-            .handle   = tensorShard.tensorInfo.handle,
-            .rank     = tensorShard.rank,
-        });
+        tnsr.AddShard(tensorShard.tensorInfo);
     }
 }
 
@@ -1114,8 +1129,7 @@ void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string 
         boost::beast::http::request_serializer<boost::beast::http::buffer_body, boost::beast::http::fields> sr{req};
         boost::beast::http::write_header(stream, sr);
 
-        // Serialize and stream each TensorShardInfo as an individual HTTP chunk
-        // Format per entry: [rank: uint32][tensorInfo: DS4Tensor][nodeId_len: uint32][nodeId: bytes]
+        // Each record carries logical tensor metadata, a physical shard and its state path.
         size_t numTensors = 0;
 
         auto& localState = GetSessionLocalState_(rank);
@@ -1344,28 +1358,34 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     }
     BufStream istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
     auto      localRegistry = StateSerDes::Read(istrm);
-    Rank      rank          = localRegistry->Topo().rank;
-    auto      snapshotSize  = localRegistry->GetTotalSnapshotStateSizeInBytes();
-    auto      registryTopo  = localRegistry->Topo();
+    if (localRegistry->SessionId() != sessionId)
+    {
+        throw std::invalid_argument(
+            fmt::format("Local registry session {} does not match request session {}", localRegistry->SessionId(), sessionId));
+    }
+    ValidateLocalTensorMetadata(*localRegistry);
+    Rank rank         = localRegistry->Topo().rank;
+    auto snapshotSize = localRegistry->GetTotalSnapshotStateSizeInBytes();
+    auto registryTopo = localRegistry->Topo();
 
     // Reset tensor handles to be offsets in the local tensor storage.
     uint64_t offset = 0;
     localRegistry->WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
         {
-            auto& tnsr  = std::get<StateNode::TensorShard>(node.data);
+            auto& tnsr  = std::get<Tensor>(node.data);
             tnsr.handle = offset;
-            offset += tnsr.ShardSizeBytes();
+            offset += tnsr.StorageSizeBytes();
         }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::ShardedTensor))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
-            auto&                 tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            auto&                 tnsr = std::get<DTensor>(node.data);
             decltype(tnsr.shards) newShards;
             for (auto shard : tnsr.shards)
             {
                 shard.handle = offset;
                 newShards.insert(shard);
-                offset += shard.ShardSizeBytes(tnsr.dtype);
+                offset += shard.StorageSizeBytes();
             }    // will be filled in when tensor data is received
             tnsr.shards = std::move(newShards);
         }
@@ -1781,8 +1801,8 @@ void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
                             uint8_t queueCount,
                             size_t  slotCount)
 {
-    if (!_msgQueue.empty()) { return; }
     if (queueCount == 0) { throw std::invalid_argument("at least one shared-memory queue is required"); }
+    if (queueCount <= _msgQueue.size()) { return; }
     if (cipc::MsgQueue::MinimumShmSize(slotCount) > std::numeric_limits<size_t>::max() / queueCount)
     {
         throw std::overflow_error("configured shared-memory ring-buffer geometry is too large");
@@ -1792,12 +1812,15 @@ void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
     auto const totalSize    = cipc::MsgQueue::DetectShmSize(
         cipc::Message::RequestChannelName(_index, queueCount), configuredTotalSize, minimumTotal, slotCount);
     auto const queueSize = totalSize / queueCount;
-    _running             = true;
-    _msgQueue.assign(queueCount, nullptr);
-    std::latch queuesReady{queueCount};
+
+    _running              = true;
+    auto       neededMore = queueCount - _msgQueue.size();
+    std::latch queuesReady{static_cast<ptrdiff_t>(neededMore)};
     // Start server thread
     //_serverThread = std::thread([this]() {
-    for (uint8_t i = 0; i < queueCount; ++i)
+    auto origSize = _msgQueue.size();
+    _msgQueue.resize(queueCount);
+    for (auto i = origSize; i < queueCount; ++i)
     {
         _threads.emplace_back([this, i, queueSize, slotCount, queueCount, &queuesReady] {
             SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
@@ -1815,7 +1838,8 @@ void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
                 queueNuma           = numaNodes[domain];
                 BindThreadCpuToNumaNode(queueNuma);
             }
-            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, i), queueSize, slotCount);
+            auto const queueIndex = static_cast<uint8_t>(i);
+            auto       msgQueue   = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
             if (numaNodes.size() > 1)
             {
                 auto region = msgQueue.GetShmDataRegion();
@@ -2316,12 +2340,20 @@ void Server::ReceiveStateRegistryFragments_(cipc::SessionId const&              
         {
             TensorShardInfo info;
             uint32_t        nodeIdLen{};
-            readTrivial(info.rank);
+            readTrivial(info.dtype);
+            readTrivial(info.fulldim);
             readTrivial(info.tensorInfo);
+            info.tensorInfo.AssertShardIsValid(info.fulldim);
             readTrivial(nodeIdLen);
             info.nodeId = std::string(nodeIdLen, '\0');
             readBlob(info.nodeId.data(), nodeIdLen);
-            info.tensorInfo.AssertShardIsValid();
+            if (info.tensorInfo.rank != fromRank)
+            {
+                throw std::invalid_argument(fmt::format("Peer registry fragment from rank={} contains tensor '{}' owned by rank={}",
+                                                        fromRank,
+                                                        info.nodeId,
+                                                        info.tensorInfo.rank));
+            }
             tensorShards.push_back(std::move(info));
         }
         else if (recordTag == PeerRecordBlob)
@@ -2590,8 +2622,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
         if (it != segs.end())
         {
-            throw std::invalid_argument(
-                "Unexpected extra URL segments in globalregistry endpoint; globalregistry requires a /{sessionId}?fwd=<start>:<end> path");
+            throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint; globalregistry requires a "
+                                        "/{sessionId}?fwd=<start>:<end> path");
         }
         auto [fwdRangeStart, fwdRangeEnd] = [&] -> std::pair<size_t, size_t> {
             auto const fwdParam = url.params().find("fwd");
@@ -2929,12 +2961,12 @@ void Session::OnReceiveLocalStateRegistryAsync_(Rank const& rank)
         if (sessionState.globalRegistry == nullptr)
         {
             sessionState.globalRegistry = localState.localRegistry->Clone();
-            sessionState.globalRegistry->ConvertTensorShardsToShardedTensors();
+            sessionState.globalRegistry->ConvertTensorsToDTensor();
             sessionState.globalRegistry->WalkNodes([&](auto& node) {
-                if (node.data.index() == static_cast<size_t>(StateNode::Type::TensorShard))
+                if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
                 {
                     throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Unexpected TensorShard node in "
-                                                         "activeGlobalState. Should only contain ShardedTensor nodes",
+                                                         "activeGlobalState. Should only contain DTensor nodes",
                                                          *server,
                                                          sessionId,
                                                          sessionState.globalRegistry->GetNodeId(node.handle)));
@@ -2945,7 +2977,7 @@ void Session::OnReceiveLocalStateRegistryAsync_(Rank const& rank)
                     node.data = StateNode::Blob{};
                     return;
                 }
-                if (node.data.index() != static_cast<size_t>(StateNode::Type::ShardedTensor)) { return; }
+                if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)) { return; }
                 tensorMap[localState.localRegistry->GetNodeId(node.handle)] = node.handle;
             });
         }

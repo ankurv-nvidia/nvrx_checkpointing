@@ -120,6 +120,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         registry_finalized=0,
         rewrite_replica_ids=False,
         registered_replica_ids=[],
+        async_completions_waited=0,
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
@@ -133,6 +134,9 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     class Root:
         def finalize_registry(self) -> None:
             calls.registry_finalized += 1
+
+        def wait_for_async_completion(self) -> None:
+            calls.async_completions_waited += 1
 
     root = Root()
 
@@ -359,6 +363,7 @@ def test_native_load_registers_constructed_state(monkeypatch: pytest.MonkeyPatch
     assert calls.public_loads == [(state, "/checkpoint", None, {})]
     assert calls.native_loads == [(state, 0)]
     assert calls.registry_finalized == 1
+    assert calls.async_completions_waited == 1
 
 
 def test_native_load_registers_the_replica_ids_assigned_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,6 +418,7 @@ def test_native_load_registers_nothing_when_the_public_load_fails(monkeypatch: p
     assert len(calls.public_loads) == 1
     assert calls.native_loads == []
     assert calls.registry_finalized == 0
+    assert calls.async_completions_waited == 0
 
 
 def test_module_launcher_installs_before_running_entrypoint(

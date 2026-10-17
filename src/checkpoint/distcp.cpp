@@ -66,9 +66,9 @@ static constexpr uint8_t  PickleTuple3Opcode        = 0x87U;
 static constexpr uint8_t  PickleNewFalseOpcode      = 0x89U;
 static constexpr size_t   InitialPickleReserveBytes = 192;
 
-static std::string_view DTypeName(DS4Tensor::DType dtype)
+static std::string_view DTypeName(Tensor::DType dtype)
 {
-    using DT = DS4Tensor::DType;
+    using DT = Tensor::DType;
     switch (dtype)
     {
     case DT::Float16: return "float16";
@@ -101,9 +101,9 @@ struct DtypePickleInfo
 };
 }    // namespace
 
-static DtypePickleInfo PickleInfoForDtype(DS4Tensor::DType dtype)
+static DtypePickleInfo PickleInfoForDtype(Tensor::DType dtype)
 {
-    using DT = DS4Tensor::DType;
+    using DT = Tensor::DType;
     switch (dtype)
     {
     case DT::Float16: return {.useV3 = false, .storageMod = "torch", .storageName = "HalfStorage", .dtypeMod = "", .dtypeName = ""};
@@ -214,7 +214,7 @@ static void PickleTupleClose(ByteBuffer& b, size_t n)
 
 // Precondition: shape is non-empty. WriteRankShard builds shapes from
 // `sharddim`, which is non-empty for every tensor we write.
-static ByteBuffer BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape)
+static ByteBuffer BuildDataPkl(Tensor::DType dtype, Tensor::Dim const& shape)
 {
     auto const info = PickleInfoForDtype(dtype);
 
@@ -223,12 +223,12 @@ static ByteBuffer BuildDataPkl(DS4Tensor::DType dtype, DS4Tensor::Dim const& sha
 
     // Row-major contiguous stride. inplace_vector lacks `resize`, so seed with
     // a placeholder then overwrite via operator[].
-    DS4Tensor::Dim stride;
+    Tensor::Dim stride;
     for (size_t i = 0; i < shape.size(); ++i) { stride.push_back(0); }
     stride[shape.size() - 1] = 1;
     for (size_t i = shape.size() - 1; i-- > 0;) { stride[i] = stride[i + 1] * shape[i + 1]; }
 
-    uint64_t const storageSize = info.useV3 ? numel * DynamicSharded4TensorTraits::GetDTypeSize(dtype) : numel;
+    uint64_t const storageSize = info.useV3 ? numel * Tensor::GetDTypeSize(dtype) : numel;
 
     ByteBuffer out;
     out.reserve(InitialPickleReserveBytes);
@@ -406,7 +406,7 @@ constexpr std::string_view StorageAlignmentBytes = "64";
 constexpr std::string_view ByteorderBytes        = "little";
 constexpr std::string_view VersionBytes          = "3\n";
 
-uint64_t ComputeShardArchiveSize(DS4Tensor::DType dtype, DS4Tensor::Dim const& shape, uint64_t shardDataSize)
+uint64_t ComputeShardArchiveSize(Tensor::DType dtype, Tensor::Dim const& shape, uint64_t shardDataSize)
 {
     if (shardDataSize >= MZ_UINT32_MAX)
     {
@@ -594,12 +594,12 @@ static void FinishOutputFile(std::ofstream& output, std::filesystem::path const&
 // avoids miniz's much slower scalar CRC while still streaming directly to
 // `output`. StreamZipWrite changes miniz's DEFLATED method marker back to
 // STORED, so the resulting archive remains byte-identical to PyTorch's.
-static uint64_t WriteShardArchive(std::ostream&         output,
-                                  DS4Tensor::DType      dtype,
-                                  DS4Tensor::Dim const& shape,
-                                  char const*           srcPtr,
-                                  uint64_t              length,
-                                  std::string_view      contextName)
+static uint64_t WriteShardArchive(std::ostream&      output,
+                                  Tensor::DType      dtype,
+                                  Tensor::Dim const& shape,
+                                  char const*        srcPtr,
+                                  uint64_t           length,
+                                  std::string_view   contextName)
 {
     ByteBuffer dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
@@ -831,7 +831,7 @@ template <typename TInts> static void EmitTorchSize(ByteBuffer& b, TInts const& 
     PutU8(b, 'R');                   // REDUCE — call torch.Size(dims_tuple)
 }
 
-static void EmitTorchDtype(ByteBuffer& b, DS4Tensor::DType dtype)
+static void EmitTorchDtype(ByteBuffer& b, Tensor::DType dtype)
 {
     // torch.<dtype> is a module-level attribute (singleton); GLOBAL pushes it directly.
     checkpoint::distcp::PickleGlobal(b, "torch", checkpoint::distcp::DTypeName(dtype));
@@ -861,7 +861,7 @@ static void EmitMemoryFormatContiguousEnum(ByteBuffer& b)
     PutU8(b, 'R');                          // REDUCE — _MEM_FORMAT_ENCODING(0)
 }
 
-static void EmitTensorProperties(ByteBuffer& b, DS4Tensor::DType dtype)
+static void EmitTensorProperties(ByteBuffer& b, Tensor::DType dtype)
 {
     // TensorProperties has a custom __getstate__/__setstate__ that uses a
     // 5-tuple (not a dict): (dtype, layout, requires_grad, mem_format_encoding,
@@ -880,27 +880,25 @@ static void EmitTensorProperties(ByteBuffer& b, DS4Tensor::DType dtype)
     PutU8(b, 'b');                     // BUILD — apply via __setstate__
 }
 
-static void EmitChunkStorageMetadata(ByteBuffer& b, DS4Tensor::DimRange const& sharddim)
+static void EmitChunkStorageMetadata(ByteBuffer& b, Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "ChunkStorageMetadata");
 
     checkpoint::distcp::PickleBinunicode(b, "offsets");
-    DS4Tensor::Dim offsets;
+    Tensor::Dim offsets;
     for (auto const& r : sharddim) { offsets.push_back(r.begin); }
     EmitTorchSize(b, offsets);
 
     checkpoint::distcp::PickleBinunicode(b, "sizes");
-    DS4Tensor::Dim sizes;
+    Tensor::Dim sizes;
     for (auto const& r : sharddim) { sizes.push_back(r.end - r.begin); }
     EmitTorchSize(b, sizes);
 
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitTensorStorageMetadata(ByteBuffer&                             b,
-                                      DS4Tensor::DType                        dtype,
-                                      DS4Tensor::Dim const&                   fulldim,
-                                      std::vector<DS4Tensor::DimRange> const& chunks)
+static void
+EmitTensorStorageMetadata(ByteBuffer& b, Tensor::DType dtype, Tensor::Dim const& fulldim, std::vector<Tensor::DimRange> const& chunks)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "TensorStorageMetadata");
 
@@ -919,7 +917,7 @@ static void EmitTensorStorageMetadata(ByteBuffer&                             b,
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitMetadataIndex(ByteBuffer& b, std::string_view fqn, DS4Tensor::DimRange const& sharddim)
+static void EmitMetadataIndex(ByteBuffer& b, std::string_view fqn, Tensor::DimRange const& sharddim)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
 
@@ -927,7 +925,7 @@ static void EmitMetadataIndex(ByteBuffer& b, std::string_view fqn, DS4Tensor::Di
     PickleBinunicode(b, fqn);
 
     PickleBinunicode(b, "offset");
-    DS4Tensor::Dim offsets;
+    Tensor::Dim offsets;
     for (auto const& r : sharddim) { offsets.push_back(r.begin); }
     EmitTorchSize(b, offsets);
 
@@ -976,13 +974,13 @@ static void EmitMetadataIndexBytes(ByteBuffer& b, std::string_view fqn)
     EmitNewObjBuildEnd(b);
 }
 
-static std::vector<DS4Tensor::DimRange> CollectChunkRanges(StateNode::ShardedTensor const& tensor)
+static std::vector<Tensor::DimRange> CollectChunkRanges(DTensor const& tensor)
 {
-    std::vector<DS4Tensor::DimRange> chunkRanges;
+    std::vector<Tensor::DimRange> chunkRanges;
     chunkRanges.reserve(tensor.shards.size());
     for (auto const& shard : tensor.shards)
     {
-        if (shard.ShardSizeBytes(tensor.dtype) == 0) { continue; }
+        if (shard.StorageSizeBytes() == 0) { continue; }
         // Replicas can be separated by rank ordering, so compare with every
         // range already collected rather than only the previous shard.
         if (std::ranges::find(chunkRanges, shard.sharddim) == chunkRanges.end()) { chunkRanges.push_back(shard.sharddim); }
@@ -1007,9 +1005,9 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     PutU8(b, '(');    // MARK
     globalRegistry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        assert(type != StateNode::Type::TensorShard);
-        if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const& tnsr        = std::get<StateNode::ShardedTensor>(node.data);
+        assert(type != StateNode::Type::Tensor);
+        if (type != StateNode::Type::DTensor) { return; }
+        auto const& tnsr        = std::get<DTensor>(node.data);
         auto const  chunkRanges = CollectChunkRanges(tnsr);
         if (chunkRanges.empty()) { return; }
         auto const fqn = globalRegistry.GetNodeId(node.handle);
@@ -1047,15 +1045,15 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     std::unordered_map<Rank, uint64_t> rankCursors;
     globalRegistry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const&         tnsr = std::get<StateNode::ShardedTensor>(node.data);
-        auto const          fqn  = globalRegistry.GetNodeId(node.handle);
-        DS4Tensor::DimRange lastShard{};
+        if (type != StateNode::Type::DTensor) { return; }
+        auto const&      tnsr = std::get<DTensor>(node.data);
+        auto const       fqn  = globalRegistry.GetNodeId(node.handle);
+        Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
-            auto const shardSize = shard.ShardSizeBytes(tnsr.dtype);
+            auto const shardSize = shard.StorageSizeBytes();
             if (shardSize == 0) { continue; }
-            DS4Tensor::Dim shardShape;
+            Tensor::Dim shardShape;
             for (auto const& r : shard.sharddim) { shardShape.push_back(r.end - r.begin); }
             uint64_t const archiveLen = ComputeShardArchiveSize(tnsr.dtype, shardShape, shardSize);
             uint64_t&      cursor     = rankCursors[shard.rank];
@@ -1118,8 +1116,8 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     if (!hasPayload)
     {
         registry.WalkNodes([&](StateNode const& node) {
-            if (hasPayload || static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::ShardedTensor) { return; }
-            auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+            if (hasPayload || static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
+            auto const& tnsr = std::get<DTensor>(node.data);
             // A zero-element tensor is still a DCP write item and therefore
             // still produces a torch.save archive in the NVRx writer.
             hasPayload = std::ranges::any_of(tnsr.shards, [&](auto const& shard) { return shard.rank == rank; });
@@ -1143,18 +1141,18 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         // The registry handed in is always the post-merge global registry
-        // (ShardedTensor entries keyed by rank). Tests construct it with
+        // (DTensor entries keyed by rank). Tests construct it with
         // the same shape.
-        assert(type != StateNode::Type::TensorShard);
-        if (type != StateNode::Type::ShardedTensor) { return; }
-        auto const& tnsr = std::get<StateNode::ShardedTensor>(node.data);
+        assert(type != StateNode::Type::Tensor);
+        if (type != StateNode::Type::DTensor) { return; }
+        auto const& tnsr = std::get<DTensor>(node.data);
         auto const  fqn  = registry.GetNodeId(node.handle);
         for (auto const& shard : tnsr.shards)
         {
             if (shard.rank != rank) { continue; }
-            auto const size = shard.ShardSizeBytes(tnsr.dtype);
+            auto const size = shard.StorageSizeBytes();
             if (size == 0) { continue; }
-            DS4Tensor::Dim shape{};
+            Tensor::Dim shape{};
             for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
             // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
             // per-entry call site (the m_zip64 flag) plus the alignment math;

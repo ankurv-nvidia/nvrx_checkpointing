@@ -33,14 +33,14 @@ namespace
 struct InputEntry
 {
     std::string                fqn;
-    DS4Tensor::DType           dtype{};
+    Tensor::DType              dtype{};
     std::vector<size_t>        shape;
     std::vector<unsigned char> bytes;
 };
 }    // namespace
-static DS4Tensor::DType ParseDType(std::string const& name)
+static Tensor::DType ParseDType(std::string const& name)
 {
-    using DT = DS4Tensor::DType;
+    using DT = Tensor::DType;
     if (name == "float16") { return DT::Float16; }
     if (name == "bfloat16") { return DT::BFloat16; }
     if (name == "float32") { return DT::Float32; }
@@ -63,9 +63,9 @@ static InputEntry ConvertEntry(nb::tuple const& t)
     e.fqn   = nb::cast<std::string>(t[0]);
     e.dtype = ParseDType(nb::cast<std::string>(t[1]));
     e.shape = nb::cast<std::vector<size_t>>(t[2]);
-    if (e.shape.empty() || e.shape.size() > DS4Tensor::MaxDims)
+    if (e.shape.empty() || e.shape.size() > Tensor::MaxDims)
     {
-        throw std::runtime_error(fmt::format("distcp_shim: shape rank {} out of range [1, {}]", e.shape.size(), DS4Tensor::MaxDims));
+        throw std::runtime_error(fmt::format("distcp_shim: shape rank {} out of range [1, {}]", e.shape.size(), Tensor::MaxDims));
     }
     auto data = nb::cast<nb::bytes>(t[3]);
     e.bytes.resize(data.size());
@@ -121,9 +121,9 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
         .peersPerNode = 1,
         .peers        = {"localhost"},
     };
-    StateTree tree(std::move(topo));
+    StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
 
-    // Build the tree in the post-merge global-registry shape — ShardedTensor
+    // Build the tree in the post-merge global-registry shape — DTensor
     // leaves keyed by rank — since that's what WriteRankShard's assert
     // expects. For the parity shim every entry is one shard owned by the
     // calling rank covering the full shape.
@@ -132,15 +132,21 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
     {
         std::memcpy(tensorStorage[offset], e.bytes.data(), e.bytes.size());
 
-        DS4Tensor::Dim fulldim;
+        Tensor::Dim fulldim;
         for (auto d : e.shape) { fulldim.push_back(d); }
-        DS4Tensor::DimRange sharddim;
+        Tensor::DimRange sharddim;
         for (auto d : e.shape) { sharddim.push_back({.begin = 0, .end = d}); }
 
-        auto [leafName, parent]       = tree.FindOrAddNodeByFQN(e.fqn);
-        auto&                    leaf = tree.AddChild(parent, leafName);
-        StateNode::ShardedTensor st(e.dtype, fulldim);
-        st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = offset, .rank = Rank{rank}});
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(e.fqn);
+        auto&   leaf            = tree.AddChild(parent, leafName);
+        DTensor st(e.dtype, fulldim);
+        st.AddShard({
+            .rank        = Rank{rank},
+            .handle      = offset,
+            .storageSize = e.bytes.size(),
+            .sharddim    = sharddim,
+            .device      = DeviceId{"cpu"},
+        });
         leaf.data = std::move(st);
 
         offset += e.bytes.size();
@@ -155,7 +161,7 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
     uint64_t cursor = 0;
     for (auto const& e : entries)
     {
-        DS4Tensor::Dim shape;
+        Tensor::Dim shape;
         for (auto d : e.shape) { shape.push_back(d); }
         uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(e.dtype, shape, e.bytes.size());
 
@@ -167,13 +173,13 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
     return out;
 }
 
-static DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
+static Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 {
-    DS4Tensor::DimRange out;
-    auto                sdList = nb::cast<nb::list>(sd);
-    if (sdList.empty() || sdList.size() > DS4Tensor::MaxDims)
+    Tensor::DimRange out;
+    auto             sdList = nb::cast<nb::list>(sd);
+    if (sdList.empty() || sdList.size() > Tensor::MaxDims)
     {
-        throw std::runtime_error(fmt::format("distcp_shim: sharddim rank {} out of range [1, {}]", sdList.size(), DS4Tensor::MaxDims));
+        throw std::runtime_error(fmt::format("distcp_shim: sharddim rank {} out of range [1, {}]", sdList.size(), Tensor::MaxDims));
     }
     for (auto&& i : sdList)
     {
@@ -186,7 +192,7 @@ static DS4Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 
 // `tensors`: list of (fqn, dtype_name, full_shape, shards) where `shards` is a
 // list of (rank, sharddim, file_offset, length). The shim assembles a global
-// StateTree with one ShardedTensor per fqn, populated with the per-rank chunks,
+// StateTree with one DTensor per fqn, populated with the per-rank chunks,
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
 // The (file_offset, length) values are used as the verification side-channel
 // inside WriteMetadata — they're asserted against the analytical prediction.
@@ -199,7 +205,7 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
         .peersPerNode = 1,
         .peers        = {"localhost"},
     };
-    StateTree tree(std::move(topo));
+    StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
 
     for (auto const& tensor : tensors)
     {
@@ -213,18 +219,18 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
         auto fullShape = nb::cast<std::vector<size_t>>(t[2]);
         auto shards    = nb::cast<nb::list>(t[3]);
 
-        if (fullShape.empty() || fullShape.size() > DS4Tensor::MaxDims)
+        if (fullShape.empty() || fullShape.size() > Tensor::MaxDims)
         {
             throw std::runtime_error(
-                fmt::format("distcp_shim: full_shape rank {} out of range [1, {}]", fullShape.size(), DS4Tensor::MaxDims));
+                fmt::format("distcp_shim: full_shape rank {} out of range [1, {}]", fullShape.size(), Tensor::MaxDims));
         }
 
-        DS4Tensor::Dim fulldim;
+        Tensor::Dim fulldim;
         for (auto d : fullShape) { fulldim.push_back(d); }
 
-        auto [leafName, parent]       = tree.FindOrAddNodeByFQN(fqn);
-        auto&                    leaf = tree.AddChild(parent, leafName);
-        StateNode::ShardedTensor st(dtype, fulldim);
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        auto&   leaf            = tree.AddChild(parent, leafName);
+        DTensor st(dtype, fulldim);
 
         for (auto&& shard : shards)
         {
@@ -233,7 +239,15 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
             auto const rank     = Rank{nb::cast<uint32_t>(entry[0])};
             auto const sharddim = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
 
-            st.AddShard({.sharddim = sharddim, .device = DeviceId{"cpu"}, .handle = 0, .rank = rank});
+            uint64_t storageSize = Tensor::GetDTypeSize(dtype);
+            for (auto const& range : sharddim) { storageSize *= range.end - range.begin; }
+            st.AddShard({
+                .rank        = rank,
+                .handle      = 0,
+                .storageSize = storageSize,
+                .sharddim    = sharddim,
+                .device      = DeviceId{"cpu"},
+            });
         }
 
         leaf.data = std::move(st);

@@ -5,9 +5,15 @@
       "name": "Python Debugger: Remote Attach",
       "type": "debugpy",
       "request": "attach",
-      "connect": { "host": "localhost", "port": 5678 },
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      },
       "pathMappings": [
-        { "localRoot": "${workspaceFolder}", "remoteRoot": "." }
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "."
+        }
       ],
       "justMyCode": false
     },
@@ -22,21 +28,30 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/distcp_trace.py",
-      "args": ["--checkpoint-dir", "${workspaceFolder}/../../../iter_0000250"]
+      "args": [
+        "--checkpoint-dir",
+        "${workspaceFolder}/../../../iter_0000250"
+      ]
     },
     {
       "name": "py-pretrain-mamba",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
-      "args": ["pretrain-native", "--gpus-per-node=1"]
+      "args": [
+        "pretrain-native",
+        "--gpus-per-node=1"
+      ]
     },
     {
       "name": "py-pretrain-mamba-multi",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
-      "args": ["pretrain-native", "--gpus-per-node=2"],
+      "args": [
+        "pretrain-native",
+        "--gpus-per-node=2"
+      ],
       "subProcess": true
     },
     {
@@ -73,7 +88,9 @@
         "PYTHONPATH": "${workspaceFolder}/../.."
       },
       "disableASLR": false,
-      "initCommands": ["settings set target.process.follow-fork-mode child"]
+      "initCommands": [
+        "settings set target.process.follow-fork-mode child"
+      ]
     },
     {
       "name": "benchmark-1dev-ckpt",
@@ -101,7 +118,9 @@
       "type": "lldb-dap",
       "request": "launch",
       "program": "${command:python.interpreterPath}", //Users/ankurv/cmakebuild/python_venv/bin/python3",
-      "args": ["${workspaceFolder}/src/python3/test.py"],
+      "args": [
+        "${workspaceFolder}/src/python/test.py"
+      ],
       "cwd": "${command:cmake.getLaunchTargetDirectory}",
       "env": {
         //"PATH": "/opt/homebrew/bin:$PATH",
@@ -112,7 +131,7 @@
       "name": "py-test.py",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/src/python3/test.py",
+      "program": "${workspaceFolder}/src/python/test.py",
       "cwd": "${command:cmake.getLaunchTargetDirectory}",
       "env": {
         //"PATH": "/opt/homebrew/bin:$PATH",

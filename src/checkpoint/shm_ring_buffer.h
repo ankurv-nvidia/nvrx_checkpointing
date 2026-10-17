@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -247,6 +248,7 @@ template <typename THdr> struct ShmRingBuffer
     static ShmRingBuffer Create(std::string name, size_t totalShmSize, size_t slotCount)
     { return {std::move(name), true, totalShmSize, slotCount}; }
     static ShmRingBuffer Open(std::string name) { return {std::move(name), false, 0, 0}; }
+    static auto OpenUniquePtr(std::string name) { return std::unique_ptr<ShmRingBuffer>(new ShmRingBuffer(std::move(name), false, 0, 0)); }
 
     // Find the largest per-node budget the shared-memory filesystem accepts:
     // start from maxShmSize and halve on ENOSPC. The probe is a dedicated

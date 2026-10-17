@@ -25,9 +25,10 @@ struct Server;
 
 struct TensorShardInfo
 {
-    checkpoint::ipc::Rank rank{};
-    DS4Tensor             tensorInfo{};
-    StateTree::NodeId     nodeId;
+    Tensor::DType     dtype{};
+    Tensor::Dim       fulldim;
+    DTensor::Shard    tensorInfo;
+    StateTree::NodeId nodeId;
 };
 
 struct Session

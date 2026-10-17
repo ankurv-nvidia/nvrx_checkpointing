@@ -1,10 +1,11 @@
 """Unit tests for ``scripts/registry_tree.py``.
 
-Writes small registries in the checkpoint daemon's serialization (rank
-topology, then the flattened state tree) for per-rank and global views of the
-same two-rank state. Checks per-rank and unique sizes, scalar and blob
-decoding, input selection, the page payload, the page's JavaScript data layer
-(when node is installed), and that the script runs without torch or numpy.
+Writes small registries in the checkpoint daemon's binary serialization
+(session ID, rank topology, then the flattened state tree) for per-rank and
+global views of the same two-rank state. Checks physical tensor storage sizes,
+logical tensor metadata, scalar and blob decoding, input selection, the page
+payload, the page's JavaScript data layer (when node is installed), and that
+the script runs without torch or numpy.
 
 Single-process and CPU-only.
 """
@@ -17,6 +18,7 @@ import gzip
 import importlib.util
 import io
 import json
+import math
 import re
 import shutil
 import struct
@@ -37,12 +39,13 @@ _spec.loader.exec_module(registry_tree)
 page = registry_tree.page
 
 _BF16, _F32, _I64 = 2, 3, 12
-_DICT, _SCALAR, _BLOB, _TENSOR_SHARD, _SHARDED_TENSOR = 1, 2, 3, 4, 5
+_DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR = 1, 2, 3, 4, 5
 _INT64_BITS = 0b10100
 _DOUBLE_BITS = 0b11100
 _LR = struct.unpack("<Q", struct.pack("<d", 0.25))[0]
 _REMOVED = 0xFFFFFFFF
 _PEER = "node-a:4100"
+_SESSION_ID = 73
 _NODE = shutil.which("node")
 _NODE_DRIVER = r"""
 const fs = require("fs");
@@ -73,20 +76,25 @@ const DT = require(path.join(dir, "page.js"));
 
 
 def _dim(dims: tuple[int, ...]) -> bytes:
-    return struct.pack("<5Q", *dims, *[0] * (4 - len(dims)), len(dims))
+    return struct.pack("<5Q", *dims, *(0 for _ in range(4 - len(dims))), len(dims))
 
 
 def _ranges(ranges: list[tuple[int, int]]) -> bytes:
     flat = [value for pair in ranges for value in pair]
-    return struct.pack("<9Q", *flat, *[0] * (8 - len(flat)), len(ranges))
+    return struct.pack("<9Q", *flat, *(0 for _ in range(8 - len(flat))), len(ranges))
+
+
+def _logical_size(dtype: int, dims: tuple[int, ...]) -> int:
+    return math.prod(dims) * {_BF16: 2, _F32: 4, _I64: 8}[dtype]
 
 
 class _Tree:
     """Serializes a hand-built state tree the way the checkpoint daemon does."""
 
-    def __init__(self, rank: int, world: int = 2) -> None:
+    def __init__(self, rank: int, world: int = 2, session_id: int = _SESSION_ID) -> None:
         self.rank = rank
         self.world = world
+        self.session_id = session_id
         self.nodes: list[list] = [[0, 0, "", _DICT, []]]
         self.dicts = {"": 0}
 
@@ -114,7 +122,7 @@ class _Tree:
         self.nodes.append([_REMOVED, _REMOVED, "", 0, None])
 
     def write(self, path: Path) -> None:
-        out = bytearray(struct.pack("<IIII", self.rank, self.world, 2, 1))
+        out = bytearray(struct.pack("<IIIII", self.session_id, self.rank, self.world, 2, 1))
         out += struct.pack("<I", len(_PEER)) + _PEER.encode()
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
@@ -125,13 +133,16 @@ class _Tree:
                 out += struct.pack("<B7xQ", *payload)
             elif kind == _BLOB:
                 out += struct.pack("<I", len(payload)) + payload
-            elif kind == _TENSOR_SHARD:
-                dtype, fulldim, ranges = payload
-                out += _ranges(ranges) + _dim(fulldim) + struct.pack("<B7xQ4sI", dtype, 0, b"cuda", 0)
-            elif kind == _SHARDED_TENSOR:
+            elif kind == _TENSOR:
+                dtype, fulldim, storage_size, device, device_index = payload
+                out += struct.pack("<B7xQQ", dtype, 0x1000 + handle, storage_size)
+                out += _dim(fulldim) + struct.pack("<4sI", device, device_index)
+            elif kind == _DTENSOR:
                 dtype, fulldim, shards = payload
                 out += struct.pack("<IB", len(shards), dtype) + _dim(fulldim)
-                out += b"".join(_ranges(ranges) + struct.pack("<4sIQII", b"cuda", 0, 0, rank, 0) for rank, ranges in shards)
+                for shard_index, (rank, ranges, storage_size, device, device_index) in enumerate(shards):
+                    out += struct.pack("<I4xQQ", rank, 0x100000 + (handle << 8) + shard_index, storage_size)
+                    out += _ranges(ranges) + struct.pack("<4sI", device, device_index)
         path.write_bytes(bytes(out))
 
 
@@ -146,14 +157,21 @@ def _per_rank(common: bytes) -> list[_Tree]:
     for rank in range(2):
         tree = _Tree(rank)
         rows = [(2 * rank, 2 * rank + 2), (0, 6)]
-        tree.add("model.layers.0.weight", _TENSOR_SHARD, (_BF16, (4, 6), rows))
-        for layer in range(2):
-            tree.add("model.experts.fc1.weight", _TENSOR_SHARD, (_F32, (2, 8, 4), [(layer, layer + 1), (4 * rank, 4 * rank + 4), (0, 4)]))
-        tree.add("model.norm.weight", _TENSOR_SHARD, (_BF16, (6,), [(0, 6)]))
-        tree.add("optimizer.state.exp_avg.model.layers.0.weight", _TENSOR_SHARD, (_F32, (4, 6), rows))
+        tree.add("model.layers.0.weight", _DTENSOR, (_BF16, (4, 6), [(rank, rows, 12, b"cuda", rank)]))
+        expert_shards = [
+            (rank, [(layer, layer + 1), (4 * rank, 4 * rank + 4), (0, 4)], 64, b"cuda", rank) for layer in range(2)
+        ]
+        tree.add("model.experts.fc1.weight", _DTENSOR, (_F32, (2, 8, 4), expert_shards))
+        tree.add("model.norm.weight", _TENSOR, (_BF16, (6,), _logical_size(_BF16, (6,)), b"cuda", rank))
+        tree.add(
+            "optimizer.state.exp_avg.model.layers.0.weight",
+            _DTENSOR,
+            (_F32, (4, 6), [(rank, rows, 48, b"cuda", rank)]),
+        )
         if rank == 0:
-            tree.add("model.embed.weight", _TENSOR_SHARD, (_I64, (10, 4), [(0, 10), (0, 4)]))
+            tree.add("model.embed.weight", _TENSOR, (_I64, (10, 4), _logical_size(_I64, (10, 4)), b"cuda", rank))
             tree.add("common_state/shard_0_1", _BLOB, common)
+        tree.add("model.loss_scale", _TENSOR, (_F32, (), 4, b"cpu\0", 0))
         tree.add(f"rng_state/shard_0.{rank}_1.2", _BLOB, b"x" * (100 + rank))
         tree.add("train.iteration", _SCALAR, (_INT64_BITS, 7 + rank))
         tree.add("train.lr", _SCALAR, (_DOUBLE_BITS, _LR))
@@ -163,13 +181,22 @@ def _per_rank(common: bytes) -> list[_Tree]:
 
 def _global() -> _Tree:
     tree = _Tree(0)
-    tree.add("model.layers.0.weight", _SHARDED_TENSOR, (_BF16, (4, 6), [(r, [(2 * r, 2 * r + 2), (0, 6)]) for r in range(2)]))
-    experts = [(r, [(layer, layer + 1), (4 * r, 4 * r + 4), (0, 4)]) for r in range(2) for layer in range(2)]
-    tree.add("model.experts.fc1.weight", _SHARDED_TENSOR, (_F32, (2, 8, 4), experts))
-    tree.add("model.norm.weight", _SHARDED_TENSOR, (_BF16, (6,), [(r, [(0, 6)]) for r in range(2)]))
-    exp_avg = [(r, [(2 * r, 2 * r + 2), (0, 6)]) for r in range(2)]
-    tree.add("optimizer.state.exp_avg.model.layers.0.weight", _SHARDED_TENSOR, (_F32, (4, 6), exp_avg))
-    tree.add("model.embed.weight", _SHARDED_TENSOR, (_I64, (10, 4), [(0, [(0, 10), (0, 4)])]))
+    layers = [(r, [(2 * r, 2 * r + 2), (0, 6)], 12, b"cuda", r) for r in range(2)]
+    tree.add("model.layers.0.weight", _DTENSOR, (_BF16, (4, 6), layers))
+    experts = [
+        (r, [(layer, layer + 1), (4 * r, 4 * r + 4), (0, 4)], 64, b"cuda", r)
+        for r in range(2)
+        for layer in range(2)
+    ]
+    tree.add("model.experts.fc1.weight", _DTENSOR, (_F32, (2, 8, 4), experts))
+    norm = [(r, [(0, 6)], 12, b"cuda", r) for r in range(2)]
+    tree.add("model.norm.weight", _DTENSOR, (_BF16, (6,), norm))
+    exp_avg = [(r, [(2 * r, 2 * r + 2), (0, 6)], 48, b"cuda", r) for r in range(2)]
+    tree.add("optimizer.state.exp_avg.model.layers.0.weight", _DTENSOR, (_F32, (4, 6), exp_avg))
+    embed = [(0, [(0, 10), (0, 4)], 320, b"cuda", 0)]
+    tree.add("model.embed.weight", _DTENSOR, (_I64, (10, 4), embed))
+    loss_scale = [(r, [], 4, b"cpu\0", 0) for r in range(2)]
+    tree.add("model.loss_scale", _DTENSOR, (_F32, (), loss_scale))
     tree.removed()
     tree.add("common_state/shard_0_1", _BLOB, b"")
     tree.add("rng_state/shard_0.0_1.2", _BLOB, b"")
@@ -201,14 +228,38 @@ def _tensor_bytes(report: object) -> dict[int, int]:
 def test_per_rank_registries(tmp_path: Path) -> None:
     common = _torch_blob({"iteration": 7}, padding=64)
     _write_per_rank(tmp_path, common)
+    registry = registry_tree.read_registry(tmp_path / "registry.0.bin")
     report = registry_tree.analyze([tmp_path])
     leaves = {leaf.fqn: leaf for leaf in report.leaves}
 
+    assert (registry.session_id, registry.trailing) == (_SESSION_ID, 0)
+    scalar_tensor = next(
+        payload for handle, kind, payload in registry.entries if kind == _TENSOR and registry.names[handle] == "loss_scale"
+    )
+    assert (scalar_tensor.storage_size, scalar_tensor.full_dim) == (4, ())
+    layer = next(
+        payload for _, kind, payload in registry.entries if kind == _DTENSOR and payload.dtype == _BF16 and payload.full_dim == (4, 6)
+    )
+    assert (layer.shards[0].storage_size, layer.shards[0].ranges) == (
+        12,
+        ((0, 2), (0, 6)),
+    )
     assert (report.ranks, report.files, report.warnings, report.hosts, report.ranks_per_host) == (2, 2, [], [_PEER], 2)
-    assert _tensor_bytes(report) == {0: 532, 1: 212}
+    assert _tensor_bytes(report) == {0: 524, 1: 204}
     fc1 = leaves["model.experts.fc1.weight"]
     assert (fc1.dtype, fc1.shape, fc1.chunk_count(), fc1.unique, fc1.layout()) == ("float32", (2, 8, 4), 4, 256, f"4 {chr(0xD7)} [1, 4, 4]")
     assert (leaves["model.norm.weight"].nbytes, leaves["model.norm.weight"].unique) == (24, 12)
+    layers = leaves["model.layers.0.weight"]
+    assert (layers.nbytes, layers.unique, layers.shape) == (24, 24, (4, 6))
+    assert layers.storage == "physical tensor shard storage bytes in per-rank registries"
+    loss_scale = leaves["model.loss_scale"]
+    assert (loss_scale.kind, loss_scale.shape, loss_scale.nbytes, loss_scale.unique, loss_scale.layout()) == (
+        "scalar",
+        (),
+        8,
+        4,
+        f"2 {chr(0xD7)} []",
+    )
     iteration = leaves["train.iteration"]
     assert (iteration.kind, iteration.nbytes, iteration.unique, iteration.rank_labels) == ("scalar", 16, 8, {0: "= 7", 1: "= 8"})
     assert iteration.blob == {"k": "scalar", "t": "int64", "b": 8, "v": "2 distinct values across ranks"}
@@ -224,7 +275,7 @@ def test_global_registry(tmp_path: Path) -> None:
     leaves = {leaf.fqn: leaf for leaf in report.leaves}
 
     assert (report.ranks, report.files) == (2, 1)
-    assert _tensor_bytes(report) == {0: 532, 1: 212}
+    assert _tensor_bytes(report) == {0: 524, 1: 204}
     assert leaves["model.norm.weight"].unique == 12
     common = leaves["common_state/shard_0_1"]
     assert (common.nbytes, list(common.ranks)) == (0, [page.UNKNOWN_RANK])
@@ -259,6 +310,12 @@ def test_input_selection_and_errors(tmp_path: Path) -> None:
     _global().write(tmp_path / "registry.bin")
     assert registry_tree.analyze([tmp_path]).warnings == ["ignored 1 global registry file(s) because per-rank registries were given"]
 
+    mixed = tmp_path / "mixed"
+    _write_per_rank(mixed)
+    _Tree(1, session_id=_SESSION_ID + 1).write(mixed / "registry.1.bin")
+    with pytest.raises(ValueError, match="disagree on the session ID"):
+        registry_tree.analyze([mixed])
+
     partial = tmp_path / "partial"
     partial.mkdir()
     trees[1].write(partial / "registry.rank1.bin")
@@ -290,8 +347,10 @@ def test_page_payload(tmp_path: Path) -> None:
 
     assert (doc["options"]["unique"], doc["options"]["values"]) == (True, True)
     assert (doc["inputLabel"], doc["hosts"], doc["ranksPerHost"]) == ("Registries", [_PEER], 2)
-    assert doc["summary"]["uniqueBytes"] == 732 + len(b"common") + 100 + 101 + 8 + 8
+    assert doc["summary"]["uniqueBytes"] == 712 + len(b"common") + 100 + 101 + 8 + 8
     assert items["train.iteration"]["st"] == "64-bit scalar in per-rank registries"
+    assert items["model.layers.0.weight"]["b"] == 24
+    assert "physical storage bytes" in report.notes[0]
     assert {"= 7", "= 8", "= 0.25"} <= set(doc["shapes"])
     assert "<title>regs &lt;2&gt;</title>" in page.render_html(doc, binary)
 
@@ -311,8 +370,8 @@ def test_page_data_layer_counts_replicas_once_in_unique(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     values = json.loads(result.stdout)
 
-    rank0 = 532 + len(b"common") + 100 + 16
-    rank1 = 212 + 101 + 16
+    rank0 = 524 + len(b"common") + 100 + 16
+    rank1 = 204 + 101 + 16
     assert values["rankTotals"] == [rank0, rank1]
     assert (values["rootAll"], values["rootUnique"]) == (rank0 + rank1, doc["summary"]["uniqueBytes"])
     assert values["iteration"] == ["= 7", "= 8", "2 distinct values across ranks"]

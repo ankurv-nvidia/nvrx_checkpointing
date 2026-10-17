@@ -5685,6 +5685,7 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
         name: env[name]
         for name in slurm_job._VALGRIND_NATIVE_ENV
     } == slurm_job._VALGRIND_NATIVE_ENV
+    assert env["NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS"] == "0"
     assert "NATIVE_CKPT_OTEL_FILE" not in env
     assert env["MEGATRON_OTEL_ENABLED"] == "0"
 

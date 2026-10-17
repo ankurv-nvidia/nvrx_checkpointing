@@ -270,7 +270,7 @@ def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_st
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         ordered_peers = detect_peers(rank, world_size)
-        _root = checkpoint.model_state.create_root(rank, world_size, **ordered_peers.checkpoint_args())
+        _root = checkpoint.model_state.create_root(0, rank, world_size, **ordered_peers.checkpoint_args())
     _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
     return _root
 
@@ -395,8 +395,8 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
         if not getattr(args, "async_save", False):
             # A deferred client send must run before the blocking server wait.
-            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_deferred_save", iteration):
-                root.wait_for_deferred_save()
+            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
+                root.wait_for_async_completion()
             with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
                 checkpoint.wait_for_ckpt_finalize(_SESSION_ID, iteration)
                 _write_checkpoint_tracker(args, iteration)
@@ -411,8 +411,8 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                     f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
                 )
 
-            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_deferred_save", iteration):
-                root.wait_for_deferred_save()
+            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
+                root.wait_for_async_completion()
             with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
                 future = _get_executor().submit(checkpoint.wait_for_ckpt_finalize, _SESSION_ID, iteration)
                 _pending = _PendingSave(future, finalize_fn)

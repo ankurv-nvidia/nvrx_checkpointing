@@ -5,18 +5,44 @@
 from __future__ import annotations
 
 import gc
+import os
 import threading
+import time
 import weakref
 from enum import Enum, auto
+from itertools import count
 from typing import TYPE_CHECKING, ClassVar, Self
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from nvrx_checkpointing import checkpoint
 from nvrx_checkpointing.megatron.mapping import ShardedObject, ShardedTensor, ShardedTensorFactory
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+_SESSION_IDS = count(1000)
+_REQUIRES_CHECKPOINT_SERVER = pytest.mark.skipif(
+    os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1",
+    reason="requires checkpoint-server IPC support",
+)
+
+
+def _create_root(
+    global_rank: int = 0,
+    global_world_size: int = 1,
+    peers: list[str] | None = None,
+    ranks_per_peer: int = 1,
+):
+    return checkpoint.model_state.create_root(
+        next(_SESSION_IDS),
+        global_rank,
+        global_world_size,
+        ["localhost"] if peers is None else peers,
+        ranks_per_peer,
+    )
 
 
 class _CudaGraphModule(Enum):
@@ -67,14 +93,16 @@ def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
         )
         for layer, expert in ((3, 5), (3, 6), (4, 5), (4, 6))
     ]
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
 
     root.register_state_dict({"weight_shards": tensors})
     assert root.snapshot_size == sum(tensor.data.numel() * tensor.data.element_size() for tensor in tensors)
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_repoints_sharded_tensor_data() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     initial = ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32), (0, 0, 1))
     fresh = ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32) + 10, (0, 0, 1))
     state = {"weight": initial}
@@ -89,6 +117,36 @@ def test_register_state_dict_repoints_sharded_tensor_data() -> None:
     assert refreshed["weight"] is fresh
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+def test_register_state_dict_repoints_plain_tensor_data(tmp_path: Path) -> None:
+    root = _create_root()
+    initial = torch.arange(4, dtype=torch.float32)
+    fresh = initial + 10
+    root.register_state_dict({"weight": initial})
+    root.finalize_registry()
+
+    root.register_state_dict({"weight": fresh})
+    checkpoint_dir = tmp_path / "iter_0000001"
+
+    assert root.snapshot_size == fresh.numel() * fresh.element_size()
+    try:
+        root.save(1, checkpoint_dir)
+        deadline = time.monotonic() + 30
+        while not (checkpoint_dir / ".metadata").is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+            time.sleep(0.05)
+
+        loaded = {"weight": torch.zeros_like(fresh)}
+        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+        torch.testing.assert_close(loaded["weight"], fresh)
+    finally:
+        checkpoint.svc_spindown()
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_skips_non_main_tensor_replicas() -> None:
     def state(offset: float) -> dict:
         def tensor(numel: int) -> torch.Tensor:
@@ -111,7 +169,7 @@ def test_register_state_dict_skips_non_main_tensor_replicas() -> None:
 
     # The one-element weight and the first four-element expert shard are the only main replicas.
     expected_size = (1 + 4) * 4
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict(state(0.0))
     assert root.snapshot_size == expected_size
     root.finalize_registry()
@@ -120,8 +178,10 @@ def test_register_state_dict_skips_non_main_tensor_replicas() -> None:
     assert root.snapshot_size == expected_size
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_releases_superseded_python_objects() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     tensor = torch.arange(4, dtype=torch.float32)
     tensor_ref = weakref.ref(tensor)
     state = {"weight": ShardedTensor.from_rank_offsets("weight", tensor, (0, 0, 1))}
@@ -138,6 +198,8 @@ def test_register_state_dict_releases_superseded_python_objects() -> None:
     assert tensor_ref() is None
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_materializes_storage_less_quantized_tensor() -> None:
     _StorageLessQuantizedTensor.dequantized.clear()
     data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16))
@@ -146,7 +208,7 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
         "weight": ShardedTensor.from_rank_offsets("weight", data, (0, 0, 1)),
     }
 
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict(state)
     assert root.snapshot_size == 16
 
@@ -167,14 +229,49 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
     assert _StorageLessQuantizedTensor.dequantized[1]() is not None
 
 
+def test_register_state_dict_retains_all_factory_shard_materializations() -> None:
+    def factory(offset: int) -> ShardedTensorFactory:
+        def build(key: str, *_args: object) -> list[ShardedTensor]:
+            return [
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    _StorageLessQuantizedTensor(torch.arange(4, dtype=torch.bfloat16) + offset + shard),
+                    (0, shard, 2),
+                )
+                for shard in range(2)
+            ]
+
+        return ShardedTensorFactory(key="weight", data=torch.empty(0), build_fn=build, merge_fn=None)
+
+    _StorageLessQuantizedTensor.dequantized.clear()
+    root = _create_root()
+    root.register_state_dict({"weight": factory(0)})
+    assert root.snapshot_size == 16
+    first_materializations = list(_StorageLessQuantizedTensor.dequantized)
+
+    gc.collect()
+    assert all(ref() is not None for ref in first_materializations)
+
+    root.register_state_dict({"weight": factory(10)})
+    assert root.snapshot_size == 16
+    second_materializations = _StorageLessQuantizedTensor.dequantized[2:]
+    assert len(first_materializations) == len(second_materializations) == 2
+
+    gc.collect()
+    assert all(ref() is None for ref in first_materializations)
+    assert all(ref() is not None for ref in second_materializations)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires one CUDA GPU")
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
     _StorageLessQuantizedTensor.dequantized.clear()
     source = torch.arange(8, dtype=torch.bfloat16, device="cuda")
     data = _StorageLessQuantizedTensor(source)
     assert data.data_ptr() == 0
 
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict(
         {"weight": ShardedTensor.from_rank_offsets("weight", data, (0, 0, 1))},
     )
@@ -196,8 +293,10 @@ def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
     assert _StorageLessQuantizedTensor.dequantized[0]() is None
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_refreshes_when_the_same_dictionary_is_reused() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     state = {"rng_state": ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))}
     root.register_state_dict(state)
     assert root.snapshot_size > 0
@@ -209,8 +308,10 @@ def test_register_state_dict_refreshes_when_the_same_dictionary_is_reused() -> N
         _ = root.snapshot_size
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_accepts_dotted_sharded_object_key() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     state = {"rng_state": ShardedObject("nested.rng_state", {"iteration": 1}, (1,), (0,))}
     root.register_state_dict(state)
     root.finalize_registry()
@@ -223,8 +324,10 @@ def test_register_state_dict_accepts_dotted_sharded_object_key() -> None:
     assert refreshed["rng_state"].data == {"iteration": 2}
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_uses_prepared_sharded_object_blob() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     setattr(initial, "_nvrx_serialized_blob", b"a" * 2048)
     root.register_state_dict({"rng_state": initial})
@@ -238,7 +341,7 @@ def test_register_state_dict_uses_prepared_sharded_object_blob() -> None:
 
 
 def test_register_state_dict_is_the_only_state_registration_method() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
 
     assert not hasattr(root, "capture_state")
     assert not hasattr(root, "register")
@@ -251,6 +354,8 @@ def test_register_state_dict_is_the_only_state_registration_method() -> None:
     assert not hasattr(checkpoint.model_state, "warmup")
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
     def factory(dtype: torch.dtype) -> ShardedTensorFactory:
         tensor = torch.arange(4, dtype=dtype)
@@ -261,7 +366,7 @@ def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
             merge_fn=None,
         )
 
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict({"weight": factory(torch.float32)})
     assert root.snapshot_size == 4 * 4
     root.finalize_registry()
@@ -271,6 +376,8 @@ def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
         _ = root.snapshot_size
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_state_registration_runs_asynchronously() -> None:
     calls: list[tuple[int, float]] = []
 
@@ -283,7 +390,7 @@ def test_state_registration_runs_asynchronously() -> None:
 
         return ShardedTensorFactory(key="weight", data=tensor, build_fn=build, merge_fn=None)
 
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict({"weight": factory(1)})
     assert root.snapshot_size == 4 * 4
     root.finalize_registry()
@@ -294,8 +401,10 @@ def test_state_registration_runs_asynchronously() -> None:
     assert all(thread != threading.get_ident() for thread, _ in calls)
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_rebinds_a_complete_nested_state() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {
         "rng_state": initial,
@@ -318,8 +427,10 @@ def test_register_state_dict_rebinds_a_complete_nested_state() -> None:
     assert refreshed["nested"]["step"] == 3
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_matches_optimizer_tuple_keys() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     dtype_pair = (torch.bfloat16, torch.float32)
     state = {"optimizer": {dtype_pair: {"step": 1}}}
     root.register_state_dict(state)
@@ -332,8 +443,10 @@ def test_register_state_dict_matches_optimizer_tuple_keys() -> None:
     assert refreshed["optimizer"][dtype_pair]["step"] == 2
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_matches_nested_optimizer_bucket_lists() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     dtype_pair = (torch.bfloat16, torch.float32)
     initial = {"optimizer": {"param_state": {0: {dtype_pair: [[{"step": 1}]]}}}}
     root.register_state_dict(initial)
@@ -374,10 +487,12 @@ def _float16_optimizer_state(offset: float) -> dict:
     }
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_accepts_float16_optimizer_master_weights() -> None:
     # Two 6-element and one 2-element fp32 tensors plus the two int64 parameter indices.
     expected_size = (6 + 6 + 2) * 4 + 2 * 8
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict(_float16_optimizer_state(0.0))
     assert root.snapshot_size == expected_size
     root.finalize_registry()
@@ -395,7 +510,7 @@ def test_register_state_dict_accepts_factory_shards_inside_nested_lists() -> Non
         build_fn=lambda key, data, *_args: [ShardedTensor.from_rank_offsets(f"{key}.z", data, (0, 0, 1))],
         merge_fn=None,
     )
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
 
     root.register_state_dict({"optimizer": {"fp32_from_fp16_params": [[swiglu_halves, in_proj], [{"step": 1}]]}})
 
@@ -414,7 +529,7 @@ def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
         ],
         merge_fn=lambda values: values,
     )
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
 
     root.register_state_dict({"decoder.layers.0.mixer.conv1d_weight": factory})
 
@@ -422,7 +537,7 @@ def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
 
 
 def test_state_registration_accepts_integer_enum_list() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
 
     root.register_state_dict(
         {
@@ -442,8 +557,10 @@ def test_state_registration_accepts_integer_enum_list() -> None:
 
 
 @pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_rejects_blob_size_changes(rank: int) -> None:
-    root = checkpoint.model_state.create_root(rank, 2, ["coordinator", "remote"], 1)
+    root = _create_root(rank, 2, ["coordinator", "remote"], 1)
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {"rng_state": initial}
     root.register_state_dict(state)
@@ -456,8 +573,10 @@ def test_register_state_dict_rejects_blob_size_changes(rank: int) -> None:
         _ = root.snapshot_size
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_accepts_repeated_normalized_paths() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     initial = ShardedTensor.from_rank_offsets("a.b", torch.arange(4, dtype=torch.float32), (0, 0, 1))
     root.register_state_dict({"a": {"b": initial}})
     root.finalize_registry()
@@ -476,8 +595,10 @@ def test_register_state_dict_accepts_repeated_normalized_paths() -> None:
         ({"known": {"value": 1, "unknown": 2}}, "known.unknown"),
     ],
 )
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_rejects_unregistered_path(fresh: dict, path: str) -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     state = {"known": {"value": 1}}
     root.register_state_dict(state)
     assert root.snapshot_size == 0
@@ -488,8 +609,10 @@ def test_register_state_dict_rejects_unregistered_path(fresh: dict, path: str) -
         _ = root.snapshot_size
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_allows_missing_registered_path() -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict({"known": {"value": 1}})
     assert root.snapshot_size == 0
     root.finalize_registry()
@@ -498,8 +621,10 @@ def test_register_state_dict_allows_missing_registered_path() -> None:
     assert root.snapshot_size == 0
 
 
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
 def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
-    root = checkpoint.model_state.create_root(0, 1, ["localhost"], 1)
+    root = _create_root()
     root.register_state_dict({"weight": torch.arange(4, dtype=torch.float32), "step": 1})
     assert root.snapshot_size == 4 * 4
     root.finalize_registry()
@@ -507,4 +632,4 @@ def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
     root.register_state_dict({"step": 2})
     root.save_async(1, tmp_path / "iter_0000001")
     with pytest.raises(RuntimeError, match=r"registered tensor 'weight' was not supplied for this snapshot"):
-        root.wait_for_deferred_save()
+        root.wait_for_async_completion()
