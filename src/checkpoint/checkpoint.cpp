@@ -5,6 +5,7 @@
 #include "config.h"
 #include "messages.h"
 #include "numa_utils.h"    // IWYU pragma: keep
+#include "quant.h"
 #include "service_client.h"
 #include "state.h"
 #include "stateserdes.h"
@@ -507,7 +508,11 @@ struct CheckpointWriter
             if (bufBytesRemaining == 0) { FlushBytes_(that->slotSize); }
         }
 
-        void ProcessTensor_(StateNode::Handle /* handle */, DeviceId const device, uint64_t tensorSize, uint64_t tensorHandle)
+        void ProcessTensor_(StateNode::Handle /* handle */,
+                            Tensor::DType  snapshotDtype,
+                            DeviceId const device,
+                            uint64_t       tensorSize,
+                            uint64_t       tensorHandle)
         {
             if (readOffset >= partitionEnd) { return; }
             if (tensorSize == 0) { return; }
@@ -525,7 +530,18 @@ struct CheckpointWriter
                 readOffset  = partitionStart;
             }
             uint64_t const bytesRemaining = std::min(tensorSize - startOffset, partitionEnd - readOffset);
-            AppendDeviceBytes_(device, tensorHandle + startOffset, bytesRemaining);
+            if (snapshotDtype == Tensor::DType::Invalid) { throw std::runtime_error("Snapshot dtype is invalid"); }
+            if (snapshotDtype == Tensor::DType::FP8E4M3 || snapshotDtype == Tensor::DType::MXFP8 || snapshotDtype == Tensor::DType::NVFP4)
+            {
+                checkpoint::quant::SerializeSnapshotSegments(
+                    tensorHandle, startOffset, bytesRemaining, [&](DeviceId segmentDevice, uint64_t source, uint64_t size) {
+                        AppendDeviceBytes_(segmentDevice, source, size);
+                    });
+            }
+            else
+            {
+                AppendDeviceBytes_(device, tensorHandle + startOffset, bytesRemaining);
+            }
             readOffset = next;
         }
 
@@ -590,14 +606,14 @@ struct CheckpointWriter
                     if (type == StateNode::Type::Tensor)
                     {
                         auto const& tensor = std::get<Tensor>(node.data);
-                        ProcessTensor_(node.handle, tensor.device, tensor.StorageSizeBytes(), tensor.handle);
+                        ProcessTensor_(node.handle, tensor.snapshotDtype, tensor.device, tensor.StorageSizeBytes(), tensor.handle);
                     }
                     else if (type == StateNode::Type::DTensor)
                     {
                         auto const& tensor = std::get<DTensor>(node.data);
                         for (auto const& shard : tensor.shards)
                         {
-                            ProcessTensor_(node.handle, shard.device, shard.StorageSizeBytes(), shard.handle);
+                            ProcessTensor_(node.handle, shard.snapshotDtype, shard.device, shard.StorageSizeBytes(), shard.handle);
                         }
                     }
                 } catch (std::exception& e)

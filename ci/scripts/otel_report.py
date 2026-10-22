@@ -91,6 +91,14 @@ def _iter_spans(records: list[tuple[Path, dict]]) -> Iterator[dict]:
                         "span_id": identity[1],
                         "resource": resource,
                         "attributes": _attributes(span),
+                        "events": [
+                            {
+                                "name": event.get("name", ""),
+                                "attributes": _attributes(event),
+                                "time_unix_nano": int(event.get("timeUnixNano", 0)),
+                            }
+                            for event in span.get("events", [])
+                        ],
                         "start_time_unix_nano": int(span.get("startTimeUnixNano", 0)),
                         "end_time_unix_nano": int(span.get("endTimeUnixNano", 0)),
                     }
@@ -221,6 +229,21 @@ def collect_spans(source: OtelData | list[str | Path], name: str, run_id: str | 
         if span["name"] == name
         and (run_id is None or str(span["resource"].get("nemo.run.id")) == run_id)
     ]
+
+
+def collect_save_gpu_memory_events(source: OtelData | list[str | Path], run_id: str | None = None) -> list[dict]:
+    events = []
+    for span in iter_spans(source):
+        if span["name"] != "nvrx.checkpoint.save":
+            continue
+        if run_id is not None and str(span["resource"].get("nemo.run.id")) != run_id:
+            continue
+        events.extend(
+            {**event, "resource": span["resource"]}
+            for event in span["events"]
+            if event["name"].startswith("nvrx.checkpoint.save.gpu_memory.")
+        )
+    return events
 
 
 def collect_metrics(source: OtelData | list[str | Path], name_prefix: str, run_id: str | None = None) -> list[dict]:
@@ -568,6 +591,7 @@ def load_latest(results_dir: Path) -> dict[str, list]:
         "megatron_spans": [],
         "megatron_metrics": [],
         "resource_metrics": [],
+        "save_gpu_memory_events": [],
         "process_memory": [],
     }
     otel_root = results_dir / "otel"
@@ -592,6 +616,7 @@ def load_latest(results_dir: Path) -> dict[str, list]:
         "resource_metrics": [
             sample for sample in resource_metrics if run_id is None or str(sample["resource"].get("nemo.run.id")) == run_id
         ],
+        "save_gpu_memory_events": collect_save_gpu_memory_events(source, run_id),
         "process_memory": collect_process_memory(source),
     }
 
@@ -792,6 +817,41 @@ def _resource_metrics(samples: list[dict]) -> dict:
     return metrics
 
 
+def _save_gpu_memory_metrics(events: list[dict]) -> dict:
+    exits = [
+        event
+        for event in events
+        if event["name"].endswith(".exit") and event["attributes"].get("nvrx.gpu.memory.invariant_required") is True
+    ]
+    if not exits:
+        return {}
+    ranks = [int(event["resource"].get("dl.rank", -1)) for event in exits]
+    fields = {
+        "checkpoint_save_gpu_allocated_delta_bytes": "nvrx.gpu.memory.allocated_delta_bytes",
+        "checkpoint_save_gpu_reserved_delta_bytes": "nvrx.gpu.memory.reserved_delta_bytes",
+        "checkpoint_save_gpu_allocated_during_save_bytes": "nvrx.gpu.memory.allocated_during_save_bytes",
+        "checkpoint_save_gpu_freed_during_save_bytes": "nvrx.gpu.memory.freed_during_save_bytes",
+        "checkpoint_save_gpu_hbm_used_delta_bytes": "nvrx.gpu.memory.hbm_used_delta_bytes",
+    }
+    metrics = {
+        name: metric([int(event["attributes"][attribute]) for event in exits], "B", higher_is_better=None, ranks=ranks)
+        for name, attribute in fields.items()
+    }
+    for name, attribute in {
+        "checkpoint_save_gpu_allocator_unchanged": "nvrx.gpu.memory.allocator_unchanged",
+        "checkpoint_save_gpu_transient_activity_within_limit": "nvrx.gpu.memory.transient_activity_within_limit",
+        "checkpoint_save_gpu_invariant_satisfied": "nvrx.gpu.memory.invariant_satisfied",
+        "checkpoint_save_gpu_hbm_unchanged": "nvrx.gpu.memory.hbm_unchanged",
+    }.items():
+        metrics[name] = metric(
+            [int(event["attributes"].get(attribute) is True) for event in exits],
+            "bool",
+            higher_is_better=None,
+            ranks=ranks,
+        )
+    return metrics
+
+
 def metrics_from_data(
     data: dict[str, list],
     gpus_per_node: int | None = None,
@@ -819,6 +879,7 @@ def metrics_from_data(
         )
     metrics.update(_megatron_metrics(data["megatron_metrics"]))
     metrics.update(_resource_metrics(data["resource_metrics"]))
+    metrics.update(_save_gpu_memory_metrics(data.get("save_gpu_memory_events", [])))
     metrics.update(process_memory_metrics(data.get("process_memory", [])))
     return metrics
 
@@ -1027,6 +1088,7 @@ def validate_collected(  # noqa: C901, PLR0912, PLR0913, PLR0917
         "megatron_spans": checkpoint_spans,
         "megatron_metrics": megatron_metrics,
         "resource_metrics": resource_metrics,
+        "save_gpu_memory_events": collect_save_gpu_memory_events(data, run_id),
         "process_memory": collect_process_memory(data),
     }
     return {

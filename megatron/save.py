@@ -21,6 +21,7 @@ from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  #
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
 from megatron.core.rerun_state_machine import get_rerun_state_machine  # type: ignore[import-not-found]
 from megatron.core.utils import unwrap_model  # type: ignore[import-not-found]
+from megatron.training import checkpointing as checkpointing_module  # type: ignore[import-not-found]
 from megatron.training.checkpointing import (  # type: ignore[import-not-found]
     _build_sharded_state_dict_metadata,
     generate_state_dict,
@@ -35,7 +36,8 @@ from megatron.training.utils import print_rank_0  # type: ignore[import-not-foun
 from .. import checkpoint  # noqa: TID252
 from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
 from ..peers import OrderedPeers, detect_environment_peers  # noqa: TID252
-from ..telemetry import managed_span  # noqa: TID252
+from ..quantized_snapshot import preserve_quantized_tensors  # noqa: TID252
+from ..telemetry import assert_cuda_memory_unchanged, managed_span  # noqa: TID252
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -109,8 +111,43 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
         call.apply_defaults()
         values = call.arguments
         _LOAD_CONTEXT = {name: values.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
+        training_args = get_args()
+        original_generate_state_dict = checkpointing_module.generate_state_dict
+
+        @wraps(original_generate_state_dict)
+        def generate_quantized_state_dict(*generate_args, **generate_kwargs):  # noqa: ANN002, ANN003, ANN202
+            with preserve_quantized_tensors():
+                return original_generate_state_dict(*generate_args, **generate_kwargs)
+
+        checkpointing_module.generate_state_dict = generate_quantized_state_dict
         try:
-            return load_checkpoint(*args, **kwargs)
+            try:
+                result = load_checkpoint(*args, **kwargs)
+            finally:
+                checkpointing_module.generate_state_dict = original_generate_state_dict
+
+            iteration, num_floating_point_operations_so_far = result
+            metadata = _build_sharded_state_dict_metadata(training_args, dp_cp_group=values.get("dp_cp_group"))
+            with preserve_quantized_tensors():
+                state_dict = generate_state_dict(
+                    training_args,
+                    unwrap_model(values["ddp_model"]),
+                    values["optimizer"],
+                    values["opt_param_scheduler"],
+                    None,
+                    iteration=iteration,
+                    optim_sd_kwargs={"metadata": metadata},
+                    model_sd_kwargs={"metadata": metadata},
+                    rerun_state=None,
+                )
+            state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
+            if torch.distributed.get_rank() == 0:
+                state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
+
+            root = register_state_dict(state_dict, 0)
+            root.wait_for_async_completion()
+            root.finalize_registry()
+            return result
         finally:
             _LOAD_CONTEXT = previous
 
@@ -277,7 +314,8 @@ def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_st
         world_size = torch.distributed.get_world_size()
         ordered_peers = detect_peers(rank, world_size)
         _root = checkpoint.model_state.create_root(0, rank, world_size, **ordered_peers.checkpoint_args())
-    _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
+    with preserve_quantized_tensors():
+        _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
     return _root
 
 
@@ -319,9 +357,10 @@ def _save_dataloader_state(save_args: SaveCheckpointArgs, args: object) -> None:
 def save_checkpoint(save_args: SaveCheckpointArgs) -> None:
     """Save through native checkpointing and diagnose server failures."""
     started_at_ns = time.time_ns()
-    with _checkpoint_span("nvrx.checkpoint.save", save_args.iteration):
+    with _checkpoint_span("nvrx.checkpoint.save", save_args.iteration) as span:
         try:
-            _save_checkpoint_impl(save_args, started_at_ns)
+            with assert_cuda_memory_unchanged(span):
+                _save_checkpoint_impl(save_args, started_at_ns)
         except Exception as e:
             diagnose_checkpoint_server_failure(e)
             print_rank_0(f"Error saving checkpoint at iteration {save_args.iteration}: {e}")
@@ -358,7 +397,6 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
         with _checkpoint_span("megatron.checkpoint.save.state_dict", iteration):
             args = get_args()
-            model = unwrap_model(save_args.model)
             metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=save_args.dp_cp_group)
             if args.use_distributed_optimizer:
                 print_rank_0(
@@ -376,17 +414,18 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 data_iterator=save_args.train_data_iterator,
                 ckpt_format="torch_dist",
             )
-            state_dict = generate_state_dict(
-                args,
-                model,
-                save_args.optimizer,
-                save_args.opt_param_scheduler,
-                rng_state,
-                iteration=iteration,
-                optim_sd_kwargs={"metadata": metadata},
-                model_sd_kwargs={"metadata": metadata},
-                rerun_state=rerun_state,
-            )
+            with preserve_quantized_tensors():
+                state_dict = generate_state_dict(
+                    args,
+                    unwrap_model(save_args.model),
+                    save_args.optimizer,
+                    save_args.opt_param_scheduler,
+                    rng_state,
+                    iteration=iteration,
+                    optim_sd_kwargs={"metadata": metadata},
+                    model_sd_kwargs={"metadata": metadata},
+                    rerun_state=rerun_state,
+                )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
             if torch.distributed.get_rank() == 0:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}

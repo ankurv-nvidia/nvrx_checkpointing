@@ -471,6 +471,68 @@ static std::string ComputeMd5Hex(char const* data, size_t size)
     return result;
 }
 
+static std::string ComputeLogicalShardMd5Hex(ByteStorage const&      snapshot,
+                                             Tensor::DType const     dtype,
+                                             Tensor::DimRange const& sharddim,
+                                             uint64_t const          handle,
+                                             uint64_t const          storageSize,
+                                             std::vector<uint16_t>&  dequantized)
+{
+    uint64_t logicalSize = Tensor::GetDTypeSize(dtype);
+    for (auto const& range : sharddim) { logicalSize *= range.end - range.begin; }
+    auto const storageBytes = snapshot.AsSpan<char const>(handle, storageSize);
+    if (!checkpoint::host_dequant::HasStorageHeader(storageBytes))
+    {
+        if (storageSize != logicalSize) { throw std::runtime_error("Physical tensor bytes have no encoded storage header"); }
+        return ComputeMd5Hex(storageBytes.data(), storageBytes.size());
+    }
+    if (dtype != Tensor::DType::BFloat16 || sharddim.empty())
+    {
+        throw std::runtime_error("Quantized debug MD5 requires a non-scalar BF16 shard");
+    }
+
+    uint64_t rows = 1;
+    for (size_t i = 0; i + 1 < sharddim.size(); ++i) { rows *= sharddim[i].end - sharddim[i].begin; }
+    uint64_t const cols = sharddim[sharddim.size() - 1].end - sharddim[sharddim.size() - 1].begin;
+
+    auto const storage = checkpoint::host_dequant::ParseStorage(storageBytes);
+    if (storage.header.logicalRows != rows || storage.header.logicalCols != cols)
+    {
+        throw std::runtime_error("Quantized debug MD5 storage shape does not match the logical shard");
+    }
+
+    auto context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    if (context == nullptr || EVP_DigestInit_ex(context.get(), EVP_md5(), nullptr) != 1)
+    {
+        throw std::runtime_error("Quantized debug MD5 initialization failed");
+    }
+
+    constexpr size_t MaxChunkElements = 1U << 20U;
+    uint64_t const   elements         = rows * cols;
+    for (uint64_t offset = 0; offset < elements;)
+    {
+        auto const count = static_cast<size_t>(std::min<uint64_t>(MaxChunkElements, elements - offset));
+        dequantized.resize(count);
+        checkpoint::host_dequant::DequantizeToBFloat16Range(storage, offset, dequantized);
+        if (EVP_DigestUpdate(context.get(), dequantized.data(), dequantized.size() * sizeof(uint16_t)) != 1)
+        {
+            throw std::runtime_error("Quantized debug MD5 update failed");
+        }
+        offset += count;
+    }
+
+    std::array<uint8_t, 16> digest{};
+    auto                    digestLen = static_cast<unsigned int>(digest.size());
+    if (EVP_DigestFinal_ex(context.get(), digest.data(), &digestLen) != 1 || digestLen != digest.size())
+    {
+        throw std::runtime_error("Quantized debug MD5 finalization failed");
+    }
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (auto const byte : digest) { result += fmt::format("{:02x}", byte); }
+    return result;
+}
+
 // Match Python's list-shaped dimension representation.
 static std::string FormatDim(Tensor::Dim const& dim)
 {
@@ -695,6 +757,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
 
     for (auto const& [localRank, localState] : snapshot.localStates)
     {
+        std::vector<uint16_t> dequantized;
         localState->localRegistry->WalkNodes([&](StateNode const& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
             if (type == StateNode::Type::Tensor)
@@ -702,22 +765,26 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
                 auto const&      tnsr = std::get<Tensor>(node.data);
                 Tensor::DimRange sharddim;
                 for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
-                auto const  size     = tnsr.StorageSizeBytes();
-                auto const* data     = static_cast<char const*>(localState->tensorStorage.data) + tnsr.handle;    // NOLINT
-                auto const  localFqn = localState->localRegistry->GetNodeId(node.handle);
+                auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
                 localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, sharddim), tnsr.handle);
-                addmd5(fmt::format("{}[{}]", localFqn, sharddim), ComputeMd5Hex(data, size));
+                addmd5(fmt::format("{}[{}]", localFqn, sharddim),
+                       ComputeLogicalShardMd5Hex(
+                           localState->tensorStorage, tnsr.durableDtype, sharddim, tnsr.handle, tnsr.StorageSizeBytes(), dequantized));
             }
             else if (type == StateNode::Type::DTensor)
             {
                 auto const& tnsr = std::get<DTensor>(node.data);
                 for (auto const& shard : tnsr.shards)
                 {
-                    auto const size     = shard.StorageSizeBytes();
-                    auto const data     = localState->tensorStorage.AsSpan<char const>(shard.handle, size);
                     auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
                     localShardHandleMap.emplace(makeShardHandleKey(shard.rank, localFqn, shard.sharddim), shard.handle);
-                    addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim), ComputeMd5Hex(data.data(), data.size()));
+                    addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim),
+                           ComputeLogicalShardMd5Hex(localState->tensorStorage,
+                                                     tnsr.durableDtype,
+                                                     shard.sharddim,
+                                                     shard.handle,
+                                                     shard.StorageSizeBytes(),
+                                                     dequantized));
                 }
             }
             else if (type == StateNode::Type::Blob)

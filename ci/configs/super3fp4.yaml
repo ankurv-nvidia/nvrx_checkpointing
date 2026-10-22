@@ -6,11 +6,9 @@ inherits: super3
 # supported first/last BF16 boundary is in super3.yaml.
 fp4-format: e2m1
 fp4-recipe: nvfp4
+fp4-param-gather: true
 
-# Precision-aware optimizer keeps main grads and reductions in bf16. Optimizer
-# parameters and moments inherit their fp32 dtypes from the common profile.
-use-precision-aware-optimizer: true
-main-grads-dtype: bf16
+# Megatron's NVFP4 parameter-gather path requires the default FP32 optimizer.
 grad-reduce-in-bf16: true
 
 # Mamba capture faults on replay, while adding MoE-router capture consumes too

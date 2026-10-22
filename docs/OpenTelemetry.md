@@ -122,6 +122,13 @@ the collected OTLP data after a run:
   after training and aggregated by rank. `gpu_peak_bytes` is PyTorch's peak live
   allocation; `gpu_hbm_peak_bytes` is the sampled whole-device HBM use and therefore
   also includes reserved allocator memory, CUDA/NCCL state, and other device users.
+- Native save spans contain `nvrx.checkpoint.save.gpu_memory.entry` and
+  `nvrx.checkpoint.save.gpu_memory.exit` events. They record live and reserved
+  allocator bytes, cumulative allocator activity, and whole-device HBM. Packed
+  NVFP4/MXFP8 saves fail if live or reserved allocator bytes change, or if
+  cumulative transient allocator activity exceeds 1 MiB. The bounded allowance
+  covers Megatron's small checkpoint bookkeeping tensors while still rejecting
+  material parameter dequantization.
 - The Slurm harness also persists each training rank's process high-water mark and
   reads each native checkpoint daemon's Linux `VmHWM` immediately before shutdown.
   The final report prints `training_process_peak_rss_bytes` across ranks and

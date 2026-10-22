@@ -229,6 +229,18 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
     assert _StorageLessQuantizedTensor.dequantized[1]() is not None
 
 
+def test_register_state_dict_materializes_non_mxfp8_float8_tensor() -> None:
+    _StorageLessQuantizedTensor.dequantized.clear()
+    data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16))
+    data._fp8_dtype = 7  # noqa: SLF001
+
+    root = _create_root()
+    root.register_state_dict({"weight": data})
+
+    assert root.snapshot_size == 16
+    assert len(_StorageLessQuantizedTensor.dequantized) == 1
+
+
 def test_register_state_dict_retains_all_factory_shard_materializations() -> None:
     def factory(offset: int) -> ShardedTensorFactory:
         def build(key: str, *_args: object) -> list[ShardedTensor]:

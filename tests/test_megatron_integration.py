@@ -76,6 +76,7 @@ def test_save_checkpoint_captures_entry_time_before_implementation() -> None:
     tree = ast.parse((REPO_ROOT / "megatron/save.py").read_text())
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "save_checkpoint"]
     events = []
+    memory_checks = []
 
     @contextmanager
     def checkpoint_span(name: str, iteration: int) -> Any:
@@ -88,8 +89,14 @@ def test_save_checkpoint_captures_entry_time_before_implementation() -> None:
         del kwargs
         events.append(("impl", args[1]))
 
+    @contextmanager
+    def cuda_memory(_span: object) -> Any:
+        memory_checks.append(True)
+        yield
+
     namespace = {
         "_checkpoint_span": checkpoint_span,
+        "assert_cuda_memory_unchanged": cuda_memory,
         "_save_checkpoint_impl": save_impl,
         "SaveCheckpointArgs": SimpleNamespace,
         "diagnose_checkpoint_server_failure": lambda _error: None,
@@ -105,6 +112,7 @@ def test_save_checkpoint_captures_entry_time_before_implementation() -> None:
         ("impl", 123),
         ("end", "nvrx.checkpoint.save"),
     ]
+    assert memory_checks == [True]
 
 
 def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, SimpleNamespace]:
@@ -112,15 +120,20 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         init=[],
         finalize=[],
         native_saves=[],
+        native_save_fp8=[],
         native_loads=[],
         public_loads=[],
         metadata_cache_at_load=[],
         public_load_error=None,
+        registry_finalized_at_load=[],
+        async_completions_at_load=[],
+        async_completions_at_finalize=[],
         train=0,
         registry_finalized=0,
         rewrite_replica_ids=False,
         registered_replica_ids=[],
         async_completions_waited=0,
+        gc_collect=0,
     )
 
     fake_package = ModuleType("nvrx_checkpointing")
@@ -129,10 +142,17 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     fake_megatron_package.__path__ = [str(REPO_ROOT / "megatron")]
     fake_save = ModuleType("nvrx_checkpointing.megatron.save")
     fake_save.SaveCheckpointArgs = SimpleNamespace
-    fake_save.save_checkpoint = lambda *args, **kwargs: calls.native_saves.append((args, kwargs)) or "native"
+
+    def native_save_checkpoint(*args: Any, **kwargs: Any) -> str:
+        calls.native_saves.append((args, kwargs))
+        calls.native_save_fp8.append(training_module.get_args().fp8)
+        return "native"
+
+    fake_save.save_checkpoint = native_save_checkpoint
 
     class Root:
         def finalize_registry(self) -> None:
+            calls.async_completions_at_finalize.append(calls.async_completions_waited)
             calls.registry_finalized += 1
 
         def wait_for_async_completion(self) -> None:
@@ -183,6 +203,8 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
         **kwargs: Any,
     ) -> Any:
         calls.public_loads.append((state, checkpoint_dir, sharded_strategy, kwargs))
+        calls.registry_finalized_at_load.append(calls.registry_finalized)
+        calls.async_completions_at_load.append(calls.async_completions_waited)
         base = getattr(sharded_strategy, "base_strategy", sharded_strategy)
         calls.metadata_cache_at_load.append(getattr(base, "cache_metadata", None))
         if calls.public_load_error is not None:
@@ -250,6 +272,22 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     training_module.load_checkpoint = reference_load_checkpoint
     training_module.save_checkpoint = reference_save
     training_module.train = train
+    training_args = SimpleNamespace(fp4_param_gather=False, fp8=False, fp8_param_gather=False)
+    training_module.get_args = lambda: training_args
+
+    def collect() -> None:
+        calls.gc_collect += 1
+
+    training_module.gc = SimpleNamespace(collect=collect)
+
+    def save_checkpoint_and_time(*args: Any, **kwargs: Any) -> Any:
+        training_args = training_module.get_args()
+        result = training_module.save_checkpoint(*args, **kwargs)
+        if training_args.fp8:
+            training_module.gc.collect()
+        return result
+
+    training_module.save_checkpoint_and_time = save_checkpoint_and_time
     training_package.initialize = initialize_module
     training_package.inprocess_restart = restart_module
     training_package.training = training_module
@@ -288,6 +326,7 @@ def _load_integration(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Simp
     calls.initialize_module = initialize_module
     calls.restart_module = restart_module
     calls.training_module = training_module
+    calls.args = training_args
     return integration, calls
 
 
@@ -354,19 +393,22 @@ def test_train_does_not_register_state_without_a_load(monkeypatch: pytest.Monkey
     assert calls.native_loads == []
 
 
-def test_native_load_registers_constructed_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_defers_registration_until_the_outer_load_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     state = {"model": "tensor"}
     result = calls.dist_checkpointing.load(state, "/checkpoint")
 
     assert result == {"loaded": True}
     assert calls.public_loads == [(state, "/checkpoint", None, {})]
-    assert calls.native_loads == [(state, 0)]
-    assert calls.registry_finalized == 1
-    assert calls.async_completions_waited == 1
+    assert calls.native_loads == []
+    assert calls.registry_finalized_at_load == [0]
+    assert calls.async_completions_at_load == [0]
+    assert calls.async_completions_at_finalize == []
+    assert calls.registry_finalized == 0
+    assert calls.async_completions_waited == 0
 
 
-def test_native_load_registers_the_replica_ids_assigned_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_restores_the_replica_ids_assigned_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     calls.rewrite_replica_ids = True
     main = calls.sharded_tensor("decoder.weight", (0, 0, 0))
@@ -375,8 +417,42 @@ def test_native_load_registers_the_replica_ids_assigned_before_loading(monkeypat
 
     calls.dist_checkpointing.load(state, "/checkpoint")
 
-    assert calls.registered_replica_ids == [[(0, 0, 0), (0, 0, 1)]]
+    assert calls.registered_replica_ids == []
     assert (main.replica_id, replica.replica_id) == ((0, 0, 0), (0, 0, 1))
+
+
+@pytest.mark.parametrize(
+    ("fp4_param_gather", "fp8_param_gather", "fp8_recipe"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, "mxfp8"),
+        (False, True, "tensorwise"),
+    ],
+)
+def test_load_does_not_register_the_intermediate_state(
+    monkeypatch: pytest.MonkeyPatch,
+    fp4_param_gather: bool,
+    fp8_param_gather: bool,
+    fp8_recipe: str | None,
+) -> None:
+    _, calls = _load_integration(monkeypatch)
+    state = {"model": {"weight": "tensor"}}
+    calls.args.fp4_param_gather = fp4_param_gather
+    calls.args.fp8_param_gather = fp8_param_gather
+    calls.args.fp8_recipe = fp8_recipe
+
+    result = calls.dist_checkpointing.load(state, "/checkpoint")
+
+    assert result == {"loaded": True}
+    assert calls.public_loads == [(state, "/checkpoint", None, {})]
+    assert calls.native_loads == []
+    assert calls.registry_finalized_at_load == [0]
+    assert calls.async_completions_at_load == [0]
+    assert calls.async_completions_at_finalize == []
+    assert calls.registry_finalized == 0
+    assert calls.async_completions_waited == 0
+    assert calls.public_loads[0][0] is state
 
 
 def test_native_load_forwards_the_caller_arguments_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,7 +464,7 @@ def test_native_load_forwards_the_caller_arguments_unchanged(monkeypatch: pytest
 
     assert result == {"loaded": True}
     assert calls.public_loads == [(state, "/checkpoint", strategy, {"strict": "assume_ok_unexpected"})]
-    assert calls.native_loads == [(state, 0)]
+    assert calls.native_loads == []
 
 
 @pytest.mark.parametrize("as_keyword", [False, True])
@@ -405,10 +481,10 @@ def test_native_load_reads_metadata_without_the_extension_cache(monkeypatch: pyt
 
     assert calls.metadata_cache_at_load == [False]
     assert calls.public_loads == [(state, "/checkpoint", strategy, {})]
-    assert calls.native_loads == [(state, 0)]
+    assert calls.native_loads == []
 
 
-def test_native_load_registers_nothing_when_the_public_load_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_does_not_register_when_the_public_load_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     calls.public_load_error = KeyError("missing shard")
 
@@ -456,3 +532,18 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
     assert 'local staging="${MEGATRON_ROOT}.cloning-$$"' in resolver
     assert "git_retry git -c protocol.version=1 clone" in resolver
     assert "git_retry git -C" in resolver
+
+
+def test_native_fp8_skips_checkpoint_gc(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _load_integration(monkeypatch)
+    calls.args.fp8 = True
+
+    result = calls.training_module.save_checkpoint_and_time(10, [], None, None, 0)
+
+    assert result == "native"
+    assert calls.gc_collect == 0
+    assert len(calls.native_saves) == 1
+    assert calls.native_save_fp8 == [True]
+    assert calls.args.fp8 is True
+    calls.training_module.gc.collect()
+    assert calls.gc_collect == 1

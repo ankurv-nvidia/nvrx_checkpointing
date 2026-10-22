@@ -247,15 +247,24 @@ def _load_run_dependency():
 _CONSTANT_STRUCTURE = "--ckpt-assume-constant-structure"
 
 
-@pytest.mark.parametrize(("selected", "expected_installs"), [("native", 1), ("nvrx", 0)])
+@pytest.mark.parametrize(
+    ("selected", "expected_installs", "expected_compatibility_installs"),
+    [("native", 1, 0), ("nvrx", 0, 1)],
+)
 def test_comparison_launcher_installs_only_selected_provider(
     monkeypatch: pytest.MonkeyPatch,
     selected: str,
     expected_installs: int,
+    expected_compatibility_installs: int,
 ) -> None:
     slurm_job = _load_slurm_job()
     installs: list[None] = []
+    compatibility_installs: list[None] = []
     package = ModuleType("nvrx_checkpointing")
+    package.__path__ = []
+    package.quantized_snapshot = SimpleNamespace(
+        install_quantized_sharded_narrow=lambda: compatibility_installs.append(None),
+    )
     megatron_package = ModuleType("nvrx_checkpointing.megatron")
     megatron_package.provider = SimpleNamespace(
         NATIVE_PROVIDER="native",
@@ -264,11 +273,13 @@ def test_comparison_launcher_installs_only_selected_provider(
     megatron_package.integration = SimpleNamespace(install=lambda: installs.append(None))
     package.megatron = megatron_package
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing", package)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.quantized_snapshot", package.quantized_snapshot)
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron", megatron_package)
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.provider", megatron_package.provider)
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.integration", megatron_package.integration)
 
     assert slurm_job._install_selected_checkpoint_provider() is megatron_package.provider
+    assert len(compatibility_installs) == expected_compatibility_installs
     assert len(installs) == expected_installs
 
 
@@ -1539,7 +1550,7 @@ def test_deterministic_drops_async_checkpointing_by_default(
     assert "--deterministic-mode" in cmd
 
 
-def test_fp4_profile_uses_precision_aware_optimizer_without_param_gather(
+def test_fp4_gather_uses_supported_optimizer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1555,11 +1566,9 @@ def test_fp4_profile_uses_precision_aware_optimizer_without_param_gather(
 
     native = command("native")
     nvrx = command("nvrx")
-    assert "--fp4-param-gather" not in native + nvrx
-    assert "--use-precision-aware-optimizer" in native
-    assert "--use-precision-aware-optimizer" in nvrx
-    for command in (native, nvrx):
-        assert command[command.index("--main-grads-dtype") + 1] == "bf16"
+    assert "--fp4-param-gather" in native
+    assert "--fp4-param-gather" in nvrx
+    assert "--use-precision-aware-optimizer" not in native + nvrx
 
 
 def test_mxfp8_gather_retains_precision_aware_optimizer(
@@ -3206,6 +3215,9 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
         "[PERF]:gb200:native:super3fp4_16x4": 70,
         "[DETR]:gb300:native:nano4_32x4": 185,
         "[PERF]:gb300:native:nano4_32x4": 30,
+        "[DETR]:gb300:native:nano4_8x4": 110,
+        "[PERF]:gb300:native:nano4_8x4": 45,
+        "[DETR]:gb300:nvrx:nano4_8x4": 115,
         "[PERF]:gb200:native:ultra3bf16_64x4": 45,
         "[DETR]:gb200:native:ultra3fp8_64x4": 160,
         "[PERF]:gb200:native:ultra3fp8_64x4": 90,
@@ -4396,6 +4408,60 @@ def test_nvrx_perf_writes_a_baseline_for_every_reported_metric(
         "gpu_hbm_peak_bytes": 120,
         "training_process_peak_rss_bytes": 200,
     }
+
+
+def test_native_perf_baselines_only_stable_checkpoint_save_gpu_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavor=["perf", "native"],
+        flavors=slurm_job.FlavorSelection(["perf", "native"]),
+    )
+    _cfg, _flavor, stem = slurm_job._identity(args)
+    report = {
+        "telemetry_source": "otlp",
+        "ckpt_save_spans_valid": True,
+        "metrics": {
+            "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
+            "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
+            "total_written_bytes": {"mean": 100.25, "higher_is_better": None, "unit": "B"},
+            "megatron.training.memory_allocated_gb": {"max": 20, "higher_is_better": False, "unit": "GB"},
+            "checkpoint_save_gpu_allocated_during_save_bytes": {
+                "mean": 4096,
+                "higher_is_better": None,
+                "unit": "B",
+            },
+            "checkpoint_save_gpu_hbm_used_delta_bytes": {
+                "mean": 1024,
+                "higher_is_better": None,
+                "unit": "B",
+            },
+            "checkpoint_save_gpu_hbm_unchanged": {"mean": 0.5, "higher_is_better": None, "unit": "bool"},
+            "checkpoint_save_gpu_allocator_unchanged": {"mean": 1, "higher_is_better": None, "unit": "bool"},
+            "checkpoint_save_gpu_transient_activity_within_limit": {
+                "mean": 1,
+                "higher_is_better": None,
+                "unit": "bool",
+            },
+            "checkpoint_save_gpu_invariant_satisfied": {"mean": 1, "higher_is_better": None, "unit": "bool"},
+        },
+    }
+    (tmp_path / f"{stem}_report.json").write_text(json.dumps(report))
+
+    slurm_job._write_performance_baseline(args, tmp_path)
+
+    candidate = yaml.safe_load((tmp_path / "baselines" / f"{stem}.yaml").read_text())
+    checkpoint_metrics = {name for name in candidate["metrics"] if name.startswith("checkpoint_save_gpu_")}
+    assert checkpoint_metrics == slurm_job.CHECKPOINT_SAVE_GPU_BASELINE_GATES
+    assert candidate["metrics"]["total_written_bytes"] == 100.25
 
 
 def test_native_perf_refuses_an_incomplete_baseline_candidate(
@@ -5966,6 +6032,7 @@ def test_super3_profiles_share_reference_architecture() -> None:
     precision = {
         "fp4-format": "e2m1",
         "fp4-recipe": "nvfp4",
+        "fp4-param-gather": True,
     }
     optimizer_precision = {
         "use-precision-aware-optimizer": True,
@@ -5988,7 +6055,7 @@ def test_super3_profiles_share_reference_architecture() -> None:
     }
 
     assert {key: fp4.pop(key) for key in precision} == precision
-    assert {key: fp4.pop(key) for key in optimizer_precision} == optimizer_precision
+    assert not optimizer_precision.keys() & fp4.keys()
     assert {key: bf16.pop(key) for key in optimizer_precision} == optimizer_precision
     assert bf16.pop("grad-reduce-in-bf16") is fp4.pop("grad-reduce-in-bf16") is True
     # Both profiles need TP4 to halve the native fused-loss temporary while

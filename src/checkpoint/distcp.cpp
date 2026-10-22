@@ -1,5 +1,6 @@
 #include "distcp.h"
 #include "distcp_internal.h"
+#include "host_dequant.h"
 #include "state.h"
 
 #define MINIZ_NO_ZLIB_APIS
@@ -14,11 +15,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <ios>
 #include <limits>
 #include <ostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -337,6 +340,7 @@ constexpr std::array<std::string_view, 7> EntryFullNames{
     "archive/version",
     "archive/.data/serialization_id",
 };
+
 // The serialization identifier is excluded from its own name hash.
 constexpr std::array<std::string_view, 6> EntryBareNames{
     "data.pkl",
@@ -487,20 +491,92 @@ static void FinishOutputFile(std::ofstream& output, std::filesystem::path const&
     if (output.fail()) { throw std::runtime_error(fmt::format("distcp: close({}) failed", path.string())); }
 }
 
-static uint64_t WriteShardArchive(std::ostream&      output,
-                                  Tensor::DType      dtype,
-                                  Tensor::Dim const& shape,
-                                  char const*        srcPtr,
-                                  uint64_t           length,
-                                  std::string_view   contextName)
+static uint64_t LogicalShardSizeBytes(TensorShard const& shard, Tensor::DType dtype)
 {
-    ByteBuffer dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
+    if (shard.sharddim.empty()) { return 0; }
+    uint64_t size = Tensor::GetDTypeSize(dtype);
+    for (auto const& range : shard.sharddim) { size *= range.end - range.begin; }
+    return size;
+}
+namespace
+{
+struct CBData
+{
+    std::span<char const> snapshotBytes;
+    TensorShard           shard;
+    DType                 durableDtype;
+    uint64_t              bytesRead{};
+    std::exception_ptr    failure{};
+};
+}    // namespace
+
+static size_t ReadDurableTensorBytes(void* cbDataPtr, mz_uint64 fileOffset, void* buffer, size_t size)
+{
+    auto& cbData = *static_cast<CBData*>(cbDataPtr);
+    if (cbData.failure != nullptr) { return 0; }
+    try
+    {
+        if (fileOffset != cbData.bytesRead) { throw std::runtime_error("distcp: non-sequential logical tensor read"); }
+        auto const logicalSize = LogicalShardSizeBytes(cbData.shard, cbData.durableDtype);
+        if (cbData.bytesRead > logicalSize) { throw std::runtime_error("distcp: quantized read exceeds logical tensor size"); }
+        if ((cbData.bytesRead % sizeof(uint16_t)) != 0) { throw std::runtime_error("distcp: unaligned quantized streaming offset"); }
+        auto const readSize = static_cast<size_t>(std::min<uint64_t>(size, logicalSize - cbData.bytesRead));
+        if ((readSize % sizeof(uint16_t)) != 0) { throw std::runtime_error("distcp: unaligned quantized streaming read"); }
+        checkpoint::host_dequant::DequantizeToBFloat16Range(
+            cbData.snapshotBytes,
+            cbData.bytesRead / sizeof(uint16_t),
+            std::span<uint16_t>(static_cast<uint16_t*>(buffer), readSize / sizeof(uint16_t)));
+        cbData.bytesRead += readSize;
+        return readSize;
+    } catch (...)
+    {
+        cbData.failure = std::current_exception();
+        return 0;
+    }
+}
+
+static uint64_t WriteShardArchive(std::ostream&         output,
+                                  Tensor::DType         durableDtype,
+                                  Tensor::Dim const&    shape,
+                                  TensorShard const&    shard,
+                                  std::span<char const> snapshot,
+                                  std::string_view      contextName)
+{
+    ByteBuffer dataPkl     = checkpoint::distcp::BuildDataPkl(durableDtype, shape);
+    auto const logicalSize = LogicalShardSizeBytes(shard, durableDtype);
+    auto const storageSize = shard.StorageSizeBytes();
+    if (shard.handle > snapshot.size() || storageSize > snapshot.size() - shard.handle)
+    {
+        throw std::runtime_error(fmt::format("distcp: shard '{}' storage range [{}:{}) exceeds snapshot size {}",
+                                             contextName,
+                                             shard.handle,
+                                             shard.handle + storageSize,
+                                             snapshot.size()));
+    }
+    auto const storageBytes = snapshot.subspan(static_cast<size_t>(shard.handle), static_cast<size_t>(storageSize));
+    bool const dequantize   = durableDtype != shard.snapshotDtype;
+    if (dequantize)
+    {
+        if (durableDtype != Tensor::DType::BFloat16
+            || (shard.snapshotDtype != Tensor::DType::FP8E4M3 && shard.snapshotDtype != Tensor::DType::MXFP8
+                && shard.snapshotDtype != Tensor::DType::NVFP4)
+            || !checkpoint::host_dequant::HasStorageHeader(storageBytes))
+        {
+            throw std::runtime_error(fmt::format("distcp: shard '{}' has incompatible durable and snapshot dtypes", contextName));
+        }
+    }
+    else if (storageSize != logicalSize)
+    {
+        throw std::runtime_error(
+            fmt::format("distcp: shard '{}' has {} physical bytes and {} logical bytes", contextName, storageSize, logicalSize));
+    }
 
     struct EntryPlan
     {
         std::string fullName;
         void const* data;
         size_t      size;
+        bool        streamData{};
         ByteBuffer  padding;
     };
 
@@ -537,7 +613,13 @@ static uint64_t WriteShardArchive(std::ostream&      output,
             .size     = checkpoint::distcp::ByteorderBytes.size(),
             .padding  = {},
         },
-        EntryPlan{.fullName = std::string{checkpoint::distcp::EntryFullNames[DataZeroIdx]}, .data = srcPtr, .size = length, .padding = {}},
+        EntryPlan{
+            .fullName   = std::string{checkpoint::distcp::EntryFullNames[DataZeroIdx]},
+            .data       = storageBytes.data(),
+            .size       = logicalSize,
+            .streamData = dequantize,
+            .padding    = {},
+        },
         EntryPlan{
             .fullName = std::string{checkpoint::distcp::EntryFullNames[VersionIdx]},
             .data     = checkpoint::distcp::VersionBytes.data(),
@@ -557,36 +639,67 @@ static uint64_t WriteShardArchive(std::ostream&      output,
 
     uint64_t                        combinedCrc = 0;
     std::unordered_set<std::string> bareNamesWritten;
+    CBData                          cbData{
+        .snapshotBytes = storageBytes,
+        .shard         = shard,
+        .durableDtype  = durableDtype,
+        .bytesRead     = 0,
+    };
 
     auto addEntry = [&](EntryPlan& plan, std::string_view bareName) {
         plan.padding               = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, plan.fullName.size(), plan.size);
         streamOutput.sawDescriptor = false;
-        auto const entryCrc        = static_cast<mz_uint32>(
-            ::crc32_z(/*crc=*/0L, reinterpret_cast<Bytef const*>(plan.data), static_cast<z_size_t>(plan.size)));    // NOLINT
-        if (mz_zip_writer_add_mem_ex_v2(&zip,
-                                        plan.fullName.c_str(),
-                                        plan.data,
-                                        plan.size,
-                                        /*pComment=*/nullptr,
-                                        /*comment_size=*/0,
-                                        /*level_and_flags=*/MZ_ZIP_FLAG_COMPRESSED_DATA,
-                                        /*uncomp_size=*/plan.size,
-                                        /*uncomp_crc32=*/entryCrc,
-                                        /*last_modified=*/nullptr,
-                                        /*user_extra_data=*/plan.padding.data(),
-                                        /*user_extra_data_len=*/static_cast<mz_uint16>(plan.padding.size()),
-                                        /*user_extra_data_central=*/nullptr,
-                                        /*user_extra_data_central_len=*/0)
-            != MZ_TRUE)
+        mz_uint32 entryCrc{};
+        mz_bool   added{};
+        if (plan.streamData)
         {
-            throw std::runtime_error(fmt::format("distcp: mz_zip_writer_add_mem_ex_v2 failed for '{}'", plan.fullName));
+            added = mz_zip_writer_add_read_buf_callback(&zip,
+                                                        plan.fullName.c_str(),
+                                                        &ReadDurableTensorBytes,
+                                                        &cbData,
+                                                        plan.size,
+                                                        /*pFile_time=*/nullptr,
+                                                        /*pComment=*/nullptr,
+                                                        /*comment_size=*/0,
+                                                        /*level_and_flags=*/MZ_NO_COMPRESSION,
+                                                        /*user_extra_data=*/plan.padding.data(),
+                                                        /*user_extra_data_len=*/static_cast<mz_uint16>(plan.padding.size()),
+                                                        /*user_extra_data_central=*/nullptr,
+                                                        /*user_extra_data_central_len=*/0);
+            if (cbData.failure != nullptr) { std::rethrow_exception(cbData.failure); }
+            if (cbData.bytesRead != plan.size)
+            {
+                throw std::runtime_error(fmt::format(
+                    "distcp: logical tensor read for '{}' produced {} of {} bytes", plan.fullName, cbData.bytesRead, plan.size));
+            }
         }
+        else
+        {
+            entryCrc = static_cast<mz_uint32>(
+                ::crc32_z(/*crc=*/0L, reinterpret_cast<Bytef const*>(plan.data), static_cast<z_size_t>(plan.size)));    // NOLINT
+            added = mz_zip_writer_add_mem_ex_v2(&zip,
+                                                plan.fullName.c_str(),
+                                                plan.data,
+                                                plan.size,
+                                                /*pComment=*/nullptr,
+                                                /*comment_size=*/0,
+                                                /*level_and_flags=*/MZ_ZIP_FLAG_COMPRESSED_DATA,
+                                                /*uncomp_size=*/plan.size,
+                                                /*uncomp_crc32=*/entryCrc,
+                                                /*last_modified=*/nullptr,
+                                                /*user_extra_data=*/plan.padding.data(),
+                                                /*user_extra_data_len=*/static_cast<mz_uint16>(plan.padding.size()),
+                                                /*user_extra_data_central=*/nullptr,
+                                                /*user_extra_data_central_len=*/0);
+        }
+        if (added != MZ_TRUE) { throw std::runtime_error(fmt::format("distcp: miniz failed to add '{}'", plan.fullName)); }
 
         if (!streamOutput.sawDescriptor)
         {
             throw std::runtime_error(fmt::format("distcp: miniz omitted data descriptor for '{}'", plan.fullName));
         }
-        if (streamOutput.lastDescriptorCrc != entryCrc)
+        if (plan.streamData) { entryCrc = streamOutput.lastDescriptorCrc; }
+        else if (streamOutput.lastDescriptorCrc != entryCrc)
         {
             throw std::runtime_error(fmt::format("distcp: data descriptor CRC mismatch for '{}'", plan.fullName));
         }
@@ -794,7 +907,7 @@ static std::vector<Tensor::DimRange> CollectChunkRanges(DTensor const& tensor)
     chunkRanges.reserve(tensor.shards.size());
     for (auto const& shard : tensor.shards)
     {
-        if (shard.StorageSizeBytes() == 0) { continue; }
+        if (LogicalShardSizeBytes(shard, tensor.durableDtype) == 0) { continue; }
         if (std::ranges::find(chunkRanges, shard.sharddim) == chunkRanges.end()) { chunkRanges.push_back(shard.sharddim); }
     }
     return chunkRanges;
@@ -859,7 +972,7 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
         Tensor::DimRange lastShard{};
         for (auto const& shard : tnsr.shards)
         {
-            auto const shardSize = shard.StorageSizeBytes();
+            auto const shardSize = LogicalShardSizeBytes(shard, tnsr.durableDtype);
             if (shardSize == 0) { continue; }
             Tensor::Dim shardShape;
             for (auto const& r : shard.sharddim) { shardShape.push_back(r.end - r.begin); }
@@ -929,9 +1042,10 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
 
     std::filesystem::create_directories(ckptDir);
 
-    auto        output = OpenOutputFile(filepath);
-    uint64_t    cursor = 0;
-    auto const* base   = static_cast<char const*>(tensorStorage.data);
+    auto        output        = OpenOutputFile(filepath);
+    uint64_t    cursor        = 0;
+    auto const* base          = static_cast<char const*>(tensorStorage.data);
+    auto const  snapshotBytes = std::span<char const>(base, tensorStorage.size);
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         assert(type != StateNode::Type::Tensor);
@@ -941,17 +1055,18 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
         for (auto const& shard : tnsr.shards)
         {
             if (shard.rank != rank) { continue; }
-            auto const size = shard.StorageSizeBytes();
-            if (size == 0) { continue; }
+            auto const logicalSize = LogicalShardSizeBytes(shard, tnsr.durableDtype);
+            if (logicalSize == 0) { continue; }
             Tensor::Dim shape{};
             for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
-            if (size >= MZ_UINT32_MAX)
+
+            if (logicalSize >= MZ_UINT32_MAX)
             {
                 throw std::runtime_error(
-                    fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, size));
+                    fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, logicalSize));
             }
-            uint64_t const predicted = ComputeShardArchiveSize(tnsr.durableDtype, shape, size);
-            uint64_t const actual    = WriteShardArchive(output, tnsr.durableDtype, shape, base + shard.handle, size, fqn);
+            uint64_t const predicted = ComputeShardArchiveSize(tnsr.durableDtype, shape, logicalSize);
+            uint64_t const actual    = WriteShardArchive(output, tnsr.durableDtype, shape, shard, snapshotBytes, fqn);
             if (predicted != actual)
             {
                 throw std::runtime_error(fmt::format("distcp: ComputeShardArchiveSize/WriteShardArchive disagree for '{}' "
@@ -959,7 +1074,7 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
                                                      fqn,
                                                      DTypeName(tnsr.durableDtype),
                                                      fmt::join(shape, ","),
-                                                     size,
+                                                     logicalSize,
                                                      predicted,
                                                      actual));
             }

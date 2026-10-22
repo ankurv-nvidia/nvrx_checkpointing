@@ -103,6 +103,7 @@ struct PythonStateTree : PyStateDictAccessor
     StateNode&   RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) override;
     StateNode&   RegisterStateByFQN(std::string_view fqn, StateNode::Variant data) override;
     void         AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nb::object const& obj) override;
+    void         AttachQuantHeader(StateNode& tensor, std::unique_ptr<checkpoint::quant::Header> header) override;
 
     [[nodiscard]] std::string GetNodeId(StateNode::Handle node) const override;
 
@@ -168,6 +169,8 @@ struct PythonStateTree : PyStateDictAccessor
     nb::dict _dictToScan;
 
     std::vector<nb::object> _tensorRefObjects;
+
+    std::vector<std::unique_ptr<checkpoint::quant::Header>> _quantHeaders;
 
     std::mutex        _asyncMutex;
     std::future<void> _async;
@@ -315,6 +318,31 @@ StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_
 void PythonStateTree::AcquireTensorObjectRefForSnapshot(StateNode::Handle /* node */, nb::object const& obj)
 { _tensorRefObjects.push_back(obj); }
 
+void PythonStateTree::AttachQuantHeader(StateNode& tensor, std::unique_ptr<checkpoint::quant::Header> header)
+{
+    // auto const captureHandle = checkpoint::quant::CaptureHandle(*header);
+    auto newHandle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(header.get()));    // NOLINT
+
+    if (tensor.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
+    {
+        auto& value  = std::get<Tensor>(tensor.data);
+        value.handle = newHandle;
+    }
+    if (tensor.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
+    {
+        auto& shards = std::get<DTensor>(tensor.data).shards;
+        for (auto const& shard : shards)
+        {
+            auto newShard   = shard;
+            newShard.handle = newHandle;
+            shards.erase(shard);
+            shards.insert(newShard);
+            break;
+        }
+    }
+    _quantHeaders.push_back(std::move(header));
+}
+
 std::string PythonStateTree::GetNodeId(StateNode::Handle node) const
 { return _tree.GetNodeId(node); }
 
@@ -363,6 +391,7 @@ void PythonStateTree::ValidateTensorHandles_() const
 void PythonStateTree::ReleasePythonObjects_()
 {
     _tensorRefObjects.clear();
+    _quantHeaders.clear();
     _dictToScan.reset();
 }
 

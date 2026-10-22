@@ -21,6 +21,51 @@ class Color(Enum):
     BLUE = auto()
 
 
+class TEDType(Enum):
+    kFloat8E4M3 = 7  # noqa: N815
+    kFloat4E2M1 = 10  # noqa: N815
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+class _QuantizedTensor(torch.Tensor):
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN206
+        msg = f"{cls.__name__} does not support {func}"
+        raise NotImplementedError(msg)
+
+
+class MXFP8Tensor(_QuantizedTensor):
+    @classmethod
+    def random(cls, rows: int, cols: int, device: torch.device) -> "MXFP8Tensor":
+        self = torch.Tensor._make_wrapper_subclass(cls, (rows, cols), dtype=torch.bfloat16, device=device)  # noqa: SLF001
+        self._fp8_dtype = TEDType.kFloat8E4M3
+        self._with_gemm_swizzled_scales = False
+        # E4M3 codes below 0x7F are finite; E8M0 scale 127 encodes 1.0.
+        self._rowwise_data = torch.randint(0, 0x7F, (rows, cols), dtype=torch.uint8, device=device)
+        scale_shape = (_round_up(rows, 128), _round_up((cols + 31) // 32, 4))
+        self._rowwise_scale_inv = torch.full(scale_shape, 127, dtype=torch.uint8, device=device)
+        return self
+
+
+class NVFP4Tensor(_QuantizedTensor):
+    @classmethod
+    def random(cls, rows: int, cols: int, device: torch.device) -> "NVFP4Tensor":
+        self = torch.Tensor._make_wrapper_subclass(cls, (rows, cols), dtype=torch.bfloat16, device=device)  # noqa: SLF001
+        self._fp4_dtype = TEDType.kFloat4E2M1
+        self._with_gemm_swizzled_scales = False
+        self._nvfp4_e4m3_max = 448
+        self._row_scaled_nvfp4 = False
+        # E4M3 scale 0x38 encodes 1.0; an amax of 448 * 6 makes the global scale 1.0.
+        self._rowwise_data = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, device=device)
+        scale_shape = (_round_up(rows, 128), _round_up(cols // 16, 4))
+        self._rowwise_scale_inv = torch.full(scale_shape, 0x38, dtype=torch.uint8, device=device)
+        self._amax_rowwise = torch.full((1,), 448.0 * 6.0, dtype=torch.float32, device=device)
+        return self
+
+
 torch.manual_seed(0)
 
 roots = {}
@@ -60,6 +105,8 @@ def workload(session_id: int, snapshot_id: int, rank: int, world_size: int) -> N
     }
     state_dict["dict_self"] = {"self": state_dict}
     state_dict["tensor"] = torch.arange(0, 16, dtype=torch.int8, device=device).reshape(4, 4)
+    state_dict["mxfp8_tensor"] = MXFP8Tensor.random(4, 64, device)
+    state_dict["nvfp4_tensor"] = NVFP4Tensor.random(4, 64, device)
     state_dict["sharded_tensor"] = nvrx_checkpointing.megatron.mapping.ShardedTensor(
         key="sharded_tensor",
         data=torch.arange(16.0, 24.0, dtype=torch.float32, device=device).reshape(4, 2),

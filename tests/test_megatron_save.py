@@ -7,7 +7,7 @@ import importlib.util
 import sys
 import threading
 from concurrent.futures import Future
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
@@ -53,6 +53,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     core.__path__ = []
     training = _module("megatron.training")
     training.__path__ = []
+    training.checkpointing = checkpointing
     megatron = _module("megatron", core=core, training=training)
     megatron.__path__ = []
     modules = {
@@ -349,6 +350,7 @@ def test_load_registration_synthesizes_rng_with_role_specific_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
+    prepared = []
     rng_state = {"sharded": "placeholder rng handler"}
     monkeypatch.setattr(
         save,
@@ -362,18 +364,36 @@ def test_load_registration_synthesizes_rng_with_role_specific_groups(
         "rerun_state_machine": "rerun handler",
     }
 
-    def load_checkpoint(
+    class Root:
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
+        @staticmethod
+        def finalize_registry() -> None:
+            return
+
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+
+    def load_checkpoint(  # noqa: PLR0913
+        ddp_model,  # noqa: ANN001
+        optimizer,  # noqa: ANN001
+        opt_param_scheduler,  # noqa: ANN001
         *,
         tp_group=None,  # noqa: ANN001
         pp_group=None,  # noqa: ANN001
         dp_cp_group=None,  # noqa: ANN001
         dp_group=None,  # noqa: ANN001
         rng_state_key_prefix="",  # noqa: ANN001
-    ) -> dict:
-        del tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
-        return save._prepare_registration_state_dict(state, 0)
+    ) -> tuple[int, int]:
+        del ddp_model, optimizer, opt_param_scheduler, tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
+        prepared.append(save._prepare_registration_state_dict(state, 0))
+        return 0, 0
 
-    prepared = save._wrap_load_checkpoint(load_checkpoint)(
+    result = save._wrap_load_checkpoint(load_checkpoint)(
+        "model",
+        "optimizer",
+        "scheduler",
         tp_group="tp",
         pp_group="pp",
         dp_cp_group="dp-cp",
@@ -387,27 +407,84 @@ def test_load_registration_synthesizes_rng_with_role_specific_groups(
             {"dp_cp_group": "dp-cp", "dp_group": "dp", "key_prefix": "language."},
         ),
     ]
-    assert prepared == {**state, "rng_state": rng_state}
+    assert result == (0, 0)
+    assert prepared == [{**state, "rng_state": rng_state}]
     assert "rng_state" not in state
     assert save._LOAD_CONTEXT is None
 
 
-def test_load_registration_binds_positional_role_specific_groups(save: ModuleType) -> None:
-    contexts = []
+@pytest.mark.parametrize(
+    ("fp4_param_gather", "fp8_param_gather", "fp8_recipe"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, "mxfp8"),
+        (False, True, "tensorwise"),
+    ],
+)
+def test_load_registers_live_state_after_loading(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    fp4_param_gather: bool,
+    fp8_param_gather: bool,
+    fp8_recipe: str | None,
+) -> None:
+    events = []
+    args = SimpleNamespace(
+        fp4_param_gather=fp4_param_gather,
+        fp8_param_gather=fp8_param_gather,
+        fp8_recipe=fp8_recipe,
+    )
+    metadata = {"dp_cp_group": "dp-cp", "checkpoint_version": 3.1}
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "_build_sharded_state_dict_metadata", lambda *_args, **_kwargs: metadata)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
 
-    def load_checkpoint(  # noqa: PLR0913, PLR0917
-        ddp_model,  # noqa: ANN001
-        optimizer,  # noqa: ANN001
-        opt_param_scheduler,  # noqa: ANN001
-        tp_group=None,  # noqa: ANN001
-        pp_group=None,  # noqa: ANN001
-        dp_cp_group=None,  # noqa: ANN001
-        dp_group=None,  # noqa: ANN001
-        rng_state_key_prefix="language.",  # noqa: ANN001
-    ) -> str:
+    @contextmanager
+    def preserve_quantized_tensors() -> Generator[None]:
+        events.append("preserve begin")
+        yield
+        events.append("preserve end")
+
+    def generate_load_state(*args: object, **kwargs: object) -> dict[str, object]:
+        events.append(("generate load", args, kwargs, save._LOAD_CONTEXT))
+        return {"model": "load state"}
+
+    def generate_live_state(*args: object, **kwargs: object) -> dict[str, object]:
+        events.append(("generate live", args, kwargs, save._LOAD_CONTEXT))
+        return {"model": "live state"}
+
+    class Root:
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            events.append("wait")
+
+        @staticmethod
+        def finalize_registry() -> None:
+            events.append("finalize")
+
+    monkeypatch.setattr(save, "preserve_quantized_tensors", preserve_quantized_tensors)
+    monkeypatch.setattr(save, "generate_state_dict", generate_live_state)
+    monkeypatch.setattr(
+        save,
+        "register_state_dict",
+        lambda state, iteration: events.append(("register", state, iteration)) or Root(),
+    )
+    save.checkpointing_module.generate_state_dict = generate_load_state
+
+    def load_checkpoint(
+        ddp_model: object,
+        optimizer: object,
+        opt_param_scheduler: object,
+        tp_group: object = None,
+        pp_group: object = None,
+        dp_cp_group: object = None,
+        dp_group: object = None,
+        rng_state_key_prefix: str = "",
+    ) -> tuple[int, int]:
         del ddp_model, optimizer, opt_param_scheduler, tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
-        contexts.append(save._LOAD_CONTEXT)
-        return "loaded"
+        assert save.checkpointing_module.generate_state_dict("template") == {"model": "load state"}
+        return 12, 34
 
     result = save._wrap_load_checkpoint(load_checkpoint)(
         "model",
@@ -417,10 +494,14 @@ def test_load_registration_binds_positional_role_specific_groups(save: ModuleTyp
         "pp",
         "dp-cp",
         "dp",
+        "language.",
     )
 
-    assert result == "loaded"
-    assert contexts == [
+    assert result == (12, 34)
+    load_event = (
+        "generate load",
+        ("template",),
+        {},
         {
             "tp_group": "tp",
             "pp_group": "pp",
@@ -428,7 +509,40 @@ def test_load_registration_binds_positional_role_specific_groups(save: ModuleTyp
             "dp_group": "dp",
             "rng_state_key_prefix": "language.",
         },
+    )
+    expected = [
+        "preserve begin",
+        load_event,
+        "preserve end",
     ]
+    expected.extend(
+        [
+            "preserve begin",
+            (
+                "generate live",
+                (args, "model", "optimizer", "scheduler", None),
+                {
+                    "iteration": 12,
+                    "optim_sd_kwargs": {"metadata": metadata},
+                    "model_sd_kwargs": {"metadata": metadata},
+                    "rerun_state": None,
+                },
+                {
+                    "tp_group": "tp",
+                    "pp_group": "pp",
+                    "dp_cp_group": "dp-cp",
+                    "dp_group": "dp",
+                    "rng_state_key_prefix": "language.",
+                },
+            ),
+            "preserve end",
+            ("register", {"model": "live state", "num_floating_point_operations_so_far": 34}, 0),
+            "wait",
+            "finalize",
+        ],
+    )
+    assert events == expected
+    assert save.checkpointing_module.generate_state_dict is generate_load_state
     assert save._LOAD_CONTEXT is None
 
 

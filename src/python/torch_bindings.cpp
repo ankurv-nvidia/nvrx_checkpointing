@@ -1,4 +1,5 @@
 #include "binding.h"
+#include "quant.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -67,8 +69,10 @@ struct CachedTypes
 
 struct TensorState
 {
-    DTensor    meta;
-    nb::object owner;
+    DTensor                                    meta;
+    DTensor::Shard                             shard;
+    nb::object                                 owner;
+    std::unique_ptr<checkpoint::quant::Header> header;
 };
 }    // namespace
 
@@ -207,6 +211,199 @@ static DlpackCapsule ReadDlpack(nb::handle tensor)
     throw std::runtime_error("tensor.__dlpack__() returned a PyCapsule with an unexpected name");
 }
 
+static bool HasAttr(nb::handle obj, char const* name)
+{
+    int const result = PyObject_HasAttrString(obj.ptr(), name);
+    if (result < 0) { throw nb::python_error(); }
+    return result != 0;
+}
+
+static std::string ObjectString(nb::handle obj)
+{
+    PyObject* value = PyObject_Str(obj.ptr());
+    if (value == nullptr) { throw nb::python_error(); }
+    return Str(nb::steal<nb::str>(value));
+}
+
+static Tensor::DType DetectQuantDType(nb::handle tensor)
+{
+    if (HasAttr(tensor, "_fp4_dtype")) { return Tensor::DType::NVFP4; }
+    if (HasAttr(tensor, "_fp8_dtype") && HasAttr(tensor, "_rowwise_data") && HasAttr(tensor, "_rowwise_scale_inv"))
+    {
+        return Tensor::DType::MXFP8;
+    }
+    if (HasAttr(tensor, "_fp8_dtype") && HasAttr(tensor, "_data") && HasAttr(tensor, "_scale_inv")) { return Tensor::DType::FP8E4M3; }
+    return Tensor::DType::Invalid;
+}
+
+static auto AddHeaderComponent(nb::handle             tensor,
+                               Tensor::DType const    componentDtype,
+                               std::string_view const tensorName,
+                               std::string_view const componentName)
+{
+    auto dlp = ReadDlpack(tensor);
+    if (!IsRowMajorContiguous(*dlp.tnsr))
+    {
+        throw std::runtime_error(fmt::format("Quantized component {}.{} is not contiguous", tensorName, componentName));
+    }
+    auto const dtype       = DlpackDtypeToDs4(dlp.tnsr->dtype);
+    auto const device      = DlpackDeviceToId(dlp.tnsr->device);
+    auto const handle      = DataPtrFromDlTensor(*dlp.tnsr);
+    auto const elementSize = Tensor::GetDTypeSize(dtype);
+
+    if (dtype != componentDtype)
+    {
+        throw std::runtime_error(fmt::format("Quantized component {}.{} has dtype {}, expected {}",
+                                             tensorName,
+                                             componentName,
+                                             static_cast<uint8_t>(dtype),
+                                             static_cast<uint8_t>(componentDtype)));
+    }
+    if (dlp.tnsr->ndim < 1)
+    {
+        throw std::runtime_error(fmt::format("Quantized component {}.{} has ndim={}", tensorName, componentName, dlp.tnsr->ndim));
+    }
+
+    uint64_t rows = 1;
+    for (int i = 0; i + 1 < dlp.tnsr->ndim; ++i) { rows *= static_cast<uint64_t>(dlp.tnsr->shape[i]); }
+    auto const cols = static_cast<uint64_t>(dlp.tnsr->shape[dlp.tnsr->ndim - 1]);
+    if (rows == 0 || cols == 0)
+    {
+        throw std::runtime_error(fmt::format("Quantized component {}.{} has an empty shape", tensorName, componentName));
+    }
+    if (cols > std::numeric_limits<uint64_t>::max() / rows || rows * cols > std::numeric_limits<uint64_t>::max() / elementSize)
+    {
+        throw std::runtime_error(fmt::format("Quantized component {}.{} shape overflows", tensorName, componentName));
+    }
+    auto const sizeBytes = rows * cols * elementSize;
+    if (handle == 0 || sizeBytes == 0) { throw std::runtime_error(fmt::format("Quantized tensor {} invalid component", tensorName)); }
+    return std::make_pair(device, checkpoint::quant::Component{.handle = handle, .sizeBytes = sizeBytes, .rows = rows, .cols = cols});
+}
+
+static auto ReadMXFP8Header(Tensor::DType& durableDtype, nb::handle pyobj, std::string_view const tensorName)
+{
+    auto const logicalDtype = ObjectString(pyobj.attr("dtype"));
+    if (logicalDtype != "torch.bfloat16")
+    {
+        throw std::runtime_error(fmt::format("MXFP8 tensor {} must have logical dtype torch.bfloat16, got {}", tensorName, logicalDtype));
+    }
+    auto const fp8Dtype = ObjectString(pyobj.attr("_fp8_dtype"));
+    if (fp8Dtype != "7" && !fp8Dtype.contains("kFloat8E4M3"))
+    {
+        throw std::runtime_error(fmt::format("MXFP8 tensor {} uses unsupported FP8 dtype {}", tensorName, fp8Dtype));
+    }
+    if (HasAttr(pyobj, "_with_gemm_swizzled_scales") && nb::cast<bool>(pyobj.attr("_with_gemm_swizzled_scales")))
+    {
+        throw std::runtime_error(fmt::format("MXFP8 tensor {} uses unsupported GEMM-swizzled scales", tensorName));
+    }
+
+    auto data     = pyobj.attr("_rowwise_data");
+    auto scaleInv = pyobj.attr("_rowwise_scale_inv");
+    if (data.is_none() || scaleInv.is_none())
+    {
+        throw std::runtime_error(fmt::format("MXFP8 tensor {} is missing rowwise data or scales", tensorName));
+    }
+
+    durableDtype    = Tensor::DType::BFloat16;
+    auto     header = std::make_unique<checkpoint::quant::Header>();
+    DeviceId scaleDevice{};
+    header->encoding                               = checkpoint::quant::Encoding::MXFP8E4M3;
+    header->scaleLayout                            = checkpoint::quant::ScaleLayout::Compact;
+    std::tie(header->device, header->rowwiseData)  = AddHeaderComponent(data, Tensor::DType::UInt8, tensorName, "rowwise_data");
+    std::tie(scaleDevice, header->rowwiseScaleInv) = AddHeaderComponent(scaleInv, Tensor::DType::UInt8, tensorName, "rowwise_scale_inv");
+    if (header->device != scaleDevice)
+    {
+        throw std::runtime_error(fmt::format("Quantized tensor {} components must be on one device", tensorName));
+    }
+    return header;
+}
+
+static auto ReadFP8Header(Tensor::DType& durableDtype, nb::handle pyobj, std::string_view const tensorName)
+{
+    auto const logicalDtype = ObjectString(pyobj.attr("dtype"));
+    if (logicalDtype != "torch.bfloat16")
+    {
+        throw std::runtime_error(fmt::format("FP8 tensor {} must have logical dtype torch.bfloat16, got {}", tensorName, logicalDtype));
+    }
+    auto const fp8Dtype = ObjectString(pyobj.attr("_fp8_dtype"));
+    if (fp8Dtype != "7" && !fp8Dtype.contains("kFloat8E4M3"))
+    {
+        throw std::runtime_error(fmt::format("FP8 tensor {} uses unsupported dtype {}", tensorName, fp8Dtype));
+    }
+
+    auto data     = pyobj.attr("_data");
+    auto scaleInv = pyobj.attr("_scale_inv");
+    if (data.is_none() || scaleInv.is_none())
+    {
+        throw std::runtime_error(fmt::format("FP8 tensor {} is missing data or scale", tensorName));
+    }
+
+    durableDtype    = Tensor::DType::BFloat16;
+    auto     header = std::make_unique<checkpoint::quant::Header>();
+    DeviceId scaleDevice{};
+    header->encoding                               = checkpoint::quant::Encoding::FP8E4M3;
+    header->scaleLayout                            = checkpoint::quant::ScaleLayout::Compact;
+    std::tie(header->device, header->rowwiseData)  = AddHeaderComponent(data, Tensor::DType::UInt8, tensorName, "data");
+    std::tie(scaleDevice, header->rowwiseScaleInv) = AddHeaderComponent(scaleInv, Tensor::DType::Float32, tensorName, "scale_inv");
+    if (header->device != scaleDevice)
+    {
+        throw std::runtime_error(fmt::format("Quantized tensor {} components must be on one device", tensorName));
+    }
+    if (header->rowwiseScaleInv.rows != 1 || header->rowwiseScaleInv.cols != 1)
+    {
+        throw std::runtime_error(fmt::format("FP8 tensor {} scale must contain one value", tensorName));
+    }
+    return header;
+}
+
+static auto ReadNVFP4Header(Tensor::DType& durableDtype, nb::handle pyobj, std::string_view const tensorName)
+{
+    auto const logicalDtype = ObjectString(pyobj.attr("dtype"));
+    if (logicalDtype != "torch.bfloat16")
+    {
+        throw std::runtime_error(fmt::format("NVFP4 tensor {} must have logical dtype torch.bfloat16, got {}", tensorName, logicalDtype));
+    }
+    auto const fp4Dtype = ObjectString(pyobj.attr("_fp4_dtype"));
+    if (fp4Dtype != "10" && !fp4Dtype.contains("kFloat4E2M1"))
+    {
+        throw std::runtime_error(fmt::format("NVFP4 tensor {} uses unsupported FP4 dtype {}", tensorName, fp4Dtype));
+    }
+
+    auto data     = pyobj.attr("_rowwise_data");
+    auto scaleInv = pyobj.attr("_rowwise_scale_inv");
+    auto amax     = pyobj.attr("_amax_rowwise");
+    if (data.is_none() || scaleInv.is_none() || amax.is_none())
+    {
+        throw std::runtime_error(fmt::format("NVFP4 tensor {} is missing rowwise data, scales, or amax", tensorName));
+    }
+
+    auto const e4m3Mode = [&] {
+        if (!HasAttr(pyobj, "_nvfp4_e4m3_max")) { return checkpoint::quant::NVFP4E4M3Mode::ScaleBound448; }
+        auto scaleBound = nb::cast<uint16_t>(pyobj.attr("_nvfp4_e4m3_max"));
+        if (scaleBound == 448u) { return checkpoint::quant::NVFP4E4M3Mode::ScaleBound448; }    // NOLINT(readability-magic-numbers)
+        if (scaleBound == 256u) { return checkpoint::quant::NVFP4E4M3Mode::ScaleBound256; }
+        throw std::runtime_error(fmt::format("NVFP4 tensor {} has unsupported _nvfp4_e4m3_max value: {}", tensorName, scaleBound));
+    }();
+
+    durableDtype    = Tensor::DType::BFloat16;
+    auto     header = std::make_unique<checkpoint::quant::Header>();
+    DeviceId scaleDevice{};
+    DeviceId amaxDevice{};
+    header->encoding       = checkpoint::quant::Encoding::NVFP4E2M1;
+    header->scaleLayout    = nb::cast<bool>(pyobj.attr("_with_gemm_swizzled_scales")) ? checkpoint::quant::ScaleLayout::GemmSwizzled
+                                                                                      : checkpoint::quant::ScaleLayout::Compact;
+    header->nvfp4E4M3Mode  = e4m3Mode;
+    header->rowScaledNVFP4 = HasAttr(pyobj, "_row_scaled_nvfp4") && nb::cast<bool>(pyobj.attr("_row_scaled_nvfp4"));
+    std::tie(header->device, header->rowwiseData)  = AddHeaderComponent(data, Tensor::DType::UInt8, tensorName, "data");
+    std::tie(scaleDevice, header->rowwiseScaleInv) = AddHeaderComponent(scaleInv, Tensor::DType::UInt8, tensorName, "scale_inv");
+    std::tie(amaxDevice, header->rowwiseAmax)      = AddHeaderComponent(amax, Tensor::DType::Float32, tensorName, "amax");
+    if (scaleDevice != header->device || amaxDevice != header->device)
+    {
+        throw std::runtime_error(fmt::format("Quantized tensor {} components must be on one device", tensorName));
+    }
+    return header;
+}
+
 // === Megatron / torch type predicates ===
 //
 // Per-leaf `nb::module_::import_(...)` + `attr(...)` adds ~3-5us of overhead
@@ -285,7 +482,7 @@ static nb::object AddressableTensor(std::string_view name, nb::handle value)
     if (hasDequantize < 0) { throw nb::python_error(); }
     if (hasDequantize == 0) { throw std::runtime_error(fmt::format("Tensor {} has no addressable storage", name)); }
 
-    // TODO_HOST_DEQUANT: Revisit this for host-based dequantization.
+    // Packed formats are handled before the fallback for storage-less wrappers.
     owner = owner.attr("detach")().attr("dequantize")();
     dlp   = ReadDlpack(owner);
     if (DataPtrFromDlTensor(*dlp.tnsr) == 0 && HasElements(*dlp.tnsr))
@@ -295,48 +492,91 @@ static nb::object AddressableTensor(std::string_view name, nb::handle value)
     return owner;
 }
 
-static DTensor BareTensorMeta(RankTopology const& topo, std::string_view name, DLTensor const& t)
+static TensorState TensorStorageState(RankTopology const& topo, std::string_view name, nb::handle value)
 {
-    DTensor        meta{};
-    DTensor::Shard shard;
-    shard.rank          = topo.rank;
-    meta.durableDtype   = DlpackDtypeToDs4(t.dtype);
-    shard.snapshotDtype = meta.durableDtype;
-    shard.device        = DlpackDeviceToId(t.device);
-    shard.handle        = DataPtrFromDlTensor(t);
-    uint64_t nelem      = 1;
-    if (!IsRowMajorContiguous(t)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", name)); }
-    if (std::cmp_greater(t.ndim, Tensor::MaxDims))
-    {
-        throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, t.ndim));
-    }
-    if (t.ndim == 0)
-    {
-        meta.fulldim.push_back(1);
-        shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
-    }
+    TensorState state{.owner = nb::borrow<nb::object>(value)};
+    state.shard.rank         = topo.rank;
+    auto const snapshotDtype = DetectQuantDType(state.owner);
+    if (snapshotDtype == Tensor::DType::FP8E4M3) { state.header = ReadFP8Header(state.meta.durableDtype, state.owner, name); }
+    else if (snapshotDtype == Tensor::DType::MXFP8) { state.header = ReadMXFP8Header(state.meta.durableDtype, state.owner, name); }
+    else if (snapshotDtype == Tensor::DType::NVFP4) { state.header = ReadNVFP4Header(state.meta.durableDtype, state.owner, name); }
     else
     {
-        for (int i = 0; i < t.ndim; ++i)
+        state.owner               = AddressableTensor(name, state.owner);
+        auto [capsule, t]         = ReadDlpack(state.owner);
+        state.meta.durableDtype   = DlpackDtypeToDs4(t->dtype);
+        state.shard.snapshotDtype = state.meta.durableDtype;
+        state.shard.device        = DlpackDeviceToId(t->device);
+        state.shard.handle        = DataPtrFromDlTensor(*t);
+        state.shard.storageSize   = static_cast<size_t>((t->dtype.bits + 7U) / 8U) * t->dtype.lanes;    // NOLINT
+
+        if (!IsRowMajorContiguous(*t)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", name)); }
+        if (std::cmp_greater(t->ndim, Tensor::MaxDims))
         {
-            auto dim = t.shape[i];    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-            if (dim <= 0) { throw std::runtime_error(fmt::format("Tensor {} has non-positive dim[{}]: {}", name, i, dim)); }
-            nelem = nelem * static_cast<uint64_t>(dim);
-            meta.fulldim.push_back(static_cast<uint64_t>(dim));
-            shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = static_cast<uint64_t>(dim)});
+            throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, t->ndim));
         }
+        for (int i = 0; i < t->ndim; ++i)
+        {
+            auto const dim = t->shape[i];    // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            if (dim <= 0) { throw std::runtime_error(fmt::format("Tensor {} has non-positive dim[{}]: {}", name, i, dim)); }
+            state.shard.storageSize *= static_cast<size_t>(dim);
+        }
+        return state;
     }
-    shard.storageSize = nelem * Tensor::GetDTypeSize(meta.durableDtype);
-    shard.AssertShardIsValid(meta.fulldim);
-    meta.AddShard(shard);
-    return meta;
+    auto const shape = nb::cast<nb::tuple>(state.owner.attr("shape"));
+    if (shape.empty()) { throw std::runtime_error(fmt::format("Quantized tensor {} has an empty shape", name)); }
+    uint64_t rows = 1;
+    for (size_t i = 0; i + 1 < shape.size(); ++i)
+    {
+        auto const dim = nb::cast<uint64_t>(shape[i]);
+        rows *= dim;
+    }
+    auto const cols = nb::cast<uint64_t>(shape[shape.size() - 1]);
+    if (rows == 0 || cols == 0 || state.header->rowwiseData.handle == 0)
+    {
+        throw std::runtime_error(fmt::format("Quantized tensor {} has invalid dimensions or components", name));
+    }
+    state.header->logicalRows    = rows;
+    state.header->logicalCols    = cols;
+    state.header->totalSizeBytes = sizeof(checkpoint::quant::Header) + state.header->rowwiseData.sizeBytes
+                                   + state.header->rowwiseScaleInv.sizeBytes + state.header->rowwiseAmax.sizeBytes;
+    state.shard.snapshotDtype    = snapshotDtype;
+    state.shard.device           = state.header->device;
+    state.shard.handle           = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state.header.get()));    // NOLINT
+    state.shard.storageSize      = state.header->totalSizeBytes;
+    return state;
 }
 
 static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
 {
-    auto owner = AddressableTensor(name, value);
-    auto dlp   = ReadDlpack(owner);
-    return {.meta = BareTensorMeta(topo, name, *dlp.tnsr), .owner = std::move(owner)};
+    auto       state = TensorStorageState(topo, name, value);
+    auto const shape = nb::cast<nb::tuple>(state.owner.attr("shape"));
+    if (shape.size() > Tensor::MaxDims)
+    {
+        throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, shape.size()));
+    }
+    uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
+    if (shape.empty())
+    {
+        state.meta.fulldim.push_back(1);
+        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
+    }
+    for (auto const& dimension : shape)
+    {
+        auto const dim = nb::cast<int64_t>(dimension);
+        if (dim <= 0) { throw std::runtime_error(fmt::format("Tensor {} has non-positive dimension {}", name, dim)); }
+        state.meta.fulldim.push_back(static_cast<uint64_t>(dim));
+        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = static_cast<uint64_t>(dim)});
+        logicalBytes *= static_cast<uint64_t>(dim);
+    }
+    if (!state.header && state.shard.storageSize != logicalBytes)
+    {
+        throw std::runtime_error(fmt::format(
+            "Tensor {} size mismatch: dimensions imply {} bytes, tensor storage implies {}", name, logicalBytes, state.shard.storageSize));
+    }
+    state.shard.AssertShardIsValid(state.meta.fulldim);
+    state.meta.AddShard(state.shard);
+    return state;
 }
 
 static StateNode::Scalar TorchDtypeState(nb::handle value)
@@ -372,7 +612,6 @@ static StateNode::Blob TorchGeneratorBlob(std::string_view name, nb::handle valu
 static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, nb::dict const& container)
 {
     using Range = Tensor::Range;
-    DTensor ds4tensor{};
 
     auto shtKey     = nb::cast<nb::str>(container["key"]);
     auto shtKeyView = StrView(shtKey);
@@ -393,15 +632,7 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     };
     auto throwError = [&](std::string_view const& message) { throw ShardedTensorError(shtKey, container, message); };
 
-    auto owner = AddressableTensor(shtKeyView, container["data"]);
-    auto dlp   = ReadDlpack(owner);
-    if (!IsRowMajorContiguous(*dlp.tnsr)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", shtKeyView)); }
-    ds4tensor.durableDtype = DlpackDtypeToDs4(dlp.tnsr->dtype);
-    DTensor::Shard shard{};
-    shard.rank          = topo.rank;
-    shard.snapshotDtype = ds4tensor.durableDtype;
-    shard.handle        = DataPtrFromDlTensor(*dlp.tnsr);
-    shard.device        = DlpackDeviceToId(dlp.tnsr->device);
+    auto [ds4tensor, shard, owner, header] = TensorStorageState(topo, shtKeyView, container["data"]);
 
     auto globalShape    = nb::cast<nb::tuple>(container["global_shape"]);
     auto localShape     = nb::cast<nb::tuple>(container["local_shape"]);
@@ -498,7 +729,7 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     }();
 
     for (auto const& val : globalShape) { ds4tensor.fulldim.push_back(nb::cast<uint64_t>(val)); }
-    shard.storageSize = 1;
+    uint64_t logicalBytes = Tensor::GetDTypeSize(ds4tensor.durableDtype);
     for (size_t i = 0; i < globalShape.size(); ++i)
     {
         auto    start = nb::cast<int64_t>(globalOffset[i]);
@@ -509,23 +740,21 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
             end = start + nb::cast<int64_t>(localShape[i - prependAxisNumValue]);
         }
         shard.sharddim.push_back(Range{.begin = static_cast<size_t>(start), .end = static_cast<size_t>(end)});
-        shard.storageSize *= (end - start);
+        logicalBytes *= static_cast<uint64_t>(end - start);
     }
-    shard.storageSize = shard.storageSize * Tensor::GetDTypeSize(ds4tensor.durableDtype);
-
-    size_t dlpackBytes = static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * dlp.tnsr->dtype.lanes;    // NOLINT
-    for (int i = 0; i < dlp.tnsr->ndim; ++i)
+    uint64_t const storageLogicalBytes
+        = header ? header->rowwiseData.sizeBytes * (header->encoding == checkpoint::quant::Encoding::NVFP4E2M1 ? uint64_t{4} : uint64_t{2})
+                 : shard.storageSize;
+    if (logicalBytes != storageLogicalBytes)
     {
-        dlpackBytes *= static_cast<size_t>(dlp.tnsr->shape[i]);    // NOLINT
-    }
-    if (shard.storageSize != dlpackBytes)
-    {
-        throw std::runtime_error(fmt::format(
-            "Tensor {} size mismatch: sharddim implies {} bytes, DLPack shape implies {}", shtKeyView, shard.storageSize, dlpackBytes));
+        throw std::runtime_error(fmt::format("Tensor {} size mismatch: shard dimensions imply {} bytes, tensor storage implies {}",
+                                             shtKeyView,
+                                             logicalBytes,
+                                             storageLogicalBytes));
     }
     ds4tensor.AddShard(shard);
     // ds4tensor.AssertShardIsValid();
-    return {.meta = ds4tensor, .owner = std::move(owner)};
+    return {.meta = ds4tensor, .shard = shard, .owner = std::move(owner), .header = std::move(header)};
 }
 
 static StateNode::Blob ShardedObjectBlob(nb::handle value)
@@ -549,11 +778,16 @@ static StateNode::Blob ShardedObjectBlob(nb::handle value)
     return {raw.c_str(), raw.c_str() + raw.size()};
 }
 
-static StateNode&
-RegisterTensorState(PyStateDictAccessor& scan, StateNode::Handle parent, std::string_view name, DTensor tensor, nb::handle owner)
+static StateNode& RegisterTensorState(PyStateDictAccessor&                       scan,
+                                      StateNode::Handle                          parent,
+                                      std::string_view                           name,
+                                      DTensor                                    tensor,
+                                      nb::handle                                 owner,
+                                      std::unique_ptr<checkpoint::quant::Header> header)
 {
     auto& node = name.contains('.') ? scan.RegisterStateByFQN(name, tensor) : scan.RegisterState(parent, name, tensor);
     scan.AcquireTensorObjectRefForSnapshot(node.handle, nb::borrow<nb::object>(owner));
+    if (header) { scan.AttachQuantHeader(node, std::move(header)); }
     return node;
 }
 
@@ -609,7 +843,7 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
         if (!IsMainReplica(innerContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, innerContainer);
-        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
     }
 }
 
@@ -684,7 +918,7 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
         if (!IsMainReplica(itemContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, itemContainer);
-        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
     }
     return true;
 }
@@ -694,7 +928,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     if (IsTorchTensor(val))
     {
         auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
-        RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner);
+        RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;
     }
     if (IsTorchDtype(val))
@@ -708,7 +942,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
         if (!IsMainReplica(val.attr("replica_id"))) { return true; }
         auto tensorName  = key;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
-        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner);
+        RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;
     }
     if (IsMegatronShardedTensorFactory(val))

@@ -263,6 +263,11 @@
           "checkpoint_interval": 25,
           "runner_tags": [],
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 110,
+            "native-perf": 45,
+            "nvrx-detr": 115
+          },
           "jobs": [
             [
               "native",

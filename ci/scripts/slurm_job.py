@@ -113,6 +113,12 @@ HOST_MEMORY_METRICS = frozenset({
 })
 GPU_MEMORY_METRICS = frozenset({"gpu_peak_bytes", "gpu_hbm_peak_bytes"})
 MEMORY_REGRESSION_METRICS = HOST_MEMORY_METRICS | GPU_MEMORY_METRICS
+# Baselines keep stable save-boundary gates while raw allocator and NVML values remain diagnostic.
+CHECKPOINT_SAVE_GPU_BASELINE_GATES = frozenset({
+    "checkpoint_save_gpu_allocator_unchanged",
+    "checkpoint_save_gpu_transient_activity_within_limit",
+    "checkpoint_save_gpu_invariant_satisfied",
+})
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
 # The allocation directory owns every named run.
@@ -1639,6 +1645,14 @@ def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> N
             otel_report.log_checkpoint_timings(path, None, label)
 
 
+def _baseline_candidate_metrics(measured: dict) -> dict:
+    return {
+        name: value
+        for name, value in measured.items()
+        if not name.startswith("checkpoint_save_gpu_") or name in CHECKPOINT_SAVE_GPU_BASELINE_GATES
+    }
+
+
 def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> None:
     """Write measured metrics from the job-level report as a candidate baseline."""
     flavors = _selected_flavors(args)
@@ -1681,7 +1695,7 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
         return
     metrics = {}
     rank_statistics = {}
-    for name, value in measured.items():
+    for name, value in _baseline_candidate_metrics(measured).items():
         # Socket imbalance is an in-job topology diagnostic rather than a
         # workload baseline. The platform bandwidth value is only a fallback
         # when a workload has no recorded measurement.
@@ -3412,13 +3426,18 @@ def _emit_checkpoint_resource_metrics(
     meter_provider.shutdown()
 
 def _install_selected_checkpoint_provider() -> ModuleType:
-    """Install native hooks only for a native comparison run."""
+    """Install packed-tensor compatibility and the selected provider's hooks."""
     from nvrx_checkpointing.megatron import provider as megatron_provider  # noqa: PLC0415
 
-    if megatron_provider.selected_provider() == megatron_provider.NATIVE_PROVIDER:
+    selected_provider = megatron_provider.selected_provider()
+    if selected_provider == megatron_provider.NATIVE_PROVIDER:
         from nvrx_checkpointing.megatron import integration as megatron_integration  # noqa: PLC0415
 
         megatron_integration.install()
+    else:
+        from nvrx_checkpointing import quantized_snapshot  # noqa: PLC0415
+
+        quantized_snapshot.install_quantized_sharded_narrow()
     return megatron_provider
 
 

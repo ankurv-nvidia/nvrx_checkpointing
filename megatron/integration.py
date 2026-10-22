@@ -4,8 +4,8 @@
 """Minimal runtime integration for an unmodified Megatron-LM checkout.
 
 The native provider owns checkpoint saves, its rank-local durability queue,
-loads that do not require NVIDIA Resiliency Extension, and post-load
-shared-memory registration. Provider selection is intentionally kept out of
+loads that do not require NVIDIA Resiliency Extension, and shared-memory
+registration. Provider selection is intentionally kept out of
 this module: callers that compare native with another provider can opt in to
 :mod:`nvrx_checkpointing.megatron.provider` before installing this module.
 """
@@ -17,6 +17,7 @@ import runpy
 import sys
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 SUPPORTED_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
@@ -24,6 +25,7 @@ SUPPORTED_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 _NATIVE_SAVE_MARKER = "_nvrx_checkpointing_native_save_installed"
 _NATIVE_ASYNC_MARKER = "_nvrx_checkpointing_native_async_installed"
 _NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
+_NATIVE_SAVE_TIME_MARKER = "_nvrx_checkpointing_native_save_time_installed"
 
 
 def _read_metadata_uncached(strategy: Any) -> None:
@@ -39,7 +41,7 @@ def _read_metadata_uncached(strategy: Any) -> None:
 
 
 def _install_load_registration() -> None:
-    """Load without NVIDIA Resiliency Extension, then register the constructed state."""
+    """Coordinate native registration around Megatron's checkpoint load."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
     from megatron.core.dist_checkpointing.dict_utils import nested_values  # type: ignore[import-not-found]
     from megatron.core.dist_checkpointing.mapping import ShardedTensor  # type: ignore[import-not-found]
@@ -58,13 +60,11 @@ def _install_load_registration() -> None:
         # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
         # replica_ids are overwritten by the fully parallel loading process. We need to preserve the original values.
         replica_ids = [(value, value.replica_id) for value in nested_values(sharded_state_dict) if isinstance(value, ShardedTensor)]
-        result = original_load(sharded_state_dict, *args, **kwargs)
-        for value, replica_id in replica_ids:
-            value.replica_id = replica_id
-        root = native_save.register_state_dict(sharded_state_dict, 0)
-        root.finalize_registry()
-        root.wait_for_async_completion()
-        return result
+        try:
+            return original_load(sharded_state_dict, *args, **kwargs)
+        finally:
+            for value, replica_id in replica_ids:
+                value.replica_id = replica_id
 
     dist_checkpointing.load = load
     setattr(dist_checkpointing, _NATIVE_LOAD_MARKER, True)
@@ -85,6 +85,28 @@ def _install_async_queue_bindings() -> None:
     training_module.maybe_finalize_async_save = native_save.maybe_finalize_async_save
 
     setattr(training_module, _NATIVE_ASYNC_MARKER, True)
+
+
+def _install_save_timer_wrapper() -> None:
+    """Disable Megatron's post-save collection for native checkpoint saves."""
+    from megatron.training import training as training_module  # type: ignore[import-not-found]
+
+    if getattr(training_module, _NATIVE_SAVE_TIME_MARKER, False):
+        return
+    original_save_checkpoint_and_time = training_module.save_checkpoint_and_time
+    gc_without_collect = SimpleNamespace(collect=lambda *_args, **_kwargs: 0)
+
+    @wraps(original_save_checkpoint_and_time)
+    def save_checkpoint_and_time(*args: Any, **kwargs: Any) -> Any:
+        original_gc = training_module.gc
+        training_module.gc = gc_without_collect
+        try:
+            return original_save_checkpoint_and_time(*args, **kwargs)
+        finally:
+            training_module.gc = original_gc
+
+    training_module.save_checkpoint_and_time = save_checkpoint_and_time
+    setattr(training_module, _NATIVE_SAVE_TIME_MARKER, True)
 
 
 def _install_save_wrapper() -> None:
@@ -132,6 +154,7 @@ def install() -> None:
     _install_async_queue_bindings()
     _install_load_registration()
     _install_save_wrapper()
+    _install_save_timer_wrapper()
 
 
 def main(argv: list[str] | None = None) -> None:

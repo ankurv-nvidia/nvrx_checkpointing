@@ -257,7 +257,7 @@
   fp16_lm_cross_entropy ........................... False
   fp32_residual_connection ........................ False
   fp4 ............................................. e2m1
-  fp4_param_gather ................................ False
+  fp4_param_gather ................................ True
   fp4_quantizer_factory ........................... None
   fp4_recipe ...................................... nvfp4
   fp8 ............................................. None
@@ -450,7 +450,7 @@
   lr_wsd_decay_iters .............................. None
   lr_wsd_decay_samples ............................ 40000
   lr_wsd_decay_style .............................. minus_sqrt
-  main_grads_dtype ................................ torch.bfloat16
+  main_grads_dtype ................................ torch.float32
   main_params_dtype ............................... torch.float32
   make_vocab_size_divisible_by .................... 128
   mamba_head_dim .................................. 64
@@ -853,7 +853,7 @@
   use_mp_args_from_checkpoint_args ................ False
   use_mup ......................................... False
   use_persistent_ckpt_worker ...................... False
-  use_precision_aware_optimizer ................... True
+  use_precision_aware_optimizer ................... False
   use_pytorch_profiler ............................ False
   use_ring_exchange_p2p ........................... False
   use_rope_scaling ................................ False

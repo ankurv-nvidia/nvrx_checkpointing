@@ -198,6 +198,49 @@ def _checkpoint_timing_span(
     }
 
 
+def _gpu_memory_span(rank: int, *, unchanged: bool = True, run_id: str = "run-1") -> dict:
+    attributes = [
+        {"key": "nvrx.gpu.memory.invariant_required", "value": {"boolValue": True}},
+        {"key": "nvrx.gpu.memory.allocated_delta_bytes", "value": _iv(0)},
+        {"key": "nvrx.gpu.memory.reserved_delta_bytes", "value": _iv(0)},
+        {"key": "nvrx.gpu.memory.allocated_during_save_bytes", "value": _iv(0)},
+        {"key": "nvrx.gpu.memory.freed_during_save_bytes", "value": _iv(0)},
+        {"key": "nvrx.gpu.memory.hbm_used_delta_bytes", "value": _iv(-1024)},
+        {"key": "nvrx.gpu.memory.allocator_unchanged", "value": {"boolValue": unchanged}},
+        {"key": "nvrx.gpu.memory.transient_activity_within_limit", "value": {"boolValue": unchanged}},
+        {"key": "nvrx.gpu.memory.invariant_satisfied", "value": {"boolValue": unchanged}},
+        {"key": "nvrx.gpu.memory.hbm_unchanged", "value": {"boolValue": unchanged}},
+    ]
+    return {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "nemo.run.id", "value": {"stringValue": run_id}},
+                        {"key": "dl.rank", "value": _iv(rank)},
+                    ],
+                },
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "name": "nvrx.checkpoint.save",
+                                "events": [
+                                    {
+                                        "name": "nvrx.checkpoint.save.gpu_memory.exit",
+                                        "attributes": attributes,
+                                        "timeUnixNano": "123",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
 def test_iter_samples_extracts_per_rank(tmp_path):
     path = _write_jsonl(tmp_path / "t.jsonl", [_save_span(0, 100.0, 200, 4096), _save_span(1, 50.0, 400, 4096)])
     by_rank = {s["rank"]: s for s in otel_report.collect_samples([path])}
@@ -208,6 +251,30 @@ def test_iter_samples_extracts_per_rank(tmp_path):
     assert by_rank[0]["snapshot_id"] == 1
     assert by_rank[1]["bw_mbps"] == 50.0
     assert by_rank[1]["total_written_bytes"] == 4096
+
+
+def test_save_gpu_memory_events_are_reported_as_metrics(tmp_path: Path) -> None:
+    path = _write_jsonl(tmp_path / "telemetry.jsonl", [_gpu_memory_span(0), _gpu_memory_span(1)])
+    events = otel_report.collect_save_gpu_memory_events([path], "run-1")
+    data = {
+        "native_saves": [],
+        "daemon_durable_spans": [],
+        "megatron_spans": [],
+        "megatron_metrics": [],
+        "resource_metrics": [],
+        "save_gpu_memory_events": events,
+        "process_memory": [],
+    }
+
+    metrics = otel_report.metrics_from_data(data)
+
+    assert len(events) == 2
+    assert metrics["checkpoint_save_gpu_allocator_unchanged"]["mean"] == 1
+    assert metrics["checkpoint_save_gpu_transient_activity_within_limit"]["mean"] == 1
+    assert metrics["checkpoint_save_gpu_invariant_satisfied"]["mean"] == 1
+    assert metrics["checkpoint_save_gpu_hbm_unchanged"]["mean"] == 1
+    assert metrics["checkpoint_save_gpu_allocated_during_save_bytes"]["max"] == 0
+    assert metrics["checkpoint_save_gpu_hbm_used_delta_bytes"]["min"] == -1024
 
 
 def test_process_memory_metrics_and_combined_chart(tmp_path: Path) -> None:

@@ -84,6 +84,7 @@ include(zlib)
 add_library(phoenix_checkpoint OBJECT
     src/checkpoint/checkpoint.cpp
     src/checkpoint/logtel.cpp
+    src/checkpoint/quant.cpp
 )
 
 target_include_directories(phoenix_checkpoint PUBLIC
@@ -275,7 +276,9 @@ find_package(cpptrace CONFIG REQUIRED)
 # STATIC + POSITION_INDEPENDENT_CODE=ON would let transitive PUBLIC
 # propagation handle this naturally; defer that until a third consumer hits
 # the same wall.
-add_library(distcpio OBJECT src/checkpoint/distcp.cpp)
+add_library(distcpio OBJECT
+    src/checkpoint/distcp.cpp
+    src/checkpoint/host_dequant.cpp)
 target_link_libraries(distcpio PUBLIC
     phoenix_checkpoint
     fmt::fmt-header-only
@@ -368,6 +371,15 @@ if (PHOENIX_BUILD_TESTS)
             ENVIRONMENT
                 MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
+
+        pytest_discover_tests(quantized_snapshot
+            TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quantized_snapshot.py
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            DEPENDS checkpoint checkpoint_server
+            ENVIRONMENT
+                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
+        )
+
     endif()
 endif()
 
@@ -391,6 +403,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             debug.py
             megatron@megatron
             megatron_stubs@megatron_stubs
+            quantized_snapshot.py
             metadata_compare.py
             peers.py
             telemetry.py

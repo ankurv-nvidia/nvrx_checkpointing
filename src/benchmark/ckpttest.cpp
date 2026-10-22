@@ -6,7 +6,9 @@
 #include "config.h"
 #include "distcp.h"
 #include "distcp_internal.h"
+#include "host_dequant.h"
 #include "logging.h"
+#include "quant.h"
 #include "server.h"
 #include "service_client.h"
 #include "session.h"
@@ -47,6 +49,7 @@
 #include <new>
 #include <regex>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -225,6 +228,12 @@ static std::filesystem::path CkptDir(std::string_view stem)
     return base / stem;
 }
 
+static std::vector<char> ReadWholeFile(std::filesystem::path const& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
 static RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
 {
     return RankTopology{
@@ -354,6 +363,451 @@ static void AddShardedTensorLeaf(StateTree&                 tree,
 
 TEST_CASE("scaffolding", "[scaffolding]")
 { REQUIRE(true); }
+
+TEST_CASE("MXFP8 scalar dequantization matches BF16 golden values", "[mxfp8][tier1]")
+{
+    std::array<char, 8> nativeBytes{};
+    REQUIRE_FALSE(checkpoint::host_dequant::HasStorageHeader(nativeBytes));
+
+    struct GoldenValue
+    {
+        uint8_t  value;
+        uint8_t  scale;
+        uint16_t expected;
+    };
+    static constexpr std::array GoldenValues{
+        GoldenValue{0x00, 0x7f, 0x0000},
+        GoldenValue{0x80, 0x7f, 0x8000},
+        GoldenValue{0x38, 0x7f, 0x3f80},
+        GoldenValue{0x3c, 0x7f, 0x3fc0},
+        GoldenValue{0xb8, 0x7f, 0xbf80},
+        GoldenValue{0x38, 0x80, 0x4000},
+        GoldenValue{0x38, 0x7e, 0x3f00},
+        GoldenValue{0x01, 0x7f, 0x3b00},
+        GoldenValue{0x38, 0x00, 0x0040},
+        GoldenValue{0x7e, 0x7f, 0x43e0},
+        GoldenValue{0x7f, 0x7f, 0x7fff},
+        GoldenValue{0x38, 0xff, 0x7fff},
+    };
+    for (auto const& golden : GoldenValues)
+    {
+        CHECK(checkpoint::host_dequant::MXFP8E4M3ToBFloat16(golden.value, golden.scale) == golden.expected);
+    }
+}
+
+TEST_CASE("FP8 E4M3 scalar dequantization matches BF16 golden values", "[fp8][tier1]")
+{
+    struct GoldenValue
+    {
+        uint8_t  value;
+        float    scaleInv;
+        uint16_t expected;
+    };
+    static constexpr std::array GoldenValues{
+        GoldenValue{0x00, 1.0F, 0x0000},
+        GoldenValue{0x80, 1.0F, 0x8000},
+        GoldenValue{0x38, 1.0F, 0x3f80},
+        GoldenValue{0x3c, 1.0F, 0x3fc0},
+        GoldenValue{0xb8, 1.0F, 0xbf80},
+        GoldenValue{0x38, 2.0F, 0x4000},
+        GoldenValue{0x38, 0.5F, 0x3f00},
+        GoldenValue{0x01, 1.0F, 0x3b00},
+        GoldenValue{0x7e, 1.0F, 0x43e0},
+        GoldenValue{0x7f, 1.0F, 0x7fff},
+        GoldenValue{0x38, 0.1F, 0x3dcd},
+        GoldenValue{0x38, 3.1415927F, 0x4049},
+    };
+    for (auto const& golden : GoldenValues)
+    {
+        CHECK(checkpoint::host_dequant::FP8E4M3ToBFloat16(golden.value, golden.scaleInv) == golden.expected);
+    }
+}
+
+TEST_CASE("NVFP4 scalar dequantization matches BF16 golden values", "[nvfp4][tier1]")
+{
+    using E4M3Mode = checkpoint::quant::NVFP4E4M3Mode;
+    struct GoldenValue
+    {
+        uint8_t  value;
+        uint8_t  scale;
+        float    amax;
+        E4M3Mode mode;
+        uint16_t expected;
+    };
+    static constexpr std::array GoldenValues{
+        GoldenValue{0x0, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x0000},
+        GoldenValue{0x8, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x8000},
+        GoldenValue{0x2, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x3f80},
+        GoldenValue{0x1, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x3f00},
+        GoldenValue{0x3, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x3fc0},
+        GoldenValue{0x7, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0x40c0},
+        GoldenValue{0xf, 0x38, 2688.0F, E4M3Mode::ScaleBound448, 0xc0c0},
+        GoldenValue{0x2, 0x40, 1344.0F, E4M3Mode::ScaleBound448, 0x3f80},
+        GoldenValue{0x2, 0x38, 1536.0F, E4M3Mode::ScaleBound256, 0x3f80},
+        GoldenValue{0x2, 0x38, 0.0F, E4M3Mode::ScaleBound448, 0x0000},
+        GoldenValue{0x2, 0x7f, 1.0F, E4M3Mode::ScaleBound448, 0x7fff},
+    };
+    for (auto const& golden : GoldenValues)
+    {
+        CHECK(checkpoint::host_dequant::NVFP4E2M1ToBFloat16(golden.value, golden.scale, golden.amax, golden.mode) == golden.expected);
+    }
+}
+
+TEST_CASE("quantized snapshot segments preserve capture handles", "[quantized][tier1]")
+{
+    std::array<uint8_t, 8> data{0, 1, 2, 3, 4, 5, 6, 7};
+    std::array<uint8_t, 2> scale{120, 121};
+
+    checkpoint::quant::Header source{
+        .totalSizeBytes  = sizeof(checkpoint::quant::Header) + data.size() + scale.size(),
+        .logicalRows     = 1,
+        .logicalCols     = 8,
+        .encoding        = checkpoint::quant::Encoding::MXFP8E4M3,
+        .scaleLayout     = checkpoint::quant::ScaleLayout::Compact,
+        .device          = DeviceId{"cpu:3"},
+        .rowwiseData     = {.handle    = reinterpret_cast<uint64_t>(data.data()),    // NOLINT
+                            .sizeBytes = data.size(),
+                            .rows      = 1,
+                            .cols      = data.size()},
+        .rowwiseScaleInv = {.handle    = reinterpret_cast<uint64_t>(scale.data()),    // NOLINT
+                            .sizeBytes = scale.size(),
+                            .rows      = 1,
+                            .cols      = scale.size()},
+    };
+    auto const original = source;
+
+    auto snapshot = [&](uint64_t offset, uint64_t size) {
+        std::vector<char> result;
+        checkpoint::quant::SerializeSnapshotSegments(reinterpret_cast<uint64_t>(&source),    // NOLINT
+                                                     offset,
+                                                     size,
+                                                     [&](DeviceId, uint64_t handle, uint64_t bytes) {
+                                                         auto const* begin = reinterpret_cast<char const*>(handle);    // NOLINT
+                                                         result.insert(result.end(), begin, begin + bytes);            // NOLINT
+                                                     });
+        return result;
+    };
+
+    auto const first  = snapshot(0, source.totalSizeBytes);
+    auto const second = snapshot(0, source.totalSizeBytes);
+    REQUIRE(first == second);
+    REQUIRE(source == original);
+
+    checkpoint::quant::Header serialized;
+    std::memcpy(&serialized, first.data(), sizeof(serialized));
+    CHECK(serialized.device == source.device);
+    CHECK(serialized.rowwiseData.handle == source.rowwiseData.handle);
+    CHECK(serialized.rowwiseScaleInv.handle == source.rowwiseScaleInv.handle);
+    CHECK(std::equal(data.begin(), data.end(), first.begin() + static_cast<std::ptrdiff_t>(sizeof(serialized))));
+    CHECK(std::equal(scale.begin(), scale.end(), first.end() - static_cast<std::ptrdiff_t>(scale.size())));
+
+    std::vector<char> partitioned;
+    for (uint64_t offset = 0; offset < source.totalSizeBytes; offset += 37)
+    {
+        auto const size  = std::min<uint64_t>(37, source.totalSizeBytes - offset);
+        auto const bytes = snapshot(offset, size);
+        partitioned.insert(partitioned.end(), bytes.begin(), bytes.end());
+    }
+    CHECK(partitioned == first);
+
+    std::vector<DeviceId> devices;
+    source.device = DeviceId{"cuda:3"};
+    checkpoint::quant::SerializeSnapshotSegments(reinterpret_cast<uint64_t>(&source),    // NOLINT
+                                                 0,
+                                                 source.totalSizeBytes,
+                                                 [&](DeviceId device, uint64_t, uint64_t) { devices.push_back(device); });
+    REQUIRE(devices.size() == 3);
+    CHECK(devices[0] == DeviceId{"cpu"});
+    CHECK(devices[1] == DeviceId{"cuda:3"});
+    CHECK(devices[2] == DeviceId{"cuda:3"});
+
+    source.magic = {};
+    CHECK_THROWS(checkpoint::quant::SerializeSnapshotSegments(reinterpret_cast<uint64_t>(&source),    // NOLINT
+                                                              0,
+                                                              source.totalSizeBytes,
+                                                              [](DeviceId, uint64_t, uint64_t) {}));
+    source.magic = checkpoint::quant::Magic;
+
+    auto otherDevice   = source;
+    otherDevice.device = DeviceId{"cuda:4"};
+    checkpoint::quant::HeaderMap headers{source, source, otherDevice};
+    checkpoint::quant::FinalizeHeaders(headers);
+    REQUIRE(headers.size() == 2);
+    CHECK(checkpoint::quant::FindHeader(headers, source.device, reinterpret_cast<uint64_t>(data.data())) == source);              // NOLINT
+    CHECK(checkpoint::quant::FindHeader(headers, otherDevice.device, reinterpret_cast<uint64_t>(data.data())) == otherDevice);    // NOLINT
+}
+
+TEST_CASE("FP8 E4M3 snapshots retain packed storage and write identical BF16 DCP", "[fp8][distcp]")
+{
+    constexpr uint64_t rows          = 4;
+    constexpr uint64_t cols          = 256;
+    constexpr uint64_t elements      = rows * cols;
+    constexpr uint64_t dataOffset    = sizeof(checkpoint::quant::Header);
+    constexpr uint64_t dataSize      = elements;
+    constexpr uint64_t scaleOffset   = dataOffset + dataSize;
+    constexpr uint64_t scaleSize     = sizeof(float);
+    constexpr uint64_t quantizedSize = scaleOffset + scaleSize;
+
+    checkpoint::quant::Header header{
+        .totalSizeBytes  = quantizedSize,
+        .logicalRows     = rows,
+        .logicalCols     = cols,
+        .encoding        = checkpoint::quant::Encoding::FP8E4M3,
+        .scaleLayout     = checkpoint::quant::ScaleLayout::Compact,
+        .device          = "cpu",
+        .rowwiseData     = {.handle = dataOffset, .sizeBytes = dataSize, .rows = rows, .cols = cols},
+        .rowwiseScaleInv = {.handle = scaleOffset, .sizeBytes = scaleSize, .rows = 1, .cols = 1},
+    };
+
+    ByteStorage quantizedStorage(quantizedSize);
+    auto*       quantized = static_cast<uint8_t*>(quantizedStorage.data);
+    std::memcpy(quantized, &header, sizeof(header));
+    for (uint64_t i = 0; i < dataSize; ++i) { quantized[dataOffset + i] = static_cast<uint8_t>((i * 29U) & 0xffU); }
+    float const scaleInv = 0.1F;
+    std::memcpy(quantized + scaleOffset, &scaleInv, sizeof(scaleInv));
+    auto snapshot = quantizedStorage.AsSpan<char const>(0, quantizedStorage.size);
+
+    ByteStorage bf16Storage(elements * sizeof(uint16_t));
+    auto        bf16 = std::span<uint16_t>(static_cast<uint16_t*>(bf16Storage.data), elements);
+    checkpoint::host_dequant::FP8E4M3ToBFloat16Range(snapshot, 0, bf16);
+
+    std::vector<uint16_t> chunked(elements);
+    for (uint64_t offset = 0; offset < elements;)
+    {
+        auto const count = static_cast<size_t>(std::min<uint64_t>(37, elements - offset));
+        checkpoint::host_dequant::DequantizeToBFloat16Range(snapshot, offset, std::span(chunked).subspan(offset, count));
+        offset += count;
+    }
+    REQUIRE(std::ranges::equal(chunked, bf16));
+
+    StateTree quantizedTree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    StateTree bf16Tree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    AddShardedTensorLeaf(quantizedTree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    AddShardedTensorLeaf(bf16Tree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    auto& quantizedTensor = std::get<DTensor>(quantizedTree.GetNode(quantizedTree.FindNodeByFQN("weight")).data);
+    auto  quantizedShard  = *quantizedTensor.shards.begin();
+    quantizedTensor.shards.clear();
+    quantizedShard.snapshotDtype = Tensor::DType::FP8E4M3;
+    quantizedShard.storageSize   = quantizedSize;
+    quantizedTensor.AddShard(quantizedShard);
+
+    auto quantizedDir = CkptDir("fp8_quantized");
+    auto bf16Dir      = CkptDir("fp8_bf16");
+    std::filesystem::remove_all(quantizedDir);
+    std::filesystem::remove_all(bf16Dir);
+    checkpoint::distcp::WriteRankShard(quantizedDir, Rank{0}, quantizedTree, quantizedStorage, {});
+    checkpoint::distcp::WriteMetadata(quantizedDir, quantizedTree, {});
+    checkpoint::distcp::WriteRankShard(bf16Dir, Rank{0}, bf16Tree, bf16Storage, {});
+    checkpoint::distcp::WriteMetadata(bf16Dir, bf16Tree, {});
+
+    REQUIRE(ReadWholeFile(quantizedDir / "__0_0.distcp") == ReadWholeFile(bf16Dir / "__0_0.distcp"));
+    REQUIRE(ReadWholeFile(quantizedDir / ".metadata") == ReadWholeFile(bf16Dir / ".metadata"));
+}
+
+TEST_CASE("MXFP8 snapshots retain packed storage and write identical BF16 DCP", "[mxfp8][distcp]")
+{
+    constexpr uint64_t rows           = 128;
+    constexpr uint64_t cols           = 512;
+    constexpr uint64_t elements       = rows * cols;
+    constexpr uint64_t rowDataOffset  = sizeof(checkpoint::quant::Header);
+    constexpr uint64_t rowDataSize    = elements;
+    constexpr uint64_t rowScaleOffset = rowDataOffset + rowDataSize;
+    constexpr uint64_t rowScaleSize   = 128 * 16;
+    constexpr uint64_t quantizedSize  = rowScaleOffset + rowScaleSize;
+
+    checkpoint::quant::Header header{
+        .totalSizeBytes  = quantizedSize,
+        .logicalRows     = rows,
+        .logicalCols     = cols,
+        .encoding        = checkpoint::quant::Encoding::MXFP8E4M3,
+        .scaleLayout     = checkpoint::quant::ScaleLayout::Compact,
+        .device          = "cpu",
+        .rowwiseData     = {.handle = rowDataOffset, .sizeBytes = rowDataSize, .rows = rows, .cols = cols},
+        .rowwiseScaleInv = {.handle = rowScaleOffset, .sizeBytes = rowScaleSize, .rows = 128, .cols = 16},
+    };
+
+    ByteStorage quantizedStorage(quantizedSize);
+    auto*       quantized = static_cast<uint8_t*>(quantizedStorage.data);
+    std::memcpy(quantized, &header, sizeof(header));
+    auto snapshot = quantizedStorage.AsSpan<char const>(0, quantizedStorage.size);
+    for (uint64_t i = 0; i < rowDataSize; ++i) { quantized[rowDataOffset + i] = static_cast<uint8_t>((i * 29U) & 0xffU); }
+    for (uint64_t i = 0; i < rowScaleSize; ++i) { quantized[rowScaleOffset + i] = static_cast<uint8_t>(120U + (i % 16U)); }
+    REQUIRE(checkpoint::host_dequant::HasStorageHeader(quantizedStorage.AsSpan<char const>(0, quantizedStorage.size)));
+    // auto const storage = checkpoint::host_dequant::ParseStorage(quantizedStorage.AsSpan<char const>(0, quantizedStorage.size));
+
+    ByteStorage bf16Storage(elements * sizeof(uint16_t));
+    auto        bf16 = std::span<uint16_t>(static_cast<uint16_t*>(bf16Storage.data), elements);
+    checkpoint::host_dequant::MXFP8E4M3ToBFloat16(snapshot, bf16);
+
+    std::vector<uint16_t> chunked(elements);
+    for (uint64_t offset = 0; offset < elements;)
+    {
+        auto const count = static_cast<size_t>(std::min<uint64_t>(37, elements - offset));
+        checkpoint::host_dequant::MXFP8E4M3ToBFloat16Range(snapshot, offset, std::span(chunked).subspan(offset, count));
+        offset += count;
+    }
+    REQUIRE(std::ranges::equal(chunked, bf16));
+
+    StateTree quantizedTree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    StateTree bf16Tree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    AddShardedTensorLeaf(quantizedTree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    AddShardedTensorLeaf(bf16Tree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    auto& quantizedTensor = std::get<DTensor>(quantizedTree.GetNode(quantizedTree.FindNodeByFQN("weight")).data);
+    auto  quantizedShard  = *quantizedTensor.shards.begin();
+    quantizedTensor.shards.clear();
+    quantizedShard.snapshotDtype = Tensor::DType::MXFP8;
+    quantizedShard.storageSize   = quantizedSize;
+    quantizedTensor.AddShard(quantizedShard);
+
+    REQUIRE(quantizedTree.GetTotalTensorStateSizeInBytes() == quantizedStorage.size);
+    std::stringstream serializedRegistry;
+    StateSerDes::Write(serializedRegistry, quantizedTree, StateNode::Handle::Root);
+    auto const  restoredTree   = StateSerDes::Read(serializedRegistry);
+    auto const& restoredTensor = std::get<DTensor>(restoredTree->GetNode(restoredTree->FindNodeByFQN("weight")).data);
+    REQUIRE(restoredTensor.shards.begin()->storageSize == quantizedSize);
+    REQUIRE(restoredTree->GetTotalTensorStateSizeInBytes() == quantizedStorage.size);
+
+    std::vector<char> invalid(quantizedStorage.AsSpan<char const>(0, quantizedStorage.size).begin(),
+                              quantizedStorage.AsSpan<char const>(0, quantizedStorage.size).end());
+    auto              invalidHeader      = header;
+    invalidHeader.rowwiseScaleInv.handle = rowDataOffset;
+    std::memcpy(invalid.data(), &invalidHeader, sizeof(invalidHeader));
+    // REQUIRE_THROWS(checkpoint::host_dequant::ParseStorage(invalid));
+    invalidHeader             = header;
+    invalidHeader.scaleLayout = checkpoint::quant::ScaleLayout::GemmSwizzled;
+    std::memcpy(invalid.data(), &invalidHeader, sizeof(invalidHeader));
+    // REQUIRE_THROWS(checkpoint::host_dequant::MXFP8E4M3ToBFloat16(snapshot, bf16));
+    invalidHeader             = header;
+    invalidHeader.scaleLayout = static_cast<checkpoint::quant::ScaleLayout>(0xff);
+    std::memcpy(invalid.data(), &invalidHeader, sizeof(invalidHeader));
+    // REQUIRE_THROWS(checkpoint::host_dequant::ParseStorage(invalid));
+
+    auto quantizedDir = CkptDir("mxfp8_quantized");
+    auto bf16Dir      = CkptDir("mxfp8_bf16");
+    std::filesystem::remove_all(quantizedDir);
+    std::filesystem::remove_all(bf16Dir);
+    checkpoint::distcp::WriteRankShard(quantizedDir, Rank{0}, quantizedTree, quantizedStorage, {});
+    checkpoint::distcp::WriteMetadata(quantizedDir, quantizedTree, {});
+    checkpoint::distcp::WriteRankShard(bf16Dir, Rank{0}, bf16Tree, bf16Storage, {});
+    checkpoint::distcp::WriteMetadata(bf16Dir, bf16Tree, {});
+
+    REQUIRE(ReadWholeFile(quantizedDir / "__0_0.distcp") == ReadWholeFile(bf16Dir / "__0_0.distcp"));
+    REQUIRE(ReadWholeFile(quantizedDir / ".metadata") == ReadWholeFile(bf16Dir / ".metadata"));
+    REQUIRE(quantized[rowDataOffset + 17] == static_cast<uint8_t>((17U * 29U) & 0xffU));
+}
+
+TEST_CASE("NVFP4 snapshots retain packed storage and write identical BF16 DCP", "[nvfp4][distcp]")
+{
+    constexpr uint64_t rows           = 128;
+    constexpr uint64_t cols           = 512;
+    constexpr uint64_t elements       = rows * cols;
+    constexpr uint64_t rowDataOffset  = sizeof(checkpoint::quant::Header);
+    constexpr uint64_t rowDataSize    = elements / 2;
+    constexpr uint64_t rowScaleOffset = rowDataOffset + rowDataSize;
+    constexpr uint64_t rowScaleRows   = 128;
+    constexpr uint64_t rowScaleCols   = 32;
+    constexpr uint64_t rowScaleSize   = rowScaleRows * rowScaleCols;
+    constexpr uint64_t rowAmaxOffset  = rowScaleOffset + rowScaleSize;
+    constexpr uint64_t rowAmaxSize    = sizeof(float);
+    constexpr uint64_t quantizedSize  = rowAmaxOffset + rowAmaxSize;
+
+    checkpoint::quant::Header header{
+        .totalSizeBytes  = quantizedSize,
+        .logicalRows     = rows,
+        .logicalCols     = cols,
+        .encoding        = checkpoint::quant::Encoding::NVFP4E2M1,
+        .scaleLayout     = checkpoint::quant::ScaleLayout::Compact,
+        .rowScaledNVFP4  = false,
+        .nvfp4E4M3Mode   = checkpoint::quant::NVFP4E4M3Mode::ScaleBound448,
+        .device          = "cpu",
+        .rowwiseData     = {.handle = rowDataOffset, .sizeBytes = rowDataSize, .rows = rows, .cols = cols / 2},
+        .rowwiseScaleInv = {.handle = rowScaleOffset, .sizeBytes = rowScaleSize, .rows = rowScaleRows, .cols = rowScaleCols},
+        .rowwiseAmax     = {.handle = rowAmaxOffset, .sizeBytes = rowAmaxSize, .rows = 1, .cols = 1},
+    };
+
+    ByteStorage quantizedStorage(quantizedSize);
+    auto*       quantized = static_cast<uint8_t*>(quantizedStorage.data);
+    auto        snapshot  = quantizedStorage.AsSpan<char const>(0, quantizedStorage.size);
+
+    std::memcpy(quantized, &header, sizeof(header));
+    for (uint64_t i = 0; i < rowDataSize; ++i) { quantized[rowDataOffset + i] = static_cast<uint8_t>((i * 29U) & 0xffU); }
+    for (uint64_t i = 0; i < rowScaleSize; ++i) { quantized[rowScaleOffset + i] = static_cast<uint8_t>(96U + (i % 48U)); }
+    float const rowAmax = 123.25F;
+    std::memcpy(quantized + rowAmaxOffset, &rowAmax, sizeof(rowAmax));
+
+    // auto const storage = checkpoint::host_dequant::ParseStorage(quantizedStorage.AsSpan<char const>(0, quantizedStorage.size));
+
+    ByteStorage bf16Storage(elements * sizeof(uint16_t));
+    auto        bf16 = std::span<uint16_t>(static_cast<uint16_t*>(bf16Storage.data), elements);
+    checkpoint::host_dequant::NVFP4E2M1ToBFloat16Range(snapshot, 0, bf16);
+
+    std::vector<uint16_t> chunked(elements);
+    for (uint64_t offset = 0; offset < elements;)
+    {
+        auto const count = static_cast<size_t>(std::min<uint64_t>(37, elements - offset));
+        checkpoint::host_dequant::DequantizeToBFloat16Range(snapshot, offset, std::span(chunked).subspan(offset, count));
+        offset += count;
+    }
+    REQUIRE(std::ranges::equal(chunked, bf16));
+
+    ByteStorage swizzledStorage(quantizedSize);
+    auto*       swizzled = static_cast<uint8_t*>(swizzledStorage.data);
+    std::memcpy(swizzled, quantized, swizzledStorage.size);
+    std::memset(swizzled + rowScaleOffset, 0, rowScaleSize);
+    auto               swizzledSnapshot = swizzledStorage.AsSpan<char const>(0, swizzledStorage.size);
+    constexpr uint64_t tileSize         = 4 * 128;
+    constexpr uint64_t numTilesX        = rowScaleCols / 4;
+    for (uint64_t row = 0; row < rows; ++row)
+    {
+        for (uint64_t col = 0; col < rowScaleCols; ++col)
+        {
+            uint64_t const tileX             = col / 4;
+            uint64_t const tileY             = row / 128;
+            uint64_t const inTileX           = col % 4;
+            uint64_t const inTileY           = row % 128;
+            uint64_t const index             = (tileY * numTilesX + tileX) * tileSize + (inTileY % 32) * 16 + (inTileY / 32) * 4 + inTileX;
+            swizzled[rowScaleOffset + index] = quantized[rowScaleOffset + row * rowScaleCols + col];
+        }
+    }
+    auto swizzledHeader        = header;
+    swizzledHeader.scaleLayout = checkpoint::quant::ScaleLayout::GemmSwizzled;
+    std::memcpy(swizzled, &swizzledHeader, sizeof(swizzledHeader));
+    std::vector<uint16_t> swizzledResult(elements);
+    checkpoint::host_dequant::NVFP4E2M1ToBFloat16Range(swizzledSnapshot, 0, swizzledResult);
+    REQUIRE(std::ranges::equal(swizzledResult, bf16));
+
+    StateTree quantizedTree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    StateTree bf16Tree(checkpoint::ipc::SessionId{0}, SingleRankTopo());
+    AddShardedTensorLeaf(quantizedTree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    AddShardedTensorLeaf(bf16Tree, "weight", Tensor::DType::BFloat16, {rows, cols}, Rank{0}, 0);
+    auto& quantizedTensor = std::get<DTensor>(quantizedTree.GetNode(quantizedTree.FindNodeByFQN("weight")).data);
+    auto  quantizedShard  = *quantizedTensor.shards.begin();
+    quantizedTensor.shards.clear();
+    quantizedShard.snapshotDtype = Tensor::DType::NVFP4;
+    quantizedShard.storageSize   = quantizedSize;
+    quantizedTensor.AddShard(quantizedShard);
+
+    REQUIRE(quantizedTree.GetTotalTensorStateSizeInBytes() == quantizedStorage.size);
+    std::stringstream serializedRegistry;
+    StateSerDes::Write(serializedRegistry, quantizedTree, StateNode::Handle::Root);
+    auto const  restoredTree   = StateSerDes::Read(serializedRegistry);
+    auto const& restoredTensor = std::get<DTensor>(restoredTree->GetNode(restoredTree->FindNodeByFQN("weight")).data);
+    REQUIRE(restoredTensor.shards.begin()->storageSize == quantizedSize);
+    REQUIRE(restoredTree->GetTotalTensorStateSizeInBytes() == quantizedStorage.size);
+
+    auto quantizedDir = CkptDir("nvfp4_quantized");
+    auto bf16Dir      = CkptDir("nvfp4_bf16");
+    std::filesystem::remove_all(quantizedDir);
+    std::filesystem::remove_all(bf16Dir);
+    checkpoint::distcp::WriteRankShard(quantizedDir, Rank{0}, quantizedTree, quantizedStorage, {});
+    checkpoint::distcp::WriteMetadata(quantizedDir, quantizedTree, {});
+    checkpoint::distcp::WriteRankShard(bf16Dir, Rank{0}, bf16Tree, bf16Storage, {});
+    checkpoint::distcp::WriteMetadata(bf16Dir, bf16Tree, {});
+
+    REQUIRE(ReadWholeFile(quantizedDir / "__0_0.distcp") == ReadWholeFile(bf16Dir / "__0_0.distcp"));
+    REQUIRE(ReadWholeFile(quantizedDir / ".metadata") == ReadWholeFile(bf16Dir / ".metadata"));
+    REQUIRE(quantized[rowDataOffset + 17] == static_cast<uint8_t>((17U * 29U) & 0xffU));
+}
 
 TEST_CASE("state serialization preserves opaque tensor storage sizes", "[state][tier1]")
 {

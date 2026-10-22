@@ -561,7 +561,7 @@ wheel-pytest:aarch64:
         -DPHOENIX_BUILD_TESTS=ON \
         -DPHOENIX_BUILD_CUDA=OFF \
         -DBUILDENV_DISABLE_MARCH_NATIVE=ON
-    - cmake --build build-test -j"$(nproc)" --target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip
+    - cmake --build build-test -j"$(nproc)" --target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip quantized_snapshot
     - mkdir -p ci/ci-results
     - export MEGATRON_NATIVE_BUILD_DIR="${CI_PROJECT_DIR}/build-test"
     - export PYTHONPATH="${CI_PROJECT_DIR}/build-test"
@@ -850,7 +850,7 @@ wheel-publish:pypi:
     - job: wheel:aarch64
       artifacts: true
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 8 --config nano4 --time-minutes 110 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb300:native:nano4_8x4":
   extends: [.slurm_job, .runner_gb300, .manual_optional]
@@ -861,7 +861,7 @@ wheel-publish:pypi:
     - job: wheel:aarch64
       artifacts: true
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --flavor perf+native --checkpoint-interval 25"
+    JOB_ARGS: "--nodes 8 --config nano4 --time-minutes 45 --flavor perf+native --checkpoint-interval 25"
 
 "[DETR]:gb300:nvrx:nano4_8x4":
   extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
@@ -869,7 +869,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb300, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano4 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
+    JOB_ARGS: "--nodes 8 --config nano4 --time-minutes 115 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
 
 # 8node-nano3
 
