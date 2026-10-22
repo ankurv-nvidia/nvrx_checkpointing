@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import time
 import warnings
@@ -98,11 +99,16 @@ _SINGLETON_PROCESS_GROUP = _SingletonProcessGroup()
 def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
     """Expose Megatron's role-specific groups while its DCP load is running."""
 
+    load_signature = inspect.signature(load_checkpoint)
+
     @wraps(load_checkpoint)
     def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         global _LOAD_CONTEXT  # noqa: PLW0603
         previous = _LOAD_CONTEXT
-        _LOAD_CONTEXT = {name: kwargs.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
+        call = load_signature.bind(*args, **kwargs)
+        call.apply_defaults()
+        values = call.arguments
+        _LOAD_CONTEXT = {name: values.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
         try:
             return load_checkpoint(*args, **kwargs)
         finally:
@@ -291,6 +297,25 @@ def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
             f.write(str(iteration))
 
 
+def _save_dataloader_state(save_args: SaveCheckpointArgs, args: object) -> None:
+    """Save loader state with the process groups supported by Megatron."""
+    groups = {
+        "tp_group": save_args.tp_group,
+        "pp_group": save_args.pp_group,
+        "dp_group": save_args.dp_gtp_remat_group if save_args.dp_gtp_remat_group is not None else save_args.dp_group,
+        "cp_group": save_args.cp_group,
+    }
+    parameters = inspect.signature(maybe_save_dataloader_state).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        groups = {name: group for name, group in groups.items() if name in parameters}
+    maybe_save_dataloader_state(
+        save_args.train_data_iterator,
+        save_args.iteration,
+        getattr(args, "dataloader_save", None),
+        **groups,
+    )
+
+
 def save_checkpoint(save_args: SaveCheckpointArgs) -> None:
     """Save through native checkpointing and diagnose server failures."""
     started_at_ns = time.time_ns()
@@ -363,9 +388,7 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 rerun_state=rerun_state,
             )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
-            rank = torch.distributed.get_rank()
-            if rank == 0:
-                # Rank 0 stores portable optimizer-sharding metadata without the process group.
+            if torch.distributed.get_rank() == 0:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
             # Native checkpoints always use the torch_dist format.
@@ -377,16 +400,7 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
     with _checkpoint_span("megatron.checkpoint.save.io_write", iteration):
         # Loader state lands before snapshot submission, so the tracker never names an iteration without it.
         with _checkpoint_span("megatron.checkpoint.save.dataloader_state", iteration):
-            maybe_save_dataloader_state(
-                save_args.train_data_iterator,
-                iteration,
-                getattr(args, "dataloader_save", None),
-                tp_group=save_args.tp_group,
-                pp_group=save_args.pp_group,
-                # Loader state is indexed on the full data-distribution axis when that group is provided.
-                dp_group=save_args.dp_gtp_remat_group if save_args.dp_gtp_remat_group is not None else save_args.dp_group,
-                cp_group=save_args.cp_group,
-            )
+            _save_dataloader_state(save_args, args)
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
                 root = register_state_dict(state_dict, iteration)

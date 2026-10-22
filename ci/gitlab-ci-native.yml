@@ -644,7 +644,7 @@ wheel-publish:pypi:
   extends: [.slurm_job, .runner_h100, .main_branch_runs_pipeline]
   tags: [h100, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--config pico --time-minutes 20 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 # native-perf
 
@@ -661,13 +661,13 @@ wheel-publish:pypi:
   extends: [.slurm_job, .runner_gb200, .main_branch_runs_pipeline]
   tags: [gb200, 1n]
   variables:
-    JOB_ARGS: "--nodes 1 --config gpt_moe --flavor perf+native --checkpoint-interval 20"
+    JOB_ARGS: "--nodes 1 --config gpt_moe --time-minutes 10 --flavor perf+native --checkpoint-interval 20"
 
 "[PERF]:h100:native:pico_1x8":
   extends: [.slurm_job, .runner_h100, .main_branch_runs_pipeline]
   tags: [h100, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor perf+native"
+    JOB_ARGS: "--config pico --time-minutes 15 --flavor perf+native"
 
 # nvrx-deterministic
 
@@ -683,7 +683,7 @@ wheel-publish:pypi:
   stage: nvrx-deterministic
   tags: [h100, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor detr --run=ref:nvrx --run=cmp:nvrx"
+    JOB_ARGS: "--config pico --time-minutes 20 --flavor detr --run=ref:nvrx --run=cmp:nvrx"
 
 # nvrx-perf
 
@@ -699,7 +699,7 @@ wheel-publish:pypi:
   stage: nvrx-perf
   tags: [h100, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor perf+nvrx"
+    JOB_ARGS: "--config pico --time-minutes 15 --flavor perf+nvrx"
 
 # valgrind
 
@@ -708,14 +708,14 @@ wheel-publish:pypi:
   stage: valgrind
   tags: [gb200, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor detr+vg+native"
+    JOB_ARGS: "--config pico --time-minutes 25 --flavor detr+vg+native"
 
 "h100:valgrind:pico_1x8":
   extends: [.slurm_job, .runner_h100, .main_branch_runs_pipeline]
   stage: valgrind
   tags: [h100, 1n]
   variables:
-    JOB_ARGS: "--config pico --flavor detr+vg+native"
+    JOB_ARGS: "--config pico --time-minutes 60 --flavor detr+vg+native"
 
 # 16node-super3bf16
 
@@ -725,7 +725,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "--nodes 16 --config super3bf16 --flavor detr+shm --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 16 --config super3bf16 --time-minutes 80 --flavor detr+shm --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:super3bf16_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
@@ -733,9 +733,17 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "--nodes 16 --config super3bf16 --flavor perf+async+native --checkpoint-interval 125"
+    JOB_ARGS: "--nodes 16 --config super3bf16 --time-minutes 50 --flavor perf+async+native --checkpoint-interval 125"
 
 # 16node-super3fp4
+
+"[DETR]:gb200:native:super3fp4_16x4":
+  extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
+  stage: 16node-super3fp4
+  timeout: 1d
+  tags: [gb200, 16n]
+  variables:
+    JOB_ARGS: "--nodes 16 --config super3fp4 --time-minutes 100 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:super3fp4_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
@@ -743,7 +751,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "--nodes 16 --config super3fp4 --flavor perf+async+native --checkpoint-interval 125"
+    JOB_ARGS: "--nodes 16 --config super3fp4 --time-minutes 70 --flavor perf+async+native --checkpoint-interval 125"
 
 "[PERF]:gb200:nvrx:super3fp4_16x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
@@ -761,7 +769,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb300, 32n]
   variables:
-    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --flavor detr+async --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --time-minutes 185 --flavor detr+async --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb300:native:nano4_32x4":
   extends: [.slurm_job, .runner_gb300, .large_scale_pipeline]
@@ -769,7 +777,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb300, 32n]
   variables:
-    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --flavor perf+async+native --checkpoint-interval 125"
+    JOB_ARGS: "--nodes 32 --config nano4 --job-array-segment 8 --time-minutes 30 --flavor perf+async+native --checkpoint-interval 125"
 
 "[DETR]:gb300:nvrx:nano4_32x4":
   extends: [.slurm_job, .runner_gb300, .nvrx_pipeline]
@@ -795,7 +803,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 64n]
   variables:
-    JOB_ARGS: "--nodes 64 --config ultra3bf16 --flavor perf+async+native --checkpoint-interval 125"
+    JOB_ARGS: "--nodes 64 --config ultra3bf16 --time-minutes 45 --flavor perf+async+native --checkpoint-interval 125"
 
 "[PERF]:gb200:nvrx:ultra3bf16_64x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
@@ -813,7 +821,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 64n]
   variables:
-    JOB_ARGS: "--nodes 64 --config ultra3fp8 --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 64 --config ultra3fp8 --time-minutes 160 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:ultra3fp8_64x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
@@ -821,7 +829,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 64n]
   variables:
-    JOB_ARGS: "--nodes 64 --config ultra3fp8 --flavor perf+async+native --checkpoint-interval 125"
+    JOB_ARGS: "--nodes 64 --config ultra3fp8 --time-minutes 90 --flavor perf+async+native --checkpoint-interval 125"
 
 "[PERF]:gb200:nvrx:ultra3fp8_64x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
@@ -871,7 +879,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 8 --config nano3 --time-minutes 30 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:nano3_8x4":
   extends: [.slurm_job, .runner_gb200, .main_branch_runs_pipeline]
@@ -879,7 +887,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --flavor perf+native"
+    JOB_ARGS: "--nodes 8 --config nano3 --time-minutes 25 --flavor perf+native"
 
 "[DETR]:gb200:nvrx:nano3_8x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]
@@ -903,7 +911,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --flavor detr+vg+native"
+    JOB_ARGS: "--nodes 8 --config nano3 --time-minutes 50 --flavor detr+vg+native"
 
 # baseline artifacts
 
@@ -945,6 +953,7 @@ wheel-publish:pypi:
   dependencies:
     - "[DETR]:gb200:native:super3bf16_16x4"
     - "[PERF]:gb200:native:super3bf16_16x4"
+    - "[DETR]:gb200:native:super3fp4_16x4"
     - "[PERF]:gb200:native:super3fp4_16x4"
     - "[PERF]:gb200:native:ultra3bf16_64x4"
     - "[DETR]:gb200:native:ultra3fp8_64x4"

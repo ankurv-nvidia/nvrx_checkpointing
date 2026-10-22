@@ -1618,6 +1618,7 @@ def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, s
         results.append(_compare_arguments(spec.args, log, ()))
     return len(results) == len(specs) and all(results)
 
+
 def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> None:
     specs = _run_specs(args)
     for spec in specs:
@@ -1636,6 +1637,7 @@ def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> N
         for path in otel_files:
             label = f"{spec.name} {path.parent.name}" if len(specs) > 1 else path.parent.name
             otel_report.log_checkpoint_timings(path, None, label)
+
 
 def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> None:
     """Write measured metrics from the job-level report as a candidate baseline."""
@@ -1689,7 +1691,10 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
         if statistic in value:
             measured_value = value[statistic]
             preserve_decimals = name.endswith("_pct") or name.startswith("megatron.training.")
-            metrics[name] = round(measured_value, 2) if preserve_decimals else round(measured_value)
+            if name == "total_written_bytes":
+                metrics[name] = measured_value
+            else:
+                metrics[name] = round(measured_value, 2) if preserve_decimals else round(measured_value)
         if {"rank_min", "rank_median", "rank_max"} <= value.keys():
             rank_statistics[name] = {
                 "min": round(value["rank_min"], 2),
@@ -2031,10 +2036,9 @@ class DeterministicFlavor(Flavor):
             "--overlap-grad-reduce",
             "--overlap-param-gather",
         )
-        # Recomputation reproduces the forward it replaces rather than altering
-        # it, so a deterministic run keeps whatever its configuration asks for
-        # and spends the memory on unfused attention and an FP64 router.
-        _set(opts, "--moe-router-dtype", "fp64")
+        # Deterministic FP4 uses FP32 router probabilities; other profiles use FP64.
+        router_dtype = "fp32" if "--fp4-format" in opts or "--fp4-recipe" in opts else "fp64"
+        _set(opts, "--moe-router-dtype", router_dtype)
         _set(opts, "--deterministic-mode")
         _drop(opts, "--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
         env.update(

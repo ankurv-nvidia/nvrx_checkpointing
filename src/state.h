@@ -384,14 +384,15 @@ struct StateTree
             Tensor::DimRange sharddim;
             for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
             // Do not do a ref. We will be overwriting the mem location shortly
-            node.data           = DTensor(tnsr.dtype, tnsr.fulldim);
+            node.data           = DTensor(tnsr.durableDtype, tnsr.fulldim);
             auto& shardedTensor = std::get<DTensor>(node.data);
             shardedTensor.AddShard(DTensor::Shard{
-                .rank        = _topo.rank,
-                .handle      = tnsr.handle,
-                .storageSize = tnsr.storageSize,
-                .sharddim    = sharddim,
-                .device      = tnsr.device,
+                .rank          = _topo.rank,
+                .snapshotDtype = tnsr.snapshotDtype,
+                .handle        = tnsr.handle,
+                .storageSize   = tnsr.storageSize,
+                .sharddim      = sharddim,
+                .device        = tnsr.device,
             });
         }
     }

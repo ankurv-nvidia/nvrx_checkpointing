@@ -124,6 +124,32 @@ enum class Rank : uint32_t
     Invalid = std::numeric_limits<uint32_t>::max(),
 };
 
+enum class DType : uint8_t
+{
+    Invalid = 0,
+
+    Float16,
+    BFloat16,
+    Float32,
+    Float64,
+
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+
+    Bool,
+
+    MXFP8,
+    NVFP4,
+    FP8E4M3,
+};
+
 struct RankTopology
 {
     Rank     rank{Rank::Invalid};
@@ -165,7 +191,8 @@ struct TensorShard
     using DimRange = std::inplace_vector<Range, MaxDims>;
 
     Rank                   rank{Rank::Invalid};
-    std::array<uint8_t, 4> padding{};    // to avoid Uninitialized memory-reads in valgrind
+    DType                  snapshotDtype{DType::Invalid};
+    std::array<uint8_t, 3> padding{};    // to avoid Uninitialized memory-reads in valgrind
     uint64_t               handle{};
     uint64_t               storageSize{};
     DimRange               sharddim;
@@ -212,33 +239,12 @@ struct TensorShard
 
 struct Tensor
 {
+    using DType    = ::DType;
     using Dim      = TensorShard::Dim;
     using DimRange = TensorShard::DimRange;
     using Range    = TensorShard::Range;
 
     static constexpr auto MaxDims = TensorShard::MaxDims;
-
-    enum class DType : uint8_t
-    {
-        Invalid = 0,
-
-        Float16,
-        BFloat16,
-        Float32,
-        Float64,
-
-        UInt8,
-        UInt16,
-        UInt32,
-        UInt64,
-
-        Int8,
-        Int16,
-        Int32,
-        Int64,
-
-        Bool,
-    };
 
     static constexpr size_t GetDTypeSize(DType dtype)
     {
@@ -260,13 +266,17 @@ struct Tensor
         case DType::UInt64: return 8;
 
         case DType::Bool:
+        case DType::FP8E4M3:
+        case DType::MXFP8:
+        case DType::NVFP4:
         case DType::Invalid: [[fallthrough]];
         default: throw std::runtime_error("Invalid DType:" + std::to_string(static_cast<int>(dtype)));
         }
     }
 
-    DType                   dtype{};
-    std::array<uint8_t, 7U> padding{};    // to avoid Uninitialized memory-reads in valgrind
+    DType                   durableDtype{DType::Invalid};
+    DType                   snapshotDtype{DType::Invalid};
+    std::array<uint8_t, 6U> padding{};    // NOLINT(readability-magic-numbers)
     uint64_t                handle{};
     uint64_t                storageSize{};
     Dim                     fulldim;
@@ -284,7 +294,7 @@ struct DTensor
     using DimRange = Tensor::DimRange;
     using Shard    = TensorShard;
 
-    Tensor::DType dtype{};
+    Tensor::DType durableDtype{Tensor::DType::Invalid};
     Tensor::Dim   fulldim;
 
     std::set<TensorShard> shards;
@@ -292,14 +302,15 @@ struct DTensor
     std::vector<Tensor::DimRange> holes;
 
     DTensor() = default;
-    DTensor(Tensor::DType dtypeIn, Tensor::Dim const& fulldimIn) : dtype(dtypeIn), fulldim(fulldimIn)
+    DTensor(Tensor::DType durableDtypeIn, Tensor::Dim const& fulldimIn) : durableDtype(durableDtypeIn), fulldim(fulldimIn)
     {
         // Initially the entire tensor is a hole
         holes.emplace_back();
         for (auto const i : fulldim) { holes.back().push_back({.begin = 0, .end = i}); }
     }
 
-    bool operator==(DTensor const& other) const { return dtype == other.dtype && fulldim == other.fulldim && shards == other.shards; }
+    bool operator==(DTensor const& other) const
+    { return durableDtype == other.durableDtype && fulldim == other.fulldim && shards == other.shards; }
 
     static bool Intersects(DimRange const& r1, DimRange const& r2)
     {
@@ -401,18 +412,21 @@ static_assert(sizeof(Tensor) == 72);
 static_assert(sizeof(TensorShard) == 104);
 // NOLINTEND(readability-magic-numbers)
 static_assert(std::is_trivially_copyable_v<DeviceId>);
+static_assert(std::is_trivially_copyable_v<DType>);
 static_assert(std::is_trivially_copyable_v<Tensor::Range>);
 static_assert(std::is_trivially_copyable_v<Tensor::Dim>);
 static_assert(std::is_trivially_copyable_v<Tensor::DimRange>);
 static_assert(std::is_trivially_copyable_v<Tensor>);
 static_assert(std::is_trivially_copyable_v<TensorShard>);
 static_assert(std::is_standard_layout_v<DeviceId>);
+static_assert(std::is_standard_layout_v<DType>);
 static_assert(std::is_standard_layout_v<Tensor::Range>);
 static_assert(std::is_standard_layout_v<Tensor::Dim>);
 static_assert(std::is_standard_layout_v<Tensor::DimRange>);
 static_assert(std::is_standard_layout_v<Tensor>);
 static_assert(std::is_standard_layout_v<TensorShard>);
 static_assert(std::has_unique_object_representations_v<DeviceId>);
+static_assert(std::has_unique_object_representations_v<DType>);
 static_assert(std::has_unique_object_representations_v<Tensor::Range>);
 static_assert(std::has_unique_object_representations_v<Tensor::Dim>);
 static_assert(std::has_unique_object_representations_v<Tensor::DimRange>);

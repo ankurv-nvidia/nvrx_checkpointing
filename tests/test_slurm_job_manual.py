@@ -1539,6 +1539,50 @@ def test_deterministic_drops_async_checkpointing_by_default(
     assert "--deterministic-mode" in cmd
 
 
+def test_fp4_profile_uses_precision_aware_optimizer_without_param_gather(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+
+    def command(provider: str) -> list[str]:
+        args = _args(tmp_path, config="super3fp4", nodes=16, flavors=["perf", "async", provider])
+        slurm_job._configure_run(args)
+        return slurm_job._phase_command("super3fp4_16x4", args, provider, 1)[0]
+
+    native = command("native")
+    nvrx = command("nvrx")
+    assert "--fp4-param-gather" not in native + nvrx
+    assert "--use-precision-aware-optimizer" in native
+    assert "--use-precision-aware-optimizer" in nvrx
+    for command in (native, nvrx):
+        assert command[command.index("--main-grads-dtype") + 1] == "bf16"
+
+
+def test_mxfp8_gather_retains_precision_aware_optimizer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
+    monkeypatch.setenv("MASTER_ADDR", "n0")
+
+    args = _args(tmp_path, config="ultra3fp8", nodes=64, flavors=["perf", "async", "native"])
+    slurm_job._configure_run(args)
+    command = slurm_job._phase_command("ultra3fp8_64x4", args, "native", 1)[0]
+
+    assert "--fp8-param-gather" in command
+    assert "--reuse-grad-buf-for-mxfp8-param-ag" in command
+    assert "--use-precision-aware-optimizer" in command
+    assert command[command.index("--main-grads-dtype") + 1] == "bf16"
+    for name in ("--exp-avg-dtype", "--exp-avg-sq-dtype"):
+        assert command[command.index(name) + 1] == "fp32"
+
+
 def test_perf_enables_parallel_checkpoint_optimizations(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2462,7 +2506,7 @@ def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
     )
     reproducer = (tmp_path / "ultra3-64n" / "run.sbatch").read_text()
 
-    assert "#SBATCH --time=03:00:00" in reproducer
+    assert "#SBATCH --time=04:00:00" in reproducer
     assert "#SBATCH --partition=batch" in reproducer
     assert "batch_long" not in reproducer
 
@@ -3145,6 +3189,31 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
         if isinstance(job, dict) and isinstance(job.get("variables"), dict) and "JOB_ARGS" in job["variables"]
     }
 
+    expected_slurm_times = {
+        "[DETR]:h100:native:pico_1x8": 20,
+        "[PERF]:gb200:native:gpt_moe_1x4": 10,
+        "[PERF]:h100:native:pico_1x8": 15,
+        "[DETR]:h100:nvrx:pico_1x8": 20,
+        "[PERF]:h100:nvrx:pico_1x8": 15,
+        "gb200:valgrind:pico_1x4": 25,
+        "h100:valgrind:pico_1x8": 60,
+        "[DETR]:gb200:native:nano3_8x4": 30,
+        "[PERF]:gb200:native:nano3_8x4": 25,
+        "[DETR]:gb200:native:nano3_8x4:vg": 50,
+        "[DETR]:gb200:native:super3bf16_16x4": 80,
+        "[PERF]:gb200:native:super3bf16_16x4": 50,
+        "[DETR]:gb200:native:super3fp4_16x4": 100,
+        "[PERF]:gb200:native:super3fp4_16x4": 70,
+        "[DETR]:gb300:native:nano4_32x4": 185,
+        "[PERF]:gb300:native:nano4_32x4": 30,
+        "[PERF]:gb200:native:ultra3bf16_64x4": 45,
+        "[DETR]:gb200:native:ultra3fp8_64x4": 160,
+        "[PERF]:gb200:native:ultra3fp8_64x4": 90,
+    }
+    for name, minutes in expected_slurm_times.items():
+        args = shlex.split(workloads[name]["variables"]["JOB_ARGS"])
+        assert args[args.index("--time-minutes") + 1] == str(minutes)
+
     for name, job in workloads.items():
         args = shlex.split(job["variables"]["JOB_ARGS"])
         nodes = int(args[args.index("--nodes") + 1]) if "--nodes" in args else 1
@@ -3247,6 +3316,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert gpt_moe["tags"] == ["gb200", "1n"]
     assert shlex.split(gpt_moe["variables"]["JOB_ARGS"]) == [
         "--nodes", "1", "--config", "gpt_moe",
+        "--time-minutes", "10",
         "--flavor", "perf+native",
         "--checkpoint-interval", "20",
     ]
@@ -3263,6 +3333,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     assert set(large) == {
         "[DETR]:gb200:native:super3bf16_16x4",
         "[PERF]:gb200:native:super3bf16_16x4",
+        "[DETR]:gb200:native:super3fp4_16x4",
         "[PERF]:gb200:native:super3fp4_16x4",
         "[PERF]:gb200:native:ultra3bf16_64x4",
         "[DETR]:gb200:native:ultra3fp8_64x4",
@@ -3272,16 +3343,20 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     ultra64_det = shlex.split(large["[DETR]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
     assert ultra64_det == [
         "--nodes", "64", "--config", "ultra3fp8",
+        "--time-minutes", "160",
         "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
     ]
-    # Staging is named per entry and per flavor: the sixteen-node gate stages
-    # through shared memory while the run beside it keeps the default. The
-    # 64-node determinism gate stays synchronous to avoid async staging's extra
-    # host-memory pressure for this large optimizer state.
+    # Each deterministic gate uses its configured synchronous or shared-memory staging mode.
     super16_det = shlex.split(large["[DETR]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
     super16_perf = shlex.split(large["[PERF]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
     assert "detr+shm" in super16_det
     assert "perf+async+native" in super16_perf
+    fp4_det = shlex.split(large["[DETR]:gb200:native:super3fp4_16x4"]["variables"]["JOB_ARGS"])
+    assert fp4_det == [
+        "--nodes", "16", "--config", "super3fp4",
+        "--time-minutes", "100",
+        "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
+    ]
     ultra64_perf = shlex.split(large["[PERF]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
     assert "--use-precision-aware-optimizer" not in ultra64_perf
 
@@ -3766,6 +3841,7 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     }
     assert all(bundle["rules"][0]["when"] in {"always", "never"} for bundle in bundles.values())
     assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
+    assert "[DETR]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
     assert "[PERF]:gb200:nvrx:super3fp4_16x4" in bundles["nvrx"]["dependencies"]
     assert "[PERF]:gb200:nvrx:ultra3bf16_64x4" in bundles["nvrx"]["dependencies"]
@@ -4354,7 +4430,7 @@ def test_native_perf_refuses_an_incomplete_baseline_candidate(
     assert "required metrics were absent" in caplog.text
 
 
-def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_log_report_writes_exact_byte_baseline_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("PLATFORM", "gb200")
@@ -4373,7 +4449,7 @@ def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPa
         "metrics": {
             "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
             "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
-            "total_written_bytes": {"mean": 100, "higher_is_better": None, "unit": "B"},
+            "total_written_bytes": {"mean": 100.25, "higher_is_better": None, "unit": "B"},
             "checkpoint_daemon_peak_rss_bytes": {"max": 200, "higher_is_better": False, "unit": "B"},
             "training_process_peak_rss_bytes": {"max": 300, "higher_is_better": False, "unit": "B"},
         },
@@ -4387,7 +4463,7 @@ def test_log_report_writes_a_log_baseline_candidate(monkeypatch: pytest.MonkeyPa
     assert candidate["metrics"] == {
         "bw_mbps": 150000,
         "wr_tnsr_us": 10,
-        "total_written_bytes": 100,
+        "total_written_bytes": 100.25,
         "checkpoint_daemon_peak_rss_bytes": 200,
         "training_process_peak_rss_bytes": 300,
     }
@@ -5646,6 +5722,17 @@ def test_flavor_transforms_are_profile_independent() -> None:
     assert deterministic_env["NATIVE_CKPT_OTEL_FILE"] == "/tmp/otel.jsonl"
     assert slurm_job.FlavorSelection(["detr"]).policy.otel_reporting
     assert "TRITON_CACHE_AUTOTUNING" not in deterministic_env
+    fp4_opts = ["--fp4-format", "e2m1", "--moe-router-dtype", "fp32"]
+    slurm_job.FlavorSelection(["detr"]).transform(fp4_opts, {})
+    assert fp4_opts == [
+        "--fp4-format",
+        "e2m1",
+        "--attention-backend",
+        "unfused",
+        "--moe-router-dtype",
+        "fp32",
+        "--deterministic-mode",
+    ]
     disabled_env = {"MEGATRON_OTEL_ENABLED": "0"}
     slurm_job.FlavorSelection(["detr"]).transform([], disabled_env)
     assert disabled_env["MEGATRON_OTEL_ENABLED"] == "0"
@@ -5739,7 +5826,7 @@ def test_ultra3_profiles_share_reference_architecture() -> None:
     }
 
     assert bf16.pop("async-ckpt-use-cpu-shm") is True
-    assert fp8["job_time_in_mins"]["srun"].pop("detr") == 180  # noqa: PLR2004
+    assert fp8["job_time_in_mins"]["srun"].pop("detr") == 240  # noqa: PLR2004
     assert bf16["job_time_in_mins"]["srun"].pop("detr") == 180  # noqa: PLR2004
     assert {key: fp8.pop(key) for key in precision} == precision
     assert fp8 == bf16
@@ -5883,7 +5970,6 @@ def test_super3_profiles_share_reference_architecture() -> None:
     optimizer_precision = {
         "use-precision-aware-optimizer": True,
         "main-grads-dtype": "bf16",
-        "grad-reduce-in-bf16": True,
     }
     expected = {
         "num-layers": 88,
@@ -5904,6 +5990,7 @@ def test_super3_profiles_share_reference_architecture() -> None:
     assert {key: fp4.pop(key) for key in precision} == precision
     assert {key: fp4.pop(key) for key in optimizer_precision} == optimizer_precision
     assert {key: bf16.pop(key) for key in optimizer_precision} == optimizer_precision
+    assert bf16.pop("grad-reduce-in-bf16") is fp4.pop("grad-reduce-in-bf16") is True
     # Both profiles need TP4 to halve the native fused-loss temporary while
     # retaining identical model topology.
     tp_key = "tensor-model-parallel-size"

@@ -141,11 +141,12 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
         auto&   leaf            = tree.AddChild(parent, leafName);
         DTensor st(e.dtype, fulldim);
         st.AddShard({
-            .rank        = Rank{rank},
-            .handle      = offset,
-            .storageSize = e.bytes.size(),
-            .sharddim    = sharddim,
-            .device      = DeviceId{"cpu"},
+            .rank          = Rank{rank},
+            .snapshotDtype = e.dtype,
+            .handle        = offset,
+            .storageSize   = e.bytes.size(),
+            .sharddim      = sharddim,
+            .device        = DeviceId{"cpu"},
         });
         leaf.data = std::move(st);
 
@@ -242,11 +243,12 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
             uint64_t storageSize = Tensor::GetDTypeSize(dtype);
             for (auto const& range : sharddim) { storageSize *= range.end - range.begin; }
             st.AddShard({
-                .rank        = rank,
-                .handle      = 0,
-                .storageSize = storageSize,
-                .sharddim    = sharddim,
-                .device      = DeviceId{"cpu"},
+                .rank          = rank,
+                .snapshotDtype = dtype,
+                .handle        = 0,
+                .storageSize   = storageSize,
+                .sharddim      = sharddim,
+                .device        = DeviceId{"cpu"},
             });
         }
 

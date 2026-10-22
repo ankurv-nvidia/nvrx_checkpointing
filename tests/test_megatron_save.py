@@ -224,12 +224,14 @@ def test_async_finalize_wait_starts_after_client_send(
     ("dp_gtp_remat_group", "expected_dp_group"),
     [("dp-gtp-remat", "dp-gtp-remat"), (None, "dp")],
 )
-def test_dataloader_state_is_saved_before_snapshot_submission(
+@pytest.mark.parametrize("supports_cp_group", [True, False])
+def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913, PLR0917
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     dp_gtp_remat_group: str | None,
     expected_dp_group: str,
+    supports_cp_group: bool,
 ) -> None:
     events: list[object] = []
 
@@ -242,7 +244,29 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
         def wait_for_async_completion(self) -> None:
             events.append("client_send_complete")
 
-    def maybe_save_dataloader_state(iterator: object, iteration: int, save_path: object, **groups: object) -> None:
+    def current_dataloader_state(  # noqa: PLR0913
+        iterator: object,
+        iteration: int,
+        save_path: object,
+        *,
+        tp_group: object = None,
+        pp_group: object = None,
+        dp_group: object = None,
+        cp_group: object = None,
+    ) -> None:
+        groups = {"tp_group": tp_group, "pp_group": pp_group, "dp_group": dp_group, "cp_group": cp_group}
+        events.append(("dataloader_state", iterator, iteration, save_path, groups))
+
+    def legacy_dataloader_state(  # noqa: PLR0913
+        iterator: object,
+        iteration: int,
+        save_path: object,
+        *,
+        tp_group: object = None,
+        pp_group: object = None,
+        dp_group: object = None,
+    ) -> None:
+        groups = {"tp_group": tp_group, "pp_group": pp_group, "dp_group": dp_group}
         events.append(("dataloader_state", iterator, iteration, save_path, groups))
 
     args = SimpleNamespace(use_distributed_optimizer=False, async_save=False, save=tmp_path, dataloader_save=tmp_path)
@@ -264,7 +288,8 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
     monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
     monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000020")
-    monkeypatch.setattr(save, "maybe_save_dataloader_state", maybe_save_dataloader_state)
+    dataloader_state = current_dataloader_state if supports_cp_group else legacy_dataloader_state
+    monkeypatch.setattr(save, "maybe_save_dataloader_state", dataloader_state)
     monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or Root())
     monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, _iteration: events.append("tracker"))
     monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
@@ -276,13 +301,16 @@ def test_dataloader_state_is_saved_before_snapshot_submission(
 
     save._save_checkpoint_impl(save_args, 123)
 
+    expected_groups = {"tp_group": "tp", "pp_group": "pp", "dp_group": expected_dp_group}
+    if supports_cp_group:
+        expected_groups["cp_group"] = "cp"
     assert events == [
         (
             "dataloader_state",
             "iterator",
             20,
             tmp_path,
-            {"tp_group": "tp", "pp_group": "pp", "dp_group": expected_dp_group, "cp_group": "cp"},
+            expected_groups,
         ),
         "register",
         "save_async",
@@ -361,6 +389,46 @@ def test_load_registration_synthesizes_rng_with_role_specific_groups(
     ]
     assert prepared == {**state, "rng_state": rng_state}
     assert "rng_state" not in state
+    assert save._LOAD_CONTEXT is None
+
+
+def test_load_registration_binds_positional_role_specific_groups(save: ModuleType) -> None:
+    contexts = []
+
+    def load_checkpoint(  # noqa: PLR0913, PLR0917
+        ddp_model,  # noqa: ANN001
+        optimizer,  # noqa: ANN001
+        opt_param_scheduler,  # noqa: ANN001
+        tp_group=None,  # noqa: ANN001
+        pp_group=None,  # noqa: ANN001
+        dp_cp_group=None,  # noqa: ANN001
+        dp_group=None,  # noqa: ANN001
+        rng_state_key_prefix="language.",  # noqa: ANN001
+    ) -> str:
+        del ddp_model, optimizer, opt_param_scheduler, tp_group, pp_group, dp_cp_group, dp_group, rng_state_key_prefix
+        contexts.append(save._LOAD_CONTEXT)
+        return "loaded"
+
+    result = save._wrap_load_checkpoint(load_checkpoint)(
+        "model",
+        "optimizer",
+        "scheduler",
+        "tp",
+        "pp",
+        "dp-cp",
+        "dp",
+    )
+
+    assert result == "loaded"
+    assert contexts == [
+        {
+            "tp_group": "tp",
+            "pp_group": "pp",
+            "dp_cp_group": "dp-cp",
+            "dp_group": "dp",
+            "rng_state_key_prefix": "language.",
+        },
+    ]
     assert save._LOAD_CONTEXT is None
 
 

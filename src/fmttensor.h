@@ -39,6 +39,9 @@ template <> struct fmt::formatter<Tensor::DType> : fmt::formatter<std::string_vi
         case Tensor::DType::UInt32: return fmt::format_to(ctx.out(), "UInt32");
         case Tensor::DType::UInt64: return fmt::format_to(ctx.out(), "UInt64");
         case Tensor::DType::Bool: return fmt::format_to(ctx.out(), "Bool");
+        case Tensor::DType::FP8E4M3: return fmt::format_to(ctx.out(), "FP8E4M3");
+        case Tensor::DType::MXFP8: return fmt::format_to(ctx.out(), "MXFP8");
+        case Tensor::DType::NVFP4: return fmt::format_to(ctx.out(), "NVFP4");
         case Tensor::DType::Invalid: return fmt::format_to(ctx.out(), "Invalid");
         default: return fmt::format_to(ctx.out(), "Unknown");
         }
@@ -61,7 +64,12 @@ template <> struct fmt::formatter<Tensor> : fmt::formatter<std::string_view>
 {
     auto format(Tensor const& tensor, fmt::format_context& ctx) const    // NOLINT
     {
-        fmt::format_to(ctx.out(), "Tensor(handle={:x} bytes={} dtype={} fulldim=[", tensor.handle, tensor.storageSize, tensor.dtype);
+        fmt::format_to(ctx.out(),
+                       "Tensor(handle={:x} bytes={} durableDtype={} snapshotDtype={} fulldim=[",
+                       tensor.handle,
+                       tensor.storageSize,
+                       tensor.durableDtype,
+                       tensor.snapshotDtype);
         for (size_t i = 0; i < tensor.fulldim.size(); ++i)
         {
             if (i > 0) { fmt::format_to(ctx.out(), ", "); }
@@ -83,8 +91,8 @@ template <> struct fmt::formatter<DTensor> : fmt::formatter<std::string_view>
     auto format(DTensor const& tensor, fmt::format_context& ctx) const    // NOLINT
     {
         return fmt::format_to(ctx.out(),
-                              "DTensor(dtype={} fulldim=[{}], holes={}, nshards={})",
-                              tensor.dtype,
+                              "DTensor(durableDtype={} fulldim=[{}], holes={}, nshards={})",
+                              tensor.durableDtype,
                               tensor.fulldim,
                               tensor.holes,
                               tensor.shards.size());

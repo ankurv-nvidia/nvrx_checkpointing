@@ -192,7 +192,7 @@ StateNode& PythonStateTree::MatchStateChild_(StateNode::Handle parent, std::stri
         }
         auto const& previous = std::get<Tensor>(child.data);
         auto const& current  = std::get<Tensor>(data);
-        if (current.dtype == previous.dtype && current.fulldim == previous.fulldim)
+        if (current.durableDtype == previous.durableDtype && current.fulldim == previous.fulldim)
         {
             if (matchingTensorChild == nullptr) { matchingTensorChild = &child; }
             if (previous.handle == 0) { return child; }
@@ -241,7 +241,7 @@ StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_
                 auto&       registered = std::get<DTensor>(child.data);
                 auto const& supplied   = std::get<DTensor>(data);
                 auto const  path       = _tree.GetNodeId(child.handle);
-                if (registered.dtype != supplied.dtype || registered.fulldim != supplied.fulldim)
+                if (registered.durableDtype != supplied.durableDtype || registered.fulldim != supplied.fulldim)
                 {
                     throw std::runtime_error(fmt::format("State '{}' changed tensor metadata before registry synchronization", path));
                 }
@@ -257,12 +257,9 @@ StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_
                                                  StateTypeName(static_cast<StateNode::Type>(child.data.index())),
                                                  StateTypeName(static_cast<StateNode::Type>(data.index()))));
         }
-        else
-        {
-            auto& child = _tree.AddChild(parent, stateName);
-            child.data  = std::move(data);
-            return child;
-        }
+        auto& child = _tree.AddChild(parent, stateName);
+        child.data  = std::move(data);
+        return child;
     }
 
     auto& child = MatchStateChild_(parent, stateName, data);
@@ -300,7 +297,7 @@ StateNode& PythonStateTree::RegisterState(StateNode::Handle parent, std::string_
     {
         auto&       previous = std::get<DTensor>(child.data);
         auto const& current  = std::get<DTensor>(data);
-        if (current.dtype != previous.dtype || current.fulldim != previous.fulldim)
+        if (current.durableDtype != previous.durableDtype || current.fulldim != previous.fulldim)
         {
             throw std::runtime_error(fmt::format("State '{}' changed tensor metadata after registry synchronization", path));
         }

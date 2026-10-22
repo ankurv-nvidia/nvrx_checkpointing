@@ -40,10 +40,6 @@ struct CheckpointTestContext
 // rank present in any ShardedTensor node, then returns that value + 1 as worldSize.
 Rank InferWorldSize(StateTree const& tree);
 
-// Builds a per-rank StateTree from `ctx.globalRegistry`, allocating zero-filled
-// device memory and tiling each shard with its FQN as the test pattern.
-std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& ctx, RankTopology topo, std::vector<char>& buffer);
-
 // Loads a serialized state registry from `path` and stores it in `ctx.globalRegistry`,
 // then sets `ctx.worldSize` via InferWorldSize and populates `ctx.localRegistries`.
 void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path const& path);
@@ -51,10 +47,6 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
 // Per-rank driver loop. Waits on `ctx.fixtureFunc`; calls it on each iteration; bumps
 // `ctx.completedRanks` and notifies once all ranks have finished. Exits when `ctx.stopRequested`.
 void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree);
-
-// Walks `localState` and verifies each shard's bytes in `blob` still match the FQN
-// pattern that BuildPerRankStateTree wrote. Throws std::runtime_error on mismatch.
-void ValidateRoundTrip(StateTree const& localState, ByteStorage const& tensorStorage);
 
 // Drives a save: SaveCheckpoint -> WaitForCheckpointSave. No validation — used by
 // the benchmark timing path so the round-trip walk doesn't dominate the measurement.

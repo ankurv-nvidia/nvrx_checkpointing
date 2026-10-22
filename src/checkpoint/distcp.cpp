@@ -30,25 +30,7 @@ static_assert(std::endian::native == std::endian::little,
               "distcp writer assumes a little-endian host: archive/byteorder is hardcoded "
               "to \"little\" and the LE serializers are direct memcpys.");
 
-// `__<rank>_0.distcp` is the concatenation of one self-contained `torch.save`
-// ZIP per shard. We emit those ZIPs directly in C++:
-//   - pickle stream: hand-built from primitives (proto-2 _rebuild_tensor_v2/v3)
-//   - ZIP container: miniz `mz_zip_writer_add_mem_ex_v2`, the same container
-//     API used by PyTorchStreamWriter. zlib supplies the CRC32 so the archive
-//     has standard headers without miniz's scalar CRC pass.
-//   - 64-byte alignment of `archive/data/N` body: replicate
-//     PyTorchStreamWriter::writeRecord's FB extra-field padding so byte-parity
-//     with `dcp.save` output holds.
-//   - `archive/.data/serialization_id`: replicate
-//     PyTorchStreamWriter::writeSerializationId — `format("{:020d}{:020d}",
-//     combined_record_name_hash, combined_uncomp_crc32)`, where the name hash
-//     is `c10::hash_combine` over `std::hash<std::string>` of each record
-//     name. std::hash<std::string> is libstdc++-specific; we link the same
-//     stdlib torch was built against (gcc-14 libstdc++).
-//
-// The on-disk layout is byte-identical to the output of
-// `torch.distributed.checkpoint.save`; `tests/test_distcp_roundtrip.py` is the
-// gating check.
+// Each rank shard concatenates byte-compatible torch.save ZIP archives.
 
 namespace checkpoint::distcp
 {
@@ -84,11 +66,13 @@ static std::string_view DTypeName(Tensor::DType dtype)
     case DT::Int32: return "int32";
     case DT::Int64: return "int64";
     case DT::Bool: return "bool";
+    case DT::FP8E4M3: return "fp8e4m3";
+    case DT::MXFP8: return "mxfp8";
+    case DT::NVFP4: return "nvfp4";
     case DT::Invalid: [[fallthrough]];
     default: throw std::runtime_error(fmt::format("distcp: unsupported dtype {}", static_cast<int>(dtype)));
     }
 }
-// ---- Pickle stream emission ----------------------------------------------
 namespace
 {
 struct DtypePickleInfo
@@ -122,6 +106,9 @@ static DtypePickleInfo PickleInfoForDtype(Tensor::DType dtype)
         return {.useV3 = true, .storageMod = "torch.storage", .storageName = "UntypedStorage", .dtypeMod = "torch", .dtypeName = "uint32"};
     case DT::UInt64:
         return {.useV3 = true, .storageMod = "torch.storage", .storageName = "UntypedStorage", .dtypeMod = "torch", .dtypeName = "uint64"};
+    case DT::FP8E4M3:
+    case DT::MXFP8:
+    case DT::NVFP4:
     case DT::Invalid: [[fallthrough]];
     default: throw std::runtime_error(fmt::format("distcp: unsupported dtype {}", static_cast<int>(dtype)));
     }
@@ -212,8 +199,6 @@ static void PickleTupleClose(ByteBuffer& b, size_t n)
     }
 }
 
-// Precondition: shape is non-empty. WriteRankShard builds shapes from
-// `sharddim`, which is non-empty for every tensor we write.
 static ByteBuffer BuildDataPkl(Tensor::DType dtype, Tensor::Dim const& shape)
 {
     auto const info = PickleInfoForDtype(dtype);
@@ -221,8 +206,6 @@ static ByteBuffer BuildDataPkl(Tensor::DType dtype, Tensor::Dim const& shape)
     uint64_t numel = 1;
     for (auto d : shape) { numel *= d; }
 
-    // Row-major contiguous stride. inplace_vector lacks `resize`, so seed with
-    // a placeholder then overwrite via operator[].
     Tensor::Dim stride;
     for (size_t i = 0; i < shape.size(); ++i) { stride.push_back(0); }
     stride[shape.size() - 1] = 1;
@@ -294,35 +277,15 @@ static ByteBuffer BuildDataPkl(Tensor::DType dtype, Tensor::Dim const& shape)
     return out;
 }
 
-// ---- miniz ZIP archive helper --------------------------------------------
-
-// Layout constants shared between the actual writer (WriteShardArchive) and
-// the length predictor (ComputeShardArchiveSize). The predictor is what lets
-// rank 0 emit `.metadata` storage_info entries for OTHER ranks' shards
-// without ever seeing their local registry: archive size is fully determined
-// by (dtype, shape, dataSize), so the layout simulator below produces the
-// same numbers WriteShardArchive would record in a writeLog. See
-// `[distcp][tier1][predict]` for the self-consistency test that gates this.
-//
-// 64-byte alignment of `archive/data/N` mirrors what PyTorchStreamWriter does
-// for zero-copy mmap reads downstream. Without it, torch.load still works but
-// byte-parity with `dcp.save` breaks.
-constexpr uint64_t KFieldAlignment      = 64;
-constexpr uint64_t LocalFileHeaderSize  = 30;
-constexpr uint64_t CentralDirHeaderSize = 46;
-constexpr uint64_t FbExtraHeaderBytes   = sizeof(uint16_t) * 2;    // 2-byte ID + 2-byte length
-constexpr uint64_t EocdSize             = 22;
-// Forced by MZ_ZIP_FLAG_WRITE_ZIP64 at writer init — present even when
-// per-entry sizes fit in 32 bits. Sizes from miniz_zip.c.
-constexpr uint64_t Zip64EocdRecordSize  = 56;
-constexpr uint64_t Zip64EocdLocatorSize = 20;
-// `archive/.data/serialization_id` body is always `fmt::format("{:020d}{:020d}", ...)`.
-constexpr uint64_t SerializationIdSize = 40;
-// Every entry with `uncomp_size > 0` gets a post-body data descriptor:
-// 4-byte signature + 4-byte CRC + 4-byte comp_size + 4-byte uncomp_size.
-// Miniz emits the 32-bit variant unless the LFH itself needed a ZIP64 extra
-// (`pExtra_data != NULL`), which only happens when size or offset crosses
-// 4 GiB — gated out by WriteRankShard. See miniz_zip.c:3505-3533.
+// Archive bodies use PyTorch's 64-byte FB padding and ZIP64 trailer.
+constexpr uint64_t   KFieldAlignment                = 64;
+constexpr uint64_t   LocalFileHeaderSize            = 30;
+constexpr uint64_t   CentralDirHeaderSize           = 46;
+constexpr uint64_t   FbExtraHeaderBytes             = sizeof(uint16_t) * 2;
+constexpr uint64_t   EocdSize                       = 22;
+constexpr uint64_t   Zip64EocdRecordSize            = 56;
+constexpr uint64_t   Zip64EocdLocatorSize           = 20;
+constexpr uint64_t   SerializationIdSize            = 40;
 constexpr uint64_t   DataDescriptorSize             = 16;
 constexpr size_t     LocalTimestampOffset           = 10;
 constexpr size_t     CentralDirTimestampOffset      = 12;
@@ -339,10 +302,6 @@ constexpr std::array CentralDirSignature{'P', 'K', '\x01', '\x02'};
 constexpr std::array LocalFileHeaderSignature{'P', 'K', '\x03', '\x04'};
 constexpr std::array DataDescriptorSignature{'P', 'K', '\x07', '\x08'};
 
-// Per-entry extra-field length needed to push the entry's data body onto a
-// `kFieldAlignment` boundary. Replicates `caffe2::serialize::detail::getOffset`
-// / `getPadding` from pytorch/v2.11.0. `cursor` is the archive offset the next
-// LFH will land at (miniz's `m_archive_size`).
 static uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
 {
     uint64_t const start       = cursor + LocalFileHeaderSize + filenameSize + FbExtraHeaderBytes;
@@ -351,15 +310,10 @@ static uint64_t ComputeFbExtraSize(uint64_t cursor, uint64_t filenameSize)
     return paddingSize + FbExtraHeaderBytes;
 }
 
-// Materializes the FB extra-field bytes for WriteShardArchive to hand to
-// miniz. Layout: `'F','B', <padding_size LE 2 bytes>, 'Z' * padding_size`.
-// Total length = padding_size + 4.
 static ByteBuffer BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSize)
 {
     if (dataSize >= MZ_UINT32_MAX || cursor >= MZ_UINT32_MAX)
     {
-        // The upstream code adds extra bytes here for ZIP64 LFH fields. We
-        // gate ZIP64 out at the caller, so this branch shouldn't fire.
         throw std::runtime_error(fmt::format("distcp: ZIP entry too large for ZIP32 (cursor={}, dataSize={})", cursor, dataSize));
     }
     uint64_t const extraSize   = ComputeFbExtraSize(cursor, filenameSize);
@@ -374,8 +328,6 @@ static ByteBuffer BuildFbExtra(size_t cursor, size_t filenameSize, size_t dataSi
     return extra;
 }
 
-// Filenames for the 7 archive entries, in write order. Shared between the
-// writer and the size predictor so they can't drift apart.
 constexpr std::array<std::string_view, 7> EntryFullNames{
     "archive/data.pkl",
     "archive/.format_version",
@@ -385,10 +337,7 @@ constexpr std::array<std::string_view, 7> EntryFullNames{
     "archive/version",
     "archive/.data/serialization_id",
 };
-// Bare names that PyTorchStreamWriter::files_written_ stores (no `archive/`
-// prefix), in the same order as EntryFullNames. Used by WriteShardArchive
-// to reproduce the serialization_id name-hash leg. The 7th entry,
-// `.data/serialization_id`, is intentionally excluded from the hash.
+// The serialization identifier is excluded from its own name hash.
 constexpr std::array<std::string_view, 6> EntryBareNames{
     "data.pkl",
     ".format_version",
@@ -397,10 +346,6 @@ constexpr std::array<std::string_view, 6> EntryBareNames{
     "data/0",
     "version",
 };
-// Constant-body bytes for the fixed entries (indices 1, 2, 3, 5 in
-// EntryFullNames). The two variable entries — `data.pkl` (index 0) and
-// `data/0` (index 4) — are produced per-shard by the caller. Sizes drive
-// the analytical size predictor; bytes also feed the actual writer.
 constexpr std::string_view FormatVersionBytes    = "1";
 constexpr std::string_view StorageAlignmentBytes = "64";
 constexpr std::string_view ByteorderBytes        = "little";
@@ -416,7 +361,6 @@ uint64_t ComputeShardArchiveSize(Tensor::DType dtype, Tensor::Dim const& shape, 
 
     auto const dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
-    // Per-entry payload size, indexed in lockstep with EntryFullNames.
     std::array<uint64_t, 7> const dataSizes{
         dataPkl.size(),
         checkpoint::distcp::FormatVersionBytes.size(),
@@ -427,12 +371,6 @@ uint64_t ComputeShardArchiveSize(Tensor::DType dtype, Tensor::Dim const& shape, 
         checkpoint::distcp::SerializationIdSize,
     };
 
-    // LFH + filename + FB extra + data + data descriptor, per entry. Cursor
-    // advancement mirrors miniz `m_archive_size` so each ComputeFbExtraSize
-    // sees the same alignment input that WriteShardArchive's BuildFbExtra
-    // would — getting the cursor wrong shifts every subsequent entry's FB
-    // padding off the 64-byte grid too, so the descriptor MUST be folded into
-    // cursor advancement, not just added at the end.
     uint64_t cursor = 0;
     for (size_t i = 0; i < checkpoint::distcp::EntryFullNames.size(); ++i)
     {
@@ -440,37 +378,22 @@ uint64_t ComputeShardArchiveSize(Tensor::DType dtype, Tensor::Dim const& shape, 
         uint64_t const dataSize  = dataSizes.at(i);
         uint64_t const extraSize = checkpoint::distcp::ComputeFbExtraSize(cursor, fnSize);
         cursor += checkpoint::distcp::LocalFileHeaderSize + fnSize + extraSize + dataSize;
-        // All seven of our entries have non-zero body, so the descriptor
-        // always fires. The `if` keeps the formula honest if a future
-        // change ever introduces a zero-body entry.
         if (dataSize > 0) { cursor += checkpoint::distcp::DataDescriptorSize; }
     }
 
-    // Central directory: 46-byte fixed header + filename per entry. We pass
-    // null/0 for both `pExtra` and `user_extra_data_central`, and all our
-    // LFH offsets/sizes fit in 32 bits, so miniz adds no zip64 extra to CD
-    // records either (verified against miniz_zip.c:3184-3221).
     for (auto const& fn : checkpoint::distcp::EntryFullNames) { cursor += checkpoint::distcp::CentralDirHeaderSize + fn.size(); }
 
-    // MZ_ZIP_FLAG_WRITE_ZIP64 forces m_zip64 at writer init, so finalize
-    // always emits ZIP64 EOCD record + locator before the plain EOCD trailer
-    // — even when nothing in the archive actually needs 64-bit fields
-    // (miniz_zip.c:4442-4470).
     cursor += checkpoint::distcp::Zip64EocdRecordSize + checkpoint::distcp::Zip64EocdLocatorSize + checkpoint::distcp::EocdSize;
 
     return cursor;
 }
 
-// `c10::hash_combine` from c10/util/hash.h: deterministic mixer used in the
-// serialization_id record-name hash.
 static constexpr uint64_t HashCombineConstant  = 0x9e3779b9ULL;
 static constexpr uint32_t HashCombineLeftShift = 6U;
 
 static uint64_t HashCombine(uint64_t seed, uint64_t value)
 { return seed ^ (value + HashCombineConstant + (seed << HashCombineLeftShift) + (seed >> 2U)); }
 
-// libstdc++'s `std::hash<std::string>` (used by torch's writer via
-// `c10::hash<std::string>{}(...)` -> std::hash) — we just call it directly.
 static uint64_t StdHashString(std::string const& s)
 { return std::hash<std::string>{}(s); }
 
@@ -495,9 +418,6 @@ static void WriteBytes(std::ostream& output, char const* data, size_t size, std:
 }
 namespace
 {
-// A miniz user writer streams the already-CRC'd ZIP bytes directly to the rank
-// file and captures the supplied CRC from each emitted data descriptor. The
-// descriptor value is the same one PyTorchStreamWriter uses for serialization_id.
 struct StreamingZipOutput
 {
     std::ostream&    output;    // NOLINT
@@ -511,10 +431,6 @@ struct StreamingZipOutput
 static size_t StreamZipWrite(void* opaque, mz_uint64 fileOffset, void const* buffer, size_t size)
 {
     auto& state = *static_cast<StreamingZipOutput*>(opaque);
-    // WriteShardArchive uses a new miniz writer per concatenated archive. Its
-    // callback offsets therefore begin at zero even though the outer stream is
-    // already positioned at the next archive. miniz's create path is strictly
-    // append-only; reject a future behavior change instead of silently seeking.
     if (fileOffset != state.nextOffset) { return 0; }
 
     auto const* bytes = static_cast<char const*>(buffer);
@@ -524,11 +440,6 @@ static size_t StreamZipWrite(void* opaque, mz_uint64 fileOffset, void const* buf
         state.sawDescriptor = true;
     }
 
-    // PyTorch's vendored miniz is built with MINIZ_NO_TIME. Patch timestamps
-    // as the small headers pass through rather than materializing and walking
-    // a tensor-sized archive after finalization. We give miniz raw bytes under
-    // its "already compressed" API to bypass its slow internal CRC; patch the
-    // method back from DEFLATED to STORED in both header forms.
     char const* writeData = bytes;
     ByteBuffer  patched;
     if (size == LocalFileHeaderSize && std::equal(LocalFileHeaderSignature.begin(), LocalFileHeaderSignature.end(), bytes))
@@ -563,12 +474,7 @@ static size_t StreamZipWrite(void* opaque, mz_uint64 fileOffset, void const* buf
     try
     {
         WriteBytes(state.output, writeData, size, state.contextName);
-    } catch (...)
-    {
-        // Exceptions cannot cross miniz's C callback boundary. A short return
-        // makes miniz report MZ_ZIP_FILE_WRITE_FAILED to the C++ caller.
-        return 0;
-    }
+    } catch (...) { return 0; }
     state.nextOffset += size;
     return size;
 }
@@ -581,19 +487,6 @@ static void FinishOutputFile(std::ofstream& output, std::filesystem::path const&
     if (output.fail()) { throw std::runtime_error(fmt::format("distcp: close({}) failed", path.string())); }
 }
 
-// Writes one self-contained torch.save-compatible ZIP archive containing the
-// 7 entries for a single shard. Returns the bytes appended.
-//
-// Layout: `archive/data.pkl`, `archive/byteorder`, `archive/.format_version`,
-// `archive/.storage_alignment`, `archive/data/0`, `archive/version`,
-// `archive/.data/serialization_id`. The data/0 entry is FB-padded to 64-byte
-// alignment so zero-copy mmap downstream lines up.
-//
-// zlib computes each entry CRC once using its architecture-optimized routine.
-// We pass that CRC and the raw bytes to miniz's pre-compressed-data path, which
-// avoids miniz's much slower scalar CRC while still streaming directly to
-// `output`. StreamZipWrite changes miniz's DEFLATED method marker back to
-// STORED, so the resulting archive remains byte-identical to PyTorch's.
 static uint64_t WriteShardArchive(std::ostream&      output,
                                   Tensor::DType      dtype,
                                   Tensor::Dim const& shape,
@@ -603,21 +496,14 @@ static uint64_t WriteShardArchive(std::ostream&      output,
 {
     ByteBuffer dataPkl = checkpoint::distcp::BuildDataPkl(dtype, shape);
 
-    // Per-entry plan: filename + content pointer + content size.
     struct EntryPlan
     {
         std::string fullName;
         void const* data;
         size_t      size;
-        ByteBuffer  padding;    // 0 for non-data entries
+        ByteBuffer  padding;
     };
 
-    // Record order matches torch.serialization._save / PyTorchStreamWriter::
-    // writeEndOfFile exactly:
-    //   data.pkl, .format_version, .storage_alignment, byteorder,
-    //   data/N..., version, .data/serialization_id
-    // Filenames live in `EntryFullNames` so the size predictor uses the same
-    // strings. The serialization_id entry is appended after combined-CRC is known.
     static constexpr size_t DataPklIdx    = 0;
     static constexpr size_t FormatVerIdx  = 1;
     static constexpr size_t StorageAlnIdx = 2;
@@ -660,10 +546,6 @@ static uint64_t WriteShardArchive(std::ostream&      output,
         },
     };
 
-    // Set up a streaming miniz writer. MZ_ZIP_FLAG_WRITE_ZIP64 forces the ZIP64 EOCD
-    // + locator at finalize time — matches PyTorchStreamWriter's "universally
-    // ZIP64" guarantee. Per-entry LFH/CD records stay ZIP32 unless their size
-    // or offset overflow 32 bits.
     mz_zip_archive     zip{};
     StreamingZipOutput streamOutput{.output = output, .contextName = contextName};
     zip.m_pWrite     = &StreamZipWrite;
@@ -673,11 +555,6 @@ static uint64_t WriteShardArchive(std::ostream&      output,
         throw std::runtime_error(fmt::format("distcp: mz_zip_writer_init_v2 failed for '{}'", contextName));
     }
 
-    // `combined_uncomp_crc32_` from PyTorchStreamWriter is hash_combine'd across
-    // CRCs in write order; the record-name hash is hash_combine'd across the
-    // unordered_set iteration order — and the set holds BARE names (without
-    // the `archive/` prefix) because writeRecord does `files_written_.insert(name)`
-    // with the un-prefixed argument.
     uint64_t                        combinedCrc = 0;
     std::unordered_set<std::string> bareNamesWritten;
 
@@ -692,10 +569,6 @@ static uint64_t WriteShardArchive(std::ostream&      output,
                                         plan.size,
                                         /*pComment=*/nullptr,
                                         /*comment_size=*/0,
-                                        // The bytes are raw, not compressed. This flag is
-                                        // deliberately used only to make miniz accept our
-                                        // precomputed CRC and skip its internal CRC pass;
-                                        // StreamZipWrite patches method 8 back to STORED (0).
                                         /*level_and_flags=*/MZ_ZIP_FLAG_COMPRESSED_DATA,
                                         /*uncomp_size=*/plan.size,
                                         /*uncomp_crc32=*/entryCrc,
@@ -706,13 +579,9 @@ static uint64_t WriteShardArchive(std::ostream&      output,
                                         /*user_extra_data_central_len=*/0)
             != MZ_TRUE)
         {
-            // Don't `mz_zip_writer_end` here — the outer catch does it once.
             throw std::runtime_error(fmt::format("distcp: mz_zip_writer_add_mem_ex_v2 failed for '{}'", plan.fullName));
         }
 
-        // Track contributions to serialization_id: see comment block at file top.
-        // Verify the CRC that miniz placed in its trailing data descriptor,
-        // then combine the value exactly like upstream does.
         if (!streamOutput.sawDescriptor)
         {
             throw std::runtime_error(fmt::format("distcp: miniz omitted data descriptor for '{}'", plan.fullName));
@@ -729,15 +598,9 @@ static uint64_t WriteShardArchive(std::ostream&      output,
     {
         for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries.at(i), checkpoint::distcp::EntryBareNames.at(i)); }
 
-        // Record-name hash: iterate `bareNamesWritten` (the unordered_set) in
-        // its hash-bucket order, like PyTorchStreamWriter::writeSerializationId.
-        // Identical std::hash<string> + bucket layout (same libstdc++ ABI as
-        // torch's build) reproduces the upstream iteration order. Verified
-        // empirically against torch 2.11 with gcc-14.
         uint64_t combinedRecordNameHash = 0;
         for (auto const& name : bareNamesWritten) { combinedRecordNameHash = HashCombine(combinedRecordNameHash, StdHashString(name)); }
 
-        // serialization_id: "{:020d}{:020d}", record-name hash, combined CRC.
         std::string const serializationId = fmt::format("{:020d}{:020d}", combinedRecordNameHash, combinedCrc);
 
         EntryPlan idPlan{
@@ -746,10 +609,6 @@ static uint64_t WriteShardArchive(std::ostream&      output,
             .size     = serializationId.size(),
             .padding  = {},
         };
-        // Important: do NOT mix the id record itself into combinedCrc / name hash —
-        // upstream excludes it (see PyTorchStreamWriter::writeSerializationId, which
-        // checks `files_written_.find(kSerializationIdRecordName) == end()` before
-        // computing).
         idPlan.padding = checkpoint::distcp::BuildFbExtra(zip.m_archive_size, idPlan.fullName.size(), idPlan.size);
         if (mz_zip_writer_add_mem_ex_v2(&zip,
                                         idPlan.fullName.c_str(),
@@ -787,97 +646,61 @@ static uint64_t WriteShardArchive(std::ostream&      output,
     return archiveSize;
 }
 
-// ---- `.metadata` pickle emission -----------------------------------------
-//
-// Hand-emits a proto-2 pickle stream describing
-// `torch.distributed.checkpoint.metadata.Metadata`. The loader accepts the
-// equivalent object graph just as well as torch's proto-4 output (verified
-// by the step-9 loader-tolerance probes — see plan.md "step 9 verification"
-// entry). Sharing proto-2 with `BuildDataPkl` keeps the opcode surface
-// small. No memoization — strict byte parity isn't required.
-//
-// Every dataclass instance uses the default `__reduce_ex__(2)` shape:
-//   GLOBAL <mod> <name>  EMPTY_TUPLE  NEWOBJ  EMPTY_DICT  MARK
-//     <field-name>  <field-value>  ...
-//   SETITEMS  BUILD
-// Default-None fields are omitted (matches torch's writer).
-
 constexpr std::string_view KMetadataModule   = "torch.distributed.checkpoint.metadata";
 constexpr std::string_view KFilesystemModule = "torch.distributed.checkpoint.filesystem";
 
 static void EmitNewObjBuildBegin(ByteBuffer& b, std::string_view mod, std::string_view name)
 {
     checkpoint::distcp::PickleGlobal(b, mod, name);
-    PutU8(b, ')');                   // EMPTY_TUPLE
-    PutU8(b, PickleNewObjOpcode);    // NEWOBJ — push cls.__new__(cls, *())
-    PutU8(b, '}');                   // EMPTY_DICT — start of state dict
-    PutU8(b, '(');                   // MARK
+    PutU8(b, ')');
+    PutU8(b, PickleNewObjOpcode);
+    PutU8(b, '}');
+    PutU8(b, '(');
 }
 
 static void EmitNewObjBuildEnd(ByteBuffer& b)
 {
-    PutU8(b, 'u');    // SETITEMS — fold marked (key, value) pairs into the dict
-    PutU8(b, 'b');    // BUILD — apply state dict to the instance
+    PutU8(b, 'u');
+    PutU8(b, 'b');
 }
 
-// torch.Size(<dims-tuple>) via REDUCE.
 template <typename TInts> static void EmitTorchSize(ByteBuffer& b, TInts const& dims)
 {
     checkpoint::distcp::PickleGlobal(b, "torch", "Size");
     if (dims.size() >= 4) { PutU8(b, '('); }
     for (auto d : dims) { checkpoint::distcp::PickleInt(b, static_cast<uint64_t>(d)); }
     PickleTupleClose(b, dims.size());
-    PutU8(b, PickleTuple1Opcode);    // TUPLE1 — wrap the dims tuple as the single ctor arg
-    PutU8(b, 'R');                   // REDUCE — call torch.Size(dims_tuple)
+    PutU8(b, PickleTuple1Opcode);
+    PutU8(b, 'R');
 }
 
 static void EmitTorchDtype(ByteBuffer& b, Tensor::DType dtype)
-{
-    // torch.<dtype> is a module-level attribute (singleton); GLOBAL pushes it directly.
-    checkpoint::distcp::PickleGlobal(b, "torch", checkpoint::distcp::DTypeName(dtype));
-}
+{ checkpoint::distcp::PickleGlobal(b, "torch", checkpoint::distcp::DTypeName(dtype)); }
 
 static void EmitLayoutStrided(ByteBuffer& b)
-{
-    // `torch.strided` is a module-level singleton — GLOBAL resolves it directly.
-    // dcp.save uses a longer `_get_layout(...)` REDUCE path; this shorter form
-    // is semantically equivalent (verified by-hand: `pickle.loads(b'\\x80\\x02ctorch\\nstrided\\n.')`
-    // returns the same singleton). `TensorProperties.__setstate__` just assigns
-    // it straight to `self.layout` — no enum decode.
-    checkpoint::distcp::PickleGlobal(b, "torch", "strided");
-}
+{ checkpoint::distcp::PickleGlobal(b, "torch", "strided"); }
 
 static void EmitMemoryFormatContiguousEnum(ByteBuffer& b)
 {
-    // TensorProperties.__getstate__ encodes memory_format via the
-    // `_MEM_FORMAT_ENCODING` Enum that lives next to TensorProperties (in
-    // `torch.distributed.checkpoint.metadata`, *not* `torch.memory_format`).
-    // `__setstate__` compares against `TORCH_CONTIGUOUS_FORMAT` (== 0) and
-    // resolves back to the singleton. Emitting the actual `torch.contiguous_format`
-    // object here would break the equality check and raise at load time.
     checkpoint::distcp::PickleGlobal(b, KMetadataModule, "_MEM_FORMAT_ENCODING");
-    checkpoint::distcp::PickleInt(b, 0);    // TORCH_CONTIGUOUS_FORMAT
-    PutU8(b, PickleTuple1Opcode);           // TUPLE1
-    PutU8(b, 'R');                          // REDUCE — _MEM_FORMAT_ENCODING(0)
+    checkpoint::distcp::PickleInt(b, 0);
+    PutU8(b, PickleTuple1Opcode);
+    PutU8(b, 'R');
 }
 
 static void EmitTensorProperties(ByteBuffer& b, Tensor::DType dtype)
 {
-    // TensorProperties has a custom __getstate__/__setstate__ that uses a
-    // 5-tuple (not a dict): (dtype, layout, requires_grad, mem_format_encoding,
-    // pin_memory). The MARK..TUPLE..BUILD shape feeds that tuple directly into
-    // __setstate__.
     checkpoint::distcp::PickleGlobal(b, KMetadataModule, "TensorProperties");
-    PutU8(b, ')');                   // EMPTY_TUPLE
-    PutU8(b, PickleNewObjOpcode);    // NEWOBJ
-    PutU8(b, '(');                   // MARK
+    PutU8(b, ')');
+    PutU8(b, PickleNewObjOpcode);
+    PutU8(b, '(');
     EmitTorchDtype(b, dtype);
     EmitLayoutStrided(b);
-    PutU8(b, PickleNewFalseOpcode);    // NEWFALSE (requires_grad)
+    PutU8(b, PickleNewFalseOpcode);
     EmitMemoryFormatContiguousEnum(b);
-    PutU8(b, PickleNewFalseOpcode);    // NEWFALSE (pin_memory)
-    PutU8(b, 't');                     // TUPLE — fold the marked values into a 5-tuple
-    PutU8(b, 'b');                     // BUILD — apply via __setstate__
+    PutU8(b, PickleNewFalseOpcode);
+    PutU8(b, 't');
+    PutU8(b, 'b');
 }
 
 static void EmitChunkStorageMetadata(ByteBuffer& b, Tensor::DimRange const& sharddim)
@@ -909,10 +732,10 @@ EmitTensorStorageMetadata(ByteBuffer& b, Tensor::DType dtype, Tensor::Dim const&
     EmitTorchSize(b, fulldim);
 
     PickleBinunicode(b, "chunks");
-    PutU8(b, ']');    // EMPTY_LIST
-    PutU8(b, '(');    // MARK
+    PutU8(b, ']');
+    PutU8(b, '(');
     for (auto const& chunk : chunks) { EmitChunkStorageMetadata(b, chunk); }
-    PutU8(b, 'e');    // APPENDS
+    PutU8(b, 'e');
 
     EmitNewObjBuildEnd(b);
 }
@@ -930,7 +753,7 @@ static void EmitMetadataIndex(ByteBuffer& b, std::string_view fqn, Tensor::DimRa
     EmitTorchSize(b, offsets);
 
     PickleBinunicode(b, "index");
-    PickleInt(b, 0);    // always 0 in single-server v1 (no multi-storage-id splits)
+    PickleInt(b, 0);
 
     EmitNewObjBuildEnd(b);
 }
@@ -948,24 +771,15 @@ static void EmitStorageInfo(ByteBuffer& b, std::string_view relativePath, uint64
     PickleBinunicode(b, "length");
     PickleInt(b, length);
 
-    // `transform_descriptors` defaults to None and is omitted (torch's writer
-    // does the same — verified in the disassembly probe).
-
     EmitNewObjBuildEnd(b);
 }
 
-// torch.distributed.checkpoint.metadata.BytesStorageMetadata() — an empty
-// dataclass (no fields). Marks `fqn` in state_dict_metadata as a non-tensor
-// (ShardedObject) entry; the DCP load planner reads its bytes via storage_data.
 static void EmitBytesStorageMetadata(ByteBuffer& b)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "BytesStorageMetadata");
     EmitNewObjBuildEnd(b);
 }
 
-// MetadataIndex for a bytes (ShardedObject) entry. Unlike the tensor index, a
-// bytes index carries no offset/index — both default to None, which torch's
-// writer omits — so the restored key equals MetadataIndex(fqn).
 static void EmitMetadataIndexBytes(ByteBuffer& b, std::string_view fqn)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "MetadataIndex");
@@ -981,8 +795,6 @@ static std::vector<Tensor::DimRange> CollectChunkRanges(DTensor const& tensor)
     for (auto const& shard : tensor.shards)
     {
         if (shard.StorageSizeBytes() == 0) { continue; }
-        // Replicas can be separated by rank ordering, so compare with every
-        // range already collected rather than only the previous shard.
         if (std::ranges::find(chunkRanges, shard.sharddim) == chunkRanges.end()) { chunkRanges.push_back(shard.sharddim); }
     }
     return chunkRanges;
@@ -994,15 +806,14 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     b.reserve(2048);
     std::unordered_set<std::string> tensorFqns;
 
-    PutU8(b, 0x80);    // PROTO
-    PutU8(b, 0x02);    // protocol 2
+    PutU8(b, 0x80);
+    PutU8(b, 0x02);
 
     EmitNewObjBuildBegin(b, KMetadataModule, "Metadata");
 
-    // `state_dict_metadata`: dict[fqn -> TensorStorageMetadata]
     PickleBinunicode(b, "state_dict_metadata");
-    PutU8(b, '}');    // EMPTY_DICT
-    PutU8(b, '(');    // MARK
+    PutU8(b, '}');
+    PutU8(b, '(');
     globalRegistry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         assert(type != StateNode::Type::Tensor);
@@ -1013,10 +824,8 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
         auto const fqn = globalRegistry.GetNodeId(node.handle);
         tensorFqns.insert(fqn);
         PickleBinunicode(b, fqn);
-        EmitTensorStorageMetadata(b, tnsr.dtype, tnsr.fulldim, chunkRanges);
+        EmitTensorStorageMetadata(b, tnsr.durableDtype, tnsr.fulldim, chunkRanges);
     });
-    // Blobs are opaque torch.save'd bytes. Tensor and Blob fqns share
-    // one metadata namespace, so reject an accidental collision explicitly.
     for (auto const& [fqn, copies] : blobs)
     {
         if (copies.empty()) { throw std::runtime_error(fmt::format("distcp: Blob fqn '{}' has no owning rank", fqn)); }
@@ -1036,9 +845,8 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
         PickleBinunicode(b, fqn);
         EmitBytesStorageMetadata(b);
     }
-    PutU8(b, 'u');    // SETITEMS
+    PutU8(b, 'u');
 
-    // `storage_data`: dict[MetadataIndex -> _StorageInfo]
     PickleBinunicode(b, "storage_data");
     PutU8(b, '}');
     PutU8(b, '(');
@@ -1055,7 +863,7 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
             if (shardSize == 0) { continue; }
             Tensor::Dim shardShape;
             for (auto const& r : shard.sharddim) { shardShape.push_back(r.end - r.begin); }
-            uint64_t const archiveLen = ComputeShardArchiveSize(tnsr.dtype, shardShape, shardSize);
+            uint64_t const archiveLen = ComputeShardArchiveSize(tnsr.durableDtype, shardShape, shardSize);
             uint64_t&      cursor     = rankCursors[shard.rank];
             uint64_t       curCursor  = cursor;
             cursor += archiveLen;
@@ -1063,20 +871,12 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
             if (lastShard == shard.sharddim) { continue; }
             lastShard = shard.sharddim;
 
-            // Emit only the first replica of each sharddim; later replicas share
-            // the same MetadataIndex key and would just overwrite the prior
-            // entry. The cursor must still advance for every shard — WriteRankShard
-            // wrote each one to that rank's .distcp file, so skipping the
-            // advance would leave subsequent non-replica shards on the same rank
-            // pointing at a wrong offset.
+            // Replica records advance physical offsets but share one metadata key.
             EmitMetadataIndex(b, fqn, shard.sharddim);
             auto const relPath = fmt::format("__{}_0.distcp", static_cast<uint32_t>(shard.rank));
             EmitStorageInfo(b, relPath, curCursor, archiveLen);
         }
     });
-    // Each rank writes every local Blob in fqn order, including replicas. The
-    // FQN-first view lets us advance every rank's physical cursor in that same
-    // order while selecting the lowest-rank replica for metadata.
     std::unordered_map<Rank, uint64_t> blobRegionCursors;
     for (auto const& [fqn, copies] : blobs)
     {
@@ -1093,13 +893,10 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
             regionCursor += meta.length;
         }
     }
-    PutU8(b, 'u');    // SETITEMS
-
-    // `planner_data`, `storage_meta`, `version` omitted — dataclass defaults
-    // handle them (loader tolerates absence — verified in step-9 probes).
+    PutU8(b, 'u');
 
     EmitNewObjBuildEnd(b);
-    PutU8(b, '.');    // STOP
+    PutU8(b, '.');
     return b;
 }
 
@@ -1118,15 +915,12 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
         registry.WalkNodes([&](StateNode const& node) {
             if (hasPayload || static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
             auto const& tnsr = std::get<DTensor>(node.data);
-            // A zero-element tensor is still a DCP write item and therefore
-            // still produces a torch.save archive in the NVRx writer.
+            // Zero-element tensors still produce an archive.
             hasPayload = std::ranges::any_of(tnsr.shards, [&](auto const& shard) { return shard.rank == rank; });
         });
     }
     if (!hasPayload)
     {
-        // NVRx creates a file only for a non-empty local write bucket. Remove
-        // an older partial/stale path so a retried save has the same file set.
         std::error_code ec;
         std::filesystem::remove(filepath, ec);
         if (ec) { throw std::system_error(ec, fmt::format("distcp: remove({}) failed", filepath.string())); }
@@ -1140,9 +934,6 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     auto const* base   = static_cast<char const*>(tensorStorage.data);
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        // The registry handed in is always the post-merge global registry
-        // (DTensor entries keyed by rank). Tests construct it with
-        // the same shape.
         assert(type != StateNode::Type::Tensor);
         if (type != StateNode::Type::DTensor) { return; }
         auto const& tnsr = std::get<DTensor>(node.data);
@@ -1154,24 +945,19 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
             if (size == 0) { continue; }
             Tensor::Dim shape{};
             for (auto const& r : shard.sharddim) { shape.push_back(r.end - r.begin); }
-            // ZIP32 entry size limit: 4 GiB. ZIP64 requires extending miniz's
-            // per-entry call site (the m_zip64 flag) plus the alignment math;
-            // defer until we see a real large-shard case. The archive's EOCD
-            // is already ZIP64 (MZ_ZIP_FLAG_WRITE_ZIP64), but per-entry LFH
-            // sizes are still 32-bit.
             if (size >= MZ_UINT32_MAX)
             {
                 throw std::runtime_error(
                     fmt::format("distcp: shard '{}' is {} bytes (>= 4 GiB); ZIP64 support is not yet implemented", fqn, size));
             }
-            uint64_t const predicted = ComputeShardArchiveSize(tnsr.dtype, shape, size);
-            uint64_t const actual    = WriteShardArchive(output, tnsr.dtype, shape, base + shard.handle, size, fqn);
+            uint64_t const predicted = ComputeShardArchiveSize(tnsr.durableDtype, shape, size);
+            uint64_t const actual    = WriteShardArchive(output, tnsr.durableDtype, shape, base + shard.handle, size, fqn);
             if (predicted != actual)
             {
                 throw std::runtime_error(fmt::format("distcp: ComputeShardArchiveSize/WriteShardArchive disagree for '{}' "
                                                      "(dtype={}, shape=[{}], dataSize={}): predicted={} actual={}",
                                                      fqn,
-                                                     DTypeName(tnsr.dtype),
+                                                     DTypeName(tnsr.durableDtype),
                                                      fmt::join(shape, ","),
                                                      size,
                                                      predicted,
@@ -1181,8 +967,7 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
         }
     });
 
-    // Append this rank's Blobs after its tensors in fqn order, matching
-    // the per-rank order used by BuildMetadataPkl.
+    // Blob payloads follow tensor archives in FQN order.
     for (auto const& [fqn, bytes] : blobs)
     {
         WriteBytes(output, bytes.data(), bytes.size(), filepath.string());
@@ -1202,9 +987,7 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
     WriteBytes(output, pkl.data(), pkl.size(), filepath.string());
     FinishOutputFile(output, filepath);
 
-    // Megatron uses this marker to recognize the directory as a torch_dist
-    // checkpoint. Publish it from the daemon alongside .metadata so the
-    // training process does not write checkpoint sidecars in the exposed path.
+    // The format marker makes the directory loadable as a torch_dist checkpoint.
     static constexpr std::string_view ConfigJson   = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
     auto const                        configPath   = ckptDir / "metadata.json";
     auto                              configOutput = OpenOutputFile(configPath);

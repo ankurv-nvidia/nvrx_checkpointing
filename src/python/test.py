@@ -11,7 +11,6 @@ import nvrx_checkpointing.checkpoint
 import nvrx_checkpointing.megatron.mapping
 import torch
 import torch.cuda
-import torch.mps
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 

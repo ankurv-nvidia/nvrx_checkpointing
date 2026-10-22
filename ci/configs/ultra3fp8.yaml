@@ -80,3 +80,4 @@ moe-router-padding-for-quantization: true
 job_time_in_mins:
   srun:
     perf: 120
+    detr: 240

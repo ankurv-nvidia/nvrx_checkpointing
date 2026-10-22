@@ -489,6 +489,24 @@ struct CheckpointWriter
         }
 
         private:
+        void AppendDeviceBytes_(DeviceId const device, uint64_t source, uint64_t size)
+        {
+            while (bufBytesRemaining < size)
+            {
+                pendingD2HRequests.push_back({.device = device, .src = source, .size = bufBytesRemaining});
+                source += bufBytesRemaining;
+                size -= bufBytesRemaining;
+                bufBytesRemaining = 0;
+                FlushBytes_(that->slotSize);
+            }
+            if (size > 0)
+            {
+                pendingD2HRequests.push_back({.device = device, .src = source, .size = size});
+                bufBytesRemaining -= size;
+            }
+            if (bufBytesRemaining == 0) { FlushBytes_(that->slotSize); }
+        }
+
         void ProcessTensor_(StateNode::Handle /* handle */, DeviceId const device, uint64_t tensorSize, uint64_t tensorHandle)
         {
             if (readOffset >= partitionEnd) { return; }
@@ -500,27 +518,14 @@ struct CheckpointWriter
                 readOffset = next;
                 return;
             }
-            size_t startOffset = 0;
+            uint64_t startOffset = 0;
             if (readOffset < partitionStart)
             {
                 startOffset = partitionStart - readOffset;
                 readOffset  = partitionStart;
             }
-            size_t bytesRemaining = std::min(tensorSize - startOffset, partitionEnd - readOffset);
-            while (bufBytesRemaining < bytesRemaining)
-            {
-                pendingD2HRequests.emplace_back(device, tensorHandle + startOffset, bufBytesRemaining);
-                startOffset += bufBytesRemaining;
-                bytesRemaining -= bufBytesRemaining;
-                bufBytesRemaining = 0;
-                FlushBytes_(that->slotSize);
-            }
-            if (bytesRemaining > 0)
-            {
-                pendingD2HRequests.emplace_back(device, tensorHandle + startOffset, bytesRemaining);
-                bufBytesRemaining -= bytesRemaining;
-            }
-            if (bufBytesRemaining == 0) { FlushBytes_(that->slotSize); }
+            uint64_t const bytesRemaining = std::min(tensorSize - startOffset, partitionEnd - readOffset);
+            AppendDeviceBytes_(device, tensorHandle + startOffset, bytesRemaining);
             readOffset = next;
         }
 
@@ -544,8 +549,7 @@ struct CheckpointWriter
                                             ? deviceContext[req.device].get()
                                             : deviceContext.insert({req.device, DeviceContext::CreateDeviceContext(req.device, index)})
                                                   .first->second.get();
-                    lastDeviceContext->StreamAcquire();
-                    usedDeviceContexts.insert(lastDeviceContext);
+                    if (usedDeviceContexts.insert(lastDeviceContext).second) { lastDeviceContext->StreamAcquire(); }
                 }
                 lastDeviceContext->AddD2H(req.src, ptr, req.size);
                 that->totalWrittenBytes.fetch_add(req.size);

@@ -299,11 +299,12 @@ static DTensor BareTensorMeta(RankTopology const& topo, std::string_view name, D
 {
     DTensor        meta{};
     DTensor::Shard shard;
-    shard.rank     = topo.rank;
-    meta.dtype     = DlpackDtypeToDs4(t.dtype);
-    shard.device   = DlpackDeviceToId(t.device);
-    shard.handle   = DataPtrFromDlTensor(t);
-    uint64_t nelem = 1;
+    shard.rank          = topo.rank;
+    meta.durableDtype   = DlpackDtypeToDs4(t.dtype);
+    shard.snapshotDtype = meta.durableDtype;
+    shard.device        = DlpackDeviceToId(t.device);
+    shard.handle        = DataPtrFromDlTensor(t);
+    uint64_t nelem      = 1;
     if (!IsRowMajorContiguous(t)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", name)); }
     if (std::cmp_greater(t.ndim, Tensor::MaxDims))
     {
@@ -325,7 +326,7 @@ static DTensor BareTensorMeta(RankTopology const& topo, std::string_view name, D
             shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = static_cast<uint64_t>(dim)});
         }
     }
-    shard.storageSize = nelem * Tensor::GetDTypeSize(meta.dtype);
+    shard.storageSize = nelem * Tensor::GetDTypeSize(meta.durableDtype);
     shard.AssertShardIsValid(meta.fulldim);
     meta.AddShard(shard);
     return meta;
@@ -374,15 +375,13 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     DTensor ds4tensor{};
 
     auto shtKey     = nb::cast<nb::str>(container["key"]);
-    auto nameView   = StrView(name);
     auto shtKeyView = StrView(shtKey);
-    if (!nameView.starts_with(shtKeyView))
+    if (!StrView(name).starts_with(shtKeyView))
     {
         // Match the prior C++ walker's TODO_SHTEN_KEY policy: when
         // the dict-path name doesn't match the DTensor's own
         // `key`, the sharded key wins.
-        name     = shtKey;
-        nameView = shtKeyView;
+        name = shtKey;
     }
 
     struct ShardedTensorError : public std::runtime_error
@@ -397,11 +396,12 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     auto owner = AddressableTensor(shtKeyView, container["data"]);
     auto dlp   = ReadDlpack(owner);
     if (!IsRowMajorContiguous(*dlp.tnsr)) { throw std::runtime_error(fmt::format("Tensor {} is not contiguous", shtKeyView)); }
-    ds4tensor.dtype = DlpackDtypeToDs4(dlp.tnsr->dtype);
+    ds4tensor.durableDtype = DlpackDtypeToDs4(dlp.tnsr->dtype);
     DTensor::Shard shard{};
-    shard.rank   = topo.rank;
-    shard.handle = DataPtrFromDlTensor(*dlp.tnsr);
-    shard.device = DlpackDeviceToId(dlp.tnsr->device);
+    shard.rank          = topo.rank;
+    shard.snapshotDtype = ds4tensor.durableDtype;
+    shard.handle        = DataPtrFromDlTensor(*dlp.tnsr);
+    shard.device        = DlpackDeviceToId(dlp.tnsr->device);
 
     auto globalShape    = nb::cast<nb::tuple>(container["global_shape"]);
     auto localShape     = nb::cast<nb::tuple>(container["local_shape"]);
@@ -511,7 +511,7 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
         shard.sharddim.push_back(Range{.begin = static_cast<size_t>(start), .end = static_cast<size_t>(end)});
         shard.storageSize *= (end - start);
     }
-    shard.storageSize = shard.storageSize * Tensor::GetDTypeSize(ds4tensor.dtype);
+    shard.storageSize = shard.storageSize * Tensor::GetDTypeSize(ds4tensor.durableDtype);
 
     size_t dlpackBytes = static_cast<size_t>((dlp.tnsr->dtype.bits + 7U) / 8U) * dlp.tnsr->dtype.lanes;    // NOLINT
     for (int i = 0; i < dlp.tnsr->ndim; ++i)

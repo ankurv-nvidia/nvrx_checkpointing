@@ -397,7 +397,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
         auto& tnsr = std::get<DTensor>(node.data);
         if (tnsr.shards.empty()) { return; }
 
-        DTensor selected(tnsr.dtype, tnsr.fulldim);
+        DTensor selected(tnsr.durableDtype, tnsr.fulldim);
         for (auto const& shard : selectedByNode.at(node.handle)) { selected.AddShard(shard); }
         tnsr = std::move(selected);
     });
@@ -438,7 +438,8 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
             auto const& tnsr = std::get<Tensor>(node.data);
             // fmt::print(ostrm, "{}.sharddim: [{}]\n", name, tnsr.sharddim);
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-            fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
+            fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
+            fmt::print(ostrm, "{}.snapshotDtype: {}\n", name, tnsr.snapshotDtype);
             // fmt::print(ostrm, "{}.device: {}\n", name, tnsr.device);
         }
         else if (type == StateNode::Type::DTensor)
@@ -446,7 +447,7 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
             auto const& tnsr = std::get<DTensor>(node.data);
             if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor={}", name));
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-            fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
+            fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
 
             for (auto const& rshard : tnsr.shards)
             {
@@ -524,6 +525,9 @@ static std::string_view DTypeToTorchStr(Tensor::DType dtype)
     case Tensor::DType::UInt32: return "torch.uint32";
     case Tensor::DType::UInt64: return "torch.uint64";
     case Tensor::DType::Bool: return "torch.bool";
+    case Tensor::DType::FP8E4M3:
+    case Tensor::DType::MXFP8:
+    case Tensor::DType::NVFP4:
     case Tensor::DType::Invalid: return "torch.unknown";
     default: throw std::runtime_error(fmt::format("Invalid DType={}", static_cast<int>(dtype)));
     }
@@ -539,7 +543,7 @@ static constexpr uint8_t PeerRecordBlob   = 1;
 
 static void WriteTensorShardInfo(std::ostream& ostrm, TensorShardInfo const& info)
 {
-    serdes::WriteTrivial(ostrm, info.dtype);
+    serdes::WriteTrivial(ostrm, info.durableDtype);
     serdes::WriteTrivial(ostrm, info.fulldim);
     serdes::WriteTrivial(ostrm, info.tensorInfo);
     serdes::WriteBlobWithSize<uint32_t>(ostrm, info.nodeId);
@@ -581,13 +585,14 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
             Tensor::DimRange sharddim;
             for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
             auto shard = TensorShard{
-                .rank        = rank,
-                .handle      = tnsr.handle,
-                .storageSize = tnsr.storageSize,
-                .sharddim    = sharddim,
-                .device      = tnsr.device,
+                .rank          = rank,
+                .snapshotDtype = tnsr.snapshotDtype,
+                .handle        = tnsr.handle,
+                .storageSize   = tnsr.storageSize,
+                .sharddim      = sharddim,
+                .device        = tnsr.device,
             };
-            lambda({tnsr.dtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
+            lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
         }
         if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
@@ -595,7 +600,7 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
             for (auto const& shard : tnsr.shards)
             {
                 shard.AssertShardIsValid(tnsr.fulldim);
-                lambda({tnsr.dtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
+                lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
             }
         }
     });
@@ -666,7 +671,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
     std::unordered_map<std::string, std::string>     md5Map;    // map["<fqn[range...]>"] = "<md5sum>"
 
     auto emit   = [&](std::string key, std::string val) { entries.emplace_back(std::move(key), std::move(val)); };
-    auto addmd5 = [&](std::string&& fqnShardName, std::string&& md5) {
+    auto addmd5 = [&](std::string fqnShardName, std::string md5) {
         auto it = md5Map.find(fqnShardName);
         if (it == md5Map.end()) { md5Map.insert({std::move(fqnShardName), std::move(md5)}); }
         else
@@ -750,7 +755,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
             throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", name));
         }
         emit(name + ".size", FormatDim(shardedTnsr.fulldim));
-        emit(name + ".properties.dtype", std::string(DTypeToTorchStr(shardedTnsr.dtype)));
+        emit(name + ".properties.dtype", std::string(DTypeToTorchStr(shardedTnsr.durableDtype)));
         emit(name + ".properties.layout", "torch.strided");
         emit(name + ".properties.memory_format", "torch.contiguous_format");
         emit(name + ".properties.pin_memory", "False");
@@ -1075,7 +1080,7 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             auto [childName, parentNode] = sessionState.globalRegistry->FindOrAddNodeByFQN(stateName);
             // Add the final node which contains the handler
             auto& child = sessionState.globalRegistry->AddChild(parentNode, childName, true);
-            auto  shTen = DTensor(tensorShard.dtype, tensorShard.fulldim);
+            auto  shTen = DTensor(tensorShard.durableDtype, tensorShard.fulldim);
             shTen.AddShard(tensorShard.tensorInfo);
             child.data                    = shTen;
             tensorMap[tensorShard.nodeId] = child.handle;
@@ -1096,14 +1101,14 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
             throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", tensorShard.nodeId));
         }
 
-        if (tnsr.dtype != tensorShard.dtype || tnsr.fulldim != tensorShard.fulldim)
+        if (tnsr.durableDtype != tensorShard.durableDtype || tnsr.fulldim != tensorShard.fulldim)
         {
             throw std::runtime_error(fmt::format("Received incompatible replicas for tensor='{}': expected dtype={} full-shape=[{}], got "
                                                  "dtype={} full-shape=[{}] on rank={}",
                                                  tensorShard.nodeId,
-                                                 tnsr.dtype,
+                                                 tnsr.durableDtype,
                                                  tnsr.fulldim,
-                                                 tensorShard.dtype,
+                                                 tensorShard.durableDtype,
                                                  tensorShard.fulldim,
                                                  tensorShard.tensorInfo.rank));
         }
@@ -2340,7 +2345,7 @@ void Server::ReceiveStateRegistryFragments_(cipc::SessionId const&              
         {
             TensorShardInfo info;
             uint32_t        nodeIdLen{};
-            readTrivial(info.dtype);
+            readTrivial(info.durableDtype);
             readTrivial(info.fulldim);
             readTrivial(info.tensorInfo);
             info.tensorInfo.AssertShardIsValid(info.fulldim);

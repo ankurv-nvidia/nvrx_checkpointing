@@ -69,6 +69,7 @@ def _job(  # noqa: PLR0913
 
 # Above eight nodes a synchronous save costs more than a run can afford.
 ASYNC_FROM_NODES = 16
+SLURM_CLEANUP_GRACE_MINUTES = 5
 
 GROUPS = (
     "native-deterministic",
@@ -99,6 +100,18 @@ def _provider(job: str) -> str:
 def _pretrain_group(job: str, flavor: str) -> str:
     """Default group for a single-node or 2-node pretrain job: <provider>-<flavor>."""
     return f"{_provider(job)}-{GROUP_FLAVOR.get(flavor, flavor)}"
+
+
+def _slurm_time_arg(config: dict, provider: str, flavors: list[str]) -> str:
+    key = "-".join((provider, *flavors))
+    minutes = (config.get("slurm_time_minutes") or {}).get(key)
+    if minutes is None:
+        return ""
+    if not isinstance(minutes, int) or minutes <= SLURM_CLEANUP_GRACE_MINUTES:
+        raise ValueError(
+            f"{key}: Slurm time must exceed the {SLURM_CLEANUP_GRACE_MINUTES}-minute cleanup reserve",
+        )
+    return f"--time-minutes {minutes}"
 
 
 def _add_job(  # noqa: PLR0913
@@ -160,6 +173,7 @@ def _emit_multinode(
                     f"--nodes {entry['nodes']} --config {entry['config']}",
                     f"--megatron-commit {entry['megatron_commit']}" if entry.get("megatron_commit") else "",
                     f"--job-array-segment {segment}" if segment is not None else "",
+                    _slurm_time_arg(entry, provider, flavors),
                     flavor_flags,
                 )
                 if part
@@ -203,10 +217,15 @@ def _emit_platform(p: dict, groups: dict[str, list[str]], bundle_jobs: dict[str,
             modifiers = "".join(f":{modifier}" for modifier in flavors[1:])
             jname = f"{FLAVOR_LABEL.get(flavors[0], flavors[0])}:{name}:{provider}:pico_{gpus}{modifiers}"
         common = "+".join(flavors)
-        args = (
-            f"--config pico --flavor {common} --run=ref:nvrx --run=cmp:{provider}"
+        flavor_args = (
+            f"--flavor {common} --run=ref:nvrx --run=cmp:{provider}"
             if flavors[0] == "detr" and "vg" not in flavors
-            else f"--config pico --flavor {common}+{provider}"
+            else f"--flavor {common}+{provider}"
+        )
+        args = " ".join(
+            part
+            for part in ("--config pico", _slurm_time_arg(p, provider, flavors), flavor_args)
+            if part
         )
         group = "valgrind" if "vg" in flavors else _pretrain_group(job, flavors[0])
         suite = (

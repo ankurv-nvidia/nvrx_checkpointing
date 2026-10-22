@@ -35,6 +35,9 @@
           "perf"
         ]
       ],
+      "slurm_time_minutes": {
+        "native-detr-vg": 25
+      },
       "multinode": [
         {
           "key": "gpt-moe",
@@ -43,6 +46,9 @@
           "scale": "1x4",
           "pipeline_suite": "main-branch-runs",
           "checkpoint_interval": 20,
+          "slurm_time_minutes": {
+            "native-perf": 10
+          },
           "jobs": [
             [
               "native",
@@ -58,6 +64,11 @@
           "group": "8node-nano3",
           "pipeline_suite": "main-branch-runs",
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 30,
+            "native-perf": 25,
+            "native-detr-vg": 50
+          },
           "jobs": [
             [
               "native",
@@ -93,6 +104,10 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 80,
+            "native-perf": 50
+          },
           "jobs": [
             [
               "native",
@@ -116,7 +131,18 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 100,
+            "native-perf": 70
+          },
+          "staging": {
+            "detr": null
+          },
           "jobs": [
+            [
+              "native",
+              "detr"
+            ],
             [
               "native",
               "perf"
@@ -136,6 +162,9 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-perf": 45
+          },
           "jobs": [
             [
               "native",
@@ -156,6 +185,10 @@
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 160,
+            "native-perf": 90
+          },
           "staging": {
             "detr": null
           },
@@ -198,6 +231,10 @@
           "checkpoint_interval": 125,
           "job_array_segment": 8,
           "timeout": "1d",
+          "slurm_time_minutes": {
+            "native-detr": 185,
+            "native-perf": 30
+          },
           "jobs": [
             [
               "native",
@@ -248,6 +285,13 @@
       "gpus": "1x8",
       "has_image": true,
       "pipeline_suite": "main-branch-runs",
+      "slurm_time_minutes": {
+        "native-detr": 20,
+        "native-perf": 15,
+        "nvrx-detr": 20,
+        "native-detr-vg": 60,
+        "nvrx-perf": 15
+      },
       "jobs": [
         [
           "native",

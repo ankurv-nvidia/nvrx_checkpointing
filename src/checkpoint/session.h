@@ -25,7 +25,7 @@ struct Server;
 
 struct TensorShardInfo
 {
-    Tensor::DType     dtype{};
+    Tensor::DType     durableDtype{};
     Tensor::Dim       fulldim;
     DTensor::Shard    tensorInfo;
     StateTree::NodeId nodeId;

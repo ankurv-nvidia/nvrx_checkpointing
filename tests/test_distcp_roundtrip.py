@@ -47,10 +47,10 @@ def _tensor_bytes(t: torch.Tensor) -> bytes:
 
 @st.composite
 def _tensor(draw) -> torch.Tensor:
-    ndim  = draw(st.integers(min_value=1, max_value=4))
+    ndim = draw(st.integers(min_value=1, max_value=4))
     shape = tuple(draw(st.integers(min_value=1, max_value=8)) for _ in range(ndim))
     dtype = draw(st.sampled_from(SUPPORTED_DTYPES))
-    n     = 1
+    n = 1
     for d in shape:
         n *= d
     base = torch.arange(n)
@@ -69,25 +69,18 @@ def _state_dict(draw) -> dict[str, torch.Tensor]:
 @settings(deadline=None, max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_per_tensor_torch_load_roundtrip(state_dict, tmp_path_factory):
     out_dir = tmp_path_factory.mktemp("roundtrip")
-    entries = [
-        (fqn, _dtype_name(t.dtype), tuple(int(d) for d in t.shape), _tensor_bytes(t))
-        for fqn, t in state_dict.items()
-    ]
+    entries = [(fqn, _dtype_name(t.dtype), tuple(int(d) for d in t.shape), _tensor_bytes(t)) for fqn, t in state_dict.items()]
     write_log = _distcp_shim.write_rank_shard(str(out_dir), 0, entries)
 
-    assert len(write_log) == len(state_dict), (
-        f"writeLog has {len(write_log)} entries; expected {len(state_dict)}"
-    )
+    assert len(write_log) == len(state_dict), f"writeLog has {len(write_log)} entries; expected {len(state_dict)}"
 
-    file_bytes     = (out_dir / "__0_0.distcp").read_bytes()
+    file_bytes = (out_dir / "__0_0.distcp").read_bytes()
     expected_items = list(state_dict.items())
 
     for i, (fqn, _sharddim, offset, length) in enumerate(write_log):
         expected_fqn, expected_tensor = expected_items[i]
-        assert fqn == expected_fqn, (
-            f"writeLog order diverged at index {i}: got {fqn!r}, expected {expected_fqn!r}"
-        )
-        loaded = torch.load(BytesIO(file_bytes[offset:offset + length]), weights_only=True)
+        assert fqn == expected_fqn, f"writeLog order diverged at index {i}: got {fqn!r}, expected {expected_fqn!r}"
+        loaded = torch.load(BytesIO(file_bytes[offset : offset + length]), weights_only=True)
         assert torch.equal(loaded, expected_tensor), (
             f"per-tensor round-trip mismatch for {fqn!r}: expected {expected_tensor!r}, got {loaded!r}"
         )
@@ -95,16 +88,13 @@ def test_per_tensor_torch_load_roundtrip(state_dict, tmp_path_factory):
 
 def test_smoke_single_float32_tensor_roundtrip(tmp_path):
     state_dict = {"weight": torch.arange(12, dtype=torch.float32).reshape(3, 4)}
-    entries    = [
-        (fqn, _dtype_name(t.dtype), tuple(int(d) for d in t.shape), _tensor_bytes(t))
-        for fqn, t in state_dict.items()
-    ]
+    entries = [(fqn, _dtype_name(t.dtype), tuple(int(d) for d in t.shape), _tensor_bytes(t)) for fqn, t in state_dict.items()]
     write_log = _distcp_shim.write_rank_shard(str(tmp_path), 0, entries)
 
     assert len(write_log) == 1
-    file_bytes  = (tmp_path / "__0_0.distcp").read_bytes()
+    file_bytes = (tmp_path / "__0_0.distcp").read_bytes()
     _fqn, _sharddim, offset, length = write_log[0]
-    loaded = torch.load(BytesIO(file_bytes[offset:offset + length]), weights_only=True)
+    loaded = torch.load(BytesIO(file_bytes[offset : offset + length]), weights_only=True)
     assert torch.equal(loaded, state_dict["weight"])
 
 

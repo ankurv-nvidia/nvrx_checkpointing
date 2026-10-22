@@ -129,7 +129,7 @@ struct StateSerDes
                         fmt::format("Sharded tensor {} has no shards in metadata output\n", tree.GetNodeId(nodeHandle)));
                 }
                 serdes::WriteTrivial(ostrm, typehdr);
-                serdes::WriteTrivial(ostrm, shTen.dtype);
+                serdes::WriteTrivial(ostrm, shTen.durableDtype);
                 serdes::WriteTrivial(ostrm, shTen.fulldim);
 
                 for (auto const& rankShard : shTen.shards)
@@ -226,11 +226,11 @@ struct StateSerDes
                     fmt::print(stderr, "StateSerDes::Read!DTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
-                auto typehdr = serdes::ReadTrivial<ShardedTensorHeader>(istrm);
-                auto dtype   = serdes::ReadTrivial<Tensor::DType>(istrm);
-                auto fulldim = serdes::ReadTrivial<Tensor::Dim>(istrm);
+                auto typehdr      = serdes::ReadTrivial<ShardedTensorHeader>(istrm);
+                auto durableDtype = serdes::ReadTrivial<Tensor::DType>(istrm);
+                auto fulldim      = serdes::ReadTrivial<Tensor::Dim>(istrm);
 
-                DTensor shTen{dtype, fulldim};
+                DTensor shTen{durableDtype, fulldim};
                 if (typehdr.numShards == 0)
                 {
                     throw std::runtime_error(fmt::format("Sharded tensor {} has no shards in metadata output\n", node.name));
@@ -299,7 +299,8 @@ struct StateSerDes
             {
                 auto const& tnsr = std::get<Tensor>(node.data);
                 fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-                fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
+                fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
+                fmt::print(ostrm, "{}.snapshotDtype: {}\n", name, tnsr.snapshotDtype);
                 fmt::print(ostrm, "{}.handle: {}\n", name, tnsr.handle);
             }
             else if (type == StateNode::Type::DTensor)
@@ -307,7 +308,7 @@ struct StateSerDes
                 auto const& tnsr = std::get<DTensor>(node.data);
                 if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor : {}", name));
                 fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-                fmt::print(ostrm, "{}.dtype: {}\n", name, tnsr.dtype);
+                fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
 
                 for (auto const& rshard : tnsr.shards)
                 {
