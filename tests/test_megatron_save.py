@@ -546,6 +546,26 @@ def test_load_registers_live_state_after_loading(
     assert save._LOAD_CONTEXT is None
 
 
+def test_load_without_checkpoint_leaves_registration_to_first_save(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(save, "get_args", SimpleNamespace)
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: events.append("generate live"))
+    monkeypatch.setattr(save, "register_state_dict", lambda *_args: events.append("register"))
+    load_generate_state_dict = save.checkpointing_module.generate_state_dict
+
+    def load_checkpoint(ddp_model: object, optimizer: object, opt_param_scheduler: object) -> tuple[int, int]:
+        del ddp_model, optimizer, opt_param_scheduler
+        return 0, 0
+
+    assert save._wrap_load_checkpoint(load_checkpoint)("model", "optimizer", "scheduler") == (0, 0)
+    assert events == []
+    assert save.checkpointing_module.generate_state_dict is load_generate_state_dict
+    assert save._LOAD_CONTEXT is None
+
+
 def test_load_registration_warns_and_uses_singleton_dp_groups_when_rng_is_unexpectedly_missing(
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,

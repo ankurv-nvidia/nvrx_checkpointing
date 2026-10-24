@@ -725,7 +725,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 16n]
   variables:
-    JOB_ARGS: "--nodes 16 --config super3bf16 --time-minutes 80 --flavor detr+shm --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 16 --config super3bf16 --time-minutes 100 --flavor detr+shm --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:super3bf16_16x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]
@@ -887,7 +887,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 8n]
   variables:
-    JOB_ARGS: "--nodes 8 --config nano3 --time-minutes 25 --flavor perf+native"
+    JOB_ARGS: "--nodes 8 --config nano3 --time-minutes 40 --flavor perf+native"
 
 "[DETR]:gb200:nvrx:nano3_8x4":
   extends: [.slurm_job, .runner_gb200, .nvrx_pipeline]

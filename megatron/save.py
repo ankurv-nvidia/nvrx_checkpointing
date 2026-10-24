@@ -113,9 +113,12 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
         _LOAD_CONTEXT = {name: values.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
         training_args = get_args()
         original_generate_state_dict = checkpointing_module.generate_state_dict
+        checkpoint_loaded = False
 
         @wraps(original_generate_state_dict)
         def generate_quantized_state_dict(*generate_args, **generate_kwargs):  # noqa: ANN002, ANN003, ANN202
+            nonlocal checkpoint_loaded
+            checkpoint_loaded = True
             with preserve_quantized_tensors():
                 return original_generate_state_dict(*generate_args, **generate_kwargs)
 
@@ -125,6 +128,10 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
                 result = load_checkpoint(*args, **kwargs)
             finally:
                 checkpointing_module.generate_state_dict = original_generate_state_dict
+
+            # Without a loaded checkpoint the optimizer has no state yet, so the first save registers the state dict.
+            if not checkpoint_loaded:
+                return result
 
             iteration, num_floating_point_operations_so_far = result
             metadata = _build_sharded_state_dict_metadata(training_args, dp_cp_group=values.get("dp_cp_group"))

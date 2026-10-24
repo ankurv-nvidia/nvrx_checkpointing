@@ -66,7 +66,7 @@
           "timeout": "1d",
           "slurm_time_minutes": {
             "native-detr": 30,
-            "native-perf": 25,
+            "native-perf": 40,
             "native-detr-vg": 50
           },
           "jobs": [
@@ -105,7 +105,7 @@
           "checkpoint_interval": 125,
           "timeout": "1d",
           "slurm_time_minutes": {
-            "native-detr": 80,
+            "native-detr": 100,
             "native-perf": 50
           },
           "jobs": [

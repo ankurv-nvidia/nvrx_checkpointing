@@ -163,6 +163,7 @@ function ubuntu2404 {
     apt update
 
     apt-get install --yes --no-install-recommends "${packages[@]}"
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="/usr/local/bin" UV_NO_MODIFY_PATH=1 sh
 
     update-alternatives --install /usr/bin/cc cc /usr/bin/clang-${CLANG_VERSION} 100
     update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-${CLANG_VERSION} 100
@@ -176,7 +177,7 @@ function ubuntu2404 {
     # Remove cmake /usr/local/bin that conflicts with /usr/bin/cmake installed by apt
     rm -f /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack
     # Print out tool version info
-    for tool in cmake cc gcc g++ clang-${CLANG_VERSION}; do
+    for tool in cmake cc gcc g++ clang-${CLANG_VERSION} uv; do
     echo .
     echo "-- ${tool} version"
     command -v ${tool}
@@ -256,8 +257,9 @@ function megatron {
         *)    export NVTE_CUDA_ARCHS=$(echo "${_COMPUTE_CAP}" | sed 's/\.//') ;;  # pre-Blackwell: bare arch (9.0 -> 90)
     esac
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    source $HOME/.local/bin/env
+    if [ -f "$HOME/.local/bin/env" ]; then
+        source $HOME/.local/bin/env
+    fi
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
