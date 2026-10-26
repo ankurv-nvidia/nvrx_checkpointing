@@ -55,7 +55,7 @@ class PyStateDictAccessor
     virtual StateNode&   RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) = 0;
     virtual StateNode&   RegisterStateByFQN(std::string_view name, StateNode::Variant data)                      = 0;
     virtual void         AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nanobind::object const& obj)  = 0;
-    virtual void         AttachQuantHeader(StateNode& tensor, std::unique_ptr<checkpoint::quant::Header> header) = 0;
+    virtual void         RetainQuantHeader(std::unique_ptr<checkpoint::quant::Header> header)                    = 0;
 
     [[nodiscard]] virtual std::string GetNodeId(StateNode::Handle node) const = 0;
 };

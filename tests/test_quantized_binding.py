@@ -21,11 +21,11 @@ from typing_extensions import Self
 try:
     from nvrx_checkpointing import checkpoint
     from nvrx_checkpointing.megatron import mapping as mapping_module
-    from nvrx_checkpointing.megatron.mapping import ShardedTensor
+    from nvrx_checkpointing.megatron.mapping import ShardedTensor, ShardedTensorFactory
 except ModuleNotFoundError:
     import checkpoint
     from megatron import mapping as mapping_module
-    from megatron.mapping import ShardedTensor
+    from megatron.mapping import ShardedTensor, ShardedTensorFactory
 
 package = types.ModuleType("nvrx_checkpointing")
 package.__path__ = []
@@ -253,6 +253,64 @@ def test_cpu_quantized_snapshot_dequantizes_during_dcp_write(tmp_path: Path, sto
         loaded = {"weight": torch.zeros(tensor.shape, dtype=torch.bfloat16)}
         dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
         torch.testing.assert_close(loaded["weight"], torch.ones_like(loaded["weight"]))
+    finally:
+        checkpoint.svc_spindown()
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
+    def tensor(packed_value: int) -> _FakeNVFP4Tensor:
+        value = _FakeNVFP4Tensor((128, 512))
+        value._rowwise_data = torch.full((128, 256), packed_value, dtype=torch.uint8)
+        value._rowwise_scale_inv = torch.full((128, 32), 0x38, dtype=torch.uint8)
+        value._amax_rowwise = torch.tensor([2688.0], dtype=torch.float32)
+        value._fp4_dtype = _FP4DType()
+        value._with_gemm_swizzled_scales = False
+        value._row_scaled_nvfp4 = False
+        value._nvfp4_e4m3_max = 448
+        return value
+
+    shards = [tensor(0x22), tensor(0x44)]
+
+    def build(key: str, *_args: object) -> list[ShardedTensor]:
+        return [
+            ShardedTensor(
+                key=key,
+                data=value,
+                dtype=torch.bfloat16,
+                local_shape=(128, 512),
+                global_shape=(2, 128, 512),
+                global_offset=(index, 0, 0),
+                axis_fragmentations=None,
+                prepend_axis_num=1,
+            )
+            for index, value in enumerate(shards)
+        ]
+
+    state = {
+        "weight": ShardedTensorFactory(
+            key="weight",
+            data=torch.empty(0),
+            build_fn=build,
+            merge_fn=None,
+        ),
+    }
+    root = _create_root()
+    root.register_state_dict(state)
+    checkpoint_dir = tmp_path / "nvfp4-shards"
+    try:
+        root.save(1, checkpoint_dir)
+        deadline = time.monotonic() + 30
+        while not (checkpoint_dir / ".metadata").is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+            time.sleep(0.05)
+
+        loaded = {"weight": torch.zeros((2, 128, 512), dtype=torch.bfloat16)}
+        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+        torch.testing.assert_close(loaded["weight"][0], torch.ones((128, 512), dtype=torch.bfloat16))
+        torch.testing.assert_close(loaded["weight"][1], torch.full((128, 512), 2.0, dtype=torch.bfloat16))
     finally:
         checkpoint.svc_spindown()
 

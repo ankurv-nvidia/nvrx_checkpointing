@@ -3355,7 +3355,7 @@ def test_generated_pipeline_suites_and_node_tags() -> None:
     ultra64_det = shlex.split(large["[DETR]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
     assert ultra64_det == [
         "--nodes", "64", "--config", "ultra3fp8",
-        "--time-minutes", "160",
+        "--time-minutes", "200",
         "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
     ]
     # Each deterministic gate uses its configured synchronous or shared-memory staging mode.

@@ -787,7 +787,7 @@ static StateNode& RegisterTensorState(PyStateDictAccessor&                      
 {
     auto& node = name.contains('.') ? scan.RegisterStateByFQN(name, tensor) : scan.RegisterState(parent, name, tensor);
     scan.AcquireTensorObjectRefForSnapshot(node.handle, nb::borrow<nb::object>(owner));
-    if (header) { scan.AttachQuantHeader(node, std::move(header)); }
+    if (header) { scan.RetainQuantHeader(std::move(header)); }
     return node;
 }
 

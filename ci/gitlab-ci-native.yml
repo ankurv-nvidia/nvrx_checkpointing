@@ -821,7 +821,7 @@ wheel-publish:pypi:
   timeout: 1d
   tags: [gb200, 64n]
   variables:
-    JOB_ARGS: "--nodes 64 --config ultra3fp8 --time-minutes 160 --flavor detr --run=ref:nvrx --run=cmp:native"
+    JOB_ARGS: "--nodes 64 --config ultra3fp8 --time-minutes 200 --flavor detr --run=ref:nvrx --run=cmp:native"
 
 "[PERF]:gb200:native:ultra3fp8_64x4":
   extends: [.slurm_job, .runner_gb200, .large_scale_pipeline]

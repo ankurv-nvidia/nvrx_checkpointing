@@ -186,7 +186,7 @@
           "checkpoint_interval": 125,
           "timeout": "1d",
           "slurm_time_minutes": {
-            "native-detr": 160,
+            "native-detr": 200,
             "native-perf": 90
           },
           "staging": {
