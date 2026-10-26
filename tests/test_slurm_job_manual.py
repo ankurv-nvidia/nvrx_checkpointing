@@ -428,17 +428,19 @@ def test_host_memory_metrics_distinguish_training_process_and_daemon(
     assert metrics["training_process_peak_rss_bytes"]["max"] == 104  # noqa: PLR2004
     assert metrics["checkpoint_daemon_peak_rss_bytes"]["max"] == 123456
     assert metrics["checkpoint_daemon_peak_rss_bytes"]["per_node"] == {"node-a": 123456}
-    assert slurm_job.PerfReport._statistic(
-        "training_process_peak_rss_bytes",
-        metrics["training_process_peak_rss_bytes"],
-    ) == "max"
+    assert (
+        slurm_job.PerfReport._statistic(
+            "training_process_peak_rss_bytes",
+            metrics["training_process_peak_rss_bytes"],
+        )
+        == "max"
+    )
 
 
 def test_log_report_uses_each_ranks_peak_rss_across_all_phases() -> None:
     slurm_job = _load_slurm_job()
     text = "\n".join(
-        f"[native_ckpt:mem] rank={rank} gpu_peak_bytes=1 cpu_rss_bytes={rss}"
-        for rank, rss in ((0, 100), (1, 120), (0, 130), (1, 110))
+        f"[native_ckpt:mem] rank={rank} gpu_peak_bytes=1 cpu_rss_bytes={rss}" for rank, rss in ((0, 100), (1, 120), (0, 130), (1, 110))
     )
 
     measured = slurm_job.log_report._metrics(text, "", 4)["cpu_rss_bytes"]
@@ -509,12 +511,10 @@ def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(slurm_job.shutil, "which", lambda _name: "/usr/bin/valgrind")
     monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(require_stopped=lambda: None))
     monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
+
     def popen(*_args: object, **kwargs: object) -> None:
         assert "--errors-for-leak-kinds=definite,indirect" in _args[0]
-        assert {
-            name: kwargs["env"][name]
-            for name in slurm_job._VALGRIND_NATIVE_ENV
-        } == slurm_job._VALGRIND_NATIVE_ENV
+        assert {name: kwargs["env"][name] for name in slurm_job._VALGRIND_NATIVE_ENV} == slurm_job._VALGRIND_NATIVE_ENV
         assert "NATIVE_CKPT_OTEL_FILE" not in kwargs["env"]
         raise RuntimeError("popen reached")
 
@@ -608,7 +608,7 @@ def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
         "clean_run": False,
         "background": False,
         "dry_run": False,
-                "nodes": 64,
+        "nodes": 64,
         "gpus_per_node": 4,
         "config": "ultra3fp8",
         "flavors": ["perf"],
@@ -673,7 +673,10 @@ def test_run_options_apply_default_env_cli_precedence(monkeypatch: pytest.Monkey
     monkeypatch.setenv("SLURMJOB_OPT_BACKGROUND", "1")
     from_env, _ = slurm_job._parse_args(slurm_job._parser(), ["pretrain-native"])
     assert (from_env.nodes, from_env.config, from_env.flavor, from_env.background) == (
-        8, "nano3", ["perf", "detr"], True,
+        8,
+        "nano3",
+        ["perf", "detr"],
+        True,
     )
 
     cli, _ = slurm_job._parse_args(
@@ -780,7 +783,8 @@ def test_reading_a_checkpoint_is_given_what_wrote_it(
     monkeypatch.setenv("PYTHONPATH", "/already/here")
     captured: dict = {}
     monkeypatch.setattr(
-        slurm_job.subprocess, "run",
+        slurm_job.subprocess,
+        "run",
         lambda *_a, **kwargs: captured.update(kwargs) or SimpleNamespace(returncode=0),
     )
 
@@ -841,7 +845,9 @@ def test_the_run_settings_can_be_argued_or_exported(monkeypatch: pytest.MonkeyPa
     for name in ("PLATFORM", "CLUSTER", "SLURM_ACCOUNT"):
         monkeypatch.delenv(name, raising=False)
     assert settle(["--platform", "gb200", "--cluster", "awscmh", "--slurm-account", "acct"]) == {
-        "PLATFORM": "gb200", "CLUSTER": "awscmh", "SLURM_ACCOUNT": "acct",
+        "PLATFORM": "gb200",
+        "CLUSTER": "awscmh",
+        "SLURM_ACCOUNT": "acct",
     }
     assert slurm_job.platform_tag() == "gb200"
     assert slurm_job.cluster_tag() == "awscmh"
@@ -854,7 +860,9 @@ def test_the_run_settings_can_be_argued_or_exported(monkeypatch: pytest.MonkeyPa
 
     # An argument wins over the environment, as every other option does.
     assert settle(["--platform", "gb200", "--slurm-account", "argued"]) == {
-        "PLATFORM": "gb200", "CLUSTER": "lyris", "SLURM_ACCOUNT": "argued",
+        "PLATFORM": "gb200",
+        "CLUSTER": "lyris",
+        "SLURM_ACCOUNT": "argued",
     }
 
 
@@ -920,9 +928,13 @@ def test_the_platform_names_its_gpus_per_node(monkeypatch: pytest.MonkeyPatch) -
     assert slurm_job.platform_gpus_per_node() == 4  # noqa: PLR2004
     monkeypatch.setenv("PLATFORM", "gb200")
     assert _validated_args(slurm_job, ["--config", "pico", "--nodes", "1"]).gpus_per_node == 4  # noqa: PLR2004
-    assert _validated_args(
-        slurm_job, ["--config", "pico", "--nodes", "1", "--gpus-per-node", "2"],
-    ).gpus_per_node == 2  # noqa: PLR2004
+    assert (
+        _validated_args(
+            slurm_job,
+            ["--config", "pico", "--nodes", "1", "--gpus-per-node", "2"],
+        ).gpus_per_node
+        == 2
+    )  # noqa: PLR2004
 
     # A platform the matrix does not name cannot supply one.
     monkeypatch.setenv("PLATFORM", "unknown")
@@ -957,8 +969,13 @@ def test_a_ci_job_holds_the_runs_it_owns(
     monkeypatch.setenv("MASTER_ADDR", "n0")
     monkeypatch.setenv("CI_JOB_ID", "389645773")
     args = _args(
-        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr"],
-        flavor=["detr"], run=["ref:nvrx", "cmp:native"],
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        name=None,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
     )
     slurm_job._configure_run(args)
 
@@ -977,8 +994,13 @@ def test_a_ci_job_holds_the_runs_it_owns(
     # A manual run has no job to belong to and says so by omission.
     monkeypatch.delenv("CI_JOB_ID")
     manual = _args(
-        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr"],
-        flavor=["detr"], run=["ref:nvrx", "cmp:native"],
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        name=None,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
     )
     slurm_job._configure_run(manual)
     assert slurm_job.RUN_ROOT.name == "nano3_8n-detr"
@@ -988,8 +1010,13 @@ def test_a_ci_job_holds_the_runs_it_owns(
     # Scoped revisions identify child directories while common options identify the allocation directory.
     candidate = "735068d5df9b450f32f33b4f42e449bf126c3683"
     scoped = _args(
-        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr", "nvrx"],
-        flavor=["detr", "nvrx"], run=["ref", "cmp"],
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        name=None,
+        flavors=["detr", "nvrx"],
+        flavor=["detr", "nvrx"],
+        run=["ref", "cmp"],
     )
     scoped.run_blocks = (
         slurm_job.RunBlock("ref"),
@@ -1018,6 +1045,7 @@ def test_a_run_on_pinned_sources_names_only_what_it_is(
         _args(tmp_path, name=None, config="nano3", nodes=8, flavors=["detr"], nvrx_commit="c" * 40),
     )
     assert slurm_job.RUN_NAME == "nano3_8n-detr-nvrx-cccccccc"
+
 
 def test_run_name_template_expands_before_paths_are_created(
     monkeypatch: pytest.MonkeyPatch,
@@ -1071,6 +1099,7 @@ def test_nvrx_repo_root_selects_source_checkout(monkeypatch: pytest.MonkeyPatch,
     assert "export NVRX_REPO_ROOT=" + str(nvrx) in reproducer
     assert '--repo-root "${NVRX_REPO_ROOT}"' in reproducer
     assert '--target "${SLURMJOB_OPT_RUN_DIR}/deps/nvidia-resiliency-ext-${NVRX_COMMIT}"' in reproducer
+
 
 def test_nvrx_repo_root_reuses_existing_checkout_without_switching_it(tmp_path: Path) -> None:
     installer = _load_run_dependency()
@@ -1339,9 +1368,11 @@ def test_worker_preserves_checkpoint_cycle_arguments(
     args.flavors = slurm_job.FlavorSelection(flavors)
     monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     calls = []
-    monkeypatch.setattr(slurm_job, "_run_routine",
-                        lambda _cfg, run_args, _provider, _label="": calls.append(
-                            (run_args.checkpoints_per_run, run_args.repeat)))
+    monkeypatch.setattr(
+        slurm_job,
+        "_run_routine",
+        lambda _cfg, run_args, _provider, _label="": calls.append((run_args.checkpoints_per_run, run_args.repeat)),
+    )
     monkeypatch.setattr(slurm_job, "_manifest_batch", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(slurm_job, "_write_checkpoint_digest", lambda *_args, **_kwargs: None)
     uninstalls = []
@@ -1366,7 +1397,8 @@ def test_worker_failure_requests_nonblocking_local_server_stop(
     monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     args.flavors = slurm_job.FlavorSelection(args.flavors)
     monkeypatch.setattr(
-        slurm_job, "_run_routine",
+        slurm_job,
+        "_run_routine",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
     )
     requests = []
@@ -1394,7 +1426,8 @@ def test_worker_failure_preserves_original_error_when_local_stop_fails(
     monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     args.flavors = slurm_job.FlavorSelection(args.flavors)
     monkeypatch.setattr(
-        slurm_job, "_run_routine",
+        slurm_job,
+        "_run_routine",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("workload failed")),
     )
     monkeypatch.setenv("SLURM_LOCALID", "0")
@@ -1436,11 +1469,7 @@ def test_uninstall_nvrx_for_native_is_serialized_and_verified(
     monkeypatch.setattr(
         slurm_job.importlib.util,
         "find_spec",
-        lambda _name: (
-            SimpleNamespace(submodule_search_locations=[str(package)], origin=None)
-            if package.exists()
-            else None
-        ),
+        lambda _name: SimpleNamespace(submodule_search_locations=[str(package)], origin=None) if package.exists() else None,
     )
 
     slurm_job.uninstall_nvrx_for_native()
@@ -1490,8 +1519,13 @@ def test_a_run_trains_on_one_toolchain(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(slurm_job, "WORK_ROOT", tmp_path)
 
     args = _args(
-        tmp_path, config="nano3", nodes=8, flavors=["detr"],
-        megatron_repo_url="https://example/fork.git", megatron_commit="a" * 40, nvrx_commit="b" * 40,
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        flavors=["detr"],
+        megatron_repo_url="https://example/fork.git",
+        megatron_commit="a" * 40,
+        nvrx_commit="b" * 40,
     )
     toolchain = slurm_job._toolchain("nano3_8x4", args)
     assert (toolchain.megatron_url, toolchain.megatron_commit) == ("https://example/fork.git", "a" * 40)
@@ -1523,15 +1557,26 @@ def test_naming_a_second_toolchain_fails_before_the_allocation(
     # An option the parser does not know reaches Megatron, so a retired one has
     # to be caught here rather than in phase 1 with the nodes already held.
     with pytest.raises(SystemExit):
-        _validated_args(slurm_job, ["--config", "nano3", "--nodes", "8", "--flavor", "detr",
-            "--megatron-commit-compare", "a" * 40,
-        ])
+        _validated_args(
+            slurm_job,
+            [
+                "--config",
+                "nano3",
+                "--nodes",
+                "8",
+                "--flavor",
+                "detr",
+                "--megatron-commit-compare",
+                "a" * 40,
+            ],
+        )
     error = capsys.readouterr().err
     assert "--megatron-commit-compare: a run trains on one toolchain" in error
     assert "--diff-digests" in error
 
 
 _ASYNC_OPTS = ("--async-save", "--use-persistent-ckpt-worker", "--async-ckpt-use-cpu-shm")
+
 
 def test_deterministic_drops_async_checkpointing_by_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -2115,6 +2160,7 @@ def test_every_variant_is_a_flavor_and_they_mix(
     # A writer and the staging it agrees with still compose.
     slurm_job.FlavorSelection(["detr", "shm", "pt-async"])
 
+
 def test_one_flavor_option_names_several_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
@@ -2122,7 +2168,8 @@ def test_one_flavor_option_names_several_variants(monkeypatch: pytest.MonkeyPatc
 
     def flavors(*argv: str) -> tuple[str, ...]:
         return _validated_args(
-            slurm_job, ["--config", "nano3", "--nodes", "8", *argv],
+            slurm_job,
+            ["--config", "nano3", "--nodes", "8", *argv],
         ).flavors.names
 
     joined = flavors("--flavor", "detr+shm+pg-cache")
@@ -2195,7 +2242,10 @@ def test_a_mixin_keeps_its_execution_mode_budget(monkeypatch: pytest.MonkeyPatch
     assert budget == table["detr"]
     assert budget != table["default"]
     assert slurm_job._time_budget("nano3", perf, "srun", 30) == slurm_job._time_budget(
-        "nano3", slurm_job.FlavorSelection(["perf"]), "srun", 30,
+        "nano3",
+        slurm_job.FlavorSelection(["perf"]),
+        "srun",
+        30,
     )
     # A table naming the exact combination still wins over the mode.
     valgrind = slurm_job.FlavorSelection(["detr", "vg"])
@@ -2239,9 +2289,7 @@ def test_checkpoint_digest_is_diffable_and_summarised(
 
     # A run with nothing to compare against still writes its own digest.
     slurm_job._write_checkpoint_digest(run, "alone")
-    assert (tmp_path / "logs/alone_checkpoint_summary.log").read_text().strip() == (
-        "checkpoints/iter_0000120: entries=4"
-    )
+    assert (tmp_path / "logs/alone_checkpoint_summary.log").read_text().strip() == ("checkpoints/iter_0000120: entries=4")
 
     # What names where or how a run wrote is not what it computed. Runs keep
     # their own directories and checkpoint implementation, and DCP may select
@@ -2306,14 +2354,10 @@ def test_a_chunk_is_compared_by_where_it_sits_not_where_it_was_listed(
     # Two writers may enumerate the same chunks in their own orders. Here the
     # chunk at offset 128 is listed first by one and second by the other.
     for name, lines in (
-        ("ref", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\n"
-                "w.chunks.1.md5sum=B\nw.chunks.1.offsets=[256, 0, 0]\n")),
-        ("cmp", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\n"
-                "w.chunks.1.md5sum=B\nw.chunks.1.offsets=[256, 0, 0]\n")),
-        ("rev", ("w.chunks.0.md5sum=B\nw.chunks.0.offsets=[256, 0, 0]\n"
-                "w.chunks.1.md5sum=A\nw.chunks.1.offsets=[128, 0, 0]\n")),
-        ("bad", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\n"
-                "w.chunks.1.md5sum=CHANGED\nw.chunks.1.offsets=[256, 0, 0]\n")),
+        ("ref", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\nw.chunks.1.md5sum=B\nw.chunks.1.offsets=[256, 0, 0]\n")),
+        ("cmp", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\nw.chunks.1.md5sum=B\nw.chunks.1.offsets=[256, 0, 0]\n")),
+        ("rev", ("w.chunks.0.md5sum=B\nw.chunks.0.offsets=[256, 0, 0]\nw.chunks.1.md5sum=A\nw.chunks.1.offsets=[128, 0, 0]\n")),
+        ("bad", ("w.chunks.0.md5sum=A\nw.chunks.0.offsets=[128, 0, 0]\nw.chunks.1.md5sum=CHANGED\nw.chunks.1.offsets=[256, 0, 0]\n")),
     ):
         iteration = tmp_path / name / "checkpoints/iter_0000050"
         iteration.mkdir(parents=True)
@@ -2476,7 +2520,10 @@ def test_long_run_options_are_exported_and_override_allocation_time(
 
     script, reaper, _log = slurm_job._build_job(args)
     slurm_job.sbatch_run(
-        script, slurm_job.RESULTS_DIR / "scheduler.log", extra_sbatch_args=[reaper], dry_run=True,
+        script,
+        slurm_job.RESULTS_DIR / "scheduler.log",
+        extra_sbatch_args=[reaper],
+        dry_run=True,
     )
     reproducer = (tmp_path / "ultra3-64n" / "run.sbatch").read_text()
 
@@ -2572,8 +2619,14 @@ def test_clean_run_removes_the_directories_the_runs_write(
     monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
     monkeypatch.setenv("MASTER_ADDR", "n0")
     args = _args(
-        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr"],
-        flavor=["detr"], run=["ref:nvrx", "cmp:native"], clean_run=True,
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        name=None,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+        clean_run=True,
     )
     # Every run writes inside the job's own directory, so removing that
     # directory takes each run's checkpoints, logs and digests with it.
@@ -2604,8 +2657,14 @@ def test_clean_run_refuses_a_symlinked_run_directory(
     (elsewhere / "logs").mkdir(parents=True)
     (tmp_path / "nano3_8n-detr").symlink_to(elsewhere)
     args = _args(
-        tmp_path, config="nano3", nodes=8, name=None, flavors=["detr"],
-        flavor=["detr"], run=["ref:nvrx", "cmp:native"], clean_run=True,
+        tmp_path,
+        config="nano3",
+        nodes=8,
+        name=None,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+        clean_run=True,
     )
 
     with pytest.raises(SystemExit, match="refuses to remove a symlink"):
@@ -2901,7 +2960,14 @@ def test_lyris_templates_select_the_platform_partition(
     monkeypatch.setenv("PLATFORM", platform)
 
     values = slurm_job._slurm_values(
-        1, 4, 30, "partition-test", str(tmp_path / "image.sqsh"), "", 4, 4,
+        1,
+        4,
+        30,
+        "partition-test",
+        str(tmp_path / "image.sqsh"),
+        "",
+        4,
+        4,
     )
     values.update(
         image_base=str(tmp_path / "base.sqsh"),
@@ -2974,8 +3040,7 @@ def test_shipped_clusters_have_complete_template_sets() -> None:
 
     assert clusters == {"awscmh", "cwdfw", "cwpdx", "lyris", "ocihsg"}
     assert all(
-        {name.removeprefix(f"{cluster}.") for name in templates if name.startswith(f"{cluster}.")} == expected
-        for cluster in clusters
+        {name.removeprefix(f"{cluster}.") for name in templates if name.startswith(f"{cluster}.")} == expected for cluster in clusters
     )
 
 
@@ -3071,7 +3136,8 @@ def test_image_build_selects_account_compatible_partition(monkeypatch: pytest.Mo
 
 
 def test_image_build_validates_import_and_prepare_partitions_independently(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     prepare_image = _load_prepare_image()
     (tmp_path / "pytorch2609.sqsh").touch()
@@ -3160,10 +3226,7 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
     manual_optional = config[".manual_optional"]
     assert "allow_failure" not in manual_optional
     assert manual_optional["rules"][0] == {
-        "if": (
-            '$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale" '
-            '|| $PIPELINE_SUITE == "main-branch-runs"'
-        ),
+        "if": ('$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale" || $PIPELINE_SUITE == "main-branch-runs"'),
         "when": "never",
     }
     assert manual_optional["rules"][1] == {
@@ -3186,215 +3249,9 @@ def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
     assert ".manual_nvrx" not in config
 
 
-def test_generated_pipeline_suites_and_node_tags() -> None:
-    matrix = yaml.safe_load((REPO_ROOT / "ci/jobs.json").read_text())
-    assert all("jobs" in platform for platform in matrix["platforms"])
-    platform_jobs = {platform["name"]: platform["jobs"] for platform in matrix["platforms"]}
-    assert platform_jobs["gb300"] == []
-
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    workloads = {
-        name: job for name, job in config.items()
-        if isinstance(job, dict) and isinstance(job.get("variables"), dict) and "JOB_ARGS" in job["variables"]
-    }
-
-    expected_slurm_times = {
-        "[DETR]:h100:native:pico_1x8": 20,
-        "[PERF]:gb200:native:gpt_moe_1x4": 10,
-        "[PERF]:h100:native:pico_1x8": 15,
-        "[DETR]:h100:nvrx:pico_1x8": 20,
-        "[PERF]:h100:nvrx:pico_1x8": 15,
-        "gb200:valgrind:pico_1x4": 25,
-        "h100:valgrind:pico_1x8": 60,
-        "[DETR]:gb200:native:nano3_8x4": 30,
-        "[PERF]:gb200:native:nano3_8x4": 40,
-        "[DETR]:gb200:native:nano3_8x4:vg": 50,
-        "[DETR]:gb200:native:super3bf16_16x4": 100,
-        "[PERF]:gb200:native:super3bf16_16x4": 50,
-        "[DETR]:gb200:native:super3fp4_16x4": 100,
-        "[PERF]:gb200:native:super3fp4_16x4": 70,
-        "[DETR]:gb300:native:nano4_32x4": 185,
-        "[PERF]:gb300:native:nano4_32x4": 30,
-        "[DETR]:gb300:native:nano4_8x4": 110,
-        "[PERF]:gb300:native:nano4_8x4": 45,
-        "[DETR]:gb300:nvrx:nano4_8x4": 115,
-        "[PERF]:gb200:native:ultra3bf16_64x4": 45,
-        "[DETR]:gb200:native:ultra3fp8_64x4": 160,
-        "[PERF]:gb200:native:ultra3fp8_64x4": 90,
-    }
-    for name, minutes in expected_slurm_times.items():
-        args = shlex.split(workloads[name]["variables"]["JOB_ARGS"])
-        assert args[args.index("--time-minutes") + 1] == str(minutes)
-
-    for name, job in workloads.items():
-        args = shlex.split(job["variables"]["JOB_ARGS"])
-        nodes = int(args[args.index("--nodes") + 1]) if "--nodes" in args else 1
-        platform = next(tag for tag in ("devbox", "gb200", "gb300", "h100") if f":{tag}:" in f":{name}:")
-        expected_tags = [platform, f"{nodes}n"]
-        assert job["tags"] == expected_tags
-
-    assert all("pico_2x" not in name for name in workloads)
-    assert all(
-        ":gb300:" not in name or ":nano4_32x4" in name or ":nano4_8x4" in name
-        for name in workloads
-    )
-    assert ".run_ckpt_stress" not in config
-
-    nano4 = {name: job for name, job in workloads.items() if ":nano4_32x4" in name}
-    assert config[".runner_gb300"]["tags"] == ["gb300"]
-    assert config[".runner_gb300"]["variables"] == {
-        "PLATFORM_OVERRIDE": "gb300",
-        "GPUS_PER_NODE": "4",
-        "WHEEL_ARCH": "aarch64",
-        "NVTE_FUSED_ATTN": "0",
-    }
-    assert set(nano4) == {
-        "[DETR]:gb300:native:nano4_32x4",
-        "[PERF]:gb300:native:nano4_32x4",
-        "[DETR]:gb300:nvrx:nano4_32x4",
-        "[PERF]:gb300:nvrx:nano4_32x4",
-    }
-    for name, job in nano4.items():
-        expected_suite = ".nvrx_pipeline" if ":nvrx:" in name else ".large_scale_pipeline"
-        assert job["extends"] == [".slurm_job", ".runner_gb300", expected_suite]
-        args = shlex.split(job["variables"]["JOB_ARGS"])
-        assert args[:4] == ["--nodes", "32", "--config", "nano4"]
-        assert "--megatron-commit" not in args
-        assert "--flavor" in args
-        assert "async" in args[args.index("--flavor") + 1]
-        segment_index = args.index("--job-array-segment")
-        assert args[segment_index + 1] == "8"
-        run_indexes = [index for index, arg in enumerate(args) if arg.startswith("--run=")]
-        assert not run_indexes or segment_index < min(run_indexes)
-        if "[PERF]" in name:
-            interval_index = args.index("--checkpoint-interval")
-            assert args[interval_index + 1] == "125"
-        else:
-            assert "--lr-decay-style" not in args
-            assert "--lr-warmup-samples" not in args
-        assert "--cuda-graph-impl" not in args
-        assert "--cuda-graph-modules" not in args
-        assert "--muon-fp32-matmul-prec" not in args
-
-    eight_node_nano4 = workloads["[DETR]:gb300:nvrx:nano4_8x4"]
-    assert eight_node_nano4["extends"] == [".slurm_job", ".runner_gb300", ".nvrx_pipeline"]
-    args = shlex.split(eight_node_nano4["variables"]["JOB_ARGS"])
-    assert args[:4] == ["--nodes", "8", "--config", "nano4"]
-    assert args[args.index("--flavor") + 1] == "detr"
-    assert "--cuda-graph-impl" not in args
-    assert "--cuda-graph-modules" not in args
-    assert "--muon-fp32-matmul-prec" not in args
-    assert args[args.index("--run=ref:nvrx") : args.index("--run=cmp:nvrx") + 1] == [
-        "--run=ref:nvrx",
-        "--run=cmp:nvrx",
-    ]
-    assert "--lr-decay-style" not in args
-    assert "--lr-warmup-samples" not in args
-
-    for name in (
-        "[DETR]:gb300:native:nano4_8x4",
-        "[PERF]:gb300:native:nano4_8x4",
-    ):
-        job = workloads[name]
-        assert job["extends"] == [".slurm_job", ".runner_gb300", ".manual_optional"]
-        args = shlex.split(job["variables"]["JOB_ARGS"])
-        assert args[:4] == ["--nodes", "8", "--config", "nano4"]
-        assert "--cuda-graph-impl" not in args
-        assert "--cuda-graph-modules" not in args
-        assert "--muon-fp32-matmul-prec" not in args
-        if "[PERF]" in name:
-            interval_index = args.index("--checkpoint-interval")
-            assert args[interval_index + 1] == "25"
-
-    nvrx = {name: job for name, job in workloads.items() if ":nvrx:" in name and ":gb200:" in name}
-    assert any(":super3fp4_16x4" in name for name in nvrx)
-    assert any(":ultra3bf16_64x4" in name for name in nvrx)
-    assert any(":ultra3fp8_64x4" in name for name in nvrx)
-    assert all(job["extends"][-1] == ".nvrx_pipeline" for job in nvrx.values())
-
-    main_only = {
-        name: job for name, job in workloads.items()
-        if (
-            ":h100:" in f":{name}:"
-            or ":native:nano3_8x4" in name
-            or "detr+vg" in shlex.split(job["variables"]["JOB_ARGS"])
-        )
-    }
-    assert main_only
-    assert all(job["extends"][-1] == ".main_branch_runs_pipeline" for job in main_only.values())
-
-    gpt_moe = workloads["[PERF]:gb200:native:gpt_moe_1x4"]
-    assert gpt_moe["extends"] == [".slurm_job", ".runner_gb200", ".main_branch_runs_pipeline"]
-    assert gpt_moe["tags"] == ["gb200", "1n"]
-    assert shlex.split(gpt_moe["variables"]["JOB_ARGS"]) == [
-        "--nodes", "1", "--config", "gpt_moe",
-        "--time-minutes", "10",
-        "--flavor", "perf+native",
-        "--checkpoint-interval", "20",
-    ]
-
-    large = {
-        name: job for name, job in workloads.items()
-        if (
-            ":native:super3bf16_16x4" in name
-            or ":native:super3fp4_16x4" in name
-            or ":native:ultra3bf16_64x4" in name
-            or ":native:ultra3fp8_64x4" in name
-        )
-    }
-    assert set(large) == {
-        "[DETR]:gb200:native:super3bf16_16x4",
-        "[PERF]:gb200:native:super3bf16_16x4",
-        "[DETR]:gb200:native:super3fp4_16x4",
-        "[PERF]:gb200:native:super3fp4_16x4",
-        "[PERF]:gb200:native:ultra3bf16_64x4",
-        "[DETR]:gb200:native:ultra3fp8_64x4",
-        "[PERF]:gb200:native:ultra3fp8_64x4",
-    }
-    assert all(job["extends"][-1] == ".large_scale_pipeline" for job in large.values())
-    ultra64_det = shlex.split(large["[DETR]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
-    assert ultra64_det == [
-        "--nodes", "64", "--config", "ultra3fp8",
-        "--time-minutes", "200",
-        "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
-    ]
-    # Each deterministic gate uses its configured synchronous or shared-memory staging mode.
-    super16_det = shlex.split(large["[DETR]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
-    super16_perf = shlex.split(large["[PERF]:gb200:native:super3bf16_16x4"]["variables"]["JOB_ARGS"])
-    assert "detr+shm" in super16_det
-    assert "perf+async+native" in super16_perf
-    fp4_det = shlex.split(large["[DETR]:gb200:native:super3fp4_16x4"]["variables"]["JOB_ARGS"])
-    assert fp4_det == [
-        "--nodes", "16", "--config", "super3fp4",
-        "--time-minutes", "100",
-        "--flavor", "detr", "--run=ref:nvrx", "--run=cmp:native",
-    ]
-    ultra64_perf = shlex.split(large["[PERF]:gb200:native:ultra3fp8_64x4"]["variables"]["JOB_ARGS"])
-    assert "--use-precision-aware-optimizer" not in ultra64_perf
-
-    pico_perf = config["[PERF]:gb200:native:pico_1x4"]
-    assert pico_perf["needs"] == [{"job": "wheel:aarch64", "artifacts": True}]
-    assert all("wheel-publish" not in need["job"] for need in pico_perf["needs"])
-
-    pico_detr_args = shlex.split(config["[DETR]:gb200:native:pico_1x4"]["variables"]["JOB_ARGS"])
-    assert "--checkpoint-interval" not in pico_detr_args
-    nano_valgrind_args = shlex.split(config["[DETR]:gb200:native:nano3_8x4:vg"]["variables"]["JOB_ARGS"])
-    assert "--checkpoint-interval" not in nano_valgrind_args
-    assert "--checkpoint-interval" not in shlex.split(
-        config["gb200:valgrind:pico_1x4"]["variables"]["JOB_ARGS"],
-    )
-    assert "--checkpoint-interval" not in shlex.split(
-        config["[DETR]:gb200:native:nano3_8x4"]["variables"]["JOB_ARGS"],
-    )
-
-
 def test_generated_jobs_do_not_override_config_or_flavor_options() -> None:
     matrix = yaml.safe_load((REPO_ROOT / "ci/jobs.json").read_text())
-    assert all(
-        "flavor_args" not in entry
-        for platform in matrix["platforms"]
-        for entry in platform.get("multinode", [])
-    )
+    assert all("flavor_args" not in entry for platform in matrix["platforms"] for entry in platform.get("multinode", []))
 
     config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
     forbidden = (
@@ -3538,9 +3395,16 @@ def test_only_nccl_ib_proxy_segfault_gets_one_clean_allocation_retry(
 
     monkeypatch.setattr(slurm_job, "sbatch_run", submit)
 
-    assert slurm_job._sbatch_run_with_retry(
-        "script", log, extra_sbatch_args=["reaper"], background=False, dry_run=False,
-    ) == 0
+    assert (
+        slurm_job._sbatch_run_with_retry(
+            "script",
+            log,
+            extra_sbatch_args=["reaper"],
+            background=False,
+            dry_run=False,
+        )
+        == 0
+    )
     assert calls == [
         {"extra_sbatch_args": ["reaper"], "background": False, "dry_run": False, "job_array": False},
         {"extra_sbatch_args": ["reaper"], "job_array": False},
@@ -3572,7 +3436,11 @@ def test_oom_nan_and_unrelated_crashes_are_not_retried(
 
     with pytest.raises(RuntimeError, match="failed"):
         slurm_job._sbatch_run_with_retry(
-            "script", log, extra_sbatch_args=[], background=False, dry_run=False,
+            "script",
+            log,
+            extra_sbatch_args=[],
+            background=False,
+            dry_run=False,
         )
 
     assert calls == [True]
@@ -3613,8 +3481,9 @@ def test_background_submission_uses_only_the_streamed_log(
     monkeypatch.setattr(
         slurm_job.subprocess,
         "run",
-        lambda command, **_kwargs: SimpleNamespace(returncode=0, stdout="123\n", stderr="")
-        if command[0] == "sbatch" else SimpleNamespace(returncode=0),
+        lambda command, **_kwargs: (
+            SimpleNamespace(returncode=0, stdout="123\n", stderr="") if command[0] == "sbatch" else SimpleNamespace(returncode=0)
+        ),
     )
 
     assert slurm_job.sbatch_run("#!/bin/bash\n\necho test\n", log, background=True) == 0
@@ -3847,10 +3716,7 @@ def test_each_pipeline_suite_bundles_generated_baselines() -> None:
     assert config["stages"][-1] == "baseline-artifacts"
     assert "ci/ci-runs/*/logs/baselines/*" in config[".slurm_job"]["artifacts"]["paths"]
     assert config[".baseline_bundle"]["artifacts"]["paths"] == ["ci/baselines/"]
-    bundles = {
-        suite: config[f"baseline-artifacts:{suite}"]
-        for suite in ("default", "nvrx", "large-scale", "main-branch-runs")
-    }
+    bundles = {suite: config[f"baseline-artifacts:{suite}"] for suite in ("default", "nvrx", "large-scale", "main-branch-runs")}
     assert all(bundle["rules"][0]["when"] in {"always", "never"} for bundle in bundles.values())
     assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
     assert "[DETR]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
@@ -4178,6 +4044,7 @@ def test_deterministic_cadence_keeps_three_phase2_saves(tmp_path: Path) -> None:
     # How many runs happen is --run's business, not the flavor's.
     assert policy.checkpoint_routines == 1
 
+
 def test_checkpoint_interval_override_only_changes_phase2(tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     args = _args(tmp_path, checkpoint_interval=125)
@@ -4230,6 +4097,7 @@ def test_a_variant_that_undoes_another_is_refused(monkeypatch: pytest.MonkeyPatc
     # question the command line may ask; whether it answers is the digest's job.
     assert slurm_job.FlavorSelection(["perf", "detr"]).names == ("perf", "detr")
 
+
 def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
@@ -4273,7 +4141,8 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
     monkeypatch.setattr(slurm_job, "_log_otel_checkpoint_timings", lambda *_args: None)
 
     slurm_job._epilog(
-        ["--nodes",
+        [
+            "--nodes",
             "1",
             "--gpus-per-node",
             "1",
@@ -4339,14 +4208,14 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
     recorded = tmp_path / "recorded"
     recorded.mkdir()
     (recorded / "devbox_perf_pico_1x1_arguments.txt").write_text(
-        "  ckpt_provider ................................... native\n"
-        "  micro_batch_size ................................ 1\n",
+        "  ckpt_provider ................................... native\n  micro_batch_size ................................ 1\n",
     )
     monkeypatch.setattr(slurm_job, "BASELINES_DIR", recorded)
     monkeypatch.setattr(slurm_job, "_log_otel_checkpoint_timings", lambda *_args: None)
 
     slurm_job._epilog(
-        ["--nodes",
+        [
+            "--nodes",
             "1",
             "--gpus-per-node",
             "1",
@@ -4639,8 +4508,9 @@ def test_a_changed_training_option_does_not_pass_as_recorded(
         "  micro_batch_size ................................ 1\n"
     )
     # The run this branch performs recomputes what the recorded run held.
-    changed = recorded.replace("recompute_granularity ........................... None",
-                               "recompute_granularity ........................... selective")
+    changed = recorded.replace(
+        "recompute_granularity ........................... None", "recompute_granularity ........................... selective"
+    )
 
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "same", recorded, recorded) is True
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "changed", changed, recorded) is False
@@ -4655,8 +4525,7 @@ def test_two_jobs_comparing_different_providers_record_separately(
     monkeypatch.setenv("PLATFORM", "gb200")
 
     def stem(compared: str) -> str:
-        args = _args(tmp_path, config="pico", nodes=1, flavors=["detr"], flavor=["detr"],
-                     run=["ref:nvrx", f"cmp:{compared}"])
+        args = _args(tmp_path, config="pico", nodes=1, flavors=["detr"], flavor=["detr"], run=["ref:nvrx", f"cmp:{compared}"])
         return slurm_job._arguments_stem(args)
 
     # A job reports the options of the last run it trained, and these two train
@@ -5172,12 +5041,8 @@ def test_durability_aggregates_identical_index_warnings_across_ranks(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     slurm_job = _load_slurm_job()
-    spans = [
-        _checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=0, rank=rank)
-        for rank in range(16)
-    ] + [
-        _checkpoint_span("megatron.checkpoint.save.finalize", 4, 5, call_idx=[1], rank=rank)
-        for rank in range(16)
+    spans = [_checkpoint_span("megatron.checkpoint.save", 0, 2, call_idx=0, rank=rank) for rank in range(16)] + [
+        _checkpoint_span("megatron.checkpoint.save.finalize", 4, 5, call_idx=[1], rank=rank) for rank in range(16)
     ]
 
     with caplog.at_level("WARNING"):
@@ -5382,10 +5247,13 @@ def test_megatron_perf_metrics_report_latest_values_across_export_ranks() -> Non
     assert memory_allocated["rank_median"] == 62.0
     assert memory_allocated["rank_max"] == 64.0
     assert memory_allocated["median"] == 62.0
-    assert slurm_job.PerfReport._statistic(
-        "megatron.training.memory_allocated_gb",
-        metrics["megatron.training.memory_allocated_gb"],
-    ) == "max"
+    assert (
+        slurm_job.PerfReport._statistic(
+            "megatron.training.memory_allocated_gb",
+            metrics["megatron.training.memory_allocated_gb"],
+        )
+        == "max"
+    )
 
 
 def test_hbm_sampler_tracks_hbm_and_training_rss(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5457,8 +5325,7 @@ def test_training_process_memory_is_exported_as_otlp(monkeypatch: pytest.MonkeyP
     records = resource_logs.scope_logs[0].log_records
     assert [record.event_name for record in records] == ["process.memory", "process.memory"]
     assert [
-        next(attribute.value.int_value for attribute in record.attributes if attribute.key == "nvrx.memory.rss_bytes")
-        for record in records
+        next(attribute.value.int_value for attribute in record.attributes if attribute.key == "nvrx.memory.rss_bytes") for record in records
     ] == [40, 50]
 
 
@@ -5749,10 +5616,15 @@ def test_flavor_transforms_are_profile_independent() -> None:
     slurm_job.FlavorSelection(["perf"]).transform(perf_opts, perf_env)
 
     assert perf_opts == [
-        "--cuda-graph-impl", "local",
-        "--recompute-granularity", "selective", "--recompute-modules", "moe",
+        "--cuda-graph-impl",
+        "local",
+        "--recompute-granularity",
+        "selective",
+        "--recompute-modules",
+        "moe",
         "--async-save",
-        "--ckpt-assume-constant-structure", "--async-ckpt-use-cpu-shm",
+        "--ckpt-assume-constant-structure",
+        "--async-ckpt-use-cpu-shm",
     ]
     assert not perf_env
     deterministic_opts = [
@@ -5834,10 +5706,7 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
     assert "--check-for-nan-in-loss-and-grad" in opts
     assert "--no-check-for-nan-in-loss-and-grad" not in opts
     assert opts[-2:] == ["--rerun-mode", "disabled"]
-    assert {
-        name: env[name]
-        for name in slurm_job._VALGRIND_NATIVE_ENV
-    } == slurm_job._VALGRIND_NATIVE_ENV
+    assert {name: env[name] for name in slurm_job._VALGRIND_NATIVE_ENV} == slurm_job._VALGRIND_NATIVE_ENV
     assert env["NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS"] == "0"
     assert "NATIVE_CKPT_OTEL_FILE" not in env
     assert env["MEGATRON_OTEL_ENABLED"] == "0"
@@ -5847,11 +5716,14 @@ def test_nonzero_rank_log_is_retained_without_mirroring_stdout(tmp_path: Path, c
     slurm_job = _load_slurm_job()
     log = tmp_path / "rank1.log"
 
-    assert slurm_job._tee_rc(
-        [sys.executable, "-c", "print('rank-specific warning')"],
-        log,
-        mirror_stdout=False,
-    ) == 0
+    assert (
+        slurm_job._tee_rc(
+            [sys.executable, "-c", "print('rank-specific warning')"],
+            log,
+            mirror_stdout=False,
+        )
+        == 0
+    )
 
     assert capfd.readouterr().out == ""
     assert log.read_text() == "rank-specific warning\n"
@@ -6074,10 +5946,14 @@ def test_super3_profiles_share_reference_architecture() -> None:
         "cuda-graph-impl": "local",
         "cuda-graph-modules": ["mamba", "attn", "moe_router"],
     }
-    assert bf16_graphs == fp4_graphs == {
-        "cuda-graph-impl": "local",
-        "cuda-graph-modules": ["attn"],
-    }
+    assert (
+        bf16_graphs
+        == fp4_graphs
+        == {
+            "cuda-graph-impl": "local",
+            "cuda-graph-modules": ["attn"],
+        }
+    )
     assert common == bf16
     assert fp4 == bf16
     assert {key: bf16[key] for key in expected} == expected
