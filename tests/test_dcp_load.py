@@ -118,6 +118,7 @@ def test_multi_tensor_mixed_dtype_dcp_load(tmp_path) -> None:
 
     for fqn, expected in state_dict.items():
         assert torch.equal(loaded[fqn], expected), f"mismatch for {fqn!r}"
+    assert not (tmp_path / "metadata.json").exists()
 
 
 def test_common_state_is_embedded_and_fresh_for_each_checkpoint(tmp_path) -> None:

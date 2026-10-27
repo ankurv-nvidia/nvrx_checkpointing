@@ -10,9 +10,11 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -57,6 +59,7 @@ constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>{
 struct CachedTypes
 {
     nb::object torchTensor;
+    nb::object torchDTensor;
     nb::object torchDtype;
     nb::object torchGenerator;
     nb::object localShardedTensor;
@@ -417,11 +420,16 @@ static CachedTypes const& CachedTypesGet()
         nb::gil_scoped_acquire acquire;
         auto                   torchModule                  = nb::module_::import_("torch");
         auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
+        auto                   torchDTensor                 = nb::object(nb::none());
         auto                   megatronShardedTensor        = nb::object(nb::none());
         auto                   megatronShardedTensorFactory = nb::object(nb::none());
         auto                   megatronShardedObject        = nb::object(nb::none());
         auto                   importlibUtil                = nb::module_::import_("importlib.util");
         auto                   findSpec                     = importlibUtil.attr("find_spec");
+        if (nb::cast<bool>(nb::module_::import_("torch.distributed").attr("is_available")()))
+        {
+            torchDTensor = nb::module_::import_("torch.distributed.tensor").attr("DTensor");
+        }
         if (!findSpec("megatron").is_none() && !findSpec("megatron.core").is_none()
             && !findSpec("megatron.core.dist_checkpointing").is_none() && !findSpec("megatron.core.dist_checkpointing.mapping").is_none())
         {
@@ -432,6 +440,7 @@ static CachedTypes const& CachedTypesGet()
         }
         return CachedTypes{
             .torchTensor                  = torchModule.attr("Tensor"),
+            .torchDTensor                 = std::move(torchDTensor),
             .torchDtype                   = torchModule.attr("dtype"),
             .torchGenerator               = torchModule.attr("Generator"),
             .localShardedTensor           = mappingModule.attr("ShardedTensor"),
@@ -447,6 +456,11 @@ static CachedTypes const& CachedTypesGet()
 
 static bool IsTorchTensor(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchTensor); }
+static bool IsTorchDTensor(nb::handle obj)
+{
+    auto const& types = CachedTypesGet();
+    return !types.torchDTensor.is_none() && nb::isinstance(obj, types.torchDTensor);
+}
 static bool IsTorchDtype(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchDtype); }
 static bool IsTorchGenerator(nb::handle obj)
@@ -573,6 +587,67 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
     {
         throw std::runtime_error(fmt::format(
             "Tensor {} size mismatch: dimensions imply {} bytes, tensor storage implies {}", name, logicalBytes, state.shard.storageSize));
+    }
+    state.shard.AssertShardIsValid(state.meta.fulldim);
+    state.meta.AddShard(state.shard);
+    return state;
+}
+
+// Ranks that differ only in replicated mesh dimensions hold the same chunk; coordinate zero there writes it.
+static bool IsMainTorchDTensorReplica(nb::handle value)
+{
+    auto const coordinate = value.attr("device_mesh").attr("get_coordinate")();
+    if (coordinate.is_none()) { return false; }
+    auto const placements = nb::cast<nb::tuple>(value.attr("placements"));
+    for (size_t dim = 0; dim < placements.size(); ++dim)
+    {
+        auto const placement = placements[dim];
+        if (nb::cast<bool>(placement.attr("is_partial")())) { throw std::runtime_error("DTensor with a partial placement"); }
+        if (nb::cast<bool>(placement.attr("is_replicate")()) && nb::cast<int64_t>(coordinate[dim]) != 0) { return false; }
+    }
+    return true;
+}
+
+// Returns no state for a rank whose chunk is empty.
+static std::optional<TensorState> TorchDTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
+{
+    auto const chunks = nb::cast<nb::list>(value.attr("__create_chunk_list__")());
+    if (chunks.size() != 1) { throw std::runtime_error(fmt::format("DTensor {} has {} local chunks, expected one", name, chunks.size())); }
+    auto const offsets     = nb::cast<nb::tuple>(chunks[0].attr("offsets"));
+    auto const sizes       = nb::cast<nb::tuple>(chunks[0].attr("sizes"));
+    auto const globalShape = nb::cast<nb::tuple>(value.attr("shape"));
+    if (offsets.size() != globalShape.size() || sizes.size() != globalShape.size())
+    {
+        throw std::runtime_error(fmt::format("DTensor {} chunk has {} dimensions, tensor has {}", name, sizes.size(), globalShape.size()));
+    }
+    if (std::ranges::any_of(sizes, [](auto const& size) { return nb::cast<uint64_t>(size) == 0; })) { return std::nullopt; }
+
+    auto state = TensorStorageState(topo, name, value.attr("_local_tensor"));
+    if (globalShape.empty())
+    {
+        state.meta.fulldim.push_back(1);
+        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
+    }
+    uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
+    for (size_t i = 0; i < globalShape.size(); ++i)
+    {
+        auto const fulldim = nb::cast<uint64_t>(globalShape[i]);
+        auto const begin   = nb::cast<uint64_t>(offsets[i]);
+        auto const end     = begin + nb::cast<uint64_t>(sizes[i]);
+        if (end > fulldim)
+        {
+            throw std::runtime_error(fmt::format("DTensor {} chunk ends at {} in dimension {} of size {}", name, end, i, fulldim));
+        }
+        state.meta.fulldim.push_back(fulldim);
+        state.shard.sharddim.push_back(Tensor::Range{.begin = begin, .end = end});
+        logicalBytes *= end - begin;
+    }
+    if (!state.header && state.shard.storageSize != logicalBytes)
+    {
+        throw std::runtime_error(fmt::format("DTensor {} size mismatch: chunk implies {} bytes, local tensor storage implies {}",
+                                             name,
+                                             logicalBytes,
+                                             state.shard.storageSize));
     }
     state.shard.AssertShardIsValid(state.meta.fulldim);
     state.meta.AddShard(state.shard);
@@ -757,6 +832,16 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     return {.meta = ds4tensor, .shard = shard, .owner = std::move(owner), .header = std::move(header)};
 }
 
+static StateNode::Blob TorchSaveBlob(nb::handle value)
+{
+    nb::object io    = nb::module_::import_("io");
+    nb::object torch = nb::module_::import_("torch");
+    nb::object buf   = io.attr("BytesIO")();
+    torch.attr("save")(value, buf);
+    auto const raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
+    return {raw.c_str(), raw.c_str() + raw.size()};
+}
+
 static StateNode::Blob ShardedObjectBlob(nb::handle value)
 {
     static constexpr char const* PreparedBlobAttr = "_nvrx_serialized_blob";
@@ -768,14 +853,9 @@ static StateNode::Blob ShardedObjectBlob(nb::handle value)
         return {raw.c_str(), raw.c_str() + raw.size()};
     }
 
-    nb::object io    = nb::module_::import_("io");
-    nb::object torch = nb::module_::import_("torch");
-    nb::object buf   = io.attr("BytesIO")();
-    nb::list   one;
+    nb::list one;
     one.append(value.attr("data"));
-    torch.attr("save")(one, buf);
-    auto const raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
-    return {raw.c_str(), raw.c_str() + raw.size()};
+    return TorchSaveBlob(one);
 }
 
 static StateNode& RegisterTensorState(PyStateDictAccessor&                       scan,
@@ -925,8 +1005,23 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
 
 bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::handle val)
 {
+    if (IsTorchDTensor(val))
+    {
+        if (!IsMainTorchDTensorReplica(val)) { return true; }
+        if (auto tensorState = TorchDTensorState(scan.GetRankTopo(), StrView(key), val))
+        {
+            RegisterTensorState(scan, node, StrView(key), tensorState->meta, tensorState->owner, std::move(tensorState->header));
+        }
+        return true;
+    }
     if (IsTorchTensor(val))
     {
+        // An empty tensor has no storage to snapshot, so it is saved like an object.
+        if (nb::cast<int64_t>(val.attr("numel")()) == 0)
+        {
+            scan.RegisterState(node, StrView(key), TorchSaveBlob(val.attr("cpu")()));
+            return true;
+        }
         auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
         RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;

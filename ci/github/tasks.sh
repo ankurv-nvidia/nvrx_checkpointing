@@ -113,7 +113,7 @@ ctest_gate() {
         -DPHOENIX_BUILD_BENCHMARK=ON \
         -DPHOENIX_BUILD_TESTS=ON \
         -DPHOENIX_BUILD_CUDA=OFF
-    cmake --build build-test -j"$(nproc)" --target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip quantized_snapshot
+    cmake --build build-test -j"$(nproc)" --target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip
     mkdir -p ci/ci-results
     export MEGATRON_NATIVE_BUILD_DIR=${repo_root}/build-test
     export PYTHONPATH=${repo_root}/build-test

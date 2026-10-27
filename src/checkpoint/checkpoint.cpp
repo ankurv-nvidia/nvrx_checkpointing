@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <fcntl.h>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -47,6 +48,34 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     if (ec && ec != boost::system::errc::not_connected)
     {    //
         fmt::print(stderr, "[native_ckpt:cli][ERROR] Shutdown Error: {}\n", ec.what());
+    }
+}
+
+// Returns the pid holding the daemon instance lock, or 0 when no other process holds it.
+static pid_t ServiceInstanceHolder()
+{
+    // Closing any descriptor of the lock file drops this process's own locks on it, so this one stays open.
+    static int const LockFd = ::open(cipc::Message::InstanceLockPath(0).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (LockFd < 0) { return 0; }
+    struct flock query{};
+    query.l_type   = F_WRLCK;
+    query.l_whence = SEEK_SET;
+    if (::fcntl(LockFd, F_GETLK, &query) != 0 || query.l_type == F_UNLCK) { return 0; }
+    return query.l_pid;
+}
+
+static void WaitForServiceExit(pid_t daemonPid)
+{
+    static constexpr auto ExitTimeout  = 300s;
+    static constexpr auto PollInterval = 50ms;
+    auto const            deadline     = std::chrono::steady_clock::now() + ExitTimeout;
+    while (daemonPid != 0 && ServiceInstanceHolder() == daemonPid)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            throw std::runtime_error(fmt::format("Checkpoint service pid={} did not exit within {}", daemonPid, ExitTimeout));
+        }
+        std::this_thread::sleep_for(PollInterval);
     }
 }
 
@@ -173,6 +202,7 @@ void SvcStop()
     std::scoped_lock lock(PingMutex);
 
     if (!TryConnectToCheckpointService()) { return; }
+    auto const daemonPid = ServiceInstanceHolder();
 
     boost::system::error_code ec;
 
@@ -203,6 +233,7 @@ void SvcStop()
 
     if (res.result() != boost::beast::http::status::ok) { return; }
     TryCleanShutdown(stream);
+    WaitForServiceExit(daemonPid);
 }
 
 void SvcSpinDown()
@@ -215,6 +246,7 @@ void SvcSpinDown()
     std::scoped_lock lock(SpinDownMutex);
 
     if (!TryConnectToCheckpointService()) { return; }
+    auto const daemonPid = ServiceInstanceHolder();
 
     boost::system::error_code ec;
 
@@ -246,9 +278,8 @@ void SvcSpinDown()
     boost::beast::http::response_parser<boost::beast::http::string_body> parser;
     parser.body_limit(std::numeric_limits<std::uint64_t>::max());
     boost::beast::http::read(stream, buffer, parser, ec);
-    if (ec && ec != boost::beast::http::error::end_of_stream) { return; }
-
-    TryCleanShutdown(stream);
+    if (!ec || ec == boost::beast::http::error::end_of_stream) { TryCleanShutdown(stream); }
+    WaitForServiceExit(daemonPid);
 }
 
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
@@ -348,13 +379,37 @@ struct CheckpointWriter
         return Registry;
     }
 
+    // A restarted daemon recreates its channels, so a queue mapped from its predecessor no longer reaches it.
+    static bool IsQueueReplaced(QueueState const& state)
+    {
+        if (state.ready.wait_for(0s) != std::future_status::ready) { return false; }
+        try
+        {
+            state.ready.get();
+        } catch (...) { return false; }
+        return state.queue->IsDetached();
+    }
+
+    static void ReleaseQueue(QueueState& state)
+    {
+#ifdef PHOENIX_HAVE_CUDA
+        DeviceContext::CudaUnregisterHostBuffer(state.queue->GetShmDataRegion().data());
+#endif
+        state.queue->Abandon();
+    }
+
     static void SendStateRegistry(StateTree const& root)
     {
         auto const& topo = root.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
+        if (auto const it = reg.states.find(topo.rank); it != reg.states.end())
+        {
+            if (!IsQueueReplaced(*it->second)) { return; }
+            ReleaseQueue(*it->second);
+            reg.states.erase(it);
+        }
         auto               state = std::make_shared<QueueState>();
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <variant>
 
 namespace checkpoint::ipc
@@ -43,6 +44,9 @@ struct Message
     static constexpr uint16_t Port = 4100;
 
     static std::string RequestChannelName(uint16_t index, uint8_t rank) { return fmt::format("checkpoint_request_{}_{}", index, rank); }
+
+    static std::filesystem::path InstanceLockPath(uint16_t index)
+    { return std::filesystem::temp_directory_path() / fmt::format("nvrx_ckpt_server.{}.lock", Port + index); }
 
     enum class Type : uint8_t
     {
