@@ -3044,6 +3044,18 @@ def test_shipped_clusters_have_complete_template_sets() -> None:
     )
 
 
+def test_shipped_image_templates_name_their_partition(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("CI_DIR", str(tmp_path))
+    clusters = {path.name.split(".", 1)[0] for path in (REPO_ROOT / "ci/templates").glob("*.tmpl")}
+
+    for cluster in sorted(clusters):
+        monkeypatch.setenv("CLUSTER", cluster)
+        for name in ("enroot_import.tmpl", "image_prep.tmpl"):
+            cmd = slurm_job.build_cmd_from_template(name, {}, [])
+            assert sum(token.startswith("--partition=") for token in cmd) == 1, f"{cluster}.{name}"
+
+
 def test_template_override_must_be_cluster_prefixed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("CI_DIR", str(tmp_path))
@@ -3086,6 +3098,19 @@ def test_enroot_import_requests_runner_gpus(
     assert f"--partition={partition}" in cmd
 
 
+@pytest.mark.parametrize("name", ["enroot_import.tmpl", "image_prep.tmpl"])
+def test_ocihsg_image_build_requests_gpus_per_node(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.setenv("CI_DIR", str(tmp_path))
+    monkeypatch.setenv("CLUSTER", "ocihsg")
+
+    cmd = slurm_job.build_cmd_from_template(name, {"account": "account", "time_minutes": 20, "gpus_per_node": 4}, [])
+
+    assert "--gpus-per-node=4" in cmd
+    # The OCI-HSG NVL72 policy rejects job-scoped GPU requests.
+    assert not any(token.startswith("--gpus=") for token in cmd)
+
+
 def test_image_preparation_stack_versions_match() -> None:
     slurm_job = _load_slurm_job()
     prepare_image = (SCRIPTS_DIR / "prepare_image.py").read_text()
@@ -3105,37 +3130,7 @@ def test_image_preparation_stack_versions_match() -> None:
     assert "/usr/local/cuda-13.4" in prepare
 
 
-def test_image_build_selects_account_compatible_partition(monkeypatch: pytest.MonkeyPatch) -> None:
-    prepare_image = _load_prepare_image()
-    probed: list[list[str]] = []
-
-    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
-        if cmd[0] == "sinfo":
-            return SimpleNamespace(returncode=0, stdout="batch*\ninteractive\ngb200\n", stderr="")
-        probed.append(cmd)
-        return SimpleNamespace(returncode=0 if "--partition=interactive" in cmd else 1, stdout="", stderr="invalid")
-
-    monkeypatch.setattr(prepare_image.subprocess, "run", run)
-    cmd = [
-        "srun",
-        "--account=account",
-        "--partition=batch",
-        "--time=00:120:00",
-        "--mem=0",
-        "--gpus-per-node=4",
-        "enroot",
-        "import",
-    ]
-
-    partition = prepare_image._valid_partition(cmd)
-
-    assert partition == "interactive"
-    assert prepare_image._set_partition(cmd, partition)[1] == "--partition=interactive"
-    assert "--time=00:120:00" in probed[0]
-    assert "--mem=0" in probed[0]
-
-
-def test_image_build_validates_import_and_prepare_partitions_independently(
+def test_image_build_runs_templated_prepare_command(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3145,7 +3140,6 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
     build_values: list[dict[str, object]] = []
-    validated: list[str] = []
     runs: list[tuple[list[str], dict[str, object]]] = []
 
     def build(name: str, values: dict[str, object], payload: list[str], **kwargs: object) -> list[str]:
@@ -3154,13 +3148,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
         partition = "interactive" if name == "image_prep.tmpl" else "backfill"
         return ["srun", f"--partition={partition}", *payload]
 
-    def validate(cmd: list[str]) -> str:
-        partition = next(arg.removeprefix("--partition=") for arg in cmd if arg.startswith("--partition="))
-        validated.append(partition)
-        return partition
-
     monkeypatch.setattr(prepare_image, "build_cmd_from_template", build)
-    monkeypatch.setattr(prepare_image, "_valid_partition", validate)
     monkeypatch.setattr(prepare_image, "_remove_native_smoke_build", lambda _path: None)
     monkeypatch.setattr(prepare_image, "_publish_to_shared", lambda _local, _image: True)
     monkeypatch.setattr(prepare_image.subprocess, "run", lambda cmd, **kwargs: runs.append((cmd, kwargs)))
@@ -3179,7 +3167,7 @@ def test_image_build_validates_import_and_prepare_partitions_independently(
     assert 'patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"' in prepare
     assert (REPO_ROOT / "scripts" / "deepep-nvshmem.patch").is_file()
     assert built[-1][2] == {}
-    assert validated == ["backfill", "interactive"]
+    assert len(runs) == 1
     assert "--partition=interactive" in runs[-1][0]
     assert runs[-1][1]["env"]["NVTE_WITH_NCCL_EP"] == "0"
 

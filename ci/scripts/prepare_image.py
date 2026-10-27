@@ -79,47 +79,6 @@ def _publish_to_shared(local: Path, image: Path) -> bool:
     return True
 
 
-def _valid_partition(cmd: list[str]) -> str:
-    account = next(token for token in cmd if token.startswith("--account="))
-    configured = [token.split("=", 1)[1] for token in cmd if token.startswith("--partition=")]
-    info = subprocess.run(["sinfo", "--noheader", "--format=%P"], capture_output=True, check=True, text=True)  # noqa: S607
-    visible = [line.strip().rstrip("*") for line in info.stdout.splitlines()]
-    preferred = [partition for partition in ("interactive", "batch_short", "batch", "compute") if partition in visible]
-    # Honor a platform-specific template partition first. Fall back to the
-    # conventional short queues only when that partition rejects the account.
-    candidates = [*configured, *preferred, *visible]
-    sys.stderr.write(f"[prepare-image] candidate partitions: {', '.join(dict.fromkeys(filter(None, candidates)))}\n")
-    resource_args = [
-        token
-        for token in cmd
-        if token.startswith(("--gpus=", "--gpus-per-node=", "--gres=", "--mem=", "--time="))
-    ]
-    errors = []
-    for partition in dict.fromkeys(filter(None, candidates)):
-        probe = subprocess.run(
-            [  # noqa: S607
-                "sbatch",
-                "--test-only",
-                account,
-                f"--partition={partition}",
-                "--nodes=1",
-                *resource_args,
-                "--wrap=true",
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        if probe.returncode == 0:
-            return partition
-        errors.append(f"{partition}: {probe.stderr.strip()}")
-    raise RuntimeError("no valid Slurm partition for image build; " + "; ".join(errors))
-
-
-def _set_partition(cmd: list[str], partition: str) -> list[str]:
-    return [cmd[0], f"--partition={partition}", *(token for token in cmd[1:] if not token.startswith("--partition="))]
-
-
 def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     """Run enroot_import.tmpl then image_prep.tmpl to build the project enroot image.
 
@@ -156,12 +115,10 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         {**srun_values, "time_minutes": 20},
         ["enroot", "import", "--output", (local.parent / base_image.name).as_posix(), f"docker://{DOCKER_IMAGE_BASE}"],
     )
-    import_partition = _valid_partition(import_cmd)
     if not base_image.exists():
         local_base_image = local.parent / base_image.name
         local_base_image.unlink(missing_ok=True)  # clear any leftover from a previously failed build
         sys.stderr.write(f"[prepare-image] base image not found: {base_image} — importing from registry\n")
-        import_cmd = _set_partition(import_cmd, import_partition)
         sys.stderr.write(f"[prepare-image] running import command: {' '.join(import_cmd)}\n")
         subprocess.run(import_cmd, check=True)
         shutil.move(str(local_base_image), str(base_image))  # move to final location after successful import
@@ -174,7 +131,6 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
         {**srun_values, "time_minutes": 240},
         ["bash", "-c", f"bash {prepare_sh} ubuntu2404 megatron test"],
     )
-    prep_cmd = _set_partition(prep_cmd, _valid_partition(prep_cmd))
     # Keep image-preparation smoke artifacts out of the workload's build directory.
     native_smoke_build = container_root / ".image-prep-native-build"
     _remove_native_smoke_build(native_smoke_build)
