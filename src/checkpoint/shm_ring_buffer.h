@@ -10,6 +10,7 @@
 #include <boost/interprocess/sync/interprocess_condition.hpp>
 #include <boost/interprocess/sync/interprocess_mutex.hpp>
 #include <boost/interprocess/sync/scoped_lock.hpp>
+#include <sys/stat.h>
 
 #include <fmt/chrono.h>
 #include <fmt/std.h>
@@ -299,11 +300,24 @@ template <typename THdr> struct ShmRingBuffer
             Stop();
             bip::shared_memory_object::remove(_name.c_str());
         }
-        else
-        {
-            Flush();
-        }
+        else if (!_abandoned) { Flush(); }
     }
+
+    // True once the channel name refers to a different shared-memory object than this mapping.
+    [[nodiscard]] bool IsDetached() const
+    {
+        struct stat mapped{};
+        if (::fstat(_shm.get_mapping_handle().handle, &mapped) != 0) { return true; }
+        try
+        {
+            bip::shared_memory_object const current(bip::open_only, _name.c_str(), bip::read_only);
+            struct stat                     live{};
+            return ::fstat(current.get_mapping_handle().handle, &live) != 0 || live.st_dev != mapped.st_dev || live.st_ino != mapped.st_ino;
+        } catch (bip::interprocess_exception const&) { return true; }
+    }
+
+    // Skips draining on destruction, for a ring whose reader is gone.
+    void Abandon() noexcept { _abandoned = true; }
 
     void Stop()
     {
@@ -630,6 +644,7 @@ template <typename THdr> struct ShmRingBuffer
     std::span<THdr>           _hdrs;
     bool                      _stopRequested{false};
     bool                      _resetShm{false};
+    bool                      _abandoned{false};
 #ifdef SHM_RING_BUFFER_ENABLE_PERF_METRICS
     PerfMetrics::Clock::time_point readstart;
 #endif

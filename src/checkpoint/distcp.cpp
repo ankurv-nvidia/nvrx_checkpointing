@@ -1102,6 +1102,10 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
     WriteBytes(output, pkl.data(), pkl.size(), filepath.string());
     FinishOutputFile(output, filepath);
 
+    // A torch_dist checkpoint carries Megatron's common state; snapshots without it stay plain DCP checkpoints.
+    static constexpr std::string_view CommonStateFqn = "common_state/shard_0_1";
+    if (!blobs.contains(std::string(CommonStateFqn))) { return; }
+
     // The format marker makes the directory loadable as a torch_dist checkpoint.
     static constexpr std::string_view ConfigJson   = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
     auto const                        configPath   = ckptDir / "metadata.json";

@@ -25,33 +25,11 @@ python3 -m pip install \
   "nvrx-checkpointing==VERSION"
 ```
 
-Use the public Megatron-LM checkout pinned by this repository
-(`16251ac1221f4814cd39350def05cefa3c36734a`) and make sure the
+Use a Megatron-LM checkout that saves its checkpoints through this package,
+such as the `native_ckpt` branch of
+<https://github.com/ankurv-nvidia/megatron-lm>, and make sure the
 `nvrx_checkpointing` package is installed in the training container on every
-node.
-
-The only required sbatch change is to run the Megatron entrypoint through the
-integration module. For example, change:
-
-```bash
-python3 -u "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
-```
-
-to:
-
-```bash
-python3 -u -m nvrx_checkpointing.megatron.integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
-```
-
-The same substitution works inside `srun`, `numactl`, or an existing Python
-wrapper chain. With `torchrun`, use its module form:
-
-```bash
-torchrun <torchrun-options> --module nvrx_checkpointing.megatron.integration "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"
-```
-
-Each rank must invoke the integration module; calling `install()` in a
-separate setup process will not work because the patches are process-local.
+node. The Megatron entrypoints run unchanged.
 
 ### Enabling OpenTelemetry
 
@@ -93,23 +71,8 @@ modes, collector topology, attributes, and analysis commands.
 
 ### Adapting an existing Megatron workload launcher
 
-Wrap the existing Megatron entrypoint in the `run_cmd` assignment:
-
-```bash
-run_cmd="python -u -m nvrx_checkpointing.megatron.integration ${REPO_DIR}/pretrain_hybrid.py ${options}"
-```
-
-Keep the existing `--ckpt-format torch_dist`, `--save`, `--load`, and
-`--save-interval` arguments. This launcher is native-only and does not patch
-Megatron's argument parser or optimizer classes. It stages each checkpoint and
-lets the checkpoint daemon persist it. Saves are chained back-to-back: a later
-checkpoint waits for the previous one to become durable before taking its next
-snapshot. With `--async-save`, the durability wait and tracker-file update run
-off the training thread through the package's rank-local queue. If the previous
-save is still running when the next one starts, the native provider emits a
-flushed warning and appends the time spent waiting in milliseconds on the same
-log line.
+Keep the existing Megatron entrypoint and its `--save`, `--load`,
+`--save-interval`, and `--async-save` arguments.
 
 Comparison harnesses that need a `native`/`nvrx` selector can opt in to
-`nvrx_checkpointing.megatron.provider`; reference runs should not install the
-native integration.
+`nvrx_checkpointing.megatron.provider`.

@@ -2899,7 +2899,7 @@ void Server::AcquireInstanceLock_()
 {
     if (_instanceLock) { return; }
 
-    auto const lockPath = std::filesystem::temp_directory_path() / fmt::format("nvrx_ckpt_server.{}.lock", Port + _index);
+    auto const lockPath = cipc::Message::InstanceLockPath(_index);
     {
         std::ofstream lockFile(lockPath, std::ios::app);
         if (!lockFile.good()) { throw std::runtime_error(fmt::format("Instance lock create failed: {}", lockPath)); }

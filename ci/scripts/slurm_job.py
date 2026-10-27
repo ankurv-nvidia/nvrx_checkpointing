@@ -3425,22 +3425,6 @@ def _emit_checkpoint_resource_metrics(
         instrument.set(value)
     meter_provider.shutdown()
 
-def _install_selected_checkpoint_provider() -> ModuleType:
-    """Install packed-tensor compatibility and the selected provider's hooks."""
-    from nvrx_checkpointing.megatron import provider as megatron_provider  # noqa: PLC0415
-
-    selected_provider = megatron_provider.selected_provider()
-    if selected_provider == megatron_provider.NATIVE_PROVIDER:
-        from nvrx_checkpointing.megatron import integration as megatron_integration  # noqa: PLC0415
-
-        megatron_integration.install()
-    else:
-        from nvrx_checkpointing import quantized_snapshot  # noqa: PLC0415
-
-        quantized_snapshot.install_quantized_sharded_narrow()
-    return megatron_provider
-
-
 def _prepare_otel_randomness() -> None:
     if os.environ.get("NVRX_OTEL_USE_SYSTEM_RANDOM") != "1":
         return
@@ -3469,8 +3453,8 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
 
-    # Reference runs execute without native integration patches.
-    megatron_provider = _install_selected_checkpoint_provider()
+    from nvrx_checkpointing.megatron import provider as megatron_provider  # noqa: PLC0415
+
     from megatron.core.enums import ModelType  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     from megatron.training import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
         inprocess_restart,

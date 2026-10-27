@@ -114,7 +114,7 @@ marker that ends every peer task. Task 0 keeps its healthy launcher agents
 alive when another node in its domain is evicted, allowing the hot-spare domain
 to finish the world without losing the rendezvous store. The launcher records
 the world's rank-to-node map in a cycle-info file (`--ft-cycle-info-dir` under
-the run directory); `nvrx_checkpointing.megatron.save` reads it via
+the run directory); Megatron's checkpoint save reads it via
 `NVRX_CURRENT_CYCLE_INFO` to build the rank-ordered checkpoint peer list.
 Each elastic cycle uses its own synchronization markers. If `ft_launcher`
 restarts the worker, phase 1 is reused only after its checkpoint is durable,

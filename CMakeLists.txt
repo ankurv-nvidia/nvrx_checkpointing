@@ -377,14 +377,6 @@ if (PHOENIX_BUILD_TESTS)
                 MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
-        pytest_discover_tests(quantized_snapshot
-            TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quantized_snapshot.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
-            DEPENDS checkpoint checkpoint_server
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
-        )
-
     endif()
 endif()
 
@@ -408,7 +400,6 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             debug.py
             megatron@megatron
             megatron_stubs@megatron_stubs
-            quantized_snapshot.py
             metadata_compare.py
             peers.py
             telemetry.py

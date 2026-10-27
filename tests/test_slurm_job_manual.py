@@ -247,42 +247,6 @@ def _load_run_dependency():
 _CONSTANT_STRUCTURE = "--ckpt-assume-constant-structure"
 
 
-@pytest.mark.parametrize(
-    ("selected", "expected_installs", "expected_compatibility_installs"),
-    [("native", 1, 0), ("nvrx", 0, 1)],
-)
-def test_comparison_launcher_installs_only_selected_provider(
-    monkeypatch: pytest.MonkeyPatch,
-    selected: str,
-    expected_installs: int,
-    expected_compatibility_installs: int,
-) -> None:
-    slurm_job = _load_slurm_job()
-    installs: list[None] = []
-    compatibility_installs: list[None] = []
-    package = ModuleType("nvrx_checkpointing")
-    package.__path__ = []
-    package.quantized_snapshot = SimpleNamespace(
-        install_quantized_sharded_narrow=lambda: compatibility_installs.append(None),
-    )
-    megatron_package = ModuleType("nvrx_checkpointing.megatron")
-    megatron_package.provider = SimpleNamespace(
-        NATIVE_PROVIDER="native",
-        selected_provider=lambda: selected,
-    )
-    megatron_package.integration = SimpleNamespace(install=lambda: installs.append(None))
-    package.megatron = megatron_package
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", package)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.quantized_snapshot", package.quantized_snapshot)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron", megatron_package)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.provider", megatron_package.provider)
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing.megatron.integration", megatron_package.integration)
-
-    assert slurm_job._install_selected_checkpoint_provider() is megatron_package.provider
-    assert len(compatibility_installs) == expected_compatibility_installs
-    assert len(installs) == expected_installs
-
-
 def test_node_once_waits_for_local_peers_before_action(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     results = tmp_path / "results"
