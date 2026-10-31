@@ -13,11 +13,11 @@ LLM/agent maintenance constraints:
    flavor policy in model configs.
 4. Cluster and scale may select unavoidable scheduler mechanics (allocation topology,
    partition, timeout, and paths), but must not silently change training semantics.
-5. Do not inject model options into GitLab ``JOB_ARGS``. Put architecture/precision options
+5. Do not inject model options into CI workload arguments. Put architecture/precision options
    in model YAML and uniform execution-policy transforms in the owning flavor.
-6. Keep generated GitLab CI files synchronized with their template/matrix, and update
+6. Keep the generated JET workflow forms synchronized with ci/jobs.json, and update
    argument baselines whenever an intentional option change affects them.
-7. Keep experiment-only runner tags and pipeline scoping on ``expr/*`` branches.
+7. Keep experiment-only CI overrides on ``expr/*`` branches.
 8. Explain and obtain approval before changing Python or C++ checkpointing implementation.
 9. Existing scale/config policy exceptions are legacy behavior. Do not copy or extend them
    without explicit approval; migrate them separately when their ownership is clarified.

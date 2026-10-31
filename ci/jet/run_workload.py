@@ -248,7 +248,7 @@ def _run_epilog(args: argparse.Namespace, log: Path) -> int:
             marker.write_text(json.dumps(failure, indent=2))
             report = log.with_name(f"{stem}_report.json")
             details = report.read_text(errors="replace") if report.is_file() else "report not found"
-            print(  # noqa: T201 - prominent, nonblocking GitLab/JET job warning
+            print(  # noqa: T201 - prominent, nonblocking JET job warning
                 "\n"
                 "=" * 80
                 + "\nJET PERFORMANCE BASELINE FAILED (nonblocking exit code 3)\n"

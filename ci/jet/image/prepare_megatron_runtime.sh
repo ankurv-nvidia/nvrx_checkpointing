@@ -110,7 +110,7 @@ for raw_line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     actual = importlib.metadata.version(name)
     if actual != expected:
         raise SystemExit(f"constraint mismatch for {name}: expected {expected}, found {actual}")
-print("JET Megatron overlay matches the regular-CI package constraints")
+print("JET Megatron overlay matches the pinned package constraints")
 PY
 
 python -c 'import transformer_engine; import transformer_engine.pytorch; print(f"Using TransformerEngine {transformer_engine.__version__}")'

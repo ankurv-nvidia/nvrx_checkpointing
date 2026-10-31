@@ -1,4 +1,4 @@
-# Match the regular-CI 26.09 Python resolution.
+# Match the 26.09 Python package resolution of the Slurm runner image.
 cffi==2.1.1
 cuda-tile==1.5.0
 datasets==4.7.0

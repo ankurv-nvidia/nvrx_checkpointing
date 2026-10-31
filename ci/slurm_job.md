@@ -51,8 +51,8 @@ through the training container. Immediately before every pretrain phase or
 repeat cycle, rank 0 prints an allowlisted snapshot with the
 `[slurm_job:env]` prefix. Authentication variables are excluded.
 
-Authentication tokens are intentionally not written to the reproducer. If a
-direct re-run has no `CI_JOB_TOKEN`, native wheel setup falls back to a source
+Authentication tokens are intentionally not written to the reproducer. When a
+direct re-run finds no wheel, native wheel setup falls back to a source
 build. Its preparation step uses a writable container overlay and runs
 `scripts/prepare.sh ubuntu2404` when the custom image does not contain
 `clang-23`; the supplied `.sqsh` itself is not overwritten. Native checkpoint

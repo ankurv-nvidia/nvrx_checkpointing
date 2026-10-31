@@ -2,8 +2,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 """Install an nvrx_checkpointing wheel for CI and Slurm runs.
 
-CI pipelines consume ``dist/*.whl`` from the exact parent wheel-build job.
-Main publishes its tested wheels to the project PyPI registry for users.
+CI jobs install the wheel their own run built; JET workloads download it from
+that run's GitHub artifact.
 Slurm runs without wheel artifacts fall back to an import-triggered source
 build.
 
@@ -13,7 +13,6 @@ or the container image.
 
 CLI:
   wheel_install.py --from-dist DIR   install from a local artifacts dir
-  wheel_install.py --fetch-upstream-wheel
 """
 
 from __future__ import annotations
@@ -362,24 +361,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--from-dist", type=Path, default=None, help="Install from this local artifacts dir (no registry fetch)")
     p.add_argument(
-        "--fetch-upstream-wheel",
-        action="store_true",
-        help="Download this architecture's wheel artifact from the upstream CI wheel job",
-    )
-    p.add_argument(
         "--ensure-prebuilt",
         action="store_true",
         help="Prep step, perf flavor: use installed or local wheel binaries, else build from source",
-    )
-    p.add_argument(
-        "--require-prebuilt",
-        action="store_true",
-        help="Install the exact selected wheel and fail instead of building from source",
-    )
-    p.add_argument(
-        "--build-from-source",
-        action="store_true",
-        help="Prep step, other flavors: build the wheel from the checkout with the ambient build env and install it",
     )
     p.add_argument("--report-install", action="store_true", help="Report selected checkout, commit, and native binary paths")
     p.add_argument(
@@ -393,17 +377,8 @@ def main() -> None:
     for define in args.define:
         key, _, value = define.partition("=")
         os.environ[key] = value
-    if args.fetch_upstream_wheel:
-        fetch_upstream_wheel()
-        return
     if args.ensure_prebuilt:
         ensure_prebuilt()
-        return
-    if args.require_prebuilt:
-        require_prebuilt_wheel(args.from_dist)
-        return
-    if args.build_from_source:
-        build_and_install_from_source()
         return
     if args.report_install:
         report_install()
