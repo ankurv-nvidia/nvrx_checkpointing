@@ -32,7 +32,7 @@ PY
 
 setup() {
     python3 -m venv "${venv}"
-    "${venv}/bin/pip" install --quiet --no-cache-dir PyYAML==6.0.2 jet-client==4.58.4 \
+    "${venv}/bin/pip" install --quiet --no-cache-dir --retries 10 PyYAML==6.0.2 jet-client==4.58.4 \
         --index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hw-joc-pypi/simple
 }
 

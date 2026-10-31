@@ -21,6 +21,8 @@ export PATH=${CUDA_HOME}/bin:${PATH}
 export VCPKG_ROOT=${scratch}/vcpkg
 export VCPKG_BINARY_SOURCES="clear;files,${cache}/vcpkg-binary,readwrite"
 export VCPKG_DOWNLOADS=${cache}/vcpkg-downloads
+# Package downloads ride out brief network outages.
+export UV_HTTP_RETRIES=10
 mkdir -p "${cache}/vcpkg-binary" "${VCPKG_DOWNLOADS}"
 
 make_venv() {
