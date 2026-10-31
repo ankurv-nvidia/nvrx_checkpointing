@@ -159,10 +159,35 @@ jobs:
     secrets:
       JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
-  # Each main build that passes every gate adds its wheels to the pip index on GitHub Pages.
+  # Pull requests require this one check, so the jobs behind it can change freely.
+  gate:
+    needs: [changes, wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200, jet-gb300, jet-h100, jet-b200]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          if [[ $(jq -r '.changes.outputs.fork' <<< "${NEEDS}") == true ]]; then
+              echo "::error::CI does not build pull requests from forks; push the branch to this repository to test it."
+              exit 1
+          fi
+          if [[ $(jq -r '.changes.result' <<< "${NEEDS}") == success && $(jq -r '.changes.outputs.build' <<< "${NEEDS}") == false ]]; then
+              echo "Only documentation changed, so CI built nothing."
+              exit 0
+          fi
+          unfinished=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "${NEEDS}")
+          if [[ -n ${unfinished} ]]; then
+              echo "::error::CI jobs did not pass: ${unfinished//$'\n'/, }"
+              exit 1
+          fi
+          echo "Every CI job passed."
+
+  # Each main build that passes the gate adds its wheels to the pip index on GitHub Pages.
   publish-wheels:
-    needs: [wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200, jet-gb300, jet-h100, jet-b200]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [changes, gate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
