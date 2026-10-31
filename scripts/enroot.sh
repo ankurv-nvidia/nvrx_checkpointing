@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --partition=batch
-#SBATCH --account=coreai_resiliency_osiris
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -45,10 +44,8 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}
 
 # Common srun flags. Defaults match slurm_job.py; override via env vars in CI.
-# The SBATCH headers above only apply when submitted via sbatch — when this script
-# is run directly (CI, devbox), srun uses the cluster's user defaults, which on lyris
-# requires --account to be specified explicitly.
-SLURM_ACCOUNT=${SLURM_ACCOUNT:-coreai_resiliency_osiris}
+# Direct runs bypass the SBATCH headers above, so srun takes the account explicitly.
+SLURM_ACCOUNT=${SLURM_ACCOUNT:?set SLURM_ACCOUNT to the Slurm account to charge}
 SLURM_TIME=${SLURM_TIME:-00:60:00}
 slurm_common_args=(
     "--account=${SLURM_ACCOUNT}"
