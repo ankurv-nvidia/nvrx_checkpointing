@@ -4,16 +4,16 @@ name: JET gb300
 on:
   workflow_dispatch:
     inputs:
-      gb300-nvrx-detr-nano4-8x4:
-        description: gb300-nvrx-detr-nano4-8x4 (nvrx)
-        type: boolean
-        default: false
       gb300-native-detr-nano4-8x4:
-        description: gb300-native-detr-nano4-8x4 (optional)
+        description: gb300-native-detr-nano4-8x4 (default)
         type: boolean
         default: false
       gb300-native-perf-nano4-8x4:
-        description: gb300-native-perf-nano4-8x4 (optional)
+        description: gb300-native-perf-nano4-8x4 (default)
+        type: boolean
+        default: false
+      gb300-nvrx-detr-nano4-8x4:
+        description: gb300-nvrx-detr-nano4-8x4 (nvrx)
         type: boolean
         default: false
 

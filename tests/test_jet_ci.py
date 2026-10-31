@@ -628,15 +628,22 @@ def test_large_gb200_recipes_share_one_storage_lane() -> None:
     )
 
 
-def test_github_ci_runs_the_default_jet_suite() -> None:
-    workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
-    jet = workflow["jobs"]["jet-gb200"]
-    default, _unsupported = generate_workloads.select_workloads(workload_matrix.jet_platform("gb200"), "default")
+def test_github_ci_runs_every_platform_default_jet_suite() -> None:
+    jobs = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())["jobs"]
 
-    assert jet["uses"] == "./.github/workflows/jet.yml"
-    assert jet["with"]["platform"] == "gb200"
-    assert json.loads(jet["with"]["workloads"]) == [workload.display_name for workload in default]
-    assert jet["with"]["wheel-aarch64-artifact-id"] == "${{ needs.wheel-aarch64.outputs.artifact-id }}"
+    for platform in generate_jet_workflows.platforms():
+        jet = jobs[f"jet-{platform.name}"]
+        default, _unsupported = generate_workloads.select_workloads(platform, "default")
+        wheel = f"wheel-{platform.architecture}"
+
+        assert default, f"{platform.name} has no default JET workloads"
+        assert jet["uses"] == "./.github/workflows/jet.yml"
+        assert jet["needs"] == wheel
+        assert "github.event.pull_request.head.repo.full_name == github.repository" in jet["if"]
+        assert jet["with"]["platform"] == platform.name
+        assert json.loads(jet["with"]["workloads"]) == [workload.display_name for workload in default]
+        assert jet["with"][f"{wheel}-artifact-id"] == f"${{{{ needs.{wheel}.outputs.artifact-id }}}}"
+        assert jobs[wheel]["outputs"]["artifact-id"] == "${{ steps.upload.outputs.artifact-id }}"
 
 
 def test_manual_jet_workflows_offer_a_checkbox_per_workload() -> None:

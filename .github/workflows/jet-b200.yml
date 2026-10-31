@@ -5,23 +5,23 @@ on:
   workflow_dispatch:
     inputs:
       b200-native-detr-pico-1x8:
-        description: b200-native-detr-pico-1x8 (main-branch-runs)
+        description: b200-native-detr-pico-1x8 (default)
         type: boolean
         default: false
       b200-native-perf-pico-1x8:
-        description: b200-native-perf-pico-1x8 (main-branch-runs)
-        type: boolean
-        default: false
-      b200-nvrx-detr-pico-1x8:
-        description: b200-nvrx-detr-pico-1x8 (main-branch-runs)
+        description: b200-native-perf-pico-1x8 (default)
         type: boolean
         default: false
       b200-native-detr-vg-pico-1x8:
         description: b200-native-detr-vg-pico-1x8 (main-branch-runs)
         type: boolean
         default: false
+      b200-nvrx-detr-pico-1x8:
+        description: b200-nvrx-detr-pico-1x8 (nvrx)
+        type: boolean
+        default: false
       b200-nvrx-perf-pico-1x8:
-        description: b200-nvrx-perf-pico-1x8 (main-branch-runs)
+        description: b200-nvrx-perf-pico-1x8 (nvrx)
         type: boolean
         default: false
 

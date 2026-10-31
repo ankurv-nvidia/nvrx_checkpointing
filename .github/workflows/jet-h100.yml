@@ -5,23 +5,23 @@ on:
   workflow_dispatch:
     inputs:
       h100-native-detr-pico-1x8:
-        description: h100-native-detr-pico-1x8 (main-branch-runs)
+        description: h100-native-detr-pico-1x8 (default)
         type: boolean
         default: false
       h100-native-perf-pico-1x8:
-        description: h100-native-perf-pico-1x8 (main-branch-runs)
-        type: boolean
-        default: false
-      h100-nvrx-detr-pico-1x8:
-        description: h100-nvrx-detr-pico-1x8 (main-branch-runs)
+        description: h100-native-perf-pico-1x8 (default)
         type: boolean
         default: false
       h100-native-detr-vg-pico-1x8:
         description: h100-native-detr-vg-pico-1x8 (main-branch-runs)
         type: boolean
         default: false
+      h100-nvrx-detr-pico-1x8:
+        description: h100-nvrx-detr-pico-1x8 (nvrx)
+        type: boolean
+        default: false
       h100-nvrx-perf-pico-1x8:
-        description: h100-nvrx-perf-pico-1x8 (main-branch-runs)
+        description: h100-nvrx-perf-pico-1x8 (nvrx)
         type: boolean
         default: false
 

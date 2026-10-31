@@ -35,10 +35,13 @@ jobs:
   wheel-x86_64:
     runs-on: [self-hosted, build]
     timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v7
       - run: ci/github/tasks.sh wheel
-      - uses: actions/upload-artifact@v7
+      - id: upload
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-x86_64
           path: |
@@ -93,9 +96,39 @@ jobs:
       wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
     secrets: inherit
 
+  jet-gb300:
+    needs: wheel-aarch64
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: gb300
+      workloads: '["gb300-native-detr-nano4-8x4", "gb300-native-perf-nano4-8x4"]'
+      wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
+    secrets: inherit
+
+  jet-h100:
+    needs: wheel-x86_64
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: h100
+      workloads: '["h100-native-detr-pico-1x8", "h100-native-perf-pico-1x8"]'
+      wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
+    secrets: inherit
+
+  jet-b200:
+    needs: wheel-x86_64
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: b200
+      workloads: '["b200-native-detr-pico-1x8", "b200-native-perf-pico-1x8"]'
+      wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
+    secrets: inherit
+
   # Each main build that passes every gate adds its wheels to the pip index on GitHub Pages.
   publish-wheels:
-    needs: [wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200]
+    needs: [wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200, jet-gb300, jet-h100, jet-b200]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30

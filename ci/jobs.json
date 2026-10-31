@@ -262,6 +262,7 @@
           "nodes": 8,
           "scale": "8x4",
           "group": "8node-nano4",
+          "pipeline_suite": "default",
           "checkpoint_interval": 25,
           "runner_tags": [],
           "timeout": "1d",
@@ -292,7 +293,6 @@
       "architecture": "x86_64",
       "gpus": "1x8",
       "has_image": true,
-      "pipeline_suite": "main-branch-runs",
       "slurm_time_minutes": {
         "native-detr": 20,
         "native-perf": 15,
