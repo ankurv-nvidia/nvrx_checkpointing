@@ -1,0 +1,87 @@
+name: JET
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: JET platform from ci/jobs.json
+        type: string
+        required: true
+      workloads:
+        description: JSON list of the platform's JET workload keys
+        type: string
+        required: true
+      wheel-aarch64-artifact-id:
+        type: string
+        default: ""
+      wheel-x86_64-artifact-id:
+        type: string
+        default: ""
+      wheel-valgrind-aarch64-artifact-id:
+        type: string
+        default: ""
+      wheel-valgrind-x86_64-artifact-id:
+        type: string
+        default: ""
+    secrets:
+      JET_GITLAB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  JET_CI_MAINTAINER: ankurv
+  JET_PLATFORM: ${{ inputs.platform }}
+  JET_CLUSTERS: ${{ vars.JET_CLUSTERS }}
+  UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID: ${{ inputs.wheel-aarch64-artifact-id }}
+  UPSTREAM_WHEEL_X86_64_ARTIFACT_ID: ${{ inputs.wheel-x86_64-artifact-id }}
+  UPSTREAM_WHEEL_VALGRIND_AARCH64_ARTIFACT_ID: ${{ inputs.wheel-valgrind-aarch64-artifact-id }}
+  UPSTREAM_WHEEL_VALGRIND_X86_64_ARTIFACT_ID: ${{ inputs.wheel-valgrind-x86_64-artifact-id }}
+
+jobs:
+  image:
+    name: ${{ inputs.platform }}-image
+    runs-on: [self-hosted, jet]
+    timeout-minutes: 240
+    outputs:
+      tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: build
+        run: ci/github/jet.sh image
+        env:
+          JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+      - if: always()
+        run: ci/github/jet.sh cancel
+        env:
+          JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+
+  workload:
+    needs: image
+    name: ${{ matrix.workload }}
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: ${{ fromJSON(inputs.workloads) }}
+    runs-on: [self-hosted, jet]
+    timeout-minutes: 4320
+    env:
+      JET_IMAGE_TAG: ${{ needs.image.outputs.tag }}
+      JET_WORKLOAD: ${{ matrix.workload }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/github/jet.sh workload
+        env:
+          JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+      - if: always()
+        run: ci/github/jet.sh cancel
+        env:
+          JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.workload }}
+          path: jet-results/
+          if-no-files-found: ignore
+          retention-days: 30

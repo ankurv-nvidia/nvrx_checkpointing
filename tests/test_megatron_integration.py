@@ -519,7 +519,7 @@ def test_module_launcher_installs_before_running_entrypoint(
 
 def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     integration, _ = _load_integration(monkeypatch)
-    resolver = (REPO_ROOT / "scripts/megatron_root.sh").read_text()
+    resolver = (REPO_ROOT / "scripts/prepare.sh").read_text()
 
     assert f"COMMIT_HASH=${{MEGATRON_COMMIT:-{integration.SUPPORTED_MEGATRON_COMMIT}}}" in resolver
     assert "https://github.com/NVIDIA/Megatron-LM.git" in resolver

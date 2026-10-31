@@ -2,8 +2,18 @@
   "platforms": [
     {
       "name": "gb200",
+      "architecture": "aarch64",
       "gpus": "1x4",
       "has_image": true,
+      "jet": {
+        "wheel_mode": "prebuilt",
+        "compute_capability": "10.0",
+        "max_timeout_minutes": 180,
+        "smoke_timeout_minutes": 180,
+        "distributed_timeout_minutes": 60,
+        "distributed_timeout_min_nodes": 16,
+        "use_regular_time_budget": true
+      },
       "native_wheel_needs": [
         [
           "wheel:aarch64",
@@ -24,20 +34,10 @@
           "detr"
         ],
         [
-          "native",
-          [
-            "detr",
-            "vg"
-          ]
-        ],
-        [
           "nvrx",
           "perf"
         ]
       ],
-      "slurm_time_minutes": {
-        "native-detr-vg": 25
-      },
       "multinode": [
         {
           "key": "gpt-moe",
@@ -66,8 +66,7 @@
           "timeout": "1d",
           "slurm_time_minutes": {
             "native-detr": 30,
-            "native-perf": 40,
-            "native-detr-vg": 50
+            "native-perf": 40
           },
           "jobs": [
             [
@@ -85,13 +84,6 @@
             [
               "nvrx",
               "perf"
-            ],
-            [
-              "native",
-              [
-                "detr",
-                "vg"
-              ]
             ]
           ]
         },
@@ -211,8 +203,18 @@
     },
     {
       "name": "gb300",
+      "architecture": "aarch64",
       "gpus": "1x4",
       "has_image": true,
+      "jet": {
+        "wheel_mode": "prebuilt",
+        "compute_capability": "10.3",
+        "max_nodes": 18,
+        "max_timeout_minutes": 240,
+        "distributed_timeout_minutes": 60,
+        "distributed_timeout_min_nodes": 16,
+        "use_regular_time_budget": true
+      },
       "native_wheel_needs": [
         [
           "wheel:aarch64",
@@ -287,6 +289,7 @@
     },
     {
       "name": "h100",
+      "architecture": "x86_64",
       "gpus": "1x8",
       "has_image": true,
       "pipeline_suite": "main-branch-runs",
@@ -322,7 +325,26 @@
           "perf"
         ]
       ],
-      "multinode": []
+      "multinode": [],
+      "jet": {
+        "wheel_mode": "prebuilt",
+        "compute_capability": "9.0",
+        "max_timeout_minutes": 180
+      }
+    },
+    {
+      "name": "b200",
+      "workload_profile": "h100",
+      "architecture": "x86_64",
+      "gpus": "1x8",
+      "has_image": false,
+      "jobs": [],
+      "multinode": [],
+      "jet": {
+        "wheel_mode": "prebuilt",
+        "compute_capability": "10.0",
+        "max_timeout_minutes": 120
+      }
     }
   ]
 }

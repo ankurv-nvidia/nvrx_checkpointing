@@ -3,25 +3,28 @@
 For named Ultra v3 runs, background submission, per-run work directories, and
 custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
 
-## Install a wheel from GitLab PyPI
+## Install a wheel from the project's pip index
 
-Successful `main` pipelines publish tested x86_64 and aarch64 wheels to the
-project's public GitLab PyPI registry. Install the newest wheel compatible with
+Every `main` build that passes CI publishes its x86_64 and aarch64 wheels to the
+project's pip index on GitHub Pages. Install the newest wheel compatible with
 the current machine (Python 3.12 or newer) with:
 
 ```bash
 python3 -m pip install --upgrade --pre \
-  --index-url https://gitlab-master.nvidia.com/api/v4/projects/381021/packages/pypi/simple \
+  --index-url https://ankurv-nvidia.github.io/nvrx_checkpointing/simple/ \
   nvrx-checkpointing
 ```
 
-Published versions have the form
-`0.0.1.dev<PIPELINE_IID>+g<COMMIT_SHORT_SHA>`. To reproduce a particular
-pipeline, replace `VERSION` below with its published version:
+The aarch64 wheel targets Grace (Neoverse V2) CPUs, as in GB200 and GB300
+systems.
+
+Published versions have the form `0.0.1.dev<RUN_NUMBER>+g<COMMIT_SHORT_SHA>`,
+and the index keeps the newest 50 builds. To reproduce a particular build,
+replace `VERSION` below with its published version:
 
 ```bash
 python3 -m pip install \
-  --index-url https://gitlab-master.nvidia.com/api/v4/projects/381021/packages/pypi/simple \
+  --index-url https://ankurv-nvidia.github.io/nvrx_checkpointing/simple/ \
   "nvrx-checkpointing==VERSION"
 ```
 

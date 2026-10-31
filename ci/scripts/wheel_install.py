@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 """Install an nvrx_checkpointing wheel for CI and Slurm runs.
 
 CI pipelines consume ``dist/*.whl`` from the exact parent wheel-build job.
@@ -23,11 +24,13 @@ import importlib.util
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-import urllib.parse
+import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 logger = logging.getLogger("native_ci")
@@ -37,6 +40,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _WHEEL_BINARIES = ("checkpoint.abi3.so", "checkpoint_server")
 
 _FETCH_TIMEOUT_S = 120
+_GITHUB_API = "https://api.github.com"
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_SOURCE_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 def wheel_arch() -> str:
@@ -49,6 +55,11 @@ def wheel_arch() -> str:
     return os.environ.get("WHEEL_ARCH") or platform.machine()
 
 
+def wheel_variant() -> str:
+    """Build variant selected by the current workload."""
+    return os.environ.get("WHEEL_VARIANT", "normal").strip() or "normal"
+
+
 def _find_local_wheel(dist_dir: Path) -> Path | None:
     """Newest wheel in dist_dir whose platform tag matches this arch."""
     if not dist_dir.is_dir():
@@ -58,31 +69,64 @@ def _find_local_wheel(dist_dir: Path) -> Path | None:
     return wheels[-1] if wheels else None
 
 
+class _KeepRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface redirects as errors so the token never reaches the redirect target."""
+
+    def redirect_request(self, *_args: object) -> None:
+        return None
+
+
+def _artifact_download_url(repository: str, artifact_id: str, token: str) -> str:
+    """Resolve a GitHub Actions artifact to its short-lived storage URL."""
+    request = urllib.request.Request(
+        f"{_GITHUB_API}/repos/{repository}/actions/artifacts/{artifact_id}/zip",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.build_opener(_KeepRedirect).open(request, timeout=_FETCH_TIMEOUT_S) as response:
+            raise RuntimeError(f"GitHub answered artifact {artifact_id} with {response.status} instead of a redirect")
+    except urllib.error.HTTPError as error:
+        location = error.headers.get("Location")
+        if error.code in _REDIRECT_CODES and location:
+            return location
+        raise
+
+
 def fetch_upstream_wheel(dest_dir: Path | None = None) -> Path:
-    """Download this architecture's wheel from an exact upstream CI job."""
-    job_var = f"UPSTREAM_WHEEL_{wheel_arch().upper().replace('-', '_')}_JOB_ID"
-    job_id = os.environ.get(job_var, "")
-    api = os.environ.get("CI_API_V4_URL")
-    project = os.environ.get("CI_PROJECT_ID")
-    token = os.environ.get("CI_JOB_TOKEN")
-    if not (job_id.isdigit() and api and project and token):
-        raise RuntimeError(f"{job_var}, CI_API_V4_URL, CI_PROJECT_ID, and CI_JOB_TOKEN are required")
-    root = f"{api}/projects/{project}/jobs/{job_id}/artifacts"
-    headers = {"JOB-TOKEN": token}
-    pointer = f"dist/nvrx_checkpointing-linux_{wheel_arch()}.txt"
-    request = urllib.request.Request(f"{root}/{urllib.parse.quote(pointer, safe='/')}", headers=headers)
-    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response:
-        filename = response.read().decode().strip()
-    if Path(filename).name != filename or not filename.endswith(f"-linux_{wheel_arch()}.whl"):
-        raise RuntimeError(f"upstream wheel job {job_id} returned invalid filename {filename!r}")
+    """Download this architecture's wheel from an exact upstream CI wheel artifact."""
+    variant_segment = "" if wheel_variant() == "normal" else f"{wheel_variant().upper()}_"
+    artifact_var = f"UPSTREAM_WHEEL_{variant_segment}{wheel_arch().upper().replace('-', '_')}_ARTIFACT_ID"
+    artifact_id = os.environ.get(artifact_var, "")
+    repository = os.environ.get("UPSTREAM_PROJECT_PATH", "")
+    token = os.environ.get("NVRX_GITHUB_TOKEN", "")
+    if not (artifact_id.isdigit() and repository and token):
+        raise RuntimeError(f"{artifact_var}, UPSTREAM_PROJECT_PATH, and NVRX_GITHUB_TOKEN are required")
+    location = _artifact_download_url(repository, artifact_id, token)
     target_dir = dest_dir or REPO_ROOT / "dist"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / filename
-    wheel_path = urllib.parse.quote(f"dist/{filename}", safe="/")
-    request = urllib.request.Request(f"{root}/{wheel_path}", headers=headers)
-    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response, target.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    logger.info(f"[wheel] downloaded {target.name} from upstream job {job_id}")
+    archive = target_dir / f".artifact-{artifact_id}.downloading-{os.getpid()}"
+    try:
+        with urllib.request.urlopen(location, timeout=_FETCH_TIMEOUT_S) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        with zipfile.ZipFile(archive) as contents:
+            wheels = [name for name in contents.namelist() if name.endswith(f"-linux_{wheel_arch()}.whl")]
+            if len(wheels) != 1:
+                raise RuntimeError(f"upstream wheel artifact {artifact_id} holds {len(wheels)} {wheel_arch()} wheels")
+            target = target_dir / Path(wheels[0]).name
+            temporary = target.with_name(f".{target.name}.downloading-{os.getpid()}")
+            try:
+                with contents.open(wheels[0]) as source, temporary.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+    finally:
+        archive.unlink(missing_ok=True)
+    logger.info(f"[wheel] downloaded {target.name} from upstream artifact {artifact_id}")
     return target
 
 
@@ -91,7 +135,13 @@ def _install_dir() -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
-def _source_revision() -> str:
+def source_revision() -> str:
+    """Return the immutable checkout revision represented by the JET build."""
+    revision = os.environ.get("NVRX_SOURCE_REVISION", "").strip()
+    if revision:
+        if not _SOURCE_REVISION_RE.fullmatch(revision):
+            raise RuntimeError("NVRX_SOURCE_REVISION must be a 7-40 character hexadecimal commit")
+        return revision
     return subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()  # noqa: S607
 
 
@@ -156,9 +206,11 @@ def _pip_install(whl: Path) -> None:
             ],
             check=True,
         )
-        (staging / ".nvrx-checkpointing-commit").write_text(f"{_source_revision()}\n")
+        (staging / ".nvrx-checkpointing-commit").write_text(f"{source_revision()}\n")
+        (staging / ".nvrx-checkpointing-variant").write_text(f"{wheel_variant()}\n")
         shutil.rmtree(target, ignore_errors=True)
         staging.replace(target)
+        importlib.invalidate_caches()
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -201,13 +253,29 @@ def install_prebuilt_wheel(dist_dir: Path | None = None, *, probe: bool = True) 
     return True
 
 
+def require_prebuilt_wheel(
+    dist_dir: Path | None = None,
+    *,
+    probe: bool = True,
+) -> None:
+    """Install the exact selected wheel or fail without a source-build fallback."""
+    if not install_prebuilt_wheel(dist_dir, probe=probe):
+        raise RuntimeError(
+            f"required {wheel_variant()} {wheel_arch()} wheel for {source_revision()} is unavailable from {dist_dir}",
+        )
+
+
 def _binaries_installed() -> bool:
     """True when the selected checkout's wheel is installed."""
     target = _install_dir()
     if target is None:
         return False
     marker = target / ".nvrx-checkpointing-commit"
-    if not marker.is_file() or marker.read_text().strip() != _source_revision():
+    if not marker.is_file() or marker.read_text().strip() != source_revision():
+        return False
+    variant_marker = target / ".nvrx-checkpointing-variant"
+    installed_variant = variant_marker.read_text().strip() if variant_marker.is_file() else "normal"
+    if installed_variant != wheel_variant():
         return False
     root = target / "nvrx_checkpointing"
     return all((root / name).is_file() for name in _WHEEL_BINARIES)
@@ -294,7 +362,8 @@ def report_install() -> None:
     if missing := [str(path) for path in binaries if not path.is_file()]:
         raise RuntimeError(f"nvrx_checkpointing native binaries are missing: {', '.join(missing)}")
     logger.info(
-        f"[wheel] nvrx_checkpointing distribution={distribution.version} commit={_source_revision()} module={spec.origin} "
+        f"[wheel] nvrx_checkpointing distribution={distribution.version} commit={source_revision()} "
+        f"arch={wheel_arch()} variant={wheel_variant()} module={spec.origin} "
         f"shlib={binaries[0]} server={binaries[1]}",
     )
 
@@ -308,10 +377,16 @@ def main() -> None:
         action="store_true",
         help="Download this architecture's wheel artifact from the upstream CI wheel job",
     )
+    p.add_argument("--variant", default=None, help="Select a wheel build variant")
     p.add_argument(
         "--ensure-prebuilt",
         action="store_true",
         help="Prep step, perf flavor: use installed or local wheel binaries, else build from source",
+    )
+    p.add_argument(
+        "--require-prebuilt",
+        action="store_true",
+        help="Install the exact selected wheel and fail instead of building from source",
     )
     p.add_argument(
         "--build-from-source",
@@ -327,6 +402,8 @@ def main() -> None:
         help="Export KEY=VALUE before acting — carries the flavor build env into the source build on argv",
     )
     args = p.parse_args()
+    if args.variant:
+        os.environ["WHEEL_VARIANT"] = args.variant
     for define in args.define:
         key, _, value = define.partition("=")
         os.environ[key] = value
@@ -335,6 +412,9 @@ def main() -> None:
         return
     if args.ensure_prebuilt:
         ensure_prebuilt()
+        return
+    if args.require_prebuilt:
+        require_prebuilt_wheel(args.from_dist)
         return
     if args.build_from_source:
         build_and_install_from_source()

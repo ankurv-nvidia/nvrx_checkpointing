@@ -2,7 +2,7 @@
   _is_global_batch_size_explicitly_specified ...... True
   account_for_embedding_in_pipeline_split ......... False
   account_for_loss_in_pipeline_split .............. False
-  accumulate_allreduce_grads_in_fp32 .............. False
+  accumulate_allreduce_grads_in_fp32 .............. True
   activation_func_clamp_value ..................... None
   activation_func_tanh_clamp_scale ................ None
   activation_func_tanh_clamp_scale_linear ......... None
@@ -49,7 +49,7 @@
   bias_swiglu_fusion .............................. True
   cache_mla_latents ............................... False
   calc_ft_timeouts ................................ False
-  calculate_per_token_loss ........................ False
+  calculate_per_token_loss ........................ True
   chat_template ................................... None
   check_for_large_grads ........................... False
   check_for_nan_in_loss_and_grad .................. True
@@ -61,16 +61,16 @@
   ckpt_convert_update_legacy_dist_opt_format ...... False
   ckpt_drop_redundant_extra_state ................. False
   ckpt_format ..................................... torch_dist
-  ckpt_fully_parallel_load ........................ True
+  ckpt_fully_parallel_load ........................ False
   ckpt_fully_parallel_load_exchange_algo .......... broadcast
   ckpt_fully_parallel_load_per_rank_objects ....... False
-  ckpt_fully_parallel_load_process_group .......... ep_dp
+  ckpt_fully_parallel_load_process_group .......... dp
   ckpt_fully_parallel_save ........................ True
-  ckpt_fully_parallel_save_deprecated ............. True
-  ckpt_fully_parallel_save_process_group .......... ep_dp
+  ckpt_fully_parallel_save_deprecated ............. False
+  ckpt_fully_parallel_save_process_group .......... dp
   ckpt_load_validate_sharding_integrity ........... True
   ckpt_pg_tensors_cache_create .................... False
-  ckpt_provider ................................... native
+  ckpt_provider ................................... nvrx
   ckpt_step ....................................... None
   classes_fraction ................................ 1.0
   clip_grad ....................................... 1.0
@@ -96,7 +96,7 @@
   data_args_path .................................. None
   data_parallel_random_init ....................... False
   data_parallel_sharding_strategy ................. optim_grads_params
-  data_parallel_size .............................. 16
+  data_parallel_size .............................. 1
   data_path ....................................... None
   data_per_class_fraction ......................... 1.0
   data_sharding ................................... True
@@ -106,7 +106,7 @@
   dataloader_type ................................. single
   ddp_average_in_collective ....................... False
   ddp_bucket_size ................................. None
-  ddp_num_buckets ................................. 24
+  ddp_num_buckets ................................. 10
   ddp_pad_buckets_for_high_nccl_busbw ............. False
   ddp_param_name_patterns_for_fp32_local_accumulation  []
   ddp_reduce_scatter_with_fp32_accumulation ....... False
@@ -146,7 +146,7 @@
   distrib_optim_fully_reshardable_mem_efficient ... False
   distribute_saved_activations .................... False
   distributed_backend ............................. nccl
-  distributed_timeout_minutes ..................... 120
+  distributed_timeout_minutes ..................... 30
   distributed_timeout_seconds_after_init .......... None
   dsa_indexer_head_dim ............................ None
   dsa_indexer_k_norm_epsilon ...................... None
@@ -173,19 +173,19 @@
   enable_mhc_connections .......................... False
   enable_msc ...................................... False
   enable_one_logger ............................... True
-  encoder_num_layers .............................. 52
-  encoder_seq_length .............................. 8192
+  encoder_num_layers .............................. 3
+  encoder_seq_length .............................. 1024
   end_weight_decay ................................ 0.1
   eod_mask_loss ................................... False
   ep_overlap_early_attn_memory_release ............ False
   error_injection_rate ............................ 0
   error_injection_type ............................ transient_error
-  eval_global_batch_size .......................... 32
-  eval_interval ................................... 106
+  eval_global_batch_size .......................... 8
+  eval_interval ................................... 250
   eval_iters ...................................... 100
   eval_micro_batch_size ........................... 1
   exit_duration_in_mins ........................... None
-  exit_interval ................................... 53
+  exit_interval ................................... 125
   exit_on_missing_checkpoint ...................... False
   exit_signal ..................................... 15
   exit_signal_handler ............................. False
@@ -196,7 +196,7 @@
   experimental_attention_variant .................. None
   expert_data_parallel_sharding_strategy .......... None
   expert_gtp_weight_remat_size .................... 1
-  expert_model_parallel_size ...................... 32
+  expert_model_parallel_size ...................... 8
   expert_outer_dp_sharding_strategy ............... None
   expert_tensor_parallel_num_weight_shards ........ 1
   expert_tensor_parallel_size ..................... 1
@@ -226,7 +226,7 @@
   fault_injector_offset_seconds ................... None
   fault_injector_ranks ............................ None
   fault_injector_seed ............................. None
-  ffn_hidden_size ................................. 1856
+  ffn_hidden_size ................................. 1344
   fim_data ........................................ False
   fim_eod_token ................................... <|endoftext|>
   fim_fragment_rate ............................... None
@@ -244,7 +244,7 @@
   finetune_data_files ............................. None
   finetune_data_split ............................. train
   finetune_hf_dataset ............................. None
-  first_last_layers_bf16 .......................... False
+  first_last_layers_bf16 .......................... True
   flash_attention_version ......................... None
   flash_decode .................................... False
   flight_recorder_dump_on_timeout ................. True
@@ -284,13 +284,13 @@
   gdp_cutedsl_kernel .............................. False
   gdp_num_chunk_states_to_recompute ............... 2
   gdp_num_householder ............................. 3
-  global_batch_size ............................... 32
+  global_batch_size ............................... 8
   glu_linear_offset ............................... 0.0
   gpu_sniff_test_interval ......................... None
-  grad_reduce_in_bf16 ............................. True
+  grad_reduce_in_bf16 ............................. False
   gradient_accumulation_fusion .................... False
   gradient_reduce_div_fusion ...................... True
-  group_query_attention ........................... True
+  group_query_attention ........................... False
   grpo_clamp_eps_lower ............................ 0.01
   grpo_clamp_eps_upper ............................ 0.01
   grpo_entropy_term_weight ........................ 0.0
@@ -309,13 +309,13 @@
   heterogeneous_layers_config_path ................ None
   hfsdp_param_gather_overlap ...................... False
   hidden_dropout .................................. 0.0
-  hidden_size ..................................... 2688
+  hidden_size ..................................... 2048
   hierarchical_context_parallel_sizes ............. None
   high_priority_a2a_comm_stream ................... False
-  high_priority_stream_groups ..................... ['ep']
+  high_priority_stream_groups ..................... []
   hybrid_context_parallel ......................... False
-  hybrid_layer_pattern ............................ MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
-  hybrid_override_pattern ......................... None
+  hybrid_layer_pattern ............................ M*E/*E/*E
+  hybrid_override_pattern ......................... M*E
   hysteresis ...................................... 2
   img_h ........................................... 224
   img_w ........................................... 224
@@ -365,11 +365,11 @@
   inference_text_gen_server_logging ............... False
   inference_use_synchronous_zmq_collectives ....... False
   inference_wandb_logging ......................... False
-  init_method_std ................................. 0.0099
+  init_method_std ................................. 0.014
   init_method_xavier_uniform ...................... False
   init_model_with_meta_device ..................... False
   initial_loss_scale .............................. 4294967296
-  inprocess_active_world_size ..................... 32
+  inprocess_active_world_size ..................... 8
   inprocess_barrier_timeout ....................... 120
   inprocess_completion_timeout .................... 120
   inprocess_empty_cuda_cache ...................... False
@@ -411,12 +411,12 @@
   local_rank ...................................... 0
   log_device_memory_used .......................... False
   log_energy ...................................... False
-  log_interval .................................... 1
+  log_interval .................................... 25
   log_loss_scale_to_tensorboard ................... True
   log_max_attention_logit ......................... False
   log_memory_interval ............................. None
   log_memory_to_tensorboard ....................... False
-  log_num_zeros_in_grad ........................... False
+  log_num_zeros_in_grad ........................... True
   log_params_norm ................................. True
   log_progress .................................... True
   log_straggler ................................... False
@@ -439,7 +439,7 @@
   logits_save_top_p_min_k ......................... 1
   loss_scale ...................................... None
   loss_scale_window ............................... 1000
-  lr .............................................. 0.0008
+  lr .............................................. 0.00045
   lr_decay_iters .................................. None
   lr_decay_samples ................................ 38000
   lr_decay_style .................................. WSD
@@ -450,7 +450,7 @@
   lr_wsd_decay_iters .............................. None
   lr_wsd_decay_samples ............................ 40000
   lr_wsd_decay_style .............................. minus_sqrt
-  main_grads_dtype ................................ torch.bfloat16
+  main_grads_dtype ................................ torch.float32
   main_params_dtype ............................... torch.float32
   make_vocab_size_divisible_by .................... 128
   mamba_head_dim .................................. 64
@@ -460,19 +460,19 @@
   mamba_num_heads ................................. 64
   mamba_state_dim ................................. 128
   mamba_training_ssm_states_dtype ................. None
-  manual_gc ....................................... True
+  manual_gc ....................................... False
   manual_gc_eval .................................. True
-  manual_gc_interval .............................. 100
+  manual_gc_interval .............................. 0
   mask_factor ..................................... 1.0
   mask_prob ....................................... 0.15
   mask_type ....................................... random
   masked_softmax_fusion ........................... True
-  max_position_embeddings ......................... 8192
+  max_position_embeddings ......................... 1024
   max_seqlen_per_dp_cp_rank ....................... None
   max_tokens_to_oom ............................... 12000
   megatron_fsdp_enable_fine_grained_param_gather .. False
   megatron_fsdp_grad_comm_dtype ................... None
-  megatron_fsdp_main_grads_dtype .................. torch.bfloat16
+  megatron_fsdp_main_grads_dtype .................. None
   megatron_fsdp_main_params_dtype ................. torch.float32
   megatron_fsdp_max_pool_double_buffer ............ False
   megatron_fsdp_version ........................... 1
@@ -488,7 +488,7 @@
   microbatch_group_size_per_vp_stage .............. None
   mid_level_dataset_surplus ....................... 0.005
   min_loss_scale .................................. 1.0
-  min_lr .......................................... 8e-06
+  min_lr .......................................... 4.5e-06
   min_offloaded_tensor_size ....................... 1048576
   mla_down_proj_fusion ............................ False
   mlp_chunks_for_prefill .......................... 1
@@ -505,7 +505,7 @@
   moe_enable_routing_replay ....................... False
   moe_expert_capacity_factor ...................... None
   moe_expert_rank_capacity_factor ................. None
-  moe_ffn_hidden_size ............................. 1856
+  moe_ffn_hidden_size ............................. 1344
   moe_flex_dispatcher_backend ..................... deepep
   moe_flex_dispatcher_num_sms ..................... None
   moe_grouped_gemm ................................ True
@@ -515,7 +515,7 @@
   moe_hybridep_num_sms_preprocessing .............. 108
   moe_hybridep_pad_uneven_dispatch_inputs ......... False
   moe_input_jitter_eps ............................ None
-  moe_latent_size ................................. None
+  moe_latent_size ................................. 1024
   moe_layer_freq .................................. 1
   moe_layer_recompute ............................. False
   moe_mlp_glu_interleave_size ..................... None
@@ -535,7 +535,7 @@
   moe_router_dtype ................................ fp64
   moe_router_enable_expert_bias ................... True
   moe_router_force_biased ......................... None
-  moe_router_force_load_balancing ................. True
+  moe_router_force_load_balancing ................. False
   moe_router_fusion ............................... False
   moe_router_group_topk ........................... None
   moe_router_load_balancing_type .................. seq_aux_loss
@@ -546,8 +546,8 @@
   moe_router_quantile_balancing_ema ............... 0.0
   moe_router_score_function ....................... sigmoid
   moe_router_skip_muon ............................ False
-  moe_router_topk ................................. 6
-  moe_router_topk_scaling_factor .................. 2.5
+  moe_router_topk ................................. 11
+  moe_router_topk_scaling_factor .................. 5.0
   moe_routing_trace_capture_hidden_states ......... False
   moe_routing_trace_capture_logits ................ False
   moe_routing_trace_dump_weights .................. False
@@ -555,7 +555,7 @@
   moe_routing_trace_path .......................... None
   moe_shared_expert_gate .......................... False
   moe_shared_expert_glu_interleave_size ........... None
-  moe_shared_expert_intermediate_size ............. 3712
+  moe_shared_expert_intermediate_size ............. 2688
   moe_shared_expert_overlap ....................... False
   moe_shortcut_connection ......................... False
   moe_shortcut_parallel ........................... False
@@ -575,8 +575,8 @@
   mtp_detach_heads ................................ False
   mtp_hsm ......................................... False
   mtp_hybrid_override_pattern ..................... None
-  mtp_loss_scaling_factor ......................... 0.1
-  mtp_num_layers .................................. None
+  mtp_loss_scaling_factor ......................... 0.3
+  mtp_num_layers .................................. 2
   mtp_standalone .................................. False
   mtp_use_repeated_layer .......................... False
   multi_latent_attention .......................... False
@@ -623,15 +623,15 @@
   num_classes ..................................... 1000
   num_dataset_builder_threads ..................... 1
   num_distributed_optimizer_instances ............. 1
-  num_experts ..................................... 128
-  num_layers ...................................... 52
-  num_layers_at_end_in_bf16 ....................... 1
-  num_layers_at_start_in_bf16 ..................... 1
+  num_experts ..................................... 32
+  num_layers ...................................... 3
+  num_layers_at_end_in_bf16 ....................... 2
+  num_layers_at_start_in_bf16 ..................... 0
   num_layers_per_virtual_pipeline_stage ........... None
-  num_query_groups ................................ 8
+  num_query_groups ................................ 1
   num_speculative_tokens .......................... 0
   num_virtual_stages_per_pipeline_rank ............ None
-  num_workers ..................................... 2
+  num_workers ..................................... 1
   nvtx_ranges ..................................... False
   object_storage_cache_path ....................... None
   offload_modules ................................. []
@@ -662,7 +662,7 @@
   overlap_param_gather ............................ False
   overlap_param_gather_with_optimizer_step ........ False
   override_ckpt_iteration ......................... None
-  override_opt_param_scheduler .................... False
+  override_opt_param_scheduler .................... True
   pad_vocab_size .................................. True
   padded_vocab_size ............................... None
   params_dtype .................................... torch.bfloat16
@@ -711,7 +711,7 @@
   replication ..................................... False
   replication_factor .............................. 2
   replication_jump ................................ None
-  rerun_mode ...................................... disabled
+  rerun_mode ...................................... validate_results
   reset_attention_mask ............................ False
   reset_position_ids .............................. False
   result_rejected_tracker_filename ................ None
@@ -759,14 +759,14 @@
   sample_rate ..................................... 1.0
   save_activations_interval ....................... None
   save_dgrads_interval ............................ None
-  save_interval ................................... 1
+  save_interval ................................... 25
   save_params_interval ............................ None
-  save_retain_interval ............................ 1
+  save_retain_interval ............................ 25
   save_tokenizer_assets ........................... True
   save_tokens_per_expert_interval ................. None
   save_wgrads_interval ............................ None
   seed ............................................ 1234
-  seq_length ...................................... 8192
+  seq_length ...................................... 1024
   sequence_packing_scheduler ...................... None
   sequence_parallel ............................... True
   sft ............................................. False
@@ -787,7 +787,7 @@
   start_weight_decay .............................. 0.1
   step_batch_size_schedule ........................ None
   straggler_ctrlr_port ............................ 65535
-  straggler_minmax_count .......................... 1
+  straggler_minmax_count .......................... 16
   strict_fsdp_dtensor_load ........................ True
   suggested_communication_unit_size ............... None
   swiglu .......................................... False
@@ -795,8 +795,8 @@
   symmetric_ar_type ............................... None
   te_precision_config_file ........................ None
   te_rng_tracker .................................. True
-  tensor_model_parallel_size ...................... 2
-  tensor_parallel_num_weight_shards ............... 2
+  tensor_model_parallel_size ...................... 8
+  tensor_parallel_num_weight_shards ............... 8
   tensorboard_log_interval ........................ 1
   tensorboard_queue_size .......................... 1000
   test_data_path .................................. None
@@ -836,7 +836,7 @@
   use_cpu_initialization .......................... None
   use_dist_ckpt ................................... True
   use_dist_ckpt_deprecated ........................ False
-  use_distributed_optimizer ....................... True
+  use_distributed_optimizer ....................... False
   use_flash_attn .................................. False
   use_fused_mhc ................................... False
   use_fused_weighted_squared_relu ................. False
@@ -853,7 +853,7 @@
   use_mp_args_from_checkpoint_args ................ False
   use_mup ......................................... False
   use_persistent_ckpt_worker ...................... False
-  use_precision_aware_optimizer ................... True
+  use_precision_aware_optimizer ................... False
   use_pytorch_profiler ............................ False
   use_ring_exchange_p2p ........................... False
   use_rope_scaling ................................ False
@@ -879,7 +879,7 @@
   vision_pretraining_type ......................... classify
   vocab_extra_ids ................................. 0
   vocab_file ...................................... None
-  vocab_size ...................................... 131072
+  vocab_size ...................................... 256000
   wandb_entity .................................... None
   wandb_exp_name .................................. None
   wandb_project ................................... None
@@ -894,7 +894,7 @@
   wide_residual_streamwise_sigmoid_init_scale ..... 0.01
   window_attn_skip_freq ........................... None
   window_size ..................................... None
-  world_size ...................................... 32
+  world_size ...................................... 8
   yaml_cfg ........................................ None
   yarn_beta_fast .................................. None
   yarn_beta_slow .................................. None

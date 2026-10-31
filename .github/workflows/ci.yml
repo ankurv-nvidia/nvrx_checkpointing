@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  WHEEL_ARCH: x86_64
+
+jobs:
+  wheel-aarch64:
+    runs-on: [self-hosted, build]
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/github/tasks.sh wheel-aarch64
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel-aarch64
+          path: dist/
+          retention-days: 7
+
+  wheel-x86_64:
+    runs-on: [self-hosted, build]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/github/tasks.sh wheel
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-x86_64
+          path: |
+            dist/
+            dev_binaries/
+          retention-days: 7
+
+  wheel-pytest-x86_64:
+    needs: wheel-x86_64
+    runs-on: [self-hosted, build]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+      - run: ci/github/tasks.sh pytest
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: pytest-x86_64
+          path: ci/ci-results/pytest.xml
+          retention-days: 7
+
+  ctest-x86_64:
+    needs: wheel-x86_64
+    runs-on: [self-hosted, build]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+      - run: ci/github/tasks.sh ctest
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: ctest-x86_64
+          path: |
+            ci/ci-results/ctest.xml
+            ci/ci-results/*.log
+          retention-days: 7
+
+  # Pull requests from forks get no secrets, so they cannot submit to JET.
+  jet-gb200:
+    needs: wheel-aarch64
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: gb200
+      workloads: '["gb200-native-detr-pico-1x4", "gb200-native-perf-pico-1x4"]'
+      wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
+    secrets: inherit
+
+  # Each main build that passes every gate adds its wheels to the pip index on GitHub Pages.
+  publish-wheels:
+    needs: [wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: wheels
+      - run: python3 ci/github/publish_wheels.py wheels site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5

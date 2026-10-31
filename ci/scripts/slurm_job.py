@@ -384,7 +384,7 @@ def megatron_root() -> Path:
         root = Path(value).expanduser().resolve()
         if (root / ".git").exists():
             return root
-    out = subprocess.check_output(["bash", str(ENROOT_SCRIPTS_DIR / "megatron_root.sh")], text=True)  # noqa: S607
+    out = subprocess.check_output(["bash", str(ENROOT_SCRIPTS_DIR / "prepare.sh"), "megatron_root"], text=True)  # noqa: S607
     return Path(out.strip()).resolve()
 def platform_tag() -> str:
     return os.environ.get("PLATFORM", "").strip() or socket.gethostname().split(".")[0]
@@ -522,8 +522,11 @@ def _repo_sha() -> str:
 
 def _megatron_checkout(args: argparse.Namespace, commit: str | None = None) -> Path:
     """Where this run's Megatron-LM lives, keyed so runs of one commit share it."""
-    root = WORK_ROOT if WORK_ROOT is not None else REPO_ROOT / "workdir"
     revision = commit or args.megatron_commit or DEFAULT_MEGATRON_COMMIT
+    prepared_root = os.environ.get("JET_PREPARED_MEGATRON_ROOT", "").strip()
+    if prepared_root and revision == DEFAULT_MEGATRON_COMMIT:
+        return Path(prepared_root).expanduser().resolve()
+    root = WORK_ROOT if WORK_ROOT is not None else REPO_ROOT / "workdir"
     return root / f"deps/megatron-lm-{revision[:8]}"
 
 def _source_suffix(args: argparse.Namespace) -> str:
@@ -1225,9 +1228,14 @@ def _with_host_memory_metrics(metrics: dict, results_dir: Path, *, native: bool)
 
 class PerfReport:
     @staticmethod
-    def _platform_bandwidth_baseline(platform: str) -> int:
+    def _platform_bandwidth_baseline(platform: str) -> int | None:
         values = _load_yaml(BANDWIDTH_BASELINE_FILE)
         if platform not in values:
+            if os.environ.get("JET_BASELINE_BOOTSTRAP") == "1":
+                logger.warning(
+                    f"[baseline] {platform!r} has no bandwidth target; emitting a candidate without gating",
+                )
+                return None
             known = ", ".join(sorted(values))
             hint = (
                 " PLATFORM is unset, so this is the hostname; set it to the hardware "
@@ -1243,8 +1251,8 @@ class PerfReport:
         path = BASELINES_DIR / f"{stem}.yaml"
         baseline = dict(_load_yaml(path) if path.exists() else {})
         metrics = dict(baseline.get("metrics", {}))
-        if "nvrx" not in stem:
-            metrics.setdefault("bw_mbps", PerfReport._platform_bandwidth_baseline(platform_tag()))
+        if "nvrx" not in stem and (bandwidth := PerfReport._platform_bandwidth_baseline(platform_tag())) is not None:
+            metrics.setdefault("bw_mbps", bandwidth)
         baseline["metrics"] = metrics
         return baseline
 
@@ -1424,13 +1432,16 @@ def _arguments_stem(args: argparse.Namespace, variants: tuple[str, ...] | None =
         variants = next((spec.variants for spec in reversed(_run_specs(args)) if spec.variants), ())
     return f"{stem}-{'-'.join(variants)}" if variants else stem
 
+# Collective timeouts bound how long ranks wait for one another, not what a run trains on.
+_UNCOMPARED_ARGUMENTS = frozenset({"distributed_timeout_minutes"})
+
 def _compare_arguments(args: argparse.Namespace, log: Path, variants: tuple[str, ...] = ()) -> bool:
     """Report how the options this run trained on differ from the recorded ones.
 
     An option that changes changes what the run's checkpoints mean, so a run
-    that no longer trains on what was recorded reports every difference and
-    marks the job. The candidate beside this run's logs is what a reviewer
-    adopts to accept the change.
+    that no longer trains on what was recorded reports every difference,
+    records them beside the candidate, and marks the job. The candidate beside
+    this run's logs is what a reviewer adopts to accept the change.
     """
     stem = _arguments_stem(args, variants)
     candidate = log.parent / "baselines" / f"{stem}_arguments.txt"
@@ -1452,14 +1463,21 @@ def _compare_arguments(args: argparse.Namespace, log: Path, variants: tuple[str,
             logger.warning(f"[slurm_job:args] WARNING {stem}: no options read from the {name} arguments in {path}")
             return False
     differences = [
-        f"{name}: {expected.get(name, '<unset>')} -> {produced.get(name, '<unset>')}"
-        for name in sorted(expected.keys() | produced.keys())
+        {"option": name, "recorded": expected.get(name, "<unset>"), "run": produced.get(name, "<unset>")}
+        for name in sorted((expected.keys() | produced.keys()) - _UNCOMPARED_ARGUMENTS)
         if expected.get(name) != produced.get(name)
     ]
     for difference in differences:
-        logger.warning(f"[slurm_job:args] WARNING {stem} {difference}")
+        logger.warning(
+            f"[slurm_job:args] WARNING {stem} {difference['option']}: {difference['recorded']} -> {difference['run']}",
+        )
     report = logger.warning if differences else logger.info
     report(f"[slurm_job:args] {stem}: {len(differences)} of {len(expected)} options differ from the recorded run")
+    record = candidate.with_name(f"{stem}_arguments_differences.json")
+    if differences:
+        record.write_text(json.dumps(differences, indent=2))
+    else:
+        record.unlink(missing_ok=True)
     return not differences
 
 # The line may carry a timestamp or stream prefix from the log reader, so
@@ -1588,10 +1606,10 @@ def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tup
     arguments.write_text("\n".join(line.rstrip() for line in lines if not volatile.match(line)) + "\n")
     return arguments
 
-def _argument_log(_args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
+def _argument_log(args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
     """Return the rank-0 log containing a particular run's argument blocks."""
     cfg = f"{spec.args.config}_{spec.args.nodes}x{spec.args.gpus_per_node}"
-    run_root = batch_log.parent.parent
+    run_root = getattr(args, "run_root", None) or batch_log.parent.parent
     run = run_root / _run_dir_name(spec) if spec.name else run_root
     return run / "logs" / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
 
@@ -2770,6 +2788,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             expected_checkpoints = args.checkpoints_per_run
         if checkpoints_override is not None:
             expected_checkpoints = checkpoints_override
+        cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
+        # The trainer environment consumes the cycle-specific daemon log path.
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
         cmd, env = _phase_command(
             cfg,
             args,
@@ -2782,10 +2803,6 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         resume_iteration = checkpoints_override = None
         rank = _rank_env("SLURM_PROCID", "RANK", "0")
         log = RESULTS_DIR / f"{cfg}_{label}-routine_rank{rank}.log" if label else None
-        cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
-        server_log = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
-        os.environ["NATIVE_CKPT_SERVER_LOG"] = server_log
-        env["NATIVE_CKPT_SERVER_LOG"] = server_log
         otel_cycle_dir = RESULTS_DIR / "otel" / cycle_tag
         otel_cycle_dir.mkdir(parents=True, exist_ok=True)
         otel_file = otel_cycle_dir / "native_ckpt_otel.jsonl"
@@ -3573,7 +3590,8 @@ def _worker(args: argparse.Namespace) -> None:
         # auto-launched the checkpoint daemon; the leftover belongs to this run,
         # so terminate it instead of refusing to start.
         CHECKPOINT_SERVER.terminate()
-    else:
+    # JET preflights the node before starting worker ranks.
+    elif os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
         CHECKPOINT_SERVER.require_stopped()
     try:
         _perform_runs(cfg, args)
@@ -3872,7 +3890,8 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
             f"MEGATRON_COMMIT={toolchain.megatron_commit}",
             f"MEGATRON_REPO_URL={toolchain.megatron_url}",
             "bash",
-            str(ENROOT_SCRIPTS_DIR / "megatron_root.sh"),
+            str(ENROOT_SCRIPTS_DIR / "prepare.sh"),
+            "megatron_root",
             str(toolchain.megatron_root),
         ]
         for toolchain in megatron_sources.values()
@@ -4207,6 +4226,7 @@ def _epilog(argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = _parser()
     parser.add_argument("--log-file", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path)
     parser.add_argument("--baseline-json", required=True)
     args, args.extra_args = _parse_args(parser, argv)
     args.flavors = FlavorSelection(args.flavor)

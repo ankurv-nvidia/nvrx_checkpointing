@@ -49,7 +49,7 @@ else
 fi
 
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
-MEGATRON_ROOT=$(${SCRIPT_DIR}/../megatron_root.sh)
+MEGATRON_ROOT=$(bash ${SCRIPT_DIR}/../prepare.sh megatron_root)
 ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../nemotron6-base.sqsh}
 ENROOT_IMAGE_OUT=${ENROOT_IMAGE_OUT:-${MEGATRON_ROOT}/../nemotron6-native.sqsh}
 RUN_DIR="${MEGATRON_ROOT}/../run_${RUN_TAG}"
