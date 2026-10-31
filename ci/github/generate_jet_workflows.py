@@ -78,6 +78,20 @@ jobs:
       wheel-{architecture}-artifact-id: ${{{{ needs.wheel.outputs.artifact-id }}}}
     secrets:
       JET_GITLAB_TOKEN: ${{{{ secrets.JET_GITLAB_TOKEN }}}}
+
+  perf-report:
+    needs: jet
+    if: ${{{{ !cancelled() }}}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+      - run: python3 ci/github/perf_report.py summary reports
 """
 
 def platforms() -> list[JetPlatform]:

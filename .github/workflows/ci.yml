@@ -159,6 +159,21 @@ jobs:
     secrets:
       JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
+  # Collects every workload's report and fails when any missed its baselines; the gate does not wait on it.
+  perf-report:
+    needs: [changes, jet-gb200, jet-gb300, jet-h100, jet-b200]
+    if: ${{ !cancelled() && needs.changes.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+      - run: python3 ci/github/perf_report.py summary reports
+
   # Pull requests require this one check, so the jobs behind it can change freely.
   gate:
     needs: [changes, wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200, jet-gb300, jet-h100, jet-b200]

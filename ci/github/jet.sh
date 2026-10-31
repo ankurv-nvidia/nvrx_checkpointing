@@ -47,8 +47,10 @@ workload() {
     export "JET_IMAGE_TAG_${JET_PLATFORM^^}=${JET_IMAGE_TAG:?}"
     setup
     "${python}" ci/jet/submit_workload.py --platform "${JET_PLATFORM}" --workload "${JET_WORKLOAD:?}" || rc=$?
+    python3 ci/github/perf_report.py workload "${JET_WORKLOAD}" jet-results "${rc}" jet-report \
+        || echo "::warning::could not write the ${JET_WORKLOAD} report"
+    # A missed baseline fails the run's perf report job instead of this job.
     if (( rc == soft_failure )); then
-        python3 ci/github/perf_warning.py "${JET_WORKLOAD}" jet-results
         rc=0
     fi
     return "${rc}"

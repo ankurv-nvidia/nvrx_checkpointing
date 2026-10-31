@@ -77,3 +77,10 @@ jobs:
           path: jet-results/
           if-no-files-found: ignore
           retention-days: 30
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-${{ matrix.workload }}
+          path: jet-report/
+          if-no-files-found: ignore
+          retention-days: 30
