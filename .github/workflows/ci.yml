@@ -17,7 +17,39 @@ env:
   WHEEL_ARCH: x86_64
 
 jobs:
+  # Self-hosted runners build only this repository's branches, and only changes beyond the documentation.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      fork: ${{ steps.classify.outputs.fork }}
+      build: ${{ steps.classify.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          echo "fork=${FORK}" >> "$GITHUB_OUTPUT"
+          if [[ ${FORK} == true ]]; then
+              build=false
+          elif [[ ${EVENT} == workflow_dispatch ]] || ! changed=$(git diff --name-only "${BASE}" HEAD); then
+              build=true
+          elif grep -qvE '\.md$|^docs/' <<< "${changed}"; then
+              build=true
+          else
+              build=false
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "fork=${FORK} build=${build}"
+
   wheel-aarch64:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: [self-hosted, build]
     timeout-minutes: 180
     outputs:
@@ -33,6 +65,8 @@ jobs:
           retention-days: 7
 
   wheel-x86_64:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: [self-hosted, build]
     timeout-minutes: 180
     outputs:
@@ -85,10 +119,8 @@ jobs:
             ci/ci-results/*.log
           retention-days: 7
 
-  # Pull requests from forks get no secrets, so they cannot submit to JET.
   jet-gb200:
     needs: wheel-aarch64
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/jet.yml
     with:
       platform: gb200
@@ -99,7 +131,6 @@ jobs:
 
   jet-gb300:
     needs: wheel-aarch64
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/jet.yml
     with:
       platform: gb300
@@ -110,7 +141,6 @@ jobs:
 
   jet-h100:
     needs: wheel-x86_64
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/jet.yml
     with:
       platform: h100
@@ -121,7 +151,6 @@ jobs:
 
   jet-b200:
     needs: wheel-x86_64
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/jet.yml
     with:
       platform: b200
