@@ -621,6 +621,73 @@ def _clear_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+_MOUNTS = "  --container-mounts=${home}:${home},${root}:/root,/shared:/shared\n"
+_CLUSTER_TEMPLATES = {
+    # A fixed batch partition with per-node GPU requests.
+    "batch": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=batch\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --gpus-per-node=${gpus_per_node}\n  --mem=0\n  --job-name=${job_name}\n"
+            f"  --container-image=${{image}}\n{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=batch\n  --time=00:${time_minutes}:00\n  --mem=0\n"
+            f"  --gpus-per-node=${{gpus_per_node}}\n{_MOUNTS}  --container-image=${{image_base}}\n"
+            "  --container-save=${image_out}\n  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=batch\n  --gpus-per-node=${gpus_per_node}\n"
+            "  --time=00:${time_minutes}:00\n  --mem=0\n"
+        ),
+    },
+    # An interactive partition that also requests the job's total GPUs.
+    "interactive": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=interactive\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --gpus=${total_gpus}\n  --gpus-per-node=${gpus_per_node}\n  --mem=0\n"
+            f"  --job-name=${{job_name}}\n  --container-image=${{image}}\n{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=interactive\n  --time=00:${time_minutes}:00\n"
+            f"  --mem=0\n  --gpus-per-node=${{gpus_per_node}}\n{_MOUNTS}  --container-image=${{image_base}}\n"
+            "  --container-save=${image_out}\n  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=interactive\n  --time=00:${time_minutes}:00\n"
+            "  --mem=0\n  --gpus-per-node=${gpus_per_node}\n"
+        ),
+    },
+    # Partitions named after the platform.
+    "platform": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=${partition}\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --mem=0\n  --job-name=${job_name}\n  --container-image=${image}\n"
+            f"{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=${partition}\n  --time=00:${time_minutes}:00\n"
+            f"  --mem=0\n  --nodes=1\n{_MOUNTS}  --container-image=${{image_base}}\n  --container-save=${{image_out}}\n"
+            "  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=${partition}\n  --time=00:${time_minutes}:00\n  --mem=0\n"
+        ),
+    },
+}
+
+
+def _use_cluster(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shape: str = "batch") -> str:
+    """Install one shape of cluster templates where the runner looks for them and select that cluster."""
+    cluster = f"{shape}-cluster"
+    directory = tmp_path / "cluster-templates"
+    directory.mkdir(exist_ok=True)
+    for name, text in _CLUSTER_TEMPLATES[shape].items():
+        (directory / f"{cluster}.{name}").write_text(text)
+    monkeypatch.setenv("CI_DIR", str(directory))
+    monkeypatch.setenv("CLUSTER", cluster)
+    return cluster
+
+
 def test_worker_tmpdir_uses_short_container_path(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_PROCID", "7")
@@ -842,24 +909,24 @@ def test_the_run_settings_can_be_argued_or_exported(monkeypatch: pytest.MonkeyPa
     # Named on the command line, with nothing in the environment.
     for name in ("PLATFORM", "CLUSTER", "SLURM_ACCOUNT"):
         monkeypatch.delenv(name, raising=False)
-    assert settle(["--platform", "gb200", "--cluster", "awscmh", "--slurm-account", "acct"]) == {
+    assert settle(["--platform", "gb200", "--cluster", "cluster-a", "--slurm-account", "acct"]) == {
         "PLATFORM": "gb200",
-        "CLUSTER": "awscmh",
+        "CLUSTER": "cluster-a",
         "SLURM_ACCOUNT": "acct",
     }
     assert slurm_job.platform_tag() == "gb200"
-    assert slurm_job.cluster_tag() == "awscmh"
+    assert slurm_job.cluster_tag() == "cluster-a"
 
     # An environment that already carries them still works without arguments.
     monkeypatch.setenv("PLATFORM", "h100")
-    monkeypatch.setenv("CLUSTER", "lyris")
+    monkeypatch.setenv("CLUSTER", "cluster-b")
     monkeypatch.setenv("SLURM_ACCOUNT", "from-env")
-    assert settle([]) == {"PLATFORM": "h100", "CLUSTER": "lyris", "SLURM_ACCOUNT": "from-env"}
+    assert settle([]) == {"PLATFORM": "h100", "CLUSTER": "cluster-b", "SLURM_ACCOUNT": "from-env"}
 
     # An argument wins over the environment, as every other option does.
     assert settle(["--platform", "gb200", "--slurm-account", "argued"]) == {
         "PLATFORM": "gb200",
-        "CLUSTER": "lyris",
+        "CLUSTER": "cluster-b",
         "SLURM_ACCOUNT": "argued",
     }
 
@@ -1085,7 +1152,7 @@ def test_nvrx_repo_root_selects_source_checkout(monkeypatch: pytest.MonkeyPatch,
     nvrx = tmp_path / "sources" / "nvidia-resiliency-ext"
     monkeypatch.setenv("NVRX_REPO_ROOT", str(nvrx))
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path)
 
@@ -2546,7 +2613,7 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, checkpoints_per_run=6, repeat=2, time_minutes=240)
     slurm_job._configure_run(args)
@@ -2574,14 +2641,14 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     assert reproducer.count("--kill-on-bad-exit=1") == len(("allocation-epilog", "prepare", "train"))
 
 
-def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
+def test_ultra_fp8_determinism_keeps_the_template_partition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "awscmh")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, flavors=["detr"])
     slurm_job._configure_run(args)
@@ -2600,14 +2667,14 @@ def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
     assert "batch_long" not in reproducer
 
 
-def test_awscmh_ultra_fp8_perf_keeps_default_partition(
+def test_ultra_fp8_perf_keeps_the_template_partition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "awscmh")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path)
     slurm_job._configure_run(args)
@@ -2713,7 +2780,7 @@ def test_clean_run_intent_is_reproducible_from_sbatch(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, clean_run=True, job_array_segment=0)
     slurm_job._configure_run(args)
@@ -2747,7 +2814,7 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("NVRX_COMMIT", "a" * 40)
     monkeypatch.setenv("CI_PIPELINE_ID", "98765")
@@ -2834,7 +2901,7 @@ def test_job_array_passes_the_worker_script_directly_to_ft_launcher(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "ocihsg")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
     slurm_job._configure_run(args)
@@ -2861,7 +2928,7 @@ def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
 
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "ocihsg")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16")
     slurm_job._configure_run(args)
@@ -2891,16 +2958,14 @@ def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
     assert "#SBATCH --array=" not in classic
 
 
-@pytest.mark.parametrize("cluster", ["cwdfw", "cwpdx"])
 def test_job_array_steps_request_only_segment_gpus(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    cluster: str,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
     slurm_job._configure_run(args)
@@ -2925,7 +2990,7 @@ def test_manual_training_environment_override_is_reproduced(monkeypatch: pytest.
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
     args = _args(tmp_path, nodes=8, config="nano3", flavors=[])
@@ -2944,7 +3009,7 @@ def test_ci_default_job_name_is_keyed_by_job_id(monkeypatch: pytest.MonkeyPatch,
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("CI_PIPELINE_ID", "98765")
     monkeypatch.setenv("CI_JOB_ID", "12345")
@@ -2961,7 +3026,7 @@ def test_ci_default_job_name_is_keyed_by_job_id(monkeypatch: pytest.MonkeyPatch,
 def test_srun_output_is_redirected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     log = tmp_path / "run.log"
 
     cmd = slurm_job.build_srun_cmd(
@@ -2982,14 +3047,14 @@ def test_srun_output_is_redirected(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 
 @pytest.mark.parametrize("platform", ["gb200", "gb300"])
-def test_lyris_templates_select_the_platform_partition(
+def test_platform_named_partitions_follow_the_platform(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     platform: str,
 ) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "lyris")
+    _use_cluster(monkeypatch, tmp_path, "platform")
     monkeypatch.setenv("PLATFORM", platform)
 
     values = slurm_job._slurm_values(
@@ -3015,12 +3080,12 @@ def test_lyris_templates_select_the_platform_partition(
 @pytest.mark.parametrize(
     "case",
     [
-        ("cwdfw", 1, None, None),
-        ("lyris", 2, None, None),
-        ("ocihsg", 8, None, None),
-        ("ocihsg", 16, None, "16"),
-        ("cwdfw", 64, None, "16"),
-        ("lyris", 2, "8", "8"),
+        ("interactive", 1, None, None),
+        ("platform", 2, None, None),
+        ("batch", 8, None, None),
+        ("batch", 16, None, "16"),
+        ("interactive", 64, None, "16"),
+        ("platform", 2, "8", "8"),
     ],
 )
 def test_sbatch_segment_matches_allocation(
@@ -3028,10 +3093,10 @@ def test_sbatch_segment_matches_allocation(
     tmp_path: Path,
     case: tuple[str, int, str | None, str | None],
 ) -> None:
-    cluster, nodes, override, expected = case
+    shape, nodes, override, expected = case
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, shape)
     if override is None:
         monkeypatch.delenv("SLURM_SEGMENT", raising=False)
     else:
@@ -3066,15 +3131,10 @@ def test_prepare_image_template_api_is_available(monkeypatch: pytest.MonkeyPatch
     assert cmd == ["srun", "--nodes=2", "echo", "ready"]
 
 
-def test_shipped_clusters_have_complete_template_sets() -> None:
-    expected = {"srun.tmpl", "enroot_import.tmpl", "image_prep.tmpl"}
+def test_the_example_template_set_is_complete() -> None:
     templates = {path.name for path in (REPO_ROOT / "ci/templates").glob("*.tmpl")}
-    clusters = {name.split(".", 1)[0] for name in templates}
 
-    assert clusters == {"awscmh", "cwdfw", "cwpdx", "lyris", "ocihsg"}
-    assert all(
-        {name.removeprefix(f"{cluster}.") for name in templates if name.startswith(f"{cluster}.")} == expected for cluster in clusters
-    )
+    assert templates == {"example.srun.tmpl", "example.enroot_import.tmpl", "example.image_prep.tmpl"}
 
 
 def test_shipped_image_templates_name_their_partition(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3109,17 +3169,14 @@ def test_missing_cluster_template_has_no_default_fallback(monkeypatch: pytest.Mo
         slurm_job._load_template("srun.tmpl")
 
 
-@pytest.mark.parametrize(
-    ("cluster", "partition"),
-    [("awscmh", "batch"), ("cwdfw", "interactive")],
-)
+@pytest.mark.parametrize("shape", ["batch", "interactive"])
 def test_enroot_import_requests_runner_gpus(
     monkeypatch: pytest.MonkeyPatch,
-    cluster: str,
-    partition: str,
+    tmp_path: Path,
+    shape: str,
 ) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, shape)
 
     cmd = slurm_job.build_cmd_from_template(
         "enroot_import.tmpl",
@@ -3128,20 +3185,7 @@ def test_enroot_import_requests_runner_gpus(
     )
 
     assert "--gpus-per-node=4" in cmd
-    assert f"--partition={partition}" in cmd
-
-
-@pytest.mark.parametrize("name", ["enroot_import.tmpl", "image_prep.tmpl"])
-def test_ocihsg_image_build_requests_gpus_per_node(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> None:
-    slurm_job = _load_slurm_job()
-    monkeypatch.setenv("CI_DIR", str(tmp_path))
-    monkeypatch.setenv("CLUSTER", "ocihsg")
-
-    cmd = slurm_job.build_cmd_from_template(name, {"account": "account", "time_minutes": 20, "gpus_per_node": 4}, [])
-
-    assert "--gpus-per-node=4" in cmd
-    # The OCI-HSG NVL72 policy rejects job-scoped GPU requests.
-    assert not any(token.startswith("--gpus=") for token in cmd)
+    assert f"--partition={shape}" in cmd
 
 
 def test_image_build_runs_templated_prepare_command(
@@ -3539,7 +3583,7 @@ def test_training_is_teed_without_a_postprocess_step(monkeypatch: pytest.MonkeyP
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     slurm_job._configure_run(_args(tmp_path))
 

@@ -763,8 +763,7 @@ def _slurm_values(
         "job_name": job_name,
         "image": image,
         "container_env": container_env,
-        # Lyris names its hardware partitions after the platform. Other
-        # cluster templates do not consume this value.
+        # Templates that name their partitions after the platform read this value.
         "partition": platform_tag(),
         "gpus_per_node": gpus_per_node,
         "total_gpus": total_gpus,
@@ -4094,11 +4093,11 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   # One training process checkpoints indefinitely within a four-hour allocation.
-  slurm_job.py pretrain-native --config nano3 --nodes 4 --work-dir /lustre/runs \\
+  slurm_job.py pretrain-native --config nano3 --nodes 4 --work-dir /shared/runs \\
     --clean-run --checkpoints-per-run 0 --time-minutes 240 --background
 
   # Restart after each default three-checkpoint cycle on the same allocation.
-  slurm_job.py pretrain-native --config nano3 --nodes 4 --work-dir /lustre/runs \\
+  slurm_job.py pretrain-native --config nano3 --nodes 4 --work-dir /shared/runs \\
     --clean-run --repeat 0 --time-minutes 240 --background
 """,
     )

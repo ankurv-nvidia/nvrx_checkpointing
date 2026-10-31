@@ -1,3 +1,4 @@
+# Copy into the runner's template directory under the cluster's name and adapt the partition and mounts.
 srun
   --account=${account}
   --partition=batch
@@ -8,5 +9,5 @@ srun
   --mem=0
   --job-name=${job_name}
   --container-image=${image}
-  --container-mounts=${home}:${home},${root}:/root,/lustre:/lustre
+  --container-mounts=${home}:${home},${root}:/root
   --container-env=${container_env}
