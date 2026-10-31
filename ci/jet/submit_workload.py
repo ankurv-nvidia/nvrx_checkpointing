@@ -38,12 +38,7 @@ LOG_WAIT_SECONDS = 600
 TERMINAL_STATUSES = frozenset({"success", "failed", "canceled", "skipped"})
 TRACE_STATUSES = frozenset({"running", "success", "failed", "canceled"})
 WORKLOAD_PHASE = 2
-WHEEL_VARIABLES = (
-    "UPSTREAM_WHEEL_X86_64_ARTIFACT_ID",
-    "UPSTREAM_WHEEL_VALGRIND_X86_64_ARTIFACT_ID",
-    "UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID",
-    "UPSTREAM_WHEEL_VALGRIND_AARCH64_ARTIFACT_ID",
-)
+WHEEL_VARIABLES = ("UPSTREAM_WHEEL_X86_64_ARTIFACT_ID", "UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID")
 JOB_NAME = re.compile(r"^(?P<key>(?:build|recipe)/\S+) .*? \d+ \[(?P<phase>\d+) [^]]+]$")
 OTHER_RANK = re.compile(r"^(?:\x1b\[[0-9;]*[A-Za-z])*[1-9]\d*: ")
 SIGNIFICANT = re.compile(r"Traceback|Error|FAIL|PASS|WARNING|\[slurm_job|\[jet\]|\[native_ckpt:run\]|differences")

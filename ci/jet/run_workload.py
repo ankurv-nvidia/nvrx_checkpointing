@@ -417,7 +417,7 @@ def finalize(workload_argv: list[str], assets_dir: Path) -> int:
     """Finalize synchronized rank outputs from JET's per-rank teardown tasks."""
     args = runtime.parse_args(workload_argv)
     runtime.configure(args)
-    state = runtime.require_prepared(args)
+    state = runtime.require_prepared()
     run_root = slurm_job.RUN_ROOT
     if run_root is None:
         raise RuntimeError("run directory is not configured")
@@ -468,7 +468,7 @@ def coordinated_finalize(workload_argv: list[str], assets_dir: Path) -> int:
     """Elect one surviving rank to finalize and publish its result to every rank."""
     args = runtime.parse_args(workload_argv)
     runtime.configure(args)
-    runtime.require_prepared(args)
+    runtime.require_prepared()
     run_root = slurm_job.RUN_ROOT
     if run_root is None:
         raise RuntimeError("run directory is not configured")
@@ -516,7 +516,7 @@ def main() -> int:
         tee = Tee(sys.stdout, output)
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             try:
-                runtime.require_prepared(args)
+                runtime.require_prepared()
                 inventory = runtime.inventory(args)
                 _coordinate_server_preflight(args)
                 slurm_job._worker(args)

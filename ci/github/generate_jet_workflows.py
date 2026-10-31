@@ -76,14 +76,8 @@ jobs:
       platform: {platform}
       workloads: ${{{{ needs.select.outputs.workloads }}}}
       wheel-{architecture}-artifact-id: ${{{{ needs.wheel.outputs.artifact-id }}}}
-{valgrind_wheel}    secrets: inherit
+    secrets: inherit
 """
-
-VALGRIND_WHEEL = """\
-      # Valgrind workloads run the standard wheel with valgrind runtime settings.
-      wheel-valgrind-{architecture}-artifact-id: ${{{{ needs.wheel.outputs.artifact-id }}}}
-"""
-
 
 def platforms() -> list[JetPlatform]:
     """JET platforms that have at least one supported workload."""
@@ -105,12 +99,10 @@ def render(platform: JetPlatform) -> str:
     if len(selected) > MAX_INPUTS:
         raise ValueError(f"{platform.name} has {len(selected)} workloads; a manual-run form holds at most {MAX_INPUTS}")
     inputs = "".join(INPUT.format(key=workload.display_name, suite=workload.pipeline_suite) for workload in selected)
-    valgrind = any("vg" in workload.flavors for workload in selected)
     jobs = JOBS.format(
         platform=platform.name,
         architecture=platform.architecture,
         wheel_task=WHEEL_TASKS[platform.architecture],
-        valgrind_wheel=VALGRIND_WHEEL.format(architecture=platform.architecture) if valgrind else "",
     )
     return HEADER.format(platform=platform.name) + inputs + jobs
 

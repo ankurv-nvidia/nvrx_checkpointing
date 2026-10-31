@@ -64,6 +64,4 @@ jobs:
       platform: h100
       workloads: ${{ needs.select.outputs.workloads }}
       wheel-x86_64-artifact-id: ${{ needs.wheel.outputs.artifact-id }}
-      # Valgrind workloads run the standard wheel with valgrind runtime settings.
-      wheel-valgrind-x86_64-artifact-id: ${{ needs.wheel.outputs.artifact-id }}
     secrets: inherit

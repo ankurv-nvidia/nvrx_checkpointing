@@ -55,11 +55,6 @@ def wheel_arch() -> str:
     return os.environ.get("WHEEL_ARCH") or platform.machine()
 
 
-def wheel_variant() -> str:
-    """Build variant selected by the current workload."""
-    return os.environ.get("WHEEL_VARIANT", "normal").strip() or "normal"
-
-
 def _find_local_wheel(dist_dir: Path) -> Path | None:
     """Newest wheel in dist_dir whose platform tag matches this arch."""
     if not dist_dir.is_dir():
@@ -98,8 +93,7 @@ def _artifact_download_url(repository: str, artifact_id: str, token: str) -> str
 
 def fetch_upstream_wheel(dest_dir: Path | None = None) -> Path:
     """Download this architecture's wheel from an exact upstream CI wheel artifact."""
-    variant_segment = "" if wheel_variant() == "normal" else f"{wheel_variant().upper()}_"
-    artifact_var = f"UPSTREAM_WHEEL_{variant_segment}{wheel_arch().upper().replace('-', '_')}_ARTIFACT_ID"
+    artifact_var = f"UPSTREAM_WHEEL_{wheel_arch().upper().replace('-', '_')}_ARTIFACT_ID"
     artifact_id = os.environ.get(artifact_var, "")
     repository = os.environ.get("UPSTREAM_PROJECT_PATH", "")
     token = os.environ.get("NVRX_GITHUB_TOKEN", "")
@@ -207,7 +201,6 @@ def _pip_install(whl: Path) -> None:
             check=True,
         )
         (staging / ".nvrx-checkpointing-commit").write_text(f"{source_revision()}\n")
-        (staging / ".nvrx-checkpointing-variant").write_text(f"{wheel_variant()}\n")
         shutil.rmtree(target, ignore_errors=True)
         staging.replace(target)
         importlib.invalidate_caches()
@@ -261,7 +254,7 @@ def require_prebuilt_wheel(
     """Install the exact selected wheel or fail without a source-build fallback."""
     if not install_prebuilt_wheel(dist_dir, probe=probe):
         raise RuntimeError(
-            f"required {wheel_variant()} {wheel_arch()} wheel for {source_revision()} is unavailable from {dist_dir}",
+            f"required {wheel_arch()} wheel for {source_revision()} is unavailable from {dist_dir}",
         )
 
 
@@ -272,10 +265,6 @@ def _binaries_installed() -> bool:
         return False
     marker = target / ".nvrx-checkpointing-commit"
     if not marker.is_file() or marker.read_text().strip() != source_revision():
-        return False
-    variant_marker = target / ".nvrx-checkpointing-variant"
-    installed_variant = variant_marker.read_text().strip() if variant_marker.is_file() else "normal"
-    if installed_variant != wheel_variant():
         return False
     root = target / "nvrx_checkpointing"
     return all((root / name).is_file() for name in _WHEEL_BINARIES)
@@ -363,7 +352,7 @@ def report_install() -> None:
         raise RuntimeError(f"nvrx_checkpointing native binaries are missing: {', '.join(missing)}")
     logger.info(
         f"[wheel] nvrx_checkpointing distribution={distribution.version} commit={source_revision()} "
-        f"arch={wheel_arch()} variant={wheel_variant()} module={spec.origin} "
+        f"arch={wheel_arch()} module={spec.origin} "
         f"shlib={binaries[0]} server={binaries[1]}",
     )
 
@@ -377,7 +366,6 @@ def main() -> None:
         action="store_true",
         help="Download this architecture's wheel artifact from the upstream CI wheel job",
     )
-    p.add_argument("--variant", default=None, help="Select a wheel build variant")
     p.add_argument(
         "--ensure-prebuilt",
         action="store_true",
@@ -402,8 +390,6 @@ def main() -> None:
         help="Export KEY=VALUE before acting — carries the flavor build env into the source build on argv",
     )
     args = p.parse_args()
-    if args.variant:
-        os.environ["WHEEL_VARIANT"] = args.variant
     for define in args.define:
         key, _, value = define.partition("=")
         os.environ[key] = value

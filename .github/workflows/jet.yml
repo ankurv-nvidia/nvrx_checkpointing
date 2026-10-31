@@ -17,12 +17,6 @@ on:
       wheel-x86_64-artifact-id:
         type: string
         default: ""
-      wheel-valgrind-aarch64-artifact-id:
-        type: string
-        default: ""
-      wheel-valgrind-x86_64-artifact-id:
-        type: string
-        default: ""
     secrets:
       JET_GITLAB_TOKEN:
         required: true
@@ -36,8 +30,6 @@ env:
   JET_CLUSTERS: ${{ vars.JET_CLUSTERS }}
   UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID: ${{ inputs.wheel-aarch64-artifact-id }}
   UPSTREAM_WHEEL_X86_64_ARTIFACT_ID: ${{ inputs.wheel-x86_64-artifact-id }}
-  UPSTREAM_WHEEL_VALGRIND_AARCH64_ARTIFACT_ID: ${{ inputs.wheel-valgrind-aarch64-artifact-id }}
-  UPSTREAM_WHEEL_VALGRIND_X86_64_ARTIFACT_ID: ${{ inputs.wheel-valgrind-x86_64-artifact-id }}
 
 jobs:
   image:

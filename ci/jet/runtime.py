@@ -100,11 +100,6 @@ def _reset_stale_outputs(args: argparse.Namespace) -> None:
     slurm_job.RESULTS_DIR.mkdir(parents=True)
 
 
-def wheel_variant(args: argparse.Namespace) -> str:
-    """Select the native binary variant required by a workload."""
-    return "valgrind" if "vg" in args.flavors.names else "normal"
-
-
 def _verify_architecture() -> None:
     expected = os.environ.get("WHEEL_ARCH", "").strip()
     actual = platform.machine()
@@ -112,15 +107,12 @@ def _verify_architecture() -> None:
         raise RuntimeError(f"JET image architecture mismatch: expected {expected}, found {actual}")
 
 
-def _install_wheel(args: argparse.Namespace) -> None:
-    variant = wheel_variant(args)
-    os.environ["WHEEL_VARIANT"] = variant
-    root = Path(os.environ.get("JET_PREBUILT_WHEEL_DIR", "/opt/nvrx-wheels"))
-    variant_root = root / variant
-    variant_root.mkdir(parents=True, exist_ok=True)
-    if not any(variant_root.glob("*.whl")):
-        wheel_install.fetch_upstream_wheel(variant_root)
-    wheel_install.require_prebuilt_wheel(variant_root, probe=False)
+def _install_wheel() -> None:
+    root = Path(os.environ["JET_PREBUILT_WHEEL_DIR"])
+    root.mkdir(parents=True, exist_ok=True)
+    if not any(root.glob("*.whl")):
+        wheel_install.fetch_upstream_wheel(root)
+    wheel_install.require_prebuilt_wheel(root, probe=False)
     wheel_install.report_install()
 
 
@@ -143,7 +135,7 @@ def prepare(args: argparse.Namespace) -> Path:
     # Single-task setup resets the exact workload paths before GPU ranks start.
     _reset_stale_outputs(args)
     _verify_architecture()
-    _install_wheel(args)
+    _install_wheel()
     _install_nvrx(args)
     if slurm_job.RUN_ROOT is None:
         raise RuntimeError("run directory is not configured")
@@ -155,7 +147,6 @@ def prepare(args: argparse.Namespace) -> Path:
         "platform": slurm_job.platform_tag(),
         "architecture": platform.machine(),
         "source_revision": wheel_install.source_revision(),
-        "wheel_variant": wheel_variant(args),
     }
     prepared = slurm_job.RUN_ROOT / ".jet-prepared.json"
     prepared.write_text(json.dumps(state, indent=2))
@@ -164,7 +155,7 @@ def prepare(args: argparse.Namespace) -> Path:
     return prepared
 
 
-def require_prepared(args: argparse.Namespace) -> dict:
+def require_prepared() -> dict:
     """Validate the preparation marker before a GPU rank starts."""
     if slurm_job.RUN_ROOT is None:
         raise RuntimeError("run directory is not configured")
@@ -176,7 +167,6 @@ def require_prepared(args: argparse.Namespace) -> dict:
         "platform": slurm_job.platform_tag(),
         "architecture": platform.machine(),
         "source_revision": wheel_install.source_revision(),
-        "wheel_variant": wheel_variant(args),
     }
     if state != expected:
         raise RuntimeError(f"JET preparation state mismatch: expected {expected}, found {state}")
