@@ -1,19 +1,18 @@
 ---
 name: native-perf-baselines
-description: Reseed the native checkpoint CI performance baselines until the perf/ckptbench jobs go green, and diagnose run-to-run perf variance with per-rank NUMA analysis. Covers the GitLab pipeline access, the baseline-file mechanism, the iterate-by-sampling loop, and the per-rank socket/NUMA breakdown.
-when_to_use: A native CI pipeline has yellow/exit-3 perf-drift warnings on gb200/h100/devbox ckptbench or pretrain-native:perf jobs and you want to reseed baselines; the user asks to "fix the perf baselines", "reseed baselines", "make the perf jobs green", "update_baselines"; the user asks why a perf number swings run-to-run or wants a per-rank / NUMA breakdown of bw_mbps; mentions gitlab-master pipeline + perf baseline mismatch.
+description: Reseed the native checkpoint CI performance baselines until the JET perf workloads stop missing them, and diagnose run-to-run perf variance with per-rank NUMA analysis. Covers where JET runs report their metrics, the baseline-file mechanism, the iterate-by-sampling loop, and the per-rank socket/NUMA breakdown.
+when_to_use: A GitHub CI or JET form run has a failing perf report or missed-baseline warnings on gb200/gb300/h100/b200 perf or DETR workloads and you want to reseed baselines; the user asks to "fix the perf baselines", "reseed baselines", "make the perf jobs green"; the user asks why a perf number swings run-to-run or wants a per-rank / NUMA breakdown of bw_mbps.
 ---
 
 # Native Perf Baselines — reseed & NUMA diagnosis
 
-Reseed the `ci/baselines/*.yaml` perf baselines so the ckptbench /
-`pretrain-native:perf` jobs stop tripping the non-blocking exit-3 perf-drift
-check. Also: diagnose run-to-run variance by breaking the aggregate `bw_mbps`
+Reseed the `ci/baselines/*.yaml` perf baselines so the JET workloads stop
+missing them. Also: diagnose run-to-run variance by breaking the aggregate `bw_mbps`
 into its per-rank samples and per-NUMA-socket groups.
 
-**Trigger prompt to remember:** _"Reseed the native perf baselines for pipeline
+**Trigger prompt to remember:** _"Reseed the native perf baselines for run
 &lt;url&gt; — iterate to green, no widening tolerances, and do the per-rank
-NUMA analysis."_ (URL optional; default to the latest pipeline on `ankurv/main`.)
+NUMA analysis."_ (URL optional; default to the latest pull-request CI run.)
 
 ## Hard rules (from the user)
 
@@ -33,75 +32,61 @@ NUMA analysis."_ (URL optional; default to the latest pipeline on `ankurv/main`.
      `wr_tnsr_us` (anchor to its min) are anti-correlated, so prefer the
      metric whose low-side false alarm you most want to avoid rather than
      min-anchoring both at once.
-3. **Run ONE pipeline at a time.** Wait for the current pipeline to finish
-   before starting another. Overlapping pipelines contend for storage IO on
-   the shared runners and produce false slow-mode outliers. Never cancel a
-   pipeline unless the user explicitly requests it.
+3. **Run ONE run at a time per cluster.** Wait for the current run to finish
+   before starting another. Overlapping runs contend for the cluster's shared
+   storage and produce false slow-mode outliers. Never cancel a run unless the
+   user explicitly requests it.
 4. Fetch the remote, then create a separate worktree and branch from the latest
    remote `main`.
 
-## Setup
+## Where the numbers are
 
-```bash
-export GITLAB_TOKEN_FILE=/path/to/your/gitlab_token   # or: export GITLAB_TOKEN=glpat-...
-source .claude/skills/native-perf-baselines/perf_baseline_tools.sh   # pstatus/pwatch/perrank/numa/...
-```
-
-Token: set `GITLAB_TOKEN` (value) or `GITLAB_TOKEN_FILE` (path) before sourcing. Project `ankurv/megatron-lm` on
-`gitlab-master.nvidia.com`. The project `ci_config_path` is
-`ci/gitlab-ci-native.yml` (no `workflow:` rules), so **any push
-to any branch triggers a full pipeline** running the auto (non-manual) jobs.
-
-## The jobs & baseline mechanism
-
-- 4 jobs typically drift: `gb200:ckptbench:1x4`, `gb200:pretrain-native:1x4:perf`,
-  `h100:ckptbench:1x8`, `h100:pretrain-native:1x8:perf` (devbox usually fine).
-  All are `allow_failure: exit_codes:[3]` → yellow, non-blocking. Deterministic
-  jobs gate on md5, not perf; leave them unless they drift.
+- Every JET workload job uploads `report-<workload>`, a short report with each
+  metric against its baseline, the options that differ from the recorded run,
+  and Megatron's `save-checkpoint` timings. The run's perf report job collects
+  them all and fails when any workload missed a baseline.
+- The `<workload>` artifact holds the full results: `ci/ci-results/*_report.json`
+  (every metric, its baseline and tolerance), the baseline candidate
+  `ci/ci-results/baselines/<stem>.yaml`, recorded-argument candidates under
+  `ci/ci-runs/**/logs/baselines/`, and the daemon logs
+  `ci/ci-results/checkpoint_server.*.log` with one
+  `[native_ckpt:svr][...][PERF] Rank=<n> Finished bw_mbps=...` line per rank and save.
 - Baseline file = `ci/baselines/<platform>_<job>[_<flavor>]_<config>.yaml`.
-  Platform is the runner namespace (h100 runner uses `h100_*`, not `h200_*`).
   Metrics: `bw_mbps` (higher better), `wr_tnsr_us` (lower better; anti-correlated
   with bw), plus exact-match info metrics (`total_written_bytes`, `gpu_peak_bytes`).
-- The `*:update_baselines` manual jobs just read the test job's `*_report.json`
-  artifact and write the **2-significant-figure mean** (`run_job.py`
-  `_round_for_baseline`), then commit `[skip ci]` + push. **Editing the YAML
-  directly is equivalent and preferred** — full control, no skip-ci retrigger.
+  Adopting a candidate is copying it over the baseline; editing the YAML by hand
+  is equivalent.
 
 ## The loop
 
-1. Read the pipeline: `pstatus <pid>`. For each failing focus job,
-   `jverdict <jobid>` to get measured-vs-baseline (`Δ`, the n, and the values).
+1. Open the run's perf report job summary; for each workload that missed, read
+   its `report-<workload>` artifact for measured-vs-baseline and the samples.
 2. Fetch the remote, then create a separate worktree and branch from the latest
-   remote `main`. Confirm `h100_*` baseline files are present.
+   remote `main`.
 3. Edit the drifting metrics to the most-likely mean. Anti-correlated bw/wr:
    center **both** so either extreme of a clean run stays within ±5%. Verify
    every clean historical sample lands inside ±5% of the new center.
 4. **`git add` the files**, create a new commit, and push. Never amend, rebase,
    squash, force-push, or otherwise overwrite commits. Verify the committed
    files with `git show HEAD:<file>`.
-5. Wait for the current pipeline to finish before pushing another commit. Find
-   the new pipeline (`pl_latest <branch>`), grab focus job ids from `pstatus`,
-   and run `pwatch` in the background.
-6. Each pipeline = one clean sample per job. Need more samples cheaply? Retry a
-   single job (`_post /jobs/<id>/retry` → new id) — sequential retries on one
-   runner are clean (no cross-runner contention). Accumulate samples; recenter.
+5. Wait for the current run to finish before starting another.
+6. Each run = one sample per workload. Need more samples cheaply? Dispatch the
+   platform's `JET <platform>` form with only that workload ticked; sequential
+   single-workload runs are clean (no contention from the rest of the suite).
+   Accumulate samples; recenter.
 
 ## Per-rank + NUMA analysis (the variance diagnosis)
 
-The aggregate `bw_mbps` hides structure. Each rank does 4 saves; the report
-drops save #1 (warmup), so n = (gpus) × 3. Break it down:
+The aggregate `bw_mbps` hides structure. Each rank does several saves, and the
+first is a warmup. Break the daemon log's per-rank `PERF` lines down by rank
+and by save, and compare the ranks on each NUMA socket.
 
-```bash
-perrank <jobid> <label>   # socket0(r0-3) vs socket1(r4-7) means, gap%, overall
-numa <jobid>              # per-rank NUMA node + shm channel (client logs at queue open)
-```
-
-Run `perrank` across several runs and a stable control job (gb200 perf). What
+Compare several runs against a stable control workload (gb200 perf). What
 to look for and conclude:
 
 - **Dual modality:** per-rank bw partitions along the GPU/socket boundary. On an
-  8-GPU 2-NUMA h100 node, ranks 0-3 = NUMA#0, ranks 4-7 = NUMA#1 (confirm with
-  `numa`). If one socket is _consistently_ faster across every run (never
+  8-GPU 2-NUMA h100 node, ranks 0-3 = NUMA#0, ranks 4-7 = NUMA#1 (confirm from
+  the client logs at queue open). If one socket is _consistently_ faster across every run (never
   reversed), that's a systematic asymmetry, not jitter. The aggregate "bimodal"
   mean = a fast-socket + slow-socket population whose mix/amplitude varies.
 - **NUMA root cause (confirmed for h100 perf):** The client channel index is
@@ -121,11 +106,3 @@ to look for and conclude:
   local node. Note `D2HBufferSize = TotalShmSize / D2HBufferCount /
 MaxRanksPerNode`, so bumping ranks shrinks per-buffer size unless TotalShmSize
   grows.
-
-## Useful API calls
-
-`GET /jobs/<id>` (name/status/failure_reason/allow_failure) ·
-`GET /jobs/<id>/trace` (grep, huge) · `POST /jobs/<id>/retry` ·
-`POST /pipelines/<id>/cancel` · `GET /pipelines?ref=<branch>&order_by=id&sort=desc`.
-GitLab's `!reference` tags break `yaml.safe_load`; lint via
-`POST /ci/lint` instead.
