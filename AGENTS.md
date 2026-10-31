@@ -36,7 +36,7 @@
 - Pushing an agent branch alone does not start a pipeline; do not defer an
   agent-branch push because another pipeline is active.
 - Group jobs by passed, running, waiting, warnings or failures, and manual status.
-- For running jobs, identify the execution cluster from the GitLab runner or
+- For running jobs, identify the execution cluster from the JET config or
   scheduler context, not the job's `CLUSTER` environment variable.
 - Distinguish active work from Slurm queueing and report the estimated
   remaining wait as a relative duration.

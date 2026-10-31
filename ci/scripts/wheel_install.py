@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 """Install an nvrx_checkpointing wheel for CI and Slurm runs.
 
-CI pipelines consume ``dist/*.whl`` from the exact parent wheel-build job.
-Main publishes its tested wheels to the project PyPI registry for users.
+CI jobs install the wheel their own run built; JET workloads download it from
+that run's GitHub artifact.
 Slurm runs without wheel artifacts fall back to an import-triggered source
 build.
 
@@ -12,7 +13,6 @@ or the container image.
 
 CLI:
   wheel_install.py --from-dist DIR   install from a local artifacts dir
-  wheel_install.py --fetch-upstream-wheel
 """
 
 from __future__ import annotations
@@ -23,11 +23,13 @@ import importlib.util
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
-import urllib.parse
+import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 logger = logging.getLogger("native_ci")
@@ -37,6 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _WHEEL_BINARIES = ("checkpoint.abi3.so", "checkpoint_server")
 
 _FETCH_TIMEOUT_S = 120
+_GITHUB_API = "https://api.github.com"
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_SOURCE_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 def wheel_arch() -> str:
@@ -58,31 +63,63 @@ def _find_local_wheel(dist_dir: Path) -> Path | None:
     return wheels[-1] if wheels else None
 
 
+class _KeepRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface redirects as errors so the token never reaches the redirect target."""
+
+    def redirect_request(self, *_args: object) -> None:
+        return None
+
+
+def _artifact_download_url(repository: str, artifact_id: str, token: str) -> str:
+    """Resolve a GitHub Actions artifact to its short-lived storage URL."""
+    request = urllib.request.Request(
+        f"{_GITHUB_API}/repos/{repository}/actions/artifacts/{artifact_id}/zip",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.build_opener(_KeepRedirect).open(request, timeout=_FETCH_TIMEOUT_S) as response:
+            raise RuntimeError(f"GitHub answered artifact {artifact_id} with {response.status} instead of a redirect")
+    except urllib.error.HTTPError as error:
+        location = error.headers.get("Location")
+        if error.code in _REDIRECT_CODES and location:
+            return location
+        raise
+
+
 def fetch_upstream_wheel(dest_dir: Path | None = None) -> Path:
-    """Download this architecture's wheel from an exact upstream CI job."""
-    job_var = f"UPSTREAM_WHEEL_{wheel_arch().upper().replace('-', '_')}_JOB_ID"
-    job_id = os.environ.get(job_var, "")
-    api = os.environ.get("CI_API_V4_URL")
-    project = os.environ.get("CI_PROJECT_ID")
-    token = os.environ.get("CI_JOB_TOKEN")
-    if not (job_id.isdigit() and api and project and token):
-        raise RuntimeError(f"{job_var}, CI_API_V4_URL, CI_PROJECT_ID, and CI_JOB_TOKEN are required")
-    root = f"{api}/projects/{project}/jobs/{job_id}/artifacts"
-    headers = {"JOB-TOKEN": token}
-    pointer = f"dist/nvrx_checkpointing-linux_{wheel_arch()}.txt"
-    request = urllib.request.Request(f"{root}/{urllib.parse.quote(pointer, safe='/')}", headers=headers)
-    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response:
-        filename = response.read().decode().strip()
-    if Path(filename).name != filename or not filename.endswith(f"-linux_{wheel_arch()}.whl"):
-        raise RuntimeError(f"upstream wheel job {job_id} returned invalid filename {filename!r}")
+    """Download this architecture's wheel from an exact upstream CI wheel artifact."""
+    artifact_var = f"UPSTREAM_WHEEL_{wheel_arch().upper().replace('-', '_')}_ARTIFACT_ID"
+    artifact_id = os.environ.get(artifact_var, "")
+    repository = os.environ.get("UPSTREAM_PROJECT_PATH", "")
+    token = os.environ.get("NVRX_GITHUB_TOKEN", "")
+    if not (artifact_id.isdigit() and repository and token):
+        raise RuntimeError(f"{artifact_var}, UPSTREAM_PROJECT_PATH, and NVRX_GITHUB_TOKEN are required")
+    location = _artifact_download_url(repository, artifact_id, token)
     target_dir = dest_dir or REPO_ROOT / "dist"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / filename
-    wheel_path = urllib.parse.quote(f"dist/{filename}", safe="/")
-    request = urllib.request.Request(f"{root}/{wheel_path}", headers=headers)
-    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_S) as response, target.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    logger.info(f"[wheel] downloaded {target.name} from upstream job {job_id}")
+    archive = target_dir / f".artifact-{artifact_id}.downloading-{os.getpid()}"
+    try:
+        with urllib.request.urlopen(location, timeout=_FETCH_TIMEOUT_S) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        with zipfile.ZipFile(archive) as contents:
+            wheels = [name for name in contents.namelist() if name.endswith(f"-linux_{wheel_arch()}.whl")]
+            if len(wheels) != 1:
+                raise RuntimeError(f"upstream wheel artifact {artifact_id} holds {len(wheels)} {wheel_arch()} wheels")
+            target = target_dir / Path(wheels[0]).name
+            temporary = target.with_name(f".{target.name}.downloading-{os.getpid()}")
+            try:
+                with contents.open(wheels[0]) as source, temporary.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+    finally:
+        archive.unlink(missing_ok=True)
+    logger.info(f"[wheel] downloaded {target.name} from upstream artifact {artifact_id}")
     return target
 
 
@@ -91,7 +128,13 @@ def _install_dir() -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
-def _source_revision() -> str:
+def source_revision() -> str:
+    """Return the immutable checkout revision represented by the JET build."""
+    revision = os.environ.get("NVRX_SOURCE_REVISION", "").strip()
+    if revision:
+        if not _SOURCE_REVISION_RE.fullmatch(revision):
+            raise RuntimeError("NVRX_SOURCE_REVISION must be a 7-40 character hexadecimal commit")
+        return revision
     return subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()  # noqa: S607
 
 
@@ -156,9 +199,10 @@ def _pip_install(whl: Path) -> None:
             ],
             check=True,
         )
-        (staging / ".nvrx-checkpointing-commit").write_text(f"{_source_revision()}\n")
+        (staging / ".nvrx-checkpointing-commit").write_text(f"{source_revision()}\n")
         shutil.rmtree(target, ignore_errors=True)
         staging.replace(target)
+        importlib.invalidate_caches()
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -201,26 +245,45 @@ def install_prebuilt_wheel(dist_dir: Path | None = None, *, probe: bool = True) 
     return True
 
 
+def require_prebuilt_wheel(
+    dist_dir: Path | None = None,
+    *,
+    probe: bool = True,
+) -> None:
+    """Install the exact selected wheel or fail without a source-build fallback."""
+    if not install_prebuilt_wheel(dist_dir, probe=probe):
+        raise RuntimeError(
+            f"required {wheel_arch()} wheel for {source_revision()} is unavailable from {dist_dir}",
+        )
+
+
 def _binaries_installed() -> bool:
     """True when the selected checkout's wheel is installed."""
     target = _install_dir()
     if target is None:
         return False
     marker = target / ".nvrx-checkpointing-commit"
-    if not marker.is_file() or marker.read_text().strip() != _source_revision():
+    if not marker.is_file() or marker.read_text().strip() != source_revision():
         return False
     root = target / "nvrx_checkpointing"
     return all((root / name).is_file() for name in _WHEEL_BINARIES)
 
 
+def _clang() -> tuple[str, str]:
+    """Return the C and C++ compilers that scripts/prepare.sh installs."""
+    version = re.search(r"^CLANG_VERSION=(\S+)$", (REPO_ROOT / "scripts" / "prepare.sh").read_text(), re.MULTILINE)[1]
+    return f"clang-{version}", f"clang++-{version}"
+
+
 def _ensure_source_toolchain() -> None:
-    if shutil.which("clang-23") and shutil.which("clang++-23"):
+    cc, cxx = _clang()
+    if shutil.which(cc) and shutil.which(cxx):
         return
     prepare = REPO_ROOT / "scripts" / "prepare.sh"
-    logger.warning("[wheel] clang-23 is unavailable — preparing the Ubuntu build environment")
+    logger.warning(f"[wheel] {cc} is unavailable — preparing the Ubuntu build environment")
     subprocess.run(["/bin/bash", str(prepare), "ubuntu2404"], check=True)
-    if not shutil.which("clang-23") or not shutil.which("clang++-23"):
-        raise RuntimeError("scripts/prepare.sh ubuntu2404 did not install clang-23")
+    if not shutil.which(cc) or not shutil.which(cxx):
+        raise RuntimeError(f"scripts/prepare.sh ubuntu2404 did not install {cc}")
 
 
 def build_and_install_from_source() -> None:
@@ -234,7 +297,7 @@ def build_and_install_from_source() -> None:
     cmake = shutil.which("cmake")
     if cmake is None:
         raise RuntimeError("CMake is not installed or not found in PATH.")
-    cc, cxx = shutil.which("clang-23"), shutil.which("clang++-23")
+    cc, cxx = (shutil.which(compiler) for compiler in _clang())
     build_dir = Path(os.environ.get("MEGATRON_NATIVE_BUILD_DIR", REPO_ROOT / "build" / "wheel-prep")).expanduser().resolve()
     vcpkg_root = os.environ.get("VCPKG_ROOT")
     subprocess.run(
@@ -294,7 +357,8 @@ def report_install() -> None:
     if missing := [str(path) for path in binaries if not path.is_file()]:
         raise RuntimeError(f"nvrx_checkpointing native binaries are missing: {', '.join(missing)}")
     logger.info(
-        f"[wheel] nvrx_checkpointing distribution={distribution.version} commit={_source_revision()} module={spec.origin} "
+        f"[wheel] nvrx_checkpointing distribution={distribution.version} commit={source_revision()} "
+        f"arch={wheel_arch()} module={spec.origin} "
         f"shlib={binaries[0]} server={binaries[1]}",
     )
 
@@ -304,19 +368,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--from-dist", type=Path, default=None, help="Install from this local artifacts dir (no registry fetch)")
     p.add_argument(
-        "--fetch-upstream-wheel",
-        action="store_true",
-        help="Download this architecture's wheel artifact from the upstream CI wheel job",
-    )
-    p.add_argument(
         "--ensure-prebuilt",
         action="store_true",
         help="Prep step, perf flavor: use installed or local wheel binaries, else build from source",
-    )
-    p.add_argument(
-        "--build-from-source",
-        action="store_true",
-        help="Prep step, other flavors: build the wheel from the checkout with the ambient build env and install it",
     )
     p.add_argument("--report-install", action="store_true", help="Report selected checkout, commit, and native binary paths")
     p.add_argument(
@@ -330,14 +384,8 @@ def main() -> None:
     for define in args.define:
         key, _, value = define.partition("=")
         os.environ[key] = value
-    if args.fetch_upstream_wheel:
-        fetch_upstream_wheel()
-        return
     if args.ensure_prebuilt:
         ensure_prebuilt()
-        return
-    if args.build_from_source:
-        build_and_install_from_source()
         return
     if args.report_install:
         report_install()

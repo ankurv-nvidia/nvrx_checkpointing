@@ -87,7 +87,8 @@ def _ensure_enroot_image(image: Path, gpus_per_node: int) -> None:
     promoted to the shared path only after a clean exit — a failed build never
     leaves a partial sqsh for later jobs to reuse.
     """
-    base_image = image.parent / "pytorch2609.sqsh"
+    release = DOCKER_IMAGE_BASE.rpartition(":")[2].partition("-")[0].replace(".", "")
+    base_image = image.parent / f"pytorch{release}.sqsh"
     local = _ci_build_path(image)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.unlink(missing_ok=True)  # clear any leftover from a previously failed build

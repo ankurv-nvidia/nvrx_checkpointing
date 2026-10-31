@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  WHEEL_ARCH: x86_64
+
+jobs:
+  # Self-hosted runners build only this repository's branches, and only changes beyond the documentation.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      fork: ${{ steps.classify.outputs.fork }}
+      build: ${{ steps.classify.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          echo "fork=${FORK}" >> "$GITHUB_OUTPUT"
+          if [[ ${FORK} == true ]]; then
+              build=false
+          elif [[ ${EVENT} == workflow_dispatch ]] || ! changed=$(git diff --name-only "${BASE}" HEAD); then
+              build=true
+          elif grep -qvE '\.md$|^docs/' <<< "${changed}"; then
+              build=true
+          else
+              build=false
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "fork=${FORK} build=${build}"
+
+  wheel-aarch64:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: [self-hosted, build]
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/github/tasks.sh wheel-aarch64
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel-aarch64
+          path: dist/
+          retention-days: 7
+
+  wheel-x86_64:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: [self-hosted, build]
+    timeout-minutes: 180
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: ci/github/tasks.sh wheel
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel-x86_64
+          path: |
+            dist/
+            dev_binaries/
+          retention-days: 7
+
+  wheel-pytest-x86_64:
+    needs: wheel-x86_64
+    runs-on: [self-hosted, build]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+      - run: ci/github/tasks.sh pytest
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: pytest-x86_64
+          path: ci/ci-results/pytest.xml
+          retention-days: 7
+
+  ctest-x86_64:
+    needs: wheel-x86_64
+    runs-on: [self-hosted, build]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-x86_64
+      - run: ci/github/tasks.sh ctest
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: ctest-x86_64
+          path: |
+            ci/ci-results/ctest.xml
+            ci/ci-results/*.log
+          retention-days: 7
+
+  jet-gb200:
+    needs: wheel-aarch64
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: gb200
+      workloads: '["gb200-native-detr-pico-1x4", "gb200-native-perf-pico-1x4"]'
+      wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+
+  jet-gb300:
+    needs: wheel-aarch64
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: gb300
+      workloads: '["gb300-native-detr-nano4-8x4", "gb300-native-perf-nano4-8x4"]'
+      wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+
+  jet-h100:
+    needs: wheel-x86_64
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: h100
+      workloads: '["h100-native-detr-pico-1x8", "h100-native-perf-pico-1x8"]'
+      wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+
+  jet-b200:
+    needs: wheel-x86_64
+    uses: ./.github/workflows/jet.yml
+    with:
+      platform: b200
+      workloads: '["b200-native-detr-pico-1x8", "b200-native-perf-pico-1x8"]'
+      wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
+
+  # Collects every workload's report and fails when any missed its baselines; the gate does not wait on it.
+  perf-report:
+    needs: [changes, jet-gb200, jet-gb300, jet-h100, jet-b200]
+    if: ${{ !cancelled() && needs.changes.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+      - run: python3 ci/github/perf_report.py summary reports
+
+  # Pull requests require this one check, so the jobs behind it can change freely.
+  gate:
+    needs: [changes, wheel-aarch64, wheel-x86_64, wheel-pytest-x86_64, ctest-x86_64, jet-gb200, jet-gb300, jet-h100, jet-b200]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          if [[ $(jq -r '.changes.outputs.fork' <<< "${NEEDS}") == true ]]; then
+              echo "::error::CI does not build pull requests from forks; push the branch to this repository to test it."
+              exit 1
+          fi
+          if [[ $(jq -r '.changes.result' <<< "${NEEDS}") == success && $(jq -r '.changes.outputs.build' <<< "${NEEDS}") == false ]]; then
+              echo "Only documentation changed, so CI built nothing."
+              exit 0
+          fi
+          unfinished=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "${NEEDS}")
+          if [[ -n ${unfinished} ]]; then
+              echo "::error::CI jobs did not pass: ${unfinished//$'\n'/, }"
+              exit 1
+          fi
+          echo "Every CI job passed."
+
+  # Each main build that passes the gate adds its wheels to the pip index on GitHub Pages.
+  publish-wheels:
+    needs: [changes, gate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: wheels
+      - run: python3 ci/github/publish_wheels.py wheels site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5

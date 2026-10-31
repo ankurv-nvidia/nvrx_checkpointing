@@ -7,8 +7,8 @@ import importlib.util
 import io
 import json
 import lzma
+import os
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,8 +30,8 @@ _MUTATED_ENV = (
     "CI_JOB_TOKEN",
     "CI_SERVER_HOST",
     "UPSTREAM_PIPELINE_ID",
-    "UPSTREAM_WHEEL_AARCH64_JOB_ID",
-    "UPSTREAM_WHEEL_X86_64_JOB_ID",
+    "UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID",
+    "UPSTREAM_WHEEL_X86_64_ARTIFACT_ID",
     "ENROOT_IMAGE",
     "ENROOT_IMAGE_DIR",
     "MEGATRON_COMMIT",
@@ -95,8 +95,6 @@ _MUTATED_ENV = (
     "CUDA_DEVICE_MAX_CONNECTIONS",
 )
 
-
-yaml.SafeLoader.add_constructor("!reference", lambda loader, node: loader.construct_sequence(node))
 
 # Results a test produces belong outside the checkout it is testing.
 _SCRATCH_RESULTS = Path(tempfile.mkdtemp(prefix="slurm-job-tests-"))
@@ -623,6 +621,73 @@ def _clear_run_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+_MOUNTS = "  --container-mounts=${home}:${home},${root}:/root,/shared:/shared\n"
+_CLUSTER_TEMPLATES = {
+    # A fixed batch partition with per-node GPU requests.
+    "batch": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=batch\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --gpus-per-node=${gpus_per_node}\n  --mem=0\n  --job-name=${job_name}\n"
+            f"  --container-image=${{image}}\n{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=batch\n  --time=00:${time_minutes}:00\n  --mem=0\n"
+            f"  --gpus-per-node=${{gpus_per_node}}\n{_MOUNTS}  --container-image=${{image_base}}\n"
+            "  --container-save=${image_out}\n  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=batch\n  --gpus-per-node=${gpus_per_node}\n"
+            "  --time=00:${time_minutes}:00\n  --mem=0\n"
+        ),
+    },
+    # An interactive partition that also requests the job's total GPUs.
+    "interactive": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=interactive\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --gpus=${total_gpus}\n  --gpus-per-node=${gpus_per_node}\n  --mem=0\n"
+            f"  --job-name=${{job_name}}\n  --container-image=${{image}}\n{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=interactive\n  --time=00:${time_minutes}:00\n"
+            f"  --mem=0\n  --gpus-per-node=${{gpus_per_node}}\n{_MOUNTS}  --container-image=${{image_base}}\n"
+            "  --container-save=${image_out}\n  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=interactive\n  --time=00:${time_minutes}:00\n"
+            "  --mem=0\n  --gpus-per-node=${gpus_per_node}\n"
+        ),
+    },
+    # Partitions named after the platform.
+    "platform": {
+        "srun.tmpl": (
+            "srun\n  --account=${account}\n  --partition=${partition}\n  --nodes=${nodes}\n  --ntasks=${ntasks}\n"
+            "  --time=${slurm_time}\n  --mem=0\n  --job-name=${job_name}\n  --container-image=${image}\n"
+            f"{_MOUNTS}  --container-env=${{container_env}}\n"
+        ),
+        "image_prep.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=${partition}\n  --time=00:${time_minutes}:00\n"
+            f"  --mem=0\n  --nodes=1\n{_MOUNTS}  --container-image=${{image_base}}\n  --container-save=${{image_out}}\n"
+            "  --container-writable\n"
+        ),
+        "enroot_import.tmpl": (
+            "srun\n  -l\n  --account=${account}\n  --partition=${partition}\n  --time=00:${time_minutes}:00\n  --mem=0\n"
+        ),
+    },
+}
+
+
+def _use_cluster(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shape: str = "batch") -> str:
+    """Install one shape of cluster templates where the runner looks for them and select that cluster."""
+    cluster = f"{shape}-cluster"
+    directory = tmp_path / "cluster-templates"
+    directory.mkdir(exist_ok=True)
+    for name, text in _CLUSTER_TEMPLATES[shape].items():
+        (directory / f"{cluster}.{name}").write_text(text)
+    monkeypatch.setenv("CI_DIR", str(directory))
+    monkeypatch.setenv("CLUSTER", cluster)
+    return cluster
+
+
 def test_worker_tmpdir_uses_short_container_path(monkeypatch: pytest.MonkeyPatch) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_PROCID", "7")
@@ -844,24 +909,24 @@ def test_the_run_settings_can_be_argued_or_exported(monkeypatch: pytest.MonkeyPa
     # Named on the command line, with nothing in the environment.
     for name in ("PLATFORM", "CLUSTER", "SLURM_ACCOUNT"):
         monkeypatch.delenv(name, raising=False)
-    assert settle(["--platform", "gb200", "--cluster", "awscmh", "--slurm-account", "acct"]) == {
+    assert settle(["--platform", "gb200", "--cluster", "cluster-a", "--slurm-account", "acct"]) == {
         "PLATFORM": "gb200",
-        "CLUSTER": "awscmh",
+        "CLUSTER": "cluster-a",
         "SLURM_ACCOUNT": "acct",
     }
     assert slurm_job.platform_tag() == "gb200"
-    assert slurm_job.cluster_tag() == "awscmh"
+    assert slurm_job.cluster_tag() == "cluster-a"
 
     # An environment that already carries them still works without arguments.
     monkeypatch.setenv("PLATFORM", "h100")
-    monkeypatch.setenv("CLUSTER", "lyris")
+    monkeypatch.setenv("CLUSTER", "cluster-b")
     monkeypatch.setenv("SLURM_ACCOUNT", "from-env")
-    assert settle([]) == {"PLATFORM": "h100", "CLUSTER": "lyris", "SLURM_ACCOUNT": "from-env"}
+    assert settle([]) == {"PLATFORM": "h100", "CLUSTER": "cluster-b", "SLURM_ACCOUNT": "from-env"}
 
     # An argument wins over the environment, as every other option does.
     assert settle(["--platform", "gb200", "--slurm-account", "argued"]) == {
         "PLATFORM": "gb200",
-        "CLUSTER": "lyris",
+        "CLUSTER": "cluster-b",
         "SLURM_ACCOUNT": "argued",
     }
 
@@ -936,6 +1001,9 @@ def test_the_platform_names_its_gpus_per_node(monkeypatch: pytest.MonkeyPatch) -
         == 2
     )  # noqa: PLR2004
 
+    monkeypatch.setenv("PLATFORM", "b200")
+    assert slurm_job.platform_gpus_per_node() == 8  # noqa: PLR2004
+
     # A platform the matrix does not name cannot supply one.
     monkeypatch.setenv("PLATFORM", "unknown")
     assert slurm_job.platform_gpus_per_node() is None
@@ -952,7 +1020,7 @@ def test_an_unset_platform_names_itself_not_the_hostname(monkeypatch: pytest.Mon
         slurm_job.PerfReport._platform_bandwidth_baseline(slurm_job.platform_tag())
 
     monkeypatch.setenv("PLATFORM", "unknown")
-    with pytest.raises(RuntimeError, match=r"Known platforms: devbox, gb200, gb300, h100"):
+    with pytest.raises(RuntimeError, match=r"Known platforms: b200, devbox, gb200, gb300, h100"):
         slurm_job.PerfReport._platform_bandwidth_baseline(slurm_job.platform_tag())
 
     monkeypatch.setenv("PLATFORM", "gb200")
@@ -1084,7 +1152,7 @@ def test_nvrx_repo_root_selects_source_checkout(monkeypatch: pytest.MonkeyPatch,
     nvrx = tmp_path / "sources" / "nvidia-resiliency-ext"
     monkeypatch.setenv("NVRX_REPO_ROOT", str(nvrx))
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path)
 
@@ -1197,7 +1265,7 @@ def test_megatron_head_does_not_modify_the_checkout(tmp_path: Path) -> None:
     before_status = subprocess.check_output(["git", "status", "--porcelain"], cwd=source, text=True)
 
     result = subprocess.run(
-        ["bash", str(REPO_ROOT / "scripts/megatron_root.sh"), str(source)],
+        ["bash", str(REPO_ROOT / "scripts/prepare.sh"), "megatron_root", str(source)],
         env={"PATH": "/usr/bin:/bin", "MEGATRON_COMMIT": "HEAD"},
         capture_output=True,
         text=True,
@@ -1295,13 +1363,19 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     args = _args(tmp_path, repeat=repeat)
     args.flavors = slurm_job.FlavorSelection(["perf", "native"])
     calls = []
-    child_envs = []
+    daemon_logs = []
 
-    def phase_command(_cfg: str, _args: object, _provider: str, phase: int, cycle: int = 0, **_kwargs: object):
-        env = {}
-        child_envs.append(env)
+    def phase_command(
+        _cfg: str,
+        _args: object,
+        _provider: str,
+        phase: int,
+        cycle: int = 0,
+        **_kwargs: object,
+    ) -> tuple[list[str], dict]:
         calls.append((phase, cycle))
-        return ["true"], env
+        daemon_logs.append(Path(os.environ["NATIVE_CKPT_SERVER_LOG"]).name)
+        return ["true"], {}
 
     monkeypatch.setattr(
         slurm_job,
@@ -1314,9 +1388,10 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     slurm_job._run_routine("nano3_4x4", args, "nvrx")
 
     assert calls == expected
-    expected_tags = ["phase1", *(f"cycle{cycle + 1}" for _phase, cycle in expected[1:])]
-    assert [Path(env["NATIVE_CKPT_SERVER_LOG"]).name for env in child_envs] == [
-        f"checkpoint_server.{tag}.%h.%p.log" for tag in expected_tags
+    phase2 = 2
+    assert daemon_logs == [
+        "checkpoint_server.phase1.%h.%p.log",
+        *(f"checkpoint_server.cycle{cycle + 1}.%h.%p.log" for phase, cycle in expected if phase == phase2),
     ]
 
 
@@ -1385,6 +1460,31 @@ def test_worker_preserves_checkpoint_cycle_arguments(
     assert uninstalls == (["native"] if "native" in flavors else [])
     assert args.checkpoints_per_run == checkpoints
     assert args.repeat == repeat
+
+
+def test_worker_uses_coordinated_jet_server_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    args = _args(tmp_path, flavors=["detr"])
+    args.flavors = slurm_job.FlavorSelection(args.flavors)
+    monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
+    checks: list[str] = []
+    monkeypatch.setattr(slurm_job, "_perform_runs", lambda *_args: None)
+    monkeypatch.setattr(
+        slurm_job,
+        "CHECKPOINT_SERVER",
+        SimpleNamespace(require_stopped=lambda: checks.append("checked")),
+    )
+
+    monkeypatch.setenv("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE", "1")
+    slurm_job._worker(args)
+    assert checks == []
+
+    monkeypatch.delenv("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE")
+    slurm_job._worker(args)
+    assert checks == ["checked"]
 
 
 def test_worker_failure_requests_nonblocking_local_server_stop(
@@ -2513,7 +2613,7 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, checkpoints_per_run=6, repeat=2, time_minutes=240)
     slurm_job._configure_run(args)
@@ -2541,14 +2641,14 @@ def test_long_run_options_are_exported_and_override_allocation_time(
     assert reproducer.count("--kill-on-bad-exit=1") == len(("allocation-epilog", "prepare", "train"))
 
 
-def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
+def test_ultra_fp8_determinism_keeps_the_template_partition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "awscmh")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, flavors=["detr"])
     slurm_job._configure_run(args)
@@ -2567,14 +2667,14 @@ def test_awscmh_ultra_fp8_determinism_uses_standard_partition(
     assert "batch_long" not in reproducer
 
 
-def test_awscmh_ultra_fp8_perf_keeps_default_partition(
+def test_ultra_fp8_perf_keeps_the_template_partition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "awscmh")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path)
     slurm_job._configure_run(args)
@@ -2680,7 +2780,7 @@ def test_clean_run_intent_is_reproducible_from_sbatch(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, clean_run=True, job_array_segment=0)
     slurm_job._configure_run(args)
@@ -2714,7 +2814,7 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("NVRX_COMMIT", "a" * 40)
     monkeypatch.setenv("CI_PIPELINE_ID", "98765")
@@ -2773,8 +2873,8 @@ def test_dry_run_writes_self_contained_exclusive_reproducer(monkeypatch: pytest.
     assert str(slurm_job.image_path()) not in body
     assert str(tmp_path / "ultra3-64n") not in body
     assert "--container-writable" in prep_step
-    assert "scripts/megatron_root.sh" in prep_step
-    assert prep_step.index("scripts/megatron_root.sh") < prep_step.index("wheel_install.py")
+    assert 'scripts/prepare.sh" megatron_root' in prep_step
+    assert prep_step.index('scripts/prepare.sh" megatron_root') < prep_step.index("wheel_install.py")
     assert all(name in prep_step for name in ("MEGATRON_ROOT", "MEGATRON_COMMIT", "MEGATRON_REPO_URL"))
     assert "install_run_dependency.py" in prep_step
     assert "python3 -m pip list" in prep_step
@@ -2801,7 +2901,7 @@ def test_job_array_passes_the_worker_script_directly_to_ft_launcher(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "ocihsg")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
     slurm_job._configure_run(args)
@@ -2828,7 +2928,7 @@ def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
 
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "ocihsg")
+    _use_cluster(monkeypatch, tmp_path, "batch")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16")
     slurm_job._configure_run(args)
@@ -2858,16 +2958,14 @@ def test_jobs_wider_than_one_nvlink_domain_launch_as_arrays(
     assert "#SBATCH --array=" not in classic
 
 
-@pytest.mark.parametrize("cluster", ["cwdfw", "cwpdx"])
 def test_job_array_steps_request_only_segment_gpus(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    cluster: str,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     args = _args(tmp_path, config="ultra3bf16", job_array_segment=16)
     slurm_job._configure_run(args)
@@ -2892,7 +2990,7 @@ def test_manual_training_environment_override_is_reproduced(monkeypatch: pytest.
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
     args = _args(tmp_path, nodes=8, config="nano3", flavors=[])
@@ -2911,7 +3009,7 @@ def test_ci_default_job_name_is_keyed_by_job_id(monkeypatch: pytest.MonkeyPatch,
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     monkeypatch.setenv("CI_PIPELINE_ID", "98765")
     monkeypatch.setenv("CI_JOB_ID", "12345")
@@ -2928,7 +3026,7 @@ def test_ci_default_job_name_is_keyed_by_job_id(monkeypatch: pytest.MonkeyPatch,
 def test_srun_output_is_redirected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     log = tmp_path / "run.log"
 
     cmd = slurm_job.build_srun_cmd(
@@ -2949,14 +3047,14 @@ def test_srun_output_is_redirected(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
 
 @pytest.mark.parametrize("platform", ["gb200", "gb300"])
-def test_lyris_templates_select_the_platform_partition(
+def test_platform_named_partitions_follow_the_platform(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     platform: str,
 ) -> None:
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "lyris")
+    _use_cluster(monkeypatch, tmp_path, "platform")
     monkeypatch.setenv("PLATFORM", platform)
 
     values = slurm_job._slurm_values(
@@ -2982,12 +3080,12 @@ def test_lyris_templates_select_the_platform_partition(
 @pytest.mark.parametrize(
     "case",
     [
-        ("cwdfw", 1, None, None),
-        ("lyris", 2, None, None),
-        ("ocihsg", 8, None, None),
-        ("ocihsg", 16, None, "16"),
-        ("cwdfw", 64, None, "16"),
-        ("lyris", 2, "8", "8"),
+        ("interactive", 1, None, None),
+        ("platform", 2, None, None),
+        ("batch", 8, None, None),
+        ("batch", 16, None, "16"),
+        ("interactive", 64, None, "16"),
+        ("platform", 2, "8", "8"),
     ],
 )
 def test_sbatch_segment_matches_allocation(
@@ -2995,10 +3093,10 @@ def test_sbatch_segment_matches_allocation(
     tmp_path: Path,
     case: tuple[str, int, str | None, str | None],
 ) -> None:
-    cluster, nodes, override, expected = case
+    shape, nodes, override, expected = case
     slurm_job = _load_slurm_job()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, shape)
     if override is None:
         monkeypatch.delenv("SLURM_SEGMENT", raising=False)
     else:
@@ -3033,15 +3131,10 @@ def test_prepare_image_template_api_is_available(monkeypatch: pytest.MonkeyPatch
     assert cmd == ["srun", "--nodes=2", "echo", "ready"]
 
 
-def test_shipped_clusters_have_complete_template_sets() -> None:
-    expected = {"srun.tmpl", "enroot_import.tmpl", "image_prep.tmpl"}
+def test_the_example_template_set_is_complete() -> None:
     templates = {path.name for path in (REPO_ROOT / "ci/templates").glob("*.tmpl")}
-    clusters = {name.split(".", 1)[0] for name in templates}
 
-    assert clusters == {"awscmh", "cwdfw", "cwpdx", "lyris", "ocihsg"}
-    assert all(
-        {name.removeprefix(f"{cluster}.") for name in templates if name.startswith(f"{cluster}.")} == expected for cluster in clusters
-    )
+    assert templates == {"example.srun.tmpl", "example.enroot_import.tmpl", "example.image_prep.tmpl"}
 
 
 def test_shipped_image_templates_name_their_partition(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3076,17 +3169,14 @@ def test_missing_cluster_template_has_no_default_fallback(monkeypatch: pytest.Mo
         slurm_job._load_template("srun.tmpl")
 
 
-@pytest.mark.parametrize(
-    ("cluster", "partition"),
-    [("awscmh", "batch"), ("cwdfw", "interactive")],
-)
+@pytest.mark.parametrize("shape", ["batch", "interactive"])
 def test_enroot_import_requests_runner_gpus(
     monkeypatch: pytest.MonkeyPatch,
-    cluster: str,
-    partition: str,
+    tmp_path: Path,
+    shape: str,
 ) -> None:
     slurm_job = _load_slurm_job()
-    monkeypatch.setenv("CLUSTER", cluster)
+    _use_cluster(monkeypatch, tmp_path, shape)
 
     cmd = slurm_job.build_cmd_from_template(
         "enroot_import.tmpl",
@@ -3095,39 +3185,7 @@ def test_enroot_import_requests_runner_gpus(
     )
 
     assert "--gpus-per-node=4" in cmd
-    assert f"--partition={partition}" in cmd
-
-
-@pytest.mark.parametrize("name", ["enroot_import.tmpl", "image_prep.tmpl"])
-def test_ocihsg_image_build_requests_gpus_per_node(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> None:
-    slurm_job = _load_slurm_job()
-    monkeypatch.setenv("CI_DIR", str(tmp_path))
-    monkeypatch.setenv("CLUSTER", "ocihsg")
-
-    cmd = slurm_job.build_cmd_from_template(name, {"account": "account", "time_minutes": 20, "gpus_per_node": 4}, [])
-
-    assert "--gpus-per-node=4" in cmd
-    # The OCI-HSG NVL72 policy rejects job-scoped GPU requests.
-    assert not any(token.startswith("--gpus=") for token in cmd)
-
-
-def test_image_preparation_stack_versions_match() -> None:
-    slurm_job = _load_slurm_job()
-    prepare_image = (SCRIPTS_DIR / "prepare_image.py").read_text()
-    prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
-    enroot = (REPO_ROOT / "scripts" / "enroot.sh").read_text()
-    dockerfile = (REPO_ROOT / "Dockerfile.ci").read_text()
-
-    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.09-py3"
-    assert 'base_image = image.parent / "pytorch2609.sqsh"' in prepare_image
-    assert 'DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.09-py3"' in prepare
-    assert 'DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.09-py3"' in enroot
-    assert "pytorch2609.sqsh" in enroot
-    assert "FROM nvcr.io/nvidia/pytorch:26.09-py3" in dockerfile
-    assert "ENV CC=clang-23 CXX=clang++-23" in dockerfile
-    assert "CLANG_VERSION=23" in prepare
-    assert "cuda-toolkit-13-4" in prepare
-    assert "/usr/local/cuda-13.4" in prepare
+    assert f"--partition={shape}" in cmd
 
 
 def test_image_build_runs_templated_prepare_command(
@@ -3187,105 +3245,6 @@ def test_slurm_job_consumers_import() -> None:
         cwd=SCRIPTS_DIR,
         check=True,
     )
-
-
-def test_auto_workloads_only_allow_perf_gate_warnings() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-
-    before_script = config[".ci_base"]["before_script"]
-    source_index = before_script.index("source ~/data/ci/config 2>/dev/null || source ~/data/ci 2>/dev/null || true")
-    assert before_script[source_index - 1 : source_index + 2] == ["set -a", before_script[source_index], "set +a"]
-    assert 'export PLATFORM="${PLATFORM_OVERRIDE:-${PLATFORM:-${CLUSTER}}}"' in before_script
-    assert config[".slurm_job"]["allow_failure"] == {"exit_codes": [3]}
-    after_script = "\n".join(config[".slurm_job"]["after_script"])
-    assert "du -ch " in after_script
-    assert "| tail -n 1 || true" in after_script
-    assert "__failure_summary__ ci/ci-runs" in after_script
-    assert "__recover_otel__ ci/ci-runs || true" in after_script
-    assert after_script.index("__recover_otel__") < after_script.index("gzip -f")
-    assert config[".slurm_job"]["artifacts"]["when"] == "always"
-    assert config[".slurm_job"]["variables"] == {
-        "SLURMJOB_OPT_WORK_DIR": "${CI_PROJECT_DIR}/ci/ci-runs",
-        "TRITON_CACHE_DIR": "/tmp/nvrx-${CI_JOB_ID}/triton-cache",
-        "TRITON_CACHE_PATH": "/tmp/nvrx-${CI_JOB_ID}/triton-cache",
-        "TORCHINDUCTOR_CACHE_DIR": "/tmp/nvrx-${CI_JOB_ID}/torchinductor-cache",
-        "TORCH_EXTENSIONS_DIR": "/tmp/nvrx-${CI_JOB_ID}/torch-extensions",
-    }
-    manual_optional = config[".manual_optional"]
-    assert "allow_failure" not in manual_optional
-    assert manual_optional["rules"][0] == {
-        "if": ('$PIPELINE_SUITE == "nvrx" || $PIPELINE_SUITE == "large-scale" || $PIPELINE_SUITE == "main-branch-runs"'),
-        "when": "never",
-    }
-    assert manual_optional["rules"][1] == {
-        "if": '$CI_COMMIT_BRANCH == "main"',
-        "when": "on_success",
-    }
-    assert manual_optional["rules"][2] == {
-        "if": '$RUN_PIPELINE == "true" || $CI_PIPELINE_SOURCE == "merge_request_event"',
-        "when": "on_success",
-    }
-    # A rule's allow_failure replaces the job's own, so leaving it unset keeps
-    # the job's exit_codes: a played job that fails reports a failure, and only
-    # the perf-drift exit is tolerated.
-    assert manual_optional["rules"][3] == {"when": "manual"}
-    assert "allow_failure" not in manual_optional["rules"][3]
-    for suite in ("nvrx", "large_scale", "main_branch_runs"):
-        policy = config[f".{suite}_pipeline"]
-        assert "allow_failure" not in policy
-        assert policy["rules"][-1] == {"when": "never"}
-    assert ".manual_nvrx" not in config
-
-
-def test_generated_jobs_do_not_override_config_or_flavor_options() -> None:
-    matrix = yaml.safe_load((REPO_ROOT / "ci/jobs.json").read_text())
-    assert all("flavor_args" not in entry for platform in matrix["platforms"] for entry in platform.get("multinode", []))
-
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    forbidden = (
-        "--cuda-graph-impl",
-        "--cuda-graph-modules",
-        "--muon-fp32-matmul-prec",
-        "--lr-decay-style",
-        "--lr-warmup-samples",
-        "--drop-config-option",
-        "--no-moe-permute-fusion",
-    )
-    for name, job in config.items():
-        if not isinstance(job, dict) or "JOB_ARGS" not in job.get("variables", {}):
-            continue
-        argv = shlex.split(job["variables"]["JOB_ARGS"])
-        assert all(option not in argv for option in forbidden), name
-
-
-def test_canceled_ci_job_cancels_only_its_recorded_slurm_job(tmp_path: Path) -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    cancel_script = config[".slurm_job"]["after_script"][0]
-    for name, gitlab_id, slurm_id in (("target", "456", "123"), ("other", "999", "789")):
-        run = tmp_path / "ci" / "ci-runs" / name
-        run.mkdir(parents=True)
-        (run / "gitlab_job_id").write_text(f"{gitlab_id}\n")
-        (run / "job_id").write_text(f"{slurm_id}\n")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    scancel = bin_dir / "scancel"
-    scancel.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "${SCANCEL_LOG}"\n')
-    scancel.chmod(0o755)
-    cancel_log = tmp_path / "scancel.log"
-
-    subprocess.run(
-        ["bash", "-c", cancel_script],
-        cwd=tmp_path,
-        env={
-            "CI_JOB_ID": "456",
-            "CI_JOB_STATUS": "canceled",
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "SCANCEL_LOG": str(cancel_log),
-        },
-        check=True,
-    )
-
-    assert cancel_log.read_text() == "-- 123\n"
 
 
 def test_foreground_submission_records_job_id_and_uses_wait(
@@ -3620,240 +3579,11 @@ def test_sacct_job_array_without_indexed_rows_fails_on_any_failed_task(monkeypat
         slurm_job._verify_allocation("123", 0, job_array=True)
 
 
-def test_workflow_runs_merge_request_events_without_duplicate_branch_pipelines() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    rules = config["workflow"]["rules"]
-
-    assert config["variables"]["PIPELINE_SUITE"]["options"] == [
-        "default",
-        "nvrx",
-        "large-scale",
-        "main-branch-runs",
-    ]
-    assert {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'} in rules
-    assert not any("CI_OPEN_MERGE_REQUESTS" in rule.get("if", "") for rule in rules)
-    assert {"if": '$CI_PIPELINE_SOURCE == "push" && $RUN_PIPELINE == "true"'} in rules
-    assert any("pipeline" in rule.get("if", "") and rule.get("when") != "never" for rule in rules)
-    assert any(rule.get("when") == "never" and "PIPELINE_SUITE !=" in rule.get("if", "") for rule in rules)
-    assert rules[-1] == {"when": "never"}
-
-
-def test_default_pipeline_has_manual_suite_launchers() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    launcher = config[".pipeline_launcher"]
-
-    assert launcher["stage"] == "launch"
-    assert launcher["rules"][0] == {
-        "if": '$PIPELINE_SUITE != "default"',
-        "when": "never",
-    }
-    assert launcher["rules"][1] == {
-        "if": '$CI_PIPELINE_SOURCE == "pipeline" || $CI_PIPELINE_SOURCE == "parent_pipeline"',
-        "when": "never",
-    }
-    assert launcher["rules"][2] == {
-        "if": '$RUN_ALL_SUITES == "true"',
-        "when": "on_success",
-    }
-    assert launcher["rules"][-1] == {"when": "manual", "allow_failure": True}
-    assert launcher["image"] == "curlimages/curl:8.15.0"
-    assert launcher["tags"] == ["perflab", "type/docker", "os/linux"]
-    assert launcher["variables"]["GIT_STRATEGY"] == "none"
-    assert "trigger" not in launcher
-    script = launcher["script"][0]
-    assert "CI_JOB_TOKEN" in script
-    assert "variables[PIPELINE_SUITE]=${LAUNCH_PIPELINE_SUITE}" in script
-    assert "variables[UPSTREAM_PIPELINE_SHA]" in script
-    assert "variables[UPSTREAM_PIPELINE_ID]" in script
-    assert "variables[UPSTREAM_WHEEL_X86_64_JOB_ID]" in script
-    assert "variables[UPSTREAM_WHEEL_AARCH64_JOB_ID]" in script
-    assert "CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" in script
-    assert "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA" in script
-    assert "head -n1" not in script
-    assert "sed -n '1p'" in script
-    needs = {need["job"]: need["artifacts"] for need in launcher["needs"]}
-    assert needs == {
-        "wheel:x86_64": True,
-        "wheel:aarch64": True,
-        "wheel-pytest:x86_64": False,
-        "wheel-pytest:aarch64": False,
-        "ctest:x86_64": False,
-        "ctest:aarch64": False,
-    }
-    assert config["launch:nvrx-pipeline"]["variables"]["LAUNCH_PIPELINE_SUITE"] == "nvrx"
-    assert config["launch:large-scale-pipeline"]["variables"]["LAUNCH_PIPELINE_SUITE"] == "large-scale"
-    main_runs = config["launch:main-branch-runs"]
-    assert main_runs["variables"]["LAUNCH_PIPELINE_SUITE"] == "main-branch-runs"
-    assert main_runs["rules"] == [
-        {"if": '$PIPELINE_SUITE != "default"', "when": "never"},
-        {"if": '$CI_COMMIT_BRANCH == "main"', "when": "on_success"},
-        {"if": '$RUN_ALL_SUITES == "true"', "when": "on_success"},
-        {"when": "manual", "allow_failure": True},
-    ]
-    assert config[".wheel_publish"]["rules"] == [
-        {"if": '$PIPELINE_SUITE != "default"', "when": "never"},
-        {"if": '$CI_COMMIT_BRANCH == "main"', "when": "on_success"},
-        {"if": '$PUBLISH_WHEELS == "true"', "when": "on_success"},
-        {"when": "never"},
-    ]
-
-
-def test_each_pipeline_suite_bundles_generated_baselines() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-
-    assert config["stages"][-1] == "baseline-artifacts"
-    assert "ci/ci-runs/*/logs/baselines/*" in config[".slurm_job"]["artifacts"]["paths"]
-    assert config[".baseline_bundle"]["artifacts"]["paths"] == ["ci/baselines/"]
-    bundles = {suite: config[f"baseline-artifacts:{suite}"] for suite in ("default", "nvrx", "large-scale", "main-branch-runs")}
-    assert all(bundle["rules"][0]["when"] in {"always", "never"} for bundle in bundles.values())
-    assert "[PERF]:gb200:native:super3bf16_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[DETR]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb200:native:super3fp4_16x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb200:nvrx:super3fp4_16x4" in bundles["nvrx"]["dependencies"]
-    assert "[PERF]:gb200:nvrx:ultra3bf16_64x4" in bundles["nvrx"]["dependencies"]
-    assert "[DETR]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
-    assert "[PERF]:gb300:nvrx:nano4_32x4" in bundles["nvrx"]["dependencies"]
-    assert "[DETR]:gb300:nvrx:nano4_8x4" in bundles["nvrx"]["dependencies"]
-    assert "[DETR]:gb300:native:nano4_8x4" in bundles["default"]["dependencies"]
-    assert "[PERF]:gb300:native:nano4_8x4" in bundles["default"]["dependencies"]
-    assert "[DETR]:gb300:native:nano4_32x4" in bundles["large-scale"]["dependencies"]
-    assert "[PERF]:gb300:native:nano4_32x4" in bundles["large-scale"]["dependencies"]
-    assert "[DETR]:gb200:native:nano3_8x4" in bundles["main-branch-runs"]["dependencies"]
-    assert "[PERF]:gb200:native:nano3_8x4" in bundles["main-branch-runs"]["dependencies"]
-    assert "[PERF]:h100:native:pico_1x8" in bundles["main-branch-runs"]["dependencies"]
-    assert "[PERF]:gb200:native:gpt_moe_1x4" in bundles["main-branch-runs"]["dependencies"]
-
-
-def test_slurm_jobs_upload_otel_and_perfetto_files() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-
-    paths = config[".slurm_job"]["artifacts"]["paths"]
-    assert "ci/ci-results/otel/*/*.jsonl.gz" in paths
-    assert "ci/ci-runs/*/logs/otel/*/*.jsonl.gz" in paths
-    assert "ci/ci-runs/*/*/logs/otel/*/*.jsonl.gz" in paths
-    assert "ci/ci-results/otel/*/*perfetto.json.gz" in paths
-    assert "ci/ci-runs/*/logs/otel/*/*perfetto.json.gz" in paths
-    assert "ci/ci-runs/*/*/logs/otel/*/*perfetto.json.gz" in paths
-    assert "ci/ci-results/otel/*/process_memory_*.svg" in paths
-    assert "ci/ci-runs/*/logs/otel/*/process_memory_*.svg" in paths
-    assert "ci/ci-runs/*/*/logs/otel/*/process_memory_*.svg" in paths
-
-
-@pytest.mark.parametrize("status", ["success", "failed"])
-def test_slurm_jobs_keep_registries_and_upload_them_only_when_failed(tmp_path: Path, status: str) -> None:
-    job = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())[".slurm_job"]
-    registries = [
-        "ci/ci-runs/456_run/logs/registry.0.bin",
-        "ci/ci-runs/456_run/logs/registry.global.bin",
-        "ci/ci-runs/456_run/variant/logs/registry.1.bin",
-        "ci/ci-runs/456_run/variant/logs/registry.global.bin.tmp",
-    ]
-    shards = [
-        "ci/ci-runs/456_run/checkpoints/iter_0000010/__0_0.distcp",
-        "ci/ci-runs/456_run/variant/phase1-checkpoints/iter_0000005/__1_0.distcp",
-    ]
-    untouched = [
-        "ci/ci-runs/456_run/checkpoints/iter_0000010/.metadata",
-        "ci/ci-runs/789_other/checkpoints/iter_0000010/__0_0.distcp",
-    ]
-    for path in (*registries, *shards, *untouched):
-        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / path).write_text(path)
-    steps = [line for line in job["after_script"] if "registries" in line or "-name '*.distcp' -delete" in line]
-    assert len(steps) == 2  # noqa: PLR2004
-
-    subprocess.run(
-        ["bash", "-c", "\n".join(steps)],
-        cwd=tmp_path,
-        env={"CI_JOB_ID": "456", "CI_JOB_STATUS": status, "PATH": "/usr/bin:/bin"},
-        check=True,
-    )
-
-    assert all((tmp_path / path).read_text() == path for path in (*registries, *untouched))
-    assert [(tmp_path / path).exists() for path in shards] == [status != "success"] * len(shards)
-    staging = tmp_path / "ci/ci-results/registries"
-    staged = {path.relative_to(staging).as_posix(): path.read_text() for path in staging.rglob("*") if path.is_file()}
-    expected = {path.removeprefix("ci/ci-runs/"): path for path in registries} if status == "failed" else {}
-    assert staged == expected
-    assert "ci/ci-results/registries/" in job["artifacts"]["paths"]
-    assert not any("registry" in pattern for pattern in job["artifacts"]["paths"])
-
-
-def test_default_native_jobs_use_wheel_artifacts() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-
-    for name in (
-        "[DETR]:gb200:native:pico_1x4",
-        "[PERF]:gb200:native:pico_1x4",
-        "[DETR]:gb300:native:nano4_8x4",
-        "[PERF]:gb300:native:nano4_8x4",
-    ):
-        assert config[name]["needs"] == [{"job": "wheel:aarch64", "artifacts": True}]
-    assert "needs" not in config["[PERF]:gb200:native:super3bf16_16x4"]
-
-
-def test_wheel_test_matches_main_and_ctest_is_isolated() -> None:
-    config = yaml.safe_load((REPO_ROOT / "ci/gitlab-ci-native.yml").read_text())
-    build_script = "\n".join(config[".wheel_build"]["script"])
-    wheel_script = "\n".join(config[".wheel_pytest"]["script"])
-    ctest_script = "\n".join(config[".ctest"]["script"])
-
-    assert "nvrx_checkpointing-linux_${WHEEL_ARCH}.txt" in build_script
-    assert "dist/*.txt" in config[".wheel_build"]["artifacts"]["paths"]
-    assert config["wheel:x86_64"]["variables"]["WHEEL_JOB_ID_VARIABLE"] == "UPSTREAM_WHEEL_X86_64_JOB_ID"
-    assert config["wheel:aarch64"]["variables"]["WHEEL_JOB_ID_VARIABLE"] == "UPSTREAM_WHEEL_AARCH64_JOB_ID"
-    assert any("--fetch-upstream-wheel" in step for step in config[".slurm_job"]["before_script"])
-    assert " -m pytest tests " in wheel_script
-    assert "./dev_binaries/ckpttest" in wheel_script
-    assert "build-test" not in wheel_script
-    assert "ckpt_stress.py" not in wheel_script
-    assert config[".wheel_pytest"]["timeout"] == "30m"
-
-    assert "ctest --test-dir build-test --output-on-failure" in ctest_script
-    assert '--output-junit "${CI_PROJECT_DIR}/ci/ci-results/ctest.xml"' in ctest_script
-    assert "ci/scripts/ckpt_stress.py --gpus-per-node 2" in ctest_script
-    assert "PHOENIX_BUILD_BENCHMARK=ON" in ctest_script
-    assert "Python3_EXECUTABLE=/opt/venv/bin/python" in ctest_script
-    assert "UV_EXECUTABLE=/nonexistent/uv" in ctest_script
-    assert "--target ckpttest _distcp_shim ckpt_stress_test dcp_load distcp_roundtrip" in ctest_script
-    assert set(config["ctest:x86_64"]["needs"]) == {"wheel-image:x86_64", "wheel:x86_64"}
-    assert set(config["ctest:aarch64"]["needs"]) == {"wheel-image:aarch64", "wheel:aarch64"}
-    assert 'PHOENIX_WHEEL_VERSION="0.0.1.dev${CI_PIPELINE_IID}+g${CI_COMMIT_SHORT_SHA}"' in build_script
-    publish = config["wheel-publish:pypi"]
-    assert {need["job"] for need in publish["needs"]} == {
-        "wheel:x86_64",
-        "wheel:aarch64",
-        "wheel-pytest:x86_64",
-        "wheel-pytest:aarch64",
-        "ctest:x86_64",
-        "ctest:aarch64",
-    }
-    assert {need["job"] for need in publish["needs"] if need["artifacts"]} == {
-        "wheel:x86_64",
-        "wheel:aarch64",
-    }
-    publish_script = "\n".join(config[".wheel_publish"]["script"])
-    assert "TWINE_USERNAME=gitlab-ci-token" in publish_script
-    assert 'TWINE_PASSWORD="${CI_JOB_TOKEN}"' in publish_script
-    assert "python -m twine check dist/*.whl" in publish_script
-    assert "python -m twine upload" in publish_script
-    assert "--skip-existing" not in publish_script
-    assert "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" in publish_script
-    assert "packages/generic" not in publish_script
-    assert config[".wheel_publish"]["rules"][1]["if"] == '$CI_COMMIT_BRANCH == "main"'
-    assert config[".wheel_publish"]["rules"][2] == {"if": '$PUBLISH_WHEELS == "true"', "when": "on_success"}
-    assert config["variables"]["PUBLISH_WHEELS"]["value"] == "false"
-    assert "pyyaml twine" in (REPO_ROOT / "Dockerfile.ci").read_text()
-    assert "Description-Content-Type: text/markdown" in (REPO_ROOT / "METADATA").read_text()
-    cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
-    assert "PHOENIX_INSTALL_TEST_TORCH" not in cmake
-
-
 def test_training_is_teed_without_a_postprocess_step(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
-    monkeypatch.setenv("CLUSTER", "cwdfw")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
     monkeypatch.setenv("PLATFORM", "gb200")
     slurm_job._configure_run(_args(tmp_path))
 
@@ -4501,7 +4231,28 @@ def test_a_changed_training_option_does_not_pass_as_recorded(
     )
 
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "same", recorded, recorded) is True
+    assert not list((tmp_path / "same").glob("logs/baselines/*_arguments_differences.json"))
     assert _arguments_case(slurm_job, monkeypatch, tmp_path / "changed", changed, recorded) is False
+    (record,) = (tmp_path / "changed").glob("logs/baselines/*_arguments_differences.json")
+    assert json.loads(record.read_text()) == [{"option": "recompute_granularity", "recorded": "None", "run": "selective"}]
+
+
+def test_a_changed_collective_timeout_passes_as_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    recorded = (
+        "  distributed_timeout_minutes ..................... 10\n"
+        "  micro_batch_size ................................ 1\n"
+    )
+    # JET widens the collective timeout for large allocations.
+    widened = recorded.replace("10\n", "60\n")
+
+    assert _arguments_case(slurm_job, monkeypatch, tmp_path, widened, recorded) is True
+    assert not list(tmp_path.glob("logs/baselines/*_arguments_differences.json"))
 
 
 def test_two_jobs_comparing_different_providers_record_separately(
@@ -4570,6 +4321,33 @@ def test_native_detr_compares_only_native_arguments(
         assert candidate.exists() is (spec.variants[0] == "native")
         if candidate.exists():
             assert "ckpt_provider ................................... native" in candidate.read_text()
+
+
+def test_argument_logs_can_use_a_run_root_separate_from_the_batch_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+    )
+    args.run_root = tmp_path / "live-run"
+    batch_log = tmp_path / "artifacts" / "ci" / "ci-results" / "job.log"
+
+    paths = [slurm_job._argument_log(args, batch_log, spec) for spec in slurm_job._run_specs(args)]
+
+    assert paths == [
+        args.run_root / "nvrx.ref/logs/pico_1x4_ref-routine_rank0.log",
+        args.run_root / "native.cmp/logs/pico_1x4_cmp-routine_rank0.log",
+    ]
 
 
 def test_arguments_with_nothing_recorded_do_not_pass_uncompared(
@@ -5362,7 +5140,7 @@ def test_wheel_install_uses_pip_target_instead_of_extracting(
     commands: list[list[str]] = []
     monkeypatch.setenv("SLURMJOB_OPT_PYTHON_INSTALL_DIR", str(target))
     monkeypatch.setenv("WHEEL_ARCH", "aarch64")
-    monkeypatch.setattr(wheel_install, "_source_revision", lambda: "a" * 40)
+    monkeypatch.setattr(wheel_install, "source_revision", lambda: "a" * 40)
 
     def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
         commands.append(command)
@@ -5387,34 +5165,6 @@ def test_wheel_install_uses_pip_target_instead_of_extracting(
     assert all((target / "nvrx_checkpointing" / name).is_file() for name in wheel_install._WHEEL_BINARIES)
     source = (REPO_ROOT / "ci/scripts/wheel_install.py").read_text()
     assert "_extract_binaries" not in source
-
-
-def test_upstream_job_artifact_downloads_wheel_without_extracting_it(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    wheel_install = _load_slurm_job().wheel_install
-    filename = "nvrx_checkpointing-0.0.1-cp312-abi3-linux_aarch64.whl"
-    monkeypatch.setenv("WHEEL_ARCH", "aarch64")
-    monkeypatch.setenv("UPSTREAM_WHEEL_AARCH64_JOB_ID", "12345")
-    monkeypatch.setenv("CI_API_V4_URL", "https://gitlab.example/api/v4")
-    monkeypatch.setenv("CI_PROJECT_ID", "381021")
-    monkeypatch.setenv("CI_JOB_TOKEN", "secret")
-    requests = []
-
-    def response(request: object, **_kwargs: object) -> io.BytesIO:
-        requests.append(request)
-        return io.BytesIO(f"{filename}\n".encode() if str(request.full_url).endswith(".txt") else b"wheel contents")
-
-    monkeypatch.setattr(wheel_install.urllib.request, "urlopen", response)
-
-    downloaded = wheel_install.fetch_upstream_wheel(tmp_path)
-
-    assert downloaded == tmp_path / filename
-    assert downloaded.read_bytes() == b"wheel contents"
-    assert requests[0].full_url.endswith("/jobs/12345/artifacts/dist/nvrx_checkpointing-linux_aarch64.txt")
-    assert requests[1].full_url.endswith(f"/jobs/12345/artifacts/dist/{filename}")
-    assert requests[0].headers["Job-token"] == "secret"
 
 
 def test_wheel_install_does_not_trust_an_untracked_site_package(
@@ -5450,7 +5200,6 @@ def test_wheel_install_main_installs_from_explicit_dist(
 
 def test_wheel_packages_megatron_modules() -> None:
     cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
-    template = (REPO_ROOT / "ci/gitlab-ci-native.template.yml").read_text()
 
     assert "megatron@megatron" in cmake
     assert "megatron_stubs@megatron_stubs" in cmake
@@ -5458,8 +5207,6 @@ def test_wheel_packages_megatron_modules() -> None:
     assert "metadata_compare.py" in cmake
     assert "peers.py" in cmake
     assert "scripts@scripts" not in cmake
-    assert 'python -c "import nvrx_checkpointing.debug"' in template
-    assert "python -m nvrx_checkpointing.metadata_compare --help" in template
 
 
 def test_source_wheel_build_prepares_ubuntu_when_clang_is_missing(

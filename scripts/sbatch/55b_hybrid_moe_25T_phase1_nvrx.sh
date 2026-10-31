@@ -1,8 +1,5 @@
 #!/bin/bash
 
-#SBATCH --qos=batch_large_long
-#SBATCH --partition=batch_long
-#SBATCH --account=llmservice_fm_text
 #SBATCH --ntasks-per-node=4
 #SBATCH --nodes=1536
 #SBATCH --time=96:00:00
@@ -32,10 +29,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
 NAME="55B_hybrid_moe_25T_phase1"
-BASE_DIR="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6"
+BASE_DIR="${BASE_DIR:?set to the project directory that holds the code, data and images}"
 RUN_DIR="${BASE_DIR}/55b_hybrid_moe"
-#IMAGE="${BASE_DIR}/images/high_stride/nemo_megatron_perf_optimization:mcore-moe-pytorch25.08-te2.11.0.dev0-nccl2.28.9.1-qizhang-arm+nvrx.sqsh"
-IMAGE="${BASE_DIR}/images/high_stride/nemo_megatron_perf_optimization:mcore-moe-pytorch25.08-te2.11.0.dev0-nccl2.28.9.1-qizhang-arm+patchedhybridep+nvrx.sqsh"
+IMAGE="${IMAGE:?set to the training container image}"
 MEGATRON_LM_DIR="${BASE_DIR}/code_ultra/"
 DATACACHE_DIR="${BASE_DIR}/data-cache-ultra-phased/"
 
@@ -155,7 +151,7 @@ OPTIONS=" \
 	--num-layers-at-end-in-bf16 16 \
 	--fp4-format e2m1 \
 	--fp4-recipe nvfp4 \
-	--te-precision-config-file /lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/code_ultra/te_quant.cfg \
+	--te-precision-config-file "${MEGATRON_LM_DIR}te_quant.cfg" \
 	\
 	--mtp-spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
 	--mtp-num-layers 2 \

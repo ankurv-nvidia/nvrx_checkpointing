@@ -3,7 +3,6 @@ project(phoenix)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
-# The pin lives in its own file so Dockerfile.ci can read the same value.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vcpkg-commit.txt" VCPKG_AUTOCLONE_COMMIT LIMIT_COUNT 1)
 set(VCPKG_ROOT_FALLBACK_TO_BINARY_DIR ON CACHE BOOL "Allow vcpkg  be found in the binary directory if not found in the source directory")
 

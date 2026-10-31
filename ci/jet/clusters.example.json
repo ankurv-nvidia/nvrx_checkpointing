@@ -1,0 +1,32 @@
+{
+  "gb200": {
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci",
+    "segment": 16,
+    "custom_config": {
+      "launchers": {
+        "<launcher>": {
+          "sbatch_additional_flags": {
+            "gpus_per_node": 4
+          }
+        }
+      }
+    }
+  },
+  "gb300": {
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci",
+    "segment": 16
+  },
+  "h100": {
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>"
+  },
+  "b200": {
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci"
+  }
+}

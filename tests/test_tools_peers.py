@@ -5,7 +5,7 @@
 
 Covers the three launch shapes the native checkpoint writer runs under:
 
-- plain srun with one Slurm task per rank (CI jobs, nano.sh),
+- plain srun with one Slurm task per rank (CI jobs and launch scripts),
 - ft_launcher/torchrun inside a single allocation, one Slurm task per node,
 - Slurm job arrays whose tasks join one ft_launcher rendezvous, where no
   single allocation covers the world and peers come from the launcher's
@@ -203,16 +203,16 @@ def _write_cycle_info(tmp_path: Path, nodes: list[str], ranks: list[int], cycle:
 def test_detect_peers_from_cycle_info(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A job-array task's allocation covers 16 of 64 nodes; the cycle file holds the world."""
     peers = _load_peers(monkeypatch)
-    monkeypatch.setenv("SLURM_JOB_NODELIST", "nvl72d005-T[01-16]")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "rack005-T[01-16]")
     monkeypatch.setenv("SLURM_TASKS_PER_NODE", "1(x16)")
     monkeypatch.setenv("SLURM_NTASKS", "16")
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
     monkeypatch.setenv("GROUP_RANK", "17")
-    monkeypatch.setattr(peers.socket, "gethostname", lambda: "nvl72d148-T02")
-    nodes = [f"nvl72d005-T{i:02d}" for i in range(1, 17)]
-    nodes += [f"nvl72d136-T{i:02d}" for i in range(1, 17)]
-    nodes += [f"nvl72d146-T{i:02d}" for i in range(1, 17)]
-    nodes += [f"nvl72d148-T{i:02d}" for i in range(1, 17)]
+    monkeypatch.setattr(peers.socket, "gethostname", lambda: "rack148-T02")
+    nodes = [f"rack005-T{i:02d}" for i in range(1, 17)]
+    nodes += [f"rack136-T{i:02d}" for i in range(1, 17)]
+    nodes += [f"rack146-T{i:02d}" for i in range(1, 17)]
+    nodes += [f"rack148-T{i:02d}" for i in range(1, 17)]
     ranks = list(range(16)) + list(range(48, 64)) + list(range(32, 48)) + list(range(16, 32))
     monkeypatch.setenv("NVRX_CURRENT_CYCLE_INFO", str(_write_cycle_info(tmp_path, nodes, ranks)))
 
@@ -222,7 +222,7 @@ def test_detect_peers_from_cycle_info(monkeypatch: pytest.MonkeyPatch, tmp_path:
     for node, rank in zip(nodes, ranks):
         expected[rank] = node
     assert result == peers.OrderedPeers(tuple(expected), 4)
-    assert result.peers[17] == "nvl72d148-T02"  # group rank 17 maps to this process's host
+    assert result.peers[17] == "rack148-T02"  # group rank 17 maps to this process's host
     assert result.checkpoint_args() == {"peers": expected, "ranks_per_peer": 4}
 
 
@@ -254,7 +254,7 @@ def test_detect_peers_waits_for_the_current_launcher_cycle(
 def test_detect_peers_cycle_info_requires_matching_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     peers = _load_peers(monkeypatch)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
-    nodes = [f"nvl72d005-T{i:02d}" for i in range(1, 17)]
+    nodes = [f"rack005-T{i:02d}" for i in range(1, 17)]
     monkeypatch.setenv("NVRX_CURRENT_CYCLE_INFO", str(_write_cycle_info(tmp_path, nodes, list(range(16)))))
     with pytest.raises(RuntimeError, match="does not match world size 256"):
         peers.detect_environment_peers(0, 256)
@@ -265,7 +265,7 @@ def test_detect_peers_cycle_info_flags_rank_host_mismatch(monkeypatch: pytest.Mo
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
     monkeypatch.setenv("GROUP_RANK", "3")
     monkeypatch.setattr(peers.socket, "gethostname", lambda: "elsewhere-T01")
-    nodes = [f"nvl72d005-T{i:02d}" for i in range(1, 17)]
+    nodes = [f"rack005-T{i:02d}" for i in range(1, 17)]
     monkeypatch.setenv("NVRX_CURRENT_CYCLE_INFO", str(_write_cycle_info(tmp_path, nodes, list(range(16)))))
     with pytest.raises(RuntimeError, match="group rank 3"):
         peers.detect_environment_peers(12, 64)
