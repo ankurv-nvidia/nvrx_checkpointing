@@ -286,6 +286,18 @@ def _write_provenance(artifact_root: Path, stem: str, inventories: list[dict], s
     (result_dir / f"{stem}_jet_provenance.json").write_text(json.dumps(result, indent=2))
 
 
+def _record_failure(log: Path, result_dir: Path, stem: str) -> None:
+    """Keep a failed run's causal log lines and draw the memory graphs its telemetry still allows."""
+    try:
+        slurm_job._report_failure_summary(log)
+        if lines := slurm_job._failure_summary_lines(log):
+            (result_dir / f"{stem}_failure_summary.txt").write_text("\n".join(lines) + "\n")
+        slurm_job.recover_memory_graphs(sorted(result_dir.glob("otel/*/native_ckpt_otel.jsonl")))
+    except Exception:
+        # The run's archive is written even when this record fails.
+        traceback.print_exc()
+
+
 def _collect_run_artifacts(artifact_root: Path, run_root: Path) -> None:
     destination = artifact_root / "ci" / "ci-runs" / run_root.name
     patterns = (
@@ -448,6 +460,8 @@ def finalize(workload_argv: list[str], assets_dir: Path) -> int:
         log, stem = _combined_log(args, artifact_root, rank_logs, assets_dir)
         if final_rc == 0:
             final_rc = _run_epilog(args, log)
+        if final_rc:
+            _record_failure(log, artifact_root / "ci" / "ci-results", stem)
         _write_arguments_candidate(log, stem)
         _write_baseline_candidate(args, log, stem)
         inventories = [

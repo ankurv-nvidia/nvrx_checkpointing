@@ -4210,18 +4210,23 @@ def _recover_otel_entry(argv: list[str]) -> None:
     job_id = os.environ.get("CI_JOB_ID", "").strip()
     runs = sorted(root.glob(f"{job_id}_*")) if job_id else sorted(root.iterdir())
     for run in runs:
-        for source in sorted(run.glob("**/logs/otel/*/native_ckpt_otel.jsonl")):
-            output = source.parent / "process_memory_all.svg"
-            if output.is_file() or not source.stat().st_size:
-                continue
-            try:
-                data = otel_report.OtelData([source], tolerate_truncated_tail=True)
-                outputs = otel_report.write_process_memory_charts(data, source.parent)
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                logger.warning(f"[slurm_job:otel] WARNING could not recover {source}: {error}")
-                continue
-            if outputs:
-                logger.info(f"[slurm_job:otel] recovered partial memory graph: {outputs[0]}")
+        recover_memory_graphs(sorted(run.glob("**/logs/otel/*/native_ckpt_otel.jsonl")))
+
+
+def recover_memory_graphs(sources: list[Path]) -> None:
+    """Draw the missing memory graph beside each telemetry file that an interrupted run left."""
+    for source in sources:
+        output = source.parent / "process_memory_all.svg"
+        if output.is_file() or not source.stat().st_size:
+            continue
+        try:
+            data = otel_report.OtelData([source], tolerate_truncated_tail=True)
+            outputs = otel_report.write_process_memory_charts(data, source.parent)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            logger.warning(f"[slurm_job:otel] WARNING could not recover {source}: {error}")
+            continue
+        if outputs:
+            logger.info(f"[slurm_job:otel] recovered partial memory graph: {outputs[0]}")
 
 
 def _epilog(argv: list[str]) -> None:

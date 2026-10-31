@@ -40,6 +40,11 @@ def changed_options(results: Path) -> list[dict]:
     return changes
 
 
+def failure_summary(results: Path) -> list[str]:
+    """The causal log lines that a failed run kept."""
+    return [line for path in sorted(results.glob("ci/ci-results/*_failure_summary.txt")) for line in path.read_text().splitlines()]
+
+
 def checkpoint_saves(results: Path) -> list[tuple[str, int | None, float, float]]:
     """Megatron's save-checkpoint time per save, as the min and max across ranks in milliseconds."""
     runs = results / "ci" / "ci-runs"
@@ -89,9 +94,18 @@ def verdict(exit_code: int) -> str:
     return MISSED if exit_code == SOFT_FAILURE else FAILED
 
 
-def markdown(name: str, result: str, comparison: dict[str, dict], changes: list[dict], saves: list) -> str:
+def markdown(  # noqa: PLR0913
+    name: str,
+    result: str,
+    comparison: dict[str, dict],
+    changes: list[dict],
+    saves: list,
+    failure: list[str],
+) -> str:
     icon = {PASSED: ":white_check_mark:", MISSED: ":warning:"}.get(result, ":x:")
     lines = [f"### {icon} `{name}` {result}", ""]
+    if failure:
+        lines += ["```", *failure, "```", ""]
     if comparison:
         lines += [
             "| Metric | Statistic | Status | Measured | Baseline | Change | Tolerance |",
@@ -120,9 +134,10 @@ def markdown(name: str, result: str, comparison: dict[str, dict], changes: list[
 
 def report_workload(name: str, results: Path, exit_code: int, output: Path) -> int:
     comparison, changes, saves = comparisons(results), changed_options(results), checkpoint_saves(results)
+    failure = failure_summary(results)
     result = verdict(exit_code)
     failures = {metric: entry for metric, entry in comparison.items() if entry.get("status") == "FAIL"}
-    text = markdown(name, result, comparison, changes, saves)
+    text = markdown(name, result, comparison, changes, saves, failure)
     output.mkdir(parents=True, exist_ok=True)
     (output / f"{name}.md").write_text(text)
     record = {"workload": name, "result": result, "missed": sorted(failures), "changed_options": len(changes)}
