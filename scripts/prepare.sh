@@ -191,7 +191,7 @@ function ubuntu2404 {
     export DEBIAN_FRONTEND=noninteractive
     export TZ=America/Los_Angeles
     rm -f /etc/apt/apt.conf.d/docker-clean
-    apt update && apt-get install --yes --no-install-recommends wget software-properties-common build-essential ca-certificates curl
+    apt update && apt-get install --yes --no-install-recommends wget build-essential ca-certificates curl
     # clang/llvm
     wget https://apt.llvm.org/llvm-snapshot.gpg.key -O /etc/apt/trusted.gpg.d/apt.llvm.org.asc
     wget https://apt.kitware.com/keys/kitware-archive-latest.asc -O /etc/apt/trusted.gpg.d/kitware-archive-latest.asc
@@ -199,7 +199,7 @@ function ubuntu2404 {
     echo "deb https://apt.kitware.com/ubuntu/ ${UBUNTU_CODENAME} main" > /etc/apt/sources.list.d/cmake.list
     packages=()
 
-    packages+=(gnupg build-essential software-properties-common wget curl ca-certificates)
+    packages+=(gnupg build-essential wget curl ca-certificates)
 
     packages+=(
         g++-${GCC_VERSION}
