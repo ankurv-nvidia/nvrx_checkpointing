@@ -523,7 +523,7 @@ def test_adapter_and_resolver_pin_same_public_commit(monkeypatch: pytest.MonkeyP
 
     assert f"COMMIT_HASH=${{MEGATRON_COMMIT:-{integration.SUPPORTED_MEGATRON_COMMIT}}}" in resolver
     assert "https://github.com/NVIDIA/Megatron-LM.git" in resolver
-    assert "gitlab-master.nvidia.com/ankurv/megatron-lm" not in resolver
+    assert "gitlab" not in resolver.lower()
     assert "git -c protocol.version=1 clone" in resolver
     assert "-c protocol.version=1" in resolver
     assert '-c remote.neworigin.url="${MEGATRON_REPO_URL}"' in resolver

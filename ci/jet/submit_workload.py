@@ -23,9 +23,6 @@ from workload_matrix import JetPlatform, jet_cluster, jet_platform
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-GITLAB_URL = "https://gitlab-master.nvidia.com"
-JET_CI_PROJECT = "dl/jet/ci"
-JET_LOGS_URL = "https://jet.nvidia.com/ui/logs"
 PIPELINE_FILE = Path(".jet-pipeline")
 RESULTS_DIR = Path("jet-results")
 IMAGE_ENV_FILE = Path("jet-image.env")
@@ -272,7 +269,7 @@ def describe(log: Any) -> list[str]:  # noqa: ANN401
     slurm = payload.get("slurm") or {}
     lines = [
         f"[jet] JET status: {status.get('name', 'unknown')} ({status.get('code', '?')}) {status.get('message', '')}".rstrip(),
-        f"[jet] JET log: {JET_LOGS_URL}/{payload.get('id', '')}",
+        f"[jet] JET log: {_logs_url()}/{payload.get('id', '')}",
     ]
     if slurm:
         lines.append(
@@ -280,6 +277,12 @@ def describe(log: Any) -> list[str]:  # noqa: ANN401
             f"ran {_duration(slurm.get('duration'))}, state {slurm.get('state', '?')}",
         )
     return lines
+
+
+def _logs_url() -> str:
+    from jetclient.utils.get_url import get_backend_url
+
+    return get_backend_url("prod").removesuffix("/api") + "/ui/logs"
 
 
 def _duration(seconds: float | None) -> str:
@@ -354,7 +357,7 @@ def _gitlab(client: Any) -> GitLabJobs:  # noqa: ANN401
 
 def cancel(pipeline_id: int) -> None:
     _gitlab(_client()).cancel_pipeline(pipeline_id)
-    print(f"[jet] canceled JET pipeline {GITLAB_URL}/{JET_CI_PROJECT}/-/pipelines/{pipeline_id}")
+    print(f"[jet] canceled JET pipeline {pipeline_id}")
 
 
 def _print_generation(client: Any, pipeline_id: int) -> None:  # noqa: ANN401
@@ -385,7 +388,7 @@ def submit(args: argparse.Namespace) -> int:
         wait_for_validation=False,
     )
     PIPELINE_FILE.write_text(f"{pipeline.jet_id}\n")
-    print(f"[jet] submitted {key} to {cluster.config}: {GITLAB_URL}/{JET_CI_PROJECT}/-/pipelines/{pipeline.jet_id}", flush=True)
+    print(f"[jet] submitted {key} to {cluster.config} as JET pipeline {pipeline.jet_id}", flush=True)
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary).open("a") as output:
             output.write(f"`{key}` was submitted to JET config `{cluster.config}`.\n")

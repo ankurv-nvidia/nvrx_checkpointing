@@ -25,9 +25,11 @@ permissions:
   contents: read
 
 env:
-  JET_CI_MAINTAINER: ankurv
+  JET_CI_MAINTAINER: ${{ vars.JET_CI_MAINTAINER }}
+  JET_CLIENT_INDEX_URL: ${{ vars.JET_CLIENT_INDEX_URL }}
   JET_PLATFORM: ${{ inputs.platform }}
   JET_CLUSTERS: ${{ vars.JET_CLUSTERS }}
+  JET_CUSTOM_CONFIG: ${{ vars.JET_CUSTOM_CONFIG }}
   UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID: ${{ inputs.wheel-aarch64-artifact-id }}
   UPSTREAM_WHEEL_X86_64_ARTIFACT_ID: ${{ inputs.wheel-x86_64-artifact-id }}
 

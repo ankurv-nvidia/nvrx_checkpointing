@@ -17,6 +17,7 @@ JOBS_FILE = Path(__file__).with_name("jobs.json")
 PLATFORMS = json.loads(JOBS_FILE.read_text())["platforms"]
 CLUSTERS_VARIABLE = "JET_CLUSTERS"
 CLUSTERS_EXAMPLE = "ci/jet/clusters.example.json"
+CUSTOM_CONFIG_VARIABLE = "JET_CUSTOM_CONFIG"
 CLUSTER_FIELDS = frozenset({"config", "launcher", "cache", "segment", "custom_config"})
 RUNTIME_CACHE_MOUNT = "/nvrx-ci-cache"
 
@@ -94,6 +95,24 @@ def jet_cluster(name: str) -> JetCluster:
         segment=segment,
         custom_config=entry.get("custom_config", {}),
     )
+
+
+def shared_custom_config() -> dict:
+    """Return the JET config that every platform's workloads share, from its repository variable.
+
+    The variable holds a JSON object shaped like ci/jet/custom_config.example.json,
+    such as the auto-retrier settings; without it workloads run without them.
+    """
+    text = os.environ.get(CUSTOM_CONFIG_VARIABLE, "").strip()
+    if not text:
+        return {}
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{CUSTOM_CONFIG_VARIABLE} is not valid JSON: {error}") from error
+    if not isinstance(config, dict):
+        raise TypeError(f"{CUSTOM_CONFIG_VARIABLE} must be a JSON object")
+    return config
 
 
 def platform_profile(name: str) -> dict:

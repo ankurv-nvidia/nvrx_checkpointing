@@ -59,17 +59,15 @@ jobs:
             [[ "${code:-000}" != 000 ]] || unreachable=1
           done <<'EOF'
           https://github.com
-          https://gitlab-master.nvidia.com/api/v4/version
-          https://jet.nvidia.com/api/docs
-          https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hw-joc-pypi/simple/jet-client/
-          https://gpuwa.nvidia.com/elasticsearch/
           https://nvcr.io/v2/
           https://pypi.org/simple/pip/
           EOF
           exit "$unreachable"
 
-      - name: jet-client from Artifactory
+      - name: jet-client from its index
         if: ${{ !cancelled() }}
+        env:
+          JET_CLIENT_INDEX_URL: ${{ vars.JET_CLIENT_INDEX_URL }}
         run: |
           ci/github/jet.sh setup
           "$RUNNER_TEMP/jet-client/bin/python" -c 'import importlib.metadata as m; print("jet-client", m.version("jet-client"))'
@@ -79,8 +77,9 @@ jobs:
         env:
           JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
         run: |
+          api=$("$RUNNER_TEMP/jet-client/bin/python" -c 'from jetclient.utils.get_url import get_backend_url; print(get_backend_url("prod"))')
           status=$(curl -sS -m 30 -o "$RUNNER_TEMP/jet-me.json" -w '%{http_code}' \
-            -H "Authorization: Bearer $JET_GITLAB_TOKEN" https://jet.nvidia.com/api/auth/v1/me)
+            -H "Authorization: Bearer $JET_GITLAB_TOKEN" "$api/auth/v1/me")
           echo "HTTP $status"
           python3 -c 'import json, sys; me = json.load(open(sys.argv[1])); print({key: me.get(key) for key in ("username", "detail")})' "$RUNNER_TEMP/jet-me.json"
           [[ "$status" == 200 ]]

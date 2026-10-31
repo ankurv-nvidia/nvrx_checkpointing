@@ -1,25 +1,13 @@
 {
   "gb200": {
-    "config": "dlalgo-ci/oci-hsg",
-    "launcher": "oci-hsg",
-    "cache": "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nvrx_checkpointing_ci",
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci",
     "segment": 16,
     "custom_config": {
-      "executors": {
-        "jet-ci": {
-          "environments": {
-            "oci-hsg": {
-              "variables": {
-                "GIT_STRATEGY": "none"
-              }
-            }
-          }
-        }
-      },
       "launchers": {
-        "oci-hsg": {
+        "<launcher>": {
           "sbatch_additional_flags": {
-            "deadline": "now+3days",
             "gpus_per_node": 4
           }
         }
@@ -27,39 +15,18 @@
     }
   },
   "gb300": {
-    "config": "dlcompiler-ci/gb300nvl",
-    "launcher": "gb300nvl_dlcluster",
-    "custom_config": {
-      "executors": {
-        "jet-ci": {
-          "environments": {
-            "gb300nvl_dlcluster": {
-              "variables": {
-                "GIT_STRATEGY": "none",
-                "SLURM_NTASKS": "1"
-              },
-              "before_script": [
-                "set -Eeuo pipefail\ntest -n \"$(printenv SLURM_JOB_ID)\"\nscontrol update \"JobId=$(printenv SLURM_JOB_ID)\" Requeue=0\nscontrol show job \"$(printenv SLURM_JOB_ID)\" --oneliner \\\n  | grep -Eq '(^|[[:space:]])Requeue=0([[:space:]]|$)'\nunset SLURM_NTASKS\n"
-              ]
-            }
-          }
-        }
-      },
-      "launchers": {
-        "gb300nvl_dlcluster": {
-          "partition": "gb300nvl72_ci"
-        }
-      }
-    }
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci",
+    "segment": 16
   },
   "h100": {
-    "config": "dlalgo-ci/coreweave-dfw",
-    "launcher": "dgxh100_coreweave",
-    "cache": "/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nvrx_checkpointing_ci"
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>"
   },
   "b200": {
-    "config": "dlalgo-ci/nsc-svg-slurm-1",
-    "launcher": "b200_nsc_svg_slurm_1",
-    "cache": "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/nvrx_checkpointing_ci"
+    "config": "<team>/<cluster>",
+    "launcher": "<launcher>",
+    "cache": "/shared/<team>/nvrx_checkpointing_ci"
   }
 }

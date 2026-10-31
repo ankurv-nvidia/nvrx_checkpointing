@@ -23,6 +23,7 @@ from workload_matrix import (  # noqa: E402
     JetPlatform,
     jet_cluster,
     platform_profile,
+    shared_custom_config,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
@@ -33,37 +34,6 @@ WHEEL_TOKEN_SECRETS = {"NVRX_GITHUB_TOKEN": "user/<current>/github/nvrx-ci-artif
 PREPARE_SCRIPT = (CI_DIR.parent / "scripts" / "prepare.sh").read_bytes()
 RUNTIME_KEY = hashlib.sha256(PREPARE_SCRIPT).hexdigest()[:10]
 PYTORCH_IMAGE = re.search(rb"^PYTORCH_IMAGE=(\S+)$", PREPARE_SCRIPT, re.MULTILINE).group(1).decode()
-# JET retries an attempt only for platform-classified infrastructure failures.
-RETRIER_CONFIG = {
-    "retrier": {
-        "enabled": True,
-        "environment": "jet-auto-retrier",
-        "default_retry_on": ["1.2", "1.2.*"],
-        "default_max_retries": 1,
-        "waiting_time": 60,
-    },
-    "executors": {
-        "jet-ci": {
-            "environments": {
-                "jet-auto-retrier": {
-                    "tags": [
-                        "purpose/auto-retrier",
-                        "arch/amd64",
-                        "env/prod",
-                        "owner/jet-core",
-                        "origin/jet-fleet",
-                    ],
-                    "image": "gitlab-master.nvidia.com/dl/jet/api:v3",
-                    "before_script": [
-                        'jet secrets jwt-login jwt/nvidia/gitlab-master jet-ci-ci "$(printenv VAULT_JWT_TOKEN)"',
-                    ],
-                },
-            },
-        },
-    },
-}
-
-
 @dataclass(frozen=True)
 class Workload:
     """One Slurm runner invocation that JET runs on a platform."""
@@ -283,7 +253,7 @@ def find_workload(platform: JetPlatform, key: str) -> Workload:
 def jet_custom_config(platform: JetPlatform) -> dict:
     """Return the JET generator config overrides for the platform's cluster."""
     cluster = jet_cluster(platform.name)
-    config = _deep_merge(RETRIER_CONFIG, cluster.custom_config)
+    config = _deep_merge(shared_custom_config(), cluster.custom_config)
     if not cluster.cache:
         return config
     environment = config.get("executors", {}).get("jet-ci", {}).get("environments", {}).get(cluster.launcher, {})
