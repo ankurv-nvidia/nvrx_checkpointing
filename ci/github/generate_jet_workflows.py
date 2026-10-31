@@ -92,7 +92,7 @@ def platforms() -> list[JetPlatform]:
 
 def workloads(platform: JetPlatform) -> list[generate_workloads.Workload]:
     """Every supported workload of a platform, grouped by suite in rollout order."""
-    supported, _unsupported = generate_workloads.select_workloads(platform, "full")
+    supported, _unsupported = generate_workloads.select_workloads(platform)
     return sorted(supported, key=lambda workload: SUITE_ORDER.index(workload.pipeline_suite))
 
 

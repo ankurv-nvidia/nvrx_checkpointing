@@ -262,10 +262,6 @@ def image_variable(platform: JetPlatform) -> str:
     return f"JET_IMAGE_TAG_{platform.name.upper()}"
 
 
-def dry_run_image(platform: JetPlatform) -> str:
-    return f"gitlab-master.nvidia.com/dl/jet/ci/nvrx-ci-{platform.name}:dry-run"
-
-
 def workload_log(logs: Iterable[Any], key: str, job_id: int | None) -> Any | None:  # noqa: ANN401
     """Return the JET log of one workload attempt, or the newest attempt when the job is unknown."""
     matching = [log for log in logs if log.log.get("workload", {}).get("key") == key]
@@ -345,10 +341,7 @@ def wait_for_log(pipeline: Any, key: str, job_id: int | None, *, sleep: Callable
 def _client() -> Any:  # noqa: ANN401
     from jetclient import JETClient
 
-    client = JETClient(
-        jet_backend_token=os.environ.get("JET_JWT_TOKEN") or None,
-        gitlab_ci_token=os.environ.get("JET_GITLAB_TOKEN") or None,
-    )
+    client = JETClient(gitlab_ci_token=os.environ.get("JET_GITLAB_TOKEN") or None)
     if not client.has_gitlab_ci_token:
         raise SystemExit(
             "JET needs the submitting user's GitLab token: store a personal access token with api scope in "
@@ -381,8 +374,7 @@ def _print_generation(client: Any, pipeline_id: int) -> None:  # noqa: ANN401
 def submit(args: argparse.Namespace) -> int:
     platform = jet_platform(args.platform)
     cluster = jet_cluster(platform.name)
-    maintainer = os.environ.get("JET_CI_MAINTAINER") or os.environ.get("GITLAB_USER_LOGIN") or ""
-    dry_run = os.environ.get("JET_CI_DRY_RUN") == "true"
+    maintainer = os.environ["JET_CI_MAINTAINER"]
     key, documents = manifests(
         platform,
         maintainer=maintainer,
@@ -396,7 +388,6 @@ def submit(args: argparse.Namespace) -> int:
         custom_config=generate_workloads.jet_custom_config(platform),
         additional_variables=submission_variables(dict(os.environ)),
         wait_for_validation=False,
-        dry_run=dry_run,
     )
     PIPELINE_FILE.write_text(f"{pipeline.jet_id}\n")
     print(f"[jet] submitted {key} to {cluster.config}: {GITLAB_URL}/{JET_CI_PROJECT}/-/pipelines/{pipeline.jet_id}", flush=True)
@@ -417,9 +408,7 @@ def submit(args: argparse.Namespace) -> int:
     print(f"[jet] JET pipeline finished: {result.pipeline_status}", flush=True)
     if not result.jobs:
         _print_generation(client, pipeline.jet_id)
-        if dry_run and result.pipeline_status == "success" and args.workload is None:
-            IMAGE_ENV_FILE.write_text(f"{image_variable(platform)}={dry_run_image(platform)}\n")
-        return 0 if dry_run and result.pipeline_status == "success" else 1
+        return 1
     step_id = int(result.jobs[WORKLOAD_PHASE]["id"]) if WORKLOAD_PHASE in result.jobs else None
     log = wait_for_log(client.workloads.get_pipeline(pipeline.jet_id), key, step_id)
     log_code = None

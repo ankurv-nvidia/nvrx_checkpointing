@@ -8,15 +8,9 @@ runtime_archive=${JET_RUNTIME_ARCHIVE:?}
 runtime_key=${JET_RUNTIME_KEY:?}
 architecture=$(uname -m)
 compute_capability=${NVRX_COMPUTE_CAPABILITY:?}
-wheel_mode=${JET_WHEEL_MODE:?}
 prepared_marker="${runtime_root}/.prepared"
 local_prepared_marker="${local_runtime_root}/.prepared"
-expected_state="${runtime_key} ${architecture} ${compute_capability} ${wheel_mode} local-bundle-v11"
-
-[[ "${wheel_mode}" == "prebuilt" ]] || {
-    echo "JET_WHEEL_MODE must be prebuilt, found ${wheel_mode}" >&2
-    exit 2
-}
+expected_state="${runtime_key} ${architecture} ${compute_capability} local-bundle-v11"
 
 # A configured cache must be the launcher's mount, never a directory inside the container.
 if [[ -n "${JET_RUNTIME_CACHE_DIR:-}" ]] && ! mountpoint -q "${JET_RUNTIME_CACHE_DIR}"; then

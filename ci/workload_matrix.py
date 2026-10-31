@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # ruff: noqa: INP001
-"""Typed access to the declarative regular and JET workload matrix."""
+"""Typed access to the platforms in ci/jobs.json and the clusters that run them."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Literal
 
 Architecture = Literal["x86_64", "aarch64"]
-WheelMode = Literal["prebuilt"]
 
 
 JOBS_FILE = Path(__file__).with_name("jobs.json")
@@ -30,14 +29,11 @@ class JetPlatform:
     profile: str
     architecture: Architecture
     gpus_per_node: int
-    wheel_mode: WheelMode
     max_nodes: int | None = None
     max_timeout_seconds: int | None = None
     use_regular_time_budget: bool = False
-    smoke_timeout_seconds: int | None = None
     distributed_timeout_minutes: int | None = None
     distributed_timeout_min_nodes: int | None = None
-    time_budget_overrides_seconds: tuple[tuple[str, int], ...] = ()
     compute_capability: str = ""
 
 
@@ -100,8 +96,8 @@ def jet_cluster(name: str) -> JetCluster:
     )
 
 
-def legacy_platform(name: str) -> dict:
-    """Return the workload profile named by a regular or JET platform."""
+def platform_profile(name: str) -> dict:
+    """Return the ci/jobs.json entry whose workloads a platform runs."""
     platform = next(platform for platform in PLATFORMS if platform["name"] == name)
     profile_name = platform.get("workload_profile", name)
     return next(candidate for candidate in PLATFORMS if candidate["name"] == profile_name)
@@ -117,21 +113,13 @@ def jet_platform(name: str) -> JetPlatform:
         profile=platform.get("workload_profile", name),
         architecture=platform["architecture"],
         gpus_per_node=gpus_per_node,
-        wheel_mode=metadata["wheel_mode"],
         max_nodes=metadata.get("max_nodes"),
         max_timeout_seconds=(
             metadata["max_timeout_minutes"] * 60 if metadata.get("max_timeout_minutes") else None
         ),
         use_regular_time_budget=metadata.get("use_regular_time_budget", False),
-        smoke_timeout_seconds=(
-            metadata["smoke_timeout_minutes"] * 60 if metadata.get("smoke_timeout_minutes") else None
-        ),
         distributed_timeout_minutes=metadata.get("distributed_timeout_minutes"),
         distributed_timeout_min_nodes=metadata.get("distributed_timeout_min_nodes"),
-        time_budget_overrides_seconds=tuple(
-            (flavor, minutes * 60)
-            for flavor, minutes in metadata.get("time_budget_overrides_minutes", {}).items()
-        ),
         compute_capability=metadata["compute_capability"],
     )
 

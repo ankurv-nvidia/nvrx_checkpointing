@@ -113,9 +113,6 @@ def _verify_architecture() -> None:
 
 
 def _install_wheel(args: argparse.Namespace) -> None:
-    mode = os.environ.get("JET_WHEEL_MODE", "").strip()
-    if mode != "prebuilt":
-        raise RuntimeError(f"JET_WHEEL_MODE must be 'prebuilt', found {mode!r}")
     variant = wheel_variant(args)
     os.environ["WHEEL_VARIANT"] = variant
     root = Path(os.environ.get("JET_PREBUILT_WHEEL_DIR", "/opt/nvrx-wheels"))
@@ -158,7 +155,6 @@ def prepare(args: argparse.Namespace) -> Path:
         "platform": slurm_job.platform_tag(),
         "architecture": platform.machine(),
         "source_revision": wheel_install.source_revision(),
-        "wheel_mode": os.environ["JET_WHEEL_MODE"],
         "wheel_variant": wheel_variant(args),
     }
     prepared = slurm_job.RUN_ROOT / ".jet-prepared.json"
@@ -180,7 +176,6 @@ def require_prepared(args: argparse.Namespace) -> dict:
         "platform": slurm_job.platform_tag(),
         "architecture": platform.machine(),
         "source_revision": wheel_install.source_revision(),
-        "wheel_mode": os.environ.get("JET_WHEEL_MODE"),
         "wheel_variant": wheel_variant(args),
     }
     if state != expected:

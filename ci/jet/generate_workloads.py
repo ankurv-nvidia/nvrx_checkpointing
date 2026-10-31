@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-"""Generate JET build and recipe workload manifests."""
+# ruff: noqa: INP001
+"""Build the JET image and recipe manifests for the workloads in ci/jobs.json."""
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import re
@@ -20,21 +19,14 @@ CONFIGS_DIR = CI_DIR / "configs"
 sys.path.insert(0, str(CI_DIR))
 
 from workload_matrix import (  # noqa: E402
-    JET_PLATFORMS,
     RUNTIME_CACHE_MOUNT,
     JetPlatform,
     jet_cluster,
-    jet_platform,
-    legacy_platform,
+    platform_profile,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
-SMOKE_TIMEOUT_SECONDS = 60 * 60
-PARITY_MAX_NODES = 2
 LARGE_CHECKPOINT_MIN_NODES = 16
-SMOKE_ID = ("native", "pico", ("detr",), ("ref:nvrx", "cmp:native"), 1)
-PERF_SMOKE_ID = ("native", "pico", ("perf", "native"), (), 1)
-POLICY_SUITES = frozenset({"default", "optional", "nvrx", "large-scale", "main-branch-runs"})
 # The submitting user's read-only GitHub token downloads the upstream wheel artifacts.
 WHEEL_TOKEN_SECRETS = {"NVRX_GITHUB_TOKEN": "user/<current>/github/nvrx-ci-artifacts"}
 # The native runtime cache follows prepare.sh, so editing that file forces a rebuild.
@@ -70,21 +62,9 @@ RETRIER_CONFIG = {
 }
 
 
-class LiteralDumper(yaml.SafeDumper):
-    """Safe YAML dumper that renders multi-line scripts as literal blocks."""
-
-
-def _represent_string(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
-    style = "|" if "\n" in value else None
-    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
-
-
-LiteralDumper.add_representer(str, _represent_string)
-
-
 @dataclass(frozen=True)
 class Workload:
-    """Resolved invocation shared by the GitLab and JET transports."""
+    """One Slurm runner invocation that JET runs on a platform."""
 
     platform: str
     provider: str
@@ -105,10 +85,6 @@ class Workload:
     @property
     def scale(self) -> str:
         return f"{self.nodes}x{self.gpus_per_node}"
-
-    @property
-    def identity(self) -> tuple[str, str, tuple[str, ...], tuple[str, ...], int]:
-        return self.provider, self.config, self.flavors, self.runs, self.nodes
 
     @property
     def job_args(self) -> list[str]:
@@ -172,8 +148,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _regular_time_budget_seconds(config: str, flavors: tuple[str, ...]) -> int:
-    """Mirror the allocation budget selected by the regular Slurm runner."""
+def _config_time_budget_seconds(config: str, flavors: tuple[str, ...]) -> int:
+    """Return the srun budget that the model config sets for these flavors."""
     base = yaml.safe_load((CONFIGS_DIR / "base.yaml").read_text())
     override = yaml.safe_load((CONFIGS_DIR / f"{config}.yaml").read_text())
     table = (_deep_merge(base, override).get("job_time_in_mins") or {}).get("srun") or {}
@@ -185,34 +161,8 @@ def _regular_time_budget_seconds(config: str, flavors: tuple[str, ...]) -> int:
     return int(table.get(flavor_tag, table.get(execution_mode, table.get("default", 30)))) * 60
 
 
-def _time_budget_override_seconds(
-    platform: JetPlatform,
-    workload: Workload,
-) -> int | None:
-    """Resolve an optional platform override from most to least specific."""
-    overrides = dict(platform.time_budget_overrides_seconds)
-    semantic_tag = "-".join(
-        flavor
-        for flavor in workload.flavors
-        if flavor not in {"native", "nvrx", "async", "shm"}
-    )
-    return next(
-        (
-            overrides[key]
-            for key in (
-                f"{workload.config}:{workload.flavor_tag}",
-                f"{workload.config}:{semantic_tag}",
-                workload.flavor_tag,
-                semantic_tag,
-            )
-            if key in overrides
-        ),
-        None,
-    )
-
-
 def _apply_transport_args(platform: JetPlatform, workload: Workload) -> Workload:
-    """Add launcher-specific arguments that do not belong to regular CI jobs."""
+    """Add the platform's collective timeout to workloads with enough nodes."""
     if platform.distributed_timeout_minutes is None:
         return workload
     if workload.nodes < (platform.distributed_timeout_min_nodes or 1):
@@ -227,10 +177,9 @@ def _apply_transport_args(platform: JetPlatform, workload: Workload) -> Workload
     )
 
 
-def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
-    """Resolve the exact regular-CI workload matrix for a JET platform profile."""
-    profile = legacy_platform(platform.profile)
-    platform_suite = profile.get("pipeline_suite")
+def resolved_workloads(platform: JetPlatform) -> list[Workload]:
+    """Resolve every workload of a platform's profile in ci/jobs.json."""
+    profile = platform_profile(platform.profile)
     workloads = []
     for provider, flavors in profile["jobs"]:
         selected = (flavors,) if isinstance(flavors, str) else tuple(flavors)
@@ -250,9 +199,7 @@ def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
                 1,
                 platform.gpus_per_node,
                 pipeline_suite=(
-                    "main-branch-runs"
-                    if "vg" in selected
-                    else platform_suite or ("nvrx" if provider == "nvrx" else "default")
+                    "main-branch-runs" if "vg" in selected else "nvrx" if provider == "nvrx" else "default"
                 ),
             ),
         )
@@ -271,20 +218,6 @@ def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
             )
             if not runs:
                 common = (*common, provider)
-            flavor_arg_table = entry.get("flavor_args", {})
-            extra_args = tuple(
-                shlex.split(
-                    flavor_arg_table.get(
-                        "+".join(selected),
-                        flavor_arg_table.get(selected[0], ""),
-                    ),
-                ),
-            )
-            if commit := entry.get("megatron_commit"):
-                extra_args = ("--megatron-commit", commit, *extra_args)
-            checkpoint_interval = entry.get("checkpoint_interval") if "perf" in selected else None
-            if "--checkpoint-interval" in extra_args:
-                checkpoint_interval = int(extra_args[extra_args.index("--checkpoint-interval") + 1])
             workloads.append(
                 Workload(
                     platform.name,
@@ -296,14 +229,12 @@ def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
                     platform.gpus_per_node,
                     timeout_seconds=_timeout_seconds(entry.get("timeout")),
                     pipeline_suite=(
-                        platform_suite
-                        or ("main-branch-runs" if "vg" in selected else None)
+                        ("main-branch-runs" if "vg" in selected else None)
                         or ("nvrx" if provider == "nvrx" else None)
                         or entry.get("pipeline_suite")
                         or "optional"
                     ),
-                    checkpoint_interval=checkpoint_interval,
-                    extra_args=extra_args,
+                    checkpoint_interval=entry.get("checkpoint_interval") if "perf" in selected else None,
                 ),
             )
     if platform.max_timeout_seconds is not None:
@@ -317,10 +248,7 @@ def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
     if platform.use_regular_time_budget:
         budgeted_workloads = []
         for workload in workloads:
-            timeout_seconds = (
-                _time_budget_override_seconds(platform, workload)
-                or _regular_time_budget_seconds(workload.config, workload.flavors)
-            )
+            timeout_seconds = _config_time_budget_seconds(workload.config, workload.flavors)
             if platform.max_timeout_seconds is not None:
                 timeout_seconds = min(timeout_seconds, platform.max_timeout_seconds)
             budgeted_workloads.append(replace(workload, timeout_seconds=timeout_seconds))
@@ -328,44 +256,10 @@ def resolved_workloads(platform: JetPlatform) -> list[Workload]:  # noqa: C901
     return workloads
 
 
-def select_workloads(platform: JetPlatform, suite: str) -> tuple[list[Workload], list[Workload]]:
-    """Select emitted and unsupported workloads for a rollout suite."""
-    workloads = resolved_workloads(platform)
-    if suite == "smoke":
-        workloads = [
-            replace(
-                workload,
-                timeout_seconds=max(
-                    SMOKE_TIMEOUT_SECONDS,
-                    platform.smoke_timeout_seconds or platform.max_timeout_seconds or 0,
-                ),
-            )
-            for workload in workloads
-            if workload.identity == SMOKE_ID
-        ]
-    elif suite == "smoke-perf":
-        workloads = [
-            replace(
-                workload,
-                timeout_seconds=max(
-                    SMOKE_TIMEOUT_SECONDS,
-                    platform.smoke_timeout_seconds or platform.max_timeout_seconds or 0,
-                ),
-            )
-            for workload in workloads
-            if workload.identity == PERF_SMOKE_ID
-        ]
-    elif suite in POLICY_SUITES:
-        workloads = [workload for workload in workloads if workload.pipeline_suite == suite]
-    elif suite == "merge-request":
-        workloads = [workload for workload in workloads if workload.pipeline_suite in {"default", "optional"}]
-    elif suite == "parity":
-        workloads = [workload for workload in workloads if workload.nodes <= PARITY_MAX_NODES]
-    elif suite != "full":
-        raise ValueError(f"unknown suite {suite!r}")
-
+def select_workloads(platform: JetPlatform) -> tuple[list[Workload], list[Workload]]:
+    """Split a platform's workloads into those its limits allow and those they exclude."""
     supported, unsupported = [], []
-    for workload in workloads:
+    for workload in resolved_workloads(platform):
         exceeds_nodes = platform.max_nodes is not None and workload.nodes > platform.max_nodes
         exceeds_time = (
             platform.max_timeout_seconds is not None
@@ -377,8 +271,8 @@ def select_workloads(platform: JetPlatform, suite: str) -> tuple[list[Workload],
 
 
 def find_workload(platform: JetPlatform, key: str) -> Workload:
-    """Return the full-suite workload with the given JET key."""
-    workloads = {workload.display_name: workload for workload in select_workloads(platform, "full")[0]}
+    """Return the supported workload with the given JET key."""
+    workloads = {workload.display_name: workload for workload in select_workloads(platform)[0]}
     if key not in workloads:
         raise ValueError(f"{platform.name} has no JET workload {key!r}; known: {', '.join(sorted(workloads))}")
     return workloads[key]
@@ -406,12 +300,9 @@ def jet_custom_config(platform: JetPlatform) -> dict:
 
 def _environment(platform: JetPlatform, workload: Workload, assets_dir: str, shared_dir: str) -> str:
     values = {
-        "CI_PROJECT_ID": "{env.UPSTREAM_PROJECT_ID}",
-        "CI_COMMIT_SHA": "{env.UPSTREAM_COMMIT_SHA}",
         "NVRX_SOURCE_REVISION": "{env.UPSTREAM_COMMIT_SHA}",
         "PLATFORM": platform.name,
         "WHEEL_ARCH": platform.architecture,
-        "JET_WHEEL_MODE": platform.wheel_mode,
         "MEGATRON_ROOT": "/opt/megatron-lm",
         "JET_PREPARED_MEGATRON_ROOT": "/opt/megatron-lm",
         "NVRX_MAX_JOBS": "16",
@@ -451,12 +342,10 @@ def _environment(platform: JetPlatform, workload: Workload, assets_dir: str, sha
         },
     )
     values["JET_PREBUILT_WHEEL_DIR"] = f"{shared_dir}/nvrx-ci-runs/{{env.UPSTREAM_PIPELINE_ID}}/wheels"
-    if platform.name in {"b200", "gb300"}:
-        values["JET_BASELINE_BOOTSTRAP"] = "1"
     exports = [
         *(f"export {name}={shlex.quote(value)}" for name, value in values.items()),
-        # Node-local compiler caches preserve regular Slurm CI behavior.
         "export NCCL_IB_TIMEOUT=24",
+        # Compiler caches stay on node-local storage.
         'export TRITON_CACHE_DIR="/tmp/nvrx-${{SLURM_JOB_ID:?}}/triton-cache"',
         'export TRITON_CACHE_PATH="$TRITON_CACHE_DIR"',
         'export TORCHINDUCTOR_CACHE_DIR="/tmp/nvrx-${{SLURM_JOB_ID:?}}/torchinductor-cache"',
@@ -481,7 +370,6 @@ def build_manifest(platform: JetPlatform, maintainer: str) -> dict:
         "labels": {
             "origin": "nvrx-checkpointing",
             "platform": platform.name,
-            "wheel-mode": platform.wheel_mode,
         },
         "spec": {
             "name": f"nvrx-ci-{platform.name}",
@@ -502,12 +390,7 @@ def build_manifest(platform: JetPlatform, maintainer: str) -> dict:
     }
 
 
-def recipe_manifest(
-    platform: JetPlatform,
-    workload: Workload,
-    maintainer: str,
-    image_tag: str | None = None,
-) -> dict:
+def recipe_manifest(platform: JetPlatform, workload: Workload, maintainer: str, image_tag: str) -> dict:
     assets_dir = "{assets_dir}"
     environment = _environment(platform, workload, assets_dir, "{shared_dir}")
     args = shlex.join(workload.job_args)
@@ -550,7 +433,6 @@ def recipe_manifest(
     return {
         "type": "recipe",
         "format_version": 1,
-        # The explicit key mirrors regular CI identity order.
         "key_pattern": workload.display_name,
         "maintainers": [maintainer],
         "secrets": dict(WHEEL_TOKEN_SECRETS),
@@ -559,7 +441,6 @@ def recipe_manifest(
             "platform": platform.name,
             "provider": workload.provider,
             "flavor": workload.flavor_tag,
-            "wheel-mode": platform.wheel_mode,
         },
         "launchers": {
             "type:slurm": {
@@ -577,9 +458,7 @@ def recipe_manifest(
             "model": "nvrx-checkpointing",
             "variant": workload.safe_name,
             "scope": f"{workload.provider}-{workload.flavor_tag}",
-            "image_source": (
-                {"image_tag": image_tag} if image_tag else {"build_key": f"build/{platform.name}-ci-image"}
-            ),
+            "image_source": {"image_tag": image_tag},
             "precision": workload.config,
             "platforms": [],
             "nodes": workload.nodes,
@@ -614,64 +493,3 @@ def recipe_manifest(
             ),
         },
     }
-
-
-def render(platform: JetPlatform, suite: str, maintainer: str) -> tuple[str, list[Workload]]:
-    """Render one platform's build and selected recipes."""
-    workloads, unsupported = select_workloads(platform, suite)
-    documents = [build_manifest(platform, maintainer)]
-    documents.extend(recipe_manifest(platform, workload, maintainer) for workload in workloads)
-    text = yaml.dump_all(
-        documents,
-        Dumper=LiteralDumper,
-        explicit_start=True,
-        sort_keys=False,
-        width=120,
-    )
-    return text, unsupported
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--platform", choices=[platform.name for platform in JET_PLATFORMS], required=True)
-    parser.add_argument(
-        "--suite",
-        choices=[
-            "default",
-            "merge-request",
-            "optional",
-            "nvrx",
-            "large-scale",
-            "main-branch-runs",
-            "smoke",
-            "smoke-perf",
-            "parity",
-            "full",
-        ],
-        default="default",
-    )
-    parser.add_argument("--maintainer", required=True, help="GitLab username recorded as the workload maintainer")
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-
-    platform = jet_platform(args.platform)
-    rendered, unsupported = render(platform, args.suite, args.maintainer)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(rendered)
-    for workload in unsupported:
-        limits = []
-        if platform.max_nodes is not None and workload.nodes > platform.max_nodes:
-            limits.append(f"nodes={workload.nodes} exceeds max_nodes={platform.max_nodes}")
-        if platform.max_timeout_seconds is not None and workload.timeout_seconds > platform.max_timeout_seconds:
-            limits.append(
-                f"timeout={workload.timeout_seconds}s exceeds max_timeout={platform.max_timeout_seconds}s",
-            )
-        print(  # noqa: T201
-            f"[jet] skipping unsupported workload {workload.display_name}: {', '.join(limits)}",
-            file=sys.stderr,
-        )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
