@@ -64,4 +64,5 @@ jobs:
       platform: h100
       workloads: ${{ needs.select.outputs.workloads }}
       wheel-x86_64-artifact-id: ${{ needs.wheel.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}

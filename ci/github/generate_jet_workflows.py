@@ -76,7 +76,8 @@ jobs:
       platform: {platform}
       workloads: ${{{{ needs.select.outputs.workloads }}}}
       wheel-{architecture}-artifact-id: ${{{{ needs.wheel.outputs.artifact-id }}}}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{{{ secrets.JET_GITLAB_TOKEN }}}}
 """
 
 def platforms() -> list[JetPlatform]:

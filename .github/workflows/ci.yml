@@ -94,7 +94,8 @@ jobs:
       platform: gb200
       workloads: '["gb200-native-detr-pico-1x4", "gb200-native-perf-pico-1x4"]'
       wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
   jet-gb300:
     needs: wheel-aarch64
@@ -104,7 +105,8 @@ jobs:
       platform: gb300
       workloads: '["gb300-native-detr-nano4-8x4", "gb300-native-perf-nano4-8x4"]'
       wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
   jet-h100:
     needs: wheel-x86_64
@@ -114,7 +116,8 @@ jobs:
       platform: h100
       workloads: '["h100-native-detr-pico-1x8", "h100-native-perf-pico-1x8"]'
       wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
   jet-b200:
     needs: wheel-x86_64
@@ -124,7 +127,8 @@ jobs:
       platform: b200
       workloads: '["b200-native-detr-pico-1x8", "b200-native-perf-pico-1x8"]'
       wheel-x86_64-artifact-id: ${{ needs.wheel-x86_64.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
 
   # Each main build that passes every gate adds its wheels to the pip index on GitHub Pages.
   publish-wheels:

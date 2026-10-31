@@ -120,4 +120,5 @@ jobs:
       platform: gb200
       workloads: ${{ needs.select.outputs.workloads }}
       wheel-aarch64-artifact-id: ${{ needs.wheel.outputs.artifact-id }}
-    secrets: inherit
+    secrets:
+      JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}
