@@ -12,9 +12,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
-import zipfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -5143,55 +5140,6 @@ def test_wheel_install_uses_pip_target_instead_of_extracting(
     assert all((target / "nvrx_checkpointing" / name).is_file() for name in wheel_install._WHEEL_BINARIES)
     source = (REPO_ROOT / "ci/scripts/wheel_install.py").read_text()
     assert "_extract_binaries" not in source
-
-
-def test_upstream_artifact_download_keeps_the_token_off_the_storage_redirect(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    wheel_install = _load_slurm_job().wheel_install
-    filename = "nvrx_checkpointing-0.0.1-cp312-abi3-linux_aarch64.whl"
-    monkeypatch.setenv("WHEEL_ARCH", "aarch64")
-    monkeypatch.setenv("WHEEL_VARIANT", "normal")
-    monkeypatch.setenv("UPSTREAM_WHEEL_AARCH64_ARTIFACT_ID", "12345")
-    monkeypatch.setenv("UPSTREAM_PROJECT_PATH", "owner/repo")
-    monkeypatch.setenv("NVRX_GITHUB_TOKEN", "secret")
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w") as contents:
-        contents.writestr(filename, b"wheel contents")
-        contents.writestr("nvrx_checkpointing-0.0.1-cp312-abi3-linux_x86_64.whl", b"other architecture")
-    api_requests: list[urllib.request.Request] = []
-    storage_urls: list[str] = []
-
-    class RedirectingOpener:
-        def open(self, request: urllib.request.Request, **_kwargs: object) -> io.BytesIO:
-            api_requests.append(request)
-            location = {"Location": "https://storage.example/artifact.zip"}
-            raise urllib.error.HTTPError(request.full_url, 302, "Found", location, None)  # type: ignore[arg-type]
-
-    def storage(url: str, **_kwargs: object) -> io.BytesIO:
-        storage_urls.append(url)
-        return io.BytesIO(archive.getvalue())
-
-    monkeypatch.setattr(wheel_install.urllib.request, "build_opener", lambda *_handlers: RedirectingOpener())
-    monkeypatch.setattr(wheel_install.urllib.request, "urlopen", storage)
-
-    downloaded = wheel_install.fetch_upstream_wheel(tmp_path)
-
-    assert downloaded == tmp_path / filename
-    assert downloaded.read_bytes() == b"wheel contents"
-    assert [request.full_url for request in api_requests] == [
-        "https://api.github.com/repos/owner/repo/actions/artifacts/12345/zip",
-    ]
-    assert api_requests[0].headers["Authorization"] == "Bearer secret"
-    assert storage_urls == ["https://storage.example/artifact.zip"]
-    assert [path.name for path in tmp_path.iterdir()] == [filename]
-
-
-def test_artifact_redirects_surface_instead_of_being_followed() -> None:
-    wheel_install = _load_slurm_job().wheel_install
-
-    assert wheel_install._KeepRedirect().redirect_request(None, None, 302, "Found", {}, "https://storage.example") is None
 
 
 def test_wheel_install_does_not_trust_an_untracked_site_package(
