@@ -13,8 +13,9 @@ scratch=${RUNNER_TEMP:-${repo_root}/build-ci}
 venv=${scratch}/venv
 python=${venv}/bin/python
 
-export CC=clang-23 CXX=clang++-23
-export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.4}
+source <(grep -E '^(CUDA|CLANG)_VERSION=' scripts/prepare.sh)
+export CC=clang-${CLANG_VERSION} CXX=clang++-${CLANG_VERSION}
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-${CUDA_VERSION}}
 export PATH=${CUDA_HOME}/bin:${PATH}
 # vcpkg lives in the job's scratch space; only its binary and download caches persist.
 export VCPKG_ROOT=${scratch}/vcpkg

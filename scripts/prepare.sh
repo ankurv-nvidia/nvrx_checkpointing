@@ -5,6 +5,11 @@ SCRIPT_DIR=$(dirname "$(realpath "$0")")
 REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 ARCH=$(uname -m)
 
+# The CI build scripts, the JET image and the Slurm runner read these versions from here.
+PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
+CUDA_VERSION=13.4
+CLANG_VERSION=23
+
 # Resolved on demand: only the container/megatron functions need the
 # megatron-lm checkout, and resolving it clones the repo — toolchain-only
 # invocations (e.g. the CI runner setup running `prepare.sh ubuntu2404`) run
@@ -95,7 +100,7 @@ declare -A DOCKER_IMAGES=()
 DOCKER_IMAGES["ubuntu2404"]="docker.io/library/ubuntu:24.04"
 DOCKER_IMAGES["fedora44"]="docker.io/library/fedora:44"
 DOCKER_IMAGES["pytorch2412"]="nvcr.io/nvidia/pytorch:24.12-py3"
-DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.09-py3"
+DOCKER_IMAGES["pytorch"]="${PYTORCH_IMAGE}"
 
 function fedora {
     # Fedora 44 provides LLVM 22; container compilation uses the Ubuntu path below.
@@ -179,7 +184,6 @@ function pytorch {
 }
 
 function ubuntu2404 {
-    CLANG_VERSION=23
     GCC_VERSION=13
     UBUNTU_CODENAME=noble
     UBUNTU_VERSION=24.04
@@ -315,21 +319,14 @@ function megatron {
     export MAX_JOBS=4
     export CC=gcc
     export CXX=g++
-    # TransformerEngine's CMake recognizes only Blackwell family heads (100/120) and
-    # expands them into the CUDA-13 feature-suffixed gencode targets its kernels require
-    # (input 100 -> generic sm_100 plus arch-specific sm_100a and sm_103a). Map the live
-    # compute capability to the family head TE can expand; torch's arch list takes the raw cc.
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
     # line in-shell. A truncating reader (head) closes the pipe early and SIGPIPEs
     # nvidia-smi, which pipefail would turn into a fatal exit on multi-GPU nodes.
     _COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)
     _COMPUTE_CAP=${_COMPUTE_CAP%%$'\n'*}
     export TORCH_CUDA_ARCH_LIST=${_COMPUTE_CAP}
-    case "${_COMPUTE_CAP}" in
-        10.*) export NVTE_CUDA_ARCHS=100 ;;   # Blackwell datacenter (sm_100/sm_103)
-        12.*) export NVTE_CUDA_ARCHS=120 ;;   # Blackwell consumer (sm_120)
-        *)    export NVTE_CUDA_ARCHS=$(echo "${_COMPUTE_CAP}" | sed 's/\.//') ;;  # pre-Blackwell: bare arch (9.0 -> 90)
-    esac
+    NVTE_CUDA_ARCHS=$(nvte_cuda_archs "${_COMPUTE_CAP}")
+    export NVTE_CUDA_ARCHS
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
     if [ -f "$HOME/.local/bin/env" ]; then
         source $HOME/.local/bin/env
@@ -370,16 +367,7 @@ function megatron {
     export RDMA_CORE_HOME=/opt/rdma-core/build
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
 
-    apt-get update
-    apt-get install --yes --allow-change-held-packages rdma-core libibverbs-dev
-    apt-get clean
-    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-    if [[ ! -f "/usr/lib/${ARCH_LIB}/libmlx5.so" ]]; then
-        ln -sf "/usr/lib/${ARCH_LIB}/libmlx5.so.1" "/usr/lib/${ARCH_LIB}/libmlx5.so"
-    fi
-    mkdir -p "${RDMA_CORE_HOME}"
-    ln -sfn /usr/include "${RDMA_CORE_HOME}/include"
-    ln -sfn "/usr/lib/${ARCH_LIB}" "${RDMA_CORE_HOME}/lib"
+    deepep_prereqs
 
     # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
     # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
@@ -398,16 +386,6 @@ function megatron {
         patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"
     popd
 
-    # DeepEP compiles against nvml.h from libnvidia-ml-dev. Installing that package
-    # via apt pulls nvidia-firmware-580 (76 MB) and libnvidia-compute as hard
-    # dependencies whose dpkg unpack overruns the enroot writable overlay and aborts
-    # with a broken pipe. Fetch the dev package alone and unpack just its payload
-    # (nvml.h and the libnvidia-ml.so dev symlink); libnvidia-ml.so.1 itself is
-    # already present from the injected driver that nvidia-smi above relies on.
-    apt-get update
-    apt-get download libnvidia-ml-dev
-    dpkg-deb -x libnvidia-ml-dev_*.deb /
-    rm -f libnvidia-ml-dev_*.deb
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
     ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
     rm -rf /var/lib/apt/lists/*
@@ -423,15 +401,44 @@ function megatron {
     $*
 }
 
+# Transformer Engine expands only the Blackwell family heads into the feature-suffixed targets its kernels need.
+function nvte_cuda_archs {
+    case "$1" in
+        10.*) echo 100 ;;
+        12.*) echo 120 ;;
+        *) echo "${1/./}" ;;
+    esac
+}
+
+# DeepEP compiles against these RDMA and NVML development files.
+function deepep_prereqs {
+    apt-get update
+    apt-get install --yes --allow-change-held-packages rdma-core libibverbs-dev
+    apt-get clean
+    local arch_lib nvml_dir
+    arch_lib=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+    if [[ ! -f "/usr/lib/${arch_lib}/libmlx5.so" ]]; then
+        ln -sf "/usr/lib/${arch_lib}/libmlx5.so.1" "/usr/lib/${arch_lib}/libmlx5.so"
+    fi
+    mkdir -p /opt/rdma-core/build
+    ln -sfn /usr/include /opt/rdma-core/build/include
+    ln -sfn "/usr/lib/${arch_lib}" /opt/rdma-core/build/lib
+    # Only the payload is unpacked because installing the package pulls in driver packages that overrun container overlays.
+    nvml_dir=$(mktemp -d)
+    (cd "${nvml_dir}" && apt-get update && apt-get download libnvidia-ml-dev && dpkg-deb -x libnvidia-ml-dev_*.deb /)
+    rm -rf "${nvml_dir}"
+    $*
+}
+
 function cuda13 {
     . /etc/os-release
     # CUDA stuff
     packages=(
         pciutils
-        cuda-toolkit-13-4
-        libcudnn9-cuda-13
+        cuda-toolkit-${CUDA_VERSION/./-}
+        libcudnn9-cuda-${CUDA_VERSION%%.*}
         libcutlass-dev
-        cudnn9-cuda-13
+        cudnn9-cuda-${CUDA_VERSION%%.*}
         libnccl-dev
         libtime-piece-mysql-perl
     )
@@ -443,7 +450,7 @@ function cuda13 {
 
     apt update && apt-get install --yes --no-install-recommends "${packages[@]}"
 
-    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.4}
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-${CUDA_VERSION}}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
 }
@@ -453,7 +460,7 @@ function cross_arm64 {
     # NVIDIA signs the sbsa cross repository with the key the CUDA keyring installs.
     echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/cross-linux-sbsa/ /" \
         > /etc/apt/sources.list.d/cuda-ubuntu2404-cross-linux-sbsa.list
-    apt update && apt-get install --yes --no-install-recommends crossbuild-essential-arm64 cuda-cross-sbsa-13-4
+    apt update && apt-get install --yes --no-install-recommends crossbuild-essential-arm64 "cuda-cross-sbsa-${CUDA_VERSION/./-}"
     $*
 }
 

@@ -3,7 +3,7 @@
 # build or workload, streams its log, and turns the verdict into the job status.
 # The job environment selects the platform, the workload, and the built image.
 #
-#   jet.sh select | image | workload | cancel
+#   jet.sh select | setup | image | workload | cancel
 set -Eeuo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -63,8 +63,9 @@ cancel() {
 
 case "${1:-}" in
     select) select_workloads ;;
+    setup) setup ;;
     image) image ;;
     workload) workload ;;
     cancel) cancel ;;
-    *) echo "usage: jet.sh select|image|workload|cancel" >&2; exit 2 ;;
+    *) echo "usage: jet.sh select|setup|image|workload|cancel" >&2; exit 2 ;;
 esac

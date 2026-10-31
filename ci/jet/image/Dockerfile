@@ -1,4 +1,4 @@
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.09-py3
+ARG FROM_IMAGE_NAME
 FROM ${FROM_IMAGE_NAME}
 
 ARG NVRX_COMPUTE_CAPABILITY
@@ -14,9 +14,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /workspace/nvrx_checkpointing
 
-# Keep the toolchain in an independently cacheable layer.
-COPY ci/jet/image/install_toolchain.sh /workspace/nvrx_checkpointing/ci/jet/image/
-RUN bash ci/jet/image/install_toolchain.sh \
+# The build runner's toolchain, plus the files DeepEP compiles against.
+COPY scripts/prepare.sh /workspace/nvrx_checkpointing/scripts/
+RUN bash scripts/prepare.sh ubuntu2404 deepep_prereqs \
  && rm -rf /var/lib/apt/lists/*
 
 # Runtime policy changes leave the toolchain cache intact.
@@ -27,14 +27,7 @@ ENV NVRX_MEGATRON_EXTRAS=training,dev,otel,te,ssm \
 RUN python3 -m pip uninstall --yes --break-system-packages nvidia-resiliency-ext \
  && python3 -c 'import importlib.metadata as m; assert not any(d.metadata["Name"] == "nvidia-resiliency-ext" for d in m.distributions())'
 
-# Allocation users consume the global uv executable.
-RUN curl -LsSf https://astral.sh/uv/install.sh \
- | env UV_UNMANAGED_INSTALL=/usr/local/bin sh \
- && command -v uv \
- && uv --version
-
 # Images own the pinned Megatron source; native allocations build architecture-sensitive dependencies.
-COPY scripts/prepare.sh /workspace/nvrx_checkpointing/scripts/
 RUN bash scripts/prepare.sh megatron_root "${MEGATRON_ROOT}"
 
 # Embed the pinned Megatron dependency sources and their submodules.

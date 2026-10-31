@@ -25,11 +25,8 @@ export MAX_JOBS=${NVRX_MAX_JOBS:-4}
 export CC=gcc
 export CXX=g++
 export TORCH_CUDA_ARCH_LIST=${compute_capability}
-case "${compute_capability}" in
-    10.*) export NVTE_CUDA_ARCHS=100 ;;
-    12.*) export NVTE_CUDA_ARCHS=120 ;;
-    *) export NVTE_CUDA_ARCHS=${compute_capability/./} ;;
-esac
+NVTE_CUDA_ARCHS=$(bash "${repo_root}/scripts/prepare.sh" nvte_cuda_archs "${compute_capability}" 2>/dev/null)
+export NVTE_CUDA_ARCHS
 export CAUSAL_CONV1D_FORCE_BUILD=TRUE
 export NVTE_FRAMEWORK=pytorch
 export HYBRID_EP_MULTINODE=1

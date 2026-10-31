@@ -3144,25 +3144,6 @@ def test_ocihsg_image_build_requests_gpus_per_node(monkeypatch: pytest.MonkeyPat
     assert not any(token.startswith("--gpus=") for token in cmd)
 
 
-def test_image_preparation_stack_versions_match() -> None:
-    slurm_job = _load_slurm_job()
-    prepare_image = (SCRIPTS_DIR / "prepare_image.py").read_text()
-    prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
-    enroot = (REPO_ROOT / "scripts" / "enroot.sh").read_text()
-    ci_tasks = (REPO_ROOT / "ci" / "github" / "tasks.sh").read_text()
-
-    assert slurm_job.DOCKER_IMAGE_BASE == "nvcr.io/nvidia/pytorch:26.09-py3"
-    assert 'base_image = image.parent / "pytorch2609.sqsh"' in prepare_image
-    assert 'DOCKER_IMAGES["pytorch"]="nvcr.io/nvidia/pytorch:26.09-py3"' in prepare
-    assert 'DOCKER_IMAGE_BASE="nvcr.io/nvidia/pytorch:26.09-py3"' in enroot
-    assert "pytorch2609.sqsh" in enroot
-    assert "CLANG_VERSION=23" in prepare
-    assert "cuda-toolkit-13-4" in prepare
-    assert "/usr/local/cuda-13.4" in prepare
-    assert "export CC=clang-23 CXX=clang++-23" in ci_tasks
-    assert "/usr/local/cuda-13.4" in ci_tasks
-
-
 def test_image_build_runs_templated_prepare_command(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

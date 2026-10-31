@@ -88,7 +88,9 @@ FLAVORS_FILE = SCRIPT_DIR / "flavors.yaml"
 TEMPLATES_DIR = (SCRIPT_DIR / "../templates").resolve()
 ENROOT_SCRIPTS_DIR = REPO_ROOT / "scripts"
 BANDWIDTH_BASELINE_FILE = BASELINES_DIR / "platform_bw_mbps.yaml"
-DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE", "nvcr.io/nvidia/pytorch:26.09-py3")
+DOCKER_IMAGE_BASE = os.environ.get("DOCKER_IMAGE_BASE") or re.search(
+    r"^PYTORCH_IMAGE=(\S+)$", (ENROOT_SCRIPTS_DIR / "prepare.sh").read_text(), re.MULTILINE,
+)[1]
 DEFAULT_MEGATRON_REPO_URL = "https://github.com/NVIDIA/Megatron-LM.git"
 DEFAULT_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 DEFAULT_NVRX_REPO_URL = "https://github.com/NVIDIA/nvidia-resiliency-ext.git"

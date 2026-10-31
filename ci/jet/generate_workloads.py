@@ -30,7 +30,9 @@ LARGE_CHECKPOINT_MIN_NODES = 16
 # The submitting user's read-only GitHub token downloads the upstream wheel artifacts.
 WHEEL_TOKEN_SECRETS = {"NVRX_GITHUB_TOKEN": "user/<current>/github/nvrx-ci-artifacts"}
 # The native runtime cache follows prepare.sh, so editing that file forces a rebuild.
-RUNTIME_KEY = hashlib.sha256((CI_DIR.parent / "scripts" / "prepare.sh").read_bytes()).hexdigest()[:10]
+PREPARE_SCRIPT = (CI_DIR.parent / "scripts" / "prepare.sh").read_bytes()
+RUNTIME_KEY = hashlib.sha256(PREPARE_SCRIPT).hexdigest()[:10]
+PYTORCH_IMAGE = re.search(rb"^PYTORCH_IMAGE=(\S+)$", PREPARE_SCRIPT, re.MULTILINE).group(1).decode()
 # JET retries an attempt only for platform-classified infrastructure failures.
 RETRIER_CONFIG = {
     "retrier": {
@@ -380,7 +382,7 @@ def build_manifest(platform: JetPlatform, maintainer: str) -> dict:
                 "path": ".",
                 "dockerfile": "ci/jet/image/Dockerfile",
                 "arguments": {
-                    "FROM_IMAGE_NAME": "nvcr.io/nvidia/pytorch:26.09-py3",
+                    "FROM_IMAGE_NAME": PYTORCH_IMAGE,
                     "NVRX_COMPUTE_CAPABILITY": platform.compute_capability,
                     "NVRX_SOURCE_REVISION": "{env.UPSTREAM_COMMIT_SHA}",
                 },

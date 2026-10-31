@@ -17,6 +17,8 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@v7
+
       - name: Host
         run: |
           uname -a
@@ -69,9 +71,7 @@ jobs:
       - name: jet-client from Artifactory
         if: ${{ !cancelled() }}
         run: |
-          python3 -m venv "$RUNNER_TEMP/jet-client"
-          "$RUNNER_TEMP/jet-client/bin/pip" install --quiet --no-cache-dir "jet-client==4.58.4" \
-            --index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hw-joc-pypi/simple
+          ci/github/jet.sh setup
           "$RUNNER_TEMP/jet-client/bin/python" -c 'import importlib.metadata as m; print("jet-client", m.version("jet-client"))'
 
       - name: JET accepts the stored GitLab token
