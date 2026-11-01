@@ -93,6 +93,7 @@ wheel_aarch64() {
 wheel_pytest() {
     make_venv
     uv pip install --quiet --python "${python}" torch --index-url https://download.pytorch.org/whl/cpu
+    uv pip install --quiet --python "${python}" opentelemetry-proto
     "${python}" ci/scripts/wheel_install.py --from-dist dist
     mkdir -p ci/ci-results
     export PYTHONPATH=${repo_root}/dev_binaries
