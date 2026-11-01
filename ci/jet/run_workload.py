@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -528,6 +529,7 @@ def main() -> int:
     inventory: dict = {"rank": rank}
     with rank_log.open("w") as output:
         tee = Tee(sys.stdout, output)
+        logging.basicConfig(level=logging.INFO, format="%(message)s", stream=tee)
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             try:
                 runtime.require_prepared()
