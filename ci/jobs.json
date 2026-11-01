@@ -2,14 +2,15 @@
   "platforms": [
     {
       "name": "gb200",
+      "architecture": "aarch64",
       "gpus": "1x4",
-      "has_image": true,
-      "native_wheel_needs": [
-        [
-          "wheel:aarch64",
-          true
-        ]
-      ],
+      "jet": {
+        "compute_capability": "10.0",
+        "max_timeout_minutes": 180,
+        "distributed_timeout_minutes": 60,
+        "distributed_timeout_min_nodes": 16,
+        "use_regular_time_budget": true
+      },
       "jobs": [
         [
           "native",
@@ -24,31 +25,16 @@
           "detr"
         ],
         [
-          "native",
-          [
-            "detr",
-            "vg"
-          ]
-        ],
-        [
           "nvrx",
           "perf"
         ]
       ],
-      "slurm_time_minutes": {
-        "native-detr-vg": 25
-      },
       "multinode": [
         {
-          "key": "gpt-moe",
           "config": "gpt_moe",
           "nodes": 1,
-          "scale": "1x4",
           "pipeline_suite": "main-branch-runs",
           "checkpoint_interval": 20,
-          "slurm_time_minutes": {
-            "native-perf": 10
-          },
           "jobs": [
             [
               "native",
@@ -57,18 +43,10 @@
           ]
         },
         {
-          "key": "nano3",
           "config": "nano3",
           "nodes": 8,
-          "scale": "8x4",
-          "group": "8node-nano3",
           "pipeline_suite": "main-branch-runs",
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 30,
-            "native-perf": 40,
-            "native-detr-vg": 50
-          },
           "jobs": [
             [
               "native",
@@ -85,29 +63,15 @@
             [
               "nvrx",
               "perf"
-            ],
-            [
-              "native",
-              [
-                "detr",
-                "vg"
-              ]
             ]
           ]
         },
         {
-          "key": "multinode-super3-bf16",
           "config": "super3bf16",
           "nodes": 16,
-          "scale": "16x4",
-          "group": "16node-super3bf16",
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 100,
-            "native-perf": 50
-          },
           "jobs": [
             [
               "native",
@@ -123,18 +87,11 @@
           }
         },
         {
-          "key": "multinode-super3-fp4",
           "config": "super3fp4",
           "nodes": 16,
-          "scale": "16x4",
-          "group": "16node-super3fp4",
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 100,
-            "native-perf": 70
-          },
           "staging": {
             "detr": null
           },
@@ -154,17 +111,11 @@
           ]
         },
         {
-          "key": "multinode-perf-bf16-64",
           "config": "ultra3bf16",
           "nodes": 64,
-          "scale": "64x4",
-          "group": "64node-ultra3bf16",
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-perf": 45
-          },
           "jobs": [
             [
               "native",
@@ -177,18 +128,11 @@
           ]
         },
         {
-          "key": "multinode-perf-64",
           "config": "ultra3fp8",
           "nodes": 64,
-          "scale": "64x4",
-          "group": "64node-ultra3fp8",
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 200,
-            "native-perf": 90
-          },
           "staging": {
             "detr": null
           },
@@ -211,30 +155,24 @@
     },
     {
       "name": "gb300",
+      "architecture": "aarch64",
       "gpus": "1x4",
-      "has_image": true,
-      "native_wheel_needs": [
-        [
-          "wheel:aarch64",
-          true
-        ]
-      ],
+      "jet": {
+        "compute_capability": "10.3",
+        "max_nodes": 18,
+        "max_timeout_minutes": 240,
+        "distributed_timeout_minutes": 60,
+        "distributed_timeout_min_nodes": 16,
+        "use_regular_time_budget": true
+      },
       "jobs": [],
       "multinode": [
         {
-          "key": "nano4",
           "config": "nano4",
           "nodes": 32,
-          "scale": "32x4",
-          "group": "32node-nano4",
           "pipeline_suite": "large-scale",
           "checkpoint_interval": 125,
-          "job_array_segment": 8,
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 185,
-            "native-perf": 30
-          },
           "jobs": [
             [
               "native",
@@ -255,19 +193,11 @@
           ]
         },
         {
-          "key": "nano4",
           "config": "nano4",
           "nodes": 8,
-          "scale": "8x4",
-          "group": "8node-nano4",
+          "pipeline_suite": "default",
           "checkpoint_interval": 25,
-          "runner_tags": [],
           "timeout": "1d",
-          "slurm_time_minutes": {
-            "native-detr": 110,
-            "native-perf": 45,
-            "nvrx-detr": 115
-          },
           "jobs": [
             [
               "native",
@@ -287,16 +217,8 @@
     },
     {
       "name": "h100",
+      "architecture": "x86_64",
       "gpus": "1x8",
-      "has_image": true,
-      "pipeline_suite": "main-branch-runs",
-      "slurm_time_minutes": {
-        "native-detr": 20,
-        "native-perf": 15,
-        "nvrx-detr": 20,
-        "native-detr-vg": 60,
-        "nvrx-perf": 15
-      },
       "jobs": [
         [
           "native",
@@ -322,7 +244,23 @@
           "perf"
         ]
       ],
-      "multinode": []
+      "multinode": [],
+      "jet": {
+        "compute_capability": "9.0",
+        "max_timeout_minutes": 180
+      }
+    },
+    {
+      "name": "b200",
+      "workload_profile": "h100",
+      "architecture": "x86_64",
+      "gpus": "1x8",
+      "jobs": [],
+      "multinode": [],
+      "jet": {
+        "compute_capability": "10.0",
+        "max_timeout_minutes": 120
+      }
     }
   ]
 }

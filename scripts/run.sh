@@ -1,7 +1,7 @@
 #!/bin/bash
 SCRIPT_PATH=$(realpath "$0")
 SCRIPT_DIR=$(dirname ${SCRIPT_PATH})
-MEGATRON_ROOT=$(${SCRIPT_DIR}/megatron_root.sh)
+MEGATRON_ROOT=$(bash ${SCRIPT_DIR}/prepare.sh megatron_root)
 NATIVE_BUILD_DIR=${SCRIPT_DIR}/../build
 REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 

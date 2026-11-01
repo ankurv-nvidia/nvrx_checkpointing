@@ -3,11 +3,11 @@
 # PyTorch 26.09 stack using only a Megatron-LM checkout. Submit this file twice
 # with distinct RUN_TAG values:
 #
-#   export DET_WORK_DIR=/lustre/<project>/<user>/determinism
-#   export MEGATRON_ROOT=/lustre/<project>/<user>/Megatron-LM
-#   export ENROOT_IMAGE=/lustre/<project>/<user>/pytorch2609-megatron.sqsh
-#   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
-#   sbatch --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
+#   export DET_WORK_DIR=/shared/<project>/<user>/determinism
+#   export MEGATRON_ROOT=/shared/<project>/<user>/Megatron-LM
+#   export ENROOT_IMAGE=/shared/<project>/<user>/pytorch2609-megatron.sqsh
+#   sbatch -A <account> --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
+#   sbatch -A <account> --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
 #
 # Add --nodes=2 to both submissions for the two-node case. The decomposed
 # weighted-squared-ReLU path is exact at both one and two nodes with Mamba,
@@ -27,7 +27,6 @@
 # itself is bind-mounted from MEGATRON_ROOT. Each submission gets independent
 # checkpoint, dataset, Triton, TorchInductor, and extension caches.
 
-#SBATCH --account=coreai_resiliency_osiris
 #SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4

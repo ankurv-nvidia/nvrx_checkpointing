@@ -37,7 +37,7 @@ resolved because Slurm reads them before the shell can expand variables. The
 reproducer can be submitted directly:
 
 ```bash
-cd /lustre/my-runs/ultra3-64n
+cd /shared/my-runs/ultra3-64n
 sbatch run.sbatch
 ```
 
@@ -51,8 +51,8 @@ through the training container. Immediately before every pretrain phase or
 repeat cycle, rank 0 prints an allowlisted snapshot with the
 `[slurm_job:env]` prefix. Authentication variables are excluded.
 
-Authentication tokens are intentionally not written to the reproducer. If a
-direct re-run has no `CI_JOB_TOKEN`, native wheel setup falls back to a source
+Authentication tokens are intentionally not written to the reproducer. When a
+direct re-run finds no wheel, native wheel setup falls back to a source
 build. Its preparation step uses a writable container overlay and runs
 `scripts/prepare.sh ubuntu2404` when the custom image does not contain
 `clang-23`; the supplied `.sqsh` itself is not overwritten. Native checkpoint
@@ -64,20 +64,24 @@ path, shared library, and server path explicitly.
 
 ## One-time shell setup
 
-The runner setup normally already provides the first four variables:
-
 ```bash
-export SLURM_ACCOUNT=coreai_resiliency_osiris
-export CLUSTER=ocihsg
+export SLURM_ACCOUNT=<account>
+export CLUSTER=<cluster>
 export GPUS_PER_NODE=4
 export PLATFORM=gb200
 
-export SLURMJOB_OPT_WORK_DIR=/lustre/my-runs
-export ENROOT_IMAGE=/lustre/images/custom-ultra3.sqsh
+export SLURMJOB_OPT_WORK_DIR=/shared/my-runs
+export ENROOT_IMAGE=/shared/images/custom-ultra3.sqsh
 ```
 
 `SLURMJOB_OPT_WORK_DIR` must be on storage visible at the same absolute path from every
 allocated node.
+
+`CLUSTER` names the cluster's Slurm templates: `<cluster>.srun.tmpl`,
+`<cluster>.image_prep.tmpl` and `<cluster>.enroot_import.tmpl`, read from `CI_DIR`
+(default `~/data/ci`) or from `ci/templates`. The repository ships only
+`ci/templates/example.*.tmpl`; copy them into `CI_DIR` under the cluster's name and
+set the partition, GPU requests and mounts that the cluster expects.
 
 ## Foreground and background runs
 
@@ -257,12 +261,12 @@ allocation:
 ```bash
 # One training process keeps checkpointing indefinitely.
 python3 ci/scripts/slurm_job.py \
-  --config nano3 --nodes 4 --work-dir /lustre/runs \
+  --config nano3 --nodes 4 --work-dir /shared/runs \
   --clean-run --checkpoints-per-run 0 --time-minutes 240 --background
 
 # Repeat the default three-checkpoint cycle indefinitely on that allocation.
 python3 ci/scripts/slurm_job.py \
-  --config nano3 --nodes 4 --work-dir /lustre/runs \
+  --config nano3 --nodes 4 --work-dir /shared/runs \
   --clean-run --repeat 0 --time-minutes 240 --background
 ```
 
@@ -367,7 +371,7 @@ containing `ci/scripts/slurm_job.py`; to select a different native revision,
 invoke that revision's launcher.
 
 ```bash
-export NVRX_REPO_ROOT=/lustre/checkouts/nvrx-b
+export NVRX_REPO_ROOT=/shared/checkouts/nvrx-b
 export NVRX_COMMIT=<40-character-nvidia-resiliency-ext-commit>
 ```
 
@@ -392,7 +396,7 @@ Run-scoped source options compare two toolchains in one allocation. Here `ref`
 uses the default extension commit and `cmp` overrides only that source:
 
 ```bash
-NVRX_REPO_ROOT=/lustre/checkouts/nvidia-resiliency-ext \
+NVRX_REPO_ROOT=/shared/checkouts/nvidia-resiliency-ext \
 python3 ci/scripts/slurm_job.py --config nano3 --nodes 8 \
   --flavor detr+nvrx \
   --run=ref \

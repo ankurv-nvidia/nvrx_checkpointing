@@ -1,0 +1,12 @@
+# Copy into the runner's template directory under the cluster's name and adapt the partition and mounts.
+srun
+  -l
+  --account=${account}
+  --partition=batch
+  --time=00:${time_minutes}:00
+  --mem=0
+  --gpus-per-node=${gpus_per_node}
+  --container-mounts=${home}:${home},${root}:/root
+  --container-image=${image_base}
+  --container-save=${image_out}
+  --container-writable

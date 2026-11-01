@@ -1,0 +1,13 @@
+# Copy into the runner's template directory under the cluster's name and adapt the partition and mounts.
+srun
+  --account=${account}
+  --partition=batch
+  --nodes=${nodes}
+  --ntasks=${ntasks}
+  --time=${slurm_time}
+  --gpus-per-node=${gpus_per_node}
+  --mem=0
+  --job-name=${job_name}
+  --container-image=${image}
+  --container-mounts=${home}:${home},${root}:/root
+  --container-env=${container_env}

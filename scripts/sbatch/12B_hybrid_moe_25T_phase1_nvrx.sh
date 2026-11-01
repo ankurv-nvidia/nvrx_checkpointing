@@ -1,9 +1,5 @@
 #!/bin/bash
 
-#SBATCH --qos=batch_large_long
-#SBATCH --reservation=sla_res_nemotron_super_v3
-#SBATCH --partition=batch_long
-#SBATCH --account=llmservice_fm_text
 #SBATCH --ntasks-per-node=4
 #SBATCH --nodes=768
 #SBATCH --time=96:00:00
@@ -30,8 +26,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
 NAME="12B_hybrid_moe_25T_phase1"
-RUN_DIR="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/12b_hybrid_moe/"
-IMAGE="${RUN_DIR}/../images/high_stride/nemo_megatron_perf_optimization:mcore-moe-pytorch25.06-te2.10.0.dev0-cudnn9.11.0.92-main0807-hybridep-nvfp4-nvrxupdated-arm.sqsh"
+RUN_DIR="${RUN_DIR:?set to the run directory beside the project code, data and images}"
+IMAGE="${IMAGE:?set to the training container image}"
 MEGATRON_LM_DIR="${RUN_DIR}/../code/"
 DATACACHE_DIR="${RUN_DIR}/../data-cache/"
 
