@@ -33,8 +33,18 @@ Use the public Megatron-LM checkout pinned by this repository
 `nvrx_checkpointing` package is installed in the training container on every
 node.
 
-The only required sbatch change is to run the Megatron entrypoint through the
-integration module. For example, change:
+For the PyTorch 26.10 container, set the following in the sbatch environment:
+
+```bash
+export TORCH_DIST_USE_NCCL2=0
+```
+
+This selects lazy NCCL communicator initialization for the pinned Megatron
+workloads. PyTorch 2.15's default NCCL2 backend allocates GPU memory for unused
+process groups. The CI, local launcher, and sbatch examples use this setting
+by default and preserve an explicit environment override.
+
+Run the Megatron entrypoint through the integration module. For example, change:
 
 ```bash
 python3 -u "${MEGATRON_LM_DIR}/pretrain_mamba.py" "${OPTIONS[@]}"

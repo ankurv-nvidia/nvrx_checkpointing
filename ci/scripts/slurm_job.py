@@ -170,6 +170,7 @@ _WORKTREE_REVISION = "HEAD"
 _DEFAULT_NAME = "{run}{config}_{nodes}n-{flavors}{sources}"
 _TRAIN_ENV_DEFAULTS = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "TORCH_DIST_USE_NCCL2": "0",
     "NCCL_IB_TIMEOUT": "24",
     "UCX_MEM_MMAP_HOOK_MODE": "none",
     "UCX_MEM_CUDA_HOOK_MODE": "none",

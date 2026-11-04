@@ -15,6 +15,7 @@ WORLD_SIZE=${WORLD_SIZE:-2}
 GLOBAL_BATCH=${WORLD_SIZE}
 export QUANTIZATION_TYPE_DEBUG=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCH_DIST_USE_NCCL2="${TORCH_DIST_USE_NCCL2:-0}"
 # Megatron asserts this on pre-Blackwell GPUs whenever CUDA graphs run with
 # expandable_segments (core/transformer/cuda_graphs.py) - and this script
 # enables both.
