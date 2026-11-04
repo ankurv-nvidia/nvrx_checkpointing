@@ -20,6 +20,7 @@ nvcc --version
 
 # Preserve the architecture-specific CUTLASS runtime from the NGC image.
 base_cutlass_dsl_version=$(python3 -c 'import importlib.metadata as m; print(m.version("nvidia-cutlass-dsl"))')
+base_transformer_engine_version=$(python3 -c 'import importlib.metadata as m; print(m.version("transformer-engine"))')
 
 export MAX_JOBS=${NVRX_MAX_JOBS:-4}
 export CC=gcc
@@ -50,8 +51,11 @@ export UV_CACHE_DIR=${uv_cache}
 overrides="${uv_cache}/megatron-overrides.txt"
 python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
     "${megatron_root}/pyproject.toml" > "${overrides}"
-# Keep the NGC image's quack-kernels, which its FlashAttention-4 requires.
-printf '%s\n' "quack-kernels; sys_platform == 'never'" >> "${overrides}"
+printf '%s\n' \
+    "transformer-engine; sys_platform == 'never'" \
+    "quack-kernels; sys_platform == 'never'" \
+    "pydantic<2.14" \
+    "nvidia-cudnn-frontend[cutedsl]==1.30.0" >> "${overrides}"
 cat "${overrides}"
 uv_args=(--constraint "${constraints}" --override "${overrides}" --no-cache)
 
@@ -63,7 +67,7 @@ uv_megatron() {
 }
 
 # Install metadata dependencies without replacing the image's CUTLASS runtime.
-uv_megatron pip install "${uv_args[@]}" --no-deps "nvidia-cudnn-frontend==1.28.0"
+uv_megatron pip install "${uv_args[@]}" --no-deps "nvidia-cudnn-frontend==1.30.0"
 uv_megatron pip install "${uv_args[@]}" --no-build-isolation -e ".[${extras}]"
 # Reconcile the CUTLASS overlay with the image version after dependency resolution.
 uv_megatron pip install "${uv_args[@]}" --upgrade \
@@ -110,7 +114,8 @@ for raw_line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 print("JET Megatron overlay matches the pinned package constraints")
 PY
 
-python -c 'import transformer_engine; import transformer_engine.pytorch; print(f"Using TransformerEngine {transformer_engine.__version__}")'
+python -c 'import importlib.metadata as m, sys; actual = m.version("transformer-engine"); assert actual == sys.argv[1], (actual, sys.argv[1]); import transformer_engine.pytorch; print(f"Using base-image TransformerEngine {actual}")' \
+    "${base_transformer_engine_version}"
 if [[ ",${extras}," == *,ssm,* ]]; then
     python -c 'import causal_conv1d, mamba_ssm; print(f"Using causal-conv1d {causal_conv1d.__version__} and mamba-ssm {mamba_ssm.__version__}")'
 fi
@@ -120,7 +125,7 @@ else
     uv_megatron pip install "${uv_args[@]}" --no-build-isolation flash-attn
 fi
 
-uv_megatron pip install "${uv_args[@]}" nvidia-nvshmem-cu13==3.7.2
+uv_megatron pip install "${uv_args[@]}" nvidia-nvshmem-cu13==3.8.0
 nvshmem_lib_dir=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
 ln -sfn libnvshmem_host.so.3 "${nvshmem_lib_dir}/libnvshmem_host.so"
 

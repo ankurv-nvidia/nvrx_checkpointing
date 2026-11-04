@@ -6,7 +6,7 @@ REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 ARCH=$(uname -m)
 
 # The CI build scripts, the JET image and the Slurm runner read these versions from here.
-PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
+PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 CUDA_VERSION=13.4
 CLANG_VERSION=23
 
@@ -319,6 +319,7 @@ function megatron {
     export MAX_JOBS=4
     export CC=gcc
     export CXX=g++
+    BASE_TRANSFORMER_ENGINE_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("transformer-engine"))')
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
     # line in-shell. A truncating reader (head) closes the pipe early and SIGPIPEs
     # nvidia-smi, which pipefail would turn into a fatal exit on multi-GPU nodes.
@@ -334,12 +335,16 @@ function megatron {
     # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
     # uv cache to avoid collision.
     export UV_CACHE_DIR="$(mktemp -d)"
-    # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
-    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.28.0"
+    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.30.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
     UV_OVERRIDES="${UV_CACHE_DIR}/megatron-overrides.txt"
     python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
         "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}"
+    printf '%s\n' \
+        "transformer-engine; sys_platform == 'never'" \
+        "quack-kernels; sys_platform == 'never'" \
+        "pydantic<2.14" \
+        "nvidia-cudnn-frontend[cutedsl]==1.30.0" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
 
     # The image's torch requires C++20, so Mamba and causal-conv1d are built from source with it.
@@ -357,6 +362,8 @@ function megatron {
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
 
     uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    python -c 'import importlib.metadata as m, sys; actual = m.version("transformer-engine"); assert actual == sys.argv[1], (actual, sys.argv[1]); import transformer_engine.pytorch; print(f"Using base-image TransformerEngine {actual}")' \
+        "${BASE_TRANSFORMER_ENGINE_VERSION}"
     uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
@@ -369,9 +376,7 @@ function megatron {
 
     deepep_prereqs
 
-    # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
-    # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
-    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.7.2
+    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.8.0
     NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
     pushd "${NVSHMEM_LIB_DIR}"
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so

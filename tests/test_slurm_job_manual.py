@@ -3193,7 +3193,7 @@ def test_image_build_runs_templated_prepare_command(
     tmp_path: Path,
 ) -> None:
     prepare_image = _load_prepare_image()
-    (tmp_path / "pytorch2609.sqsh").touch()
+    (tmp_path / "pytorch2610.sqsh").touch()
     monkeypatch.setenv("SLURM_ACCOUNT", "account")
     monkeypatch.setenv("CI_PROJECT_DIR", str(tmp_path))
     built: list[tuple[str, list[str], dict[str, object]]] = []
@@ -3217,10 +3217,10 @@ def test_image_build_runs_templated_prepare_command(
     assert build_values[-1]["time_minutes"] == 240  # noqa: PLR2004
     assert built[-1][1][-1].endswith("scripts/prepare.sh ubuntu2404 megatron test")
     prepare = (REPO_ROOT / "scripts" / "prepare.sh").read_text()
-    assert '"nvidia-cudnn-frontend[cutedsl]==1.28.0"' in prepare
+    assert '"nvidia-cudnn-frontend[cutedsl]==1.30.0"' in prepare
     assert '"${MEGATRON_ROOT}[training,dev,otel,te,ssm]"' in prepare
     assert 'export TMS_CUDA_MAJOR="${BASH_REMATCH[1]}"' in prepare
-    assert "nvidia-nvshmem-cu13==3.7.2" in prepare
+    assert "nvidia-nvshmem-cu13==3.8.0" in prepare
     assert "DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95" in prepare
     assert 'patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"' in prepare
     assert (REPO_ROOT / "scripts" / "deepep-nvshmem.patch").is_file()

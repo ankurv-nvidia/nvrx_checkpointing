@@ -1,15 +1,15 @@
-# Match the 26.09 Python package resolution of the Slurm runner image.
+# Match the 26.10 Python package resolution of the Slurm runner image.
 cffi==2.1.1
-cuda-tile==1.5.0
+cuda-tile==1.6.0
 datasets==4.7.0
-filelock==3.32.7
+filelock==4.0.12
 flashinfer-python==0.6.18.post1
 fsspec==2026.2.0
 h2==4.4.1
-hf-xet==1.6.0
-huggingface-hub==1.32.0
+hf-xet==1.7.0
+huggingface-hub==1.33.0
 megatron-energon==7.4.1
-nvidia-modelopt==0.46.0
+nvidia-modelopt==0.47.0
 onnx==1.21.0
 openai==3.22.1
 quack-kernels==0.6.2
