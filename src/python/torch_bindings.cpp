@@ -59,6 +59,7 @@ struct CachedTypes
     nb::object torchTensor;
     nb::object torchDtype;
     nb::object torchGenerator;
+    nb::object checkpointTensorProperties;
     nb::object localShardedTensor;
     nb::object localShardedTensorFactory;
     nb::object localShardedObject;
@@ -434,6 +435,7 @@ static CachedTypes const& CachedTypesGet()
             .torchTensor                  = torchModule.attr("Tensor"),
             .torchDtype                   = torchModule.attr("dtype"),
             .torchGenerator               = torchModule.attr("Generator"),
+            .checkpointTensorProperties   = nb::module_::import_("torch.distributed.checkpoint.metadata").attr("TensorProperties"),
             .localShardedTensor           = mappingModule.attr("ShardedTensor"),
             .localShardedTensorFactory    = mappingModule.attr("ShardedTensorFactory"),
             .localShardedObject           = mappingModule.attr("ShardedObject"),
@@ -492,9 +494,29 @@ static nb::object AddressableTensor(std::string_view name, nb::handle value)
     return owner;
 }
 
+static void ReadTensorProperties(TensorShard& shard, nb::handle tensor)
+{
+    auto properties = CachedTypesGet().checkpointTensorProperties.attr("create_from_tensor")(tensor);
+    auto state      = nb::cast<nb::tuple>(properties.attr("__getstate__")());
+    if (state.size() != TensorShard::LegacyPropertiesStateSize && state.size() != TensorShard::StridedPropertiesStateSize)
+    {
+        throw std::runtime_error(fmt::format("Unsupported tensor properties state size {}", state.size()));
+    }
+    shard.propertiesStateSize = static_cast<uint8_t>(state.size());
+    if (state.size() == TensorShard::StridedPropertiesStateSize && !state[TensorShard::LegacyPropertiesStateSize].is_none())
+    {
+        shard.hasStrides = true;
+        for (auto stride : nb::cast<nb::tuple>(state[TensorShard::LegacyPropertiesStateSize]))
+        {
+            shard.strides.push_back(nb::cast<uint64_t>(stride));
+        }
+    }
+}
+
 static TensorState TensorStorageState(RankTopology const& topo, std::string_view name, nb::handle value)
 {
     TensorState state{.owner = nb::borrow<nb::object>(value)};
+    ReadTensorProperties(state.shard, value);
     state.shard.rank         = topo.rank;
     auto const snapshotDtype = DetectQuantDType(state.owner);
     if (snapshotDtype == Tensor::DType::FP8E4M3) { state.header = ReadFP8Header(state.meta.durableDtype, state.owner, name); }
@@ -685,6 +707,11 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     }();
 
     if (!flattenedRange.is_none()) { throwError("flattened_range is not None"); }
+    if (prependAxisNumValue != 0 && !container["axis_fragmentations"].is_none())
+    {
+        shard.hasStrides = false;
+        shard.strides    = {};
+    }
 
     [&] {
         auto axisFragmentations = container["axis_fragmentations"];

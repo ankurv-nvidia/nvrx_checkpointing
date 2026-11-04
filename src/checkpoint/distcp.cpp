@@ -801,7 +801,7 @@ static void EmitMemoryFormatContiguousEnum(ByteBuffer& b)
     PutU8(b, 'R');
 }
 
-static void EmitTensorProperties(ByteBuffer& b, Tensor::DType dtype)
+static void EmitTensorProperties(ByteBuffer& b, Tensor::DType dtype, TensorShard const& shard)
 {
     checkpoint::distcp::PickleGlobal(b, KMetadataModule, "TensorProperties");
     PutU8(b, ')');
@@ -812,6 +812,23 @@ static void EmitTensorProperties(ByteBuffer& b, Tensor::DType dtype)
     PutU8(b, PickleNewFalseOpcode);
     EmitMemoryFormatContiguousEnum(b);
     PutU8(b, PickleNewFalseOpcode);
+    if (shard.propertiesStateSize == TensorShard::StridedPropertiesStateSize)
+    {
+        if (shard.hasStrides)
+        {
+            if (shard.strides.size() >= 4) { PutU8(b, '('); }
+            for (auto stride : shard.strides) { checkpoint::distcp::PickleInt(b, stride); }
+            PickleTupleClose(b, shard.strides.size());
+        }
+        else
+        {
+            PutU8(b, 'N');
+        }
+    }
+    else if (shard.propertiesStateSize != TensorShard::LegacyPropertiesStateSize)
+    {
+        throw std::runtime_error(fmt::format("distcp: unsupported tensor properties state size {}", shard.propertiesStateSize));
+    }
     PutU8(b, 't');
     PutU8(b, 'b');
 }
@@ -833,13 +850,16 @@ static void EmitChunkStorageMetadata(ByteBuffer& b, Tensor::DimRange const& shar
     EmitNewObjBuildEnd(b);
 }
 
-static void
-EmitTensorStorageMetadata(ByteBuffer& b, Tensor::DType dtype, Tensor::Dim const& fulldim, std::vector<Tensor::DimRange> const& chunks)
+static void EmitTensorStorageMetadata(ByteBuffer&                          b,
+                                      Tensor::DType                        dtype,
+                                      Tensor::Dim const&                   fulldim,
+                                      std::vector<Tensor::DimRange> const& chunks,
+                                      TensorShard const&                   propertiesShard)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "TensorStorageMetadata");
 
     checkpoint::distcp::PickleBinunicode(b, "properties");
-    EmitTensorProperties(b, dtype);
+    EmitTensorProperties(b, dtype, propertiesShard);
 
     PickleBinunicode(b, "size");
     EmitTorchSize(b, fulldim);
@@ -937,7 +957,7 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
         auto const fqn = globalRegistry.GetNodeId(node.handle);
         tensorFqns.insert(fqn);
         PickleBinunicode(b, fqn);
-        EmitTensorStorageMetadata(b, tnsr.durableDtype, tnsr.fulldim, chunkRanges);
+        EmitTensorStorageMetadata(b, tnsr.durableDtype, tnsr.fulldim, chunkRanges, *tnsr.shards.begin());
     });
     for (auto const& [fqn, copies] : blobs)
     {

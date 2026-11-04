@@ -236,20 +236,41 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
         for (auto&& shard : shards)
         {
             auto entry = nb::cast<nb::tuple>(shard);
-            if (entry.size() != 2) { throw std::runtime_error("distcp_shim: each shard entry must be (rank, sharddim)"); }
+            if (entry.size() != 2 && entry.size() != 3)
+            {
+                throw std::runtime_error("distcp_shim: each shard entry must be (rank, sharddim[, properties_state])");
+            }
             auto const rank     = Rank{nb::cast<uint32_t>(entry[0])};
             auto const sharddim = ParseSharddim(nb::cast<nb::sequence>(entry[1]));
 
             uint64_t storageSize = Tensor::GetDTypeSize(dtype);
             for (auto const& range : sharddim) { storageSize *= range.end - range.begin; }
-            st.AddShard({
+            TensorShard shardInfo{
                 .rank          = rank,
                 .snapshotDtype = dtype,
                 .handle        = 0,
                 .storageSize   = storageSize,
                 .sharddim      = sharddim,
                 .device        = DeviceId{"cpu"},
-            });
+            };
+            if (entry.size() == 3)
+            {
+                auto state = nb::cast<nb::tuple>(entry[2]);
+                if (state.size() != TensorShard::LegacyPropertiesStateSize && state.size() != TensorShard::StridedPropertiesStateSize)
+                {
+                    throw std::runtime_error(fmt::format("distcp_shim: unsupported tensor properties state size {}", state.size()));
+                }
+                shardInfo.propertiesStateSize = static_cast<uint8_t>(state.size());
+                if (state.size() == TensorShard::StridedPropertiesStateSize && !state[TensorShard::LegacyPropertiesStateSize].is_none())
+                {
+                    shardInfo.hasStrides = true;
+                    for (auto stride : nb::cast<nb::tuple>(state[TensorShard::LegacyPropertiesStateSize]))
+                    {
+                        shardInfo.strides.push_back(nb::cast<uint64_t>(stride));
+                    }
+                }
+            }
+            st.AddShard(shardInfo);
         }
 
         leaf.data = std::move(st);
@@ -280,7 +301,7 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("tensors"),
           nb::arg("objects") = nb::list(),
           "Write `<out_dir>/.metadata` from a list of (fqn, dtype_name, full_shape, "
-          "shards) tuples and optional (fqn, bytes) objects, where each shards entry is (rank, sharddim). The "
+          "shards) tuples and optional (fqn, bytes) objects. Each shard contains a rank, bounds, and optional tensor properties state. The "
           "per-shard (file_offset, length) is inferred analytically from the "
           "shape/dtype — no need to pass it in.");
 }

@@ -169,7 +169,9 @@ template <> struct std::hash<DeviceId>
 
 struct TensorShard
 {
-    static constexpr size_t MaxDims = 4;
+    static constexpr size_t  MaxDims                    = 4;
+    static constexpr uint8_t LegacyPropertiesStateSize  = 5;
+    static constexpr uint8_t StridedPropertiesStateSize = 6;
 
     struct Range
     {
@@ -190,14 +192,17 @@ struct TensorShard
     using Dim      = std::inplace_vector<uint64_t, MaxDims>;
     using DimRange = std::inplace_vector<Range, MaxDims>;
 
-    Rank                   rank{Rank::Invalid};
-    DType                  snapshotDtype{DType::Invalid};
-    std::array<uint8_t, 3> padding{};    // to avoid Uninitialized memory-reads in valgrind
-    uint64_t               handle{};
-    uint64_t               storageSize{};
-    DimRange               sharddim;
+    Rank     rank{Rank::Invalid};
+    DType    snapshotDtype{DType::Invalid};
+    uint8_t  propertiesStateSize{LegacyPropertiesStateSize};
+    bool     hasStrides{};
+    uint8_t  padding{};
+    uint64_t handle{};
+    uint64_t storageSize{};
+    DimRange sharddim;
 
     DeviceId device;    // Only for snapshotting. Try to avoid using it
+    Dim      strides{};
 
     bool operator==(TensorShard const& other) const = default;
 
@@ -409,7 +414,7 @@ static_assert(sizeof(Tensor::Range) == 16);
 static_assert(sizeof(Tensor::Dim) == 40);
 static_assert(sizeof(Tensor::DimRange) == 72);
 static_assert(sizeof(Tensor) == 72);
-static_assert(sizeof(TensorShard) == 104);
+static_assert(sizeof(TensorShard) == 144);
 // NOLINTEND(readability-magic-numbers)
 static_assert(std::is_trivially_copyable_v<DeviceId>);
 static_assert(std::is_trivially_copyable_v<DType>);

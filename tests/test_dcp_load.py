@@ -16,12 +16,15 @@ from __future__ import annotations
 # sys.path + MEGATRON_NATIVE_BUILD_DIR opt-out are wired by `pytest_discover_tests`.
 import io
 import json
+import os
 
 import _distcp_shim
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from torch.distributed.checkpoint.metadata import TensorProperties
 
 SUPPORTED_DTYPES = [
     torch.float32,
@@ -73,7 +76,8 @@ def _write_single_rank(out_dir, state_dict, objects=()) -> None:
     for fqn, t in state_dict.items():
         full_shape = [int(d) for d in t.shape]
         sharddim = [(0, int(d)) for d in t.shape]
-        tensors.append((fqn, _dtype_name(t.dtype), full_shape, [(0, sharddim)]))
+        properties_state = TensorProperties.create_from_tensor(t).__getstate__()
+        tensors.append((fqn, _dtype_name(t.dtype), full_shape, [(0, sharddim, properties_state)]))
     _distcp_shim.write_metadata(str(out_dir), tensors, list(objects))
 
 
@@ -118,6 +122,126 @@ def test_multi_tensor_mixed_dtype_dcp_load(tmp_path) -> None:
 
     for fqn, expected in state_dict.items():
         assert torch.equal(loaded[fqn], expected), f"mismatch for {fqn!r}"
+
+
+_PROPERTY_STATE_SIZES = sorted({5, len(TensorProperties().__getstate__())})
+
+
+def _write_tensor_chunks(out_dir, shape, chunks, properties_states):
+    shards = []
+    for rank, ((tensor, ranges), properties_state) in enumerate(zip(chunks, properties_states, strict=True)):
+        _distcp_shim.write_rank_shard(
+            str(out_dir),
+            rank,
+            [("weight", _dtype_name(tensor.dtype), tuple(end - start for start, end in ranges), tensor.numpy().tobytes())],
+        )
+        shards.append((rank, ranges, properties_state))
+    _distcp_shim.write_metadata(str(out_dir), [("weight", _dtype_name(chunks[0][0].dtype), shape, shards)])
+    return dcp.FileSystemReader(out_dir).read_metadata().state_dict_metadata["weight"]
+
+
+@pytest.mark.parametrize("state_size", _PROPERTY_STATE_SIZES)
+@pytest.mark.parametrize("shape,strides", [((2, 3), (3, 1)), ((1, 3), (19, 1)), ((3, 1), (1, 19)), ((1, 1), (31, 17))])
+def test_tensor_properties_preserve_local_chunk_strides(tmp_path, state_size, shape, strides):
+    chunks = []
+    properties_states = []
+    for rank in range(2):
+        tensor = torch.empty_strided(shape, strides, dtype=torch.float32)
+        tensor.copy_(torch.arange(tensor.numel()).reshape(shape) + rank * 100)
+        chunks.append((tensor, [(0, shape[0]), (rank * shape[1], (rank + 1) * shape[1])]))
+        properties_states.append(TensorProperties.create_from_tensor(tensor).__getstate__()[:state_size])
+
+    global_shape = (shape[0], shape[1] * 2)
+    metadata = _write_tensor_chunks(tmp_path, global_shape, chunks, properties_states)
+    expected_properties = TensorProperties()
+    expected_properties.__setstate__(properties_states[0])
+    assert metadata.properties == expected_properties
+    loaded = {"weight": torch.zeros(global_shape)}
+    dcp.load(loaded, checkpoint_id=tmp_path)
+    torch.testing.assert_close(loaded["weight"], torch.cat([tensor for tensor, _ranges in chunks], dim=1))
+
+
+@pytest.mark.parametrize("state_size", _PROPERTY_STATE_SIZES)
+def test_prepended_expert_axis_keeps_optional_strides(tmp_path, state_size):
+    chunks = []
+    properties_states = []
+    for rank in range(2):
+        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3) + rank * 100
+        chunks.append((tensor, [(rank, rank + 1), (0, 2), (0, 3)]))
+        properties_states.append(TensorProperties(dtype=tensor.dtype).__getstate__()[:state_size])
+
+    metadata = _write_tensor_chunks(tmp_path, (2, 2, 3), chunks, properties_states)
+    assert getattr(metadata.properties, "strides", None) is None
+    loaded = {"weight": torch.zeros(2, 2, 3)}
+    dcp.load(loaded, checkpoint_id=tmp_path)
+    torch.testing.assert_close(loaded["weight"], torch.stack([tensor for tensor, _ranges in chunks]))
+
+
+@pytest.mark.parametrize("state_size", _PROPERTY_STATE_SIZES)
+def test_scalar_properties_preserve_empty_strides(tmp_path, state_size):
+    scalar = torch.tensor(7.0)
+    properties_state = TensorProperties.create_from_tensor(scalar).__getstate__()[:state_size]
+    metadata = _write_tensor_chunks(tmp_path, (1,), [(scalar, [(0, 1)])], [properties_state])
+    expected_properties = TensorProperties()
+    expected_properties.__setstate__(properties_state)
+    assert metadata.properties == expected_properties
+    loaded = {"weight": torch.zeros(1)}
+    dcp.load(loaded, checkpoint_id=tmp_path)
+    torch.testing.assert_close(loaded["weight"], scalar.reshape(1))
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1", reason="requires checkpoint-server IPC support")
+def test_registered_tensor_properties_match_dcp_sources(tmp_path):
+    from nvrx_checkpointing import checkpoint
+    from nvrx_checkpointing.megatron.mapping import ShardedTensor
+
+    local = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    session = 4000
+    root = checkpoint.model_state.create_root(session, 0, 1, ["localhost"], 1)
+    try:
+        for iteration in (1, 2):
+            current = local + iteration
+            scalar = torch.tensor(7.0 + iteration)
+            singleton = torch.full((1, 3), float(iteration))
+            irregular_experts = [
+                ShardedTensor.from_rank_offsets("experts.irregular", current + rank, (0, rank, 2), prepend_axis_num=1) for rank in range(2)
+            ]
+            for shard in irregular_experts:
+                shard.axis_fragmentations = None
+            state = {
+                "dense.weight": [ShardedTensor.from_rank_offsets("dense.weight", current + rank, (1, rank, 2)) for rank in range(2)],
+                "experts.weight": [
+                    ShardedTensor.from_rank_offsets("experts.weight", current + rank, (0, rank, 2), prepend_axis_num=1) for rank in range(2)
+                ],
+                "experts.irregular": irregular_experts,
+                "scalar": scalar,
+                "singleton": singleton,
+            }
+            checkpoint_dir = tmp_path / str(iteration)
+            root.register_state_dict(state)
+            root.save(iteration, checkpoint_dir)
+            checkpoint.wait_for_ckpt_finalize(session, iteration)
+            metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+            for key, tensor in (("dense.weight", current), ("experts.irregular", current), ("scalar", scalar), ("singleton", singleton)):
+                expected = TensorProperties.create_from_tensor(tensor)
+                assert metadata[key].properties == expected
+            assert getattr(metadata["experts.weight"].properties, "strides", None) is None
+            loaded = {
+                "dense.weight": torch.zeros(2, 6),
+                "experts.weight": torch.zeros(2, 2, 3),
+                "experts.irregular": torch.zeros(2, 2, 3),
+                "scalar": torch.zeros(1),
+                "singleton": torch.zeros(1, 3),
+            }
+            dcp.load(loaded, checkpoint_id=checkpoint_dir)
+            torch.testing.assert_close(loaded["dense.weight"], torch.cat([current, current + 1], dim=1))
+            torch.testing.assert_close(loaded["experts.weight"], torch.stack([current, current + 1]))
+            torch.testing.assert_close(loaded["experts.irregular"], torch.stack([current, current + 1]))
+            torch.testing.assert_close(loaded["scalar"], scalar.reshape(1))
+            torch.testing.assert_close(loaded["singleton"], singleton)
+    finally:
+        checkpoint.svc_spindown()
 
 
 def test_common_state_is_embedded_and_fresh_for_each_checkpoint(tmp_path) -> None:
