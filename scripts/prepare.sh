@@ -343,6 +343,7 @@ function megatron {
     printf '%s\n' \
         "transformer-engine; sys_platform == 'never'" \
         "quack-kernels; sys_platform == 'never'" \
+        "filelock==3.32.7" \
         "pydantic<2.14" \
         "nvidia-cudnn-frontend[cutedsl]==1.30.0" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"

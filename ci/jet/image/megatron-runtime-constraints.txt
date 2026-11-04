@@ -2,7 +2,7 @@
 cffi==2.1.1
 cuda-tile==1.6.0
 datasets==4.7.0
-filelock==4.0.12
+filelock==3.32.7
 flashinfer-python==0.6.18.post1
 fsspec==2026.2.0
 h2==4.4.1
