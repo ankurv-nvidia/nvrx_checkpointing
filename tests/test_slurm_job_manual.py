@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -241,6 +242,104 @@ def _load_run_dependency():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_jet_submit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "ci/jet"))
+    spec = importlib.util.spec_from_file_location("jet_submit_workload_test", REPO_ROOT / "ci/jet/submit_workload.py")
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _jet_results_asset(tmp_path: Path, name: str, report: dict, *, soft_failure: bool = False):
+    archive = tmp_path / name
+    payload = json.dumps(report).encode()
+    with tarfile.open(archive, "w:gz") as contents:
+        info = tarfile.TarInfo("ci/ci-results/report.json")
+        info.size = len(payload)
+        contents.addfile(info, io.BytesIO(payload))
+        if soft_failure:
+            contents.addfile(tarfile.TarInfo("ci/ci-results/report_soft_failure.json"), io.BytesIO())
+    return SimpleNamespace(name=name, download=lambda destination: destination.write_bytes(archive.read_bytes()))
+
+
+@pytest.mark.parametrize("stale_first", [True, False])
+def test_jet_results_select_current_upstream_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stale_first: bool) -> None:
+    submit = _load_jet_submit(monkeypatch)
+    monkeypatch.setenv("GITHUB_RUN_ID", "41778586740")
+    stale = _jet_results_asset(
+        tmp_path,
+        "gb200_detr_pico_1x4_pipeline-41768443182_artifacts.tar.gz",
+        {"source": "5a0aee52", "gpu_hbm_peak_bytes": 23130931200},
+        soft_failure=True,
+    )
+    current_report = {"source": "8cddc06c", "gpu_hbm_peak_bytes": 20056506368}
+    current = _jet_results_asset(tmp_path, "gb200_detr_pico_1x4_pipeline-41778586740_artifacts.tar.gz", current_report)
+    assets = [stale, current] if stale_first else [current, stale]
+    destination = tmp_path / "results"
+
+    assert submit.publish_results(SimpleNamespace(get_assets=lambda: assets), destination) is False
+    assert json.loads((destination / "ci/ci-results/report.json").read_text()) == current_report
+    assert not (destination / "ci/ci-results/report_soft_failure.json").exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "gb200_detr_pico_1x4_pipeline-41768443182_artifacts.tar.gz",
+        "worker.log",
+        "gb200_detr_pico_1x4_artifacts.tar.gz",
+    ],
+)
+def test_jet_results_reject_missing_current_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> None:
+    submit = _load_jet_submit(monkeypatch)
+    monkeypatch.setenv("GITHUB_RUN_ID", "41778586740")
+    asset = SimpleNamespace(name=name, download=lambda _destination: pytest.fail("an unmatched asset was downloaded"))
+    destination = tmp_path / "results"
+
+    with pytest.raises(RuntimeError, match="upstream run 41778586740, found 0"):
+        submit.publish_results(SimpleNamespace(get_assets=lambda: [asset]), destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("upstream_run_id", [None, "41778586740"])
+def test_jet_results_reject_ambiguous_archives(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, upstream_run_id: str | None) -> None:
+    submit = _load_jet_submit(monkeypatch)
+    if upstream_run_id is None:
+        monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_RUN_ID", upstream_run_id)
+    name = "gb200_detr_pico_1x4_pipeline-41778586740_artifacts.tar.gz"
+    asset = SimpleNamespace(name=name, download=lambda _destination: pytest.fail("an ambiguous asset was downloaded"))
+    destination = tmp_path / "results"
+
+    with pytest.raises(RuntimeError, match="found 2"):
+        submit.publish_results(SimpleNamespace(get_assets=lambda: [asset, asset]), destination)
+    assert not destination.exists()
+
+
+def test_jet_results_publish_single_legacy_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    submit = _load_jet_submit(monkeypatch)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    report = {"result": "passed"}
+    asset = _jet_results_asset(tmp_path, "gb200_detr_pico_1x4_artifacts.tar.gz", report)
+    destination = tmp_path / "results"
+
+    assert submit.publish_results(SimpleNamespace(get_assets=lambda: [asset]), destination) is False
+    assert json.loads((destination / "ci/ci-results/report.json").read_text()) == report
+
+
+def test_jet_results_require_upstream_id_for_scoped_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    submit = _load_jet_submit(monkeypatch)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    asset = SimpleNamespace(name="gb200_detr_pico_1x4_pipeline-41778586740_artifacts.tar.gz")
+
+    with pytest.raises(RuntimeError, match="GITHUB_RUN_ID is required"):
+        submit.publish_results(SimpleNamespace(get_assets=lambda: [asset]), tmp_path / "results")
 
 
 _CONSTANT_STRUCTURE = "--ckpt-assume-constant-structure"

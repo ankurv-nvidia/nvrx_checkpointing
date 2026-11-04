@@ -295,10 +295,16 @@ def _duration(seconds: float | None) -> str:
 
 def publish_results(log: Any, destination: Path = RESULTS_DIR) -> bool:  # noqa: ANN401
     """Extract the workload's results archive into the job artifacts; return whether it reports a soft failure."""
-    archive = next((asset for asset in log.get_assets() if asset.name.endswith("_artifacts.tar.gz")), None)
-    if archive is None:
-        print("[jet] the workload published no results archive")
-        return False
+    archives = [asset for asset in log.get_assets() if asset.name.endswith("_artifacts.tar.gz")]
+    upstream_run_id = os.environ.get("GITHUB_RUN_ID")
+    if upstream_run_id:
+        archives = [asset for asset in archives if asset.name.endswith(f"_pipeline-{upstream_run_id}_artifacts.tar.gz")]
+    if len(archives) != 1:
+        context = f" for upstream run {upstream_run_id}" if upstream_run_id else ""
+        raise RuntimeError(f"Expected one JET results archive{context}, found {len(archives)}")
+    archive = archives[0]
+    if not upstream_run_id and re.search(r"_pipeline-\d+_artifacts\.tar\.gz$", archive.name):
+        raise RuntimeError("GITHUB_RUN_ID is required to select a pipeline-scoped JET results archive")
     destination.mkdir(parents=True, exist_ok=True)
     local = destination / Path(archive.name).name
     try:
