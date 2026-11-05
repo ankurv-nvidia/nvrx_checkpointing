@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 import threading
 from concurrent.futures import Future
@@ -28,7 +29,7 @@ def _module(name: str, **attributes: object) -> ModuleType:
 @pytest.fixture
 def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     state_dict_utils = _module("megatron.core.dist_checkpointing.state_dict_utils", save_preprocess=lambda state, **_kwargs: (state, {}))
-    msc_utils = _module("megatron.core.msc_utils", maybe_msc=SimpleNamespace())
+    msc_utils = _module("megatron.core.msc_utils", maybe_msc=SimpleNamespace(open=open))
     rerun = _module("megatron.core.rerun_state_machine", get_rerun_state_machine=SimpleNamespace)
     core_utils = _module("megatron.core.utils", unwrap_model=lambda model: model)
     checkpointing = _module(
@@ -93,6 +94,271 @@ def _queue(
 ) -> None:
     future = save._get_executor().submit(async_fn)
     save._pending = save._PendingSave(future, finalize_fn)
+
+
+@pytest.fixture
+def retention(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Generator[SimpleNamespace]:
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("100")
+    args = SimpleNamespace(save=tmp_path, save_retain_interval=10000, log_progress=True)
+    deleted: list[tuple[int, str, bool]] = []
+    threads: list[threading.Thread] = []
+    thread_type = threading.Thread
+
+    def checkpoint_name(directory: Path, iteration: int, **_kwargs: object) -> Path:
+        return directory / f"iter_{iteration:07d}"
+
+    def delete(directory: Path, iteration: int, log_progress: bool) -> None:
+        deleted.append((iteration, tracker.read_text(), log_progress))
+        shutil.rmtree(checkpoint_name(directory, iteration))
+
+    def start_thread(**kwargs: object) -> threading.Thread:
+        thread = thread_type(**kwargs)
+        threads.append(thread)
+        return thread
+
+    def wait() -> None:
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    monkeypatch.setattr(save, "get_checkpoint_name", checkpoint_name)
+    monkeypatch.setattr(save, "get_checkpoint_tracker_filename", lambda _directory: tracker)
+    monkeypatch.setattr(save.checkpointing_module, "_async_delete_checkpoint_impl", delete, raising=False)
+    monkeypatch.setattr(save.threading, "Thread", start_thread)
+    monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    for iteration in (20, 80, 100, 120):
+        checkpoint_name(tmp_path, iteration).mkdir()
+    yield SimpleNamespace(args=args, tracker=tracker, deleted=deleted, threads=threads, wait=wait, checkpoint=checkpoint_name)
+    wait()
+
+
+@pytest.mark.parametrize("initialized", [True, False])
+def test_retention_deletes_only_previous_tracked_checkpoint_after_publication(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    initialized: bool,
+) -> None:
+    monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: initialized)
+    if not initialized:
+        monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: pytest.fail("uninitialized process has no rank"))
+
+    save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "120"
+    assert retention.deleted == [(100, "120", True)]
+    assert not retention.checkpoint(retention.args.save, 100).exists()
+    assert all(retention.checkpoint(retention.args.save, iteration).is_dir() for iteration in (20, 80, 120))
+    assert all(not thread.daemon for thread in retention.threads)
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    [(0, 20), (10000, 10020), (120, 120), (140, 120)],
+)
+def test_retention_preserves_milestones_and_nonolder_checkpoints(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    previous: int,
+    current: int,
+) -> None:
+    retention.tracker.write_text(str(previous))
+
+    save._write_checkpoint_tracker(retention.args, current)
+    retention.wait()
+
+    assert retention.tracker.read_text() == str(current)
+    assert retention.deleted == []
+    assert retention.threads == []
+
+
+def test_retention_first_checkpoint_has_no_previous_checkpoint(
+    save: ModuleType,
+    retention: SimpleNamespace,
+) -> None:
+    retention.tracker.unlink()
+
+    save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "120"
+    assert retention.deleted == []
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_disabled_retention_does_not_read_previous_tracker(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    if explicit:
+        retention.args.save_retain_interval = None
+    else:
+        del retention.args.save_retain_interval
+    retention.tracker.write_text("release")
+
+    def write_only(path: Path, mode: str):  # noqa: ANN202
+        assert mode == "w"
+        return path.open(mode)
+
+    monkeypatch.setattr(save.maybe_msc, "open", write_only)
+
+    save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "120"
+    assert retention.deleted == []
+    assert retention.checkpoint(retention.args.save, 100).is_dir()
+
+
+def test_retention_preserves_symlinked_previous_checkpoint(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    previous = retention.checkpoint(retention.args.save, 100)
+    previous.rmdir()
+    target = tmp_path / "retained-external-checkpoint"
+    target.mkdir()
+    previous.symlink_to(target, target_is_directory=True)
+
+    save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "120"
+    assert previous.is_symlink()
+    assert target.is_dir()
+    assert retention.deleted == []
+
+
+def test_nonzero_global_rank_does_not_publish_or_delete_checkpoints(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 4)
+
+    save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "100"
+    assert retention.deleted == []
+
+
+def test_retention_does_not_delete_when_tracker_publication_fails(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_write(path: Path, mode: str):  # noqa: ANN202
+        if mode == "w":
+            raise OSError("tracker publication failed")
+        return path.open(mode)
+
+    monkeypatch.setattr(save.maybe_msc, "open", fail_write)
+
+    with pytest.raises(OSError, match="tracker publication failed"):
+        save._write_checkpoint_tracker(retention.args, 120)
+    retention.wait()
+
+    assert retention.tracker.read_text() == "100"
+    assert retention.checkpoint(retention.args.save, 100).is_dir()
+    assert retention.deleted == []
+
+
+def _complete_async_retention_save(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    future: Future[None],
+    wait: tuple[Callable[..., None], tuple[object, ...]],
+    failure: bool,
+) -> None:
+    save.maybe_finalize_async_save()
+    assert retention.tracker.read_text() == "100"
+    assert retention.deleted == []
+    fn, args = wait
+    try:
+        future.set_result(fn(*args))
+    except RuntimeError as exc:
+        future.set_exception(exc)
+    if failure:
+        with pytest.raises(RuntimeError, match="failed during background execution"):
+            save.maybe_finalize_async_save()
+    else:
+        save.maybe_finalize_async_save()
+
+
+@pytest.mark.parametrize("async_save", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_retention_waits_for_successful_durable_completion(
+    save: ModuleType,
+    retention: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    async_save: bool,
+    failure: bool,
+) -> None:
+    future: Future[None] = Future()
+    waits: list[tuple[Callable[..., None], tuple[object, ...]]] = []
+    retention.args.async_save = async_save
+    retention.args.use_distributed_optimizer = False
+    save_args = save.SaveCheckpointArgs(120, object(), None, None, 0)
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        @staticmethod
+        def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
+            assert retention.tracker.read_text() == "100"
+
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            assert retention.tracker.read_text() == "100"
+
+    class ManualExecutor:
+        @staticmethod
+        def submit(fn: Callable[..., None], *args: object) -> Future[None]:
+            waits.append((fn, args))
+            return future
+
+    def wait_for_finalize(_session: int, _iteration: int) -> None:
+        assert retention.tracker.read_text() == "100"
+        assert retention.checkpoint(retention.args.save, 100).is_dir()
+        if failure:
+            raise RuntimeError("checkpoint durability failed")
+
+    monkeypatch.setattr(save, "get_args", lambda: retention.args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+    monkeypatch.setattr(save, "_get_executor", ManualExecutor)
+    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", wait_for_finalize)
+
+    if not async_save and failure:
+        with pytest.raises(RuntimeError, match="checkpoint durability failed"):
+            save._save_checkpoint_impl(save_args, 123)
+    else:
+        save._save_checkpoint_impl(save_args, 123)
+    if async_save:
+        _complete_async_retention_save(save, retention, future, waits.pop(), failure)
+    retention.wait()
+
+    if failure:
+        assert retention.tracker.read_text() == "100"
+        assert retention.checkpoint(retention.args.save, 100).is_dir()
+        assert retention.deleted == []
+    else:
+        assert retention.tracker.read_text() == "120"
+        assert not retention.checkpoint(retention.args.save, 100).exists()
+        assert retention.deleted == [(100, "120", True)]
 
 
 def test_checkpoint_span_preserves_names_and_attributes(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,6 +485,75 @@ def test_async_finalize_wait_starts_after_client_send(
     save._save_checkpoint_impl(save_args, 123)
 
     assert events == ["save_async", "client_send_complete", "submit_finalize_wait", "wait_for_finalize"]
+
+
+@pytest.mark.parametrize("async_save", [False, True])
+@pytest.mark.parametrize("failure", ["checkpoint shard write failed: Input/output error", "checkpoint finalize timed out"])
+def test_finalize_failure_preserves_tracker_and_prevents_success(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    async_save: bool,
+    failure: str,
+) -> None:
+    messages: list[str] = []
+    deleted: list[tuple[object, ...]] = []
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("30")
+    previous = tmp_path / "iter_0000030"
+    previous.mkdir()
+    previous_payload = previous / "checkpoint"
+    previous_payload.write_text("last successful checkpoint")
+    finalize_error = RuntimeError(failure)
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        @staticmethod
+        def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
+            return
+
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
+    def fail_finalize(session: int, iteration: int) -> None:
+        assert (session, iteration) == (0, 40)
+        raise finalize_error
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=async_save, save=tmp_path, save_retain_interval=10000)
+    save_args = save.SaveCheckpointArgs(
+        iteration=40,
+        model=object(),
+        optimizer=None,
+        opt_param_scheduler=None,
+        num_floating_point_operations_so_far=0,
+    )
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000040")
+    monkeypatch.setattr(save, "get_checkpoint_tracker_filename", lambda _path: tracker)
+    monkeypatch.setattr(save, "maybe_msc", SimpleNamespace(open=Path.open))
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+    monkeypatch.setattr(save, "print_rank_0", messages.append)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", fail_finalize)
+    monkeypatch.setattr(save.checkpointing_module, "_async_delete_checkpoint_impl", lambda *args: deleted.append(args), raising=False)
+
+    if async_save:
+        save._save_checkpoint_impl(save_args, 123)
+        with pytest.raises(RuntimeError) as error:
+            save.maybe_finalize_async_save(blocking=True)
+        assert error.value.__cause__ is finalize_error
+    else:
+        with pytest.raises(RuntimeError) as error:
+            save._save_checkpoint_impl(save_args, 123)
+        assert error.value is finalize_error
+    assert tracker.read_text() == "30"
+    assert previous_payload.read_text() == "last successful checkpoint"
+    assert deleted == []
+    assert not any("successfully saved checkpoint" in message for message in messages)
 
 
 @pytest.mark.parametrize(

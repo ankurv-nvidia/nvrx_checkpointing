@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_REPO = _HERE.parent.parent
 
 _spec = importlib.util.spec_from_file_location("otel_report", _REPO / "ci" / "scripts" / "otel_report.py")
 otel_report = importlib.util.module_from_spec(_spec)

@@ -18,7 +18,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
 DEFAULT_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 DEFAULT_NVRX_COMMIT = "73b17d9bcff543a0a5f64e95d64f26899d730653"
@@ -1945,7 +1945,11 @@ def test_routine_validates_each_collected_cycle(
     monkeypatch.setitem(
         sys.modules,
         "nvrx_checkpointing",
-        SimpleNamespace(checkpoint=SimpleNamespace(ping=lambda: lifecycle.append(("ping", "")))),
+        SimpleNamespace(
+            SERVER_PATH=tmp_path / "checkpoint_server",
+            ckpt_diag=SimpleNamespace(enable_checkpoint_server_core_dumps=lambda *_: lifecycle.append(("cores", ""))),
+            checkpoint=SimpleNamespace(ping=lambda: lifecycle.append(("ping", ""))),
+        ),
     )
     monkeypatch.setattr(slurm_job, "_phase_command", phase_command)
     monkeypatch.setattr(slurm_job, "_sync_ranks", lambda tag: lifecycle.append(("sync", tag)))
@@ -1984,6 +1988,7 @@ def test_routine_validates_each_collected_cycle(
             ("ping", ""),
             ("sync", "phase1-otel-listeners-ready"),
         ]
+    expected_startup.insert(0, ("cores", ""))
     assert lifecycle[: len(expected_startup)] == expected_startup
     assert [env.get("NATIVE_CKPT_OTEL_COLLECTOR") for env in child_envs] == [collector, collector]
     assert [label.rsplit("-", 2)[-2] for _provider, label in stops] == [server_role, server_role]
@@ -3595,6 +3600,24 @@ def test_training_is_teed_without_a_postprocess_step(monkeypatch: pytest.MonkeyP
     assert "__epilog__" in script
     assert script.count("tee ") == 1
     assert script.count("--kill-on-bad-exit=1") == len(("allocation-epilog", "prepare", "train"))
+
+
+def test_classic_training_leaves_other_ranks_alive_for_core_collection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("SLURM_ACCOUNT", "account")
+    _use_cluster(monkeypatch, tmp_path, "interactive")
+    monkeypatch.setenv("PLATFORM", "gb200")
+    args = _args(tmp_path, job_array_segment=0)
+    slurm_job._configure_run(args)
+
+    script, _reaper, _log = slurm_job._build_job(args)
+
+    worker = next(line for line in script.splitlines() if "&& run_rc=0" in line)
+    assert "--kill-on-bad-exit=0" in worker
 
 
 def test_deterministic_flavor_keeps_perf_epilog_unless_valgrind(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

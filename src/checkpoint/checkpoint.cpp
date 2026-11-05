@@ -24,6 +24,7 @@
 #include <boost/process/execute.hpp>
 #include <hwloc.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -275,20 +276,15 @@ void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
     boost::beast::http::write(stream, req, ec);
     if (ec) { throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: request write failed: {}", ec.message())); }
 
-    // The server holds the connection open with chunked heartbeats and only completes the response
-    // once the snapshot is durable. No stream timeout is set, so the read blocks across heartbeats
-    // for the full (possibly long) finalize rather than timing out.
     boost::beast::flat_buffer                                            buffer;
     boost::beast::http::response_parser<boost::beast::http::string_body> parser;
     parser.body_limit(std::numeric_limits<std::uint64_t>::max());
     boost::beast::http::read(stream, buffer, parser, ec);
-    if (ec && ec != boost::beast::http::error::end_of_stream)
-    {
-        throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: response read failed: {}", ec.message()));
-    }
+    if (ec) { throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: response read failed: {}", ec.message())); }
     if (parser.get().result() != boost::beast::http::status::ok)
     {
-        throw std::runtime_error(fmt::format("wait-for-ckpt-finalize: server returned HTTP {}", parser.get().result_int()));
+        throw std::runtime_error(
+            fmt::format("wait-for-ckpt-finalize: server returned HTTP {}: {}", parser.get().result_int(), parser.get().body()));
     }
     TryCleanShutdown(stream);
 }

@@ -62,6 +62,42 @@ setup and an exact NVIDIA Resiliency Extension install share one preparation
 version. The log also records its selected source commit, installed module
 path, shared library, and server path explicitly.
 
+## Ultra4 on GB300
+
+The `ultra4` profile runs on 64 GB300 nodes with four GPUs per node, TP2/EP64,
+MXFP8, Muon, and the reference batch ramp. It uses the same `megatron_root`
+from `scripts/prepare.sh` as the other profiles, including its public
+Megatron-LM commit and dependency pins.
+
+The profile preserves hidden size 10240, 512 experts, top-k 10, MoE shortcuts,
+and two MTP depths. The public source rejects wide residuals combined with
+MoE shortcuts or MTP, so wide residuals are omitted. Private-only MTP token
+normalization, quantile-balancing controls, per-expert Muon mode,
+residual-stream recomputation, and diagnostic flags are also omitted. These
+differences make this an approximation of the original workload.
+
+The harness supplies checkpoint paths, finite run lengths, and the perf
+checkpoint interval of 20. The language-only entrypoint omits the reference
+script's vision-only precision override. The detr job applies the existing
+deterministic attention, router, communication, and fusion settings, including
+disabling GTP symmetric user buffers that require NVLS.
+
+Select `gb300-native-perf-ultra4-64x4` and
+`gb300-native-detr-ultra4-64x4` in the **JET gb300** workflow, or dispatch both
+from the branch:
+
+```bash
+gh workflow run jet-gb300.yml --ref coredump \
+  -f gb300-native-perf-ultra4-64x4=true \
+  -f gb300-native-detr-ultra4-64x4=true
+```
+
+`JET_CLUSTERS.gb300` selects the execution cluster. Its configured node limit
+is 64; the cluster still needs enough available nodes for the allocation.
+When a daemon crashes, CI retains its shared run directory, core, and matching
+executable. The uploaded artifacts include `core_manifest.json` with their
+locations and sizes plus capture diagnostics.
+
 ## One-time shell setup
 
 ```bash

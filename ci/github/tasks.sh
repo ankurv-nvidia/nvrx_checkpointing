@@ -100,7 +100,7 @@ wheel_pytest() {
     "${python}" -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
     "${python}" -c "import nvrx_checkpointing.debug"
     "${python}" -m nvrx_checkpointing.metadata_compare --help >/dev/null
-    "${python}" -m pytest tests -v --junitxml=ci/ci-results/pytest.xml
+    "${python}" -m pytest tests ci/tests -v --junitxml=ci/ci-results/pytest.xml
     chmod +x dev_binaries/ckpttest
     ./dev_binaries/ckpttest
 }

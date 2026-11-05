@@ -102,7 +102,7 @@ python3 ci/scripts/otel_report.py "$NATIVE_CKPT_OTEL_FILE"
 
 `otel_report.py` extracts one sample per `ckpt.save` span (keyed on the span's
 `nvrx.rank`) and reads OTLP gauges, sums, and histograms. It does not recreate
-performance log lines. `tests/test_otel_report.py` covers the extraction and summary
+performance log lines. `ci/tests/test_otel_report.py` covers the extraction and summary
 with synthetic OTLP fixtures.
 
 ## CI perf gating

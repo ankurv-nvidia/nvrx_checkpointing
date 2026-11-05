@@ -206,6 +206,8 @@ _PRETRAIN_ENV_NAMES = {
     "NATIVE_CKPT_OTEL_COLLECTOR",
     "NATIVE_CKPT_OTEL_FILE",
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
+    "NATIVE_CKPT_SERVER_CORE_DUMP",
+    "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
     "NCCL_NET",
@@ -570,6 +572,17 @@ def _run_name(template: str | None, args: argparse.Namespace, run: str = "") -> 
             "--name must expand to only letters, digits, '.', '_' and '-' and may not start with punctuation",
         )
     return name
+def _configure_model_environment(config_name: str) -> None:
+    environment = _model_environment(config_name)
+    for name, value in environment.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ.setdefault(name, str(value))
+    for name, default in _TRAIN_ENV_DEFAULTS.items():
+        if name not in environment or environment[name] is not None:
+            os.environ.setdefault(name, default)
+
 def _configure_run(args: argparse.Namespace) -> None:
     global JOB_ROOT, RESULTS_DIR, RUN_NAME, RUN_ROOT, WORK_ROOT  # noqa: PLW0603
     _normalize_nvrx_repo_root()
@@ -613,8 +626,7 @@ def _configure_run(args: argparse.Namespace) -> None:
         # (auto) form.
         SLURMJOB_OPT_JOB_ARRAY_SEGMENT=str(_job_array_segment(args)),
     )
-    for name, default in _TRAIN_ENV_DEFAULTS.items():
-        os.environ.setdefault(name, default)
+    _configure_model_environment(args.config)
     # Compiler and dataset caches are keyed by their own contents, so every run
     # reads the one another run filled instead of paying the first compile again.
     for name, directory in (
@@ -2068,6 +2080,8 @@ class DeterministicFlavor(Flavor):
             "--moe-router-fusion",
             "--overlap-grad-reduce",
             "--overlap-param-gather",
+            "--gtp-remat-nccl-ub",
+            "--gtp-expert-remat-nccl-ub",
         )
         # Deterministic FP4 uses FP32 router probabilities; other profiles use FP64.
         router_dtype = "fp32" if "--fp4-format" in opts or "--fp4-recipe" in opts else "fp64"
@@ -2474,6 +2488,11 @@ def _model_config(name: str) -> dict:
     base = _load_yaml(CONFIGS_DIR / "base.yaml")
     return _deep_merge(base, _profile_config(name))
 
+def _model_environment(config_name: str) -> dict[str, str | None]:
+    metadata = _model_config(config_name).get("ci") or {}
+    return metadata.get("environment") or {}
+
+
 def _pretrain_entrypoint(config_name: str) -> str:
     metadata = _model_config(config_name).get("ci") or {}
     entrypoint = metadata.get("pretrain-entry", "hybrid")
@@ -2729,6 +2748,11 @@ def _phase_command(
         checkpoints_override=checkpoints_override,
     )
     opts, env = _train_options(cfg, config), {**os.environ, **_base_env()}
+    for name, value in _model_environment(config.model_config).items():
+        if value is None:
+            env.pop(name, None)
+        elif name not in os.environ:
+            env[name] = str(value)
     for name, value in _MEGATRON_OTEL_ENV_DEFAULTS.items():
         env.setdefault(name, value)
     if "NVTE_FLASH_ATTN_V4" not in env and _gpu_compute_capability() == "9.0":
@@ -2845,7 +2869,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
         server_enabled = collect_otel
         if server_enabled:
-            from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+            from nvrx_checkpointing import SERVER_PATH, checkpoint, ckpt_diag  # noqa: PLC0415
+
+            ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
 
             if relay_otel:
                 if collector_node:
@@ -3602,6 +3628,10 @@ def _worker(args: argparse.Namespace) -> None:
             with contextlib.suppress(Exception):
                 CHECKPOINT_SERVER.request("stop", 5)
         raise
+    finally:
+        package = sys.modules.get("nvrx_checkpointing")
+        if diagnostics := getattr(package, "ckpt_diag", None):
+            diagnostics.collect_checkpoint_server_core_dumps(wait=True)
 
 def _identity(args: argparse.Namespace) -> tuple[str, str, str]:
     """The profile, the combination and the stem a run reports under."""
@@ -3872,10 +3902,14 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
         "gpus_per_node": args.gpus_per_node,
         "partition": partition,
     }
-    def step(nodes: int, tasks: int, env: str, output: Path | None = None, writable: bool = False) -> list[str]:
+    def step(
+        nodes: int, tasks: int, env: str, output: Path | None = None, writable: bool = False,
+        kill_on_bad_exit: bool = True,
+    ) -> list[str]:
         return build_srun_cmd(
             nodes=nodes, ntasks=tasks, time_minutes=work_minutes,
             total_gpus=nodes * args.gpus_per_node, container_env=env, output=output,
+            kill_on_bad_exit=kill_on_bad_exit,
             extra_srun_args=["--container-writable"] if writable else None, **common,
         )
     prep_log = RESULTS_DIR / f"{stem}_prep.log"
@@ -3942,7 +3976,7 @@ def _build_job(args: argparse.Namespace) -> tuple[str, str, Path]:
         _provider(spec.flavors) == "native" and spec.flavors.policy.requires_nvrx_absent
         for spec, _toolchain_ in spec_toolchains
     )
-    run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification),
+    run = [*step(args.nodes, total_tasks, container_env, writable=native_perf_verification, kill_on_bad_exit=False),
            "python3", "-u", str(Path(__file__).resolve()), *worker_args]
     epilog = [
         "python3", "-u", str(Path(__file__).resolve()), _EPILOG_ENTRY_CMD, *common_worker_args,
@@ -4062,7 +4096,10 @@ _RUN_OPTIONS = {
     "job_array_segment": RunOption("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", None, _nonnegative_int, None, (), "rw"),
     "dry_run": RunOption("SLURMJOB_OPT_DRY_RUN", False, _parse_bool, argparse.BooleanOptionalAction),
 }
+_MODEL_ENV_NAMES = {name for config in _CONFIGS for name in _model_environment(config)}
+_PRETRAIN_ENV_NAMES.update(_MODEL_ENV_NAMES)
 _ENV_SCOPES = {
+    **dict.fromkeys(_MODEL_ENV_NAMES, "rw"),
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS": "rw",
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
@@ -4076,6 +4113,7 @@ _ENV_SCOPES = {
     "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
+    "NATIVE_CKPT_SERVER_CORE_DUMP": "rw", "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS": "rw",
     "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
     "MEGATRON_OTEL_RUN_ID": "rw",
     **dict.fromkeys(_MEGATRON_OTEL_ENV_DEFAULTS, "rw"),

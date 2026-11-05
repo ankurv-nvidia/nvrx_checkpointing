@@ -12,7 +12,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-_REPO = Path(__file__).resolve().parent.parent
+_REPO = Path(__file__).resolve().parents[2]
 _SNAPSHOT_ID = 125
 _spec = importlib.util.spec_from_file_location("otel_to_perfetto", _REPO / "ci" / "scripts" / "otel_to_perfetto.py")
 otel_to_perfetto = importlib.util.module_from_spec(_spec)

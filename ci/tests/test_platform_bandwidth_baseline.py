@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci" / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ci" / "scripts"))
 
 from slurm_job import PERF_TOLERANCE, PerfReport, otel_report
 
