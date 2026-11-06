@@ -5,7 +5,7 @@ custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
 
 ## Install a wheel from the project's pip index
 
-Every `main` build that passes CI publishes its x86_64 and aarch64 wheels to the
+Successful `main` wheel builds publish x86_64 and aarch64 wheels to the
 project's pip index on GitHub Pages. Install the newest wheel compatible with
 the current machine (Python 3.12 or newer) with:
 

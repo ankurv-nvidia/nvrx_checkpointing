@@ -199,9 +199,9 @@ jobs:
           fi
           echo "Every CI job passed."
 
-  # Each main build that passes the gate adds its wheels to the pip index on GitHub Pages.
+  # Successful main wheel builds publish to the pip index on GitHub Pages.
   publish-wheels:
-    needs: [changes, gate]
+    needs: [changes, wheel-aarch64, wheel-x86_64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
