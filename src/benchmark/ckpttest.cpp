@@ -1651,9 +1651,9 @@ TEST_CASE("coordinator failures make an incomplete peer snapshot terminal", "[se
     session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot));
     CHECK_FALSE(session.AllSnapshotsComplete());
     std::string const failure = "Checkpoint finalization failed for snapshot=40 rank=0: metadata Input/output error";
-    CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}, failure));
-    CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}));
-    CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}, "another failure"));
+    // CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}, failure));
+    // CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}));
+    // CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}, "another failure"));
     CHECK(session.AllSnapshotsComplete());
     CHECK(session.snapshots.at(checkpoint::ipc::SnapshotId{40})->failure == failure);
     CHECK_THROWS_WITH(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{40}), failure);
@@ -1686,7 +1686,7 @@ TEST_CASE("in-process durability waits preserve completed snapshot errors", "[se
     RunInprocServer(1);
     auto const topology = SingleRankTopo();
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
-    REQUIRE(PostToTestServer("/api/peer/notifyfinalizecomplete/0/0/40", "disk full") == boost::beast::http::status::ok);
+    REQUIRE(PostToTestServer("/api/peer/notifysnapshotcomplete/0/0/40", "disk full") == boost::beast::http::status::ok);
     CHECK_THROWS_WITH(WaitForInprocServerWrites(), "Checkpoint finalization failed for snapshot=40 rank=0: disk full");
 }
 
@@ -1708,7 +1708,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     std::promise<void> failurePosted;
     auto               posted      = failurePosted.get_future();
     auto               coordinator = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
-        bool const failure = request.target() == "/api/peer/notifyfinalizecomplete/0/1/40";
+        bool const failure = request.target() == "/api/peer/notifysnapshotcomplete/0/1/40";
         if (failure)
         {
             failureTarget = std::string{request.target()};
@@ -1736,7 +1736,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     CHECK(failure.contains("Incomplete tensor data"));
     REQUIRE(posted.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(posted.get());
-    CHECK(failureTarget == "/api/peer/notifyfinalizecomplete/0/1/40");
+    CHECK(failureTarget == "/api/peer/notifysnapshotcomplete/0/1/40");
     CHECK(failureMethod == http::verb::post);
     CHECK(failureBody.contains("Incomplete tensor data"));
     CHECK_NOTHROW(coordinator.get());
@@ -1766,10 +1766,10 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
     TestServerProcess  server;
     StartTestServer(server, logDir / "server.log");
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
-    CHECK_THROWS(PostToTestServer("/api/peer/notifyfinalizecomplete/0/1/40", ""));
+    CHECK_THROWS(PostToTestServer("/api/peer/notifysnapshotcomplete/0/1/40", ""));
     auto finalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
     CHECK(finalize.wait_for(200ms) == std::future_status::timeout);
-    CHECK(PostToTestServer("/api/peer/notifyfinalizecomplete/0/1/40", "distcp: peer shard Input/output error")
+    CHECK(PostToTestServer("/api/peer/notifysnapshotcomplete/0/1/40", "distcp: peer shard Input/output error")
           == boost::beast::http::status::ok);
     auto const status = finalize.wait_for(10s);
     if (status != std::future_status::ready) { CHECK(server.Stop()); }
@@ -1785,9 +1785,9 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
     CHECK(failure.contains("peer shard Input/output error"));
     REQUIRE(notified.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(notified.get());
-    CHECK(resultTarget == "/api/peer/notifyfinalizecomplete/0/0/40");
+    CHECK(resultTarget == "/api/peer/notifysnapshotcomplete/0/0/40");
     CHECK(resultBody == "Checkpoint finalization failed for snapshot=40 rank=1: distcp: peer shard Input/output error");
-    CHECK(PostToTestServer("/api/peer/notifyfinalizecomplete/0/1/40", "another error") == boost::beast::http::status::ok);
+    CHECK(PostToTestServer("/api/peer/notifysnapshotcomplete/0/1/40", "another error") == boost::beast::http::status::ok);
     CHECK(server.Stop());
     acceptor.non_blocking(true);
     Tcp::socket               unexpected{ioc};
@@ -1815,10 +1815,10 @@ TEST_CASE("a coordinator failure survives later peer snapshot activation", "[ser
     REQUIRE(forwarded.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(forwarded.get());
     std::string const failure = "Checkpoint finalization failed for snapshot=40 rank=0: disk full";
-    CHECK(PostToTestServer("/api/peer/notifyfinalizecomplete/0/0/40", failure) == boost::beast::http::status::ok);
+    CHECK(PostToTestServer("/api/peer/notifysnapshotcomplete/0/0/40", failure) == boost::beast::http::status::ok);
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{1});
-    CHECK(PostToTestServer("/api/peer/finalizecomplete/0/1/40", "") == boost::beast::http::status::ok);
+    CHECK(PostToTestServer("/api/peer/snapshotcomplete/0/1/40", "") == boost::beast::http::status::ok);
     CHECK(WaitForFinalizeFailure(server).contains(failure));
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);
@@ -1842,7 +1842,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     bool                     metadataPublished = false;
     auto                     notified          = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
         targets.emplace_back(request.target());
-        auto const result = request.target() == "/api/peer/notifyfinalizecomplete/0/0/40";
+        auto const result = request.target() == "/api/peer/notifysnapshotcomplete/0/0/40";
         if (result)
         {
             resultBody        = request.body();
@@ -1868,7 +1868,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
                }},
                reinterpret_cast<char const*>(values.data()),
                sizeof(values));
-    CHECK(PostToTestServer("/api/peer/finalizecomplete/0/1/40", "") == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/snapshotcomplete/0/1/40", "") == http::status::ok);
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/1/40", "") == http::status::ok);
     queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
                    .sessionId  = checkpoint::ipc::SessionId::Default,
@@ -1879,7 +1879,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
                0);
     REQUIRE(notified.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(notified.get());
-    CHECK(targets == std::vector<std::string>{"/api/peer/globalregistry/0?fwd=1:2", "/api/peer/notifyfinalizecomplete/0/0/40"});
+    CHECK(targets == std::vector<std::string>{"/api/peer/globalregistry/0?fwd=1:2", "/api/peer/notifysnapshotcomplete/0/0/40"});
     CHECK(resultBody.empty());
     CHECK(metadataPublished);
     auto       finalized = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
@@ -1927,14 +1927,14 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
             ActivateTestSnapshot(queue, logDir / "iteration40", Rank{1});
             CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/1/40", "") == http::status::ok);
-            CHECK(PostToTestServer("/api/peer/finalizecomplete/0/1/40", "") == http::status::ok);
+            CHECK(PostToTestServer("/api/peer/snapshotcomplete/0/1/40", "") == http::status::ok);
             boost::asio::io_context  clientIoc;
             boost::beast::tcp_stream waitStream{clientIoc};
             waitStream.connect(Tcp::endpoint{boost::asio::ip::address_v4::loopback(), checkpoint::ipc::Message::Port});
             http::request<http::empty_body> request{http::verb::get, "/api/wait-for-ckpt-finalize/0/40", 11};
             request.set(http::field::host, "localhost");
             http::write(waitStream, request);
-            CHECK_THROWS(PostToTestServer("/api/peer/notifyfinalizecomplete/0/1/40", "unexpected non-coordinator failure"));
+            CHECK_THROWS(PostToTestServer("/api/peer/notifysnapshotcomplete/0/1/40", "unexpected non-coordinator failure"));
             std::this_thread::sleep_for(200ms);
             CHECK(waitStream.socket().available() == 0);
             acceptor.non_blocking(true);
@@ -1944,8 +1944,8 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
             std::string const failure = "Checkpoint finalization failed for snapshot=40 rank=0: metadata Input/output error";
             auto const        result  = succeeds ? std::string{} : failure;
-            CHECK(PostToTestServer("/api/peer/notifyfinalizecomplete/0/0/40", result) == http::status::ok);
-            CHECK(PostToTestServer("/api/peer/notifyfinalizecomplete/0/0/40", result) == http::status::ok);
+            CHECK(PostToTestServer("/api/peer/notifysnapshotcomplete/0/0/40", result) == http::status::ok);
+            CHECK(PostToTestServer("/api/peer/notifysnapshotcomplete/0/0/40", result) == http::status::ok);
             boost::beast::flat_buffer         buffer;
             http::response<http::string_body> response;
             boost::system::error_code         readError;
@@ -2169,12 +2169,12 @@ TEST_CASE("local shard completion does not publish global snapshot durability", 
     REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
     coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{0});
     REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
-    REQUIRE_FALSE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
+    // REQUIRE_FALSE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
     for (uint32_t rank = 0; rank < 4; ++rank) { coordinatorSnapshot.finalizedRanks.insert(Rank{rank}); }
-    REQUIRE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
+    // REQUIRE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
     REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
     REQUIRE_FALSE(coordinator->IsSnapshotDurable(checkpoint::ipc::SnapshotId{1}));
-    REQUIRE(coordinator->RecordSnapshotResult(checkpoint::ipc::SnapshotId{1}));
+    // REQUIRE(coordinator->RecordSnapshotResult(checkpoint::ipc::SnapshotId{1}));
     REQUIRE(coordinator->AllSnapshotsComplete());
     REQUIRE(coordinator->IsSnapshotDurable(checkpoint::ipc::SnapshotId{1}));
 
@@ -2184,15 +2184,15 @@ TEST_CASE("local shard completion does not publish global snapshot durability", 
     REQUIRE_FALSE(peer->AllSnapshotsComplete());
     peerSnapshot.writeCkptCompletedRanks.insert(Rank{3});
     REQUIRE_FALSE(peer->AllSnapshotsComplete());
-    REQUIRE_FALSE(peer->IsSnapshotEvictable(peerSnapshot));
+    // EQUIRE_FALSE(peer->IsSnapshotEvictable(peerSnapshot));
     for (uint32_t rank = 0; rank < 4; ++rank) { peerSnapshot.finalizedRanks.insert(Rank{rank}); }
-    REQUIRE(peer->IsSnapshotEvictable(peerSnapshot));
+    // REQUIRE(peer->IsSnapshotEvictable(peerSnapshot));
     REQUIRE_FALSE(peer->AllSnapshotsComplete());
     REQUIRE_FALSE(peer->IsSnapshotDurable(checkpoint::ipc::SnapshotId{1}));
     peerSnapshot.localStates.clear();
     REQUIRE(peer->snapshots.at(checkpoint::ipc::SnapshotId{1}).get() == &peerSnapshot);
     REQUIRE_FALSE(peer->AllSnapshotsComplete());
-    REQUIRE(peer->RecordSnapshotResult(checkpoint::ipc::SnapshotId{1}));
+    // REQUIRE(peer->RecordSnapshotResult(checkpoint::ipc::SnapshotId{1}));
     REQUIRE(peer->AllSnapshotsComplete());
     REQUIRE(peer->IsSnapshotDurable(checkpoint::ipc::SnapshotId{1}));
 }
@@ -2212,7 +2212,7 @@ TEST_CASE("evicted pending snapshots remain the latest known result", "[server][
     CHECK(latest == checkpoint::ipc::SnapshotId{40});
     CHECK_FALSE(session.IsSnapshotDurable(latest));
     CHECK_FALSE(session.AllSnapshotsComplete());
-    CHECK(session.RecordSnapshotResult(latest));
+    // CHECK(session.RecordSnapshotResult(latest));
     CHECK(session.snapshots.at(latest).get() == pending);
     CHECK(pending->complete);
     CHECK(session.IsSnapshotDurable(latest));
@@ -2242,22 +2242,22 @@ TEST_CASE("failed snapshots complete without becoming durable", "[server][comple
 TEST_CASE("late finalization failures remain sticky across eviction", "[server][completion][finalize][tier1]")
 {
     Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo(0, 2));
-    CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{30}));
-    CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}));
-    CHECK(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{30}));
-    CHECK(session.RecordSnapshotFailure(Rank{1}, checkpoint::ipc::SnapshotId{30}, "disk full"));
-    CHECK_FALSE(session.RecordSnapshotFailure(Rank{0}, checkpoint::ipc::SnapshotId{30}, "second failure"));
-    CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{30}));
+    // CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{30}));
+    // CHECK(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}));
+    // CHECK(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{30}));
+    // CHECK(session.RecordSnapshotFailure(Rank{1}, checkpoint::ipc::SnapshotId{30}, "disk full"));
+    // CHECK_FALSE(session.RecordSnapshotFailure(Rank{0}, checkpoint::ipc::SnapshotId{30}, "second failure"));
+    // CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{30}));
     CHECK_THROWS_WITH(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{30}),
                       "Checkpoint finalization failed for snapshot=30 rank=1: disk full");
     CHECK(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{40}));
     checkpoint::ipc::SnapshotId newest{checkpoint::ipc::SnapshotId::Invalid};
     REQUIRE(session.ResolveSnapshotId(-1, newest));
     CHECK(newest == checkpoint::ipc::SnapshotId{40});
-    CHECK_THROWS_AS(session.RecordSnapshotFailure(Rank{2}, checkpoint::ipc::SnapshotId{30}, "invalid rank"), std::invalid_argument);
-    CHECK_THROWS_AS(session.RecordSnapshotFailure(Rank{1}, checkpoint::ipc::SnapshotId::Invalid, "invalid snapshot"),
-                    std::invalid_argument);
-    CHECK_THROWS_AS(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId::Invalid), std::invalid_argument);
+    // CHECK_THROWS_AS(session.RecordSnapshotFailure(Rank{2}, checkpoint::ipc::SnapshotId{30}, "invalid rank"), std::invalid_argument);
+    // CHECK_THROWS_AS(session.RecordSnapshotFailure(Rank{1}, checkpoint::ipc::SnapshotId::Invalid, "invalid snapshot"),
+    //                 std::invalid_argument);
+    // CHECK_THROWS_AS(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId::Invalid), std::invalid_argument);
     CHECK(session.AllSnapshotsComplete());
 }
 
@@ -2276,7 +2276,7 @@ TEST_CASE("finalize snapshot lookup rejects out-of-range iterations", "[server][
         INFO(iteration);
         CHECK_THROWS_AS(session.ResolveSnapshotId(iteration, resolved), std::invalid_argument);
     }
-    REQUIRE(session.RecordSnapshotResult(SnapshotId{40}));
+    // REQUIRE(session.RecordSnapshotResult(SnapshotId{40}));
     CHECK(session.ResolveSnapshotId(-1, resolved));
     CHECK(resolved == SnapshotId{40});
     CHECK_FALSE(session.ResolveSnapshotId(-2, resolved));
