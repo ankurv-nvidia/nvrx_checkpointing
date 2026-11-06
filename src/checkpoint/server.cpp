@@ -1054,11 +1054,10 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
         if (notifyCoordinator)
         {
-            std::scoped_lock lock(mutex);
             SendToPeerWithRetries(server,
                                   sessionId,
                                   topo.peers[0],
-                                  snapshot.failures.empty() ? "" : fmt::format("{}", fmt::join(snapshot.failures, ", ")),
+                                  {},
                                   fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
                                   {});
         }
@@ -1220,7 +1219,65 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                 snapshot.complete = true;
             }
         }
+    } catch (std::exception const& ex)
+    {
+        std::string failure;
+        {
+            std::scoped_lock lock(mutex);
+            snapshot.failures.emplace_back(
+                fmt::format("snapshot={} rank={} Finalize failed: {}", hdr.snapshotId, hdr.globalRank, ex.what()));
+            failure = fmt::format("{}", fmt::join(snapshot.failures, ", "));
+        }
+        ERR("[{}#{}] Snapshot finalization failed for snapshot={} rank={}: {}",
+            *server,
+            sessionId,
+            hdr.snapshotId,
+            hdr.globalRank,
+            ex.what());
+        if (hdr.globalRank == Rank{0})
+        {
+            BroadcastWriteCkptCompleteToPeers_(snapshot);
+            std::scoped_lock lock(mutex);
+            snapshot.complete = true;
+        }
+        else if (notifyCoordinator && !snapshot.complete)
+        {
+            SendToPeerWithRetries(server,
+                                  sessionId,
+                                  topo.peers[0],
+                                  failure,
+                                  fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
+                                  {});
+            // snapshot.complete = true; we set complete when we hear back from the coordinator
+        }
+    }
 
+    std::string failure;
+    {
+        std::scoped_lock lock(mutex);
+        if (!snapshot.failures.empty()) { failure = snapshot.failures.front(); }
+    }
+    INFO("[{}#{}] OnFinalizeSnapshotAsync_ for rank={}, snapshotId={} failure={}",
+         *server,
+         sessionId,
+         hdr.globalRank,
+         hdr.snapshotId,
+         failure.empty() ? "<none>" : failure);
+    auto const totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(PerfClock::now().time_since_epoch() - startedAt);
+    PERF() << tel::span::SvrFinalize::End{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
+    PERF() << tel::span::CkptSave::End{
+        .id                = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
+        .d2hDuration       = std::chrono::duration_cast<std::chrono::microseconds>(hdr.d2hDuration),
+        .snapshotDuration  = std::chrono::duration_cast<std::chrono::microseconds>(hdr.snapshotDuration),
+        .totalDuration     = totalDuration,
+        .numTensors        = numTensors,
+        .d2hRequestCount   = hdr.d2hRequests,
+        .totalTensorBytes  = totalTensorStateSizeInBytes,
+        .totalWrittenBytes = hdr.totalSnapshotBytes,
+    };
+
+    try
+    {
         // Completed local writes release tensor buffers while retaining their finalization state.
         if (hdr.globalRank == Rank{0} || !onCoordinatorPeer)
         {
@@ -1261,35 +1318,8 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
     } catch (std::exception const& ex)
     {
-        snapshot.failures.emplace_back(ex.what());
-        ERR("[{}#{}] Snapshot finalization failed for snapshot={} rank={}: {}",
-            *server,
-            sessionId,
-            hdr.snapshotId,
-            hdr.globalRank,
-            ex.what());
-        BroadcastWriteCkptCompleteToPeers_(snapshot);
+        ERR("[{}#{}] Exception occurred while releasing snapshot buffers: {}", *server, sessionId, ex.what());
     }
-
-    snapshot.complete = true;
-    INFO("[{}#{}] OnFinalizeSnapshotAsync_ for rank={}, snapshotId={} failure={}",
-         *server,
-         sessionId,
-         hdr.globalRank,
-         hdr.snapshotId,
-         snapshot.failures.empty() ? "<none>" : snapshot.failures.front());
-    auto const totalDuration = std::chrono::duration_cast<std::chrono::microseconds>(PerfClock::now().time_since_epoch() - startedAt);
-    PERF() << tel::span::SvrFinalize::End{.id = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
-    PERF() << tel::span::CkptSave::End{
-        .id                = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
-        .d2hDuration       = std::chrono::duration_cast<std::chrono::microseconds>(hdr.d2hDuration),
-        .snapshotDuration  = std::chrono::duration_cast<std::chrono::microseconds>(hdr.snapshotDuration),
-        .totalDuration     = totalDuration,
-        .numTensors        = numTensors,
-        .d2hRequestCount   = hdr.d2hRequests,
-        .totalTensorBytes  = totalTensorStateSizeInBytes,
-        .totalWrittenBytes = hdr.totalSnapshotBytes,
-    };
 }
 
 void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)

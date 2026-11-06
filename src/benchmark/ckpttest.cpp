@@ -1658,9 +1658,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     std::string        failureBody;
     http::verb         failureMethod{};
     auto               coordinator = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
-        bool const failure
-            = !request.body().empty()
-              && (request.target() == "/api/peer/snapshotcomplete/0/1/40" || request.target() == "/api/peer/writeckptcomplete/0/1/40");
+        bool const failure = !request.body().empty() && request.target() == "/api/peer/writeckptcomplete/0/1/40";
         if (failure)
         {
             failureTarget = std::string{request.target()};
@@ -1687,7 +1685,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     REQUIRE(coordinatorStatus == std::future_status::ready);
     CHECK_NOTHROW(coordinator.get());
     CHECK(finalize.wait_for(3s) == std::future_status::timeout);
-    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40", fmt::format("rank=1 Finalize failed: {}", failureBody))
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40", fmt::format("rank=1 WriteCkpt failed: {}", failureBody))
           == http::status::ok);
     auto const status = finalize.wait_for(10s);
     if (status != std::future_status::ready) { CHECK(server.Stop()); }
@@ -1700,7 +1698,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     CHECK(failure.contains("snapshot=40"));
     CHECK(failure.contains("rank=1"));
     CHECK(failure.contains("Incomplete tensor data"));
-    CHECK((failureTarget == "/api/peer/snapshotcomplete/0/1/40" || failureTarget == "/api/peer/writeckptcomplete/0/1/40"));
+    CHECK(failureTarget == "/api/peer/writeckptcomplete/0/1/40");
     CHECK(failureMethod == http::verb::post);
     CHECK(failureBody.contains("Incomplete tensor data"));
     CHECK_FALSE(std::filesystem::exists(logDir / "iteration40" / ".metadata"));
@@ -1868,6 +1866,10 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     RankTopology const topology{.rank = Rank{0}, .worldSize = Rank{4}, .ranksPerPeer = 2, .peersPerNode = 1, .peers = {"localhost", peer}};
     std::vector<std::string> targets;
     std::string              resultBody;
+    std::promise<void>       resultReceived;
+    auto                     received = resultReceived.get_future();
+    std::promise<void>       releaseAcknowledgment;
+    auto                     acknowledgment    = releaseAcknowledgment.get_future();
     bool                     metadataPublished = false;
     auto                     notified          = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
         targets.emplace_back(request.target());
@@ -1878,6 +1880,8 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
             metadataPublished = std::filesystem::exists(checkpointDir / ".metadata")
                                 && std::filesystem::file_size(checkpointDir / ".metadata") > 0
                                 && std::filesystem::file_size(checkpointDir / "__0_0.distcp") > 0;
+            resultReceived.set_value();
+            CHECK(acknowledgment.wait_for(20s) == std::future_status::ready);
         }
         return std::pair{std::string{}, result};
     });
@@ -1944,6 +1948,9 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     REQUIRE(activated);
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/2/40", "") == http::status::ok);
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/3/40", "") == http::status::ok);
+    CHECK(received.wait_for(10s) == std::future_status::ready);
+    CHECK(waiting.wait_for(3s) == std::future_status::timeout);
+    releaseAcknowledgment.set_value();
     REQUIRE(notified.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(notified.get());
     CHECK(targets == std::vector<std::string>{"/api/peer/globalregistry/0?fwd=1:2", "/api/peer/writeckptcomplete/0/0/40?fwd=1:2"});
@@ -2062,12 +2069,11 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             {
                 auto const bytes = ReadWholeFile(logDir / "server.log");
                 firstLog.assign(bytes.data(), bytes.size());
-                firstFinalized = firstLog.contains("OnFinalizeSnapshotAsync_ for rank=2, snapshotId=40");
+                firstFinalized = firstLog.contains("Released 0 snapshot buffers after finalizing snapshot=40 rank=2.");
                 if (firstFinalized) { break; }
                 std::this_thread::sleep_for(50ms);
             }
             REQUIRE(firstFinalized);
-            REQUIRE(firstLog.contains("Released 0 snapshot buffers after finalizing snapshot=40 rank=2."));
             CHECK_FALSE(std::filesystem::exists(checkpointDir / "__3_0.distcp"));
             queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
                            .sessionId  = checkpoint::ipc::SessionId::Default,
@@ -2317,11 +2323,11 @@ TEST_CASE("evicted pending snapshots remain the latest known result", "[server][
     checkpoint::ipc::SnapshotId latest{checkpoint::ipc::SnapshotId::Invalid};
     REQUIRE(session.ResolveSnapshotId(-1, latest));
     CHECK(latest == checkpoint::ipc::SnapshotId{40});
-    CHECK_FALSE(session.IsSnapshotComplete(latest));
+    CHECK_FALSE(session.snapshots.at(latest)->complete);
     CHECK_FALSE(session.AllSnapshotsComplete());
     pending->complete = true;
     CHECK(session.snapshots.at(latest).get() == pending);
-    CHECK(session.IsSnapshotComplete(latest));
+    CHECK(session.snapshots.at(latest)->complete);
     CHECK(session.AllSnapshotsComplete());
 }
 
