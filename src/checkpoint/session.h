@@ -62,6 +62,8 @@ struct Session
 
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
+        bool                                      complete{false};
+        std::vector<std::string>                  failures;    // complete && failure.empty() implies success
     };
 
     Server* const                         server;
@@ -82,8 +84,6 @@ struct Session
     checkpoint::distcp::BlobMetadataByFqn blobMetas;
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
-
-    checkpoint::ipc::SnapshotId highestEvictedDurableSnapshot{checkpoint::ipc::SnapshotId::Invalid};
 
     std::vector<std::future<void>> asyncTasks;
 
@@ -108,23 +108,14 @@ struct Session
 
     size_t ExpectedWriteCompletions() const
     { return IsCoordinatorPeer() ? static_cast<size_t>(topo.worldSize) : static_cast<size_t>(topo.ranksPerPeer); }
-    bool IsSnapshotEvictable(Snapshot const& snapshot) const
-    {
-        return snapshot.writeCkptCompletedRanks.size() >= ExpectedWriteCompletions()
-               && snapshot.finalizedRanks.size() >= ExpectedWriteCompletions();
-    }
     bool AllSnapshotsComplete() const
     {
         std::scoped_lock lock(mutex);
-        return std::ranges::all_of(snapshots, [&](auto const& snapshot) { return IsSnapshotEvictable(*snapshot.second); });
+        return std::ranges::all_of(snapshots, [&](auto const& entry) { return entry.second->complete; });
     }
 
-    // Map a wait-for-finalize iteration to a concrete snapshotId. A non-negative iteration is the
-    // snapshotId directly. A negative iteration is an index from the newest known snapshot
-    // (-1 = latest, -2 = second-latest, ...), resolved against the ordered `snapshots` map (or the
-    // evicted-durable highwater when nothing is resident). Returns false if not yet resolvable.
+    // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
-    bool IsSnapshotDurable(checkpoint::ipc::SnapshotId snapshotId) const;
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank) LFTBND;
@@ -136,20 +127,16 @@ struct Session
 #endif
 
     void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
-    void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);
+    void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
     void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
-    void SendToPeerWithRetries_(std::string_view const& peer,
-                                std::string_view const& body,
-                                std::string_view const& target,
-                                std::string_view const& contentEncoding) const;
-
-    void SendPeerFinalizeSnapshotComplete_(std::string_view const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
-    void SendPeerWriteCkptComplete_(std::string_view const& peer, checkpoint::ipc::Message::FinalizeSnapshot const& msg) const;
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
+    void BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const;
+
+    friend struct Server;
 };

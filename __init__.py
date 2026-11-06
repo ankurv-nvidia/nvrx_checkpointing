@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import hashlib
 import os
 import shutil
@@ -141,3 +142,7 @@ if not SERVER_PATH.is_file():
     raise RuntimeError(
         "[nvrx_checkpointing] checkpoint_server was not built successfully.",
     )
+
+from . import ckpt_diag  # noqa: E402
+
+ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH)

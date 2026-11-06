@@ -159,7 +159,7 @@
       "gpus": "1x4",
       "jet": {
         "compute_capability": "10.3",
-        "max_nodes": 18,
+        "max_nodes": 64,
         "max_timeout_minutes": 240,
         "distributed_timeout_minutes": 60,
         "distributed_timeout_min_nodes": 16,
@@ -167,6 +167,23 @@
       },
       "jobs": [],
       "multinode": [
+        {
+          "config": "ultra4",
+          "nodes": 64,
+          "pipeline_suite": "large-scale",
+          "checkpoint_interval": 20,
+          "timeout": "1d",
+          "jobs": [
+            [
+              "native",
+              "perf"
+            ],
+            [
+              "native",
+              "detr"
+            ]
+          ]
+        },
         {
           "config": "nano4",
           "nodes": 32,

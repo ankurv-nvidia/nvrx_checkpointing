@@ -12,6 +12,30 @@ on:
         description: gb300-native-perf-nano4-8x4 (default)
         type: boolean
         default: false
+      gb300-native-perf-ultra4-64x4:
+        description: gb300-native-perf-ultra4-64x4 (large-scale)
+        type: boolean
+        default: false
+      gb300-native-detr-ultra4-64x4:
+        description: gb300-native-detr-ultra4-64x4 (large-scale)
+        type: boolean
+        default: false
+      gb300-native-detr-nano4-32x4:
+        description: gb300-native-detr-nano4-32x4 (large-scale)
+        type: boolean
+        default: false
+      gb300-native-perf-nano4-32x4:
+        description: gb300-native-perf-nano4-32x4 (large-scale)
+        type: boolean
+        default: false
+      gb300-nvrx-detr-nano4-32x4:
+        description: gb300-nvrx-detr-nano4-32x4 (nvrx)
+        type: boolean
+        default: false
+      gb300-nvrx-perf-nano4-32x4:
+        description: gb300-nvrx-perf-nano4-32x4 (nvrx)
+        type: boolean
+        default: false
       gb300-nvrx-detr-nano4-8x4:
         description: gb300-nvrx-detr-nano4-8x4 (nvrx)
         type: boolean

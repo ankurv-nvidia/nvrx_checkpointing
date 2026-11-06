@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -336,10 +337,34 @@ def _timestamp() -> str:
 
 
 def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
-    """Publish ``iteration`` as the latest completed checkpoint."""
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        with maybe_msc.open(get_checkpoint_tracker_filename(args.save), "w") as f:
-            f.write(str(iteration))
+    """Publish the completed checkpoint and schedule eligible previous-checkpoint deletion."""
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    tracker = get_checkpoint_tracker_filename(args.save)
+    retain_interval = getattr(args, "save_retain_interval", None)
+    previous_iteration = 0
+    if retain_interval is not None:
+        try:
+            with maybe_msc.open(tracker, "r") as tracker_file:
+                previous_iteration = int(tracker_file.read().strip())
+        except FileNotFoundError:
+            pass
+    with maybe_msc.open(tracker, "w") as tracker_file:
+        tracker_file.write(str(iteration))
+    if retain_interval is None or not 0 < previous_iteration < iteration or previous_iteration % retain_interval == 0:
+        return
+    previous_checkpoint = Path(get_checkpoint_name(args.save, iteration=previous_iteration, return_base_dir=True))
+    if previous_checkpoint.is_symlink():
+        print_rank_0(
+            f"  skipping deleting checkpoint from iteration {previous_iteration:7d} at {args.save} since it is a symbolic link",
+        )
+        return
+    threading.Thread(
+        target=checkpointing_module._async_delete_checkpoint_impl,  # noqa: SLF001
+        args=(args.save, previous_iteration, getattr(args, "log_progress", False)),
+        name="native-ckpt-retention",
+        daemon=False,
+    ).start()
 
 
 def _save_dataloader_state(save_args: SaveCheckpointArgs, args: object) -> None:
@@ -380,9 +405,9 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
     The load path or first save creates the process-global state tree. Every save
     rescans the complete dictionary and refreshes the registered values and tensor pointers.
 
-    Dataloader state is written as Megatron's per-iteration sidecar file. Logging
-    hooks, fault tolerance, retention cleanup, and ModelOpt state are outside this
-    provider's state contract.
+    Dataloader state is written as Megatron's per-iteration sidecar file. Retention
+    follows publication of the durable checkpoint. Logging hooks, fault tolerance,
+    and ModelOpt state are outside this provider's state contract.
     """
     global _pending  # noqa: PLW0603
     iteration = save_args.iteration

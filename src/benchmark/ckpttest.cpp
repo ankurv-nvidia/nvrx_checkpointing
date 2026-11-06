@@ -19,17 +19,20 @@
 #include "tensor.h"
 
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/iostreams/close.hpp>
 #include <boost/iostreams/device/back_inserter.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
+#include <boost/iostreams/filter/zlib.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 
 #include <fmt/format.h>
 
 #include <catch2/catch_session.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 
 #include <opentelemetry/proto/collector/logs/v1/logs_service.pb.h>
 #include <opentelemetry/proto/collector/metrics/v1/metrics_service.pb.h>
@@ -37,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -92,7 +97,7 @@ class TestServerProcess
     }
     CLASS_DELETE_COPY_AND_MOVE(TestServerProcess);
 
-    void Start()
+    void Start(std::filesystem::path const& stderrLog = {})
     {
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
         if (TryConnectToCheckpointService())
@@ -113,6 +118,17 @@ class TestServerProcess
         if (_pid < 0) { throw std::runtime_error("failed to fork checkpoint test server"); }
         if (_pid == 0)
         {
+            if (!stderrLog.empty())
+            {
+                int const descriptor = ::open(stderrLog.c_str(), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+                if (descriptor < 0) { ::_exit(EXIT_FAILURE); }
+                if (::dup2(descriptor, STDERR_FILENO) < 0)
+                {
+                    ::close(descriptor);
+                    ::_exit(EXIT_FAILURE);
+                }
+                if (descriptor != STDERR_FILENO) { ::close(descriptor); }
+            }
             auto                 executableString = executable.string();
             auto                 serverArg        = std::string{ShmTestServerArg};
             std::array<char*, 3> args{executableString.data(), serverArg.data(), nullptr};
@@ -134,6 +150,11 @@ class TestServerProcess
     bool Stop()
     {
         SvcStop();
+        return WaitForExit();
+    }
+
+    bool WaitForExit()
+    {
         static constexpr size_t MaxAttempts = 50;
         using namespace std::chrono_literals;
         int status = 0;
@@ -1021,7 +1042,7 @@ TEST_CASE("shared memory queues retain large transfer slots as their budgets gro
     CHECK(Queue::SlotCountForShmSize(headerSize + (128 * GiB), Queue::DefaultSlotCount, 1) == 32);
 }
 
-static boost::beast::http::status PostToTestServer(std::string const& target, std::string body)
+static boost::beast::http::status PostToTestServer(std::string const& target, std::string body, std::string_view encoding = {})
 {
     boost::asio::io_context        ioc;
     boost::beast::tcp_stream       stream(ioc);
@@ -1031,6 +1052,7 @@ static boost::beast::http::status PostToTestServer(std::string const& target, st
 
     boost::beast::http::request<boost::beast::http::string_body> request{boost::beast::http::verb::post, target, 11};
     request.set(boost::beast::http::field::host, "localhost");
+    if (!encoding.empty()) { request.set(boost::beast::http::field::content_encoding, encoding); }
     request.body() = std::move(body);
     request.prepare_payload();
     boost::beast::http::write(stream, request);
@@ -1042,11 +1064,212 @@ static boost::beast::http::status PostToTestServer(std::string const& target, st
 }
 
 // The forked server inherits the log location, which also places its registry dumps.
-static void StartTestServer(TestServerProcess& server, std::filesystem::path const& serverLog)
+static void StartTestServer(TestServerProcess& server, std::filesystem::path const& serverLog, bool captureStderr = false)
 {
     ::setenv("NATIVE_CKPT_SERVER_LOG", serverLog.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
-    REQUIRE_NOTHROW(server.Start());
+    REQUIRE_NOTHROW(server.Start(captureStderr ? serverLog : std::filesystem::path{}));
     ::unsetenv("NATIVE_CKPT_SERVER_LOG");    // NOLINT(concurrency-mt-unsafe)
+}
+
+static void CheckDuplicateRegistryWarning(std::filesystem::path const& serverLog, uint32_t rank)
+{
+    std::ifstream log(serverLog);
+    REQUIRE(log.good());
+    size_t      warnings = 0;
+    std::string line;
+    while (std::getline(log, line))
+    {
+        if (!line.contains("duplicate local state registry")) { continue; }
+        ++warnings;
+        CHECK(line.contains("[WARN]"));
+        CHECK(line.contains(fmt::format("#{}]", checkpoint::ipc::SessionId::Default)));
+        CHECK(line.contains(fmt::format("rank={}", rank)));
+        CHECK(line.contains("unknown reason"));
+        CHECK(line.contains("ignoring it"));
+    }
+    CHECK(warnings == 1);
+}
+
+static std::string
+FinalizeResultForResponse(boost::beast::http::status status, std::string const& body = {}, bool complete = true, int64_t iteration = 40)
+{
+    using boost::asio::ip::tcp;
+    boost::asio::io_context ioc;
+    tcp::acceptor           acceptor(ioc);
+    acceptor.open(tcp::v4());
+    acceptor.set_option(tcp::acceptor::reuse_address(true));
+    acceptor.bind({tcp::v4(), checkpoint::ipc::Message::Port});
+    acceptor.listen();
+    auto server = std::async(std::launch::async, [&] {
+        boost::beast::tcp_stream                                    stream(acceptor.accept());
+        boost::beast::flat_buffer                                   buffer;
+        boost::beast::http::request<boost::beast::http::empty_body> request;
+        boost::beast::http::read(stream, buffer, request);
+
+        boost::beast::http::response<boost::beast::http::empty_body> response{status, 11};
+        response.set(boost::beast::http::field::content_type, "text/plain");
+        response.content_length(body.size() + static_cast<size_t>(!complete));
+        boost::beast::http::response_serializer<boost::beast::http::empty_body> serializer(response);
+        boost::beast::http::write_header(stream, serializer);
+        for (size_t offset = 0; offset < body.size(); offset += 7)
+        {
+            auto const part = std::string_view{body}.substr(offset, 7);
+            boost::asio::write(stream.socket(), boost::asio::buffer(part));
+        }
+        return std::string{request.target()};
+    });
+
+    std::string failure;
+    try
+    {
+        WaitForCkptFinalize(0, iteration);
+    } catch (std::runtime_error const& error) { failure = error.what(); }
+    CHECK(server.get() == fmt::format("/api/wait-for-ckpt-finalize/0/{}", iteration));
+    return failure;
+}
+
+TEST_CASE("finalize uses the completed HTTP status and error body", "[server][finalize][tier1]")
+{
+    namespace http = boost::beast::http;
+    if (TryConnectToCheckpointService())
+    {
+        SvcStop();
+        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(); ++attempt)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+        REQUIRE_FALSE(TryConnectToCheckpointService());
+    }
+    CHECK(FinalizeResultForResponse(http::status::ok).empty());
+    CHECK(FinalizeResultForResponse(http::status::ok, "checkpoint is durable").empty());
+    CHECK(FinalizeResultForResponse(http::status::ok, {}, true, -1).empty());
+
+    std::vector<std::string> const failures{
+        "snapshot=40 rank=0: shard Input/output error",
+        "wait-for-ckpt-finalize timed out for iteration=40",
+        "wait-for-ckpt-finalize aborted during server shutdown",
+    };
+    for (auto const& body : failures)
+    {
+        INFO(body);
+        auto const failure = FinalizeResultForResponse(http::status::internal_server_error, body);
+        CHECK(failure.contains("HTTP 500"));
+        CHECK(failure.contains(body));
+    }
+    CHECK_FALSE(FinalizeResultForResponse(http::status::accepted).empty());
+    CHECK_FALSE(FinalizeResultForResponse(http::status::not_found, "unknown endpoint").empty());
+    CHECK_FALSE(FinalizeResultForResponse(http::status::ok, "checkpoint is durable", false).empty());
+    CHECK_FALSE(FinalizeResultForResponse(http::status::ok, {}, false).empty());
+}
+
+TEST_CASE("a shard write failure reaches the finalize caller", "[server][finalize][tier2]")
+{
+    auto const logDir  = CkptDir("finalize_shard_write_failure");
+    auto const goodDir = logDir / "iteration30";
+    auto const badDir  = logDir / "iteration40";
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(goodDir);
+    std::filesystem::create_directories(badDir);
+    std::filesystem::create_symlink("/dev/full", badDir / "__0_0.distcp");
+
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log", true);
+    std::array<float, 4> values{1.0f, 2.0f, 3.0f, 4.0f};
+    StateTree            tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
+    Tensor               tensor;
+    tensor.durableDtype  = Tensor::DType::Float32;
+    tensor.snapshotDtype = Tensor::DType::Float32;
+    tensor.handle        = reinterpret_cast<uint64_t>(values.data());
+    tensor.storageSize   = sizeof(values);
+    tensor.fulldim.push_back(values.size());
+    tensor.device                                         = DeviceId{"cpu"};
+    tree.AddChild(StateNode::Handle::Root, "weight").data = tensor;
+    FinalizeStateRegistry(tree);
+
+    SaveCheckpoint(tree, checkpoint::ipc::SnapshotId{30}, goodDir);
+    auto       goodFinalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 30); });
+    auto const goodStatus   = goodFinalize.wait_for(std::chrono::seconds{10});
+    if (goodStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(goodStatus == std::future_status::ready);
+    REQUIRE_NOTHROW(goodFinalize.get());
+    REQUIRE(std::filesystem::file_size(goodDir / "__0_0.distcp") > 0);
+    REQUIRE(std::filesystem::exists(goodDir / ".metadata"));
+
+    auto const nextDir = logDir / "iteration35";
+    std::filesystem::create_directories(nextDir);
+    SaveCheckpoint(tree, checkpoint::ipc::SnapshotId{35}, nextDir);
+    auto       nextFinalize = std::async(std::launch::async, [] {
+        WaitForCkptFinalize(0, 35);
+        WaitForCkptFinalize(0, 30);
+        WaitForCkptFinalize(0, -1);
+    });
+    auto const nextStatus   = nextFinalize.wait_for(std::chrono::seconds{10});
+    if (nextStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(nextStatus == std::future_status::ready);
+    REQUIRE_NOTHROW(nextFinalize.get());
+    REQUIRE(std::filesystem::exists(nextDir / ".metadata"));
+    auto waitForLog = [&](std::string_view marker) {
+        for (size_t attempt = 0; attempt < 100; ++attempt)
+        {
+            auto const contents = ReadWholeFile(logDir / "server.log");
+            if (std::string_view{contents.data(), contents.size()}.contains(marker)) { return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+        return false;
+    };
+    REQUIRE(waitForLog("Released 1 snapshot buffers after finalizing snapshot=35 rank=0."));
+    std::stringstream reactivation;
+    serdes::WriteBlobWithSize<uint16_t>(reactivation, goodDir.string());
+    serdes::WriteTrivial(reactivation, uint32_t{0});
+    serdes::WriteTrivial(reactivation, uint32_t{0});
+    auto const payload = reactivation.str();
+    auto       queue   = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+    queue.Push({checkpoint::ipc::Message::ActivateSnapshot{
+                   .sessionId    = checkpoint::ipc::SessionId::Default,
+                   .snapshotId   = checkpoint::ipc::SnapshotId{30},
+                   .globalRank   = Rank{0},
+                   .snapshotSize = sizeof(values),
+                   .messageSize  = static_cast<uint32_t>(payload.size()),
+               }},
+               payload.data(),
+               payload.size());
+    REQUIRE(waitForLog("Snapshot=30 for global rank=0 is already activated or finalized"));
+
+    static constexpr auto WrappedIteration = (int64_t{1} << 32u) + 30;
+    auto                  invalidFinalize  = std::async(std::launch::async, [] { WaitForCkptFinalize(0, WrappedIteration); });
+    auto const            invalidStatus    = invalidFinalize.wait_for(std::chrono::seconds{10});
+    if (invalidStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(invalidStatus == std::future_status::ready);
+    std::string invalidFailure;
+    try
+    {
+        invalidFinalize.get();
+    } catch (std::runtime_error const& error) { invalidFailure = error.what(); }
+    CHECK(invalidFailure.contains("HTTP 500"));
+    CHECK(invalidFailure.contains(std::to_string(WrappedIteration)));
+
+    SaveCheckpoint(tree, checkpoint::ipc::SnapshotId{40}, badDir);
+    auto       badFinalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
+    auto const badStatus   = badFinalize.wait_for(std::chrono::seconds{10});
+    if (badStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(badStatus == std::future_status::ready);
+    std::string failure;
+    try
+    {
+        badFinalize.get();
+    } catch (std::runtime_error const& error) { failure = error.what(); }
+    CHECK(failure.contains("snapshot=40"));
+    CHECK(failure.contains("distcp:"));
+    CHECK(failure.contains("__0_0.distcp"));
+    CHECK_FALSE(std::filesystem::exists(badDir / ".metadata"));
+    CHECK(std::filesystem::exists(goodDir / ".metadata"));
+    auto       spinDown   = std::async(std::launch::async, &SvcSpinDown);
+    auto const stopStatus = spinDown.wait_for(std::chrono::seconds{10});
+    if (stopStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(stopStatus == std::future_status::ready);
+    CHECK_NOTHROW(spinDown.get());
+    CHECK(server.WaitForExit());
+    std::filesystem::remove_all(logDir);
 }
 
 TEST_CASE("registry replies wait for every local registry and fit queues to the largest", "[shmem][tier2]")
@@ -1084,7 +1307,7 @@ TEST_CASE("registry replies wait for every local registry and fit queues to the 
     };
 
     TestServerProcess server;
-    StartTestServer(server, logDir / "server.log");
+    StartTestServer(server, logDir / "server.log", true);
     std::stringstream activation;
     serdes::WriteBlobWithSize<uint16_t>(activation, "");
     StateSerDes::WriteTopology(activation, SingleRankTopo(0, RanksPerPeer));
@@ -1093,14 +1316,18 @@ TEST_CASE("registry replies wait for every local registry and fit queues to the 
 
     auto smaller = std::async(std::launch::async, uploadRegistry, 0);
     CHECK(smaller.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
+    auto duplicate = std::async(std::launch::async, uploadRegistry, 0);
+    CHECK(duplicate.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
     CHECK(uploadRegistry(1) == boost::beast::http::status::accepted);
     CHECK(smaller.get() == boost::beast::http::status::accepted);
+    CHECK(duplicate.get() == boost::beast::http::status::accepted);
     for (uint8_t queueIndex = 0; queueIndex < RanksPerPeer; ++queueIndex)
     {
         auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, queueIndex));
         CHECK(queue.SlotSize() * queue.SlotCount() >= snapshotSizes[1]);
     }
     CHECK(server.Stop());
+    CheckDuplicateRegistryWarning(logDir / "server.log", 0);
     std::filesystem::remove_all(logDir);
 }
 
@@ -1149,6 +1376,176 @@ static std::string SerializedSliceFragment(uint32_t rank, uint32_t worldSize)
     return body.str();
 }
 
+TEST_CASE("duplicate registries preserve the first upload during forwarding", "[server][registry][tier2]")
+{
+    using namespace std::chrono_literals;
+    namespace http = boost::beast::http;
+    using Tcp      = boost::asio::ip::tcp;
+
+    size_t        minimumSendBuffer{};
+    size_t        defaultSendBuffer{};
+    size_t        maximumSendBuffer{};
+    std::ifstream limits("/proc/sys/net/ipv4/tcp_wmem");
+    if (!(limits >> minimumSendBuffer >> defaultSendBuffer >> maximumSendBuffer)) { SKIP("TCP send-buffer limits are unavailable"); }
+    static constexpr size_t MiB = 1ull << 20u;
+    if (maximumSendBuffer > 64 * MiB) { SKIP("TCP send-buffer limit exceeds the bounded registry fixture budget"); }
+
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc};
+    acceptor.open(Tcp::v4());
+    acceptor.set_option(boost::asio::socket_base::receive_buffer_size{64 * 1024});
+    acceptor.bind({boost::asio::ip::address_v4::loopback(), 0});
+    acceptor.listen();
+    boost::asio::socket_base::receive_buffer_size receiveBuffer;
+    acceptor.get_option(receiveBuffer);
+    auto const         peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    RankTopology const topology{.rank = Rank{1}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {peer, "localhost"}};
+
+    static constexpr std::string_view TensorName = "weight";
+    static constexpr std::string_view BlobName   = "metadata";
+    auto const streamBudget = std::max(4 * MiB, (2 * maximumSendBuffer) + (4 * static_cast<size_t>(receiveBuffer.value())));
+    auto const recordSize
+        = sizeof(uint8_t) + sizeof(Tensor::DType) + sizeof(Tensor::Dim) + sizeof(TensorShard) + sizeof(uint32_t) + TensorName.size();
+    auto const shardCount   = (streamBudget / recordSize) + 1;
+    auto       makeRegistry = [&](size_t blobSize) {
+        StateTree   tree(checkpoint::ipc::SessionId::Default, topology);
+        Tensor::Dim fulldim;
+        fulldim.push_back(shardCount);
+        DTensor tensor(Tensor::DType::Float32, fulldim);
+        for (size_t index = 0; index < shardCount; ++index)
+        {
+            Tensor::DimRange sharddim;
+            sharddim.push_back({.begin = index, .end = index + 1});
+            tensor.AddShard({.rank          = Rank{1},
+                             .snapshotDtype = Tensor::DType::Float32,
+                             .handle        = index * sizeof(float),
+                             .storageSize   = sizeof(float),
+                             .sharddim      = sharddim,
+                             .device        = DeviceId{"cpu"}});
+        }
+        std::stringstream fragment;
+        for (auto const& shard : tensor.shards)
+        {
+            serdes::WriteTrivial(fragment, uint8_t{0});
+            serdes::WriteTrivial(fragment, tensor.durableDtype);
+            serdes::WriteTrivial(fragment, tensor.fulldim);
+            serdes::WriteTrivial(fragment, shard);
+            serdes::WriteBlobWithSize<uint32_t>(fragment, TensorName);
+        }
+        serdes::WriteTrivial(fragment, uint8_t{1});
+        serdes::WriteTrivial(fragment, static_cast<uint64_t>(blobSize));
+        serdes::WriteBlobWithSize<uint32_t>(fragment, BlobName);
+
+        tree.AddChild(StateNode::Handle::Root, TensorName).data = std::move(tensor);
+        tree.AddChild(StateNode::Handle::Root, BlobName).data   = StateNode::Blob(blobSize, char{});
+        tree.FinalizeRegistry();
+        std::stringstream registry;
+        StateSerDes::Write(registry, tree, StateNode::Handle::Root);
+        return std::make_pair(registry.str(), fragment.str());
+    };
+
+    // The stream exceeds the sender and receiver TCP buffer limits.
+    auto const original    = makeRegistry(17);
+    auto const replacement = makeRegistry(23);
+    REQUIRE(original.second.size() > streamBudget);
+    auto const logDir = CkptDir("registry_forwarding_generation");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    TestServerProcess server;
+    StartTestServer(server, logDir / "server.log", true);
+    std::stringstream activation;
+    serdes::WriteBlobWithSize<uint16_t>(activation, "");
+    StateSerDes::WriteTopology(activation, topology);
+    REQUIRE(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
+            == http::status::accepted);
+
+    std::promise<void>       bodyStarted;
+    auto                     firstBody = bodyStarted.get_future();
+    std::future<std::string> received;
+    struct ReadingGate
+    {
+        std::promise<void> released;
+        bool               open{false};
+        ~ReadingGate() { Open(); }
+        void Open()
+        {
+            if (!open)
+            {
+                released.set_value();
+                open = true;
+            }
+        }
+    } gate;
+    auto resume       = gate.released.get_future().share();
+    received          = std::async(std::launch::async, [&, resume] {
+        auto run = [&](auto start) {
+            boost::system::error_code error;
+            start([&](boost::system::error_code ec, auto...) { error = ec; });
+            ioc.run();
+            ioc.restart();
+            if (error) { throw boost::system::system_error(error); }
+        };
+        bool started = false;
+        try
+        {
+            boost::beast::tcp_stream  stream{ioc};
+            boost::asio::steady_timer deadline{ioc, 30s};
+            deadline.async_wait([&](boost::system::error_code ec) {
+                if (!ec) { acceptor.cancel(); }
+            });
+            run([&](auto done) {
+                acceptor.async_accept(stream.socket(), [&, done](boost::system::error_code ec) {
+                    deadline.cancel();
+                    done(ec);
+                });
+            });
+            boost::beast::flat_buffer               buffer;
+            http::request_parser<http::string_body> parser;
+            parser.body_limit(512 * MiB);
+            stream.expires_after(30s);
+            run([&](auto done) { http::async_read_header(stream, buffer, parser, done); });
+            while (parser.get().body().empty())
+            {
+                stream.expires_after(30s);
+                run([&](auto done) { http::async_read_some(stream, buffer, parser, done); });
+            }
+            bodyStarted.set_value();
+            started = true;
+            if (resume.wait_for(30s) != std::future_status::ready) { throw std::runtime_error("registry read was not released"); }
+            stream.socket().set_option(boost::asio::socket_base::receive_buffer_size{static_cast<int>(MiB)});
+            stream.expires_after(30s);
+            run([&](auto done) { http::async_read(stream, buffer, parser, done); });
+            http::response<http::empty_body> response{http::status::ok, parser.get().version()};
+            response.prepare_payload();
+            stream.expires_after(30s);
+            run([&](auto done) { http::async_write(stream, response, done); });
+            return std::move(parser.get().body());
+        } catch (...)
+        {
+            if (!started) { bodyStarted.set_exception(std::current_exception()); }
+            throw;
+        }
+    });
+    auto const target = fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default);
+    REQUIRE(PostToTestServer(target, original.first) == http::status::accepted);
+    REQUIRE(firstBody.wait_for(30s) == std::future_status::ready);
+    firstBody.get();
+    CHECK(PostToTestServer(target, replacement.first) == http::status::accepted);
+    gate.Open();
+    auto const body = received.get();
+    CHECK(std::ranges::equal(body, original.second));
+    CHECK(server.Stop());
+    acceptor.non_blocking(true);
+    Tcp::socket               unexpected{ioc};
+    boost::system::error_code error;
+    acceptor.accept(unexpected, error);
+    CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+    auto const dump = ReadWholeFile(logDir / "registry.1.bin");
+    CHECK(std::ranges::equal(dump, original.first));
+    CheckDuplicateRegistryWarning(logDir / "server.log", 1);
+    std::filesystem::remove_all(logDir);
+}
+
 static void ActivateAndUploadRegistries(RankTopology const& topo, std::vector<std::string> const& registries)
 {
     std::stringstream activation;
@@ -1165,6 +1562,573 @@ static void ActivateAndUploadRegistries(RankTopology const& topo, std::vector<st
         }));
     }
     for (auto& upload : uploads) { CHECK(upload.get() == boost::beast::http::status::accepted); }
+}
+
+static void ActivateTestSnapshot(checkpoint::ipc::MsgQueue&   queue,
+                                 std::filesystem::path const& directory,
+                                 Rank                         rank,
+                                 checkpoint::ipc::SnapshotId  snapshotId = checkpoint::ipc::SnapshotId{40})
+{
+    std::stringstream activation;
+    serdes::WriteBlobWithSize<uint16_t>(activation, directory.string());
+    serdes::WriteTrivial(activation, uint32_t{0});
+    serdes::WriteTrivial(activation, uint32_t{0});
+    auto const payload = activation.str();
+    queue.Push({checkpoint::ipc::Message::ActivateSnapshot{
+                   .sessionId    = checkpoint::ipc::SessionId::Default,
+                   .snapshotId   = snapshotId,
+                   .globalRank   = rank,
+                   .snapshotSize = 4 * sizeof(float),
+                   .messageSize  = static_cast<uint32_t>(payload.size()),
+               }},
+               payload.data(),
+               payload.size());
+}
+
+static std::string WaitForFinalizeFailure(TestServerProcess& server)
+{
+    auto       finalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
+    auto const status   = finalize.wait_for(std::chrono::seconds{10});
+    if (status != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(status == std::future_status::ready);
+    std::string failure;
+    try
+    {
+        finalize.get();
+    } catch (std::runtime_error const& error) { failure = error.what(); }
+    return failure;
+}
+
+template <typename THandler>
+static std::future<void> ServePeerRequests(boost::asio::io_context& ioc, boost::asio::ip::tcp::acceptor& acceptor, THandler handler)
+{
+    return std::async(std::launch::async, [&, requestHandler = std::move(handler)] {
+        using namespace std::chrono_literals;
+        namespace http = boost::beast::http;
+        auto run       = [&](auto start) {
+            boost::system::error_code error;
+            start([&](boost::system::error_code ec, auto...) { error = ec; });
+            ioc.run();
+            ioc.restart();
+            if (error) { throw boost::system::system_error(error); }
+        };
+        for (size_t attempt = 0; attempt < 8; ++attempt)
+        {
+            boost::beast::tcp_stream  stream{ioc};
+            boost::asio::steady_timer deadline{ioc, 10s};
+            deadline.async_wait([&](boost::system::error_code ec) {
+                if (!ec) { acceptor.cancel(); }
+            });
+            run([&](auto done) {
+                acceptor.async_accept(stream.socket(), [&, done](boost::system::error_code ec) {
+                    deadline.cancel();
+                    done(ec);
+                });
+            });
+            boost::beast::flat_buffer        buffer;
+            http::request<http::string_body> request;
+            stream.expires_after(10s);
+            run([&](auto done) { http::async_read(stream, buffer, request, done); });
+            auto const [body, finished] = requestHandler(request);
+            http::response<http::string_body> response{http::status::ok, request.version()};
+            response.set(http::field::content_type, "text/plain");
+            response.body() = body;
+            response.prepare_payload();
+            stream.expires_after(10s);
+            run([&](auto done) { http::async_write(stream, response, done); });
+            if (finished) { return; }
+        }
+        throw std::runtime_error("peer mock received too many requests");
+    });
+}
+
+TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finalize][tier2]")
+{
+    using namespace std::chrono_literals;
+    namespace http    = boost::beast::http;
+    using Tcp         = boost::asio::ip::tcp;
+    auto const logDir = CkptDir("finalize_incomplete_tensor_data");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    RankTopology const topology{.rank = Rank{1}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {peer, "localhost"}};
+    std::string        failureTarget;
+    std::string        failureBody;
+    http::verb         failureMethod{};
+    auto               coordinator = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
+        bool const failure = !request.body().empty() && request.target() == "/api/peer/writeckptcomplete/0/1/40";
+        if (failure)
+        {
+            failureTarget = std::string{request.target()};
+            failureBody   = request.body();
+            failureMethod = request.method();
+        }
+        return std::pair{std::string{"{}"}, failure};
+    });
+    TestServerProcess  server;
+    StartTestServer(server, logDir / "server.log");
+    ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
+    auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+    ActivateTestSnapshot(queue, logDir / "iteration40", Rank{1});
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{1},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
+    auto       finalize          = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
+    auto const coordinatorStatus = coordinator.wait_for(10s);
+    if (coordinatorStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(coordinatorStatus == std::future_status::ready);
+    CHECK_NOTHROW(coordinator.get());
+    CHECK(finalize.wait_for(3s) == std::future_status::timeout);
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40", fmt::format("rank=1 WriteCkpt failed: {}", failureBody))
+          == http::status::ok);
+    auto const status = finalize.wait_for(10s);
+    if (status != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(status == std::future_status::ready);
+    std::string failure;
+    try
+    {
+        finalize.get();
+    } catch (std::runtime_error const& error) { failure = error.what(); }
+    CHECK(failure.contains("snapshot=40"));
+    CHECK(failure.contains("rank=1"));
+    CHECK(failure.contains("Incomplete tensor data"));
+    CHECK(failureTarget == "/api/peer/writeckptcomplete/0/1/40");
+    CHECK(failureMethod == http::verb::post);
+    CHECK(failureBody.contains("Incomplete tensor data"));
+    CHECK_FALSE(std::filesystem::exists(logDir / "iteration40" / ".metadata"));
+    CHECK(server.Stop());
+    acceptor.non_blocking(true);
+    Tcp::socket               unexpected{ioc};
+    boost::system::error_code error;
+    acceptor.accept(unexpected, error);
+    CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("a peer failure reaches the coordinator before local snapshot activation", "[server][finalize][tier2]")
+{
+    using namespace std::chrono_literals;
+    using Tcp         = boost::asio::ip::tcp;
+    auto const logDir = CkptDir("finalize_peer_failure_before_activation");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    std::string             resultTarget;
+    std::string             resultBody;
+    auto                    notified = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
+        resultTarget = std::string{request.target()};
+        resultBody   = request.body();
+        return std::pair{std::string{}, true};
+    });
+    RankTopology const topology{.rank = Rank{0}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost", peer}};
+    TestServerProcess  server;
+    StartTestServer(server, logDir / "server.log");
+    ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
+    auto finalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
+    CHECK(finalize.wait_for(200ms) == std::future_status::timeout);
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/1/40", "distcp: peer shard Input/output error")
+          == boost::beast::http::status::ok);
+    CHECK(finalize.wait_for(3s) == std::future_status::timeout);
+    CHECK(notified.wait_for(200ms) == std::future_status::timeout);
+    auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+    ActivateTestSnapshot(queue, logDir / "iteration40", Rank{0});
+    std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
+    queue.Push({checkpoint::ipc::Message::LocalStateData{
+                   .sessionId   = checkpoint::ipc::SessionId::Default,
+                   .snapshotId  = checkpoint::ipc::SnapshotId{40},
+                   .globalRank  = Rank{0},
+                   .messageSize = sizeof(values),
+                   .offset      = 0,
+               }},
+               reinterpret_cast<char const*>(values.data()),
+               sizeof(values));
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{0},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
+    auto const status = finalize.wait_for(10s);
+    if (status != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(status == std::future_status::ready);
+    std::string failure;
+    try
+    {
+        finalize.get();
+    } catch (std::runtime_error const& error) { failure = error.what(); }
+    CHECK(failure.contains("HTTP 500"));
+    CHECK(failure.contains("snapshot=40"));
+    CHECK(failure.contains("rank=1"));
+    CHECK(failure.contains("peer shard Input/output error"));
+    REQUIRE(notified.wait_for(10s) == std::future_status::ready);
+    CHECK_NOTHROW(notified.get());
+    CHECK(resultTarget == "/api/peer/writeckptcomplete/0/0/40?fwd=1:2");
+    CHECK(resultBody.contains("rank=1"));
+    CHECK(resultBody.contains("peer shard Input/output error"));
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/1/40", "another error") == boost::beast::http::status::ok);
+    CHECK(server.Stop());
+    acceptor.non_blocking(true);
+    Tcp::socket               unexpected{ioc};
+    boost::system::error_code error;
+    acceptor.accept(unexpected, error);
+    CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("a coordinator failure survives later peer snapshot activation", "[server][finalize][tier2]")
+{
+    using namespace std::chrono_literals;
+    using Tcp         = boost::asio::ip::tcp;
+    auto const logDir = CkptDir("finalize_result_before_peer_activation");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    boost::asio::io_context downstreamIoc;
+    Tcp::acceptor           downstream{downstreamIoc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              downstreamPeer = fmt::format("127.0.0.1:{}", downstream.local_endpoint().port());
+    RankTopology const      topology{.rank         = Rank{2},
+                                     .worldSize    = Rank{4},
+                                     .ranksPerPeer = 1,
+                                     .peersPerNode = 1,
+                                     .peers        = {peer, "unused", "localhost", downstreamPeer}};
+    auto                    forwarded = ServePeerRequests(ioc, acceptor, [](auto const&) { return std::pair{std::string{}, true}; });
+    TestServerProcess       server;
+    StartTestServer(server, logDir / "server.log", true);
+    ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
+    REQUIRE(forwarded.wait_for(10s) == std::future_status::ready);
+    CHECK_NOTHROW(forwarded.get());
+    std::string const        failure = "Checkpoint finalization failed for snapshot=40 rank=0: disk full";
+    std::vector<std::string> forwardedTargets;
+    std::vector<std::string> forwardedBodies;
+    auto                     delegated = ServePeerRequests(downstreamIoc, downstream, [&](auto const& request) {
+        forwardedTargets.emplace_back(request.target());
+        forwardedBodies.push_back(request.body());
+        CHECK(request[boost::beast::http::field::content_encoding].empty());
+        return std::pair{std::string{}, true};
+    });
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40?fwd=2:4", failure) == boost::beast::http::status::ok);
+    CHECK(WaitForFinalizeFailure(server).contains(failure));
+    auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+    ActivateTestSnapshot(queue, logDir / "iteration40", Rank{2});
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{2},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
+    bool finalized = false;
+    for (size_t attempt = 0; attempt < 100; ++attempt)
+    {
+        auto const bytes = ReadWholeFile(logDir / "server.log");
+        finalized        = std::string_view{bytes.data(), bytes.size()}.contains("OnFinalizeSnapshotAsync_ for rank=2, snapshotId=40");
+        if (finalized) { break; }
+        std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(finalized);
+    CHECK(WaitForFinalizeFailure(server).contains(failure));
+    REQUIRE(delegated.wait_for(10s) == std::future_status::ready);
+    CHECK_NOTHROW(delegated.get());
+    CHECK(forwardedTargets == std::vector<std::string>{"/api/peer/writeckptcomplete/0/0/40?fwd=3:4"});
+    CHECK(forwardedBodies == std::vector<std::string>{failure});
+    CHECK(server.Stop());
+    acceptor.non_blocking(true);
+    Tcp::socket               unexpected{ioc};
+    boost::system::error_code error;
+    acceptor.accept(unexpected, error);
+    CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][finalize][tier2]")
+{
+    using namespace std::chrono_literals;
+    namespace http           = boost::beast::http;
+    using Tcp                = boost::asio::ip::tcp;
+    auto const logDir        = CkptDir("finalize_coordinator_result");
+    auto const checkpointDir = logDir / "iteration40";
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(checkpointDir);
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    RankTopology const topology{.rank = Rank{0}, .worldSize = Rank{4}, .ranksPerPeer = 2, .peersPerNode = 1, .peers = {"localhost", peer}};
+    std::vector<std::string> targets;
+    std::string              resultBody;
+    std::promise<void>       resultReceived;
+    auto                     received = resultReceived.get_future();
+    std::promise<void>       releaseAcknowledgment;
+    auto                     acknowledgment    = releaseAcknowledgment.get_future();
+    bool                     metadataPublished = false;
+    auto                     notified          = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
+        targets.emplace_back(request.target());
+        auto const result = request.target() == "/api/peer/writeckptcomplete/0/0/40?fwd=1:2";
+        if (result)
+        {
+            resultBody        = request.body();
+            metadataPublished = std::filesystem::exists(checkpointDir / ".metadata")
+                                && std::filesystem::file_size(checkpointDir / ".metadata") > 0
+                                && std::filesystem::file_size(checkpointDir / "__0_0.distcp") > 0;
+            resultReceived.set_value();
+            CHECK(acknowledgment.wait_for(20s) == std::future_status::ready);
+        }
+        return std::pair{std::string{}, result};
+    });
+    TestServerProcess        server;
+    StartTestServer(server, logDir / "server.log", true);
+    auto secondLocal = topology;
+    secondLocal.rank = Rank{1};
+    ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(secondLocal)});
+    CHECK(PostToTestServer("/api/peer/shardedstateregistry/0/2", SerializedSliceFragment(2, 4)) == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/shardedstateregistry/0/3", SerializedSliceFragment(3, 4)) == http::status::ok);
+    auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+    std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
+    for (uint32_t const rank : {0u, 1u})
+    {
+        ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
+        queue.Push({checkpoint::ipc::Message::LocalStateData{
+                       .sessionId   = checkpoint::ipc::SessionId::Default,
+                       .snapshotId  = checkpoint::ipc::SnapshotId{40},
+                       .globalRank  = Rank{rank},
+                       .messageSize = sizeof(values),
+                       .offset      = 0,
+                   }},
+                   reinterpret_cast<char const*>(values.data()),
+                   sizeof(values));
+    }
+    CHECK(PostToTestServer("/api/peer/snapshotcomplete/0/2/40", "") == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/snapshotcomplete/0/3/40", "") == http::status::ok);
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{1},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{0},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
+    bool localFinalized = false;
+    for (size_t attempt = 0; attempt < 100; ++attempt)
+    {
+        auto const bytes = ReadWholeFile(logDir / "server.log");
+        localFinalized   = std::string_view{bytes.data(), bytes.size()}.contains("OnFinalizeSnapshotAsync_ for rank=1, snapshotId=40");
+        if (localFinalized) { break; }
+        std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(localFinalized);
+    CHECK(std::filesystem::file_size(checkpointDir / "__1_0.distcp") > 0);
+    CHECK_FALSE(std::filesystem::exists(checkpointDir / ".metadata"));
+    auto waiting = std::async(std::launch::async, [] { WaitForCkptFinalize(0, -1); });
+    CHECK(waiting.wait_for(3s) == std::future_status::timeout);
+    ActivateTestSnapshot(queue, logDir / "iteration41", Rank{0}, checkpoint::ipc::SnapshotId{41});
+    bool activated = false;
+    for (size_t attempt = 0; attempt < 100; ++attempt)
+    {
+        auto const bytes = ReadWholeFile(logDir / "server.log");
+        activated        = std::string_view{bytes.data(), bytes.size()}.contains("Activated snapshot=41 for global rank=0");
+        if (activated) { break; }
+        std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(activated);
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/2/40", "") == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/3/40", "") == http::status::ok);
+    CHECK(received.wait_for(10s) == std::future_status::ready);
+    CHECK(waiting.wait_for(3s) == std::future_status::timeout);
+    releaseAcknowledgment.set_value();
+    REQUIRE(notified.wait_for(10s) == std::future_status::ready);
+    CHECK_NOTHROW(notified.get());
+    CHECK(targets == std::vector<std::string>{"/api/peer/globalregistry/0?fwd=1:2", "/api/peer/writeckptcomplete/0/0/40?fwd=1:2"});
+    CHECK(resultBody.empty());
+    CHECK(metadataPublished);
+    auto const status = waiting.wait_for(10s);
+    if (status != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(status == std::future_status::ready);
+    CHECK_NOTHROW(waiting.get());
+    CHECK_NOTHROW(WaitForCkptFinalize(0, 40));
+    CHECK(server.Stop());
+    acceptor.non_blocking(true);
+    Tcp::socket               unexpected{ioc};
+    boost::system::error_code error;
+    acceptor.accept(unexpected, error);
+    CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+    std::filesystem::remove_all(logDir);
+}
+
+TEST_CASE("peer durability waits for the coordinator notification", "[server][finalize][tier2]")
+{
+    using namespace std::chrono_literals;
+    namespace http = boost::beast::http;
+    using Tcp      = boost::asio::ip::tcp;
+    for (bool const succeeds : {false, true})
+    {
+        DYNAMIC_SECTION("coordinator completes=" << succeeds)
+        {
+            auto const logDir = CkptDir("finalize_peer_global_result");
+            std::filesystem::remove_all(logDir);
+            std::filesystem::create_directories(logDir);
+            boost::asio::io_context ioc;
+            Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+            auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+            RankTopology const      topology{
+                .rank = Rank{2}, .worldSize = Rank{4}, .ranksPerPeer = 2, .peersPerNode = 1, .peers = {peer, "localhost"}};
+            std::set<std::string> registryTargets;
+            auto                  registered = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
+                registryTargets.insert(std::string{request.target()});
+                return std::pair{std::string{}, registryTargets.size() == 2};
+            });
+            TestServerProcess     server;
+            ::setenv("NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS", "0", 1);    // NOLINT(concurrency-mt-unsafe)
+            StartTestServer(server, logDir / "server.log", true);
+            ::unsetenv("NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS");    // NOLINT(concurrency-mt-unsafe)
+            auto secondLocal = topology;
+            secondLocal.rank = Rank{3};
+            ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(secondLocal)});
+            REQUIRE(registered.wait_for(10s) == std::future_status::ready);
+            CHECK_NOTHROW(registered.get());
+            CHECK(registryTargets == std::set<std::string>{"/api/peer/shardedstateregistry/0/2", "/api/peer/shardedstateregistry/0/3"});
+            StateTree global(checkpoint::ipc::SessionId::Default, topology);
+            auto      tensor = SliceOfSharedTensor(2, 4);
+            tensor.shards.insert(*SliceOfSharedTensor(3, 4).shards.begin());
+            global.AddChild(StateNode::Handle::Root, "weight").data = std::move(tensor);
+            global.FinalizeRegistry();
+            std::stringstream registry;
+            StateSerDes::Write(registry, global, StateNode::Handle::Root);
+            auto const  registryBytes = registry.str();
+            std::string globalRegistry;
+            {
+                boost::iostreams::filtering_ostream compressed;
+                compressed.push(boost::iostreams::zlib_compressor{});
+                compressed.push(boost::iostreams::back_inserter(globalRegistry));
+                compressed.write(registryBytes.data(), static_cast<std::streamsize>(registryBytes.size()));
+                boost::iostreams::close(compressed);
+            }
+            std::promise<void>    firstWrite;
+            auto                  firstWritten = firstWrite.get_future();
+            std::set<std::string> written;
+            auto                  localWrite    = ServePeerRequests(ioc, acceptor, [&](auto const& notification) {
+                CHECK(notification.body().empty());
+                if (notification.target() == "/api/peer/snapshotcomplete/0/2/40")
+                {
+                    CHECK(PostToTestServer("/api/peer/globalregistry/0?fwd=1:2", globalRegistry, "deflate") == http::status::ok);
+                }
+                if (notification.target() == "/api/peer/writeckptcomplete/0/2/40")
+                {
+                    if (written.insert(std::string{notification.target()}).second) { firstWrite.set_value(); }
+                }
+                else if (notification.target() == "/api/peer/writeckptcomplete/0/3/40")
+                {
+                    written.insert(std::string{notification.target()});
+                }
+                return std::pair{std::string{}, written.size() == 2};
+            });
+            auto const            checkpointDir = logDir / "iteration40";
+            std::filesystem::create_directories(checkpointDir);
+            auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+            std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
+            for (uint32_t const rank : {2u, 3u})
+            {
+                ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
+                queue.Push({checkpoint::ipc::Message::LocalStateData{
+                               .sessionId   = checkpoint::ipc::SessionId::Default,
+                               .snapshotId  = checkpoint::ipc::SnapshotId{40},
+                               .globalRank  = Rank{rank},
+                               .messageSize = sizeof(values),
+                               .offset      = 0,
+                           }},
+                           reinterpret_cast<char const*>(values.data()),
+                           sizeof(values));
+            }
+            queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                           .sessionId  = checkpoint::ipc::SessionId::Default,
+                           .globalRank = Rank{2},
+                           .snapshotId = checkpoint::ipc::SnapshotId{40},
+                       }},
+                       nullptr,
+                       0);
+            REQUIRE(firstWritten.wait_for(10s) == std::future_status::ready);
+            CHECK_NOTHROW(firstWritten.get());
+            bool        firstFinalized = false;
+            std::string firstLog;
+            for (size_t attempt = 0; attempt < 100; ++attempt)
+            {
+                auto const bytes = ReadWholeFile(logDir / "server.log");
+                firstLog.assign(bytes.data(), bytes.size());
+                firstFinalized = firstLog.contains("Released 0 snapshot buffers after finalizing snapshot=40 rank=2.");
+                if (firstFinalized) { break; }
+                std::this_thread::sleep_for(50ms);
+            }
+            REQUIRE(firstFinalized);
+            CHECK_FALSE(std::filesystem::exists(checkpointDir / "__3_0.distcp"));
+            queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                           .sessionId  = checkpoint::ipc::SessionId::Default,
+                           .globalRank = Rank{3},
+                           .snapshotId = checkpoint::ipc::SnapshotId{40},
+                       }},
+                       nullptr,
+                       0);
+            auto const localStatus = localWrite.wait_for(10s);
+            if (localStatus != std::future_status::ready) { CHECK(server.Stop()); }
+            REQUIRE(localStatus == std::future_status::ready);
+            CHECK_NOTHROW(localWrite.get());
+            CHECK(written == std::set<std::string>{"/api/peer/writeckptcomplete/0/2/40", "/api/peer/writeckptcomplete/0/3/40"});
+            CHECK(std::filesystem::file_size(checkpointDir / "__2_0.distcp") > 0);
+            CHECK(std::filesystem::file_size(checkpointDir / "__3_0.distcp") > 0);
+            boost::asio::io_context  clientIoc;
+            boost::beast::tcp_stream waitStream{clientIoc};
+            waitStream.connect(Tcp::endpoint{boost::asio::ip::address_v4::loopback(), checkpoint::ipc::Message::Port});
+            http::request<http::empty_body> request{http::verb::get, "/api/wait-for-ckpt-finalize/0/40", 11};
+            request.set(http::field::host, "localhost");
+            http::write(waitStream, request);
+            std::this_thread::sleep_for(200ms);
+            CHECK(waitStream.socket().available() == 0);
+            acceptor.non_blocking(true);
+            Tcp::socket               unexpected{ioc};
+            boost::system::error_code error;
+            acceptor.accept(unexpected, error);
+            CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+            std::string const failure = "Checkpoint finalization failed for snapshot=40 rank=0: metadata Input/output error";
+            auto const        result  = succeeds ? std::string{} : failure;
+            CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40?fwd=1:2", result) == http::status::ok);
+            CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40?fwd=1:2", result) == http::status::ok);
+            boost::beast::flat_buffer         buffer;
+            http::response<http::string_body> response;
+            boost::system::error_code         readError;
+            waitStream.expires_after(10s);
+            http::async_read(waitStream, buffer, response, [&](boost::system::error_code ec, size_t) { readError = ec; });
+            clientIoc.run();
+            if (readError) { CHECK(server.Stop()); }
+            REQUIRE_FALSE(readError);
+            CHECK_FALSE(response.chunked());
+            CHECK(response[http::field::content_type].starts_with("text/plain"));
+            if (succeeds) { CHECK(response.result() == http::status::ok); }
+            else
+            {
+                CHECK(response.result() == http::status::internal_server_error);
+                CHECK(response.body().contains(failure));
+            }
+            CHECK(server.Stop());
+            Tcp::socket noFeedback{ioc};
+            acceptor.accept(noFeedback, error);
+            CHECK((error == boost::asio::error::would_block || error == boost::asio::error::try_again));
+            std::filesystem::remove_all(logDir);
+        }
+    }
 }
 
 // The merged dump appears while the server keeps running; returns the ranks owning a slice in it.
@@ -1343,42 +2307,52 @@ TEST_CASE("checkpoint telemetry preserves the performance record schema", "[tele
     std::filesystem::remove_all(outDir);
 }
 
-TEST_CASE("snapshot completion is global on the coordinator and local on peers", "[server][completion]")
+TEST_CASE("evicted pending snapshots remain the latest known result", "[server][completion][finalize][tier1]")
 {
-    auto makeSession = [](uint32_t rank) {
-        return std::make_unique<Session>(
-            nullptr,
-            checkpoint::ipc::SessionId{1},
-            std::filesystem::path{},
-            RankTopology{.rank = Rank{rank}, .worldSize = Rank{4}, .ranksPerPeer = 2, .peersPerNode = 1, .peers = {"coordinator", "peer"}});
-    };
-    auto addSnapshot = [](Session& session) -> Session::Snapshot& {
-        auto snapshot        = std::make_unique<Session::Snapshot>();
-        snapshot->snapshotId = checkpoint::ipc::SnapshotId{1};
-        return *session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot)).first->second;
-    };
+    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo(0, 2));
+    auto    completed     = std::make_unique<Session::Snapshot>();
+    completed->snapshotId = checkpoint::ipc::SnapshotId{30};
+    completed->complete   = true;
+    session.snapshots.emplace(completed->snapshotId, std::move(completed));
+    auto snapshot        = std::make_unique<Session::Snapshot>();
+    snapshot->snapshotId = checkpoint::ipc::SnapshotId{40};
+    snapshot->localStates.emplace(Rank{0}, std::make_unique<Session::LocalState>());
+    auto* const pending = snapshot.get();
+    session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot));
+    pending->localStates.clear();
+    checkpoint::ipc::SnapshotId latest{checkpoint::ipc::SnapshotId::Invalid};
+    REQUIRE(session.ResolveSnapshotId(-1, latest));
+    CHECK(latest == checkpoint::ipc::SnapshotId{40});
+    CHECK_FALSE(session.snapshots.at(latest)->complete);
+    CHECK_FALSE(session.AllSnapshotsComplete());
+    pending->complete = true;
+    CHECK(session.snapshots.at(latest).get() == pending);
+    CHECK(session.snapshots.at(latest)->complete);
+    CHECK(session.AllSnapshotsComplete());
+}
 
-    auto  coordinator         = makeSession(0);
-    auto& coordinatorSnapshot = addSnapshot(*coordinator);
-    for (uint32_t rank = 1; rank < 4; ++rank) { coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{rank}); }
-    REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
-    coordinatorSnapshot.writeCkptCompletedRanks.insert(Rank{0});
-    REQUIRE_FALSE(coordinator->AllSnapshotsComplete());
-    REQUIRE_FALSE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
-    for (uint32_t rank = 0; rank < 4; ++rank) { coordinatorSnapshot.finalizedRanks.insert(Rank{rank}); }
-    REQUIRE(coordinator->AllSnapshotsComplete());
-    REQUIRE(coordinator->IsSnapshotEvictable(coordinatorSnapshot));
-
-    auto  peer         = makeSession(2);
-    auto& peerSnapshot = addSnapshot(*peer);
-    peerSnapshot.writeCkptCompletedRanks.insert(Rank{2});
-    REQUIRE_FALSE(peer->AllSnapshotsComplete());
-    peerSnapshot.writeCkptCompletedRanks.insert(Rank{3});
-    REQUIRE_FALSE(peer->AllSnapshotsComplete());
-    REQUIRE_FALSE(peer->IsSnapshotEvictable(peerSnapshot));
-    for (uint32_t rank = 0; rank < 4; ++rank) { peerSnapshot.finalizedRanks.insert(Rank{rank}); }
-    REQUIRE(peer->AllSnapshotsComplete());
-    REQUIRE(peer->IsSnapshotEvictable(peerSnapshot));
+TEST_CASE("finalize snapshot lookup rejects out-of-range iterations", "[server][completion][finalize][tier1]")
+{
+    using SnapshotId = checkpoint::ipc::SnapshotId;
+    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo());
+    auto    resolved = SnapshotId::Invalid;
+    CHECK(session.ResolveSnapshotId(0, resolved));
+    CHECK(resolved == SnapshotId{0});
+    auto const maxValid = static_cast<int64_t>(static_cast<uint32_t>(SnapshotId::Invalid)) - 1;
+    CHECK(session.ResolveSnapshotId(maxValid, resolved));
+    CHECK(resolved == static_cast<SnapshotId>(static_cast<uint32_t>(maxValid)));
+    for (auto const iteration : {maxValid + 1, maxValid + 2, (int64_t{1} << 32u) + 40, std::numeric_limits<int64_t>::max()})
+    {
+        INFO(iteration);
+        CHECK_THROWS_AS(session.ResolveSnapshotId(iteration, resolved), std::invalid_argument);
+    }
+    auto snapshot        = std::make_unique<Session::Snapshot>();
+    snapshot->snapshotId = SnapshotId{40};
+    session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot));
+    CHECK(session.ResolveSnapshotId(-1, resolved));
+    CHECK(resolved == SnapshotId{40});
+    CHECK_FALSE(session.ResolveSnapshotId(-2, resolved));
+    CHECK_FALSE(session.ResolveSnapshotId(std::numeric_limits<int64_t>::min(), resolved));
 }
 
 TEST_CASE("distcp shard walk visits TensorShard leaves in insertion order", "[distcp][tier1]")

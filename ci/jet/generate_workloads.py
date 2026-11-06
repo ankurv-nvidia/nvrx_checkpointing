@@ -422,7 +422,7 @@ def recipe_manifest(platform: JetPlatform, workload: Workload, maintainer: str, 
                 "srun_additional_flags": {
                     "time": workload.slurm_time,
                     # The keyed value renders as one Slurm argument.
-                    "kill_on_bad_exit=1": True,
+                    "kill_on_bad_exit=0": True,
                 },
             },
         },

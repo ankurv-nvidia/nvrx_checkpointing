@@ -1,0 +1,183 @@
+# Ultra4 language-model recipe for 64 GB300 nodes with four GPUs per node.
+ci:
+  environment:
+    CUDA_DEVICE_MAX_CONNECTIONS: null
+    NVTE_FWD_LAYERNORM_SM_MARGIN: "40"
+    NVTE_BWD_LAYERNORM_SM_MARGIN: "40"
+    NVTE_INF_LAYERNORM_SM_MARGIN: "40"
+    TORCHINDUCTOR_WORKER_START: fork
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    NCCL_NVLS_ENABLE: "1"
+    NCCL_SYM_CE_THRESHOLD: "4294967296"
+    NVTE_CPU_OFFLOAD_V1: "1"
+    NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+    NVTE_USE_CUTLASS_GROUPED_GEMM: "0"
+    NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "64"
+    USE_MNNVL: "1"
+    MIMALLOC_PURGE_DELAY: "0"
+    TRITON_CACHE_DIR: /tmp/triton_cache
+    NCCL_NET_PLUGIN: none
+    NCCL_NET_SHARED_COMMS: "0"
+    NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS: "0"
+    NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS: "1"
+    NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS: "0"
+
+spec: [megatron.core.models.hybrid.hybrid_layer_specs, gated_delta_product_stack_spec]
+hybrid-layer-pattern: "M-M-M*EMEMME*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEM-M-/*E/*E"
+hybrid-override-pattern: null
+num-layers: null
+mtp-hybrid-override-pattern: null
+mtp-num-layers: null
+mtp-use-repeated-layer: true
+mtp-loss-scaling-factor: "0.1"
+calculate-per-token-loss: true
+mtp-hsm: true
+
+hidden-size: 10240
+num-attention-heads: 96
+group-query-attention: true
+num-query-groups: 1
+mamba-num-heads: 80
+mamba-head-dim: 64
+mamba-state-dim: 128
+mamba-num-groups: 80
+ffn-hidden-size: 40960
+kv-channels: 256
+squared-relu: true
+activation-func-tanh-clamp-scale: 16
+init-method-std: "0.0089"
+output-logit-dtype: fp32
+first-last-layers-bf16: false
+num-layers-at-start-in-bf16: null
+num-layers-at-end-in-bf16: null
+
+num-experts: 512
+moe-router-topk: 10
+moe-latent-size: 3072
+moe-ffn-hidden-size: 10240
+moe-shared-expert-intermediate-size: 10240
+moe-shortcut-connection: true
+moe-shortcut-parallel: true
+moe-use-norm-before-up-proj: true
+moe-token-dispatcher-type: flex
+moe-flex-dispatcher-backend: hybridep
+moe-flex-dispatcher-num-sms: 32
+moe-router-score-function: sigmoid
+moe-grouped-gemm: true
+moe-aux-loss-coeff: 0
+moe-router-topk-scaling-factor: "3.16"
+moe-router-dtype: fp32
+moe-router-load-balancing-type: quantile_balancing
+moe-router-enable-expert-bias: false
+moe-permute-fusion: true
+moe-router-fusion: true
+
+use-transformer-engine-op-fuser: true
+recompute-granularity: selective
+recompute-modules: [moe_act, gdp_in_proj, gdp_qkv]
+fine-grained-activation-offloading: true
+offload-modules: fused_group_mlp
+gdp-cutedsl-kernel: true
+use-fused-weighted-squared-relu: true
+cuda-graph-impl: null
+cuda-graph-modules: null
+
+optimizer: muon
+muon-momentum: "0.9"
+muon-extra-scale-factor: "0.2"
+muon-scale-mode: spectral
+muon-num-ns-steps: 16
+muon-coefficient-type: polar_express
+muon-scalar-optimizer: adam
+muon-tp-mode: auto
+moe-router-skip-muon: true
+adam-beta1: "0.9"
+adam-beta2: "0.95"
+adam-eps: "1e-16"
+lr: "2.0e-4"
+min-lr: "5.0e-6"
+weight-decay: "0.25"
+clip-grad: "1.0"
+train-samples: 317382812
+lr-decay-style: WSD
+lr-decay-samples: 317382812
+lr-warmup-samples: 63476562
+lr-wsd-decay-style: minus_sqrt
+lr-wsd-decay-samples: 63476562
+micro-batch-size: 1
+global-batch-size: null
+step-batch-size-schedule: "0:4608,173342195712:9216,520026587136:13824"
+
+bf16: true
+moe-router-padding-for-quantization: true
+fp8-format: e4m3
+fp8-recipe: mxfp8
+reuse-grad-buf-for-mxfp8-param-ag: true
+fp8-param-gather: true
+seq-length: 8192
+max-position-embeddings: 8192
+vocab-size: 262272
+padded-vocab-size: 262272
+null-tokenizer-eod-id: 2
+null-tokenizer-pad-id: 3
+num-workers: 1
+no-save-tokenizer-assets: true
+patch-dim: 14
+img-h: 1540
+img-w: 1540
+
+tensor-model-parallel-size: 2
+expert-model-parallel-size: 64
+expert-tensor-parallel-size: 1
+tensor-parallel-num-weight-shards: 64
+sequence-parallel: true
+no-gradient-accumulation-fusion: false
+use-distributed-optimizer: true
+overlap-grad-reduce: true
+overlap-param-gather: true
+high-priority-stream-groups: ep
+grad-reduce-in-bf16: true
+ddp-reduce-scatter-with-fp32-accumulation: true
+ddp-param-name-patterns-for-fp32-local-accumulation: ["*output_layer*", "*router*"]
+gtp-remat-reduce-scatter-with-fp32-accumulation: true
+gtp-remat-nccl-ub: true
+ddp-num-buckets: 10
+ddp-pad-buckets-for-high-nccl-busbw: true
+attention-backend: flash
+flash-attention-version: 4
+no-load-rng: true
+rerun-mode: disabled
+seed: 1234
+
+ckpt-fully-parallel-save: true
+ckpt-fully-parallel-load: true
+ckpt-assume-constant-structure: true
+ckpt-fully-parallel-save-process-group: ep_dp
+ckpt-fully-parallel-load-process-group: ep_dp
+ckpt-fully-parallel-load-per-rank-objects: true
+ckpt-drop-redundant-extra-state: true
+no-ckpt-load-validate-sharding-integrity: true
+async-save: true
+async-strategy: null
+use-persistent-ckpt-worker: true
+async-ckpt-use-cpu-shm: true
+
+eval-interval: 100
+eval-iters: 0
+eval-micro-batch-size: 1
+eval-global-batch-size: 13824
+log-interval: 10
+log-memory-interval: 100
+log-device-memory-used: true
+log-energy: true
+manual-gc: true
+manual-gc-interval: 100
+distributed-timeout-minutes: 30
+exit-duration-in-mins: 1430
+disable-straggler-on-startup: true
+
+job_time_in_mins:
+  srun:
+    perf: 120
+    detr: 240

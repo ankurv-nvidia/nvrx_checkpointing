@@ -2,7 +2,7 @@
 //
 // At large training scale (thousands of nodes) every non-coordinator node's
 // checkpoint server opens a *fresh* TCP connection to the coordinator (peers[0],
-// "node:0") for each notify/data message — finalizecomplete, writeckptcomplete,
+// "node:0") for each notify/data message — snapshotcomplete, writeckptcomplete,
 // shardedstateregistry. node:0 services those with a single accept coroutine that
 // runs each request handler synchronously before accepting the next connection, so
 // accepts are serialized and pending connections queue in the kernel listen backlog
@@ -64,8 +64,8 @@ namespace bpo   = boost::program_options;
 namespace net   = boost::asio;
 namespace beast = boost::beast;
 namespace http  = boost::beast::http;
-using       boost::asio::ip::tcp;
-using Clock     = std::chrono::steady_clock;
+using boost::asio::ip::tcp;
+using Clock = std::chrono::steady_clock;
 
 static double ToMs(Clock::duration d)
 { return std::chrono::duration<double, std::milli>(d).count(); }
@@ -407,7 +407,7 @@ try
         ("max-inflight", bpo::value<uint32_t>(&cfg.maxInflight), "cap on simultaneous connections; default 20480")               //
         ("endpoint", bpo::value<std::string>(&endpointStr), "ping | shardedstate; default ping")                                 //
         ("host", bpo::value<std::string>(&cfg.host), "coordinator host; default 127.0.0.1")                                      //
-        ("port", bpo::value<uint16_t>(&cfg.port), "coordinator port; default 4100")                                             //
+        ("port", bpo::value<uint16_t>(&cfg.port), "coordinator port; default 4100")                                              //
         ("connect-timeout-ms", bpo::value<uint32_t>()->default_value(5000), "per-request deadline in ms")                        //
         ("io-threads", bpo::value<unsigned>(&ioThreads), "client io_context worker threads")                                     //
         ("external", bpo::bool_switch(&external), "do not start an in-process server; stress a running one at --host/--port")    //

@@ -25,10 +25,8 @@ void SvcStop();
 // spin-down completes.
 void SvcSpinDown();
 
-// Block until the local daemon reports the checkpoint for `iteration` durable. A negative
-// `iteration` indexes back from the newest snapshot (-1 = latest). Used by the async-save
-// finalization path; throws if the daemon is unreachable or reports a non-OK status.
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration);
+
 struct DeviceContext
 {
     DeviceContext(DeviceId deviceIn, uint8_t streamIdxIn) : device(deviceIn), streamIdx(streamIdxIn) {}

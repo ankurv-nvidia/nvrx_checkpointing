@@ -298,10 +298,26 @@ def _record_failure(log: Path, result_dir: Path, stem: str) -> None:
         traceback.print_exc()
 
 
+def _core_artifacts(run_root: Path) -> list[Path]:
+    logs = [run_root / "logs", *run_root.glob("*/logs")]
+    suffixes = ("*.core", "*.core.partial", "*.core.log", "*.exe", "*.exe.partial")
+    return sorted({path for directory in logs for suffix in suffixes for path in directory.rglob(suffix) if path.is_file()})
+
+
 def _collect_run_artifacts(artifact_root: Path, run_root: Path) -> None:
     destination = artifact_root / "ci" / "ci-runs" / run_root.name
+    cores = _core_artifacts(run_root)
+    if cores:
+        destination.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "retained_run_root": str(run_root.resolve()),
+            "files": [{"path": str(path.relative_to(run_root)), "size_bytes": path.stat().st_size} for path in cores],
+        }
+        (destination / "core_manifest.json").write_text(json.dumps(manifest, indent=2))
+        print(f"[jet] crash artifacts retained in shared run directory: {run_root.resolve()}")  # noqa: T201 - CI progress
     patterns = (
         "logs/*.log",
+        "logs/**/*.core.log",
         "logs/*_report.json",
         "logs/*_checkpoint_digest.xz",
         "logs/*_checkpoint_summary.log",
@@ -317,6 +333,7 @@ def _collect_run_artifacts(artifact_root: Path, run_root: Path) -> None:
         "reference-run/*/iter_*/common_pt_dump.info",
         "run1-references/iter_*/reference.metadata.info",
         "*/logs/*.log",
+        "*/logs/**/*.core.log",
         "*/logs/*_report.json",
         "*/logs/*_checkpoint_digest.xz",
         "*/logs/*_checkpoint_summary.log",
@@ -334,7 +351,7 @@ def _collect_run_artifacts(artifact_root: Path, run_root: Path) -> None:
     )
     for pattern in patterns:
         for source in run_root.glob(pattern):
-            if not source.is_file():
+            if not source.is_file() or source.name.endswith((".core", ".core.partial", ".exe", ".exe.partial")):
                 continue
             target = destination / source.relative_to(run_root)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -381,6 +398,9 @@ def cleanup_finalized_run(workload_argv: list[str], assets_dir: Path) -> None:
         raise RuntimeError(f"refusing unsafe JET run cleanup: run={run_dir}, work={work_dir}")
     if run_dir.is_symlink() or run_dir != resolved_run or work_dir != resolved_work:
         raise RuntimeError(f"refusing to clean symlinked JET run: {run_dir}")
+    if _core_artifacts(resolved_run):
+        print(f"[jet] retained finalized run directory with crash artifacts: {resolved_run}")  # noqa: T201 - CI progress
+        return
     _cfg, _flavor, stem = slurm_job._identity(args)
     archive = _archive_path(assets_dir, stem)
     if not archive.is_file():
