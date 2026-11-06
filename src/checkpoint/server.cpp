@@ -1027,13 +1027,6 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     auto const localNodeWorldSize = onCoordinatorPeer ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
     try
     {
-        if (notifyCoordinator)
-        {
-            std::scoped_lock lock(mutex);
-            SendPeerSnapshotComplete_(
-                topo.peers[0], hdr, snapshot.failures.empty() ? "" : fmt::format("{}", fmt::join(snapshot.failures, ", ")));
-        }
-
         while (true)
         {
             {
@@ -1058,6 +1051,16 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             }
             if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
             std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (notifyCoordinator)
+        {
+            std::scoped_lock lock(mutex);
+            SendToPeerWithRetries(server,
+                                  sessionId,
+                                  topo.peers[0],
+                                  snapshot.failures.empty() ? "" : fmt::format("{}", fmt::join(snapshot.failures, ", ")),
+                                  fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
+                                  {});
         }
 
         // Rank 0 dumps and validates the merged registry once every rank has finalized.
@@ -1139,7 +1142,15 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
         checkpoint::distcp::WriteRankShard(
             snapshot.path.parent_path(), hdr.globalRank, *dedupedGlobalRegistry, localState.tensorStorage, localState.blobs);
-        if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr, {}); }
+        if (notifyCoordinator)
+        {
+            SendToPeerWithRetries(server,
+                                  sessionId,
+                                  topo.peers[0],
+                                  {},
+                                  fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
+                                  {});
+        }
         // A peer may declare its local shard complete only after the coordinator has
         // acknowledged the notification. Rank 0 is delayed further, until metadata is durable.
         if (hdr.globalRank != Rank{0})
@@ -1203,6 +1214,11 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                        static_cast<size_t>(topo.worldSize),
                        durableUs.count());
             PERF() << tel::span::SvrDurable::End{.id = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId}};
+            BroadcastWriteCkptCompleteToPeers_(snapshot);
+            {
+                std::scoped_lock lock(mutex);
+                snapshot.complete = true;
+            }
         }
 
         // Completed local writes release tensor buffers while retaining their finalization state.
@@ -1220,7 +1236,11 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                     if (remainingSnapshots <= numActiveSnapshots) { break; }
                     if (candidate->localStates.empty()) { continue; }
                     // Registry broadcast and local writes finish before their buffers are released.
-
+                    if (!candidate->failures.empty() || candidate->finalizedRanks.size() < ExpectedWriteCompletions()
+                        || candidate->writeCkptCompletedRanks.size() < ExpectedWriteCompletions())
+                    {
+                        break;
+                    }
                     auto& released = *evicted.emplace_back(std::make_unique<Snapshot>());
                     released.localStates.swap(candidate->localStates);
                     released.blobMetadata.swap(candidate->blobMetadata);
@@ -1239,7 +1259,6 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                  remainingSnapshots,
                  numActiveSnapshots);
         }
-        BroadcastWriteCkptCompleteToPeers_(snapshot);
     } catch (std::exception const& ex)
     {
         snapshot.failures.emplace_back(ex.what());
@@ -1327,29 +1346,6 @@ void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /*
         }
         tnsr.AddShard(tensorShard.tensorInfo);
     }
-}
-
-// TODO_MULTILOCAL_CKPT
-void Session::SendPeerSnapshotComplete_(std::string_view const& peer, cipc::Message::FinalizeSnapshot const& msg, std::string failure) const
-{
-    SendToPeerWithRetries(server,
-                          sessionId,
-                          peer,
-                          failure,
-                          fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId),
-                          {});
-}
-
-void Session::SendPeerWriteCkptComplete_(std::string_view const&                peer,
-                                         cipc::Message::FinalizeSnapshot const& msg,
-                                         std::string                            failure) const
-{
-    SendToPeerWithRetries(server,
-                          sessionId,
-                          peer,
-                          failure,
-                          fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, msg.globalRank, msg.snapshotId),
-                          {});
 }
 
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
@@ -1916,14 +1912,6 @@ bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
         return true;
     }
     return false;
-}
-
-bool Session::IsSnapshotComplete(cipc::SnapshotId snapshotId) const
-{
-    std::scoped_lock lock(mutex);
-    auto const       snapshot = snapshots.find(snapshotId);
-    if (snapshot == snapshots.end()) { return false; }
-    return snapshot->second->complete;
 }
 
 void Server::Start()

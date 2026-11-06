@@ -116,7 +116,6 @@ struct Session
 
     // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
-    bool IsSnapshotComplete(checkpoint::ipc::SnapshotId snapshotId) const;
 
     private:
     LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank) LFTBND;
@@ -132,12 +131,6 @@ struct Session
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
     void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
-    void SendPeerSnapshotComplete_(std::string_view const&                           peer,
-                                   checkpoint::ipc::Message::FinalizeSnapshot const& msg,
-                                   std::string                                       failure) const;
-    void SendPeerWriteCkptComplete_(std::string_view const&                           peer,
-                                    checkpoint::ipc::Message::FinalizeSnapshot const& msg,
-                                    std::string                                       failure) const;
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
