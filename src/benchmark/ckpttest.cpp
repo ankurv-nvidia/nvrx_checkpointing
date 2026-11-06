@@ -1655,7 +1655,7 @@ TEST_CASE("coordinator failures make an incomplete peer snapshot terminal", "[se
     // CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}));
     // CHECK_FALSE(session.RecordSnapshotResult(checkpoint::ipc::SnapshotId{40}, "another failure"));
     CHECK(session.AllSnapshotsComplete());
-    CHECK(session.snapshots.at(checkpoint::ipc::SnapshotId{40})->failure == failure);
+    CHECK(session.snapshots.at(checkpoint::ipc::SnapshotId{40})->failures == failures);
     CHECK_THROWS_WITH(session.IsSnapshotDurable(checkpoint::ipc::SnapshotId{40}), failure);
 }
 

@@ -110,10 +110,11 @@ struct Server
     Session& SessionById_(cipc::SessionId sessionId) LFTBND;
 
     template <typename TLambda>
-    void                             FindOrWaitForSessionAndSnapshot_(std::string_view context,
-                                                                      cipc::SessionId  sessionId,
-                                                                      cipc::SnapshotId snapshotId,
-                                                                      TLambda const&   lambda);
+    void FindOrWaitForSessionAndSnapshot_(std::string_view context,
+                                          cipc::SessionId  sessionId,
+                                          cipc::SnapshotId snapshotId,
+                                          TLambda const&   lambda);
+
     template <typename TLambda> void FindOrWaitForSession_(std::string_view context, cipc::SessionId sessionId, TLambda const& lambda);
 
     void NotifySnapshotComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank, std::string failure);
@@ -756,6 +757,7 @@ static void SendToPeerWithRetries(Server const* const     server,
 static void SendWriteCkptCompleteToPeers(Server const* const     server,
                                          cipc::SessionId         sessionId,
                                          RankTopology const&     topo,
+                                         cipc::SnapshotId        snapshotId,
                                          std::string_view const& failure,
                                          size_t                  startPeerIndex,
                                          size_t                  endPeerIndex)
@@ -763,9 +765,10 @@ static void SendWriteCkptCompleteToPeers(Server const* const     server,
     if (startPeerIndex >= endPeerIndex) { return; }
     auto        delegateStart = (startPeerIndex + endPeerIndex) / 2;
     auto const& peer          = topo.peers[delegateStart];
-    auto const  postTarget    = fmt::format("/api/peer/globalregistry/{}?fwd={}:{}", sessionId, delegateStart, endPeerIndex);
-    SendToPeerWithRetries(server, sessionId, peer, failure, postTarget, RegistryContentEncoding);
-    SendWriteCkptCompleteToPeers(server, sessionId, topo, failure, startPeerIndex, delegateStart);
+    auto const  postTarget
+        = fmt::format("/api/peer/writeckptcomplete/{}/0/{}?fwd={}:{}", sessionId, snapshotId, delegateStart, endPeerIndex);
+    SendToPeerWithRetries(server, sessionId, peer, failure, postTarget, {});
+    SendWriteCkptCompleteToPeers(server, sessionId, topo, snapshotId, failure, startPeerIndex, delegateStart);
 }
 
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
@@ -1000,7 +1003,7 @@ template <> struct fmt::formatter<WaitingForRanks> : fmt::formatter<std::string_
 };
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr)
+void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hdr) noexcept
 {
     // Ranks on the coordinator peer (peers[0]) record their finalize/write-complete
     // locally; only ranks on other peers forward those notifications to the coordinator.
@@ -1475,6 +1478,7 @@ void Session::BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const
     SendWriteCkptCompleteToPeers(server,
                                  sessionId,
                                  topo,
+                                 snapshot.snapshotId,
                                  snapshot.failures.empty() ? std::string_view{} : fmt::format("{}", fmt::join(snapshot.failures, ",")),
                                  1,
                                  topo.peers.size());

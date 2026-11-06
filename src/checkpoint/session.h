@@ -114,10 +114,7 @@ struct Session
         return std::ranges::all_of(snapshots, [&](auto const& entry) { return entry.second->complete; });
     }
 
-    // Map a wait-for-finalize iteration to a concrete snapshotId. A non-negative iteration is the
-    // snapshotId directly. A negative iteration is an index from the newest known snapshot
-    // (-1 = latest, -2 = second-latest, ...), resolved against the ordered `snapshots` map (or the
-    // evicted-durable highwater when nothing is resident). Returns false if not yet resolvable.
+    // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
     bool IsSnapshotComplete(checkpoint::ipc::SnapshotId snapshotId) const;
 
@@ -131,15 +128,10 @@ struct Session
 #endif
 
     void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
-    void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr);
+    void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
     void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
-    // void SendToPeerWithRetries_(std::string_view const& peer,
-    //                             std::string_view const& body,
-    //                             std::string_view const& target,
-    //                             std::string_view const& contentEncoding) const;
-
     void SendPeerSnapshotComplete_(std::string_view const&                           peer,
                                    checkpoint::ipc::Message::FinalizeSnapshot const& msg,
                                    std::string                                       failure) const;
