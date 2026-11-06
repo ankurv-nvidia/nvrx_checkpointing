@@ -1139,11 +1139,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
         }
         checkpoint::distcp::WriteRankShard(
             snapshot.path.parent_path(), hdr.globalRank, *dedupedGlobalRegistry, localState.tensorStorage, localState.blobs);
-        if (notifyCoordinator)
-        {
-            SendPeerWriteCkptComplete_(
-                topo.peers[0], hdr, snapshot.failures.empty() ? "" : fmt::format("{}", fmt::join(snapshot.failures, ", ")));
-        }
+        if (notifyCoordinator) { SendPeerWriteCkptComplete_(topo.peers[0], hdr, {}); }
         // A peer may declare its local shard complete only after the coordinator has
         // acknowledged the notification. Rank 0 is delayed further, until metadata is durable.
         if (hdr.globalRank != Rank{0})
@@ -1475,16 +1471,16 @@ void Session::SendLocalShardedStateRegistryToPeerWithRetries_(cipc::Rank rank, s
 void Session::BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const
 {
     if (topo.peers.size() <= 1) { return; }
-    SendWriteCkptCompleteToPeers(server,
-                                 sessionId,
-                                 topo,
-                                 snapshot.snapshotId,
-                                 snapshot.failures.empty() ? std::string_view{} : fmt::format("{}", fmt::join(snapshot.failures, ",")),
-                                 1,
-                                 topo.peers.size());
+    std::string failure;
+    {
+        std::scoped_lock lock(mutex);
+        failure = fmt::format("{}", fmt::join(snapshot.failures, ","));
+    }
+    SendWriteCkptCompleteToPeers(server, sessionId, topo, snapshot.snapshotId, failure, 1, topo.peers.size());
 
     INFO("[{}#{}] Broadcast global registry to {} peer(s)", *server, sessionId, topo.peers.size() - 1);
 }
+
 void Session::BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const
 {
     if (topo.peers.size() <= 1) { return; }
@@ -2313,10 +2309,14 @@ void Server::FindOrWaitForSessionAndSnapshot_(std::string_view context,
             if (it == _activeSessions.end()) { continue; }
 
             std::scoped_lock<std::mutex> lock2(it->second->mutex);
-            auto                         it2 = it->second->snapshots.find(snapshotId);
-            if (it2 == it->second->snapshots.end() || it2->second->path.empty()) { continue; }
+            auto&                        snapshot = it->second->snapshots[snapshotId];
+            if (!snapshot)
+            {
+                snapshot             = std::make_unique<Session::Snapshot>();
+                snapshot->snapshotId = snapshotId;
+            }
 
-            lambda(*it->second, *it2->second);
+            lambda(*it->second, *snapshot);
         }
         INFO("[{}#{}] {} snapshot={} complete", *this, sessionId, context, snapshotId);
         return;
@@ -2360,7 +2360,10 @@ void Server::NotifySnapshotComplete_(cipc::SessionId sessionId, cipc::SnapshotId
                                      snapshotId,
                                      [&](Session& /* session */, Session::Snapshot& snapshot) {
                                          snapshot.finalizedRanks.insert(fromRank);
-                                         snapshot.failures.push_back(fmt::format("rank={} Finalize failed: {}", fromRank, failure));
+                                         if (!failure.empty())
+                                         {
+                                             snapshot.failures.push_back(fmt::format("rank={} Finalize failed: {}", fromRank, failure));
+                                         }
                                      });
 }
 
@@ -2369,9 +2372,16 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotI
     FindOrWaitForSessionAndSnapshot_(fmt::format("NotifyWriteCkptComplete rank={}", fromRank),
                                      sessionId,
                                      snapshotId,
-                                     [&](Session& /* session */, Session::Snapshot& snapshot) {
-                                         snapshot.writeCkptCompletedRanks.insert(fromRank);
-                                         snapshot.failures.push_back(fmt::format("rank={} WriteCkpt failed: {}", fromRank, failure));
+                                     [&](Session& session, Session::Snapshot& snapshot) {
+                                         auto const onCoordinator = session.IsCoordinatorPeer();
+                                         if (onCoordinator) { snapshot.writeCkptCompletedRanks.insert(fromRank); }
+                                         if (!failure.empty())
+                                         {
+                                             snapshot.failures.push_back(
+                                                 onCoordinator ? fmt::format("rank={} WriteCkpt failed: {}", fromRank, failure)
+                                                               : std::move(failure));
+                                         }
+                                         if (!onCoordinator) { snapshot.complete = true; }
                                      });
 }
 
@@ -2644,7 +2654,9 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
     auto const            deadline     = std::chrono::steady_clock::now() + ServerWaitTimeout;
     stream.expires_never();
 
-    std::string failure;
+    std::string      failure;
+    cipc::SnapshotId snapshotId{cipc::SnapshotId::Invalid};
+    bool             resolved = false;
     while (true)
     {
         if (_stopRequested)
@@ -2652,19 +2664,29 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
             failure = "checkpoint finalization aborted because the server is stopping";
             break;
         }
+        try
         {
             std::scoped_lock lock(_mutex);
             auto             it = _activeSessions.find(sessionId);
-            if (it == _activeSessions.end()) { continue; }
-            auto&            session = *it->second;
-            cipc::SnapshotId snapshotId{cipc::SnapshotId::Invalid};
-            if (!session.ResolveSnapshotId(iteration, snapshotId)) { continue; }
-            auto& snapshot = session.GetSnapshot_(lock, snapshotId);
-            if (snapshot.complete)
+            if (it != _activeSessions.end())
             {
-                failure = fmt::format("snapshot has failures: {}", fmt::join(snapshot.failures, ", "));
-                break;
+                auto& session = *it->second;
+                if (!resolved) { resolved = session.ResolveSnapshotId(iteration, snapshotId); }
+                std::scoped_lock sessionLock(session.mutex);
+                auto const       snapshot = session.snapshots.find(snapshotId);
+                if (resolved && snapshot != session.snapshots.end() && snapshot->second->complete)
+                {
+                    if (!snapshot->second->failures.empty())
+                    {
+                        failure = fmt::format("snapshot={} has failures: {}", snapshotId, fmt::join(snapshot->second->failures, ", "));
+                    }
+                    break;
+                }
             }
+        } catch (std::exception const& ex)
+        {
+            failure = ex.what();
+            break;
         }
         if (std::chrono::steady_clock::now() >= deadline)
         {
@@ -2767,6 +2789,16 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::write(stream, res);
         // TODO_NOSTALL : move it before we send 200 once we dont stall for session+snaphot anymore
         NotifyWriteCkptComplete_(sessionId, snapshotId, rank, parser.get().body());
+        if (auto const fwdParam = url.params().find("fwd"); fwdParam != url.params().end())
+        {
+            auto const range     = (*fwdParam).value;
+            auto const separator = range.find(':');
+            auto const fwdStart  = boost::lexical_cast<size_t>(range.substr(0, separator));
+            auto const fwdEnd    = boost::lexical_cast<size_t>(range.substr(separator + 1));
+            FindOrWaitForSession_("ReceiveWriteCkptComplete", sessionId, [&](Session& session) {
+                SendWriteCkptCompleteToPeers(this, sessionId, session.topo, snapshotId, parser.get().body(), fwdStart + 1, fwdEnd);
+            });
+        }
     }
     // The global registry for a snapshot (body = deflated serialized tree).
     else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))

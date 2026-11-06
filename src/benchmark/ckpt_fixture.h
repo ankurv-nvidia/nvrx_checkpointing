@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -16,6 +17,8 @@
 #include <vector>
 
 using FixtureFunc = void (*)(StateTree& tree, std::filesystem::path const& ckptDir);
+
+inline constexpr uint32_t NumSnapshots = 5;
 
 struct CheckpointTestContext
 {

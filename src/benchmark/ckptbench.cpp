@@ -1,4 +1,5 @@
 #include "CommonMacros.h"
+#include "checkpoint.h"
 #include "ckpt_fixture.h"
 #include "server.h"
 
@@ -21,14 +22,19 @@ namespace
 SUPPRESS_WARNINGS_START
 SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
 SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-CheckpointTestContext Ctx;    // NOLINT
+CheckpointTestContext Ctx;                         // NOLINT
+bool                  CheckpointsSaved = false;    // NOLINT
 SUPPRESS_WARNINGS_END
 
 constexpr std::string_view KDefaultCkptDir = "/tmp/checkpoint_bench";
 
 void BM_SaveCheckpoint(benchmark::State& benchState)    // NOLINT(readability-identifier-naming,llvm-prefer-static-over-anonymous-namespace)
 {
-    for (auto _ : benchState) { RunOnAllRanks(Ctx, &SaveCheckpointOnly, KDefaultCkptDir); }
+    for (auto _ : benchState)
+    {
+        RunOnAllRanks(Ctx, &SaveCheckpointOnly, KDefaultCkptDir);
+        CheckpointsSaved = true;
+    }
 }
 
 SUPPRESS_WARNINGS_START
@@ -85,6 +91,13 @@ try
     benchmark::Shutdown();
 
     JoinClientThreads(Ctx, tasks);
+    if (CheckpointsSaved)
+    {
+        for (uint32_t snapshot = 1; snapshot <= NumSnapshots; ++snapshot)
+        {
+            WaitForCkptFinalize(static_cast<uint32_t>(Ctx.globalRegistry->SessionId()), snapshot);
+        }
+    }
     if (!Ctx.outofproc)
     {
         // Keep disk I/O outside BM_SaveCheckpoint while ensuring the in-process
@@ -96,6 +109,7 @@ try
     return 0;
 } catch (std::exception const& e)
 {
+    if (!Ctx.outofproc) { StopInprocServer(); }
     fmt::print(stderr, "Exception: {}\n", e.what());
     return 1;
 }
