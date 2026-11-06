@@ -67,7 +67,7 @@ def release(api: Api, repo: str, sha: str) -> dict:
         "target_commitish": sha,
         "name": "Wheels from main",
         "body": (
-            "CI adds the wheels of every main build that passes its gates to this release.\n\n"
+            "CI publishes wheels here as soon as the main wheel builds succeed.\n\n"
             f"Install with `pip install --pre --index-url {index_url(repo)} {PROJECT}`."
         ),
         "prerelease": True,
@@ -128,7 +128,7 @@ def write_index(site: Path, repo: str, published: list[dict], digests: dict[str,
     (project / "index.html").write_text(_page(f"Links for {PROJECT}", links))
     (site / "index.html").write_text(
         f"<!DOCTYPE html>\n<html>\n  <head><title>{PROJECT} wheels</title></head>\n  <body>\n"
-        f"    <p>Wheels from every main build of {html.escape(repo)} that passes CI. Install with:</p>\n"
+        f"    <p>Wheels built on main for {html.escape(repo)}. Install with:</p>\n"
         f"    <pre>python3 -m pip install --upgrade --pre --index-url {index_url(repo)} {PROJECT}</pre>\n"
         "    <p>The aarch64 wheel targets Grace (Neoverse V2) CPUs.</p>\n"
         f'    <p><a href="simple/{PROJECT}/">All published wheels</a></p>\n  </body>\n</html>\n',
