@@ -186,14 +186,23 @@ Build and workload results are recorded here as they become available.
 ### Remote validation
 
 - Implementation commit `d2625aa9` is pushed to `origin/no_replica_id`.
-- Initial CI run `42350483257` passes both x86-64 and ARM64 wheel builds. The
-  combined local native run identifies the test-session isolation issue above;
-  a follow-up commit and fresh CI run validate that correction.
-- GB200 eight-node run `42350485730` passes its ARM64 wheel build and starts
-  the JET image build. It selects both native `nano3-8x4` deterministic and
-  performance workloads on the `dlalgo-ci/oci-hsg` configuration.
-- Full CI also selects both GB300 native `nano4-8x4` workloads on
-  `dlalgo-ci/nsc-lhr-slurm-1`. Workload verdicts remain pending.
+- Initial CI run `42350483257` passes both wheel builds before the replacement
+  run supersedes it. The follow-up test-isolation commit is `2b17145f`.
+- Fresh CI run `42351227684` passes both wheel builds, all four platform image
+  builds, **509 Python tests** with 39 expected skips, and the combined native
+  suite (**64 passed / 1 expected skip / 818 assertions**). Its CTest job passes
+  **83 checks** and all GPU stress gates.
+- GB200 eight-node run `42350485730` passes its ARM64 wheel and image builds.
+  Both native `nano3-8x4` workloads run on `dlalgo-ci/oci-hsg`: deterministic
+  GitHub job `128341190202` / Slurm `8703635`, and performance GitHub job
+  `128341190228` / Slurm `8703632`. Both allocations start at 07:36:26 UTC on
+  2026-11-07; runtime setup is active at the latest poll.
+- Fresh CI selects both GB300 native `nano4-8x4` workloads on
+  `dlalgo-ci/nsc-lhr-slurm-1`: deterministic GitHub job `128342103263` / Slurm
+  `658393`, and performance GitHub job `128342103271` / Slurm `658396`. The
+  deterministic allocation starts at 07:42:54 UTC on 2026-11-07. At 07:45 UTC,
+  performance waits for scheduler priority without a start estimate.
+- Eight-node workload verdicts and the overall CI gate remain pending.
 
 ### Remaining validation limit
 
