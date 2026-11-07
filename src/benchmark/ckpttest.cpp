@@ -1252,13 +1252,13 @@ static boost::beast::http::status PostToTestServer(std::string const& target, st
     return response.result();
 }
 
-static std::shared_ptr<StateTree> GetTestSnapshotPlan(Rank rank)
+static std::shared_ptr<StateTree> GetTestSnapshotPlan(Rank rank, checkpoint::ipc::SessionId sessionId = checkpoint::ipc::SessionId::Default)
 {
     namespace http = boost::beast::http;
     boost::asio::io_context  ioc;
     boost::beast::tcp_stream stream(ioc);
     stream.connect({boost::asio::ip::address_v4::loopback(), checkpoint::ipc::Message::Port});
-    http::request<http::empty_body> request{http::verb::get, fmt::format("/api/snapshot-plan/0/{}", rank), 11};
+    http::request<http::empty_body> request{http::verb::get, fmt::format("/api/snapshot-plan/{}/{}", sessionId, rank), 11};
     request.set(http::field::host, "localhost");
     http::write(stream, request);
     boost::beast::flat_buffer                buffer;
@@ -1483,8 +1483,9 @@ TEST_CASE("a shard write failure reaches the finalize caller", "[server][finaliz
 
 TEST_CASE("snapshot descriptors larger than a shared-memory slot save successfully", "[server][planning][tier2]")
 {
-    auto const logDir        = CkptDir("large_snapshot_descriptor");
-    auto const checkpointDir = logDir / "iteration40";
+    static constexpr uint32_t TestSessionId = 61;
+    auto const                logDir        = CkptDir("large_snapshot_descriptor");
+    auto const                checkpointDir = logDir / "iteration40";
     std::filesystem::remove_all(logDir);
     std::filesystem::create_directories(checkpointDir);
     std::array<char const*, 3> const options{
@@ -1512,7 +1513,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
             ::unsetenv(options[i]);
         }
     }
-    StateTree         tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
+    StateTree         tree(checkpoint::ipc::SessionId{TestSessionId}, SingleRankTopo());
     std::string const suffix(128, 'x');
     for (uint32_t index = 0; index < 512; ++index)
     {
@@ -1524,7 +1525,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
     tree.AddChild(StateNode::Handle::Root, "payload").data = StateNode::DynamicSizeBlob{
         .replicas = {Rank{0}}, .handle = reinterpret_cast<uint64_t>(bytes.data()), .storageSize = bytes.size()};
     FinalizeStateRegistry(tree);
-    auto selected = checkpoint::planning::BindSnapshot(*GetTestSnapshotPlan(Rank{0}), tree);
+    auto selected = checkpoint::planning::BindSnapshot(*GetTestSnapshotPlan(Rank{0}, checkpoint::ipc::SessionId{TestSessionId}), tree);
     checkpoint::planning::AssignPayloadOffsets(*selected);
     std::ostringstream descriptor;
     StateSerDes::Write(descriptor, *selected, StateNode::Handle::Root);
@@ -1532,7 +1533,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
     REQUIRE(descriptor.str().size() > queue.SlotSize());
     REQUIRE(selected->GetTotalPayloadSizeInBytes() < queue.SlotSize());
     REQUIRE_NOTHROW(SaveCheckpoint(tree, checkpoint::ipc::SnapshotId{40}, checkpointDir));
-    auto       durable = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
+    auto       durable = std::async(std::launch::async, [] { WaitForCkptFinalize(TestSessionId, 40); });
     auto const status  = durable.wait_for(std::chrono::seconds{10});
     if (status != std::future_status::ready) { CHECK(server.Stop()); }
     REQUIRE(status == std::future_status::ready);

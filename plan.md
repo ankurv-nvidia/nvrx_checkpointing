@@ -151,6 +151,8 @@ Build and workload results are recorded here as they become available.
 - The multi-rank fixture uses a stop-aware condition-variable predicate. GDB
   confirmed that its earlier bare wait could miss shutdown after all checkpoint
   work completed. The round-trip test also waits for durability before teardown.
+- The large-descriptor regression uses a distinct session so its cached client
+  plan stays isolated from other daemon lifetimes in a combined native run.
 - Generic local traversal still visits all state and serializes immediate blob
   values into temporary client buffers. Only assigned payloads are transferred,
   retained by the daemon, and written to disk. Tensor capture is selected-only.
@@ -169,6 +171,9 @@ Build and workload results are recorded here as they become available.
 - Native DCP checks: **17 cases / 232 assertions passed**.
 - Native service/shared-memory cases, isolated as in CTest:
   **23 cases / 354 assertions passed**.
+- Complete native suite in one process: **64 passed, 1 expected skip, and
+  818 assertions passed**. The skip requires an explicit registry fixture, which
+  the separate two-daemon round trip supplies.
 - Actual two-daemon loopback round trip: **eight CPU ranks, eight replicated
   tensors, five durable snapshots**, followed by independent PyTorch DCP loading
   of all eight tensors. Each snapshot captures **128 bytes from 1024 aggregate
@@ -177,6 +182,18 @@ Build and workload results are recorded here as they become available.
   activation and source-buffer lifetime fixes.
 - Formatting and `git diff --check` pass. Ruff reports **zero new findings**
   against the target branch; eight pre-existing test lint findings remain.
+
+### Remote validation
+
+- Implementation commit `d2625aa9` is pushed to `origin/no_replica_id`.
+- Initial CI run `42350483257` passes both x86-64 and ARM64 wheel builds. The
+  combined local native run identifies the test-session isolation issue above;
+  a follow-up commit and fresh CI run validate that correction.
+- GB200 eight-node run `42350485730` passes its ARM64 wheel build and starts
+  the JET image build. It selects both native `nano3-8x4` deterministic and
+  performance workloads on the `dlalgo-ci/oci-hsg` configuration.
+- Full CI also selects both GB300 native `nano4-8x4` workloads on
+  `dlalgo-ci/nsc-lhr-slurm-1`. Workload verdicts remain pending.
 
 ### Remaining validation limit
 
