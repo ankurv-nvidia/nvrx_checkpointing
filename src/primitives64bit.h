@@ -147,6 +147,8 @@ struct Primitives64Bit
 
     [[nodiscard]] Type GetType() const { return _type; }
 
+    void ClearValue() { _val.u = 0; }
+
     constexpr bool operator==(Primitives64Bit const& rhs) const { return _type == rhs._type && _val.u == rhs._val.u; }
 
     template <typename T> explicit Primitives64Bit(T const& val) : _type(Traits<T>::Type()) { Traits<T>::Assign(*this, val); }

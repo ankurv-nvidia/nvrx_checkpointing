@@ -11,6 +11,7 @@
 #include "server.h"
 #include "session.h"
 #include "shm_ring_buffer.h"
+#include "snapshot_plan.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "telemetry.h"
@@ -45,6 +46,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -134,6 +136,7 @@ struct Server
 
     void SpinDownWaitLoop_(tcp_stream stream);
     void FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration);
+    void SnapshotPlanWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, Rank rank);
     void HandleRequest_(tcp_stream& stream);
 
 #ifdef SO_REUSEPORT
@@ -192,10 +195,8 @@ struct Server
     // TODO_NOPENDING_STRUCT
     struct PendingSessionData
     {
-        PerfClock::time_point                         receivedAt;
-        Rank                                          recvFrom{Rank::Invalid};
-        std::vector<TensorShardInfo>                  tensorShards;
-        std::vector<std::pair<std::string, uint64_t>> blobMetas;
+        Rank                       recvFrom{Rank::Invalid};
+        std::shared_ptr<StateTree> registry;
     };
 
     std::unordered_map<cipc::SessionId, std::vector<std::unique_ptr<PendingSessionData>>> _pendingSessionData;
@@ -226,20 +227,7 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
 
 namespace
-{
-struct TensorReplicaDeduplicationStats
-{
-    size_t                logicalShards{};
-    size_t                replicasRemoved{};
-    std::vector<uint64_t> assignedBytesPerRank;
-};
-
-struct TensorReplicaDeduplicationResult
-{
-    std::shared_ptr<StateTree>      dedupedRegistry;
-    TensorReplicaDeduplicationStats stats;
-};
-}    // namespace
+{}    // namespace
 
 // Every rank of a run pads to the digit count of the world size so a plain name sort orders the dumps by rank.
 static std::string RankRegistryDumpName(Rank rank, Rank worldSize)
@@ -266,17 +254,9 @@ static void DumpRegistry(std::string_view fileName, std::function<void(std::ostr
     } catch (std::exception const& ex) { WARN("Failed to dump registry {}: {}", fileName, ex.what()); }
 }
 
-static void
-WriteGlobalStateTreeToFile(std::ostream& ostrm, Server const* const server, cipc::SessionId sessionId, Session::Snapshot const& snapshot)
+static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId sessionId, StateTree const& registry)
 {
-    auto start1 = PerfClock::now();
-    StateSerDes::Write(ostrm, *snapshot.globalRegistry, StateNode::Handle::Root);
-    INFO("[{}#{}] Accumulated all localState for global State: Dumped states in {}", *server, sessionId, (PerfClock::now() - start1));
-}
-
-static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId sessionId, Session::Snapshot const& snapshot)
-{
-    snapshot.globalRegistry->WalkNodes([&](StateNode const& node) {
+    registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::Tensor)
         {
@@ -284,7 +264,7 @@ static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId 
                 "[native_ckpt:svr][{}#{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
                 *server,
                 sessionId,
-                snapshot.globalRegistry->GetNodeId(node.handle)));
+                registry.GetNodeId(node.handle)));
         }
         if (type == StateNode::Type::DTensor)
         {
@@ -292,117 +272,12 @@ static void ValidateGlobalStateTree(Server const* const server, cipc::SessionId 
             for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
             if (tnsr.shards.empty())
             {
-                WARN("[{}#{}] empty sharded tensor='{}' in metadata output",
-                     *server,
-                     sessionId,
-                     snapshot.globalRegistry->GetNodeId(node.handle));
+                WARN("[{}#{}] empty sharded tensor='{}' in metadata output", *server, sessionId, registry.GetNodeId(node.handle));
                 return;
             }
-            snapshot.globalRegistry->AssertShardedTensorHasNoHoles(node.handle);
+            registry.AssertShardedTensorHasNoHoles(node.handle);
         }
     });
-}
-
-// Build a separate storage registry with one deterministic owner for every
-// logical tensor shard. The merged source registry remains unchanged. Replica
-// identity comes exclusively from normalized server metadata (FQN + dtype +
-// full shape + global shard range).
-// TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-// This information should be used to correctly identify and deduplicate tensor replicas and identify the tensors needing snapshots
-static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree const& registry, uint32_t worldSize)
-{
-    if (worldSize == 0) { throw std::invalid_argument("Cannot deduplicate tensor replicas with worldSize=0"); }
-
-    auto dedupedRegistry = registry.Clone();
-
-    struct LogicalShard
-    {
-        StateNode::Handle           nodeHandle{StateNode::Handle::Invalid};
-        std::string                 fqn;
-        Tensor::DimRange            sharddim;
-        uint64_t                    sizeBytes{};
-        std::vector<DTensor::Shard> candidates;
-    };
-
-    std::vector<LogicalShard> logicalShards;
-    registry.WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
-        auto const& tnsr = std::get<DTensor>(node.data);
-
-        std::map<Tensor::DimRange, std::vector<DTensor::Shard>> candidatesByRange;
-        for (auto const& shard : tnsr.shards)
-        {
-            auto const rank = static_cast<uint32_t>(shard.rank);
-            if (rank >= worldSize)
-            {
-                throw std::runtime_error(fmt::format("Tensor '{}' shard {} has owner rank {} outside world size {}",
-                                                     registry.GetNodeId(node.handle),
-                                                     shard.sharddim,
-                                                     rank,
-                                                     worldSize));
-            }
-            candidatesByRange[shard.sharddim].push_back(shard);
-        }
-
-        auto const fqn = registry.GetNodeId(node.handle);
-        for (auto& [sharddim, candidates] : candidatesByRange)
-        {
-            logicalShards.push_back({
-                .nodeHandle = node.handle,
-                .fqn        = fqn,
-                .sharddim   = sharddim,
-                .sizeBytes  = candidates.front().StorageSizeBytes(),
-                .candidates = std::move(candidates),
-            });
-        }
-    });
-
-    // Mirror the fully-parallel writer's deterministic greedy policy without
-    // consulting replica_id or process-group hints: constrained shards first,
-    // then larger shards, then stable logical identity.
-    std::ranges::sort(logicalShards, [](LogicalShard const& lhs, LogicalShard const& rhs) {
-        if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
-        if (lhs.sizeBytes != rhs.sizeBytes) { return lhs.sizeBytes > rhs.sizeBytes; }
-        if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
-        return lhs.sharddim < rhs.sharddim;
-    });
-
-    TensorReplicaDeduplicationStats stats;
-    stats.logicalShards = logicalShards.size();
-    stats.assignedBytesPerRank.resize(worldSize, 0);
-    std::map<StateNode::Handle, std::vector<DTensor::Shard>> selectedByNode;
-
-    for (auto const& logicalShard : logicalShards)
-    {
-        auto const* selected = &logicalShard.candidates.front();
-        for (auto const& candidate : logicalShard.candidates)
-        {
-            auto const candidateRank = static_cast<uint32_t>(candidate.rank);
-            auto const selectedRank  = static_cast<uint32_t>(selected->rank);
-            if (stats.assignedBytesPerRank[candidateRank] < stats.assignedBytesPerRank[selectedRank]
-                || (stats.assignedBytesPerRank[candidateRank] == stats.assignedBytesPerRank[selectedRank] && candidateRank < selectedRank))
-            {
-                selected = &candidate;
-            }
-        }
-
-        auto const selectedRank = static_cast<uint32_t>(selected->rank);
-        stats.assignedBytesPerRank[selectedRank] += logicalShard.sizeBytes;
-        stats.replicasRemoved += logicalShard.candidates.size() - 1;
-        selectedByNode[logicalShard.nodeHandle].push_back(*selected);
-    }
-
-    dedupedRegistry->WalkNodes([&](StateNode& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
-        auto& tnsr = std::get<DTensor>(node.data);
-        if (tnsr.shards.empty()) { return; }
-
-        DTensor selected(tnsr.durableDtype, tnsr.fulldim);
-        for (auto const& shard : selectedByNode.at(node.handle)) { selected.AddShard(shard); }
-        tnsr = std::move(selected);
-    });
-
-    return {.dedupedRegistry = std::move(dedupedRegistry), .stats = std::move(stats)};
 }
 
 [[maybe_unused]] static void DebugDumpLocalStateTreeKVP(std::filesystem::path const& fname, StateTree const& state)
@@ -432,7 +307,10 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
                 fmt::print(ostrm, "{}: {}\n", name, scalar.template Cast<bool>());
             }
         }
-        else if (type == StateNode::Type::Blob) { fmt::print(ostrm, "{}: [blob]\n", name); }
+        else if (type == StateNode::Type::DynamicSizeBlob || type == StateNode::Type::FixedSizeBlob)
+        {
+            fmt::print(ostrm, "{}: [blob]\n", name);
+        }
         else if (type == StateNode::Type::Tensor)
         {
             auto const& tnsr = std::get<Tensor>(node.data);
@@ -596,78 +474,6 @@ static std::string_view DTypeToTorchStr(Tensor::DType dtype)
 }
 #endif
 
-// Peer registry-fragment record tags. A fragment stream is a sequence of
-// tag-prefixed records terminated by a clean end-of-stream at a record boundary:
-// tensor shards (the merged global tensor view) followed by ShardedObject metadata
-// (fqn + length; the owning rank writes the bytes itself).
-static constexpr uint8_t PeerRecordTensor = 0;
-static constexpr uint8_t PeerRecordBlob   = 1;
-
-static void WriteTensorShardInfo(std::ostream& ostrm, TensorShardInfo const& info)
-{
-    serdes::WriteTrivial(ostrm, info.durableDtype);
-    serdes::WriteTrivial(ostrm, info.fulldim);
-    serdes::WriteTrivial(ostrm, info.tensorInfo);
-    serdes::WriteBlobWithSize<uint32_t>(ostrm, info.nodeId);
-}
-
-static void ValidateLocalTensorMetadata(StateTree const& registry)
-{
-    std::unordered_set<StateTree::NodeId> tensorNodeIds;
-    registry.WalkNodes([&](StateNode const& node) {
-        auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
-
-        auto const nodeId = registry.GetNodeId(node.handle);
-        if (!tensorNodeIds.insert(nodeId).second)
-        {
-            throw std::runtime_error(
-                fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
-        }
-        if (type != StateNode::Type::DTensor) { return; }
-
-        for (auto const& shard : std::get<DTensor>(node.data).shards)
-        {
-            if (shard.rank != registry.Topo().rank)
-            {
-                throw std::runtime_error(
-                    fmt::format("Local tensor '{}' has shard rank={} but registry rank={}", nodeId, shard.rank, registry.Topo().rank));
-            }
-        }
-    });
-}
-
-template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& registry, TLambda const& lambda)
-{
-    auto rank = registry.Topo().rank;
-    registry.WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            auto&            tnsr = std::get<Tensor>(node.data);
-            Tensor::DimRange sharddim;
-            for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
-            auto shard = TensorShard{
-                .rank          = rank,
-                .snapshotDtype = tnsr.snapshotDtype,
-                .handle        = tnsr.handle,
-                .storageSize   = tnsr.storageSize,
-                .sharddim      = sharddim,
-                .device        = tnsr.device,
-            };
-            lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
-        }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
-        {
-            auto& tnsr = std::get<DTensor>(node.data);
-            for (auto const& shard : tnsr.shards)
-            {
-                shard.AssertShardIsValid(tnsr.fulldim);
-                lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
-            }
-        }
-    });
-}
-
 static constexpr int              MaxRetries                     = 20;
 static constexpr auto             IntervalBetweenRetries         = std::chrono::milliseconds(100);
 static constexpr auto             ThreadStallWaitForEventTimeout = std::chrono::seconds(30);
@@ -775,12 +581,6 @@ Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::file
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
-Session::LocalState& Session::GetSessionLocalState_(cipc::Rank rank) LFTBND
-{
-    std::scoped_lock lock(mutex);
-    return *sessionState.localStates[rank];
-}
-
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
 {
     std::scoped_lock lock(mutex);
@@ -816,7 +616,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
             "[native_ckpt:svr][{}#{}][ERROR] Failed to open native metadata file for writing: {}", *server, sessionId, tmpFile));
     }
 
-    if (snapshot.globalRegistry == nullptr)
+    if (snapshot.storageRegistry == nullptr)
     {
         throw std::runtime_error(
             fmt::format("[native_ckpt:svr][{}#{}][ERROR] Active global state is null when finalizing snapshot={} for session id={}",
@@ -826,7 +626,7 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
                         sessionId));
     }
 
-    auto& globalState = *snapshot.globalRegistry;
+    auto& globalState = *snapshot.storageRegistry;
 
     // Collect as a vector so we can sort and emit in stable lexicographic order.
     std::vector<std::pair<std::string, std::string>> entries;
@@ -858,28 +658,28 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
     for (auto const& [localRank, localState] : snapshot.localStates)
     {
         std::vector<uint16_t> dequantized;
-        localState->localRegistry->WalkNodes([&](StateNode const& node) {
+        localState->snapshotRegistry->WalkNodes([&](StateNode const& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
             if (type == StateNode::Type::Tensor)
             {
                 auto const&      tnsr = std::get<Tensor>(node.data);
                 Tensor::DimRange sharddim;
                 for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
-                auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
+                auto const localFqn = localState->snapshotRegistry->GetNodeId(node.handle);
                 localShardHandleMap.emplace(makeShardHandleKey(localRank, localFqn, sharddim), tnsr.handle);
                 addmd5(fmt::format("{}[{}]", localFqn, sharddim),
                        ComputeLogicalShardMd5Hex(
-                           localState->tensorStorage, tnsr.durableDtype, sharddim, tnsr.handle, tnsr.StorageSizeBytes(), dequantized));
+                           localState->snapshotData, tnsr.durableDtype, sharddim, tnsr.handle, tnsr.StorageSizeBytes(), dequantized));
             }
             else if (type == StateNode::Type::DTensor)
             {
                 auto const& tnsr = std::get<DTensor>(node.data);
                 for (auto const& shard : tnsr.shards)
                 {
-                    auto const localFqn = localState->localRegistry->GetNodeId(node.handle);
+                    auto const localFqn = localState->snapshotRegistry->GetNodeId(node.handle);
                     localShardHandleMap.emplace(makeShardHandleKey(shard.rank, localFqn, shard.sharddim), shard.handle);
                     addmd5(fmt::format("{}[{}]", localFqn, shard.sharddim),
-                           ComputeLogicalShardMd5Hex(localState->tensorStorage,
+                           ComputeLogicalShardMd5Hex(localState->snapshotData,
                                                      tnsr.durableDtype,
                                                      shard.sharddim,
                                                      shard.handle,
@@ -887,31 +687,14 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
                                                      dequantized));
                 }
             }
-            else if (type == StateNode::Type::Blob)
-            {
-                auto const  localFqn = localState->localRegistry->GetNodeId(node.handle);
-                auto const& blob     = std::get<StateNode::Blob>(node.data);
-                addmd5(std::move(localFqn), ComputeMd5Hex(blob.data(), blob.size()));
-            }
         });
+        auto blobs = checkpoint::distcp::CollectBlobs(*localState->snapshotRegistry, localState->snapshotData, localRank);
+        for (auto const& [name, bytes] : blobs) { addmd5(name, ComputeMd5Hex(bytes.data(), bytes.size())); }
     }
     INFO("[{}#{}] DebugWriteNativeMetadataInfo_ for snapshot={}. Writing global metadata", *server, sessionId, snapshot.name);
     globalState.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type == StateNode::Type::Blob)
-        {
-            auto const nodeId = globalState.GetNodeId(node.handle);
-            auto const md5It  = md5Map.find(nodeId);
-            if (md5It == md5Map.end())
-            {
-                ERR("[{}#{}] Global Blob={} has no matching entry in any local registry", *server, sessionId, nodeId);
-            }
-            else
-            {
-                emit(nodeId + ".bytes.md5sum", md5It->second);
-            }
-            return;
-        }
+        if (type == StateNode::Type::DynamicSizeBlob || type == StateNode::Type::FixedSizeBlob) { return; }
         if (type != StateNode::Type::DTensor) { return; }
         auto const  nodeName = globalState.GetNodeId(node.handle);
         std::string name     = nodeName.starts_with("model.") ? nodeName.substr(std::string_view("model.").size()) : nodeName;
@@ -962,6 +745,14 @@ void Session::DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const    /
             ++i;
         }
     });
+
+    auto blobMetadata = checkpoint::distcp::CollectBlobMetadata(globalState);
+    for (auto const& [name, copies] : blobMetadata)
+    {
+        static_cast<void>(copies);
+        auto const digest = md5Map.find(name);
+        if (digest != md5Map.end()) { emit(name + ".bytes.md5sum", digest->second); }
+    }
 
     std::ranges::sort(entries);
     for (auto const& [key, val] : entries) { fmt::print(ofs, "{}={}\n", key, val); }
@@ -1021,39 +812,26 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     auto& localState = *localStatePtr;
 
     auto const startedAt                   = localState.startedAt;
-    auto const numTensors                  = localState.localRegistry->GetTotalNumTensors();
-    auto const totalTensorStateSizeInBytes = localState.localRegistry->GetTotalTensorStateSizeInBytes();
+    auto const numTensors                  = localState.snapshotRegistry->GetTotalNumTensors();
+    auto const totalTensorStateSizeInBytes = localState.snapshotRegistry->GetTotalTensorStateSizeInBytes();
 
-    auto const localNodeWorldSize = onCoordinatorPeer ? static_cast<uint32_t>(topo.worldSize) : topo.ranksPerPeer;
     try
     {
-        while (true)
         {
-            {
-                std::scoped_lock lock(mutex);
-                if (!snapshot.failures.empty()) { throw std::runtime_error("Aborting Wait for local-state-registry"); }
-                if (receivedFrom.size() >= localNodeWorldSize && receivedFrom.contains(hdr.globalRank))
-                {
-                    if (onCoordinatorPeer && snapshotPtr->globalRegistry == nullptr)
-                    {
-                        snapshotPtr->globalRegistry = sessionState.globalRegistry;
-                    }
-                    break;
-                }
-                INFO(
-                    "[{}#{}] FinalizeSnapshot waiting for snapshot={} local-state-registry {}",
-                    *server,
-                    sessionId,
-                    hdr.snapshotId,
-                    WaitingForRanks{receivedFrom,
-                                    hdr.globalRank,
-                                    static_cast<Rank>(static_cast<uint32_t>(hdr.globalRank) + static_cast<uint32_t>(receivedFrom.size()))});
-            }
-            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to send local state registry"); }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::scoped_lock lock(mutex);
+            if (!snapshot.failures.empty()) { throw std::runtime_error("Snapshot already has failures"); }
+            if (!sessionState.planningFailure.empty()) { throw std::runtime_error(sessionState.planningFailure); }
         }
         if (notifyCoordinator)
         {
+            std::ostringstream registryBody;
+            StateSerDes::Write(registryBody, *localState.snapshotRegistry, StateNode::Handle::Root);
+            SendToPeerWithRetries(server,
+                                  sessionId,
+                                  topo.peers[0],
+                                  registryBody.str(),
+                                  fmt::format("/api/peer/snapshotregistry/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
+                                  {});
             SendToPeerWithRetries(server,
                                   sessionId,
                                   topo.peers[0],
@@ -1061,86 +839,9 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                                   fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
                                   {});
         }
-
-        // Rank 0 dumps and validates the merged registry once every rank has finalized.
-        // TODO_MULTILOCAL_CKPT : For multinode local checkpointing this needs to happen once on each node so designate one rank
-        if (hdr.globalRank == Rank{0})
-        {
-            while (true)
-            {
-                {
-                    std::scoped_lock lock(mutex);
-                    if (!snapshot.failures.empty()) { throw std::runtime_error("Aborting Wait for finalize-snapshots"); }
-                    if (snapshot.finalizedRanks.size() >= static_cast<size_t>(topo.worldSize)) { break; }
-                    INFO("[{}#{}] FinalizeSnapshot waiting for snapshot={} finalized ranks {} of {} remaining... Finalized ranks=[{}]",
-                         *server,
-                         sessionId,
-                         hdr.snapshotId,
-                         static_cast<size_t>(topo.worldSize) - snapshot.finalizedRanks.size(),
-                         static_cast<size_t>(topo.worldSize),
-                         fmt::join(snapshot.finalizedRanks, ","));
-                }
-                if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to finalize snapshot"); }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-            std::shared_ptr<StateTree> globalRegistry;
-            {
-                std::scoped_lock lock(mutex);
-                globalRegistry = snapshot.globalRegistry;
-            }
-
-            PERF() << tel::span::SvrWriteMetadata::Begin{.id
-                                                         = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
-            DumpRegistry("registry.global.bin",
-                         [&](std::ostream& ostrm) { WriteGlobalStateTreeToFile(ostrm, server, sessionId, snapshot); });
-            ValidateGlobalStateTree(server, sessionId, snapshot);
-            PERF() << tel::span::SvrWriteMetadata::End{.id
-                                                       = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
-            BroadcastGlobalRegistryToPeers_(*globalRegistry);
-
-            auto dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(topo.worldSize));
-            INFO("[{}#{}] Selected owners for {} logical tensor shards; removed {} replicas; assigned bytes by rank=[{}]",
-                 *server,
-                 sessionId,
-                 dedupResult.stats.logicalShards,
-                 dedupResult.stats.replicasRemoved,
-                 fmt::join(dedupResult.stats.assignedBytesPerRank, ","));
-            {
-                std::scoped_lock lock(mutex);
-                sessionState.dedupedGlobalRegistry = snapshot.dedupedGlobalRegistry = std::move(dedupResult.dedupedRegistry);
-            }
-        }
-
-        std::shared_ptr<StateTree> dedupedGlobalRegistry;
-        while (true)
-        {
-            SetThreadName("ncs:finwt");
-            {
-                std::scoped_lock lock(mutex);
-                if (!snapshot.failures.empty()) { throw std::runtime_error("Aborting Wait for deduped global registry"); }
-                dedupedGlobalRegistry = sessionState.dedupedGlobalRegistry;
-                if (dedupedGlobalRegistry != nullptr) { break; }
-                INFO("[{}#{}] FinalizeSnapshot waiting for global registry rank={}...", *server, sessionId, hdr.globalRank);
-                snapshot.dedupedGlobalRegistry = sessionState.dedupedGlobalRegistry;
-            }
-            if (stopRequested) { throw std::runtime_error("Stop requested while waiting for global registry"); }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-
-        localState.blobs.clear();
-        localState.localRegistry->WalkNodes([&](StateNode const& node) {
-            if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-            auto        fqn                  = localState.localRegistry->GetNodeId(node.handle);
-            auto const& blob                 = std::get<StateNode::Blob>(node.data);
-            localState.blobs[std::move(fqn)] = std::string_view(blob.data(), blob.size());
-        });
-        if (hdr.globalRank == Rank{0})
-        {
-            std::scoped_lock lock(mutex);
-            snapshot.blobMetadata = blobMetas;
-        }
+        localState.blobs = checkpoint::distcp::CollectBlobs(*localState.snapshotRegistry, localState.snapshotData, hdr.globalRank);
         checkpoint::distcp::WriteRankShard(
-            snapshot.path.parent_path(), hdr.globalRank, *dedupedGlobalRegistry, localState.tensorStorage, localState.blobs);
+            snapshot.path.parent_path(), hdr.globalRank, *localState.snapshotRegistry, localState.snapshotData, localState.blobs);
         if (notifyCoordinator)
         {
             SendToPeerWithRetries(server,
@@ -1186,7 +887,11 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
 #endif
             try
             {
-                checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *dedupedGlobalRegistry, snapshot.blobMetadata);
+                auto const id = tel::Id{.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId};
+                PERF() << tel::span::SvrWriteMetadata::Begin{.id = id};
+                auto blobMetadata = checkpoint::distcp::CollectBlobMetadata(*snapshot.storageRegistry);
+                checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *snapshot.storageRegistry, blobMetadata);
+                PERF() << tel::span::SvrWriteMetadata::End{.id = id};
             } catch (std::exception const& ex)
             {
                 throw std::runtime_error(fmt::format("[{}#{}] WriteMetadata failed for snapshot={} rank={}: {}",
@@ -1236,19 +941,38 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             ex.what());
         if (hdr.globalRank == Rank{0})
         {
-            BroadcastWriteCkptCompleteToPeers_(snapshot);
+            try
+            {
+                BroadcastWriteCkptCompleteToPeers_(snapshot);
+            } catch (std::exception const& notifyError)
+            {
+                ERR("[{}#{}] Failed to broadcast checkpoint failure: {}", *server, sessionId, notifyError.what());
+            }
             std::scoped_lock lock(mutex);
             snapshot.complete = true;
         }
-        else if (notifyCoordinator && !snapshot.complete)
+        else if (notifyCoordinator)
         {
-            SendToPeerWithRetries(server,
-                                  sessionId,
-                                  topo.peers[0],
-                                  failure,
-                                  fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
-                                  {});
-            // snapshot.complete = true; we set complete when we hear back from the coordinator
+            bool reportFailure = false;
+            {
+                std::scoped_lock lock(mutex);
+                reportFailure = !snapshot.complete;
+            }
+            if (reportFailure)
+            {
+                try
+                {
+                    SendToPeerWithRetries(server,
+                                          sessionId,
+                                          topo.peers[0],
+                                          failure,
+                                          fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
+                                          {});
+                } catch (std::exception const& notifyError)
+                {
+                    ERR("[{}#{}] Failed to report checkpoint failure: {}", *server, sessionId, notifyError.what());
+                }
+            }
         }
     }
 
@@ -1300,9 +1024,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
                     }
                     auto& released = *evicted.emplace_back(std::make_unique<Snapshot>());
                     released.localStates.swap(candidate->localStates);
-                    released.blobMetadata.swap(candidate->blobMetadata);
-                    released.globalRegistry.swap(candidate->globalRegistry);
-                    released.dedupedGlobalRegistry.swap(candidate->dedupedGlobalRegistry);
+                    released.storageRegistry.swap(candidate->storageRegistry);
                     --remainingSnapshots;
                 }
             }
@@ -1322,116 +1044,16 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
     }
 }
 
-void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
-{
-    INFO("[{}#{}] MergeFragmentToGlobalState_ shards={}", *server, sessionId, tensorShards.size());
-
-    if (sessionState.globalRegistry == nullptr)
-    {
-        throw std::logic_error("Cannot merge state registry fragments. Global state registry is not initialized");
-    }
-
-    for (auto const& tensorShard : tensorShards)
-    {
-        // tensorShard.tensorInfo.AssertShardIsValid();
-        //  Look up the node by its string NodeId
-        auto it = tensorMap.find(tensorShard.nodeId);
-        if (it == tensorMap.end())
-        {
-            auto const& stateName        = tensorShard.nodeId;
-            auto [childName, parentNode] = sessionState.globalRegistry->FindOrAddNodeByFQN(stateName);
-            // Add the final node which contains the handler
-            auto& child = sessionState.globalRegistry->AddChild(parentNode, childName, true);
-            auto  shTen = DTensor(tensorShard.durableDtype, tensorShard.fulldim);
-            shTen.AddShard(tensorShard.tensorInfo);
-            child.data                    = shTen;
-            tensorMap[tensorShard.nodeId] = child.handle;
-            continue;
-        }
-        auto  nodeHandle = it->second;
-        auto& node       = sessionState.globalRegistry->GetNode(nodeHandle);
-        if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor))
-        {
-            throw std::runtime_error(fmt::format("Received tensor shard for non-sharded tensor='{}' expected-type={} != actual-type={}",
-                                                 tensorShard.nodeId,
-                                                 static_cast<size_t>(StateNode::Type::DTensor),
-                                                 node.data.index()));
-        }
-        auto& tnsr = std::get<DTensor>(node.data);
-        if (tnsr.shards.empty())
-        {
-            throw std::runtime_error(fmt::format("Sharded tensor={} has no shards in metadata output\n", tensorShard.nodeId));
-        }
-
-        if (tnsr.durableDtype != tensorShard.durableDtype || tnsr.fulldim != tensorShard.fulldim)
-        {
-            throw std::runtime_error(fmt::format("Received incompatible replicas for tensor='{}': expected dtype={} full-shape=[{}], got "
-                                                 "dtype={} full-shape=[{}] on rank={}",
-                                                 tensorShard.nodeId,
-                                                 tnsr.durableDtype,
-                                                 tnsr.fulldim,
-                                                 tensorShard.durableDtype,
-                                                 tensorShard.fulldim,
-                                                 tensorShard.tensorInfo.rank));
-        }
-        tnsr.AddShard(tensorShard.tensorInfo);
-    }
-}
-
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
 {
-    boost::asio::io_context  ioc;
-    boost::beast::tcp_stream stream(ioc);
+    std::shared_ptr<StateTree> registry;
     {
-        auto req = CreateRequestForPeer(ioc, stream, peer, fmt::format("/api/peer/shardedstateregistry/{}/{}", sessionId, rank));
-        req.set(boost::beast::http::field::transfer_encoding, "chunked");
-        // req.set(boost::beast::http::field::expect, "100-continue");
-        boost::beast::http::request_serializer<boost::beast::http::buffer_body, boost::beast::http::fields> sr{req};
-        boost::beast::http::write_header(stream, sr);
-
-        // Each record carries logical tensor metadata, a physical shard and its state path.
-        size_t numTensors = 0;
-
-        auto& localState = GetSessionLocalState_(rank);
-        ForeachTensorShardInfo(*localState.localRegistry, [&](TensorShardInfo const& info) {
-            // TODO : use constant sized stack based buffer streams later
-            std::ostringstream oss;
-            serdes::WriteTrivial(oss, PeerRecordTensor);
-            WriteTensorShardInfo(oss, info);
-            boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(oss.str())));
-            numTensors++;
-        });
-
-        // Blob metadata: the coordinator already knows the sending rank, so
-        // send only fqn + length. The bytes stay on this rank and are written locally.
-        size_t numBlobs = 0;
-        localState.localRegistry->WalkNodes([&](StateNode const& node) {
-            if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-            auto const&        blob = std::get<StateNode::Blob>(node.data);
-            std::ostringstream oss;
-            serdes::WriteTrivial(oss, PeerRecordBlob);
-            serdes::WriteTrivial(oss, static_cast<uint64_t>(blob.size()));
-            serdes::WriteBlobWithSize<uint32_t>(oss, localState.localRegistry->GetNodeId(node.handle));
-            boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(oss.str())));
-            numBlobs++;
-        });
-
-        // Write terminal chunk
-        boost::asio::write(stream.socket(), boost::beast::http::make_chunk_last());
-
-        INFO("[{}#{}] Rank={} Successfully sent {} tensor shards and {} Blobs to {}", *server, sessionId, rank, numTensors, numBlobs, peer);
+        std::scoped_lock lock(mutex);
+        registry = sessionState.localStates.at(rank)->localRegistry;
     }
-    // Read the response
-    boost::beast::flat_buffer                                     buffer;
-    boost::beast::http::response<boost::beast::http::string_body> res;
-    boost::beast::http::read(stream, buffer, res);
-
-    if (res.result() != boost::beast::http::status::ok)
-    {
-        throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, res.result_int()));
-    }
-    TryCleanShutdown(stream);
+    std::ostringstream body;
+    StateSerDes::Write(body, *registry, StateNode::Handle::Root);
+    SendToPeerWithRetries(server, sessionId, peer, body.str(), fmt::format("/api/peer/shardedstateregistry/{}/{}", sessionId, rank), {});
 }
 
 static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
@@ -1461,37 +1083,10 @@ static std::shared_ptr<StateTree> InflateRegistry(std::string_view bytes)
 
 void Session::SendLocalShardedStateRegistryToPeerWithRetries_(cipc::Rank rank, std::string const& peer)
 {
-    for (int attempt = 1; attempt <= MaxRetries; ++attempt)
+    try
     {
-        try
-        {
-            SendLocalShardedStateRegistryToPeer_(rank, peer);
-            return;
-        } catch (std::exception const& ex)
-        {
-            if (attempt < MaxRetries)
-            {
-                WARN("[{}#{}] Attempt {} SendLocalShardedStateRegistryToPeer_ rank={} peer={} failed sending shards: {}",
-                     *server,
-                     sessionId,
-                     attempt,
-                     rank,
-                     peer,
-                     ex.what());
-            }
-            else
-            {
-                ERR("[{}#{}] Attempt {} SendLocalShardedStateRegistryToPeer_ rank={} peer={} failed sending shards: {}",
-                    *server,
-                    sessionId,
-                    attempt,
-                    rank,
-                    peer,
-                    ex.what());
-            }
-            std::this_thread::sleep_for(IntervalBetweenRetries);
-        }
-    }
+        SendLocalShardedStateRegistryToPeer_(rank, peer);
+    } catch (std::exception const& error) { FailPlanning_(error.what()); }
 }
 
 void Session::BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const
@@ -1545,52 +1140,32 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         throw std::invalid_argument(
             fmt::format("Local state registry declares {} bytes but only {} bytes were received", hdr.messageSize, buf.size()));
     }
-    BufStream istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
-    auto      localRegistry = StateSerDes::Read(istrm);
+    BufStream                  istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
+    std::shared_ptr<StateTree> localRegistry = StateSerDes::Read(istrm);
     if (localRegistry->SessionId() != sessionId)
     {
         throw std::invalid_argument(
             fmt::format("Local registry session {} does not match request session {}", localRegistry->SessionId(), sessionId));
     }
-    ValidateLocalTensorMetadata(*localRegistry);
+    checkpoint::planning::NormalizeLocal(*localRegistry);
+    checkpoint::planning::ValidateLocalRegistry(*localRegistry);
     Rank rank         = localRegistry->Topo().rank;
     auto snapshotSize = localRegistry->GetTotalSnapshotStateSizeInBytes();
     auto registryTopo = localRegistry->Topo();
 
-    // Reset tensor handles to be offsets in the local tensor storage.
-    uint64_t offset = 0;
-    localRegistry->WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            auto& tnsr  = std::get<Tensor>(node.data);
-            tnsr.handle = offset;
-            offset += tnsr.StorageSizeBytes();
-        }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
-        {
-            auto&                 tnsr = std::get<DTensor>(node.data);
-            decltype(tnsr.shards) newShards;
-            for (auto shard : tnsr.shards)
-            {
-                shard.handle = offset;
-                newShards.insert(shard);
-                offset += shard.StorageSizeBytes();
-            }    // will be filled in when tensor data is received
-            tnsr.shards = std::move(newShards);
-        }
-    });
-    INFO("[{}#{}] Received sharded state registry from rank={} data of size={}, Total Tensor Size={}",
+    localRegistry = checkpoint::planning::MetadataClone(*localRegistry);
+    INFO("[{}#{}] Received local registry rank={} metadata bytes={} payload bytes={}",
          *server,
          sessionId,
          rank,
          hdr.messageSize,
-         offset);
+         snapshotSize);
     bool registryAccepted = false;
     {
         // Concurrent handlers push here; an unlocked emplace corrupts sibling futures.
         std::scoped_lock lock(mutex);
         auto&            localState = sessionState.localStates[rank];
-        if (localState == nullptr) { localState = std::make_unique<LocalState>(); }
+        if (localState == nullptr) { localState = std::make_unique<RegisteredState>(); }
         if (localState->localRegistry != nullptr)
         {
             WARN("[{}#{}] Received a duplicate local state registry from rank={} for an unknown reason; ignoring it",
@@ -1648,73 +1223,77 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
 
 void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
 {
-    void* ptr = nullptr;
+    void* ptr      = nullptr;
+    int   numaNode = -1;
     {
         std::scoped_lock lock(mutex);
         auto&            snapshot   = GetSnapshot_(lock, hdr1.snapshotId);
         auto&            localState = *snapshot.localStates.at(hdr1.globalRank);
         auto             endOffset  = hdr1.offset + hdr1.messageSize;
-        if (endOffset > localState.tensorStorage.size)
+        if (endOffset > localState.snapshotData.size)
         {
             throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Received tensor data exceeds allocated size={} for session id={} offset={} size={}",
+                "[native_ckpt:svr][{}#{}][ERROR] Received snapshot data exceeds allocated size={} for session id={} offset={} size={}",
                 *server,
                 sessionId,
-                localState.tensorStorage.size,
+                localState.snapshotData.size,
                 hdr1.sessionId,
                 hdr1.offset,
                 hdr1.messageSize));
         }
 
-        localState.writtenTensorSize += hdr1.messageSize;
-        localState.writtenTensorRangeBegin = std::min(localState.writtenTensorRangeBegin, static_cast<uint64_t>(hdr1.offset));
-        localState.writtenTensorRangeEnd   = std::max(localState.writtenTensorRangeEnd, endOffset);
-        if (localState.writtenTensorSize > localState.tensorStorage.size)
+        localState.writtenPayloadSize += hdr1.messageSize;
+        localState.writtenPayloadRangeBegin = std::min(localState.writtenPayloadRangeBegin, static_cast<uint64_t>(hdr1.offset));
+        localState.writtenPayloadRangeEnd   = std::max(localState.writtenPayloadRangeEnd, endOffset);
+        if (localState.writtenPayloadSize > localState.snapshotData.size)
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Received tensor data size={} (range {}-{}) exceeds "
-                                                 "total tensor size={} for session id={}",
+            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Received snapshot data size={} (range {}-{}) exceeds "
+                                                 "total snapshot size={} for session id={}",
                                                  *server,
                                                  sessionId,
-                                                 localState.writtenTensorSize,
-                                                 localState.writtenTensorRangeBegin,
-                                                 localState.writtenTensorRangeEnd,
-                                                 localState.tensorStorage.size,
+                                                 localState.writtenPayloadSize,
+                                                 localState.writtenPayloadRangeBegin,
+                                                 localState.writtenPayloadRangeEnd,
+                                                 localState.snapshotData.size,
                                                  hdr1.sessionId));
         }
 
-        ptr = localState.tensorStorage[hdr1.offset];
+        ptr      = localState.snapshotData[hdr1.offset];
+        numaNode = localState.numaNode;
     }
+    BindThreadCpuToNumaNode(numaNode);
     std::memcpy(ptr, buf.data(), hdr1.messageSize);
 }
 
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
-    BufStream bufStream{buf.data(), buf.size()};
-    auto      ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
-
-    auto                         numSnapshotBlobs = serdes::ReadTrivial<uint32_t>(bufStream);
-    std::vector<StateNode::Blob> snapshotBlobs;
-    snapshotBlobs.reserve(numSnapshotBlobs);
-    auto const startedAt = hdr.startedAt;
-    for (uint32_t i = 0; i < numSnapshotBlobs; ++i)
+    BufStream                  stream{buf.data(), buf.size()};
+    auto const                 ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(stream));
+    std::shared_ptr<StateTree> registry = StateSerDes::Read(stream);
+    if (registry->SessionId() != sessionId || registry->GlobalRank() != hdr.globalRank)
     {
-        auto data = serdes::ReadBlobWithSize<uint32_t>(bufStream);
-        snapshotBlobs.emplace_back(data.begin(), data.end());
+        throw std::invalid_argument("Snapshot registry session or rank does not match activation");
     }
-
-    auto                           numSnapshotScalars = serdes::ReadTrivial<uint32_t>(bufStream);
-    std::vector<StateNode::Scalar> snapshotScalars;
-    snapshotScalars.reserve(numSnapshotScalars);
-    for (uint32_t i = 0; i < numSnapshotScalars; ++i) { snapshotScalars.emplace_back(serdes::ReadTrivial<StateNode::Scalar>(bufStream)); }
     bool                                  beginDurableSpan = false;
     std::chrono::system_clock::time_point durableStartedAt;
     {
         std::scoped_lock lock(mutex);
-        auto&            snapshot = snapshots[hdr.snapshotId];
-        if (!snapshot)
+        if (!sessionState.planningReady) { throw std::runtime_error("Snapshot plan is not ready"); }
+        if (!sessionState.planningFailure.empty()) { throw std::runtime_error(sessionState.planningFailure); }
+        auto const plan = sessionState.snapshotPlans.find(hdr.globalRank);
+        if (plan == sessionState.snapshotPlans.end()) { throw std::invalid_argument("Snapshot rank is not local to this daemon"); }
+        checkpoint::planning::ValidateSnapshot(*plan->second, *registry);
+        auto const payloadSize = registry->GetTotalSnapshotStateSizeInBytes();
+        if (hdr.snapshotSize != payloadSize) { throw std::invalid_argument("Snapshot payload size does not match its registry"); }
+        auto& snapshot = snapshots[hdr.snapshotId];
+        if (snapshot == nullptr)
         {
             snapshot             = std::make_unique<Snapshot>();
             snapshot->snapshotId = hdr.snapshotId;
+        }
+        if (snapshot->localStates.contains(hdr.globalRank) || snapshot->finalizedRanks.contains(hdr.globalRank))
+        {
+            throw std::runtime_error("Snapshot rank is already activated or finalized");
         }
         if (snapshot->path.empty())
         {
@@ -1724,97 +1303,18 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
             durableStartedAt      = snapshot->activatedAt;
             beginDurableSpan      = true;
         }
-
-        if (snapshot->localStates.contains(hdr.globalRank) || snapshot->finalizedRanks.contains(hdr.globalRank))
+        auto localState              = std::make_unique<LocalState>();
+        localState->snapshotRegistry = registry;
+        localState->startedAt        = hdr.startedAt;
+        localState->numaNode         = hdr.numaNode;
+        localState->snapshotData     = ByteStorage(payloadSize);
+        if (localState->snapshotData.data != nullptr)
         {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot={} for global rank={} is already activated or "
-                                                 "finalized when activating snapshot={}",
-                                                 *server,
-                                                 sessionId,
-                                                 hdr.snapshotId,
-                                                 hdr.globalRank,
-                                                 hdr.snapshotId));
+            BindRegionToNumaNode(hdr.numaNode, localState->snapshotData.data, localState->snapshotData.size);
         }
-
-        auto it = sessionState.localStates.find(hdr.globalRank);
-        if (it == sessionState.localStates.end())
-        {
-            throw std::runtime_error(
-                fmt::format("[native_ckpt:svr][{}#{}][ERROR] No local state found for global rank={} when activating snapshot={}",
-                            *server,
-                            sessionId,
-                            hdr.globalRank,
-                            hdr.snapshotId));
-        }
-        auto localState            = std::make_unique<LocalState>();
-        localState->localRegistry  = it->second->localRegistry->Clone();
-        localState->startedAt      = startedAt;
-        uint32_t registeredBlobs   = 0;
-        uint32_t registeredScalars = 0;
-        localState->localRegistry->WalkNodes([&](StateNode const& node) {
-            auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::Blob) { ++registeredBlobs; }
-            else if (type == StateNode::Type::Scalar) { ++registeredScalars; }
-        });
-        if (numSnapshotBlobs != registeredBlobs || numSnapshotScalars != registeredScalars)
-        {
-            throw std::runtime_error(
-                fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot={} rank={} supplied Blob/Scalar counts {}/{}; expected {}/{}",
-                            *server,
-                            sessionId,
-                            hdr.snapshotId,
-                            hdr.globalRank,
-                            numSnapshotBlobs,
-                            numSnapshotScalars,
-                            registeredBlobs,
-                            registeredScalars));
-        }
-        size_t blobIndex   = 0;
-        size_t scalarIndex = 0;
-        localState->localRegistry->WalkNodes([&](StateNode& node) {
-            auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::Blob)
-            {
-                auto& blob = snapshotBlobs[blobIndex++];
-                if (std::get<StateNode::Blob>(node.data).size() != blob.size())
-                {
-                    throw std::runtime_error(fmt::format(
-                        "[native_ckpt:svr][{}#{}][ERROR] Snapshot={} rank={} Blob '{}' changed size after registry synchronization",
-                        *server,
-                        sessionId,
-                        hdr.snapshotId,
-                        hdr.globalRank,
-                        localState->localRegistry->GetNodeId(node.handle)));
-                }
-                node.data = std::move(blob);
-            }
-            else if (type == StateNode::Type::Scalar) { node.data = snapshotScalars[scalarIndex++]; }
-        });
-
-        if (hdr.snapshotSize != it->second->localRegistry->GetTotalTensorStateSizeInBytes())
-        {
-            throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot size={} does not match expected total tensor "
-                                                 "state size={} from local registry for global rank={} when activating snapshot={}",
-                                                 *server,
-                                                 sessionId,
-                                                 hdr.snapshotSize,
-                                                 it->second->localRegistry->GetTotalTensorStateSizeInBytes(),
-                                                 hdr.globalRank,
-                                                 hdr.snapshotId));
-        }
-        localState->tensorStorage = ByteStorage(hdr.snapshotSize);
-        // Place the tensor storage on the rank's GPU-local NUMA node (sent by the
-        // client) and pin this dequeue thread to the same node, so the shm-to-storage
-        // memcpy is on-socket. Authoritative per rank, so it is correct for any
-        // layout — multi-peer and ckptbench included.
-        if (localState->tensorStorage.data != nullptr)
-        {
-            BindRegionToNumaNode(hdr.numaNode, localState->tensorStorage.data, localState->tensorStorage.size);
-        }
-        BindThreadCpuToNumaNode(hdr.numaNode);
-        snapshot->localStates[hdr.globalRank] = std::move(localState);
+        snapshot->localStates.emplace(hdr.globalRank, std::move(localState));
+        MergeSnapshotRegistry_(hdr.snapshotId, *registry);
     }
-
     if (beginDurableSpan && IsCoordinatorPeer())
     {
         PERF() << tel::span::SvrDurable::Begin{
@@ -1822,13 +1322,11 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
             .startedAt = durableStartedAt,
         };
     }
-
     PERF() << tel::span::CkptSave::Begin{
         .id        = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
-        .startedAt = startedAt,
+        .startedAt = hdr.startedAt,
     };
-
-    INFO("[{}#{}] Activated snapshot={} for global rank={} with expected tensor data size={} path={}",
+    INFO("[{}#{}] Activated snapshot={} rank={} payload bytes={} path={}",
          *server,
          sessionId,
          hdr.snapshotId,
@@ -1848,30 +1346,30 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
         {
             auto& localState = *snapshot.localStates.at(hdr.globalRank);
 
-            if (localState.writtenTensorSize != localState.tensorStorage.size)
+            if (localState.writtenPayloadSize != localState.snapshotData.size)
             {
-                throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Incomplete tensor data received. sessionid={}. "
+                throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Incomplete snapshot data received. sessionid={}. "
                                                      "rcvd-size={}(range{} - {}) expected={} ",
                                                      *server,
                                                      sessionId,
                                                      hdr.sessionId,
-                                                     localState.writtenTensorSize,
-                                                     localState.writtenTensorRangeBegin,
-                                                     localState.writtenTensorRangeEnd,
-                                                     localState.tensorStorage.size));
+                                                     localState.writtenPayloadSize,
+                                                     localState.writtenPayloadRangeBegin,
+                                                     localState.writtenPayloadRangeEnd,
+                                                     localState.snapshotData.size));
             }
-            if (localState.writtenTensorRangeBegin != 0 || localState.writtenTensorRangeEnd != localState.tensorStorage.size)
+            if (localState.writtenPayloadRangeBegin != 0 || localState.writtenPayloadRangeEnd != localState.snapshotData.size)
             {
                 throw std::runtime_error(
-                    fmt::format("[native_ckpt:svr][{}#{}][ERROR] Tensor data received has invalid range. sessionid={}. "
+                    fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot data received has invalid range. sessionid={}. "
                                 "rcvd-size={}(range{} - {}) expected range=0 - {}",
                                 *server,
                                 sessionId,
                                 hdr.sessionId,
-                                localState.writtenTensorSize,
-                                localState.writtenTensorRangeBegin,
-                                localState.writtenTensorRangeEnd,
-                                localState.tensorStorage.size));
+                                localState.writtenPayloadSize,
+                                localState.writtenPayloadRangeBegin,
+                                localState.writtenPayloadRangeEnd,
+                                localState.snapshotData.size));
             }
             if (sessionState.globalRegistry == nullptr)
             {
@@ -1890,31 +1388,90 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
 }
 
-void Session::HandleStateRegistryFragment(Rank                                                 recvRank,
-                                          std::vector<TensorShardInfo> const&                  tensorShards,
-                                          std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn)
+void Session::HandleStateRegistryFragment(Rank recvRank, std::shared_ptr<StateTree> registry)
 {
-    std::scoped_lock lock(mutex);
-    MergeFragmentToGlobalState_(lock, tensorShards);
-    // Blob lengths are fixed by initial registry synchronization.
-    for (auto const& [fqn, length] : blobMetasIn) { blobMetas[fqn][recvRank] = {.length = length}; }
-    receivedFrom.insert(recvRank);
-    INFO("[{}#{}] HandleStateRegistryFragment rank={} shards={} Blobs={} {}",
-         *server,
-         sessionId,
-         recvRank,
-         tensorShards.size(),
-         blobMetasIn.size(),
-         WaitingForRanks{receivedFrom, Rank{0}, topo.worldSize});
+    try
+    {
+        {
+            std::scoped_lock lock(mutex);
+            if (receivedFrom.contains(recvRank)) { return; }
+            if (sessionState.planningStarted) { throw std::runtime_error("Registry arrived after planning started"); }
+            if (sessionState.globalRegistry == nullptr) { sessionState.globalRegistry = std::make_shared<StateTree>(sessionId, topo); }
+            checkpoint::planning::MergeRegistry(*sessionState.globalRegistry, *registry);
+            receivedFrom.insert(recvRank);
+        }
+        TryPlanAsync_();
+    } catch (std::exception const& error) { FailPlanning_(error.what()); }
 }
 
-void Session::RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& /* lock */, Rank rank, StateTree const& localRegistry)
+void Session::InstallGlobalRegistry_(std::shared_ptr<StateTree> registry)
 {
-    localRegistry.WalkNodes([&](StateNode const& node) {
-        if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-        auto const& blob                                      = std::get<StateNode::Blob>(node.data);
-        blobMetas[localRegistry.GetNodeId(node.handle)][rank] = {.length = blob.size()};
-    });
+    auto const       firstRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
+    auto const       rankCount = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstRank);
+    auto             plans     = checkpoint::planning::BuildLocalPlans(*registry, firstRank, rankCount);
+    std::scoped_lock lock(mutex);
+    sessionState.globalRegistry = std::move(registry);
+    sessionState.snapshotPlans  = std::move(plans);
+    sessionState.planningReady  = true;
+}
+
+void Session::TryPlanAsync_()
+{
+    std::scoped_lock lock(mutex);
+    if (!IsCoordinatorPeer() || stopRequested || sessionState.planningStarted || !sessionState.planningFailure.empty()
+        || receivedFrom.size() != static_cast<size_t>(topo.worldSize))
+    {
+        return;
+    }
+    sessionState.planningStarted = true;
+    auto registry                = sessionState.globalRegistry;
+    asyncTasks.emplace_back(std::async(std::launch::async, [this, registry] {
+        try
+        {
+            ValidateGlobalStateTree(server, sessionId, *registry);
+            DumpRegistry("registry.global.bin",
+                         [&](std::ostream& stream) { StateSerDes::Write(stream, *registry, StateNode::Handle::Root); });
+            BroadcastGlobalRegistryToPeers_(*registry);
+            InstallGlobalRegistry_(registry);
+        } catch (std::exception const& error) { FailPlanning_(error.what()); }
+    }));
+}
+
+void Session::FailPlanning_(std::string failure)
+{
+    std::scoped_lock lock(mutex);
+    if (!sessionState.planningFailure.empty()) { return; }
+    sessionState.planningFailure = std::move(failure);
+    if (stopRequested) { return; }
+    ERR("[{}#{}] Snapshot planning failed: {}", *server, sessionId, sessionState.planningFailure);
+    auto const message = sessionState.planningFailure;
+    asyncTasks.emplace_back(std::async(std::launch::async, [this, message] {
+        auto const firstPeer = IsCoordinatorPeer() ? size_t{1} : size_t{0};
+        auto const lastPeer  = IsCoordinatorPeer() ? topo.peers.size() : size_t{1};
+        for (size_t peer = firstPeer; peer < lastPeer; ++peer)
+        {
+            try
+            {
+                SendToPeerWithRetries(
+                    server, sessionId, topo.peers[peer], message, fmt::format("/api/peer/planningfailure/{}", sessionId), {});
+            } catch (std::exception const& error)
+            {
+                ERR("[{}#{}] Failed to propagate planning error: {}", *server, sessionId, error.what());
+            }
+        }
+    }));
+}
+
+void Session::MergeSnapshotRegistry_(cipc::SnapshotId snapshotId, StateTree const& registry)
+{
+    auto& snapshot = snapshots[snapshotId];
+    if (snapshot == nullptr)
+    {
+        snapshot             = std::make_unique<Snapshot>();
+        snapshot->snapshotId = snapshotId;
+    }
+    if (snapshot->storageRegistry == nullptr) { snapshot->storageRegistry = std::make_shared<StateTree>(sessionId, topo); }
+    checkpoint::planning::MergeSnapshot(*snapshot->storageRegistry, registry);
 }
 
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
@@ -2270,6 +1827,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
     std::scoped_lock lock(_mutex);
     for (auto const& [sessionId, session] : _activeSessions)
     {
+        std::scoped_lock sessionLock(session->mutex);
         for (auto const& [snapshotId, snapshot] : session->snapshots)
         {
             for (auto const& [rank, localState] : snapshot->localStates)
@@ -2279,9 +1837,9 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
                          snapshotId,
                          snapshot->name,
                          snapshot->path,
-                         *snapshot->globalRegistry,
-                         *localState->localRegistry,
-                         localState->tensorStorage);
+                         *snapshot->storageRegistry,
+                         *localState->snapshotRegistry,
+                         localState->snapshotData);
             }
         }
     }
@@ -2464,142 +2022,58 @@ void Server::InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology cons
 void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd)
 {
     FindOrWaitForSession_("ReceiveGlobalRegistry", sessionId, [&](Session& session) {
-        if (session.PeerIndex() != fwdStart)
+        try
         {
-            throw std::logic_error(fmt::format("[native_ckpt:svr][{}#{}] ReceiveGlobalRegistry expected fwdStart={} but got PeerIndex()={}",
-                                               *this,
-                                               sessionId,
-                                               fwdStart,
-                                               session.PeerIndex()));
-        }
-
-        session.SendGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
-        std::shared_ptr<StateTree> globalRegistry = InflateRegistry(body);
-        auto             dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(globalRegistry->GlobalWorldSize()));
-        std::scoped_lock lock2(session.mutex);
-        session.sessionState.globalRegistry        = std::move(globalRegistry);
-        session.sessionState.dedupedGlobalRegistry = std::move(dedupResult.dedupedRegistry);
+            if (session.PeerIndex() != fwdStart) { throw std::invalid_argument("Global registry forwarding rank does not match daemon"); }
+            session.SendGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
+            auto registry = InflateRegistry(body);
+            ValidateGlobalStateTree(this, sessionId, *registry);
+            session.InstallGlobalRegistry_(std::move(registry));
+        } catch (std::exception const& error) { session.FailPlanning_(error.what()); }
     });
 }
 
 void Server::ReceiveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
-                                            cipc::Rank                                                           fromRank,
+                                            Rank                                                                 fromRank,
                                             tcp_stream&                                                          stream,
                                             boost::beast::flat_buffer&                                           buffer,
                                             boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser)
 {
-    INFO("[{}#{}] Receiving state registry chunks for rank={}", *this, sessionId, fromRank);
-
-    // Reads exactly dest.size() bytes, looping over partial reads until complete.
-    // Returns bytes read; caller checks for 0+is_done() at record boundaries.
-    auto readSpan = [&](std::span<char> dest, bool allowDone) -> size_t {
-        size_t total    = 0;
-        auto   readSize = dest.size();
-        if (allowDone && parser.is_done()) { return 0; }
-        while (total < readSize)
-        {
-            auto prevRemaining       = readSize - total;
-            parser.get().body().data = dest.subspan(total).data();
-            parser.get().body().size = prevRemaining;
-            parser.get().body().more = true;
-            boost::system::error_code   ec;
-            [[maybe_unused]] auto const n = boost::beast::http::read_some(stream, buffer, parser, ec);
-            if (ec && ec != boost::beast::http::error::need_buffer) { throw boost::system::system_error(ec); }
-            auto const bodyBytesWritten = prevRemaining - parser.get().body().size;
-            total += bodyBytesWritten;
-            if (parser.is_done())
-            {
-                if (allowDone && bodyBytesWritten == 0) { return 0; }
-                if (total != readSize)
-                {
-                    throw std::runtime_error(fmt::format("Unexpected end of HTTP body: read {} bytes, expected {}", total, readSize));
-                }
-                break;
-            }
-        }
-        return total;
-    };
-
-    auto readTrivial = [&](auto& value, bool allowDone = false) -> bool {
-        std::span<char> dest{reinterpret_cast<char*>(&value), sizeof(value)};    // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        return readSpan(dest, allowDone) == 0;
-    };
-    auto readBlob = [&](char* dest, size_t size, bool allowDone = false) -> bool {
-        std::span<char> destSpan{dest, size};
-        return readSpan(destSpan, allowDone) == 0;
-    };
-
-    std::vector<TensorShardInfo>                  tensorShards;
-    std::vector<std::pair<std::string, uint64_t>> blobMetas;    // (fqn, length); rank is fromRank
-
-    // Read body in chunks; Beast transparently decodes chunked transfer encoding.
-    // Each record is tag-prefixed (PeerRecordTensor / PeerRecordBlob); a clean
-    // end-of-stream at a tag boundary terminates the fragment.
-    while (true)
+    std::string             body;
+    std::array<char, 65536> chunk{};
+    while (!parser.is_done())
     {
-        uint8_t recordTag{};
-        if (readTrivial(recordTag, true))
-        {
-            break;    // Clean end-of-stream at a record boundary
-        }
-        if (recordTag == PeerRecordTensor)
-        {
-            TensorShardInfo info;
-            uint32_t        nodeIdLen{};
-            readTrivial(info.durableDtype);
-            readTrivial(info.fulldim);
-            readTrivial(info.tensorInfo);
-            info.tensorInfo.AssertShardIsValid(info.fulldim);
-            readTrivial(nodeIdLen);
-            info.nodeId = std::string(nodeIdLen, '\0');
-            readBlob(info.nodeId.data(), nodeIdLen);
-            if (info.tensorInfo.rank != fromRank)
-            {
-                throw std::invalid_argument(fmt::format("Peer registry fragment from rank={} contains tensor '{}' owned by rank={}",
-                                                        fromRank,
-                                                        info.nodeId,
-                                                        info.tensorInfo.rank));
-            }
-            tensorShards.push_back(std::move(info));
-        }
-        else if (recordTag == PeerRecordBlob)
-        {
-            uint64_t length{};
-            uint32_t fqnLen{};
-            readTrivial(length);
-            readTrivial(fqnLen);
-            std::string fqn(fqnLen, '\0');
-            readBlob(fqn.data(), fqnLen);
-            blobMetas.emplace_back(std::move(fqn), length);
-        }
-        else
-        {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}#{}][ERROR] Unknown peer fragment record tag={} from rank={}", *this, sessionId, recordTag, fromRank));
-        }
+        parser.get().body().data = chunk.data();
+        parser.get().body().size = chunk.size();
+        parser.get().body().more = true;
+        boost::system::error_code error;
+        boost::beast::http::read_some(stream, buffer, parser, error);
+        if (error && error != boost::beast::http::error::need_buffer) { throw boost::system::system_error(error); }
+        body.append(chunk.data(), chunk.size() - parser.get().body().size);
     }
-
-    // Every dispatch takes _mutex; release it before the merge below holds the
-    // session mutex for a whole insert batch.
+    BufStream metadata{body.data(), body.size()};
+    auto      registry = StateSerDes::Read(metadata);
+    if (registry->SessionId() != sessionId || registry->GlobalRank() != fromRank)
+    {
+        throw std::invalid_argument("Peer registry does not match its session or rank");
+    }
+    checkpoint::planning::NormalizeLocal(*registry);
+    checkpoint::planning::ValidateLocalRegistry(*registry);
     Session* session = nullptr;
     {
-        auto lock = std::scoped_lock<std::mutex>(_mutex);
-        auto it   = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end() || it->second->sessionState.globalRegistry == nullptr)
+        std::scoped_lock lock(_mutex);
+        auto             item = _activeSessions.find(sessionId);
+        if (item == _activeSessions.end())
         {
-            INFO("[{}#{}] Received state registry fragment for non-existent session. Adding to pending data", *this, sessionId, fromRank);
-            auto pendingData          = std::make_unique<PendingSessionData>();
-            pendingData->tensorShards = std::move(tensorShards);
-            pendingData->blobMetas    = std::move(blobMetas);
-            pendingData->recvFrom     = fromRank;
-            pendingData->receivedAt   = PerfClock::now();
-            _pendingSessionData[sessionId].push_back(std::move(pendingData));
+            auto pending      = std::make_unique<PendingSessionData>();
+            pending->recvFrom = fromRank;
+            pending->registry = std::move(registry);
+            _pendingSessionData[sessionId].push_back(std::move(pending));
             return;
         }
-        session = it->second.get();
+        session = item->second.get();
     }
-    session->HandleStateRegistryFragment(fromRank, tensorShards, blobMetas);
-    INFO("[{}#{}] Successfully received and processed {} tensor shards from rank={}", *this, sessionId, tensorShards.size(), fromRank);
+    session->HandleStateRegistryFragment(fromRank, std::move(registry));
 }
 
 void Server::SpinDownWaitLoop_(tcp_stream stream)
@@ -2729,6 +2203,83 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
     TryCleanShutdown(stream);
 }
 
+void Server::SnapshotPlanWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, Rank rank)
+{
+    SetThreadName("ncs:planwait");
+    stream.expires_never();
+    auto const                 deadline = std::chrono::steady_clock::now() + ServerWaitTimeout;
+    std::shared_ptr<StateTree> plan;
+    std::string                failure;
+    while (true)
+    {
+        if (_stopRequested)
+        {
+            failure = "Server is stopping";
+            break;
+        }
+        {
+            std::scoped_lock lock(_mutex);
+            auto const       item = _activeSessions.find(sessionId);
+            if (item != _activeSessions.end())
+            {
+                auto&            session = *item->second;
+                std::scoped_lock sessionLock(session.mutex);
+                auto const       firstRank = static_cast<uint32_t>(session.PeerIndex()) * session.topo.ranksPerPeer;
+                auto const       lastRank  = std::min(firstRank + session.topo.ranksPerPeer, static_cast<uint32_t>(session.topo.worldSize));
+                if (static_cast<uint32_t>(rank) < firstRank || static_cast<uint32_t>(rank) >= lastRank)
+                {
+                    failure = "Requested snapshot plan rank is not local to this daemon";
+                    break;
+                }
+                if (session.stopRequested)
+                {
+                    failure = "Session is stopping";
+                    break;
+                }
+                if (!session.sessionState.planningFailure.empty())
+                {
+                    failure = session.sessionState.planningFailure;
+                    break;
+                }
+                if (session.sessionState.planningReady)
+                {
+                    auto const selected = session.sessionState.snapshotPlans.find(rank);
+                    if (selected == session.sessionState.snapshotPlans.end()) { failure = "Local snapshot plan is unavailable"; }
+                    else
+                    {
+                        plan = selected->second;
+                    }
+                    break;
+                }
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            failure = "Snapshot planning timed out";
+            break;
+        }
+        std::this_thread::sleep_for(IntervalBetweenRetries);
+    }
+    auto const status = failure.empty() ? boost::beast::http::status::ok : boost::beast::http::status::internal_server_error;
+    boost::beast::http::response<boost::beast::http::string_body> response{status, HttpVersion11};
+    response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+    if (plan != nullptr)
+    {
+        std::ostringstream metadata;
+        StateSerDes::Write(metadata, *plan, StateNode::Handle::Root);
+        response.body() = metadata.str();
+        response.set(boost::beast::http::field::content_type, "application/octet-stream");
+    }
+    else
+    {
+        response.body() = failure;
+    }
+    response.prepare_payload();
+    boost::system::error_code error;
+    boost::beast::http::write(stream, response, error);
+    TryCleanShutdown(stream);
+}
+
 void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-function-cognitive-complexity)
 {
     boost::beast::flat_buffer buffer;
@@ -2770,8 +2321,53 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }
-    // Check if this is the state upload endpoint: POST /api/peer/snapshotcomplete/{sessionId}/{rank}/{snapshotId}
-
+    else if (matches({"api", "peer", "snapshotregistry"}) && headers.method() == boost::beast::http::verb::post && it != segs.end())
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("Snapshot registry requires a rank"); }
+        auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("Snapshot registry requires a snapshot ID"); }
+        auto const snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot registry URL segments"); }
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        auto const& body = bodyParser.get().body();
+        BufStream   metadata{body.data(), body.size()};
+        auto        registry = StateSerDes::Read(metadata);
+        if (registry->SessionId() != sessionId || registry->GlobalRank() != rank)
+        {
+            throw std::invalid_argument("Selected registry does not match its session or rank");
+        }
+        FindOrWaitForSession_("ReceiveSnapshotRegistry", sessionId, [&](Session& session) {
+            if (!session.IsCoordinatorPeer()) { throw std::invalid_argument("Snapshot registry endpoint requires coordinator"); }
+            checkpoint::planning::ValidateLocalRegistry(*registry);
+            std::scoped_lock lock(session.mutex);
+            session.MergeSnapshotRegistry_(snapshotId, *registry);
+        });
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, headers.version()};
+        response.body() = "{}";
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+    }
+    else if (matches({"api", "peer", "planningfailure"}) && headers.method() == boost::beast::http::verb::post && it != segs.end())
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected planning failure URL segments"); }
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        boost::beast::http::read(stream, buffer, bodyParser);
+        FindOrWaitForSession_("ReceivePlanningFailure", sessionId, [&](Session& session) {
+            if (session.IsCoordinatorPeer()) { session.FailPlanning_(bodyParser.get().body()); }
+            else
+            {
+                std::scoped_lock lock(session.mutex);
+                session.sessionState.planningFailure = bodyParser.get().body();
+            }
+        });
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, headers.version()};
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+    }
     else if (matches({"api", "peer", "snapshotcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -2818,7 +2414,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             });
         }
     }
-    // The global registry for a snapshot (body = deflated serialized tree).
     else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -2888,6 +2483,53 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::write(stream, res);
         Ping();
     }
+    else if (matches({"api", "activate-snapshot"}) && headers.method() == boost::beast::http::verb::post)
+    {
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, version};
+        try
+        {
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a session ID"); }
+            auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a rank"); }
+            auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a snapshot ID"); }
+            auto const snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot activation URL segments"); }
+            auto const& body = bodyParser.get().body();
+            if (body.size() < sizeof(cipc::Message::ActivateSnapshot))
+            {
+                throw std::invalid_argument("Snapshot activation header is truncated");
+            }
+            cipc::Message::ActivateSnapshot activation;
+            std::memcpy(&activation, body.data(), sizeof(activation));
+            auto const descriptor = std::span<char const>(body.data() + sizeof(activation), body.size() - sizeof(activation));
+            if (activation.sessionId != sessionId || activation.globalRank != rank || activation.snapshotId != snapshotId)
+            {
+                throw std::invalid_argument("Snapshot activation header does not match its URL");
+            }
+            if (activation.messageSize != descriptor.size())
+            {
+                throw std::invalid_argument("Snapshot activation size does not match its descriptor");
+            }
+            FindOrWaitForSession_("ActivateSnapshot", sessionId, [&](Session& session) { session.Handle(activation, descriptor); });
+            response.body() = "{}";
+        } catch (std::exception const& error)
+        {
+            response.result(boost::beast::http::status::internal_server_error);
+            response.body() = error.what();
+        }
+        response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        response.keep_alive(keepAlive);
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+        Ping();
+    }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -2919,6 +2561,19 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
         Ping();
+    }
+    else if (matches({"api", "snapshot-plan"}) && headers.method() == boost::beast::http::verb::get && it != segs.end())
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("Snapshot plan requires a rank"); }
+        auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
+        std::scoped_lock lock(_mutex);
+        std::erase_if(_finalizeWaits,
+                      [](std::future<void>& task) { return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, socket = std::move(stream), sessionId, rank] mutable {
+            SnapshotPlanWaitLoop_(std::move(socket), sessionId, rank);
+        }));
     }
     else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
     {
@@ -3150,62 +2805,24 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
 
 void Session::OnReceiveLocalStateRegistryAsync_(Rank const& rank)
 {
+    std::shared_ptr<StateTree> registry;
     {
         std::scoped_lock lock(mutex);
-        auto&            localState = *sessionState.localStates[rank];
-        receivedFrom.insert(rank);
-        INFO("[{}#{}] OnReceiveLocalStateRegistryAsync_  rank={} {}",
-             *server,
-             sessionId,
-             rank,
-             WaitingForRanks{receivedFrom, Rank{0}, topo.worldSize});
-
-        if (sessionState.globalRegistry == nullptr)
-        {
-            sessionState.globalRegistry = localState.localRegistry->Clone();
-            sessionState.globalRegistry->ConvertTensorsToDTensor();
-            sessionState.globalRegistry->WalkNodes([&](auto& node) {
-                if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-                {
-                    throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Unexpected TensorShard node in "
-                                                         "activeGlobalState. Should only contain DTensor nodes",
-                                                         *server,
-                                                         sessionId,
-                                                         sessionState.globalRegistry->GetNodeId(node.handle)));
-                }
-                if (node.data.index() == static_cast<size_t>(StateNode::Type::Blob))
-                {
-                    // Payload bytes stay on their owning rank; the coordinator keeps the node only.
-                    node.data = StateNode::Blob{};
-                    return;
-                }
-                if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)) { return; }
-                tensorMap[localState.localRegistry->GetNodeId(node.handle)] = node.handle;
-            });
-        }
-        else
-        {
-            std::vector<TensorShardInfo> tensorShards;
-            ForeachTensorShardInfo(*localState.localRegistry, [&](TensorShardInfo const& info) { tensorShards.push_back(info); });
-            MergeFragmentToGlobalState_(lock, tensorShards);
-        }
-
-        if (IsCoordinatorPeer()) { RecordBlobMetasLocked_(lock, rank, *localState.localRegistry); }
+        registry = sessionState.localStates.at(rank)->localRegistry;
+        if (!IsCoordinatorPeer()) { receivedFrom.insert(rank); }
     }
+    if (IsCoordinatorPeer()) { HandleStateRegistryFragment(rank, std::move(registry)); }
+    std::vector<std::unique_ptr<Server::PendingSessionData>> pending;
     {
-        // TODO_NOPENDING_STRUCT
-        auto lock = std::scoped_lock<std::mutex>(server->_mutex);
-        auto itp  = server->_pendingSessionData.find(sessionId);
-        if (itp != server->_pendingSessionData.end())
+        std::scoped_lock lock(server->_mutex);
+        auto             item = server->_pendingSessionData.find(sessionId);
+        if (item != server->_pendingSessionData.end())
         {
-            for (auto& p : itp->second)
-            {
-                WARN("[{}#{}] Found pending session data. activating session with pending data", *server, sessionId);
-                HandleStateRegistryFragment(p->recvFrom, p->tensorShards, p->blobMetas);
-            }
-            server->_pendingSessionData.erase(itp);
+            pending = std::move(item->second);
+            server->_pendingSessionData.erase(item);
         }
     }
+    for (auto& fragment : pending) { HandleStateRegistryFragment(fragment->recvFrom, std::move(fragment->registry)); }
 }
 
 SUPPRESS_WARNINGS_START

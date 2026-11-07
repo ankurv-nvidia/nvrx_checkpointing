@@ -3,6 +3,7 @@
 #include "checkpoint.h"
 #include "messages.h"
 #include "server.h"
+#include "snapshot_plan.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -57,10 +58,28 @@ Rank InferWorldSize(StateTree const& tree)
 {
     uint maxRankPlus1 = 1;
     tree.WalkNodes([&](StateNode const& node) {
-        if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)) { return; }
-        auto const& tnsr = std::get<DTensor>(node.data);
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::Scalar)
+        {
+            for (auto rank : std::get<StateNode::Scalar>(node.data).replicas)
+            {
+                maxRankPlus1 = std::max(maxRankPlus1, static_cast<uint32_t>(rank) + 1u);
+            }
+            return;
+        }
+        if (type == StateNode::Type::DynamicSizeBlob)
+        {
+            for (auto rank : std::get<StateNode::DynamicSizeBlob>(node.data).replicas)
+            {
+                maxRankPlus1 = std::max(maxRankPlus1, static_cast<uint32_t>(rank) + 1u);
+            }
+            return;
+        }
+        if (type != StateNode::Type::DTensor && type != StateNode::Type::FixedSizeBlob) { return; }
+        auto const& tnsr = type == StateNode::Type::DTensor ? std::get<DTensor>(node.data)
+                                                            : static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data));
         for (auto const& rankShard : tnsr.shards) { maxRankPlus1 = std::max(maxRankPlus1, static_cast<uint32_t>(rankShard.rank) + 1u); }
-        tree.AssertShardedTensorHasNoHoles(node.handle);
+        if (!tnsr.holes.empty()) { throw std::runtime_error("State registry contains incomplete shard coverage"); }
     });
     return Rank{maxRankPlus1};
 }
@@ -124,20 +143,41 @@ static std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& c
                 execFn(shard, tree->GetNodeId(node.handle));
                 tnsr.handle = shard.handle;
             }
-            else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor)
+                     || node.data.index() == static_cast<size_t>(StateNode::Type::FixedSizeBlob))
             {
-                auto&   tnsr = std::get<DTensor>(node.data);
+                bool const immediate = node.data.index() == static_cast<size_t>(StateNode::Type::FixedSizeBlob);
+                auto&      tnsr
+                    = immediate ? static_cast<DTensor&>(std::get<StateNode::FixedSizeBlob>(node.data)) : std::get<DTensor>(node.data);
                 DTensor newTnsr{tnsr.durableDtype, tnsr.fulldim};
                 for (auto rshard : tnsr.shards)
                 {
                     if (tree->Topo().rank != rshard.rank) { continue; }
-                    execFn(rshard, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim));
-                    newTnsr.AddShard(rshard);
+                    if (!immediate) { execFn(rshard, fmt::format("{}[{}]", tree->GetNodeId(node.handle), rshard.sharddim)); }
+                    newTnsr.AddShard(rshard, immediate);
                 }
                 if (newTnsr.shards.empty()) { tree->RemoveNode(node.handle); }
                 else
                 {
-                    node.data = std::move(newTnsr);
+                    tnsr = std::move(newTnsr);
+                }
+            }
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::DynamicSizeBlob))
+            {
+                auto& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
+                if (!blob.replicas.contains(topo.rank)) { tree->RemoveNode(node.handle); }
+                else
+                {
+                    blob.replicas = {topo.rank};
+                }
+            }
+            else if (node.data.index() == static_cast<size_t>(StateNode::Type::Scalar))
+            {
+                auto& scalar = std::get<StateNode::Scalar>(node.data);
+                if (!scalar.replicas.contains(topo.rank)) { tree->RemoveNode(node.handle); }
+                else
+                {
+                    scalar.replicas = {topo.rank};
                 }
             }
         });
@@ -148,6 +188,23 @@ static std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& c
     pass(allocAndCopy);
 
     for (auto& [deviceId, devCtx] : devCtxMap) { devCtx->Flush(); }
+
+    tree->WalkNodes([&](StateNode& node) {
+        if (node.data.index() != static_cast<size_t>(StateNode::Type::FixedSizeBlob)) { return; }
+        auto&                 blob = std::get<StateNode::FixedSizeBlob>(node.data);
+        std::set<TensorShard> captured;
+        for (auto shard : blob.shards)
+        {
+            ctx.blobStorage.emplace_back(shard.storageSize);
+            auto& bytes    = ctx.blobStorage.back();
+            auto  identity = fmt::format("{}[{}]", tree->GetNodeId(node.handle), shard.sharddim);
+            for (size_t index = 0; index < bytes.size(); ++index) { bytes[index] = identity[index % identity.size()]; }
+            shard.handle = reinterpret_cast<uint64_t>(bytes.data());
+            shard.device = DeviceId{"cpu"};
+            captured.insert(shard);
+        }
+        blob.shards = std::move(captured);
+    });
 
     tree->WalkNodes([&](StateNode& node) {
         if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
@@ -199,10 +256,16 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
             totalTensorSize += size;
             tensorSizes.emplace(size, node.handle);
         }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Blob))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DynamicSizeBlob))
         {
-            auto& blob = std::get<StateNode::Blob>(node.data);
-            auto  size = blob.size();
+            auto& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
+            auto  size = blob.storageSize;
+            totalBlobSize += size;
+            blobSizes.emplace(size, node.handle);
+        }
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::FixedSizeBlob))
+        {
+            auto size = TensorStorageSize(std::get<StateNode::FixedSizeBlob>(node.data));
             totalBlobSize += size;
             blobSizes.emplace(size, node.handle);
         }
@@ -259,12 +322,30 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     {
         auto [size, handle] = blobSizes.top();
         blobSizes.pop();
-        auto&      blob    = std::get<StateNode::Blob>(registry->GetNode(handle).data);
         auto const newSize = size / 2;
-        blob.resize(newSize);
-        totalBlobSize = totalBlobSize - size + newSize;
-        fmt::print(stderr, "fqn={}: blob size={}->{}\n", registry->GetNodeId(handle), size, newSize);
-        blobSizes.emplace(newSize, handle);
+        auto&      node    = registry->GetNode(handle);
+        uint64_t   updatedSize{};
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DynamicSizeBlob))
+        {
+            auto& blob       = std::get<StateNode::DynamicSizeBlob>(node.data);
+            blob.storageSize = newSize;
+            updatedSize      = newSize;
+        }
+        else
+        {
+            auto&                 blob = std::get<StateNode::FixedSizeBlob>(node.data);
+            std::set<TensorShard> reduced;
+            for (auto shard : blob.shards)
+            {
+                shard.storageSize /= 2;
+                updatedSize += shard.storageSize;
+                reduced.insert(shard);
+            }
+            blob.shards = std::move(reduced);
+        }
+        totalBlobSize = totalBlobSize - size + updatedSize;
+        fmt::print(stderr, "fqn={}: blob size={}->{}\n", registry->GetNodeId(handle), size, updatedSize);
+        blobSizes.emplace(updatedSize, handle);
     }
 
     registry->CloneInto(*ctx.globalRegistry);
@@ -393,7 +474,7 @@ void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree)
             std::unique_lock<std::mutex> lock(ctx.mutex);
             if (ctx.fixtureFunc == nullptr)
             {
-                ctx.cv.wait(lock);
+                ctx.cv.wait(lock, [&] { return ctx.stopRequested.load(std::memory_order_acquire) || ctx.fixtureFunc != nullptr; });
                 continue;
             }
             func    = ctx.fixtureFunc;

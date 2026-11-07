@@ -126,3 +126,29 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             }
     finally:
         checkpoint.svc_spindown()
+
+
+def test_daemon_embeds_changing_common_state_lengths(tmp_path: Path) -> None:
+    session_id = 2001
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+    root.register_state_dict({_DCP_COMMON_STATE_KEY: b""})
+    root.finalize_registry()
+
+    try:
+        for iteration, length in enumerate((10, 4096, 0), 1):
+            value = {"payload": "x" * length, "iteration": iteration}
+            buffer = io.BytesIO()
+            torch.save([value], buffer)
+            serialized = buffer.getvalue()
+            checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
+
+            root.register_state_dict({_DCP_COMMON_STATE_KEY: serialized})
+            root.save(iteration, checkpoint_dir)
+            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+            assert _load_common_state(checkpoint_dir) == value
+            metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
+            entry = next(info for index, info in metadata.storage_data.items() if index.fqn == _DCP_COMMON_STATE_KEY)
+            assert entry.length == len(serialized)
+    finally:
+        checkpoint.svc_spindown()

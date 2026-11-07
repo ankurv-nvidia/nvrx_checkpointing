@@ -23,8 +23,8 @@ using ServerSessionCallback = void (*)(void*                        cbData,
                                        checkpoint::ipc::SnapshotId  snapshotId,
                                        std::string_view const&      name,
                                        std::filesystem::path const& path,
-                                       StateTree const&             globalRegistry,
-                                       StateTree const&             localState,
-                                       ByteStorage const&           tensorStorage);
+                                       StateTree const&             storageRegistry,
+                                       StateTree const&             snapshotRegistry,
+                                       ByteStorage const&           snapshotData);
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData);

@@ -330,9 +330,9 @@ struct DTensor
         return true;
     }
 
-    void AddShard(TensorShard const& rankTensor)
+    void AddShard(TensorShard const& rankTensor, bool allowEmpty = false)
     {
-        if (rankTensor.StorageSizeBytes() == 0) { throw std::runtime_error("Tensor shard storage size must be nonzero"); }
+        if (!allowEmpty && rankTensor.StorageSizeBytes() == 0) { throw std::runtime_error("Tensor shard storage size must be nonzero"); }
         if (shards.empty() && holes.empty())
         {
             holes.emplace_back();

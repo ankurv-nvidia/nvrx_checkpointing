@@ -14,9 +14,7 @@ namespace checkpoint::distcp
 
 // A snapshotted non-tensor state value.
 struct BlobMeta
-{
-    uint64_t length{};
-};
+{ uint64_t length{}; };
 
 // FQN-first ordering matches the physical order used by every rank's shard.
 // The ordered inner map makes the lowest-rank replica the deterministic owner.
@@ -26,6 +24,9 @@ using BlobMetadataByFqn = std::map<std::string, BlobMetaByRank>;
 // One rank's per-save Blob payloads (fqn-sorted). The referenced registry
 // and snapshot values outlive WriteRankShard.
 using BlobsByFqn = std::map<std::string, std::string_view>;
+
+BlobsByFqn        CollectBlobs(StateTree const& registry, ByteStorage const& storage, Rank rank);
+BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry);
 
 // Write this rank's tensor shards and local Blobs into __<rank>_0.distcp.
 // An empty Blob map means this rank has no non-tensor state payloads.

@@ -7,6 +7,7 @@
 #include "numa_utils.h"    // IWYU pragma: keep
 #include "quant.h"
 #include "service_client.h"
+#include "snapshot_plan.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -92,45 +94,51 @@ void SvcPing()
     if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
 }
 
+static auto
+LocalServiceRequest(StateTree const& registry, boost::beast::http::verb method, std::string const& target, std::string const& body = {})
+{
+    auto const&               topo        = registry.Topo();
+    auto const                serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
+    auto const                port        = cipc::Message::Port + serverIndex;
+    static constexpr int      MaxAttempts = 5;
+    boost::system::error_code ec;
+    for (int attempt = 0; attempt < MaxAttempts; ++attempt)
+    {
+        ec.clear();
+        boost::asio::io_context        ioc;
+        boost::beast::tcp_stream       stream(ioc);
+        boost::asio::ip::tcp::resolver resolver(ioc);
+        auto                           results = resolver.resolve("localhost", std::to_string(port), ec);
+        if (ec) { continue; }
+        [[maybe_unused]] auto endpoint = stream.connect(results, ec);
+        if (ec) { continue; }
+
+        static constexpr int                                         HttpVersion11 = 11;
+        boost::beast::http::request<boost::beast::http::string_body> req{method, target, HttpVersion11};
+        req.set(boost::beast::http::field::host, fmt::format("localhost:{}", port));
+        req.set(boost::beast::http::field::content_type, "application/octet-stream");
+        req.body() = body;
+        req.prepare_payload();
+        boost::beast::http::write(stream, req, ec);
+        if (ec) { continue; }
+
+        boost::beast::flat_buffer                                            buffer;
+        boost::beast::http::response_parser<boost::beast::http::string_body> parser;
+        parser.body_limit(std::numeric_limits<uint64_t>::max());
+        boost::beast::http::read(stream, buffer, parser, ec);
+        if (ec) { continue; }
+        TryCleanShutdown(stream);
+        return parser.release();
+    }
+    throw boost::system::system_error(ec);
+}
+
 static void SvcRegisterLocalState(StateTree const& registry)
 {
     SvcPing();
-
     auto const& topo        = registry.Topo();
     auto const  serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
     auto const  port        = cipc::Message::Port + serverIndex;
-    auto        send        = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
-        static constexpr int      MaxAttempts = 5;
-        boost::system::error_code ec;
-        for (int attempt = 0; attempt < MaxAttempts; ++attempt)
-        {
-            ec.clear();
-            boost::asio::io_context        ioc;
-            boost::beast::tcp_stream       stream(ioc);
-            boost::asio::ip::tcp::resolver resolver(ioc);
-            auto                           results = resolver.resolve("localhost", std::to_string(port), ec);
-            if (ec) { continue; }
-            [[maybe_unused]] auto endpoint = stream.connect(results, ec);
-            if (ec) { continue; }
-
-            static constexpr int                                         HttpVersion11 = 11;
-            boost::beast::http::request<boost::beast::http::string_body> req{method, target, HttpVersion11};
-            req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", port));
-            req.set(boost::beast::http::field::content_type, "application/octet-stream");
-            req.body() = body;
-            req.prepare_payload();
-            boost::beast::http::write(stream, req, ec);
-            if (ec) { continue; }
-
-            boost::beast::flat_buffer                                     buffer;
-            boost::beast::http::response<boost::beast::http::string_body> res;
-            boost::beast::http::read(stream, buffer, res, ec);
-            if (ec) { continue; }
-            TryCleanShutdown(stream);
-            return res;
-        }
-        throw boost::system::system_error(ec);
-    };
 
     auto requireSuccess = [port](auto const& response, std::string_view operation) {
         if (response.result() != boost::beast::http::status::ok && response.result() != boost::beast::http::status::accepted)
@@ -143,15 +151,34 @@ static void SvcRegisterLocalState(StateTree const& registry)
     std::stringstream activationStream;
     serdes::WriteBlobWithSize<uint16_t>(activationStream, "");
     StateSerDes::WriteTopology(activationStream, topo);
-    auto response
-        = send(boost::beast::http::verb::post, fmt::format("/api/activatesession/{}", registry.SessionId()), activationStream.str());
+    auto response = LocalServiceRequest(
+        registry, boost::beast::http::verb::post, fmt::format("/api/activatesession/{}", registry.SessionId()), activationStream.str());
     requireSuccess(response, "session activation");
 
     std::stringstream registryStream;
-    StateSerDes::Write(registryStream, registry, StateNode::Handle::Root);
+    auto              metadata = checkpoint::planning::MetadataClone(registry);
+    StateSerDes::Write(registryStream, *metadata, StateNode::Handle::Root);
     auto registryBody = registryStream.str();
-    response          = send(boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", registry.SessionId()), registryBody);
+    response          = LocalServiceRequest(
+        registry, boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", registry.SessionId()), registryBody);
     requireSuccess(response, "local registry upload");
+}
+
+static std::shared_ptr<StateTree> FetchSnapshotPlan(StateTree const& registry)
+{
+    auto response = LocalServiceRequest(
+        registry, boost::beast::http::verb::get, fmt::format("/api/snapshot-plan/{}/{}", registry.SessionId(), registry.GlobalRank()));
+    if (response.result() != boost::beast::http::status::ok)
+    {
+        throw std::runtime_error(fmt::format("snapshot planning failed: HTTP {}: {}", response.result_int(), response.body()));
+    }
+    std::istringstream input(response.body(), std::ios::binary);
+    auto               plan = StateSerDes::Read(input);
+    if (plan->SessionId() != registry.SessionId() || plan->GlobalRank() != registry.GlobalRank())
+    {
+        throw std::runtime_error("Snapshot plan does not match the requesting session and rank");
+    }
+    return plan;
 }
 
 static uint8_t ResolveClientQueueCount(RankTopology const& topo)
@@ -250,6 +277,12 @@ void SvcSpinDown()
     if (ec && ec != boost::beast::http::error::end_of_stream) { return; }
 
     TryCleanShutdown(stream);
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    while (TryConnectToCheckpointService())
+    {
+        if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("Checkpoint service shutdown timed out"); }
+        std::this_thread::sleep_for(20ms);
+    }
 }
 
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
@@ -326,13 +359,14 @@ struct CheckpointWriter
     {
         std::unique_ptr<cipc::MsgQueue> queue;
         std::shared_future<void>        ready;
+        std::shared_ptr<StateTree>      snapshotPlan;
         int                             numaNode{-1};
     };
 
     struct QueueRegistry
     {
-        std::mutex                                            mu;
-        std::unordered_map<Rank, std::shared_ptr<QueueState>> states;
+        std::mutex                                                              mu;
+        std::map<std::pair<cipc::SessionId, Rank>, std::shared_ptr<QueueState>> states;
     };
 
     static QueueRegistry& Registry()
@@ -350,11 +384,19 @@ struct CheckpointWriter
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
+        auto const       key      = std::make_pair(root.SessionId(), topo.rank);
+        auto             existing = reg.states.find(key);
+        if (existing != reg.states.end())
+        {
+            auto state = existing->second;
+            lock.unlock();
+            state->ready.get();
+            return;
+        }
         auto               state = std::make_shared<QueueState>();
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
+        reg.states.emplace(key, state);
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -365,6 +407,7 @@ struct CheckpointWriter
         state->numaNode = numa;
         try
         {
+            SvcRegisterLocalState(root);
             auto const& queueTopo = root.Topo();
             state->queue          = OpenMsgQueue(queueTopo);
 #ifdef PHOENIX_HAVE_CUDA
@@ -374,10 +417,11 @@ struct CheckpointWriter
 #else
             (void)numa;
 #endif
+            state->snapshotPlan = FetchSnapshotPlan(root);
         } catch (...)
         {
             readyPromise.set_exception(std::current_exception());
-            return;
+            throw;
         }
         readyPromise.set_value();
     }
@@ -388,24 +432,10 @@ struct CheckpointWriter
         {
             auto&            reg = Registry();
             std::scoped_lock lock(reg.mu);
-            state = reg.states.at(root.Topo().rank);
+            state = reg.states.at(std::make_pair(root.SessionId(), root.Topo().rank));
         }
         state->ready.get();    // rethrows if queue initialization failed
         return state;
-    }
-
-    static cipc::MsgQueue& GetMsgQueue(RankTopology const& topo)
-    {
-        std::shared_ptr<QueueState> state;
-        {
-            auto&            reg = Registry();
-            std::scoped_lock lock(reg.mu);
-            auto const       it = reg.states.find(topo.rank);
-            if (it == reg.states.end()) { throw std::logic_error("checkpoint queue was not initialized from a state registry"); }
-            state = it->second;
-        }
-        state->ready.get();
-        return *state->queue;
     }
 
     std::shared_ptr<QueueState> queueState;
@@ -594,24 +624,10 @@ struct CheckpointWriter
         public:
         void WriteTensors()
         {
-            that->root.WalkNodes([&](StateNode const& node) {
-                auto type = static_cast<StateNode::Type>(node.data.index());
-                if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
+            checkpoint::planning::ForEachPayload(that->root, [&](checkpoint::planning::Payload const& payload) {
                 try
                 {
-                    if (type == StateNode::Type::Tensor)
-                    {
-                        auto const& tensor = std::get<Tensor>(node.data);
-                        ProcessTensor_(node.handle, tensor.snapshotDtype, tensor.device, tensor.StorageSizeBytes(), tensor.handle);
-                    }
-                    else if (type == StateNode::Type::DTensor)
-                    {
-                        auto const& tensor = std::get<DTensor>(node.data);
-                        for (auto const& shard : tensor.shards)
-                        {
-                            ProcessTensor_(node.handle, shard.snapshotDtype, shard.device, shard.StorageSizeBytes(), shard.handle);
-                        }
-                    }
+                    ProcessTensor_(payload.node, payload.snapshotDtype, payload.device, payload.storageSize, payload.handle);
                 } catch (std::exception& e)
                 {
                     fmt::print(stderr,
@@ -642,7 +658,7 @@ struct CheckpointWriter
 
     void WriteTensors(cipc::SnapshotId const& snapshotId)
     {
-        auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
+        auto totalTensorStateSizeInBytes = root.GetTotalPayloadSizeInBytes();
         if (totalTensorStateSizeInBytes == 0) { return; }
 
         std::array<std::future<void>, cipc::D2HConcurrency> writerTasks{};
@@ -672,53 +688,41 @@ struct CheckpointWriter
         }
     }
 
-    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
+    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath, StateTree const& descriptor)
     {
         SetThreadName("ncc:sendsvr");
 
-        auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
+        auto totalTensorStateSizeInBytes = root.GetTotalPayloadSizeInBytes();
         auto numTensors                  = root.GetTotalNumTensors();
         auto stop1                       = Clock::now();
 
         {
-            // The CUDA current device is thread-local. Reuse the node captured while
-            // opening this rank's queue instead of querying again from an async writer
-            // thread, where the current device may have fallen back to device 0.
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
-            uint32_t numBlobs   = 0;
-            uint32_t numScalars = 0;
-            root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Blob) { ++numBlobs; }
-                else if (type == StateNode::Type::Scalar) { ++numScalars; }
-            });
-            serdes::WriteTrivial(sstrm, numBlobs);
-            root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Blob)
-                {
-                    auto const& blob = std::get<StateNode::Blob>(node.data);
-                    serdes::WriteBlobWithSize<uint32_t>(sstrm, std::string_view(blob.data(), blob.size()));
-                }
-            });
-            serdes::WriteTrivial(sstrm, numScalars);
-            root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Scalar) { serdes::WriteTrivial(sstrm, std::get<StateNode::Scalar>(node.data)); }
-            });
+            StateSerDes::Write(sstrm, descriptor, StateNode::Handle::Root);
             auto msg = sstrm.str();
-            msgQueue.Push({cipc::Message::ActivateSnapshot{
-                              .sessionId    = root.SessionId(),
-                              .snapshotId   = snapshotId,
-                              .globalRank   = root.GlobalRank(),
-                              .snapshotSize = totalTensorStateSizeInBytes,
-                              .messageSize  = static_cast<uint32_t>(msg.size()),
-                              .numaNode     = numaNode,
-                              .startedAt    = root.startedAt,
-                          }},
-                          msg.data(),
-                          msg.size());
+            if (msg.size() > std::numeric_limits<uint32_t>::max()) { throw std::length_error("Snapshot metadata exceeds wire limit"); }
+            cipc::Message::ActivateSnapshot header{
+                .sessionId    = root.SessionId(),
+                .snapshotId   = snapshotId,
+                .globalRank   = root.GlobalRank(),
+                .snapshotSize = totalTensorStateSizeInBytes,
+                .messageSize  = static_cast<uint32_t>(msg.size()),
+                .numaNode     = numaNode,
+                .startedAt    = root.startedAt,
+            };
+            std::ostringstream activation;
+            serdes::WriteTrivial(activation, header);
+            activation.write(msg.data(), static_cast<std::streamsize>(msg.size()));
+            auto response
+                = LocalServiceRequest(root,
+                                      boost::beast::http::verb::post,
+                                      fmt::format("/api/activate-snapshot/{}/{}/{}", root.SessionId(), root.GlobalRank(), snapshotId),
+                                      activation.str());
+            if (response.result() != boost::beast::http::status::ok)
+            {
+                throw std::runtime_error(fmt::format("Snapshot activation failed: HTTP {}: {}", response.result_int(), response.body()));
+            }
         }
         WriteTensors(snapshotId);
         auto const stop2       = Clock::now();
@@ -761,21 +765,23 @@ struct CheckpointWriter
 
 void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
 {
-    CheckpointWriter writer{root};
-    writer.SendToServer(snapshotId, ckptPath);
+    auto state      = CheckpointWriter::GetQueueState(root);
+    auto selected   = checkpoint::planning::BindSnapshot(*state->snapshotPlan, root);
+    auto descriptor = selected->Clone();
+    checkpoint::planning::AssignPayloadOffsets(*descriptor);
+    CheckpointWriter writer{*selected};
+    writer.SendToServer(snapshotId, ckptPath, *descriptor);
 }
 
 void WaitForCheckpointSave(StateTree const& root)
 {
-    auto& msgQueue = CheckpointWriter::GetMsgQueue(root.Topo());
+    auto& msgQueue = *CheckpointWriter::GetQueueState(root)->queue;
     for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
 void FinalizeStateRegistry(StateTree& root)
 {
-    if (root.IsFinalized()) { return; }
-    root.FinalizeRegistry();
-    SvcRegisterLocalState(root);
+    if (!root.IsFinalized()) { root.FinalizeRegistry(); }
     CheckpointWriter::SendStateRegistry(root);
 }
 

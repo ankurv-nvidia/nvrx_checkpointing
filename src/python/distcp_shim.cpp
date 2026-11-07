@@ -17,9 +17,11 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -158,18 +160,27 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
 
     checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage, blobView);
 
-    nb::list out;
-    uint64_t cursor = 0;
-    for (auto const& e : entries)
+    std::vector<InputEntry const*> archiveEntries;
+    archiveEntries.reserve(entries.size());
+    for (auto const& entry : entries) { archiveEntries.push_back(&entry); }
+    std::ranges::sort(archiveEntries, {}, [](InputEntry const* entry) { return entry->fqn; });
+    std::map<std::string, std::pair<uint64_t, uint64_t>> locations;
+    uint64_t                                             cursor = 0;
+    for (auto const* entry : archiveEntries)
     {
         Tensor::Dim shape;
-        for (auto d : e.shape) { shape.push_back(d); }
-        uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(e.dtype, shape, e.bytes.size());
-
+        for (auto dimension : entry->shape) { shape.push_back(dimension); }
+        auto const length = checkpoint::distcp::ComputeShardArchiveSize(entry->dtype, shape, entry->bytes.size());
+        locations.emplace(entry->fqn, std::pair{cursor, length});
+        cursor += length;
+    }
+    nb::list out;
+    for (auto const& entry : entries)
+    {
         nb::list sharddim;
-        for (auto d : e.shape) { sharddim.append(nb::make_tuple(0ULL, static_cast<uint64_t>(d))); }
-        out.append(nb::make_tuple(e.fqn, sharddim, cursor, archiveLen));
-        cursor += archiveLen;
+        for (auto dimension : entry.shape) { sharddim.append(nb::make_tuple(0ULL, static_cast<uint64_t>(dimension))); }
+        auto const& [offset, length] = locations.at(entry.fqn);
+        out.append(nb::make_tuple(entry.fqn, sharddim, offset, length));
     }
     return out;
 }
