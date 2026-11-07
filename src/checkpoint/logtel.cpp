@@ -36,12 +36,20 @@
 #include <opentelemetry/sdk/trace/tracer_provider_factory.h>
 #include <opentelemetry/trace/provider.h>
 
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -343,10 +351,11 @@ struct LogTelState
         boost::container::small_vector<ActiveSpan, 16> entries;
     };
 
-    std::mutex                      mutex;
-    checkpoint::telemetry::Id       lastId{};
-    std::once_flag                  poolOnce;
-    std::shared_ptr<spdlog::logger> logger;
+    std::mutex                                         mutex;
+    checkpoint::telemetry::Id                          lastId{};
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> daemonLog{nullptr, &std::fclose};
+    std::atomic<std::FILE*>                            daemonOutput{stderr};
+    std::shared_ptr<spdlog::logger>                    logger;
 
     std::atomic<bool>                          enabled{false};
     std::shared_ptr<trace_sdk::TracerProvider> traceProvider;
@@ -434,6 +443,8 @@ namespace
 class LoggingSink final : public spdlog::sinks::sink
 {
     public:
+    explicit LoggingSink(std::FILE* output LFTBND) : _output(output) {}
+
     void log(spdlog::details::log_msg const& msg) override
     {
         std::string_view payload{msg.payload.data(), msg.payload.size()};
@@ -475,7 +486,7 @@ class LoggingSink final : public spdlog::sinks::sink
             std::string      line;
             line.reserve(prefix.size() + payload.size() + 1);
             line.append(prefix).append(payload).push_back('\n');
-            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), stderr));
+            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), _output));
         }
 
         LogTelState& state = LogTelState::Get();
@@ -498,13 +509,14 @@ class LoggingSink final : public spdlog::sinks::sink
     void flush() override
     {
         std::scoped_lock lock(_mutex);
-        static_cast<void>(std::fflush(stderr));
+        static_cast<void>(std::fflush(_output));
     }
 
     void set_pattern(std::string const& /*pattern*/) override {}
     void set_formatter(std::unique_ptr<spdlog::formatter> /*formatter*/) override {}
 
     private:
+    std::FILE* _output;
     std::mutex _mutex;
 };
 
@@ -512,6 +524,37 @@ class LoggingSink final : public spdlog::sinks::sink
 
 namespace checkpoint::logging
 {
+void SetDaemonLogTarget()
+{
+    LogTelState&     state = LogTelState::Get();
+    std::scoped_lock lock(state.mutex);
+    if (state.daemonLog) { return; }
+    if (state.logger) { throw std::logic_error("Daemon log target must be configured before logging starts"); }
+
+    auto const              path = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
+    static constexpr mode_t Mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    int const               descriptor
+        = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, Mode);    // NOLINT(cppcoreguidelines-pro-type-vararg)
+    if (descriptor < 0)
+    {
+        int const error = errno;
+        throw std::runtime_error(fmt::format("cannot open server log {}: {}", path.string(), std::strerror(error)));
+    }
+    std::FILE* const output = ::fdopen(descriptor, "a");
+    if (output == nullptr)
+    {
+        int const error = errno;
+        ::close(descriptor);
+        throw std::runtime_error(fmt::format("cannot open server log stream {}: {}", path.string(), std::strerror(error)));
+    }
+    state.daemonLog.reset(output);
+    static_cast<void>(std::setvbuf(output, nullptr, _IOLBF, 0));
+    state.daemonOutput.store(output, std::memory_order_release);
+}
+
+std::FILE* DaemonOutput()
+{ return LogTelState::Get().daemonOutput.load(std::memory_order_acquire); }
+
 void Init()
 {
     LogTelState&     state = LogTelState::Get();
@@ -520,11 +563,10 @@ void Init()
 
     static constexpr size_t QueueSize   = 8192;
     static constexpr size_t WorkerCount = 1;
-    std::call_once(state.poolOnce, [] { spdlog::init_thread_pool(QueueSize, WorkerCount); });
+    if (!spdlog::thread_pool()) { spdlog::init_thread_pool(QueueSize, WorkerCount); }
 
-    // The redirected descriptor is shared with async-signal-safe crash logging.
     auto logger = std::make_shared<spdlog::async_logger>(
-        "native_ckpt", std::make_shared<LoggingSink>(), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
+        "native_ckpt", std::make_shared<LoggingSink>(DaemonOutput()), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
 
     std::string const         levelStr = checkpoint::config::GetConfigValue<checkpoint::config::LogLevel>();
     spdlog::level::level_enum level    = spdlog::level::from_str(levelStr);
@@ -544,14 +586,23 @@ void Flush()
 
 void Shutdown()
 {
-    LogTelState& state = LogTelState::Get();
+    LogTelState& state   = LogTelState::Get();
+    bool         running = false;
     {
         std::scoped_lock lock(state.mutex);
-        if (!state.logger) { return; }
-        state.logger->flush();
-        state.logger.reset();
+        if (state.logger)
+        {
+            state.logger->flush();
+            state.logger.reset();
+            running = true;
+        }
     }
-    spdlog::shutdown();
+    if (running) { spdlog::shutdown(); }
+    {
+        std::scoped_lock lock(state.mutex);
+        state.daemonOutput.store(stderr, std::memory_order_release);
+        state.daemonLog.reset();
+    }
 }
 
 void LogImpl(Level level, std::string_view message)
@@ -875,7 +926,7 @@ void Emitter<event::ProcessMemory>::Emit(event::ProcessMemory const& fields)
 
 void Emitter<span::CkptSave::Begin>::Emit(span::CkptSave::Begin const& fields)
 {
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::DaemonOutput(),
                "[native_ckpt:svr][{}][PERF] Rank={} Begin span={} started_at_ns={} snapshot={}\n",
                static_cast<uint32_t>(fields.id.sessionId),
                static_cast<uint32_t>(fields.id.rank),
@@ -898,7 +949,7 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
     auto const writeSeconds = static_cast<double>(fields.d2hDuration.count()) / 1e6;    // NOLINT
     auto const bwMbps
         = writeSeconds == 0.0 ? 0.0 : static_cast<double>(fields.totalTensorBytes) / (1024.0 * 1024.0) / writeSeconds;    // NOLINT
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::DaemonOutput(),
                "[native_ckpt:svr][{}][PERF] Rank={} Finished bw_mbps={:.2f} "
                "| Time(us):  wr_tnsr_us={} snapshot_us={} total_us={} "
                "| Count: num_tensors={} total_d2h={} "

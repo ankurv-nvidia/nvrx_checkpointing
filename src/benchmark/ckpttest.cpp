@@ -3497,9 +3497,10 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
 // Custom main registers the optional --registry argument.
 int main(int argc, char* argv[])
 {
-    if (argc == 2 && std::string_view{argv[1]} == ShmTestServerArg)
+    if ((argc == 2 || argc == 3) && std::string_view{argv[1]} == ShmTestServerArg)
     {
-        RunServer();
+        auto const index = argc == 3 ? checkpoint::config::types::Integer<uint16_t>::Parse(argv[2]) : uint16_t{0};
+        RunServer(index);
         return EXIT_SUCCESS;
     }
 

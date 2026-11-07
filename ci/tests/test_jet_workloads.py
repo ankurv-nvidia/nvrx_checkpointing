@@ -72,3 +72,18 @@ def test_training_failure_allows_remaining_tasks_to_collect_cores(generator: Mod
     flags = manifest["launchers"]["type:slurm"]["srun_additional_flags"]
     assert flags["kill_on_bad_exit=0"] is True
     assert "kill_on_bad_exit=1" not in flags
+
+
+@pytest.mark.parametrize("profile", ["h100", "b200"])
+def test_small_native_profile_includes_inproc_checkpoint_coverage(generator: ModuleType, profile: str) -> None:
+    platform = generator.JetPlatform(profile, "h100", "x86_64", 8)
+    workloads = [workload for workload in generator.resolved_workloads(platform) if "inproc" in workload.flavors]
+
+    assert len(workloads) == 1
+    workload = workloads[0]
+    assert workload.config == "pico"
+    assert workload.nodes == 1
+    assert workload.provider == "native"
+    assert workload.flavors == ("detr", "inproc")
+    assert workload.runs == ("ref:nvrx", "cmp:native")
+    assert "detr+inproc" in workload.job_args

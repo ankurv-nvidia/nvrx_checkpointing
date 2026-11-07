@@ -32,6 +32,10 @@ on:
         description: gb200-native-perf-super3bf16-16x4 (large-scale)
         type: boolean
         default: false
+      gb200-native-perf-inproc-super3bf16-16x4:
+        description: gb200-native-perf-inproc-super3bf16-16x4 (large-scale)
+        type: boolean
+        default: false
       gb200-native-detr-super3fp4-16x4:
         description: gb200-native-detr-super3fp4-16x4 (large-scale)
         type: boolean

@@ -69,6 +69,13 @@ struct EnabledByOne
     static ValueType Parse(std::string_view value) { return value == "1"; }
 };
 
+struct Present
+{
+    using ValueType = bool;
+
+    static ValueType ParsePresence(char const* value) { return value != nullptr; }
+};
+
 struct ByteSize
 {
     using ValueType = size_t;
@@ -196,6 +203,12 @@ struct SvcDisableAutoLaunch
     static constexpr std::string_view Env     = "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH";
     static constexpr std::string_view Default = "0";
     using Type                                = types::EnabledByOne;
+};
+
+struct ServerInproc
+{
+    static constexpr std::string_view Name = "server.inproc";
+    using Type                             = types::Present;
 };
 
 struct OtelExport
@@ -357,10 +370,14 @@ template <typename TConfig> consteval auto EnvName()
 
 template <typename TConfig> [[nodiscard]] auto GetConfigValue()
 {
-    constexpr auto         envName  = detail::EnvName<TConfig>();
-    char const*            rawValue = std::getenv(envName.data());    // NOLINT(concurrency-mt-unsafe)
-    std::string_view const value    = rawValue != nullptr && *rawValue != '\0' ? std::string_view{rawValue} : TConfig::Default;
-    return TConfig::Type::Parse(value);
+    constexpr auto envName  = detail::EnvName<TConfig>();
+    char const*    rawValue = std::getenv(envName.data());    // NOLINT(concurrency-mt-unsafe)
+    if constexpr (requires { TConfig::Type::ParsePresence(rawValue); }) { return TConfig::Type::ParsePresence(rawValue); }
+    else
+    {
+        std::string_view const value = rawValue != nullptr && *rawValue != '\0' ? std::string_view{rawValue} : TConfig::Default;
+        return TConfig::Type::Parse(value);
+    }
 }
 
 using OtelExportMode = types::OtelExportMode::ValueType;

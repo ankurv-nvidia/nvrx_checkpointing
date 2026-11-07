@@ -56,6 +56,34 @@ torchrun <torchrun-options> --module nvrx_checkpointing.megatron.integration "${
 Each rank must invoke the integration module; calling `install()` in a
 separate setup process will not work because the patches are process-local.
 
+### Running the daemon inside training
+
+Set `NATIVE_CKPT_SERVER_INPROC` on every training rank to host each node's
+checkpoint daemon in its local-rank-0 training process:
+
+```bash
+export NATIVE_CKPT_SERVER_INPROC=1
+```
+
+The variable's presence enables this mode, including an empty value or `0`.
+Unset it to use a separate daemon process. Other ranks keep using the same
+node-local HTTP and shared-memory communication. An existing separate daemon
+must finish before a training process can host the daemon on that node.
+
+Training roots retain a session reference until their client work finishes
+and the roots close or are destroyed. Daemons also retain references for
+asynchronous work and pending requests. Normal training-process exit waits for
+this work to finish; the coordinator remains available while other nodes still
+need it. Dead local processes and unreachable peer services release their
+references automatically.
+A daemon permits five seconds to acquire its first reference and shuts down
+without this grace period after its last valid reference is released.
+
+The daemon writes directly to `NATIVE_CKPT_SERVER_LOG` and leaves the training
+process's standard streams available. A forced process termination ends its
+hosted daemon along with training.
+The CI launcher enables this mode with its [`inproc` flavor](ci/slurm_job.md#checkpoint-variant-flavors).
+
 ### Enabling OpenTelemetry
 
 Native checkpoint telemetry is disabled by default. To collect it through the

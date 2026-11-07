@@ -8,6 +8,10 @@ on:
         description: b200-native-detr-pico-1x8 (default)
         type: boolean
         default: false
+      b200-native-detr-inproc-pico-1x8:
+        description: b200-native-detr-inproc-pico-1x8 (default)
+        type: boolean
+        default: false
       b200-native-perf-pico-1x8:
         description: b200-native-perf-pico-1x8 (default)
         type: boolean

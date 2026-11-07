@@ -63,6 +63,7 @@ struct Session
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
         bool                                      complete{false};
+        std::shared_ptr<void>                     completionReference;
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
     };
 

@@ -8,8 +8,27 @@
 #include <cstdint>
 #include <filesystem>
 
-void SvcIncrRef();
-void SvcDecrRef();
+#include <sys/types.h>
+
+struct ServiceReference
+{
+    ServiceReference(checkpoint::ipc::SessionId sessionId, RankTopology const& topology);
+    ~ServiceReference();
+    CLASS_DELETE_COPY_AND_MOVE(ServiceReference);
+
+    void Release() noexcept;
+
+    private:
+    checkpoint::ipc::SessionId _sessionId;
+    uint64_t                   _token;
+    uint16_t                   _serverIndex{};
+    pid_t                      _ownerPid;
+    bool                       _active{false};
+};
+
+void ReleasePendingServiceReferences();
+
+void WaitForOwnedCheckpointService();
 
 void FinalizeStateRegistry(StateTree& root);
 
@@ -17,6 +36,7 @@ void FinalizeStateRegistry(StateTree& root);
 
 void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
 void WaitForCheckpointSave(StateTree const& root);
+void DrainCheckpointClient(StateTree const& root);
 
 void SvcPing();
 void SvcStop();

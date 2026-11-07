@@ -6,9 +6,13 @@
 #include <filesystem>
 #include <string_view>
 
-// Starts the checkpoint server, prints "READY\n" to stdout when the port is bound,
-// then blocks until a shutdown is triggered (either by message or inactivity timeout).
-void RunServer();
+// Runs the checkpoint daemon until references expire or shutdown is requested.
+void RunServer(uint16_t index = 0);
+
+void StartOwnedInprocServer();
+void WaitForOwnedInprocServer();
+bool OwnsInprocServer();
+bool ReleaseOwnedInprocReference(uint32_t sessionId, std::string_view token);
 
 void RunInprocServer(uint16_t nodes);
 

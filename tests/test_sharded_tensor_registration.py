@@ -572,12 +572,17 @@ def test_state_registration_accepts_integer_enum_list() -> None:
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
 def test_register_state_dict_rejects_blob_size_changes(rank: int) -> None:
-    root = _create_root(rank, 2, ["coordinator", "remote"], 1)
+    session_id = next(_SESSION_IDS)
+    roots = [checkpoint.model_state.create_root(session_id, local_rank, 2, ["localhost"], 2) for local_rank in range(2)]
+    root = roots[rank]
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {"rng_state": initial}
-    root.register_state_dict(state)
+    for local_root in roots:
+        local_root.register_state_dict(state)
+        local_root.wait_for_async_completion()
     assert root.snapshot_size > 0
-    root.finalize_registry()
+    for local_root in roots:
+        local_root.finalize_registry()
     fresh = ShardedObject("rng_state", {"iteration": 2, "payload": "x" * 4096}, (1,), (0,))
 
     root.register_state_dict({"rng_state": fresh})

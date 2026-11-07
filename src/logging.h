@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <string_view>
 #include <utility>
@@ -22,6 +23,10 @@ enum class Level : uint8_t
 };
 
 void Init();
+
+void SetDaemonLogTarget();
+
+[[nodiscard]] std::FILE* DaemonOutput();
 
 void Flush();
 

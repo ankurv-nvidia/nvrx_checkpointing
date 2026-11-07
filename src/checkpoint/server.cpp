@@ -7,6 +7,7 @@
 #include "messages.h"
 #include "net_utils.h"
 #include "numa_utils.h"
+#include "reference_registry.h"
 #include "serdes_utils.h"
 #include "server.h"
 #include "session.h"
@@ -92,19 +93,31 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    explicit Server(uint16_t index = 0) : _index(index) {}
+    enum class Lifetime : uint8_t
+    {
+        Manual,
+        Process,
+        Inproc
+    };
+
+    explicit Server(uint16_t index = 0, Lifetime lifetime = Lifetime::Manual, std::atomic<bool>* ownerRunning LFTBND = nullptr) :
+        _lifetime(lifetime), _ownerRunning(ownerRunning), _index(index)
+    {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
-    void Start();
-    bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
-    bool AllSessionsComplete();
-    bool HasSessionsAndAllSessionsComplete();
-    void WaitForShutdown();
-    void Ping();
-    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
-    void Stop();
-    void QuerySessions(ServerSessionCallback callback, void* cbData);
+    void                                 Start();
+    bool                                 AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
+    bool                                 AllSessionsComplete();
+    bool                                 HasSessionsAndAllSessionsComplete();
+    void                                 WaitForShutdown();
+    void                                 Ping();
+    void                                 HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
+    void                                 Stop();
+    void                                 QuerySessions(ServerSessionCallback callback, void* cbData);
+    checkpoint::ReferenceRegistry::Lease SelfReference(cipc::SessionId sessionId)
+    { return _references.AcquireSelf(static_cast<uint32_t>(sessionId)); }
+    void ReleaseLocalReference(uint32_t sessionId, std::string_view token) { _references.ReleaseLocal(sessionId, std::string{token}); }
 
     private:
     Session& SessionById_(cipc::SessionId sessionId) LFTBND;
@@ -132,6 +145,9 @@ struct Server
     void ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf);
     void ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf);
 
+    void EnsureUpstreamReference_(cipc::SessionId sessionId);
+    void ReapUpstreamReferences_();
+    void ReleaseUpstreamReferences_();
     void SpinDownWaitLoop_(tcp_stream stream);
     void FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration);
     void HandleRequest_(tcp_stream& stream);
@@ -164,6 +180,20 @@ struct Server
     boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor);
 
     private:
+    struct UpstreamReference
+    {
+        std::string coordinator;
+        std::string token;
+    };
+
+    checkpoint::ReferenceRegistry _references;
+    Lifetime                      _lifetime;
+    std::atomic<bool>*            _ownerRunning{};
+    uint64_t                      _generation{static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+    uint64_t                      _upstreamSequence{};
+    std::mutex                    _upstreamMutex;
+    std::map<cipc::SessionId, UpstreamReference> _upstreamReferences;
+
     uint16_t   _index{};
     std::mutex _mutex;
 
@@ -221,6 +251,34 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     {    //
         ERR("Shutdown Error: {}", ec.what());
     }
+}
+
+static bool PingService(std::string const& peer)
+{
+    try
+    {
+        boost::asio::io_context ioc;
+        auto const [address, endpoints] = ResolveEndpoint(ioc, peer);
+        bool alive                      = false;
+        boost::asio::co_spawn(
+            ioc,
+            [&]() -> boost::asio::awaitable<void> {
+                boost::beast::tcp_stream stream(ioc);
+                stream.expires_after(1s);
+                co_await stream.async_connect(endpoints, boost::asio::use_awaitable);
+                boost::beast::http::request<boost::beast::http::empty_body> request{
+                    boost::beast::http::verb::get, "/api/ping", HttpVersion11};
+                request.set(boost::beast::http::field::host, address.host());
+                co_await boost::beast::http::async_write(stream, request, boost::asio::use_awaitable);
+                boost::beast::flat_buffer                                     buffer;
+                boost::beast::http::response<boost::beast::http::string_body> response;
+                co_await boost::beast::http::async_read(stream, buffer, response, boost::asio::use_awaitable);
+                alive = response.result() == boost::beast::http::status::ok;
+            },
+            [](std::exception_ptr) {});
+        ioc.run();
+        return alive;
+    } catch (std::exception const&) { return false; }
 }
 
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
@@ -771,6 +829,76 @@ static void SendWriteCkptCompleteToPeers(Server const* const     server,
     SendWriteCkptCompleteToPeers(server, sessionId, topo, snapshotId, failure, startPeerIndex, delegateStart);
 }
 
+void Server::EnsureUpstreamReference_(cipc::SessionId sessionId)
+{
+    if (_lifetime == Lifetime::Manual || _upstreamReferences.contains(sessionId)) { return; }
+    std::string coordinator;
+    std::string peer;
+    {
+        std::scoped_lock lock(_mutex);
+        auto const&      session = *_activeSessions.at(sessionId);
+        if (session.IsCoordinatorPeer()) { return; }
+        coordinator = session.topo.peers.at(0);
+        peer        = session.topo.peers.at(session.PeerIndex());
+    }
+    auto const token = fmt::format(
+        "{}-{}-{}-{}-{}", ::getpid(), std::hash<std::string>{}(peer), _generation, static_cast<uint32_t>(sessionId), ++_upstreamSequence);
+    SendToPeerWithRetries(this, sessionId, coordinator, peer, fmt::format("/api/reference/peer/acquire/{}/{}", sessionId, token), {});
+    _upstreamReferences.emplace(sessionId, UpstreamReference{.coordinator = std::move(coordinator), .token = token});
+}
+
+void Server::ReapUpstreamReferences_()
+{
+    std::scoped_lock lock(_upstreamMutex);
+    if (_references.HasUnassignedWork()) { return; }
+    for (auto it = _upstreamReferences.begin(); it != _upstreamReferences.end();)
+    {
+        if (_references.HasValidReferences(PingService, static_cast<uint32_t>(it->first)))
+        {
+            ++it;
+            continue;
+        }
+        if (!_references.HasValidReferences(PingService)) { return; }
+        if (!_references.TryCloseSession(static_cast<uint32_t>(it->first)))
+        {
+            ++it;
+            continue;
+        }
+        try
+        {
+            SendToPeerWithRetries(this,
+                                  it->first,
+                                  it->second.coordinator,
+                                  {},
+                                  fmt::format("/api/reference/peer/release/{}/{}", it->first, it->second.token),
+                                  {});
+            it = _upstreamReferences.erase(it);
+        } catch (std::exception const& ex)
+        {
+            ERR("Failed to release coordinator reference: {}", ex.what());
+            it = _upstreamReferences.erase(it);
+        }
+    }
+}
+
+void Server::ReleaseUpstreamReferences_()
+{
+    std::scoped_lock lock(_upstreamMutex);
+    for (auto const& [sessionId, reference] : _upstreamReferences)
+    {
+        try
+        {
+            SendToPeerWithRetries(this,
+                                  sessionId,
+                                  reference.coordinator,
+                                  {},
+                                  fmt::format("/api/reference/peer/release/{}/{}", sessionId, reference.token),
+                                  {});
+        } catch (std::exception const&) {}
+    }
+    _upstreamReferences.clear();
+}
+
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
@@ -1205,7 +1333,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             // Rank 0 joins last, so the set is now world-size: every shard and the metadata
             // are on disk and the checkpoint is loadable.
             // This raw marker has a strict schema consumed by CI.
-            fmt::print(stderr,
+            fmt::print(checkpoint::logging::DaemonOutput(),
                        "[native_ckpt:svr][{}#{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
                        *server,
                        sessionId,
@@ -1217,6 +1345,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             {
                 std::scoped_lock lock(mutex);
                 snapshot.complete = true;
+                snapshot.completionReference.reset();
             }
         }
     } catch (std::exception const& ex)
@@ -1239,6 +1368,7 @@ void Session::OnFinalizeSnapshotAsync_(cipc::Message::FinalizeSnapshot const& hd
             BroadcastWriteCkptCompleteToPeers_(snapshot);
             std::scoped_lock lock(mutex);
             snapshot.complete = true;
+            snapshot.completionReference.reset();
         }
         else if (notifyCoordinator && !snapshot.complete)
         {
@@ -1604,15 +1734,16 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
             localState->localRegistry = std::move(localRegistry);
             largestSnapshotSize       = std::max(largestSnapshotSize, snapshotSize);
             registryAccepted          = true;
-            asyncTasks.emplace_back(
-                std::async(std::launch::async | std::launch::deferred, &Session::OnReceiveLocalStateRegistryAsync_, this, rank));
+            asyncTasks.emplace_back(std::async(std::launch::async, [this, rank, lease = server->SelfReference(sessionId)] mutable {
+                auto taskReference = std::move(lease);
+                OnReceiveLocalStateRegistryAsync_(rank);
+            }));
             if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
             {
-                asyncTasks.push_back(std::async(std::launch::async | std::launch::deferred,
-                                                &Session::SendLocalShardedStateRegistryToPeerWithRetries_,
-                                                this,
-                                                rank,
-                                                topo.peers[0]));
+                asyncTasks.push_back(std::async(std::launch::async, [this, rank, lease = server->SelfReference(sessionId)] mutable {
+                    auto taskReference = std::move(lease);
+                    SendLocalShardedStateRegistryToPeerWithRetries_(rank, topo.peers[0]);
+                }));
             }
         }
     }
@@ -1713,8 +1844,9 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         auto&            snapshot = snapshots[hdr.snapshotId];
         if (!snapshot)
         {
-            snapshot             = std::make_unique<Snapshot>();
-            snapshot->snapshotId = hdr.snapshotId;
+            snapshot                      = std::make_unique<Snapshot>();
+            snapshot->snapshotId          = hdr.snapshotId;
+            snapshot->completionReference = server->SelfReference(sessionId);
         }
         if (snapshot->path.empty())
         {
@@ -1886,7 +2018,10 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
     {
         std::scoped_lock lock(mutex);    // local registry uploads can arrive on concurrent HTTP handlers
-        asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::OnFinalizeSnapshotAsync_, this, hdr));
+        asyncTasks.emplace_back(std::async(std::launch::async, [this, hdr, lease = server->SelfReference(sessionId)] mutable {
+            auto taskReference = std::move(lease);
+            OnFinalizeSnapshotAsync_(hdr);
+        }));
     }
 }
 
@@ -2042,7 +2177,7 @@ void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
             _msgQueue[i] = &msgQueue;
             queuesReady.count_down();
             INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::DaemonOutput());
             while (true) try
                 {
                     auto const [stop, hdr, buf] = msgQueue.BeginRead();
@@ -2086,14 +2221,19 @@ bool Server::HasSessionsAndAllSessionsComplete()
 
 void Server::WaitForShutdown()
 {
-    auto const autoShutdownTimeout
-        = std::chrono::seconds{checkpoint::config::GetConfigValue<checkpoint::config::ServerAutoShutdownTimeoutSeconds>()};
     while (true)
     {
-        auto const autoShutdown
-            = autoShutdownTimeout != 0s && (_lastPingTime + autoShutdownTimeout) < PerfClock::now() && HasSessionsAndAllSessionsComplete();
-        if (_stopRequested || autoShutdown) { break; }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (_stopRequested) { break; }
+        ReapUpstreamReferences_();
+        if (!_references.HasValidReferences(PingService) && _references.TryRetire()) { break; }
+        std::this_thread::sleep_for(10ms);
+    }
+    if (!_references.IsAccepting())
+    {
+        if (_ownerRunning != nullptr) { *_ownerRunning = false; }
+        checkpoint::logging::Shutdown();
+        checkpoint::telemetry::Shutdown();
+        ReleaseUpstreamReferences_();
     }
     Stop();
 }
@@ -2106,6 +2246,17 @@ void Server::Ping()
 
 void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
 {
+    auto const sessionId = std::visit(
+        [](auto const& message) {
+            if constexpr (requires { message.sessionId; }) { return static_cast<uint32_t>(message.sessionId); }
+            else
+            {
+                return checkpoint::ReferenceRegistry::NoSession;
+            }
+        },
+        hdr);
+    auto selfReference = _references.AcquireSelf(sessionId);
+    if (!selfReference) { return; }
     switch (static_cast<cipc::Message::Type>(hdr.index()))
     {
     case cipc::Message::Type::Ping:
@@ -2115,7 +2266,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     }
     case cipc::Message::Type::Shutdown:
     {
-        Stop();
+        _stopRequested = true;
     }
     break;
     // break;
@@ -2164,8 +2315,6 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
 
 void Server::Stop()
 {
-    checkpoint::logging::Shutdown();
-    checkpoint::telemetry::Shutdown();
     bool wasRunning = false;
     {
         std::scoped_lock lock(_mutex);
@@ -2198,7 +2347,7 @@ void Server::Stop()
                     }
                 }
             }
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::DaemonOutput());
         }
         for (auto const& msgQueue : _msgQueue)
         {
@@ -2263,6 +2412,8 @@ void Server::Stop()
         _threads.clear();
         _running = false;
     }
+    checkpoint::logging::Shutdown();
+    checkpoint::telemetry::Shutdown();
 }
 
 void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
@@ -2330,8 +2481,9 @@ void Server::FindOrWaitForSessionAndSnapshot_(std::string_view context,
             auto&                        snapshot = it->second->snapshots[snapshotId];
             if (!snapshot)
             {
-                snapshot             = std::make_unique<Session::Snapshot>();
-                snapshot->snapshotId = snapshotId;
+                snapshot                      = std::make_unique<Session::Snapshot>();
+                snapshot->snapshotId          = snapshotId;
+                snapshot->completionReference = SelfReference(sessionId);
             }
 
             lambda(*it->second, *snapshot);
@@ -2399,7 +2551,11 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotI
                                                  onCoordinator ? fmt::format("rank={} WriteCkpt failed: {}", fromRank, failure)
                                                                : std::move(failure));
                                          }
-                                         if (!onCoordinator) { snapshot.complete = true; }
+                                         if (!onCoordinator)
+                                         {
+                                             snapshot.complete = true;
+                                             snapshot.completionReference.reset();
+                                         }
                                      });
 }
 
@@ -2739,6 +2895,15 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
 
     auto const& headers = headerParser.get();
     auto        target  = headers.target();
+    if (!_references.IsAccepting() && target != "/api/ping")
+    {
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::service_unavailable,
+                                                                               headers.version()};
+        response.body() = "Checkpoint daemon is stopping";
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+        return;
+    }
     SetThreadName(fmt::format("ncs:w:{}", target).c_str());
 
     auto url     = boost::urls::parse_origin_form(target).value();
@@ -2754,11 +2919,66 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         return true;
     };
 
-    // Check if this is the state upload endpoint: POST /api/peer/shardedstateregistry/{sessionId}/{rank}
-    if (matches({"api", "peer", "shardedstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    if (matches({"api", "reference"}) && headers.method() == boost::beast::http::verb::post)
     {
-        auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
-        auto rank      = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("Missing reference operation"); }
+        bool const peerReference = *it == "peer";
+        if (peerReference) { ++it; }
+        if (it == segs.end()) { throw std::invalid_argument("Missing reference operation"); }
+        std::string const operation{*(it++)};
+        if (operation != "acquire" && operation != "release") { throw std::invalid_argument("Unknown reference operation"); }
+        if (it == segs.end()) { throw std::invalid_argument("Missing reference session"); }
+        auto const sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto       requestSession = SelfReference(sessionId);
+        if (it == segs.end()) { throw std::invalid_argument("Missing reference token"); }
+        std::string const token{*(it++)};
+        pid_t             pid{};
+        if (!peerReference && operation == "acquire")
+        {
+            if (it == segs.end()) { throw std::invalid_argument("Missing client process identity"); }
+            pid = boost::lexical_cast<pid_t>(*(it++));
+        }
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected reference path segments"); }
+        auto const                                                          version = headers.version();
+        boost::beast::http::request_parser<boost::beast::http::string_body> parser{std::move(headerParser)};
+        boost::beast::http::read(stream, buffer, parser);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, version};
+        try
+        {
+            if (peerReference)
+            {
+                if (operation == "acquire") { _references.AcquireRemote(static_cast<uint32_t>(sessionId), token, parser.get().body()); }
+                else
+                {
+                    _references.ReleaseRemote(static_cast<uint32_t>(sessionId), token);
+                }
+            }
+            else if (operation == "acquire")
+            {
+                std::scoped_lock lock(_upstreamMutex);
+                ActivateSession_(sessionId, 1, parser.get().body());
+                EnsureUpstreamReference_(sessionId);
+                _references.AcquireLocal(static_cast<uint32_t>(sessionId), token, pid);
+            }
+            else
+            {
+                _references.ReleaseLocal(static_cast<uint32_t>(sessionId), token);
+            }
+            response.body() = "{}";
+        } catch (std::exception const& ex)
+        {
+            response.result(boost::beast::http::status::service_unavailable);
+            response.body() = ex.what();
+        }
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+    }
+    else if (matches({"api", "peer", "shardedstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    {
+        auto sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
+        auto rank = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
 
         boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
@@ -2774,7 +2994,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
 
     else if (matches({"api", "peer", "snapshotcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
-        auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
         auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in snapshot complete endpoint"); }
@@ -2792,7 +3014,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     }
     else if (matches({"api", "peer", "writeckptcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
-        auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         auto rank       = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
         auto snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
@@ -2821,7 +3045,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     // The global registry for a snapshot (body = deflated serialized tree).
     else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
-        auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         if (it != segs.end())
         {
             throw std::invalid_argument("Unexpected extra URL segments in globalregistry endpoint; globalregistry requires a "
@@ -2860,7 +3086,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     }
     else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
-        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto const sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto       requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in local registry endpoint"); }
         auto const version   = headers.version();
         auto const keepAlive = headers.keep_alive();
@@ -2890,7 +3118,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
-        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto const sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto       requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in local registry endpoint"); }
         auto const version   = headers.version();
         auto const keepAlive = headers.keep_alive();
@@ -2925,7 +3155,10 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
-        res.body() = "{}";
+        res.body() = fmt::format("{{\"mode\":\"{}\",\"pid\":{},\"generation\":{}}}",
+                                 _lifetime == Lifetime::Inproc ? "inproc" : (_lifetime == Lifetime::Process ? "process" : "manual"),
+                                 ::getpid(),
+                                 _generation);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
         Ping();
@@ -2956,13 +3189,18 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         // accept loop must stay free to service the peer writeckptcomplete/snapshotcomplete
         // notifications that idle-ness depends on, otherwise the wait would deadlock.
         std::scoped_lock lock(_mutex);
-        _spinDownThreads.emplace_back([this, s = std::move(stream)] mutable { SpinDownWaitLoop_(std::move(s)); });
+        _spinDownThreads.emplace_back([this, s = std::move(stream), lease = _references.AcquireSelf()] mutable {
+            auto taskReference = std::move(lease);
+            SpinDownWaitLoop_(std::move(s));
+        });
     }
     // Block until a checkpoint is durable: GET /api/wait-for-ckpt-finalize/{sessionId}/{iteration}.
     // `iteration` is signed — negative values index back from the newest snapshot (-1 = latest).
     else if (matches({"api", "wait-for-ckpt-finalize"}) && headers.method() == boost::beast::http::verb::get && (it != segs.end()))
     {
-        auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto sessionId      = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        auto requestSession = SelfReference(sessionId);
+        if (!requestSession) { throw std::runtime_error("Checkpoint session is stopping"); }
         if (it == segs.end()) { throw std::invalid_argument("wait-for-ckpt-finalize requires a /{sessionId}/{iteration} path"); }
         auto iteration = boost::lexical_cast<int64_t>(*(it++));
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in wait-for-ckpt-finalize endpoint"); }
@@ -2972,9 +3210,11 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock lock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration] mutable {
-            FinalizeWaitLoop_(std::move(s), sessionId, iteration);
-        }));
+        _finalizeWaits.emplace_back(
+            std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration, lease = std::move(requestSession)] mutable {
+                auto taskReference = std::move(lease);
+                FinalizeWaitLoop_(std::move(s), sessionId, iteration);
+            }));
     }
     else if ((url.path() == "/v1/traces" || url.path() == "/v1/metrics" || url.path() == "/v1/logs")
              && headers.method() == boost::beast::http::verb::post)
@@ -3128,8 +3368,15 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
             ERR("accept error: {}", ec.message());
             co_return;
         }
-        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)] mutable {
-            static constexpr auto Timeout = std::chrono::seconds{30};
+        auto pendingLease = _references.AcquireSelf(checkpoint::ReferenceRegistry::NoSession, true);
+        if (!pendingLease)
+        {
+            socket.close(ec);
+            continue;
+        }
+        boost::asio::post(*_handlerPool, [this, sock = std::move(socket), lease = std::move(pendingLease)] mutable {
+            auto                  requestReference = std::move(lease);
+            static constexpr auto Timeout          = std::chrono::seconds{30};
             tcp_stream            stream(std::move(sock));
             stream.expires_after(Timeout);
             try
@@ -3214,6 +3461,114 @@ SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 static std::vector<std::unique_ptr<Server>> ServerSingletons;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
 
+namespace
+{
+struct OwnedInprocServer
+{
+    std::mutex        mutex;
+    std::mutex        serverMutex;
+    Server*           server{};
+    std::thread       thread;
+    std::future<void> completion;
+    std::atomic<bool> running{};
+
+    ~OwnedInprocServer()
+    {
+        if (thread.joinable()) { thread.join(); }
+    }
+};
+
+OwnedInprocServer& OwnedServer()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static OwnedInprocServer instance;
+    SUPPRESS_WARNINGS_END
+    return instance;
+}
+}    // namespace
+
+void StartOwnedInprocServer()
+{
+    auto&            owned = OwnedServer();
+    std::scoped_lock lock(owned.mutex);
+    if (owned.running) { return; }
+    if (owned.thread.joinable())
+    {
+        owned.thread.join();
+        owned.completion.get();
+    }
+    std::promise<void>         readyPromise;
+    auto                       readiness = readyPromise.get_future();
+    std::packaged_task<void()> task([&owned, ready = std::move(readyPromise)] mutable {
+        bool signaled = false;
+        try
+        {
+            SetThreadName("ncs:lifetime");
+            checkpoint::logging::SetDaemonLogTarget();
+            checkpoint::logging::Init();
+            Server server(0, Server::Lifetime::Inproc, &owned.running);
+            server.Start();
+            auto publication = std::shared_ptr<void>(nullptr, [&owned](void*) {
+                std::scoped_lock serverLock(owned.serverMutex);
+                owned.server = nullptr;
+            });
+            {
+                std::scoped_lock serverLock(owned.serverMutex);
+                owned.server = &server;
+            }
+            INFO("In-process daemon started pid={}", ::getpid());
+            owned.running = true;
+            ready.set_value();
+            signaled = true;
+            server.WaitForShutdown();
+            owned.running = false;
+        } catch (...)
+        {
+            owned.running = false;
+            if (!signaled) { ready.set_exception(std::current_exception()); }
+            throw;
+        }
+    });
+    owned.completion = task.get_future();
+    owned.thread     = std::thread(std::move(task));
+    try
+    {
+        readiness.get();
+    } catch (...)
+    {
+        owned.thread.join();
+        owned.completion = {};
+        throw;
+    }
+}
+
+void WaitForOwnedInprocServer()
+{
+    auto&             owned = OwnedServer();
+    std::thread       thread;
+    std::future<void> completion;
+    {
+        std::scoped_lock lock(owned.mutex);
+        thread     = std::move(owned.thread);
+        completion = std::move(owned.completion);
+    }
+    if (thread.joinable()) { thread.join(); }
+    if (completion.valid()) { completion.get(); }
+}
+
+bool OwnsInprocServer()
+{ return OwnedServer().running; }
+
+bool ReleaseOwnedInprocReference(uint32_t sessionId, std::string_view token)
+{
+    auto&            owned = OwnedServer();
+    std::scoped_lock lock(owned.serverMutex);
+    if (owned.server == nullptr) { return false; }
+    owned.server->ReleaseLocalReference(sessionId, token);
+    return true;
+}
+
 void RunInprocServer(uint16_t nodes)
 {
     checkpoint::logging::Init();
@@ -3224,13 +3579,13 @@ void RunInprocServer(uint16_t nodes)
         ServerSingletons.back()->Start();
     }
     INFO("Inproc server started.");
-    std::fflush(stderr);
+    std::fflush(checkpoint::logging::DaemonOutput());
 }
 
-void RunServer()    // NOLINT(misc-use-internal-linkage)
+void RunServer(uint16_t index)    // NOLINT(misc-use-internal-linkage)
 {
     SetThreadName("ncs:main");
-    Server server;
+    Server server(index, Server::Lifetime::Process);
     server.Start();
 
     // Signal to the launching process (SvcPing) that we are ready to accept connections.

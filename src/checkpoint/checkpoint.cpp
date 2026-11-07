@@ -6,6 +6,7 @@
 #include "messages.h"
 #include "numa_utils.h"    // IWYU pragma: keep
 #include "quant.h"
+#include "server.h"
 #include "service_client.h"
 #include "state.h"
 #include "stateserdes.h"
@@ -24,6 +25,8 @@
 #include <boost/process/execute.hpp>
 #include <hwloc.h>
 
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +35,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -40,6 +44,193 @@
 
 using namespace std::chrono_literals;
 namespace cipc = checkpoint::ipc;
+
+namespace
+{
+using ServiceResponse = boost::beast::http::response<boost::beast::http::string_body>;
+
+ServiceResponse RequestService(uint16_t index, boost::beast::http::verb method, std::string target, std::string body = {})
+{
+    boost::asio::io_context                                      context;
+    boost::beast::tcp_stream                                     stream(context);
+    ServiceResponse                                              response;
+    boost::beast::flat_buffer                                    buffer;
+    std::exception_ptr                                           failure;
+    boost::beast::http::request<boost::beast::http::string_body> request{method, std::move(target), 11};
+    request.set(boost::beast::http::field::host, "localhost");
+    request.set(boost::beast::http::field::content_type, "application/octet-stream");
+    request.body() = std::move(body);
+    request.prepare_payload();
+    boost::asio::co_spawn(
+        context,
+        [&]() -> boost::asio::awaitable<void> {
+            stream.expires_after(5s);
+            co_await stream.async_connect({boost::asio::ip::address_v4::loopback(), static_cast<uint16_t>(cipc::Message::Port + index)},
+                                          boost::asio::use_awaitable);
+            co_await boost::beast::http::async_write(stream, request, boost::asio::use_awaitable);
+            co_await boost::beast::http::async_read(stream, buffer, response, boost::asio::use_awaitable);
+        },
+        [&](std::exception_ptr error) { failure = error; });
+    context.run();
+    if (failure) { std::rethrow_exception(failure); }
+    return response;
+}
+
+std::optional<std::string> ProbeService(uint16_t index)
+{
+    try
+    {
+        auto response = RequestService(index, boost::beast::http::verb::get, "/api/ping");
+        if (response.result() == boost::beast::http::status::ok) { return std::move(response.body()); }
+    } catch (boost::system::system_error const&) {}
+    return {};
+}
+
+struct PendingServiceReference
+{
+    cipc::SessionId sessionId;
+    uint64_t        token;
+    uint16_t        serverIndex;
+    pid_t           ownerPid;
+};
+
+struct ServiceReferenceLedger
+{
+    std::mutex                                            mutex;
+    std::unordered_map<uint64_t, PendingServiceReference> pending;
+};
+
+ServiceReferenceLedger& PendingReferences()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static ServiceReferenceLedger ledger;
+    SUPPRESS_WARNINGS_END
+    return ledger;
+}
+
+void ForgetReference(uint64_t token)
+{
+    auto&            ledger = PendingReferences();
+    std::scoped_lock lock(ledger.mutex);
+    ledger.pending.erase(token);
+}
+
+bool ReleaseReference(PendingServiceReference const& reference)
+{
+    if (reference.ownerPid != ::getpid()) { return false; }
+    auto const         token  = std::to_string(reference.token);
+    auto const         target = fmt::format("/api/reference/release/{}/{}", reference.sessionId, token);
+    std::exception_ptr failure;
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        try
+        {
+            auto response = RequestService(reference.serverIndex, boost::beast::http::verb::post, target);
+            if (response.result() != boost::beast::http::status::ok)
+            {
+                throw std::runtime_error(fmt::format("Checkpoint reference release failed: {}", response.body()));
+            }
+            ForgetReference(reference.token);
+            return true;
+        } catch (...) { failure = std::current_exception(); }
+        if (reference.serverIndex == 0 && ReleaseOwnedInprocReference(static_cast<uint32_t>(reference.sessionId), token))
+        {
+            ForgetReference(reference.token);
+            return true;
+        }
+        if (attempt != 4) { std::this_thread::sleep_for(10ms); }
+    }
+    if (failure) { std::rethrow_exception(failure); }
+    return false;
+}
+
+bool IsLocalOwner(RankTopology const* topology)
+{
+    if (topology != nullptr)
+    {
+        auto const ranksPerNode = static_cast<uint64_t>(topology->ranksPerPeer) * topology->peersPerNode;
+        if (ranksPerNode == 0) { throw std::invalid_argument("local reference requires nonzero peer topology"); }
+        return static_cast<uint32_t>(topology->rank) % ranksPerNode == 0;
+    }
+    for (auto const* name : {"LOCAL_RANK", "SLURM_LOCALID"})
+    {
+        if (auto const* value = std::getenv(name); value != nullptr && *value != '\0')    // NOLINT(concurrency-mt-unsafe)
+        {
+            return checkpoint::config::types::Integer<uint32_t>::Parse(value) == 0;
+        }
+    }
+    return true;
+}
+
+void ValidateInprocService(std::string_view identity, bool localOwner)
+{
+    if (!identity.contains("\"inproc\""))
+    {
+        throw std::runtime_error("In-process checkpoint startup conflict: service port belongs to a separate daemon");
+    }
+    if (!localOwner) { return; }
+    auto const key     = identity.find("\"pid\"");
+    auto const colon   = key == std::string_view::npos ? key : identity.find(':', key);
+    auto       pidText = colon == std::string_view::npos ? std::string_view{} : identity.substr(colon + 1);
+    while (!pidText.empty() && pidText.front() == ' ') { pidText.remove_prefix(1); }
+    pid_t      pid{};
+    auto const parsed = std::from_chars(pidText.data(), pidText.data() + pidText.size(), pid);
+    if (parsed.ec != std::errc{} || pid != ::getpid())
+    {
+        throw std::runtime_error("In-process checkpoint startup conflict: service belongs to another owner process");
+    }
+}
+
+void EnsureService(RankTopology const* topology, uint16_t index)
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::mutex LaunchMutex;
+    SUPPRESS_WARNINGS_END
+    std::scoped_lock lock(LaunchMutex);
+    auto const       inproc = checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>();
+    auto const       owner  = inproc && IsLocalOwner(topology);
+    if (auto identity = ProbeService(index))
+    {
+        if (inproc)
+        {
+            ValidateInprocService(*identity, owner);
+            if (owner && !OwnsInprocServer()) { StartOwnedInprocServer(); }
+        }
+        return;
+    }
+    if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
+    {
+        throw std::runtime_error("Externally managed checkpoint service is unavailable");
+    }
+    if (inproc)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + 30s;
+        do
+        {
+            if (owner) { StartOwnedInprocServer(); }
+            if (auto identity = ProbeService(index))
+            {
+                ValidateInprocService(*identity, owner);
+                return;
+            }
+            std::this_thread::sleep_for(10ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        throw std::runtime_error("Timed out waiting for local-rank-0 in-process checkpoint daemon");
+    }
+    auto const                 selfLocation = boost::dll::this_line_location();
+    auto const                 executable   = selfLocation.parent_path() / "checkpoint_server";
+    boost::asio::io_context    context;
+    boost::asio::readable_pipe output(context);
+    boost::process::process    process(context, executable, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
+    std::string                line;
+    boost::system::error_code  error;
+    boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', error);
+    process.detach();
+    if (!ProbeService(index)) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
+}
+}    // namespace
 
 template <typename TStream> static void TryCleanShutdown(TStream& stream)
 {
@@ -52,54 +243,132 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
 }
 
 void SvcPing()
+{ EnsureService(nullptr, 0); }
+
+ServiceReference::ServiceReference(cipc::SessionId sessionId, RankTopology const& topology) :
+    _sessionId(sessionId),
+    _token([] {
+        static std::atomic<uint64_t> Next{static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+        return Next.fetch_add(1) ^ (static_cast<uint64_t>(::getpid()) << 32u);
+    }()),
+    _ownerPid(::getpid())
 {
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::mutex PingMutex;
-    SUPPRESS_WARNINGS_END
-
-    std::scoped_lock lock(PingMutex);
-    auto             selfLoc   = boost::dll::this_line_location();
-    auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
-    if (TryConnectToCheckpointService()) { return; }
-    if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
+    if (topology.ranksPerPeer == 0 || topology.peersPerNode == 0)
     {
-        throw std::runtime_error("Externally managed checkpoint service is unavailable");
+        throw std::invalid_argument("Checkpoint reference requires nonzero peer topology");
     }
-
+    auto const index = (static_cast<uint32_t>(topology.rank) / topology.ranksPerPeer) % topology.peersPerNode;
+    if (index > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) - cipc::Message::Port)
+    {
+        throw std::invalid_argument("Checkpoint reference service port is outside the supported range");
+    }
+    _serverIndex = static_cast<uint16_t>(index);
+    std::stringstream body;
+    serdes::WriteBlobWithSize<uint16_t>(body, "");
+    StateSerDes::WriteTopology(body, topology);
+    auto const target = fmt::format("/api/reference/acquire/{}/{}/{}", _sessionId, _token, _ownerPid);
     try
     {
-        boost::asio::io_context    ctx;
-        boost::asio::readable_pipe output(ctx);
-        boost::process::process    proc(ctx, svcExeLoc, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
-        std::string                line;
-        boost::system::error_code  ec;
-        boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
-        proc.detach();
-    } catch (std::exception const& ex)
+        for (int attempt = 0; attempt < 5; ++attempt)
+        {
+            EnsureService(&topology, _serverIndex);
+            if (!_active)
+            {
+                auto&            ledger = PendingReferences();
+                std::scoped_lock lock(ledger.mutex);
+                ledger.pending.emplace(
+                    _token,
+                    PendingServiceReference{.sessionId = _sessionId, .token = _token, .serverIndex = _serverIndex, .ownerPid = _ownerPid});
+                _active = true;
+            }
+            try
+            {
+                auto response = RequestService(_serverIndex, boost::beast::http::verb::post, target, body.str());
+                if (response.result() == boost::beast::http::status::service_unavailable && attempt != 4)
+                {
+                    std::this_thread::sleep_for(10ms);
+                    continue;
+                }
+                if (response.result() != boost::beast::http::status::ok)
+                {
+                    throw std::runtime_error(fmt::format("Checkpoint reference acquisition failed: {}", response.body()));
+                }
+                return;
+            } catch (boost::system::system_error const&)
+            {
+                if (attempt == 4) { throw; }
+                std::this_thread::sleep_for(10ms);
+            }
+        }
+    } catch (...)
     {
-        fmt::print(stderr,
-                   "[native_ckpt:cli][ERROR] Exception in SvcPing from {} svcbin={}: {}\n",
-                   selfLoc.string(),
-                   svcExeLoc.string(),
-                   ex.what());
+        Release();
         throw;
     }
-
-    // Both the elected daemon and losing candidates write READY only after the
-    // elected service answers a ping. The two short attempts inside TryConnect
-    // cover a final scheduling edge without a second readiness policy here.
-    if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
 }
+
+ServiceReference::~ServiceReference()
+{ Release(); }
+
+void ServiceReference::Release() noexcept
+{
+    if (!_active) { return; }
+    if (_ownerPid != ::getpid()) { return; }
+    try
+    {
+        {
+            auto&            ledger = PendingReferences();
+            std::scoped_lock lock(ledger.mutex);
+            if (!ledger.pending.contains(_token))
+            {
+                _active = false;
+                return;
+            }
+        }
+        if (ReleaseReference({.sessionId = _sessionId, .token = _token, .serverIndex = _serverIndex, .ownerPid = _ownerPid}))
+        {
+            _active = false;
+        }
+    } catch (std::exception const& error)
+    {
+        fmt::print(stderr, "[native_ckpt:cli][ERROR] Checkpoint reference release failed: {}\n", error.what());
+    }
+}
+
+void ReleasePendingServiceReferences()
+{
+    std::vector<PendingServiceReference> references;
+    {
+        auto&            ledger = PendingReferences();
+        std::scoped_lock lock(ledger.mutex);
+        for (auto const& [token, reference] : ledger.pending)
+        {
+            static_cast<void>(token);
+            if (reference.ownerPid == ::getpid()) { references.push_back(reference); }
+        }
+    }
+    for (auto const& reference : references)
+    {
+        try
+        {
+            static_cast<void>(ReleaseReference(reference));
+        } catch (std::exception const& error)
+        {
+            fmt::print(stderr, "[native_ckpt:cli][ERROR] Pending checkpoint reference release failed: {}\n", error.what());
+        }
+    }
+}
+
+void WaitForOwnedCheckpointService()
+{ WaitForOwnedInprocServer(); }
 
 static void SvcRegisterLocalState(StateTree const& registry)
 {
-    SvcPing();
-
     auto const& topo        = registry.Topo();
     auto const  serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
-    auto const  port        = cipc::Message::Port + serverIndex;
-    auto        send        = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
+    EnsureService(&topo, static_cast<uint16_t>(serverIndex));
+    auto const port = cipc::Message::Port + serverIndex;
+    auto       send = [port](boost::beast::http::verb method, std::string const& target, std::string const& body) {
         static constexpr int      MaxAttempts = 5;
         boost::system::error_code ec;
         for (int attempt = 0; attempt < MaxAttempts; ++attempt)
@@ -327,6 +596,22 @@ struct CheckpointWriter
         std::unique_ptr<cipc::MsgQueue> queue;
         std::shared_future<void>        ready;
         int                             numaNode{-1};
+        std::string                     serviceIdentity;
+#ifdef PHOENIX_HAVE_CUDA
+        bool pinned{};
+
+        ~QueueState()
+        {
+            if (!pinned) { return; }
+            try
+            {
+                DeviceContext::CudaUnregisterHostBuffer(queue->GetShmDataRegion().data());
+            } catch (std::exception const& error)
+            {
+                fmt::print(stderr, "[native_ckpt:cli][ERROR] Shared-memory unregistration failed: {}\n", error.what());
+            }
+        }
+#endif
     };
 
     struct QueueRegistry
@@ -348,13 +633,21 @@ struct CheckpointWriter
     {
         auto const& topo = root.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+        auto const index    = static_cast<uint16_t>((static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode);
+        auto const identity = ProbeService(index);
+        if (!identity) { throw std::runtime_error("Checkpoint daemon is unavailable while opening shared memory"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
-        auto               state = std::make_shared<QueueState>();
+        if (auto const existing = reg.states.find(topo.rank);
+            existing != reg.states.end() && existing->second->serviceIdentity == *identity)
+        {
+            return;
+        }
+        auto state             = std::make_shared<QueueState>();
+        state->serviceIdentity = *identity;
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
+        reg.states.insert_or_assign(topo.rank, state);
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -371,6 +664,7 @@ struct CheckpointWriter
             auto region = state->queue->GetShmDataRegion();
             BindRegionToNumaNode(numa, region.data(), region.size());
             DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            state->pinned = true;
 #else
             (void)numa;
 #endif
@@ -771,6 +1065,9 @@ void WaitForCheckpointSave(StateTree const& root)
     for (size_t i = 0; i < msgQueue.SlotCount(); ++i) { msgQueue.Push({cipc::Message::Ping{}}, nullptr, 0); }
 }
 
+void DrainCheckpointClient(StateTree const& root)
+{ CheckpointWriter::GetMsgQueue(root.Topo()).Flush(); }
+
 void FinalizeStateRegistry(StateTree& root)
 {
     if (root.IsFinalized()) { return; }
@@ -818,6 +1115,3 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
                                          "is this build missing PHOENIX_BUILD_CUDA / PHOENIX_BUILD_METAL?",
                                          device));
 }
-
-void SvcDecrRef()
-{}

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,16 @@ try
     if (!vm.contains("stateregistry")) { throw std::runtime_error("State registry path must be provided with --stateregistry"); }
 
     LoadStateRegistryFromPath(Ctx, stateRegistry);
+
+    std::vector<std::unique_ptr<ServiceReference>> references;
+    if (Ctx.outofproc)
+    {
+        references.reserve(Ctx.localRegistries.size());
+        for (auto const& tree : Ctx.localRegistries)
+        {
+            references.push_back(std::make_unique<ServiceReference>(tree->SessionId(), tree->Topo()));
+        }
+    }
 
     auto tasks = StartClientThreads(Ctx);
 
