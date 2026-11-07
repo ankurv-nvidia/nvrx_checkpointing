@@ -206,6 +206,31 @@ Build and workload results are recorded here as they become available.
   finish runtime setup. No training iteration or checkpoint is observed yet.
 - Eight-node workload verdicts and the overall CI gate remain pending.
 
+### First-save regression found in distributed validation
+
+The initial distributed runs fail at the first checkpoint on GB200, GB300, and
+H100. All eight completed workloads report the same missing common-state value;
+training-phase failures on other ranks are downstream errors. B200 remains
+queued at the failure audit.
+
+Registry finalization sorts nodes and changes their handles. The client records
+supplied values and empty shards before sorting, then checks those handles after
+sorting on a first save without a load. This falsely rejects a supplied value.
+Validate the complete local snapshot before finalization so the recorded handles
+still identify the scanned nodes. Preserve missing-value rejection for later
+saves and keep capture restricted to the daemon-selected plan.
+
+The cold-save regression reproduces the exact remote error before the fix. It
+covers mixed tensors, scalars, fixed blobs, an empty fixed blob, and dynamic
+common state without an explicit finalization call, then checks refreshed values
+and rejection of an omitted registered value. The wheel validation job enables
+the existing server integration tests so this regression runs in CI. Strict
+Clang 23 extension rebuilding and all nine focused checks pass after the fix.
+The complete Python and CI helper suite with server tests enabled passes
+**547 tests**, with two skips. Formatting, shell syntax, diff checks, and
+independent review pass. Corrected remote builds and distributed reruns remain
+pending.
+
 ### Remaining validation limit
 
 One native peer-durability success assertion returned an unexpected HTTP 500 in

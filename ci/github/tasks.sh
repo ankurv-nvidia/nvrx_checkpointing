@@ -96,6 +96,7 @@ wheel_pytest() {
     "${python}" ci/scripts/wheel_install.py --from-dist dist
     mkdir -p ci/ci-results
     export PYTHONPATH=${repo_root}/dev_binaries
+    export MEGATRON_NATIVE_RUN_SERVER_TESTS=1
     "${python}" -m pip show nvrx_checkpointing
     "${python}" -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
     "${python}" -c "import nvrx_checkpointing.debug"

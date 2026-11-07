@@ -473,8 +473,8 @@ void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem
 {
     try
     {
-        FinalizeStateRegistry(_tree);
         ValidateSnapshotValues_();
+        FinalizeStateRegistry(_tree);
         ::SaveCheckpoint(_tree, iteration, dirpath);
     } catch (...)
     {
