@@ -200,8 +200,10 @@ Build and workload results are recorded here as they become available.
 - Fresh CI selects both GB300 native `nano4-8x4` workloads on
   `dlalgo-ci/nsc-lhr-slurm-1`: deterministic GitHub job `128342103263` / Slurm
   `658393`, and performance GitHub job `128342103271` / Slurm `658396`. The
-  deterministic allocation starts at 07:42:54 UTC on 2026-11-07. At 07:45 UTC,
-  performance waits for scheduler priority without a start estimate.
+  deterministic allocation starts at 07:42:54 UTC on 2026-11-07; performance
+  starts at 07:44:11 UTC. All four eight-node allocations are active at the
+  07:45:30 UTC poll. GB200 determinism reaches workload launch; the other jobs
+  finish runtime setup. No training iteration or checkpoint is observed yet.
 - Eight-node workload verdicts and the overall CI gate remain pending.
 
 ### Remaining validation limit
