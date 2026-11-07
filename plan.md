@@ -121,6 +121,7 @@ branch during development and is removed before the pull request.
       size changes, empty blobs, quantized tensors, and DCP load round trips.
 - [x] Run available relevant native and Python checks, review the complete diff,
       and record actual results and environment limitations here.
+- [ ] Complete GB200 and GB300 eight-node deterministic/performance validation.
 
 ## Progress
 
@@ -244,6 +245,53 @@ IPC-bearing test files on the CPU-capable build runner.
 Fresh strict CPU-only rebuilding passes, and the exact CI pytest invocation
 passes **56 tests**, skipping two CUDA-only cases. Independent review, shell
 syntax, CI YAML, artifact-path validation, and diff checks pass.
+
+### Corrected distributed checkpoints
+
+- The production correction is `7eb93843`; CI placement is corrected by
+  `9177ea34` without further production changes.
+- GB200 eight-node performance run `42363307322`, GitHub job `128378275723`,
+  JET job `534838130`, Slurm `8707690` successfully saves its first native
+  checkpoint at iteration 100 at 10:44:27 UTC on 2026-11-07. This includes
+  durability and crosses the original failure point.
+- The same native checkpoint loads successfully at iteration 100 at 10:45:46
+  UTC. Resumed native checkpoints at iterations 250 and 500 also become
+  durable, followed by the final iteration 750. The GB200 performance workload
+  finishes successfully at 11:03:14 UTC. GB200 determinism completes native
+  save/load/resume through iteration 125 and reference comparison without
+  differences; its workload finishes successfully at 11:04:46 UTC.
+- Latest full CI run `42365092053` validates the CPU integration harness and
+  restarts the GB300 eight-node checks on the same production correction.
+  Both wheels, all four images, wheel checks (509 passed / 40 skipped), native
+  checks (64 passed / 1 skipped / 818 assertions), 83 CTest checks, the 56 CPU
+  integration checks (2 CUDA-only skips), and loopback service stress pass.
+- GB300 eight-node jobs `128383813341` / Slurm `661019` (determinism) and
+  `128383813238` / Slurm `661018` (performance) remain queued for scheduler
+  priority/resources without a start estimate. Both GB200 GitHub workload jobs
+  pass. Its separate performance-report job `128387361764` fails only for the
+  baseline warnings, so that workflow's overall conclusion is failure.
+
+### Snapshot volume and performance observations
+
+Across all 32 GB200 ranks, full local tensor registries total 415.750 GiB;
+selected snapshots contain 353.263 GiB. Planning excludes 62.487 GiB per
+checkpoint, a 15.03% reduction. These exact tensor totals hold for checkpoints
+100, 250, 500, and 750 and match the unique global-registry shard volume.
+All 128 rank/snapshot samples agree with daemon activation records.
+
+Functional success remains separate from performance-baseline warnings. GB200
+performance reports bandwidth 8.46% below baseline and write time 13.53% above
+baseline. Its mean byte-count mismatch is 23,683.84375 bytes per rank, fully
+accounted for by the blob payloads included in the unified snapshot-data metric;
+tensor bytes match the baseline exactly. Determinism also flags timing and byte
+baselines while its checkpoint comparison succeeds.
+
+Resumed write-time medians vary from 65.991 to 97.630 ms, including one snapshot
+faster than the 78.256 ms baseline. Tensor counts and full registry metadata
+sizes remain stable. Two outliers on one host stall before activation completes.
+The write timer includes HTTP activation, but existing records cannot isolate
+its cost or establish a causal timing regression. No baselines are changed.
+GB300 outcomes and the overall CI gate remain pending.
 
 ### Remaining validation limit
 
