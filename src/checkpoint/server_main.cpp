@@ -219,6 +219,8 @@ static void InstallSignalHandlers()
 int main(int /* argc */, char const* const /* argv */[])
 try
 {
+    // TODO provide cli args for stdout/stderr or logging file/pipe
+
     ::setsid();
     RedirectStdio();
     // Prime cpptrace before installing the handlers: absorb_trace_exceptions keeps trace

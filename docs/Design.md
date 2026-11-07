@@ -1,19 +1,29 @@
 # Design Goals
 
-- Speed-of-Light
-  - Make the happy-path faster without regressing the sad-path guarantees and performance
-    - for eg: Prefer Mem caching to avoid Network-IO / Disk-IO wherever possible
+- Scalability @100K+: Predictable and consistent performance
+
+- Speed-of-Light Recovery
+  - Enable the fastest path of recovery for happy-path scenarios without sacrificing recovery for other types of failures (no trade-offs)
+    For eg:
+    - Recovery can be catagorized into:
+      - Transient: No HW resource swaps needed
+      - Catastrophic : Requires recovering with a new set of GPU/Host nodes
+    - Transient/Catastrophic jobs can be further categorized into
+      - Low resource utilization
+      - High resource utilization
+    - The goal involves either auto-detecting and provding hooks for the user to select the appropriate mechanism that provides the SOL path given the resource constraints.
   - Minimizing and efficient utilization of resources
   - Fine-Grained synchronization support
-- Scalability @100K+: Predictable and consistent performance
+
 - Workload Generality
   - Complex optimizers (scaling state-dictionary/sharding-metadata size and complexity)
   - Multiple tenant and models (Post-training)
   - Inference workload applicability
     - Disaggregated Prefill/decode
     - Avoid strong pytorch dependency
-  - LPUs ?
-- Cluster generality, redundancy and resiliency
+  - Auto-Quantization/Dequantization for checkpointing
+
+- Infrastructure generality, redundancy and resiliency
   - Tunable policies for Mem-IO / Network-IO / Disk-IO preferences
     - There are cases where network-io maybe faster than disk-io
     - Disk might not be big enough
@@ -23,127 +33,177 @@
 
 # API Surface
 
-## Capturing State Dictionary
+The sequencing of checkpointing and the API surface is divided into 3 main areas
 
-```
-root = nvrx_checkpointing.checkpoint.model_state.create_root()
-root.register_state_dict(state_dict)
-root.finalize_registry()
+1. State-Dictionary Registration
+2. Save: Snapshot capture (Tensor, Blobs, Scalars etc) and durability guarantees
+3. Load: Recover from snapshots
 
-```
+## State Registration
 
-- The simplest case would involve simply registering a complete state_dict that the module traverses to identify the state-tree
-  - Type unsafe requires inferring types
+### Preface: Pytorch/Megatron-LM : State-Dictionary
 
-<mark>[Future Ideas and concepts]</mark>
+Pytorch and megatron apis follow the model of preparing state-dictionary completely outside the visibility of the checkpointing module and have a single api to hand over that state-dictinary.
 
-- Register state directly with the registry (not go through an intermediate state-dict preparation)
+This can often lead to the checkpointing module surfacing errors that could be traced back to the invalid or erroneous state-dictionary preparation.
+
+- State dictionary construction is very janky. No schema
+- Optimizer frequently rely on trampling over child-optimizer states thus causing confusion
+- State dictionary goes through multiple rounds of filtering and transformations in checkpointing code leading to unclear contract between Modules and checkpointing
+
+### Design Goals
+
+- Allow for "fill-in" state-dictionary preparation rather than a "hand-over"
+- easy to use api-wrappers for python (megatron-lm, pytorch) based state-dictionary registration for smoother integration.
+  - Support pytorch/megatron-lm bridges for DTensor, ShardedTensor metadata extraction.
+- Flexibility for future (possibly inference) based usage to populate a state-tree in-place directly from c++ or other frontend languages and register the supported types.
   - Type-safe and faster
   - Better construction and more meaninful errors around collisions, duplications etc
+- Future work: Capture Full fidelity tensor layout (sharding + replication) information.
+
+```python
+# First Registration
+# Happens after the load-checkpoint call
+root = nvrx_checkpointing.checkpoint.model_state.create_root()
+root.register_state_dict(state_dict)
+# Intended to signify that the state-dictionary structure wont change
+root.finalize_registry()
+# Finalize also warms up the SHMem-Queue and initiates a sync across all the ranks to infer the dedup-ing of replicated tensors.
+
+...
+
+# Update State-dictionary
+
+# Happens as part of save_checkpoint
+# Captures the blobs and update the scalar values synchronously
+# Tensors are captured asynchronously
+root.register_state_dict(state_dict)
+```
+
+## Save Checkpoint: Megatron
+
+```python
+# args compatible with save_checkpoint fn
+def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> None:
+  # Wait for previous checkpoint to complete
+    maybe_finalize_async_save(blocking=True)
+
+  # update rng-state-blobs and hyper-parameters in state-dict
+
+  # register state-dictionary and capture blobs + scalars
+  root = register_state_dict(state_dict, iteration)
+
+  # async scalar, blob capture + async snapshot (tensor) capture and durability
+  root.save_async(iteration, checkpoint_dir)
+
+  # wait for scalar, blob capture to complete. Tensor snapshot continues ...
+  root.wait_for_deferred_save()
+
+  # For sync-checkpointing. Wait for everything to complete
+  if not getattr(args, "async_save", False):
+      checkpoint.wait_for_ckpt_finalize(_SESSION_ID, iteration)
+      finalize_fn()
+
+  # For async checkpointing. oncomplete finalize-fn
+  else:
+      future = _get_executor().submit(checkpoint.wait_for_ckpt_finalize, _SESSION_ID, iteration)
+      _pending = _PendingSave(future, finalize_fn)
 
 ```
 
-layer1 = root.ceate_dict("layer-1")
-layer1.register_tensor("", [size])
-optim = root.create_dict("adam")
-m = optim.create_dict("momentum")
-m.register_sharded_dict("foo", [full_size], [shard_range], ...) # Specify local shards
+## Load Checkpoint (TBD)
 
-```
+## Future API Changes
 
-- Better expressivity to register sharded information
-  - Potentially : Specifying remote-shards/sharding-expression that avoid the need for metadata-broadcast
+- python async/await pattern for async apis
+  - fine-grained async futures for D2H, Mem-Snapshot, Durable-Snapshot etc
+- Async Load-Checkpoint
+  - Allow construction of data-loaders, cuda-graphs etc in parallel
 
-```
-# Specify sharding expressions
-# Avoids the needs for a shard-metadata broadcast
-m.register_sharded_dict("foo",
-  [c, hidden_dim], # Global dimensions
-  ["size", "aligned_shard_for_rank(size, world_size, rank, 64)"] # Lightweight (Lua??) expressions to compute shard_range across ranks
-)
-```
+## TODO :
 
-## Async Save Checkpoint
+- namespace
 
-```
-# root = nvrx_checkpointing.checkpoint.model_state.create_root()
-# Register state and finalize_registry
-root.save_async(<checkpoint-dir>)
-root.save(<checpoint-dir>) # synchronous save
-```
+## TODO : Error Cases GO over resiliency
 
-<mark>[Future Ideas and concepts]</mark>
+- Sessions
+- Error scenarios
+  - During planning
+  - During snapshotting
 
-- Return a `async-promise` to allow native python `async/await` pattern and native `on-complete` chaining and coroutines
-- Allow fine-grained orchestration of the ordering for
+## TODO : Assumptions
 
-```
-# Concepts
-await layer1.save_async(<checkpoint-dir>)
-evt1.record(stream)
+- Daemon is always restarted
+- Daemon relies on megatron to validate the checkpoint file
+-
+- Shared - memory - Daemon
+  - Add a Time sequence diagram for daemon and shared-memory
 
-await optim.save_async(<checkpoint-dir>)
-evt2.record(stream)
+1. Daemon opens the shm file (listener)
+   1.1 . shm file is already exists. it'll reinitialize it
+   1.2 - Any producer thats still writing to the old file will error
+2.
 
-await root.save_async(<checkpoint-dir>)
-on_checkpoint_complete()
-```
+# TODO : Logging and FT-Launcher integration
 
-## Async Load Checkpoint
+1. Daemon to launched by ft-launcher
 
-```
-root.load(<checkpoint-dir>)
-```
+- One consolidate log per cycle
+  - All logs go into ft-launcher logs
+  - How do training-workers redirect their logs ?
+    - stdout/stderr of workers is redirect the training pipe
 
-- Loads the checkpointed state from the directory
+- Should the daemon cause training process to die
+  - Tentatively yes. (Need confirmation from ADLR/Mcore/others if thsis is a no and a redesign)
 
-<mark>[Future Ideas and concepts]</mark>
+- ## Core-dump traces
 
-- Make this async as well
-- Return a `async-promise` to allow native python `async/await` pattern and native `on-complete` chaining and coroutines
-- Allow fine-grained orchestration of the ordering
+1. Handling of restarts without Daemon kills (Multiple sessions)
 
-## Synchronization
+2. Logs redirects
 
-```
-# TODO: Refine this
+- OTel logging ?
+-
 
-# stalls the python thread until the async-save completes
-root.wait_for_async_completion()
+# Key Components and Code Walkthrough
 
-# Injects a stream.wait_event into the default kernel launch stream for the optimizer kernel exec to be queued behind
-root.wait_for_save_event(defaultstream)
-```
+### In-proc: State-Extraction
 
-- Minimizes the changes required into the megatron model code.
-- Single line stall point
+- Files
+  - checkpoint.h/cpp
+  - python/bindings.h/cpp
+  - python/torch_bindings.cpp
+  - state.h
+  - stateserdes.h
+  - serdes_utils.h
 
-- TODO : a more expressive and fine-grained (state-data-based) stall
-  - Save: Stall invoked before tensor(s) are modified by the model
-  - Load: Stall invoked before tensor(s) are read by the model
+#### State-Tree
 
-## Callbacks/Event-Handling
+- state.h
+  - The in-memory state representation for all the scalars/blobs/tensorshard extracted from state-dictionary
+  - Blob + Scalars : Snapshotted during traversal (Includes, RNG State, learning-rate-hyperparametets etc. )
+  - TensorShards : Only metadata extracted. D2H Happens asynchronously
 
-```
-root.on_checkpoint_save_complete(checkpoint_save_handler)
-```
+#### Python-Interfaces
 
-- TODO : replace with `async/await` (coroutines) based api surface
+- python/bindings.h/cpp
+  - Python apis registration
+  - Python state dictionary traversal. (Periodic quick GIL acquisition and release to avoid stalls)
+  - Extract state from state-dictionary (python) into native in-memory tree.
+- python/torch_bindings.cpp
+  - metadata bridge for pytorch/megatron-lm classes (ShardedTensor/ShardedObjects etc) (TODO: DTensor support)
 
-# Key Components
+#### D2H (and TODO: H2D)
 
-### In-proc Native thread
-
-- Python state dictionary traversal. (Periodic quick GIL acquisition and release to avoid stalls)
 - Device Interfacing (non-blocking)
   - Background: Tensor data extraction
-    - Temporary (CPU-Mem) Bounce Buffers (4 \* 16Mb seems sufficient) cap the total CPU memory requirements
+    - Temporary (CPU-Mem) Bounce Buffers (`4 * 16Mb` seems sufficient) cap the total CPU memory requirements
     - No additional GPU memory needed
   - Stream/Events for Workload synchronization
 - Interfacing with Checkpointing Service
   - Shared memory + sockets
 
-### Out-of-proc Checkpointing-Server
+### Snapshot Daemon
 
 - Intended to persist beyond a job (across requeues)
 - Multiple simultaneous job/rank sessions. (Separate shmem channel)
@@ -212,126 +272,104 @@ box Rank-0
     participant python0
     participant native0
 end
-participant Ckpt0
-Note over native0,Ckpt0: shared_memory
-Note over Ckpt0,Ckpt1: network (ib/tcp)
+participant Daemon0
 
-participant Ckpt1
-participant CkptN
+participant Daemon1
+participant DaemonN
 
+python0->>python0: load-checkpoint
 python0->>+native0: register_state_dict(state_dict)
-native0->>+python0: read_tensor_medata(..)
-deactivate python0
-python0->>+gpu0: forward(0)
+python0->>python0: iteration
+python0->>+gpu0: forward(1)
+
+native0->>+Daemon0: start
+native0->>Daemon0: activate session
+Note over Daemon0,Daemon1: network (tcp)
+Daemon1->>Daemon0: recieve_state_registry(node:1[...])
+
 native0->>+python0: read_scalar_state(..)
 deactivate python0
-python0->>gpu0: backward(0)
 native0->>+python0: read_blob_state(..)
 deactivate python0
-Ckpt1->>Ckpt0: receive_metadata(node:1[...])
-Ckpt0->>CkptN: relay_metadata(node:1[...])
+native0->>+python0: read_tensor_medata(..)
+deactivate python0
+python0->>native0: finalize(state_dict)
 
-native0->>+Ckpt0: register_metadata
+python0->>gpu0: backward(1)
+python0->>gpu0: optimizer::step(1)
+
+native0->>+Daemon0: local_state_registry
+Note over native0,Daemon0: tcp
 deactivate native0
-python0->gpu0: optimizer::step(0)
-python0->gpu0: synchronize(0)
-python0->>+native0: save_checkpoint()
-native0-->>gpu0: optimizer_stall_event()
+DaemonN->>Daemon0: recieve_state_registry(node:1[...])
+Daemon0->Daemon0: Global-Plan
+Daemon0->>Daemon1: broadcast_metadata[tree]
+Daemon0->>DaemonN: broadcast_metadata[tree]
 
-gpu0-->>-python0: iteration:0 complete
+Daemon0->>native0: snapshot-plan
+gpu0->>-python0: iteration:0 complete
+python0->>python0: save-checkpoint
+python0->>python0: update-state-dict
+python0->>+native0: register_state_dict(state_dict)
+
+DaemonN->>Daemon0: snapshot-0-finalized
+native0->>Daemon0: activate-snapshot
+Daemon1->>Daemon0: snapshot-0-finalized
+python0->>native0: snapshot-scalars+blobs(state_dict)
+python0->>native0: save_async()
+gpu0->>native0: snapshot-tensors
+native0-->>python0: async-complete
+native0->>Daemon0: local-snapshot
+deactivate native0
+Note over native0,Daemon0: shared_memory
+
+Daemon0->>Daemon0: write_ckpt_data_file
+Daemon0->>Daemon0: write_ckpt_index_file
+Daemon0->>Daemon1: broadcast: snapshot-0-complete
+Daemon0->>DaemonN: broadcast: snapshot-0-complete
+deactivate Daemon0
+
+activate python0
+
+
+deactivate python0
+Daemon0->>DaemonN: relay_metadata(node:1[...])
+
+
+
 python0->>+gpu0: forward(1)
 python0->>gpu0: backward(1)
 python0->>gpu0: optimizer::step(1)
 
-Ckpt0->>Ckpt1: broadcast_metadata[tree]
-Ckpt0->>CkptN: broadcast_metadata[tree]
+Daemon0->>Daemon1: broadcast_metadata[tree]
+Daemon0->>DaemonN: broadcast_metadata[tree]
 
 native0<<-->>+gpu0: read_tensor_data()
 python0->>gpu0: synchronize(1)
-deactivate Ckpt0
-native0->>+Ckpt0: send_tensor_data[tree]
+deactivate Daemon0
+native0->>+Daemon0: send_tensor_data[tree]
 native0<<-->>gpu0: read_tensor_data()
 deactivate gpu0
-native0->>Ckpt0: send_tensor_data[tree]
+native0->>Daemon0: send_tensor_data[tree]
 native0-->>gpu0: optimizer_raise_event()
-native0->>Ckpt0: finalize_checkpoint()
-Ckpt0->Ckpt0: Serialize
-Ckpt0->>Ckpt1: broadcast_notify_checkpoint[tree]
-Ckpt0->>CkptN: broadcast_notify_checkpoint[tree]
-Ckpt0-->>-native0: on_checkpoint_complete()
+native0->>Daemon0: finalize_checkpoint()
+Daemon0->Daemon0: Serialize
+Daemon0->>Daemon1: broadcast_notify_checkpoint[tree]
+Daemon0->>DaemonN: broadcast_notify_checkpoint[tree]
+Daemon0-->>-native0: on_checkpoint_complete()
 native0-->>python0: on_checkpoint_complete()
 
 gpu0->>gpu0: optimizer:start
 gpu0-->>-python0: iteration:1 complete
 
-deactivate native0
-activate Ckpt0
-deactivate Ckpt0
+activate Daemon0
 
 ```
 
-## Load (Recovery)
-
-```mermaid
-sequenceDiagram
-
-box Rank-1
-participant native1
-end
-box Rank-0
-    participant gpu0
-    participant python0
-    participant native0
-end
-participant Ckpt0
-Note over native0,Ckpt0: shared_memory
-Note over Ckpt0,Ckpt1: network (ib/tcp)
-
-participant Ckpt1
-participant CkptN
-
-python0->>+native0: register_state_dict(state_dict)
-native0->>+python0: read_tensor_medata(..)
-deactivate python0
-native0->>+python0: read_scalar_state(..)
-deactivate python0
-native0->>+python0: read_blob_state(..)
-deactivate python0
-native0->>+Ckpt0: register_metadata
-deactivate native0
-Ckpt0->Ckpt0: Validate metadata
-Ckpt0->Ckpt0: Validate last_checkpoint:iter-N
-deactivate Ckpt0
-
-python0->+native0: load_checkpoint(iter-N)
-native0-->>+gpu0: cudaStreamWaitEvent(stallEvent)
-native0<<->>+Ckpt0: load_metadata(iter-N)
-native0->+python0: load_scalars ()
-deactivate python0
-python0->>python0: dataloader_init
-native0->+python0: load_blobs ()
-python0->>python0: cuda_graphs
-python0->>+gpu0: forward()
-python0->>gpu0: forward()
-native0<<->>Ckpt0: load_tensors(iter-N)
-native0<<-->>gpu0: load_tensors
-native0<<->>Ckpt0: load_tensors(iter-N)
-native0<<-->>gpu0: load_tensors
-deactivate Ckpt0
-native0-->>-gpu0: cudaRaiseEvent(nativeStream, stallEvent)
-deactivate gpu0
-native0-->>python0: on_checkpoint_loaded()
-gpu0->gpu0: kernel: forward
-deactivate gpu0
+```
 
 ```
 
-## Open Question
+```
 
-- How to get complete list of peers for the distributed-server-mesh with Slurm-Job-Arrays ?
-- How to capture Rng-States ? Understand how it works today with async-checkpointing ?
--
-
-## Discussion Notes (2026-02-04)
-
-## Review Comments
+```

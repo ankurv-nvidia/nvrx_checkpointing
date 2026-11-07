@@ -181,6 +181,8 @@ template <typename THdr> struct ShmRingBuffer
         // The producer can write all memory from _wbeg to _wend
         // As the consumer consumes the data, _wbeg and _wend are advanced to signal producer
         // As the producer produces the data, _rbeg and _rend are advanced to signal consumer
+
+        // TODO : Document why we can use monotonic clock for timestamps here
         std::atomic<Clock::time_point> rtimestamp{Clock::now()};
         std::atomic<Clock::time_point> wtimestamp{Clock::now()};
         std::atomic<std::size_t>       rbeg{0};
