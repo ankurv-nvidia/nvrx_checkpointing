@@ -191,7 +191,7 @@ Build and workload results are recorded here as they become available.
 - Fresh CI run `42351227684` passes both wheel builds, all four platform image
   builds, **509 Python tests** with 39 expected skips, and the combined native
   suite (**64 passed / 1 expected skip / 818 assertions**). Its CTest job passes
-  **83 checks** and all GPU stress gates.
+  **83 checks** and all loopback service stress gates.
 - GB200 eight-node run `42350485730` passes its ARM64 wheel and image builds.
   Both native `nano3-8x4` workloads run on `dlalgo-ci/oci-hsg`: deterministic
   GitHub job `128341190202` / Slurm `8703635`, and performance GitHub job
@@ -223,13 +223,27 @@ saves and keep capture restricted to the daemon-selected plan.
 The cold-save regression reproduces the exact remote error before the fix. It
 covers mixed tensors, scalars, fixed blobs, an empty fixed blob, and dynamic
 common state without an explicit finalization call, then checks refreshed values
-and rejection of an omitted registered value. The wheel validation job enables
-the existing server integration tests so this regression runs in CI. Strict
-Clang 23 extension rebuilding and all nine focused checks pass after the fix.
+and rejection of an omitted registered value. Server integration coverage runs
+with the CPU-only native test build, while the wheel retains its CUDA support.
+Strict Clang 23 extension rebuilding and all nine focused checks pass after
+the fix.
 The complete Python and CI helper suite with server tests enabled passes
 **547 tests**, with two skips. Formatting, shell syntax, diff checks, and
 independent review pass. Corrected remote builds and distributed reruns remain
 pending.
+
+The corrected production code is pushed as `7eb93843`. Run `42363305685`
+passes both wheels, all four images, 83 CTest checks, and loopback stress. Its
+newly enabled wheel IPC checks fail because the build runner's CUDA driver
+cannot run the CUDA wheel. That runner limitation is separate from the
+first-save defect. The integration checks move to the existing CPU-only CTest
+job, using its native artifacts and a source package alias with automatic
+rebuilding disabled. Their JUnit report is retained with the CTest artifacts.
+This keeps CUDA wheel testing on the cluster jobs and exercises all four
+IPC-bearing test files on the CPU-capable build runner.
+Fresh strict CPU-only rebuilding passes, and the exact CI pytest invocation
+passes **56 tests**, skipping two CUDA-only cases. Independent review, shell
+syntax, CI YAML, artifact-path validation, and diff checks pass.
 
 ### Remaining validation limit
 

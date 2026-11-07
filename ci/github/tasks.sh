@@ -96,7 +96,6 @@ wheel_pytest() {
     "${python}" ci/scripts/wheel_install.py --from-dist dist
     mkdir -p ci/ci-results
     export PYTHONPATH=${repo_root}/dev_binaries
-    export MEGATRON_NATIVE_RUN_SERVER_TESTS=1
     "${python}" -m pip show nvrx_checkpointing
     "${python}" -c "import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)"
     "${python}" -c "import nvrx_checkpointing.debug"
@@ -120,6 +119,16 @@ ctest_gate() {
     export PYTHONPATH=${repo_root}/build-test
     "${python}" -c "import torch; print(torch.__version__, torch.__file__)"
     ctest --test-dir build-test --output-on-failure --output-junit "${repo_root}/ci/ci-results/ctest.xml"
+    local cpu_pythonpath=${scratch}/native-test-python
+    mkdir -p "${cpu_pythonpath}"
+    ln -sfn "${repo_root}" "${cpu_pythonpath}/nvrx_checkpointing"
+    CUDA_VISIBLE_DEVICES= \
+        MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled \
+        MEGATRON_NATIVE_RUN_SERVER_TESTS=1 \
+        PYTHONPATH="${cpu_pythonpath}:${repo_root}/build-test" \
+        "${python}" -m pytest tests/test_native_common_state.py tests/test_snapshot_planning.py \
+            tests/test_sharded_tensor_registration.py tests/test_quantized_binding.py \
+            -v --junitxml=ci/ci-results/native-pytest.xml
     "${python}" ci/scripts/ckpt_stress.py --gpus-per-node 2
 }
 
