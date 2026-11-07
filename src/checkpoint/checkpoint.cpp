@@ -149,6 +149,8 @@ static void SvcRegisterLocalState(StateTree const& registry)
 
     std::stringstream registryStream;
     StateSerDes::Write(registryStream, registry, StateNode::Handle::Root);
+    serdes::WriteTrivial(registryStream, static_cast<uint32_t>(registry.checkpointWriteItems.size()));
+    for (auto const& item : registry.checkpointWriteItems) { StateSerDes::WriteCheckpointWriteItem(registryStream, item); }
     auto registryBody = registryStream.str();
     response          = send(boost::beast::http::verb::post, fmt::format("/api/localstateregistry/{}", registry.SessionId()), registryBody);
     requireSuccess(response, "local registry upload");
@@ -672,7 +674,7 @@ struct CheckpointWriter
         }
     }
 
-    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
+    void SendToServer(cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath, std::string_view commonStateKey)
     {
         SetThreadName("ncc:sendsvr");
 
@@ -686,6 +688,7 @@ struct CheckpointWriter
             // thread, where the current device may have fallen back to device 0.
             std::stringstream sstrm;
             serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
+            serdes::WriteBlobWithSize<uint32_t>(sstrm, commonStateKey);
             uint32_t numBlobs   = 0;
             uint32_t numScalars = 0;
             root.WalkNodes([&](StateNode const& node) {
@@ -759,10 +762,13 @@ struct CheckpointWriter
 };
 }    // namespace
 
-void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
+void SaveCheckpoint(StateTree const&             root,
+                    cipc::SnapshotId const&      snapshotId,
+                    std::filesystem::path const& ckptPath,
+                    std::string_view             commonStateKey)
 {
     CheckpointWriter writer{root};
-    writer.SendToServer(snapshotId, ckptPath);
+    writer.SendToServer(snapshotId, ckptPath, commonStateKey);
 }
 
 void WaitForCheckpointSave(StateTree const& root)

@@ -108,7 +108,7 @@ struct PythonStateTree : PyStateDictAccessor
     [[nodiscard]] std::string GetNodeId(StateNode::Handle node) const override;
 
     void Scan(nb::dict stateDict);
-    void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
+    void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath, std::string_view commonStateKey);
 
     void FinalizeRegistry()
     {
@@ -147,7 +147,15 @@ struct PythonStateTree : PyStateDictAccessor
     }
 
     [[nodiscard]] StateTree const& Tree() const { return _tree; }
-    void                           SetStartedAt(int64_t startedAt) { _tree.startedAt = std::chrono::nanoseconds{startedAt}; }
+    void                           SetCheckpointWriteItems(std::vector<CheckpointWriteItem> metadata)
+    {
+        if (_tree.IsFinalized() && _tree.checkpointWriteItems != metadata)
+        {
+            throw std::invalid_argument("Checkpoint write-item metadata changed after registration");
+        }
+        _tree.checkpointWriteItems = std::move(metadata);
+    }
+    void SetStartedAt(int64_t startedAt) { _tree.startedAt = std::chrono::nanoseconds{startedAt}; }
 
     private:
     StateNode& MatchStateChild_(StateNode::Handle parent, std::string_view name, StateNode::Variant const& data);
@@ -397,13 +405,13 @@ void PythonStateTree::Scan(nb::dict stateDict)
     }
 }
 
-void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath)
+void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath, std::string_view commonStateKey)
 {
     try
     {
         FinalizeStateRegistry(_tree);
         ValidateTensorHandles_();
-        ::SaveCheckpoint(_tree, iteration, dirpath);
+        ::SaveCheckpoint(_tree, iteration, dirpath, commonStateKey);
     } catch (...)
     {
         OnSnapshotComplete_();
@@ -760,17 +768,36 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
     }
 }
 
-static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
+static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict, nb::list const& writeItems)
 {
+    std::vector<CheckpointWriteItem> metadata;
+    metadata.reserve(writeItems.size());
+    for (auto const entry : writeItems)
+    {
+        auto const item = nb::cast<nb::tuple>(entry);
+        if (item.size() != 3) { throw std::invalid_argument("Checkpoint write items require a key, offsets, and size"); }
+        CheckpointWriteItem value{
+            .fqn = nb::cast<std::string>(item[0]), .sizeBytes = nb::cast<uint64_t>(item[2]), .isTensor = !item[1].is_none()};
+        if (value.isTensor)
+        {
+            for (auto const offset : nb::cast<std::vector<uint64_t>>(item[1])) { value.offsets.push_back(offset); }
+        }
+        metadata.push_back(std::move(value));
+    }
     auto                   extraDictRef = nb::dict(stateDict);
     nb::gil_scoped_release release;
-    self.ChainAsyncCall([&self, stateDict = std::move(extraDictRef)] mutable { self.Scan(std::move(stateDict)); });
+    self.ChainAsyncCall([&self, stateDict = std::move(extraDictRef), metadata = std::move(metadata)] mutable {
+        self.SetCheckpointWriteItems(std::move(metadata));
+        self.Scan(std::move(stateDict));
+    });
 }
 
-static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
+static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath, std::string const& commonStateKey)
 {
     nb::gil_scoped_release release;
-    self.ChainAsyncCall([&self, iteration, dirpath] { self.SaveCheckpoint(static_cast<cipc::SnapshotId>(iteration), dirpath); });
+    self.ChainAsyncCall([&self, iteration, dirpath, commonStateKey] {
+        self.SaveCheckpoint(static_cast<cipc::SnapshotId>(iteration), dirpath, commonStateKey);
+    });
 }
 
 NB_MODULE(checkpoint, m)    // NOLINT
@@ -846,7 +873,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
             "startedAt",
             [](PythonStateTree const& self) { return self.Tree().startedAt.count(); },
             [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
-        .def("register_state_dict", &RegisterStateDict)
+        .def("register_state_dict", &RegisterStateDict, nb::arg("state_dict"), nb::kw_only(), nb::arg("write_items") = nb::list())
         .def("finalize_registry",
              [](PythonStateTree& self) {
                  nb::gil_scoped_release release;
@@ -858,16 +885,18 @@ NB_MODULE(checkpoint, m)    // NOLINT
                          self.WaitForAsyncCalls();
                          return self.Tree().GetTotalSnapshotStateSizeInBytes();
                      })
-        .def("save_async", &SaveAsync, nb::arg("iteration"), nb::arg("dirpath"))
+        .def("save_async", &SaveAsync, nb::arg("iteration"), nb::arg("dirpath"), nb::kw_only(), nb::arg("common_state_key") = "")
         .def(
             "save",
-            [](PythonStateTree& self, int iteration, std::filesystem::path const& dirpath) {
-                SaveAsync(self, iteration, dirpath);
+            [](PythonStateTree& self, int iteration, std::filesystem::path const& dirpath, std::string const& commonStateKey) {
+                SaveAsync(self, iteration, dirpath, commonStateKey);
                 nb::gil_scoped_release release;
                 self.WaitForAsyncCalls();
             },
             nb::arg("iteration"),
-            nb::arg("dirpath"))
+            nb::arg("dirpath"),
+            nb::kw_only(),
+            nb::arg("common_state_key") = "")
         .def("wait_for_async_completion", [](PythonStateTree& self) {
             nb::gil_scoped_release release;
             self.WaitForAsyncCalls();

@@ -26,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -39,6 +40,45 @@ namespace checkpoint::distcp
 {
 
 using ByteBuffer = std::vector<char>;
+
+NonTensorOwners PlanNonTensorWrites(WriteItemsByRank const& rankItems)
+{
+    struct Candidate
+    {
+        CheckpointWriteItem item;
+        std::vector<Rank>   holders;
+    };
+    using Index = std::tuple<std::string, bool, Tensor::Dim>;
+    std::map<Index, size_t> indexes;
+    std::vector<Candidate>  candidates;
+    for (auto const& [rank, items] : rankItems)
+    {
+        for (auto const& item : items)
+        {
+            auto const [index, inserted] = indexes.try_emplace(Index{item.fqn, item.isTensor, item.offsets}, candidates.size());
+            if (inserted) { candidates.push_back({.item = item, .holders = {rank}}); }
+            else
+            {
+                auto& candidate = candidates[index->second];
+                candidate.item  = item;
+                if (candidate.holders.back() != rank) { candidate.holders.push_back(rank); }
+            }
+        }
+    }
+    NonTensorOwners          owners;
+    std::map<Rank, uint64_t> assignedBytes;
+    for (auto const& candidate : candidates)
+    {
+        auto selected = candidate.holders.front();
+        for (auto const rank : candidate.holders)
+        {
+            if (assignedBytes[rank] < assignedBytes[selected]) { selected = rank; }
+        }
+        assignedBytes[selected] += candidate.item.isTensor ? std::max<uint64_t>(candidate.item.sizeBytes, 1) : 1;
+        if (!candidate.item.isTensor) { owners[candidate.item.fqn] = selected; }
+    }
+    return owners;
+}
 
 static constexpr uint8_t  ByteMask                  = 0xffU;
 static constexpr uint64_t PickleBinIntMax           = 0x7fffffffULL;
@@ -759,6 +799,115 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     return archiveSize;
 }
 
+static void PickleScalar(ByteBuffer& out, StateNode::Scalar const& value)
+{
+    auto const type = value.GetType();
+    if (StateNode::Scalar::Type::IsFloat(type))
+    {
+        PutU8(out, 'G');
+        auto const bits = std::bit_cast<uint64_t>(value.Cast<double>());
+        for (size_t i = sizeof(bits); i > 0; --i) { PutU8(out, static_cast<uint8_t>((bits >> ((i - 1) * 8)) & ByteMask)); }
+    }
+    else if (StateNode::Scalar::Type::IsSigned(type))
+    {
+        auto const integer = value.Cast<int64_t>();
+        if (integer >= 0) { PickleInt(out, static_cast<uint64_t>(integer)); }
+        else
+        {
+            PutU8(out, PickleLong1Opcode);
+            PutU8(out, sizeof(integer));
+            auto const bits = std::bit_cast<uint64_t>(integer);
+            for (size_t i = 0; i < sizeof(bits); ++i) { PutU8(out, static_cast<uint8_t>((bits >> (i * 8)) & ByteMask)); }
+        }
+    }
+    else if (StateNode::Scalar::Type::IsUnsigned(type)) { PickleInt(out, value.Cast<uint64_t>()); }
+    else
+    {
+        throw std::runtime_error("distcp: unsupported scalar in common state");
+    }
+}
+
+static void PickleBlob(ByteBuffer& out, StateNode::Blob const& value)
+{
+    std::string encoded;
+    encoded.reserve(value.size());
+    for (auto const character : value)
+    {
+        auto const byte = static_cast<uint8_t>(character);
+        if (byte < 0x80U) { encoded.push_back(character); }
+        else
+        {
+            encoded.push_back(static_cast<char>(0xc0U | (byte >> 6U)));
+            encoded.push_back(static_cast<char>(0x80U | (byte & 0x3fU)));
+        }
+    }
+    PickleGlobal(out, "_codecs", "encode");
+    PickleBinunicode(out, encoded);
+    PickleBinunicode(out, "latin1");
+    PutU8(out, PickleTuple2Opcode);
+    PutU8(out, 'R');
+}
+
+std::vector<char> BuildCommonStateArchive(StateTree const& localRegistry, NonTensorOwners const* owners, Rank ownerRank)
+{
+    ByteBuffer dataPkl;
+    PutU8(dataPkl, 0x80);
+    PutU8(dataPkl, 0x02);
+    PutU8(dataPkl, ']');
+    PutU8(dataPkl, '}');
+    PutU8(dataPkl, '(');
+    localRegistry.WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type != StateNode::Type::Scalar && type != StateNode::Type::Blob) { return; }
+        auto const fqn = localRegistry.GetNodeId(node.handle);
+        if (owners != nullptr)
+        {
+            auto const owner = owners->find(fqn);
+            if (owner == owners->end() || owner->second != ownerRank) { return; }
+        }
+        PickleBinunicode(dataPkl, fqn);
+        if (type == StateNode::Type::Scalar) { PickleScalar(dataPkl, std::get<StateNode::Scalar>(node.data)); }
+        else
+        {
+            PickleBlob(dataPkl, std::get<StateNode::Blob>(node.data));
+        }
+    });
+    PutU8(dataPkl, 'u');
+    PutU8(dataPkl, 'a');
+    PutU8(dataPkl, '.');
+
+    mz_zip_archive zip{};
+    if (mz_zip_writer_init_heap(&zip, 0, 0) != MZ_TRUE) { throw std::runtime_error("distcp: common-state ZIP initialization failed"); }
+    void* archiveData = nullptr;
+    try
+    {
+        auto add = [&](char const* name, std::string_view data) {
+            if (mz_zip_writer_add_mem(&zip, name, data.data(), data.size(), MZ_NO_COMPRESSION) != MZ_TRUE)
+            {
+                throw std::runtime_error(fmt::format("distcp: common-state ZIP entry '{}' failed", name));
+            }
+        };
+        add("archive/data.pkl", std::string_view(dataPkl.data(), dataPkl.size()));
+        add("archive/byteorder", ByteorderBytes);
+        add("archive/version", VersionBytes);
+        size_t archiveSize = 0;
+        if (mz_zip_writer_finalize_heap_archive(&zip, &archiveData, &archiveSize) != MZ_TRUE)
+        {
+            throw std::runtime_error("distcp: common-state ZIP finalization failed");
+        }
+        auto const* bytes = static_cast<char const*>(archiveData);
+        ByteBuffer  result(bytes, bytes + archiveSize);
+        mz_free(archiveData);
+        mz_zip_writer_end(&zip);
+        return result;
+    } catch (...)
+    {
+        mz_free(archiveData);
+        mz_zip_writer_end(&zip);
+        throw;
+    }
+}
+
 constexpr std::string_view KMetadataModule   = "torch.distributed.checkpoint.metadata";
 constexpr std::string_view KFilesystemModule = "torch.distributed.checkpoint.filesystem";
 
@@ -1101,13 +1250,6 @@ void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& global
     auto output = OpenOutputFile(filepath);
     WriteBytes(output, pkl.data(), pkl.size(), filepath.string());
     FinishOutputFile(output, filepath);
-
-    // The format marker makes the directory loadable as a torch_dist checkpoint.
-    static constexpr std::string_view ConfigJson   = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
-    auto const                        configPath   = ckptDir / "metadata.json";
-    auto                              configOutput = OpenOutputFile(configPath);
-    WriteBytes(configOutput, ConfigJson.data(), ConfigJson.size(), configPath.string());
-    FinishOutputFile(configOutput, configPath);
 }
 
 }    // namespace checkpoint::distcp

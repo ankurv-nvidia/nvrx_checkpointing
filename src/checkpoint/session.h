@@ -39,6 +39,7 @@ struct Session
         std::shared_ptr<StateTree>     localRegistry;
         ByteStorage                    tensorStorage;
         checkpoint::distcp::BlobsByFqn blobs;
+        std::vector<char>              commonStateArchive;
         std::chrono::nanoseconds       startedAt{};
 
         uint64_t writtenTensorRangeBegin{0};
@@ -51,6 +52,7 @@ struct Session
         checkpoint::ipc::SnapshotId snapshotId{checkpoint::ipc::SnapshotId::Invalid};
         std::string                 name;
         std::filesystem::path       path;
+        std::string                 commonStateKey;
 
         std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
@@ -82,6 +84,9 @@ struct Session
     uint64_t                                                 largestSnapshotSize{0};
 
     checkpoint::distcp::BlobMetadataByFqn blobMetas;
+    checkpoint::distcp::NonTensorOwners   nonTensorOwners;
+    checkpoint::distcp::NonTensorOwners   plannedNonTensorOwners;
+    checkpoint::distcp::WriteItemsByRank  checkpointWriteItems;
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
@@ -100,7 +105,9 @@ struct Session
 
     void   HandleStateRegistryFragment(checkpoint::ipc::Rank                                recvRank,
                                        std::vector<TensorShardInfo> const&                  tensorShards,
-                                       std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn);
+                                       std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn,
+                                       std::vector<std::string> const&                      scalarFqns,
+                                       std::vector<CheckpointWriteItem> const&              writeItems);
     bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
     size_t PeerIndex() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer; }
 

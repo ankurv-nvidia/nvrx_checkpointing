@@ -69,6 +69,11 @@ def _install_load_registration() -> None:
     dist_checkpointing.load = load
     setattr(dist_checkpointing, _NATIVE_LOAD_MARKER, True)
     training_module.load_checkpoint = native_save._wrap_load_checkpoint(training_module.load_checkpoint)  # noqa: SLF001
+    checkpointing_module = sys.modules.get("megatron.training.checkpointing")
+    if checkpointing_module is not None and hasattr(checkpointing_module, "FileSystemReader"):
+        from .load import install as install_bundle_load
+
+        install_bundle_load(checkpointing_module)
 
 
 def _install_async_queue_bindings() -> None:

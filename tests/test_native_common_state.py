@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 import time
 from typing import TYPE_CHECKING
@@ -108,7 +107,7 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             root.wait_for_async_completion()
 
             deadline = time.monotonic() + 30
-            while not (checkpoint_dir / ".metadata").is_file() or not (checkpoint_dir / "metadata.json").is_file():
+            while not (checkpoint_dir / ".metadata").is_file():
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
                 time.sleep(0.05)
@@ -120,9 +119,6 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             assert _load_sharded_object(checkpoint_dir) == {"iteration": iteration}
             _assert_common_state_layout(checkpoint_dir, common_capacity)
             assert not (checkpoint_dir / "common.pt").exists()
-            assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
-                "sharded_backend": "torch_dist",
-                "sharded_backend_version": 1,
-            }
+            assert not (checkpoint_dir / "metadata.json").exists()
     finally:
         checkpoint.svc_spindown()

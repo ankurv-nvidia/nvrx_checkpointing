@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import lzma
+import math
 import os
 import pickle
 import re
@@ -264,12 +265,33 @@ _DCP_READ_BUFFER_BYTES = 16 * 1024 * 1024
 _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 
 
+def _is_plain_dcp(checkpoint_dir: Path, state_dict_metadata: dict) -> bool:
+    """Whether a checkpoint keeps its objects beside its tensors, like an fsdp_dtensor one."""
+    return not (checkpoint_dir / "common.pt").is_file() and _DCP_COMMON_STATE_KEY not in state_dict_metadata
+
+
 def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
-    """Load non-sharded state from legacy or current Megatron checkpoints."""
+    """Load non-sharded state from legacy or current Megatron checkpoints.
+
+    The common state of a plain DCP checkpoint is every object it holds.
+    """
     checkpoint_dir = Path(checkpoint_dir)
     commonpt = checkpoint_dir / "common.pt"
     if commonpt.is_file():
         return torch.load(commonpt, map_location="cpu", weights_only=False)
+
+    reader = FileSystemReader(str(checkpoint_dir))
+    metadata = reader.read_metadata()
+    state_dict_metadata = metadata.state_dict_metadata
+    if _is_plain_dcp(checkpoint_dir, state_dict_metadata):
+        objects = {fqn: io.BytesIO() for fqn, meta in state_dict_metadata.items() if isinstance(meta, BytesStorageMetadata)}
+        torch.distributed.checkpoint.load(objects, storage_reader=reader, no_dist=True)
+        return objects
+
+    if not (checkpoint_dir / "metadata.json").is_file():
+        from .megatron.load import read_common_state  # noqa: PLC0415
+
+        return read_common_state(reader, metadata)
 
     state_dict = {_DCP_COMMON_STATE_KEY: io.BytesIO()}
     torch.distributed.checkpoint.load(
@@ -433,11 +455,12 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     for fqn, meta in tensormeta.items():
         for i, chunk in enumerate(meta.chunks):
             si = chunk_storage[(fqn, tuple(chunk.offsets))]
-            data_size = chunk.sizes.numel() * torch.tensor([], dtype=meta.properties.dtype).element_size()
+            data_size = math.prod(chunk.sizes) * torch.tensor([], dtype=meta.properties.dtype).element_size()
             reads_by_file.setdefault(si.relative_path, []).append(("tensor", si.offset, si.length, fqn, i, data_size))
+    plain_dcp = _is_plain_dcp(checkpoint_dir, metadata.state_dict_metadata)
     for fqn in bytemeta:
-        # Embedded common state is compared through common_pt_dump.info.
-        if fqn == _DCP_COMMON_STATE_KEY:
+        # Embedded common state, like every object of a plain DCP checkpoint, is compared through common_pt_dump.info.
+        if plain_dcp or fqn == _DCP_COMMON_STATE_KEY or fqn.startswith(f"{_DCP_COMMON_STATE_KEY}.rank_"):
             continue
         si = chunk_storage.get((fqn, ()))
         if si is None:
@@ -541,6 +564,18 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
         while not native_info_file.exists():
             time.sleep(1)
         nflines = native_info_file.read_text().splitlines()
+        native_keys = {line.partition("=")[0] for line in nflines}
+        for fqn in bytemeta:
+            checksum_key = f"{fqn}.bytes.md5sum"
+            if checksum_key not in native_keys or not (fqn == _DCP_COMMON_STATE_KEY or fqn.startswith(f"{_DCP_COMMON_STATE_KEY}.rank_")):
+                continue
+            storage = chunk_storage[(fqn, ())]
+            with (checkpoint_dir / storage.relative_path).open("rb") as stream:
+                stream.seek(storage.offset)
+                raw = stream.read(storage.length)
+            if len(raw) != storage.length:
+                raise ValueError(f"Truncated common state archive: {fqn}")
+            raw_blob_entries[checksum_key] = hashlib.md5(raw).hexdigest()  # noqa: S324
         # Server validation includes raw Blob checksums; persisted manifests contain decoded Blob semantics.
         server_rflines = [line for line in rflines if ".object" not in line.partition("=")[0]]
         server_rflines.extend(f"{k}={raw_blob_entries[k]}" for k in sorted(raw_blob_entries))

@@ -260,9 +260,42 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, blobView);
 }
 
+static nb::bytes CommonStateArchiveImpl(nb::dict const& values)
+{
+    RankTopology topo{
+        .rank         = Rank{0},
+        .worldSize    = Rank{1},
+        .ranksPerPeer = 1,
+        .peersPerNode = 1,
+        .peers        = {"localhost"},
+    };
+    StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
+    for (auto const& [key, value] : values)
+    {
+        auto const fqn          = nb::cast<std::string>(key);
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        auto& leaf              = tree.AddChild(parent, leafName);
+        if (nb::isinstance<nb::bytes>(value))
+        {
+            auto const bytes = nb::cast<nb::bytes>(value);
+            leaf.data        = StateNode::Blob(bytes.c_str(), bytes.c_str() + bytes.size());
+        }
+        else if (nb::isinstance<nb::int_>(value)) { leaf.data = StateNode::Scalar{nb::cast<int64_t>(value)}; }
+        else if (nb::isinstance<nb::float_>(value)) { leaf.data = StateNode::Scalar{nb::cast<double>(value)}; }
+        else
+        {
+            throw std::runtime_error("distcp_shim: common state supports integers, floats, and bytes");
+        }
+    }
+    auto const archive = checkpoint::distcp::BuildCommonStateArchive(tree);
+    return nb::bytes(archive.data(), archive.size());
+}
+
 NB_MODULE(_distcp_shim, m)    // NOLINT
 {
     m.doc() = "Single-process shim around distcp::WriteRankShard / WriteMetadata for parity tests.";
+
+    m.def("common_state_archive", &CommonStateArchiveImpl, nb::arg("values"));
 
     m.def("write_rank_shard",
           &WriteRankShardImpl,

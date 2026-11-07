@@ -54,6 +54,26 @@ struct StateSerDes
 
     static checkpoint::ipc::SessionId ReadSessionId(std::istream& istrm) { return serdes::ReadTrivial<checkpoint::ipc::SessionId>(istrm); }
 
+    static void WriteCheckpointWriteItem(std::ostream& ostrm, CheckpointWriteItem const& item)
+    {
+        serdes::WriteTrivial(ostrm, item.isTensor);
+        serdes::WriteTrivial(ostrm, item.sizeBytes);
+        serdes::WriteTrivial(ostrm, item.offsets);
+        serdes::WriteBlobWithSize<uint32_t>(ostrm, item.fqn);
+    }
+
+    static CheckpointWriteItem ReadCheckpointWriteItem(std::istream& istrm)
+    {
+        CheckpointWriteItem item;
+        item.isTensor     = serdes::ReadTrivial<bool>(istrm);
+        item.sizeBytes    = serdes::ReadTrivial<uint64_t>(istrm);
+        item.offsets      = serdes::ReadTrivial<Tensor::Dim>(istrm);
+        auto const length = serdes::ReadTrivial<uint32_t>(istrm);
+        item.fqn          = serdes::ReadBlob(istrm, length);
+        if (!istrm) { throw std::runtime_error("Invalid checkpoint write-item metadata"); }
+        return item;
+    }
+
     static RankTopology ReadTopology(std::istream& istrm)
     {
         RankTopology topo;

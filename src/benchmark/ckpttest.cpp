@@ -265,6 +265,160 @@ static RankTopology SingleRankTopo(uint32_t rank = 0, uint32_t worldSize = 1)
         .peers        = {"localhost"},
     };
 }
+
+TEST_CASE("non-tensor ownership balances ordered tensor and object candidates", "[distcp][tier1]")
+{
+    Tensor::Dim offset;
+    offset.push_back(0);
+    CheckpointWriteItem const            tensor{.fqn = "shared.weight", .offsets = offset, .sizeBytes = 400, .isTensor = true};
+    CheckpointWriteItem const            object{.fqn = "shared.object", .sizeBytes = 1, .isTensor = false};
+    CheckpointWriteItem const            expert0{.fqn = "expert0.meta", .sizeBytes = 1, .isTensor = false};
+    CheckpointWriteItem const            expert1{.fqn = "expert1.meta", .sizeBytes = 1, .isTensor = false};
+    checkpoint::distcp::WriteItemsByRank items{
+        {Rank{0}, {tensor, object, expert0}},
+        {Rank{1}, {tensor, object, expert1}},
+    };
+    auto const owners = checkpoint::distcp::PlanNonTensorWrites(items);
+    CHECK(owners.at("shared.object") == Rank{1});
+    CHECK(owners.at("expert0.meta") == Rank{0});
+    CHECK(owners.at("expert1.meta") == Rank{1});
+    CHECK_FALSE(owners.contains("shared.weight"));
+
+    for (auto& [rank, plan] : items)
+    {
+        static_cast<void>(rank);
+        std::swap(plan[0], plan[1]);
+    }
+    CHECK(checkpoint::distcp::PlanNonTensorWrites(items).at("shared.object") == Rank{0});
+}
+
+TEST_CASE("common-state bundles retain peer-owned entries without forwarding payloads", "[server][distcp][tier2]")
+{
+    auto const directory = CkptDir("peer_common_state");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    constexpr auto                            sessionId = checkpoint::ipc::SessionId{719};
+    constexpr auto                            commonKey = "checkpoint.objects";
+    std::array<std::unique_ptr<StateTree>, 2> registries;
+    std::array<std::array<float, 100>, 2>     weights{};
+    for (uint32_t rank = 0; rank < registries.size(); ++rank)
+    {
+        RankTopology topo{
+            .rank         = Rank{rank},
+            .worldSize    = Rank{2},
+            .ranksPerPeer = 1,
+            .peersPerNode = 2,
+            .peers        = {"localhost:4100", "localhost:4101"},
+        };
+        auto& registry = registries[rank];
+        registry       = std::make_unique<StateTree>(sessionId, std::move(topo));
+        Tensor weight;
+        weight.durableDtype  = Tensor::DType::Float32;
+        weight.snapshotDtype = Tensor::DType::Float32;
+        weight.device        = DeviceId{"cpu"};
+        weight.handle        = reinterpret_cast<uint64_t>(weights[rank].data());
+        weight.storageSize   = sizeof(weights[rank]);
+        weight.fulldim.push_back(weights[rank].size());
+        registry->AddChild(StateNode::Handle::Root, "weight").data = weight;
+        registry->AddChild(StateNode::Handle::Root, "shared").data = StateNode::Scalar{int64_t{7} + rank};
+        auto const label = rank == 0 ? std::string{"rank-zero-copy"} : std::string{"rank-one-copy"};
+        registry->AddChild(StateNode::Handle::Root, "shared_blob").data = StateNode::Blob(label.begin(), label.end());
+        if (rank == 0) { registry->AddChild(StateNode::Handle::Root, "rank0_only").data = StateNode::Scalar{int64_t{11}}; }
+        else
+        {
+            registry->AddChild(StateNode::Handle::Root, "peer_only").data = StateNode::Scalar{int64_t{19}};
+            std::string const payload                                     = "peer-payload";
+            registry->AddChild(StateNode::Handle::Root, "peer_blob").data = StateNode::Blob(payload.begin(), payload.end());
+        }
+        Tensor::Dim offset;
+        offset.push_back(0);
+        registry->checkpointWriteItems = {
+            {.fqn = "weight", .offsets = offset, .sizeBytes = sizeof(weights[rank]), .isTensor = true},
+            {.fqn = "shared_blob", .sizeBytes = 1, .isTensor = false},
+            {.fqn = "shared", .sizeBytes = 1, .isTensor = false},
+        };
+        if (rank == 0) { registry->checkpointWriteItems.push_back({.fqn = "rank0_only", .sizeBytes = 1, .isTensor = false}); }
+        else
+        {
+            registry->checkpointWriteItems.push_back({.fqn = "peer_only", .sizeBytes = 1, .isTensor = false});
+            registry->checkpointWriteItems.push_back({.fqn = "peer_blob", .sizeBytes = 1, .isTensor = false});
+        }
+    }
+
+    if (TryConnectToCheckpointService())
+    {
+        SvcStop();
+        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(); ++attempt)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+        REQUIRE_FALSE(TryConnectToCheckpointService());
+    }
+    RunInprocServer(2);
+    std::array<std::future<void>, 2> tasks;
+    try
+    {
+        for (size_t rank = 0; rank < registries.size(); ++rank)
+        {
+            tasks[rank] = std::async(std::launch::async, [&, rank] { FinalizeStateRegistry(*registries[rank]); });
+        }
+        for (auto& task : tasks) { task.get(); }
+
+        uintmax_t firstArchiveSize = 0;
+        for (uint32_t iteration = 1; iteration <= 2; ++iteration)
+        {
+            auto const checkpointDir = directory / std::to_string(iteration);
+            auto const value         = iteration == 1 ? int64_t{7} : int64_t{123456};
+            for (size_t rank = 0; rank < registries.size(); ++rank)
+            {
+                auto& registry                                          = *registries[rank];
+                registry.GetNode(registry.FindNodeByFQN("shared")).data = StateNode::Scalar{value + static_cast<int64_t>(rank)};
+                tasks[rank] = std::async(std::launch::async, [&, rank, checkpointDir, iteration] {
+                    SaveCheckpoint(*registries[rank], checkpoint::ipc::SnapshotId{iteration}, checkpointDir, commonKey);
+                    WaitForCheckpointSave(*registries[rank]);
+                });
+            }
+            for (auto& task : tasks) { task.get(); }
+            WaitForCkptFinalize(static_cast<uint32_t>(sessionId), iteration);
+
+            auto const        metadataBytes = ReadWholeFile(checkpointDir / ".metadata");
+            std::string const metadata(metadataBytes.begin(), metadataBytes.end());
+            CHECK(metadata.find(commonKey) != std::string::npos);
+            CHECK(metadata.find("checkpoint.objects.rank_1") != std::string::npos);
+            for (uint32_t rank = 0; rank < registries.size(); ++rank)
+            {
+                auto const filename = fmt::format("__{}_0.distcp", rank);
+                CHECK(metadata.find(filename) != std::string::npos);
+                auto const        bytes = ReadWholeFile(checkpointDir / filename);
+                std::string const archive(bytes.begin(), bytes.end());
+                if (rank == 0)
+                {
+                    CHECK(archive.find("rank0_only") != std::string::npos);
+                    CHECK(archive.find("rank-zero-copy") == std::string::npos);
+                    CHECK(archive.find("peer-payload") == std::string::npos);
+                }
+                else
+                {
+                    CHECK(archive.find("peer_only") != std::string::npos);
+                    CHECK(archive.find("peer-payload") != std::string::npos);
+                    CHECK(archive.find("shared_blob") != std::string::npos);
+                    CHECK(archive.find("rank-one-copy") != std::string::npos);
+                    if (iteration == 1) { firstArchiveSize = bytes.size(); }
+                    else
+                    {
+                        CHECK(bytes.size() != firstArchiveSize);
+                    }
+                }
+            }
+        }
+    } catch (...)
+    {
+        StopInprocServer();
+        throw;
+    }
+    StopInprocServer();
+    std::filesystem::remove_all(directory);
+}
 namespace
 {
 struct TestShardEntry

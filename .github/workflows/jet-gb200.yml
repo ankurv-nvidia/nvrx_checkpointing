@@ -12,6 +12,10 @@ on:
         description: gb200-native-perf-pico-1x4 (default)
         type: boolean
         default: false
+      gb200-native-detr-fsdp-1x4:
+        description: gb200-native-detr-fsdp-1x4 (default)
+        type: boolean
+        default: false
       gb200-native-perf-gpt-moe-1x4:
         description: gb200-native-perf-gpt-moe-1x4 (main-branch-runs)
         type: boolean

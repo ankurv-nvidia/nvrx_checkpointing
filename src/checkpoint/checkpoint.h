@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 
 void SvcIncrRef();
 void SvcDecrRef();
@@ -15,7 +16,10 @@ void FinalizeStateRegistry(StateTree& root);
 
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
 
-void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
+void SaveCheckpoint(StateTree const&                   root,
+                    checkpoint::ipc::SnapshotId const& snapshotId,
+                    std::filesystem::path const&       ckptPath,
+                    std::string_view                   commonStateKey = {});
 void WaitForCheckpointSave(StateTree const& root);
 
 void SvcPing();

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 # sys.path + MEGATRON_NATIVE_BUILD_DIR opt-out are wired by `pytest_discover_tests`.
 import io
-import json
 
 import _distcp_shim
 import torch
@@ -118,6 +117,7 @@ def test_multi_tensor_mixed_dtype_dcp_load(tmp_path) -> None:
 
     for fqn, expected in state_dict.items():
         assert torch.equal(loaded[fqn], expected), f"mismatch for {fqn!r}"
+    assert not (tmp_path / "metadata.json").exists()
 
 
 def test_common_state_is_embedded_and_fresh_for_each_checkpoint(tmp_path) -> None:
@@ -133,10 +133,7 @@ def test_common_state_is_embedded_and_fresh_for_each_checkpoint(tmp_path) -> Non
     for checkpoint_dir, expected in checkpoints:
         assert _load_common_state(checkpoint_dir) == expected
         assert not (checkpoint_dir / "common.pt").exists()
-        assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
-            "sharded_backend": "torch_dist",
-            "sharded_backend_version": 1,
-        }
+        assert not (checkpoint_dir / "metadata.json").exists()
 
 
 @given(state_dict=_state_dict())

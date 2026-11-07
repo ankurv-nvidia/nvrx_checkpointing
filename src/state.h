@@ -67,6 +67,16 @@ struct StateNode
     Variant     data;
 };
 
+struct CheckpointWriteItem
+{
+    std::string fqn;
+    Tensor::Dim offsets{};
+    uint64_t    sizeBytes{};
+    bool        isTensor{};
+
+    bool operator==(CheckpointWriteItem const&) const = default;
+};
+
 template <> struct fmt::formatter<StateNode::Handle> : fmt::formatter<std::string_view>
 {
     auto format(StateNode::Handle const& handle, fmt::format_context& ctx) const    // NOLINT
@@ -451,7 +461,8 @@ struct StateTree
         clone._nodes.reserve(_nodes.size());
         clone._nodes.clear();
         for (auto const& node : _nodes) { clone._nodes.emplace_back(node.handle, node.parent, node.name, StateNode::Variant{node.data}); }
-        clone.startedAt = startedAt;
+        clone.startedAt            = startedAt;
+        clone.checkpointWriteItems = checkpointWriteItems;
     }
 
     [[nodiscard]] auto Clone() const
@@ -617,6 +628,8 @@ struct StateTree
     friend struct StateSerDes;
 
     public:
+    std::vector<CheckpointWriteItem> checkpointWriteItems;
+
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/
         = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());

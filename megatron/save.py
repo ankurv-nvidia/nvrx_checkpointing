@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from megatron.core import mpu  # type: ignore[import-not-found]
+from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config  # type: ignore[import-not-found]
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  # type: ignore[import-not-found]
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
 from megatron.core.rerun_state_machine import get_rerun_state_machine  # type: ignore[import-not-found]
@@ -30,9 +31,12 @@ from megatron.training.checkpointing import (  # type: ignore[import-not-found]
     get_checkpoint_tracker_filename,
     get_rng_state,
     maybe_save_dataloader_state,
+    preprocess_fsdp_dtensor_state_dict,
 )
 from megatron.training.global_vars import get_args  # type: ignore[import-not-found]
 from megatron.training.utils import print_rank_0  # type: ignore[import-not-found]
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+from torch.distributed.tensor import DTensor
 
 from .. import checkpoint  # noqa: TID252
 from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
@@ -54,6 +58,7 @@ _COMMON_STATE_ALIGNMENT = 1024
 _root = None
 _common_state_capacity: int | None = None
 _sharded_object_capacities: dict[str, int] = {}
+_dtensor_object_capacities: dict[str, int] = {}
 
 
 @dataclass
@@ -131,7 +136,8 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
                 checkpointing_module.generate_state_dict = original_generate_state_dict
 
             # Without a loaded checkpoint the optimizer has no state yet, so the first save registers the state dict.
-            if not checkpoint_loaded:
+            # A DTensor state is registered by the first save too.
+            if not checkpoint_loaded or getattr(training_args, "ckpt_format", None) == "fsdp_dtensor":
                 return result
 
             iteration, num_floating_point_operations_so_far = result
@@ -314,17 +320,56 @@ def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -
         _executor = None
 
 
-def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_state:
-    """Register the current state dictionary on the process-global state tree."""
+def _ensure_root() -> checkpoint.model_state:
+    """Create the process-global state tree on first use."""
     global _root  # noqa: PLW0603
     if _root is None:
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         ordered_peers = detect_peers(rank, world_size)
         _root = checkpoint.model_state.create_root(0, rank, world_size, **ordered_peers.checkpoint_args())
-    with preserve_quantized_tensors():
-        _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
     return _root
+
+
+def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_state:
+    """Register the current state dictionary on the process-global state tree."""
+    root = _ensure_root()
+    with preserve_quantized_tensors():
+        root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
+    return root
+
+
+def _dtensor_write_items(state: dict) -> list[tuple[str, list[int] | None, int]]:
+    items = []
+    for key, value in state.items():
+        if isinstance(value, DTensor):
+            if value.device_mesh.get_coordinate() is None:
+                continue
+            cost = max(value.numel() * value.element_size(), 1)
+            items.extend((key, list(chunk.offsets), cost) for chunk in value.__create_chunk_list__() if all(chunk.sizes))
+        elif isinstance(value, torch.Tensor):
+            items.append((key, [0] * value.ndim, max(value.numel() * value.element_size(), 1)))
+        else:
+            items.append((key, None, 1))
+    return items
+
+
+def register_dtensor_state_dict(state_dict: dict) -> checkpoint.model_state:
+    """Register a DTensor state dictionary, which native saves as a plain DCP checkpoint."""
+    state, _ = flatten_state_dict(state_dict)
+    write_items = _dtensor_write_items(state)
+    for key, value in state.items():
+        if not isinstance(value, torch.Tensor) and type(value) not in (int, float):
+            buffer = io.BytesIO()
+            torch.save(value, buffer)
+            blob = buffer.getvalue()
+            capacity = _dtensor_object_capacities.setdefault(key, _snapshot_blob_capacity(len(blob)))
+            if len(blob) > capacity:
+                raise RuntimeError(f"object '{key}' serialized to {len(blob)} bytes, exceeding its registered {capacity}-byte capacity")
+            state[key] = blob.ljust(capacity, b"\0")
+    root = _ensure_root()
+    root.register_state_dict(state, write_items=write_items)
+    return root
 
 
 # The writer and finalizer use the same fixed session.
@@ -399,7 +444,7 @@ def save_checkpoint(save_args: SaveCheckpointArgs) -> None:
             raise
 
 
-def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> None:  # noqa: PLR0915
+def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> None:  # noqa: C901, PLR0915
     """Build the current Megatron state and submit one native checkpoint.
 
     The load path or first save creates the process-global state tree. Every save
@@ -429,13 +474,15 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
         with _checkpoint_span("megatron.checkpoint.save.state_dict", iteration):
             args = get_args()
+            # Native checkpoints use the torch_dist format, except DTensor states which stay plain DCP checkpoints.
+            ckpt_format = "fsdp_dtensor" if getattr(args, "ckpt_format", None) == "fsdp_dtensor" else "torch_dist"
             metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=save_args.dp_cp_group)
             if args.use_distributed_optimizer:
                 print_rank_0(
                     f"Storing distributed optimizer sharded state of type {metadata['distrib_optim_sharding_type']}",
                 )
             rng_state = get_rng_state(
-                "torch_dist",
+                ckpt_format,
                 save_args.tp_group or mpu.get_tensor_model_parallel_group(),
                 save_args.pp_group or mpu.get_pipeline_model_parallel_group(),
                 dp_cp_group=save_args.dp_cp_group,
@@ -444,12 +491,13 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             )
             rerun_state = get_rerun_state_machine().state_dict(
                 data_iterator=save_args.train_data_iterator,
-                ckpt_format="torch_dist",
+                ckpt_format=ckpt_format,
             )
+            model = unwrap_model(save_args.model)
             with preserve_quantized_tensors():
                 state_dict = generate_state_dict(
                     args,
-                    unwrap_model(save_args.model),
+                    model,
                     save_args.optimizer,
                     save_args.opt_param_scheduler,
                     rng_state,
@@ -459,12 +507,13 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                     rerun_state=rerun_state,
                 )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
-            if torch.distributed.get_rank() == 0:
+            if ckpt_format == "fsdp_dtensor":
+                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+            elif torch.distributed.get_rank() == 0:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
-            # Native checkpoints always use the torch_dist format.
             print_rank_0(
-                f"[{_timestamp()}] saving checkpoint at iteration {iteration:7d} to {args.save} in torch_dist format",
+                f"[{_timestamp()}] saving checkpoint at iteration {iteration:7d} to {args.save} in {ckpt_format} format",
             )
             checkpoint_dir = Path(get_checkpoint_name(args.save, iteration, return_base_dir=True))
 
@@ -474,9 +523,17 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             _save_dataloader_state(save_args, args)
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
-                root = register_state_dict(state_dict, iteration)
+                if ckpt_format == "fsdp_dtensor":
+                    root = register_dtensor_state_dict(state_dict)
+                else:
+                    root = register_state_dict(state_dict, iteration)
+            # Like Megatron's own torch_dist saves, the format marker makes the directory loadable as one.
+            if ckpt_format == "torch_dist" and torch.distributed.get_rank() == 0:
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                save_config(CheckpointingConfig(ckpt_format), str(checkpoint_dir))
             root.startedAt = started_at_ns
-            root.save_async(iteration, checkpoint_dir)
+            save_options = {"common_state_key": _DCP_COMMON_STATE_KEY} if ckpt_format == "fsdp_dtensor" else {}
+            root.save_async(iteration, checkpoint_dir, **save_options)
 
         if not getattr(args, "async_save", False):
             # A deferred client send must run before the blocking server wait.
@@ -510,6 +567,7 @@ __all__ = [
     "SaveCheckpointArgs",
     "init_persistent_async_worker",
     "maybe_finalize_async_save",
+    "register_dtensor_state_dict",
     "register_state_dict",
     "save_checkpoint",
 ]
