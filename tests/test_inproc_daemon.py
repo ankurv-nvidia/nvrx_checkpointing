@@ -110,13 +110,11 @@ class _TrainingProcess:
             text=True,
         )
         self.events: queue.Queue[dict] = queue.Queue()
-        self.output: list[str] = []
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
 
     def _read_output(self) -> None:
         for line in self.process.stdout:
-            self.output.append(line)
             try:
                 event = json.loads(line)
             except ValueError:

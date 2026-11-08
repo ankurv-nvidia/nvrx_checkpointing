@@ -80,120 +80,103 @@ class ReferenceRegistry
     private:
     struct References
     {
-        size_t                                 self{};
+        std::weak_ptr<void>                    self;
         std::map<std::string, ProcessIdentity> local;
         std::map<std::string, std::string>     remote;
         std::set<std::string>                  releasedLocal;
         std::set<std::string>                  releasedRemote;
     };
 
-    struct State
-    {
-        std::mutex                      mutex;
-        std::map<SessionId, References> sessions;
-        std::set<SessionId>             closedSessions;
-        bool                            accepting{true};
-        bool                            acquired{};
-        Clock::time_point               started{Clock::now()};
-    };
-
-    struct Guard
-    {
-        std::shared_ptr<State> state;
-        SessionId              session;
-        bool                   active{};
-
-        ~Guard()
-        {
-            if (!active) { return; }
-            std::scoped_lock lock(state->mutex);
-            --state->sessions.at(session).self;
-        }
-    };
-
-    std::shared_ptr<State> _state{std::make_shared<State>()};
+    mutable std::mutex              _mutex;
+    std::map<SessionId, References> _sessions;
+    std::set<SessionId>             _closedSessions;
+    bool                            _accepting{true};
+    bool                            _acquired{};
+    Clock::time_point               _started{Clock::now()};
 
     public:
     Lease AcquireSelf(SessionId session = NoSession, bool control = false)
     {
-        auto guard     = std::make_shared<Guard>();
-        guard->state   = _state;
-        guard->session = session;
-        std::scoped_lock lock(_state->mutex);
-        if (!_state->accepting && !control) { return {}; }
-        if (session != NoSession && _state->closedSessions.contains(session)) { return {}; }
-        ++_state->sessions[session].self;
-        guard->active = true;
-        return guard;
+        std::scoped_lock lock(_mutex);
+        if (!_accepting && !control) { return {}; }
+        if (session != NoSession && _closedSessions.contains(session)) { return {}; }
+        auto& self  = _sessions[session].self;
+        auto  lease = self.lock();
+        if (!lease)
+        {
+            lease = std::make_shared<char>();
+            self  = lease;
+        }
+        return lease;
     }
 
     void AcquireLocal(SessionId session, std::string const& token, pid_t pid)
     {
         auto const identity = ProcessIdentity::Read(pid);
         if (!identity) { throw std::runtime_error("Checkpoint client process is not alive"); }
-        std::scoped_lock lock(_state->mutex);
-        if (!_state->accepting) { throw std::runtime_error("Checkpoint daemon is stopping"); }
-        auto& refs = _state->sessions[session];
+        std::scoped_lock lock(_mutex);
+        if (!_accepting) { throw std::runtime_error("Checkpoint daemon is stopping"); }
+        auto& refs = _sessions[session];
         if (refs.releasedLocal.contains(token)) { throw std::runtime_error("Checkpoint reference is already released"); }
         auto const [it, inserted] = refs.local.emplace(token, *identity);
         if (!inserted && it->second != *identity) { throw std::runtime_error("Checkpoint reference token has a different owner"); }
-        _state->closedSessions.erase(session);
-        _state->acquired = true;
+        _closedSessions.erase(session);
+        _acquired = true;
     }
 
     void ReleaseLocal(SessionId session, std::string const& token)
     {
-        std::scoped_lock lock(_state->mutex);
-        auto&            refs = _state->sessions[session];
+        std::scoped_lock lock(_mutex);
+        auto&            refs = _sessions[session];
         refs.releasedLocal.insert(token);
         refs.local.erase(token);
     }
 
     void AcquireRemote(SessionId session, std::string const& token, std::string const& peer)
     {
-        std::scoped_lock lock(_state->mutex);
-        if (!_state->accepting) { throw std::runtime_error("Checkpoint daemon is stopping"); }
-        auto& refs = _state->sessions[session];
+        std::scoped_lock lock(_mutex);
+        if (!_accepting) { throw std::runtime_error("Checkpoint daemon is stopping"); }
+        auto& refs = _sessions[session];
         if (refs.releasedRemote.contains(token)) { throw std::runtime_error("Checkpoint reference is already released"); }
         auto const [it, inserted] = refs.remote.emplace(token, peer);
         if (!inserted && it->second != peer) { throw std::runtime_error("Checkpoint reference token has a different owner"); }
-        _state->closedSessions.erase(session);
-        _state->acquired = true;
+        _closedSessions.erase(session);
+        _acquired = true;
     }
 
     void ReleaseRemote(SessionId session, std::string const& token)
     {
-        std::scoped_lock lock(_state->mutex);
-        auto&            refs = _state->sessions[session];
+        std::scoped_lock lock(_mutex);
+        auto&            refs = _sessions[session];
         refs.releasedRemote.insert(token);
         refs.remote.erase(token);
     }
 
     bool HasUnassignedWork() const
     {
-        std::scoped_lock lock(_state->mutex);
-        auto const       it = _state->sessions.find(NoSession);
-        return it != _state->sessions.end() && it->second.self != 0;
+        std::scoped_lock lock(_mutex);
+        auto const       it = _sessions.find(NoSession);
+        return it != _sessions.end() && !it->second.self.expired();
     }
 
     bool IsAccepting() const
     {
-        std::scoped_lock lock(_state->mutex);
-        return _state->accepting;
+        std::scoped_lock lock(_mutex);
+        return _accepting;
     }
 
     bool TryCloseSession(SessionId session)
     {
-        std::scoped_lock lock(_state->mutex);
-        auto const       unassigned = _state->sessions.find(NoSession);
-        if (unassigned != _state->sessions.end() && unassigned->second.self != 0) { return false; }
-        auto const it = _state->sessions.find(session);
-        if (it != _state->sessions.end())
+        std::scoped_lock lock(_mutex);
+        auto const       unassigned = _sessions.find(NoSession);
+        if (unassigned != _sessions.end() && !unassigned->second.self.expired()) { return false; }
+        auto const it = _sessions.find(session);
+        if (it != _sessions.end())
         {
             auto const& refs = it->second;
-            if (refs.self != 0 || !refs.local.empty() || !refs.remote.empty()) { return false; }
+            if (!refs.self.expired() || !refs.local.empty() || !refs.remote.empty()) { return false; }
         }
-        _state->closedSessions.insert(session);
+        _closedSessions.insert(session);
         return true;
     }
 
@@ -203,12 +186,12 @@ class ReferenceRegistry
         {
             std::vector<std::tuple<SessionId, std::string, std::string>> remotes;
             {
-                std::scoped_lock lock(_state->mutex);
-                for (auto const& [id, refs] : _state->sessions)
+                std::scoped_lock lock(_mutex);
+                for (auto const& [id, refs] : _sessions)
                 {
-                    if ((!session || id == *session) && refs.self != 0) { return true; }
+                    if ((!session || id == *session) && !refs.self.expired()) { return true; }
                 }
-                for (auto& [id, refs] : _state->sessions)
+                for (auto& [id, refs] : _sessions)
                 {
                     if (session && id != *session) { continue; }
                     for (auto it = refs.local.begin(); it != refs.local.end();)
@@ -218,7 +201,7 @@ class ReferenceRegistry
                         it = refs.local.erase(it);
                     }
                 }
-                for (auto const& [id, refs] : _state->sessions)
+                for (auto const& [id, refs] : _sessions)
                 {
                     if (session && id != *session) { continue; }
                     for (auto const& [token, peer] : refs.remote) { remotes.emplace_back(id, token, peer); }
@@ -228,12 +211,12 @@ class ReferenceRegistry
             for (auto const& [id, token, peer] : remotes)
             {
                 bool const       alive = ping(peer);
-                std::scoped_lock lock(_state->mutex);
-                auto&            refs = _state->sessions.at(id).remote;
+                std::scoped_lock lock(_mutex);
+                auto&            refs = _sessions.at(id).remote;
                 auto             it   = refs.find(token);
                 if (it == refs.end() || it->second != peer) { continue; }
                 if (alive) { return true; }
-                _state->sessions.at(id).releasedRemote.insert(token);
+                _sessions.at(id).releasedRemote.insert(token);
                 refs.erase(it);
             }
         }
@@ -242,14 +225,14 @@ class ReferenceRegistry
     bool TryRetire(Clock::time_point now = Clock::now())
     {
         static constexpr auto StartupGrace = std::chrono::seconds{5};
-        std::scoped_lock      lock(_state->mutex);
-        if (!_state->acquired && now - _state->started < StartupGrace) { return false; }
-        for (auto const& [id, refs] : _state->sessions)
+        std::scoped_lock      lock(_mutex);
+        if (!_acquired && now - _started < StartupGrace) { return false; }
+        for (auto const& [id, refs] : _sessions)
         {
             static_cast<void>(id);
-            if (refs.self != 0 || !refs.local.empty() || !refs.remote.empty()) { return false; }
+            if (!refs.self.expired() || !refs.local.empty() || !refs.remote.empty()) { return false; }
         }
-        _state->accepting = false;
+        _accepting = false;
         return true;
     }
 };

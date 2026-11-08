@@ -2,6 +2,7 @@
 #include "binding.h"
 #include "checkpoint.h"
 #include "messages.h"
+#include "server.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -71,17 +72,11 @@ namespace
 {
 struct PythonStateTree;
 
-struct ClientRootRegistry
-{
-    std::mutex                 mutex;
-    std::set<PythonStateTree*> roots;
-};
-
 auto& ClientRoots()
 {
     SUPPRESS_WARNINGS_START
     SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static ClientRootRegistry Roots;
+    static std::set<PythonStateTree*> Roots;
     SUPPRESS_WARNINGS_END
     return Roots;
 }
@@ -92,20 +87,14 @@ struct PythonStateTree : PyStateDictAccessor
     {
         {
             nb::gil_scoped_release release;
-            _reference = std::make_unique<ServiceReference>(sessionId, _tree.Topo());
+            _reference.emplace(sessionId, _tree.Topo());
         }
-        auto&            registry = ClientRoots();
-        std::scoped_lock lock(registry.mutex);
-        registry.roots.insert(this);
+        ClientRoots().insert(this);
     }
 
     ~PythonStateTree() override
     {
-        {
-            auto&            registry = ClientRoots();
-            std::scoped_lock lock(registry.mutex);
-            registry.roots.erase(this);
-        }
+        ClientRoots().erase(this);
         if (Py_IsInitialized() != 0)
         {
             try
@@ -137,26 +126,25 @@ struct PythonStateTree : PyStateDictAccessor
     void Close()
     {
         std::exception_ptr failure;
-        bool               alreadyClosed = false;
         {
             nb::gil_scoped_release release;
             std::scoped_lock       lock(_asyncMutex);
-            alreadyClosed = _closed;
-            _closed       = true;
+            if (_closed) { return; }
+            _closed = true;
             try
             {
                 if (_async.valid()) { _async.get(); }
             } catch (...) { failure = std::current_exception(); }
             try
             {
-                if (!alreadyClosed && _tree.IsFinalized()) { DrainCheckpointClient(_tree); }
+                if (_tree.IsFinalized()) { DrainCheckpointClient(_tree); }
             } catch (...)
             {
                 if (!failure) { failure = std::current_exception(); }
             }
             _reference->Release();
         }
-        if (!alreadyClosed) { OnSnapshotComplete_(); }
+        OnSnapshotComplete_();
         if (failure) { std::rethrow_exception(failure); }
     }
 
@@ -215,8 +203,8 @@ struct PythonStateTree : PyStateDictAccessor
         }
     }
 
-    StateTree                         _tree;
-    std::unique_ptr<ServiceReference> _reference;
+    StateTree                       _tree;
+    std::optional<ServiceReference> _reference;
 
     nb::dict _dictToScan;
 
@@ -232,13 +220,9 @@ struct PythonStateTree : PyStateDictAccessor
 void ShutdownClients()
 {
     std::vector<nb::object> roots;
+    for (auto* root : ClientRoots())
     {
-        auto&            registry = ClientRoots();
-        std::scoped_lock lock(registry.mutex);
-        for (auto* root : registry.roots)
-        {
-            if (auto object = nb::find(root)) { roots.push_back(std::move(object)); }
-        }
+        if (auto object = nb::find(root)) { roots.push_back(std::move(object)); }
     }
     for (auto const& root : roots)
     {
@@ -248,8 +232,7 @@ void ShutdownClients()
         } catch (std::exception const& error) { fmt::print(stderr, "[native_ckpt:cli][ERROR] Client shutdown failed: {}\n", error.what()); }
     }
     nb::gil_scoped_release release;
-    ReleasePendingServiceReferences();
-    WaitForOwnedCheckpointService();
+    WaitForOwnedInprocServer();
 }
 }    // namespace
 

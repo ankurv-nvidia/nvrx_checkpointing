@@ -8,10 +8,6 @@ on:
         description: h100-native-detr-pico-1x8 (default)
         type: boolean
         default: false
-      h100-native-detr-inproc-pico-1x8:
-        description: h100-native-detr-inproc-pico-1x8 (default)
-        type: boolean
-        default: false
       h100-native-perf-pico-1x8:
         description: h100-native-perf-pico-1x8 (default)
         type: boolean

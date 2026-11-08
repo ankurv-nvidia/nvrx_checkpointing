@@ -86,65 +86,6 @@ std::optional<std::string> ProbeService(uint16_t index)
     return {};
 }
 
-struct PendingServiceReference
-{
-    cipc::SessionId sessionId;
-    uint64_t        token;
-    uint16_t        serverIndex;
-    pid_t           ownerPid;
-};
-
-struct ServiceReferenceLedger
-{
-    std::mutex                                            mutex;
-    std::unordered_map<uint64_t, PendingServiceReference> pending;
-};
-
-ServiceReferenceLedger& PendingReferences()
-{
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static ServiceReferenceLedger ledger;
-    SUPPRESS_WARNINGS_END
-    return ledger;
-}
-
-void ForgetReference(uint64_t token)
-{
-    auto&            ledger = PendingReferences();
-    std::scoped_lock lock(ledger.mutex);
-    ledger.pending.erase(token);
-}
-
-bool ReleaseReference(PendingServiceReference const& reference)
-{
-    if (reference.ownerPid != ::getpid()) { return false; }
-    auto const         token  = std::to_string(reference.token);
-    auto const         target = fmt::format("/api/reference/release/{}/{}", reference.sessionId, token);
-    std::exception_ptr failure;
-    for (int attempt = 0; attempt < 5; ++attempt)
-    {
-        try
-        {
-            auto response = RequestService(reference.serverIndex, boost::beast::http::verb::post, target);
-            if (response.result() != boost::beast::http::status::ok)
-            {
-                throw std::runtime_error(fmt::format("Checkpoint reference release failed: {}", response.body()));
-            }
-            ForgetReference(reference.token);
-            return true;
-        } catch (...) { failure = std::current_exception(); }
-        if (reference.serverIndex == 0 && ReleaseOwnedInprocReference(static_cast<uint32_t>(reference.sessionId), token))
-        {
-            ForgetReference(reference.token);
-            return true;
-        }
-        if (attempt != 4) { std::this_thread::sleep_for(10ms); }
-    }
-    if (failure) { std::rethrow_exception(failure); }
-    return false;
-}
-
 bool IsLocalOwner(RankTopology const* topology)
 {
     if (topology != nullptr)
@@ -272,15 +213,7 @@ ServiceReference::ServiceReference(cipc::SessionId sessionId, RankTopology const
         for (int attempt = 0; attempt < 5; ++attempt)
         {
             EnsureService(&topology, _serverIndex);
-            if (!_active)
-            {
-                auto&            ledger = PendingReferences();
-                std::scoped_lock lock(ledger.mutex);
-                ledger.pending.emplace(
-                    _token,
-                    PendingServiceReference{.sessionId = _sessionId, .token = _token, .serverIndex = _serverIndex, .ownerPid = _ownerPid});
-                _active = true;
-            }
+            _active = true;
             try
             {
                 auto response = RequestService(_serverIndex, boost::beast::http::verb::post, target, body.str());
@@ -312,55 +245,23 @@ ServiceReference::~ServiceReference()
 
 void ServiceReference::Release() noexcept
 {
-    if (!_active) { return; }
-    if (_ownerPid != ::getpid()) { return; }
+    if (!_active || _ownerPid != ::getpid()) { return; }
+    _active = false;
     try
     {
+        auto const token = std::to_string(_token);
+        if (_serverIndex == 0 && ReleaseOwnedInprocReference(static_cast<uint32_t>(_sessionId), token)) { return; }
+        auto const target   = fmt::format("/api/reference/release/{}/{}", _sessionId, token);
+        auto       response = RequestService(_serverIndex, boost::beast::http::verb::post, target);
+        if (response.result() != boost::beast::http::status::ok)
         {
-            auto&            ledger = PendingReferences();
-            std::scoped_lock lock(ledger.mutex);
-            if (!ledger.pending.contains(_token))
-            {
-                _active = false;
-                return;
-            }
-        }
-        if (ReleaseReference({.sessionId = _sessionId, .token = _token, .serverIndex = _serverIndex, .ownerPid = _ownerPid}))
-        {
-            _active = false;
+            throw std::runtime_error(fmt::format("Checkpoint reference release failed: {}", response.body()));
         }
     } catch (std::exception const& error)
     {
         fmt::print(stderr, "[native_ckpt:cli][ERROR] Checkpoint reference release failed: {}\n", error.what());
     }
 }
-
-void ReleasePendingServiceReferences()
-{
-    std::vector<PendingServiceReference> references;
-    {
-        auto&            ledger = PendingReferences();
-        std::scoped_lock lock(ledger.mutex);
-        for (auto const& [token, reference] : ledger.pending)
-        {
-            static_cast<void>(token);
-            if (reference.ownerPid == ::getpid()) { references.push_back(reference); }
-        }
-    }
-    for (auto const& reference : references)
-    {
-        try
-        {
-            static_cast<void>(ReleaseReference(reference));
-        } catch (std::exception const& error)
-        {
-            fmt::print(stderr, "[native_ckpt:cli][ERROR] Pending checkpoint reference release failed: {}\n", error.what());
-        }
-    }
-}
-
-void WaitForOwnedCheckpointService()
-{ WaitForOwnedInprocServer(); }
 
 static void SvcRegisterLocalState(StateTree const& registry)
 {

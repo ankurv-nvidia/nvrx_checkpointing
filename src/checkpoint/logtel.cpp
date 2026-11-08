@@ -354,7 +354,6 @@ struct LogTelState
     std::mutex                                         mutex;
     checkpoint::telemetry::Id                          lastId{};
     std::unique_ptr<std::FILE, decltype(&std::fclose)> daemonLog{nullptr, &std::fclose};
-    std::atomic<std::FILE*>                            daemonOutput{stderr};
     std::shared_ptr<spdlog::logger>                    logger;
 
     std::atomic<bool>                          enabled{false};
@@ -524,42 +523,42 @@ class LoggingSink final : public spdlog::sinks::sink
 
 namespace checkpoint::logging
 {
-void SetDaemonLogTarget()
+std::FILE* DaemonOutput()
 {
-    LogTelState&     state = LogTelState::Get();
-    std::scoped_lock lock(state.mutex);
-    if (state.daemonLog) { return; }
-    if (state.logger) { throw std::logic_error("Daemon log target must be configured before logging starts"); }
-
-    auto const              path = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
-    static constexpr mode_t Mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-    int const               descriptor
-        = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, Mode);    // NOLINT(cppcoreguidelines-pro-type-vararg)
-    if (descriptor < 0)
-    {
-        int const error = errno;
-        throw std::runtime_error(fmt::format("cannot open server log {}: {}", path.string(), std::strerror(error)));
-    }
-    std::FILE* const output = ::fdopen(descriptor, "a");
-    if (output == nullptr)
-    {
-        int const error = errno;
-        ::close(descriptor);
-        throw std::runtime_error(fmt::format("cannot open server log stream {}: {}", path.string(), std::strerror(error)));
-    }
-    state.daemonLog.reset(output);
-    static_cast<void>(std::setvbuf(output, nullptr, _IOLBF, 0));
-    state.daemonOutput.store(output, std::memory_order_release);
+    auto const& output = LogTelState::Get().daemonLog;
+    return output ? output.get() : stderr;
 }
 
-std::FILE* DaemonOutput()
-{ return LogTelState::Get().daemonOutput.load(std::memory_order_acquire); }
-
-void Init()
+void Init(bool inproc)
 {
     LogTelState&     state = LogTelState::Get();
     std::scoped_lock lock(state.mutex);
+    if (inproc && state.logger && !state.daemonLog)
+    {
+        throw std::logic_error("Daemon log target must be configured before logging starts");
+    }
     if (state.logger) { return; }
+    if (inproc)
+    {
+        auto const              path = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
+        static constexpr mode_t Mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+        int const               descriptor
+            = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, Mode);    // NOLINT(cppcoreguidelines-pro-type-vararg)
+        if (descriptor < 0)
+        {
+            int const error = errno;
+            throw std::runtime_error(fmt::format("cannot open server log {}: {}", path.string(), std::strerror(error)));
+        }
+        std::FILE* const output = ::fdopen(descriptor, "a");
+        if (output == nullptr)
+        {
+            int const error = errno;
+            ::close(descriptor);
+            throw std::runtime_error(fmt::format("cannot open server log stream {}: {}", path.string(), std::strerror(error)));
+        }
+        state.daemonLog.reset(output);
+        static_cast<void>(std::setvbuf(output, nullptr, _IOLBF, 0));
+    }
 
     static constexpr size_t QueueSize   = 8192;
     static constexpr size_t WorkerCount = 1;
@@ -600,7 +599,6 @@ void Shutdown()
     if (running) { spdlog::shutdown(); }
     {
         std::scoped_lock lock(state.mutex);
-        state.daemonOutput.store(stderr, std::memory_order_release);
         state.daemonLog.reset();
     }
 }

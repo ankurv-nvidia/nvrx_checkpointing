@@ -100,24 +100,23 @@ struct Server
         Inproc
     };
 
-    explicit Server(uint16_t index = 0, Lifetime lifetime = Lifetime::Manual, std::atomic<bool>* ownerRunning LFTBND = nullptr) :
-        _lifetime(lifetime), _ownerRunning(ownerRunning), _index(index)
-    {}
+    explicit Server(uint16_t index = 0, Lifetime lifetime = Lifetime::Manual) : _lifetime(lifetime), _index(index) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
-    void                                 Start();
-    bool                                 AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
-    bool                                 AllSessionsComplete();
-    bool                                 HasSessionsAndAllSessionsComplete();
-    void                                 WaitForShutdown();
-    void                                 Ping();
-    void                                 HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
-    void                                 Stop();
-    void                                 QuerySessions(ServerSessionCallback callback, void* cbData);
+    void Start();
+    bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
+    bool AllSessionsComplete();
+    bool HasSessionsAndAllSessionsComplete();
+    void WaitForShutdown();
+    void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
+    void Stop();
+    void QuerySessions(ServerSessionCallback callback, void* cbData);
+
     checkpoint::ReferenceRegistry::Lease SelfReference(cipc::SessionId sessionId)
     { return _references.AcquireSelf(static_cast<uint32_t>(sessionId)); }
     void ReleaseLocalReference(uint32_t sessionId, std::string_view token) { _references.ReleaseLocal(sessionId, std::string{token}); }
+    bool IsAcceptingReferences() const { return _references.IsAccepting(); }
 
     private:
     Session& SessionById_(cipc::SessionId sessionId) LFTBND;
@@ -145,9 +144,10 @@ struct Server
     void ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf);
     void ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf);
 
-    void EnsureUpstreamReference_(cipc::SessionId sessionId);
-    void ReapUpstreamReferences_();
-    void ReleaseUpstreamReferences_();
+    std::vector<Session*> Sessions_();
+    void                  EnsureUpstreamReference_(Session& session);
+    void                  ReleaseUpstreamReferences_(bool stopping = false);
+
     void SpinDownWaitLoop_(tcp_stream stream);
     void FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int64_t iteration);
     void HandleRequest_(tcp_stream& stream);
@@ -180,24 +180,13 @@ struct Server
     boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor);
 
     private:
-    struct UpstreamReference
-    {
-        std::string coordinator;
-        std::string token;
-    };
-
     checkpoint::ReferenceRegistry _references;
     Lifetime                      _lifetime;
-    std::atomic<bool>*            _ownerRunning{};
     uint64_t                      _generation{static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
-    uint64_t                      _upstreamSequence{};
-    std::mutex                    _upstreamMutex;
-    std::map<cipc::SessionId, UpstreamReference> _upstreamReferences;
 
     uint16_t   _index{};
     std::mutex _mutex;
 
-    PerfClock::time_point        _lastPingTime{PerfClock::now()};
     std::atomic<bool>            _stopRequested{false};
     std::vector<cipc::MsgQueue*> _msgQueue;
     bool                         _running{false};
@@ -829,74 +818,57 @@ static void SendWriteCkptCompleteToPeers(Server const* const     server,
     SendWriteCkptCompleteToPeers(server, sessionId, topo, snapshotId, failure, startPeerIndex, delegateStart);
 }
 
-void Server::EnsureUpstreamReference_(cipc::SessionId sessionId)
+std::vector<Session*> Server::Sessions_()
 {
-    if (_lifetime == Lifetime::Manual || _upstreamReferences.contains(sessionId)) { return; }
-    std::string coordinator;
-    std::string peer;
-    {
-        std::scoped_lock lock(_mutex);
-        auto const&      session = *_activeSessions.at(sessionId);
-        if (session.IsCoordinatorPeer()) { return; }
-        coordinator = session.topo.peers.at(0);
-        peer        = session.topo.peers.at(session.PeerIndex());
-    }
-    auto const token = fmt::format(
-        "{}-{}-{}-{}-{}", ::getpid(), std::hash<std::string>{}(peer), _generation, static_cast<uint32_t>(sessionId), ++_upstreamSequence);
-    SendToPeerWithRetries(this, sessionId, coordinator, peer, fmt::format("/api/reference/peer/acquire/{}/{}", sessionId, token), {});
-    _upstreamReferences.emplace(sessionId, UpstreamReference{.coordinator = std::move(coordinator), .token = token});
+    std::scoped_lock      lock(_mutex);
+    std::vector<Session*> sessions;
+    for (auto const& entry : _activeSessions) { sessions.push_back(entry.second.get()); }
+    return sessions;
 }
 
-void Server::ReapUpstreamReferences_()
+void Server::EnsureUpstreamReference_(Session& session)
 {
-    std::scoped_lock lock(_upstreamMutex);
-    if (_references.HasUnassignedWork()) { return; }
-    for (auto it = _upstreamReferences.begin(); it != _upstreamReferences.end();)
+    if (_lifetime == Lifetime::Manual || session.IsCoordinatorPeer() || !session.coordinatorReference.empty()) { return; }
+    auto const& peer  = session.topo.peers.at(session.PeerIndex());
+    auto        token = fmt::format("{}-{}-{}-{}-{}",
+                                    ::getpid(),
+                                    std::hash<std::string>{}(peer),
+                                    _generation,
+                                    static_cast<uint32_t>(session.sessionId),
+                                    ++session.referenceSequence);
+    SendToPeerWithRetries(this,
+                          session.sessionId,
+                          session.topo.peers.at(0),
+                          peer,
+                          fmt::format("/api/reference/peer/acquire/{}/{}", session.sessionId, token),
+                          {});
+    session.coordinatorReference = std::move(token);
+}
+
+void Server::ReleaseUpstreamReferences_(bool stopping)
+{
+    if (!stopping && _references.HasUnassignedWork()) { return; }
+    for (auto* session : Sessions_())
     {
-        if (_references.HasValidReferences(PingService, static_cast<uint32_t>(it->first)))
-        {
-            ++it;
-            continue;
-        }
-        if (!_references.HasValidReferences(PingService)) { return; }
-        if (!_references.TryCloseSession(static_cast<uint32_t>(it->first)))
-        {
-            ++it;
-            continue;
-        }
+        auto const id = static_cast<uint32_t>(session->sessionId);
+        if (!stopping && (session->IsCoordinatorPeer() || _references.HasValidReferences(PingService, id))) { continue; }
+        if (!stopping && !_references.HasValidReferences(PingService)) { return; }
+        std::scoped_lock lock(session->mutex);
+        if (session->coordinatorReference.empty() || (!stopping && !_references.TryCloseSession(id))) { continue; }
         try
         {
             SendToPeerWithRetries(this,
-                                  it->first,
-                                  it->second.coordinator,
+                                  session->sessionId,
+                                  session->topo.peers.at(0),
                                   {},
-                                  fmt::format("/api/reference/peer/release/{}/{}", it->first, it->second.token),
+                                  fmt::format("/api/reference/peer/release/{}/{}", session->sessionId, session->coordinatorReference),
                                   {});
-            it = _upstreamReferences.erase(it);
         } catch (std::exception const& ex)
         {
-            ERR("Failed to release coordinator reference: {}", ex.what());
-            it = _upstreamReferences.erase(it);
+            if (!stopping) { ERR("Failed to release coordinator reference: {}", ex.what()); }
         }
+        session->coordinatorReference.clear();
     }
-}
-
-void Server::ReleaseUpstreamReferences_()
-{
-    std::scoped_lock lock(_upstreamMutex);
-    for (auto const& [sessionId, reference] : _upstreamReferences)
-    {
-        try
-        {
-            SendToPeerWithRetries(this,
-                                  sessionId,
-                                  reference.coordinator,
-                                  {},
-                                  fmt::format("/api/reference/peer/release/{}/{}", sessionId, reference.token),
-                                  {});
-        } catch (std::exception const&) {}
-    }
-    _upstreamReferences.clear();
 }
 
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
@@ -2224,24 +2196,17 @@ void Server::WaitForShutdown()
     while (true)
     {
         if (_stopRequested) { break; }
-        ReapUpstreamReferences_();
+        ReleaseUpstreamReferences_();
         if (!_references.HasValidReferences(PingService) && _references.TryRetire()) { break; }
         std::this_thread::sleep_for(10ms);
     }
     if (!_references.IsAccepting())
     {
-        if (_ownerRunning != nullptr) { *_ownerRunning = false; }
         checkpoint::logging::Shutdown();
         checkpoint::telemetry::Shutdown();
-        ReleaseUpstreamReferences_();
+        ReleaseUpstreamReferences_(true);
     }
     Stop();
-}
-
-void Server::Ping()
-{
-    std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
 }
 
 void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
@@ -2259,11 +2224,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     if (!selfReference) { return; }
     switch (static_cast<cipc::Message::Type>(hdr.index()))
     {
-    case cipc::Message::Type::Ping:
-    {
-        Ping();
-        return;
-    }
+    case cipc::Message::Type::Ping: return;
     case cipc::Message::Type::Shutdown:
     {
         _stopRequested = true;
@@ -2441,8 +2402,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
 Session& Server::SessionById_(cipc::SessionId sessionId) LFTBND
 {
     std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
-    auto it       = _activeSessions.find(sessionId);
+    auto             it = _activeSessions.find(sessionId);
     if (it == _activeSessions.end())
     {
         throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id={} not found", *this, sessionId));
@@ -2562,7 +2522,6 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotI
 void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
 {
     std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
 
     BufStream bufStream{buf.data(), buf.size()};
     auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
@@ -2955,9 +2914,10 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             }
             else if (operation == "acquire")
             {
-                std::scoped_lock lock(_upstreamMutex);
                 ActivateSession_(sessionId, 1, parser.get().body());
-                EnsureUpstreamReference_(sessionId);
+                auto&            session = SessionById_(sessionId);
+                std::scoped_lock lock(session.mutex);
+                EnsureUpstreamReference_(session);
                 _references.AcquireLocal(static_cast<uint32_t>(sessionId), token, pid);
             }
             else
@@ -3114,7 +3074,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
@@ -3148,7 +3107,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
     {
@@ -3161,7 +3119,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
                                  _generation);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "stop"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
     {
@@ -3369,11 +3326,6 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
             co_return;
         }
         auto pendingLease = _references.AcquireSelf(checkpoint::ReferenceRegistry::NoSession, true);
-        if (!pendingLease)
-        {
-            socket.close(ec);
-            continue;
-        }
         boost::asio::post(*_handlerPool, [this, sock = std::move(socket), lease = std::move(pendingLease)] mutable {
             auto                  requestReference = std::move(lease);
             static constexpr auto Timeout          = std::chrono::seconds{30};
@@ -3465,17 +3417,11 @@ namespace
 {
 struct OwnedInprocServer
 {
-    std::mutex        mutex;
-    std::mutex        serverMutex;
-    Server*           server{};
-    std::thread       thread;
+    std::mutex mutex;
+    std::mutex serverMutex;
+    Server*    server{};
+    // Destruction joins the lifetime task before its captured state is destroyed.
     std::future<void> completion;
-    std::atomic<bool> running{};
-
-    ~OwnedInprocServer()
-    {
-        if (thread.joinable()) { thread.join(); }
-    }
 };
 
 OwnedInprocServer& OwnedServer()
@@ -3492,73 +3438,44 @@ void StartOwnedInprocServer()
 {
     auto&            owned = OwnedServer();
     std::scoped_lock lock(owned.mutex);
-    if (owned.running) { return; }
-    if (owned.thread.joinable())
-    {
-        owned.thread.join();
-        owned.completion.get();
-    }
-    std::promise<void>         readyPromise;
-    auto                       readiness = readyPromise.get_future();
-    std::packaged_task<void()> task([&owned, ready = std::move(readyPromise)] mutable {
-        bool signaled = false;
-        try
-        {
-            SetThreadName("ncs:lifetime");
-            checkpoint::logging::SetDaemonLogTarget();
-            checkpoint::logging::Init();
-            Server server(0, Server::Lifetime::Inproc, &owned.running);
-            server.Start();
-            auto publication = std::shared_ptr<void>(nullptr, [&owned](void*) {
-                std::scoped_lock serverLock(owned.serverMutex);
-                owned.server = nullptr;
-            });
-            {
-                std::scoped_lock serverLock(owned.serverMutex);
-                owned.server = &server;
-            }
-            INFO("In-process daemon started pid={}", ::getpid());
-            owned.running = true;
-            ready.set_value();
-            signaled = true;
-            server.WaitForShutdown();
-            owned.running = false;
-        } catch (...)
-        {
-            owned.running = false;
-            if (!signaled) { ready.set_exception(std::current_exception()); }
-            throw;
-        }
-    });
-    owned.completion = task.get_future();
-    owned.thread     = std::thread(std::move(task));
+    if (OwnsInprocServer()) { return; }
+    if (owned.completion.valid()) { owned.completion.get(); }
+    checkpoint::logging::Init(true);
+    auto server = std::make_unique<Server>(0, Server::Lifetime::Inproc);
+    server->Start();
+    std::scoped_lock serverLock(owned.serverMutex);
+    owned.server = server.get();
     try
     {
-        readiness.get();
+        owned.completion = std::async(std::launch::async, [&owned, instance = std::move(server)] {
+            auto publication = std::shared_ptr<void>(nullptr, [&owned](void*) {
+                std::scoped_lock lockServer(owned.serverMutex);
+                owned.server = nullptr;
+            });
+            SetThreadName("ncs:lifetime");
+            INFO("In-process daemon started pid={}", ::getpid());
+            instance->WaitForShutdown();
+        });
     } catch (...)
     {
-        owned.thread.join();
-        owned.completion = {};
+        owned.server = nullptr;
         throw;
     }
 }
 
 void WaitForOwnedInprocServer()
 {
-    auto&             owned = OwnedServer();
-    std::thread       thread;
-    std::future<void> completion;
-    {
-        std::scoped_lock lock(owned.mutex);
-        thread     = std::move(owned.thread);
-        completion = std::move(owned.completion);
-    }
-    if (thread.joinable()) { thread.join(); }
-    if (completion.valid()) { completion.get(); }
+    auto&            owned = OwnedServer();
+    std::scoped_lock lock(owned.mutex);
+    if (owned.completion.valid()) { owned.completion.get(); }
 }
 
 bool OwnsInprocServer()
-{ return OwnedServer().running; }
+{
+    auto&            owned = OwnedServer();
+    std::scoped_lock lock(owned.serverMutex);
+    return owned.server != nullptr && owned.server->IsAcceptingReferences();
+}
 
 bool ReleaseOwnedInprocReference(uint32_t sessionId, std::string_view token)
 {

@@ -315,8 +315,7 @@ if (PHOENIX_BUILD_TESTS)
 
     add_executable(ckpttest
         src/benchmark/ckpttest.cpp
-        src/benchmark/reference_test.cpp
-        src/benchmark/daemon_lifetime_test.cpp)
+        src/benchmark/reference_test.cpp)
     # Plain `Catch2::Catch2` (not WithMain) — ckpttest.cpp owns main() so it
     # can register `--registry` on the Catch2 CLI.
     target_link_libraries(ckpttest PRIVATE phoenix_checkpoint_fixture Catch2::Catch2)

@@ -90,6 +90,8 @@ struct Session
 
     Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
     std::atomic<bool> stopRequested{false};
+    std::string       coordinatorReference;
+    uint64_t          referenceSequence{};
 
     void Activate();
 

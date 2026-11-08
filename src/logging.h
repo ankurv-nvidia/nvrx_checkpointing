@@ -22,9 +22,7 @@ enum class Level : uint8_t
     Critical,
 };
 
-void Init();
-
-void SetDaemonLogTarget();
+void Init(bool inproc = false);
 
 [[nodiscard]] std::FILE* DaemonOutput();
 

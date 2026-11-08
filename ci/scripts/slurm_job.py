@@ -2201,18 +2201,9 @@ class ValgrindFlavor(Flavor):
             try:
                 from nvrx_checkpointing import checkpoint  # noqa: PLC0415
 
-                reference = checkpoint.model_state.create_root(
-                    _DAEMON_CONTROL_SESSION,
-                    0,
-                    1,
-                    ["localhost"],
-                    1,
-                )
-                marker.with_suffix(".ready").touch()
-                try:
+                with contextlib.closing(checkpoint.model_state.create_root(_DAEMON_CONTROL_SESSION, 0, 1, ["localhost"], 1)):
+                    marker.with_suffix(".ready").touch()
                     yield
-                finally:
-                    reference.close()
                 CHECKPOINT_SERVER.request("spindown", 3600)
                 rc = proc.wait(timeout=3600)
                 if rc:
@@ -3608,14 +3599,9 @@ def _worker(args: argparse.Namespace) -> None:
         # uninstall would pull its modules from under the launcher agents.
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    if _in_job_array():
-        # A launcher restart re-runs this worker on nodes whose previous attempt
-        # auto-launched the checkpoint daemon; the leftover belongs to this run,
-        # so terminate it instead of refusing to start.
-        _node_once("server-preflight", CHECKPOINT_SERVER.terminate)
-    # JET preflights the node before starting worker ranks.
-    elif os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
-        _node_once("server-preflight", CHECKPOINT_SERVER.require_stopped)
+    if _in_job_array() or os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
+        action = CHECKPOINT_SERVER.terminate if _in_job_array() else CHECKPOINT_SERVER.require_stopped
+        _node_once("server-preflight", action)
     try:
         _perform_runs(cfg, args)
     except BaseException:

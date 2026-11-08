@@ -26,10 +26,6 @@ struct ServiceReference
     bool                       _active{false};
 };
 
-void ReleasePendingServiceReferences();
-
-void WaitForOwnedCheckpointService();
-
 void FinalizeStateRegistry(StateTree& root);
 
 [[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);

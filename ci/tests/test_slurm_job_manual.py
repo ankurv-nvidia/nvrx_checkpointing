@@ -1602,7 +1602,6 @@ def test_worker_waits_for_delayed_local_rank_before_server_preflight(
 
     monkeypatch.setattr(slurm_job, "_rank_env", rank_env)
     arrived = threading.Event()
-    started = threading.Event()
     original_touch = Path.touch
     calls = []
     failures = []
@@ -1616,12 +1615,11 @@ def test_worker_waits_for_delayed_local_rank_before_server_preflight(
 
     def preflight(action: str) -> None:
         assert len(list(slurm_job._sync_root().glob("*server-preflight-node.ready-*"))) == 2  # noqa: PLR2004
-        assert not started.is_set()
+        assert not calls
         calls.append((action, local.rank))
 
     def train(*_args: object) -> None:
         calls.append(("train", local.rank))
-        started.set()
 
     monkeypatch.setattr(
         slurm_job,
@@ -1643,7 +1641,6 @@ def test_worker_waits_for_delayed_local_rank_before_server_preflight(
     owner.start()
     assert arrived.wait(timeout=5)
     assert calls == []
-    assert not started.is_set()
     peer.start()
     owner.join(timeout=5)
     peer.join(timeout=5)
