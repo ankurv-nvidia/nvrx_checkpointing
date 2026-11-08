@@ -351,10 +351,10 @@ struct LogTelState
         boost::container::small_vector<ActiveSpan, 16> entries;
     };
 
-    std::mutex                                         mutex;
-    checkpoint::telemetry::Id                          lastId{};
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> daemonLog{nullptr, &std::fclose};
-    std::shared_ptr<spdlog::logger>                    logger;
+    std::mutex                      mutex;
+    checkpoint::telemetry::Id       lastId{};
+    std::shared_ptr<std::FILE>      daemonLog;
+    std::shared_ptr<spdlog::logger> logger;
 
     std::atomic<bool>                          enabled{false};
     std::shared_ptr<trace_sdk::TracerProvider> traceProvider;
@@ -556,7 +556,7 @@ void Init(bool inproc)
             ::close(descriptor);
             throw std::runtime_error(fmt::format("cannot open server log stream {}: {}", path.string(), std::strerror(error)));
         }
-        state.daemonLog.reset(output);
+        state.daemonLog.reset(output, &std::fclose);
         static_cast<void>(std::setvbuf(output, nullptr, _IOLBF, 0));
     }
 
@@ -688,7 +688,7 @@ namespace
 class RoutingAppender : public otlp::OtlpFileAppender
 {
     public:
-    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state)
+    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state), _diagnosticOutput(state.daemonLog)
     {
         if (!filePath.empty())
         {
@@ -698,7 +698,8 @@ class RoutingAppender : public otlp::OtlpFileAppender
         }
     }
 
-    void Export(std::string_view data, std::size_t /*record_count*/) override
+    void Export(std::string_view data, std::size_t /*record_count*/) noexcept override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open())
@@ -711,6 +712,12 @@ class RoutingAppender : public otlp::OtlpFileAppender
         if (!line.empty() && line.back() == '\n') { line.remove_suffix(1); }
         if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
         _state.Collect(line);
+    } catch (std::exception const& error)
+    {
+        auto* output = _diagnosticOutput ? _diagnosticOutput.get() : stderr;
+        // Diagnostics bypass telemetry to avoid recursive export.
+        std::fprintf(
+            output, "[native_ckpt:svr][WARN] Telemetry export failed: %s\n", error.what());    // NOLINT(cppcoreguidelines-pro-type-vararg)
     }
 
     bool ForceFlush(std::chrono::microseconds /*timeout*/) noexcept override
@@ -731,6 +738,8 @@ class RoutingAppender : public otlp::OtlpFileAppender
     std::mutex    _mutex;
     std::ofstream _file;
     LogTelState&  _state;
+
+    std::shared_ptr<std::FILE> _diagnosticOutput;
 };
 
 }    // namespace

@@ -70,7 +70,7 @@ class _TrainingProcess:
         mode: str | None,
         *,
         ping_only: bool = False,
-        telemetry: bool = False,
+        collector: str | None = None,
     ):
         self.log = directory / f"daemon.{rank}.log"
         self.telemetry_file = directory / "telemetry.jsonl"
@@ -91,11 +91,11 @@ class _TrainingProcess:
         )
         if mode is not None:
             environment["NATIVE_CKPT_SERVER_INPROC"] = mode
-        if telemetry:
+        if collector is not None:
             environment.update(
                 NATIVE_CKPT_OTEL_FILE=str(self.telemetry_file),
                 NATIVE_CKPT_OTEL_EXPORT="daemon",
-                NATIVE_CKPT_OTEL_LOGS="0",
+                NATIVE_CKPT_OTEL_COLLECTOR=collector,
             )
         arguments = [sys.executable, "-u", str(_WORKER), "--rank", str(rank), "--world", str(world)]
         if ping_only:
@@ -167,9 +167,9 @@ def training(tmp_path: Path) -> Iterator[Callable[..., _TrainingProcess]]:
         mode: str | None = "1",
         *,
         ping_only: bool = False,
-        telemetry: bool = False,
+        collector: str | None = None,
     ) -> _TrainingProcess:
-        process = _TrainingProcess(build, tmp_path, rank, world, mode, ping_only=ping_only, telemetry=telemetry)
+        process = _TrainingProcess(build, tmp_path, rank, world, mode, ping_only=ping_only, collector=collector)
         processes.append(process)
         return process
 
@@ -341,7 +341,7 @@ def test_root_destruction_after_explicit_spindown_can_restart(training: Callable
 @pytest.mark.parametrize("mode", ["1", None], ids=["inproc", "process"])
 def test_interpreter_exit_flushes_checkpoint_telemetry(training: Callable, tmp_path: Path, mode: str | None) -> None:
     pytest.importorskip("torch")
-    owner = training(mode=mode, telemetry=True)
+    owner = training(mode=mode, collector="file")
     owner.event("ready")
     identity = _ping()
     owner.request("save_exit", path=str(tmp_path / "checkpoint"))
@@ -361,6 +361,20 @@ def test_interpreter_exit_flushes_checkpoint_telemetry(training: Callable, tmp_p
         if span["name"] in required:
             assert pid == identity["pid"]
             assert int(span["endTimeUnixNano"]) >= int(span["startTimeUnixNano"])
+
+
+@pytest.mark.parametrize("mode", ["1", None], ids=["inproc", "process"])
+def test_unavailable_collector_does_not_abort_training(training: Callable, mode: str | None) -> None:
+    owner = training(mode=mode, ping_only=True, collector="127.0.0.1:4101")
+    owner.event("ready")
+    warning = "Telemetry export failed"
+    _wait_for(lambda: warning in owner.log.read_text() or owner.process.poll() is not None)
+    assert owner.process.poll() is None, owner.stderr_path.read_text()
+    assert warning in owner.log.read_text()
+    owner.request("exit")
+    owner.wait(timeout=8)
+    _wait_for(lambda: _ping() is None, timeout=8)
+    assert warning not in owner.stderr_path.read_text()
 
 
 def test_inproc_rejects_existing_separate_daemon(training: Callable) -> None:
