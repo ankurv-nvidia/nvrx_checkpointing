@@ -403,6 +403,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             checkpoint
         SCRIPTS
             __init__.py
+            bridge.py
             ckpt_diag.py
             debug.py
             megatron@megatron

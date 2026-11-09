@@ -116,3 +116,25 @@ log line.
 Comparison harnesses that need a `native`/`nvrx` selector can opt in to
 `nvrx_checkpointing.megatron.provider`; reference runs should not install the
 native integration.
+
+### Megatron Bridge backend
+
+Megatron Bridge integrations can use `nvrx_checkpointing.bridge` to create a
+native save strategy and async calls queue, and wrap checkpoint loads with
+`load_context(sharded_state_dict, sharded_strategy)`. The module imports its
+Megatron Core backend when a factory is called. It does not import Megatron
+Bridge or change training-state bindings.
+
+Pass the same complete training process group to
+`create_save_strategy(process_group=...)` and
+`create_async_calls_queue(process_group=...)`; the default is the distributed
+world. All training ranks schedule and finalize saves in the same order.
+The group includes every checkpoint participant across model components.
+The caller owns state-dictionary construction and checkpoint publication.
+
+Megatron Bridge versions with this backend integration select native
+checkpointing automatically when the wheel is installed. Set
+`NVRX_CHECKPOINT_BACKEND=auto|native|python` to select the Bridge backend;
+`auto` is the default. An explicit Bridge `save_backend` value of `native`
+or `python` takes precedence over the environment. Standard Megatron-LM
+entrypoints still use the integration module shown above.

@@ -20,6 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .loading import load_context
+
 SUPPORTED_MEGATRON_COMMIT = "16251ac1221f4814cd39350def05cefa3c36734a"
 
 _NATIVE_SAVE_MARKER = "_nvrx_checkpointing_native_save_installed"
@@ -28,23 +30,9 @@ _NATIVE_LOAD_MARKER = "_nvrx_checkpointing_native_load_installed"
 _NATIVE_SAVE_TIME_MARKER = "_nvrx_checkpointing_native_save_time_installed"
 
 
-def _read_metadata_uncached(strategy: Any) -> None:
-    """Make a load strategy chain read checkpoint metadata directly.
-
-    Megatron's only cached metadata reader belongs to NVIDIA Resiliency
-    Extension, and a training process loads its checkpoint once.
-    """
-    while strategy is not None:
-        if getattr(strategy, "cache_metadata", False):
-            strategy.cache_metadata = False
-        strategy = getattr(strategy, "base_strategy", None)
-
-
 def _install_load_registration() -> None:
     """Coordinate native registration around Megatron's checkpoint load."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
-    from megatron.core.dist_checkpointing.dict_utils import nested_values  # type: ignore[import-not-found]
-    from megatron.core.dist_checkpointing.mapping import ShardedTensor  # type: ignore[import-not-found]
     from megatron.training import training as training_module  # type: ignore[import-not-found]
 
     if getattr(dist_checkpointing, _NATIVE_LOAD_MARKER, False):
@@ -56,15 +44,8 @@ def _install_load_registration() -> None:
 
     @wraps(original_load)
     def load(sharded_state_dict: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        _read_metadata_uncached(args[1] if len(args) > 1 else kwargs.get("sharded_strategy"))
-        # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-        # replica_ids are overwritten by the fully parallel loading process. We need to preserve the original values.
-        replica_ids = [(value, value.replica_id) for value in nested_values(sharded_state_dict) if isinstance(value, ShardedTensor)]
-        try:
+        with load_context(sharded_state_dict, args[1] if len(args) > 1 else kwargs.get("sharded_strategy")):
             return original_load(sharded_state_dict, *args, **kwargs)
-        finally:
-            for value, replica_id in replica_ids:
-                value.replica_id = replica_id
 
     dist_checkpointing.load = load
     setattr(dist_checkpointing, _NATIVE_LOAD_MARKER, True)

@@ -1004,7 +1004,7 @@ def test_common_state_padding_is_local_to_megatron_serialization(save: ModuleTyp
 
     first = save._prepare_registration_state_dict(state, 0)[save._DCP_COMMON_STATE_KEY]
     second = save._prepare_registration_state_dict(state, 1)[save._DCP_COMMON_STATE_KEY]
-    expected_capacity = save._COMMON_STATE_ALIGNMENT
+    expected_capacity = 1024
 
     assert len(first) == len(second) == expected_capacity
     assert first[:100] == b"a" * 100
@@ -1035,10 +1035,10 @@ def test_rng_sharded_object_padding_is_local_to_megatron_serialization(
     second = ShardedObject({"iteration": 1})
     save._prepare_registration_state_dict({"rng_state": first, "rerun_state_machine": {}}, 0)
     save._prepare_registration_state_dict({"rng_state": second, "rerun_state_machine": {}}, 1)
-    expected_capacity = save._COMMON_STATE_ALIGNMENT
+    expected_capacity = 1024
 
-    first_blob = getattr(first, save._SERIALIZED_SHARDED_OBJECT_ATTR)
-    second_blob = getattr(second, save._SERIALIZED_SHARDED_OBJECT_ATTR)
+    first_blob = first._nvrx_serialized_blob
+    second_blob = second._nvrx_serialized_blob
     assert len(first_blob) == len(second_blob) == expected_capacity
     assert first_blob[:100] == b"a" * 100
     assert second_blob[:200] == b"b" * 200

@@ -39,6 +39,7 @@ from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
 from ..peers import OrderedPeers, detect_environment_peers  # noqa: TID252
 from ..quantized_snapshot import preserve_quantized_tensors  # noqa: TID252
 from ..telemetry import assert_cuda_memory_unchanged, managed_span  # noqa: TID252
+from .serialization import prepare_sharded_object_blobs, snapshot_blob_capacity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,9 +49,6 @@ _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 _CONTENT_METADATA_KEY = "content_metadata"
 _RERUN_STATE_KEY = "rerun_state_machine"
 _RNG_STATE_KEY = "rng_state"
-_SERIALIZED_SHARDED_OBJECT_ATTR = "_nvrx_serialized_blob"
-_COMMON_STATE_PADDING = 512
-_COMMON_STATE_ALIGNMENT = 1024
 _root = None
 _common_state_capacity: int | None = None
 _sharded_object_capacities: dict[str, int] = {}
@@ -185,40 +183,12 @@ def detect_peers(rank: int, world_size: int) -> OrderedPeers:
 
 
 def _snapshot_blob_capacity(serialized_size: int) -> int:
-    padded_size = serialized_size + _COMMON_STATE_PADDING
-    return ((padded_size + _COMMON_STATE_ALIGNMENT - 1) // _COMMON_STATE_ALIGNMENT) * _COMMON_STATE_ALIGNMENT
+    return snapshot_blob_capacity(serialized_size)
 
 
 def _prepare_rng_sharded_object_blobs(value: object) -> None:
     """Serialize variable-size RNG ShardedObjects into a stable slot."""
-    if isinstance(value, dict):
-        for child in value.values():
-            _prepare_rng_sharded_object_blobs(child)
-        return
-    if isinstance(value, (list, tuple)):
-        for child in value:
-            _prepare_rng_sharded_object_blobs(child)
-        return
-    if type(value).__name__ != "ShardedObject" or not hasattr(value, "data") or not hasattr(value, "unique_key"):
-        return
-
-    # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-    replica_id = getattr(value, "replica_id", 0)
-    if (isinstance(replica_id, int) and replica_id != 0) or (
-        not isinstance(replica_id, int) and any(component != 0 for component in replica_id)
-    ):
-        return
-
-    buffer = io.BytesIO()
-    torch.save([value.data], buffer)
-    serialized = buffer.getvalue()
-    unique_key = str(value.unique_key)
-    capacity = _sharded_object_capacities.setdefault(unique_key, _snapshot_blob_capacity(len(serialized)))
-    if len(serialized) > capacity:
-        raise RuntimeError(
-            f"sharded object '{unique_key}' serialized to {len(serialized)} bytes, exceeding its registered {capacity}-byte capacity",
-        )
-    setattr(value, _SERIALIZED_SHARDED_OBJECT_ATTR, serialized.ljust(capacity, b"\0"))
+    prepare_sharded_object_blobs(value, _sharded_object_capacities)
 
 
 def _prepare_registration_state_dict(state_dict: dict, iteration: int) -> dict:
