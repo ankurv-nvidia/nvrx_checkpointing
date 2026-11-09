@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 @contextmanager
 def load_context(sharded_state_dict: dict, sharded_strategy: object) -> Iterator[None]:
-    """Read metadata directly and restore replica identities after a checkpoint load."""
+    """Reads metadata directly and restores replica identities after a checkpoint load."""
     from megatron.core.dist_checkpointing.dict_utils import nested_values  # noqa: PLC0415
 
     strategy = sharded_strategy

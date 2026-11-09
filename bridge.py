@@ -14,21 +14,21 @@ if TYPE_CHECKING:
 
 
 def create_save_strategy(*, process_group: object | None = None) -> NativeSaveShardedStrategy:
-    """Create a native save strategy for the complete training process group."""
+    """Creates a native save strategy for the complete training process group."""
     from .megatron.bridge import NativeSaveShardedStrategy  # noqa: PLC0415
 
     return NativeSaveShardedStrategy(process_group=process_group)
 
 
 def create_async_calls_queue(*, process_group: object | None = None) -> NativeAsyncCallsQueue:
-    """Create a native durability queue for the complete training process group."""
+    """Creates a native durability queue for the complete training process group."""
     from .backend import NativeAsyncCallsQueue  # noqa: PLC0415
 
     return NativeAsyncCallsQueue(process_group=process_group)
 
 
 def load_context(sharded_state_dict: dict, sharded_strategy: object) -> AbstractContextManager[None]:
-    """Preserve replica identities and disable metadata caching during a load."""
+    """Preserves replica identities and disables metadata caching during a load."""
     from .megatron.loading import load_context as context  # noqa: PLC0415
 
     return context(sharded_state_dict, sharded_strategy)

@@ -268,7 +268,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = "spawn") -> None:
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -> None:
-    """Finalize shared native requests and close an idle queue when requested."""
+    """Finalizes shared native requests and closes an idle queue when requested."""
     queue = _async_calls_queue
     if queue is None:
         return

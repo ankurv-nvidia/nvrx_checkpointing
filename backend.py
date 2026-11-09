@@ -51,7 +51,7 @@ def _trainer_peers(hosts: list[str]) -> tuple[list[str], int]:
 
 @dataclass
 class NativeSaveRequest:
-    """Wait for native durability before invoking checkpoint finalizers."""
+    """Tracks native durability and checkpoint finalizers."""
 
     wait: Callable[[], None]
     finalize_fns: list[Callable[[], None]] = field(default_factory=list)
@@ -86,7 +86,7 @@ class _QueuedRequest:
 
 
 class NativeAsyncCallsQueue:
-    """Keep native requests pending until their durability checks succeed."""
+    """Keeps native requests pending until their durability checks succeed."""
 
     def __init__(self, *, process_group: object | None = None, collective_checks: bool = True) -> None:
         self._process_group = process_group
@@ -113,7 +113,7 @@ class NativeAsyncCallsQueue:
         return len(self._requests)
 
     def is_current_async_call_done(self) -> bool:
-        """Return local readiness for the oldest pending durability wait."""
+        """Reports local readiness for the oldest pending durability wait."""
         return not self._requests or self._requests[0].future.done()
 
     def maybe_finalize_async_calls(self, blocking: bool = False) -> list[int]:
@@ -156,7 +156,7 @@ class NativeAsyncCallsQueue:
 
 
 class NativeCheckpointSession:
-    """Register prepared state and submit snapshots to one native session."""
+    """Registers prepared state and submits snapshots to one native session."""
 
     def __init__(
         self,
@@ -179,14 +179,14 @@ class NativeCheckpointSession:
 
     @property
     def root(self) -> Any:
-        """Return the lazily initialized native state tree."""
+        """Provides the lazily initialized native state tree."""
         if self._root is None:
             self._initialize()
         return self._root
 
     @property
     def session_id(self) -> int | None:
-        """Return the configured or initialized native session identifier."""
+        """Reports the configured or initialized native session identifier."""
         return self._session_id
 
     @property
@@ -232,7 +232,7 @@ class NativeCheckpointSession:
         return result
 
     def register_state_dict(self, state: dict, *, prepare: Callable[[dict], dict] | None = None) -> Any:
-        """Prepare and register current tensor storage with a local completion fence."""
+        """Prepares and registers current tensor storage with a local completion fence."""
         root = self.root
         if prepare is not None:
             state = self._run_stage(lambda: prepare(state), "state preparation")
@@ -245,7 +245,7 @@ class NativeCheckpointSession:
         return root
 
     def submit(self, checkpoint_dir: Path, *, snapshot_id: int | None = None, started_at_ns: int | None = None) -> NativeSaveRequest:
-        """Submit registered storage and return its deferred durability request."""
+        """Submits registered storage and returns its deferred durability request."""
         from nvrx_checkpointing import checkpoint
 
         root = self.root

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 class NativeSaveShardedStrategy(TorchDistSaveShardedStrategy):
-    """Prepare sharded objects and submit snapshots through a native session."""
+    """Prepares sharded objects and submits snapshots through a native session."""
 
     def __init__(self, *, process_group: object | None = None) -> None:
         super().__init__("torch_dist", 1)

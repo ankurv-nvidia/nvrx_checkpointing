@@ -10,12 +10,12 @@ import torch
 
 
 def snapshot_blob_capacity(serialized_size: int) -> int:
-    """Return an aligned object slot with serialization growth padding."""
+    """Returns an aligned object slot with serialization growth padding."""
     return ((serialized_size + 512 + 1023) // 1024) * 1024
 
 
 def prepare_sharded_object_blobs(value: object, capacities: dict[str, int]) -> None:
-    """Refresh main-replica object bytes inside their registered slot capacities."""
+    """Refreshes main-replica object bytes inside their registered slot capacities."""
     if isinstance(value, dict):
         for child in value.values():
             prepare_sharded_object_blobs(child, capacities)
