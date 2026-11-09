@@ -62,9 +62,7 @@ class PyStateDictAccessor
 
 bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nanobind::str const& key, nanobind::handle val);
 
-// Detect a list-of-DTensor (what `apply_factories` produces in place of a
-// ShardedTensorFactory) and register every element. Returns false on any other
-// list shape so the generic walker keeps owning the existing list cases.
+// Tensor-only list trees register each leaf under its checkpoint key.
 bool TryRegisterTorchStateDictList(PyStateDictAccessor&  scan,
                                    StateNode::Handle     node,
                                    nanobind::str const&  key,

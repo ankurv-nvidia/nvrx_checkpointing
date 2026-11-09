@@ -638,10 +638,6 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
     {
         auto listObj = nb::cast<nb::list>(val);
         if (listObj.empty()) { return; }
-        // Post-`apply_factories` DTensor lists land here — register each
-        // element under its own FQN before the generic per-element-type checks
-        // below get a chance to mis-classify them (a list of DTensor
-        // instances trips `Unsupported list element type`).
         if (TryRegisterTorchStateDictList(scan, node, key, listObj)) { return; }
         if (IsTuple<nb::str, nb::list>(listObj)) { scan.RegisterState(node, keyView, StringTupleBlob<nb::list>(listObj)); }
         else if (IsTuple<int64_t, nb::list>(listObj)) { scan.RegisterState(node, keyView, TrivialTupleBlob<int64_t, nb::list>(listObj)); }

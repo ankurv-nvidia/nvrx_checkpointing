@@ -529,6 +529,69 @@ def test_register_state_dict_accepts_factory_shards_inside_nested_lists() -> Non
     assert root.snapshot_size == 3 * 4 * 4
 
 
+def _mixed_optimizer_shards(offset: float) -> tuple[dict, str, torch.Tensor]:
+    key = "mimo.images.chained_0.optimizer.state.fp32_param.decoder.mlp.linear_fc1.weight"
+    data = torch.arange(16, dtype=torch.float32).reshape(2, 8) + offset
+    first_layer = ShardedTensor.from_rank_offsets(key, data[0], (0, 0, 2), prepend_axis_num=1)
+    halves = [
+        ShardedTensor.from_rank_offsets(key, data[1, half * 4 : (half + 1) * 4], (0, 1, 2), (1, half, 2), prepend_axis_num=1)
+        for half in range(2)
+    ]
+    replica = ShardedTensor.from_rank_offsets(key, data[0] + 100, (0, 0, 2), prepend_axis_num=1, replica_id=1)
+    empty = []
+    state = {"optimizer": {"fp32_from_fp16_params": {0: [first_layer, [halves[0], empty, [halves[1]]], replica, empty]}}}
+    return state, key, data
+
+
+def test_register_state_dict_accepts_mixed_nested_optimizer_shards() -> None:
+    root = _create_root()
+    state, _, data = _mixed_optimizer_shards(0.0)
+
+    root.register_state_dict(state)
+
+    assert root.snapshot_size == data.numel() * data.element_size()
+
+
+def test_register_state_dict_rejects_cyclic_tensor_lists() -> None:
+    root = _create_root()
+    state = [ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32))]
+    state.append(state)
+
+    root.register_state_dict({"weight": state})
+
+    with pytest.raises(RuntimeError, match="Cyclic list in checkpoint state"):
+        _ = root.snapshot_size
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+def test_mixed_nested_optimizer_shards_roundtrip(tmp_path: Path) -> None:
+    root = _create_root()
+    initial, _, _ = _mixed_optimizer_shards(0.0)
+    root.register_state_dict(initial)
+    root.finalize_registry()
+    refreshed, key, expected = _mixed_optimizer_shards(10.0)
+    root.register_state_dict(refreshed)
+    checkpoint_dir = tmp_path / "iter_0000001"
+
+    assert root.snapshot_size == expected.numel() * expected.element_size()
+    try:
+        root.save(1, checkpoint_dir)
+        deadline = time.monotonic() + 30
+        while not (checkpoint_dir / ".metadata").is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+            time.sleep(0.05)
+
+        metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
+        assert set(metadata.state_dict_metadata) == {key}
+        loaded = {key: torch.zeros_like(expected)}
+        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+        torch.testing.assert_close(loaded[key], expected)
+    finally:
+        checkpoint.svc_spindown()
+
+
 def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
     """Accept Megatron's Mamba conv1d state-name compatibility mapping."""
     tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)

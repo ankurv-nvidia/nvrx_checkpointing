@@ -874,21 +874,31 @@ static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
     scan.RegisterStateByFQN(uniqueKey, ShardedObjectBlob(val));
 }
 
-// After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
-// gets replaced with `[DTensor(...weight.z), DTensor(...weight.x),
-// DTensor(...weight.B), DTensor(...weight.C), DTensor(...weight.dt)]`.
-// Register each main-replica element using its own `.key` as the FQN — same shape as nvrx's
-// post-`save_preprocess` state_dict, so the cross-provider tensor compare can
-// match tensors per-FQN. Returns false when the list isn't an all-DTensor
-// list so the generic walker can fall through to its existing per-element-type
-// handling.
+static bool CollectShardedTorchTensors(nb::list const& listObj, std::vector<nb::handle>& tensors, std::unordered_set<PyObject*>& ancestors)
+{
+    if (!ancestors.insert(listObj.ptr()).second) { throw std::runtime_error("Cyclic list in checkpoint state"); }
+    for (auto const& item : listObj)
+    {
+        if (IsMegatronShardedTensor(item)) { tensors.push_back(item); }
+        else if (nb::isinstance<nb::list>(item))
+        {
+            if (!CollectShardedTorchTensors(nb::cast<nb::list>(item), tensors, ancestors)) { return false; }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    ancestors.erase(listObj.ptr());
+    return true;
+}
+
 bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::list const& listObj)
 {
     if (listObj.empty()) { return false; }
-    for (auto const& item : listObj)
-    {
-        if (!IsMegatronShardedTensor(item)) { return false; }
-    }
+    std::vector<nb::handle>       tensors;
+    std::unordered_set<PyObject*> ancestors;
+    if (!CollectShardedTorchTensors(listObj, tensors, ancestors)) { return false; }
     auto const nameView = StrView(key);
     // Megatron's flattened-state-dict convention: when the state-dict key
     // already has dots (e.g. `decoder.layers.0.mixer.in_proj.weight`) it IS
@@ -898,7 +908,7 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
     // parent node id (mirrors `RegisterShardedTorchTensorFactory`).
     auto const parentPath = scan.GetNodeId(node);
     auto const fqn = (nameView.contains('.') || parentPath.empty()) ? std::string(nameView) : fmt::format("{}.{}", parentPath, nameView);
-    for (auto const& item : listObj)
+    for (auto const& item : tensors)
     {
         auto itemContainer = nb::cast<nb::dict>(item.attr("__dict__"));
         auto shtKey        = nb::cast<nb::str>(itemContainer["key"]);
