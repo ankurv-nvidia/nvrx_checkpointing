@@ -100,11 +100,13 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> Any:  # noqa: C901
     )
     serialization = load_module(monkeypatch, "nvrx_checkpointing.megatron.serialization", ROOT / "megatron/serialization.py")
     loading = load_module(monkeypatch, "nvrx_checkpointing.megatron.loading", ROOT / "megatron/loading.py")
+    runtime = load_module(monkeypatch, "nvrx_checkpointing.backend", ROOT / "backend.py")
     implementation = load_module(monkeypatch, "nvrx_checkpointing.megatron.bridge", ROOT / "megatron/bridge.py")
     facade = load_module(monkeypatch, "nvrx_checkpointing.bridge", ROOT / "bridge.py")
-    monkeypatch.setattr(implementation.secrets, "randbelow", lambda _limit: 40)
+    monkeypatch.setattr(runtime.secrets, "randbelow", lambda _limit: 40)
     return SimpleNamespace(
         module=implementation,
+        runtime=runtime,
         facade=facade,
         loading=loading,
         serialization=serialization,
@@ -127,11 +129,54 @@ def test_facade_import_is_lazy_without_megatron_or_bridge(monkeypatch: pytest.Mo
     assert sys.modules["megatron"] is None
 
 
+def test_queue_factory_works_without_megatron(monkeypatch: pytest.MonkeyPatch) -> None:
+    package(monkeypatch, "nvrx_checkpointing", ROOT)
+    torch = package(monkeypatch, "torch")
+    torch.distributed = SimpleNamespace(is_initialized=lambda: False)
+    for name in ("megatron", "megatron.bridge", "nemo_rl"):
+        monkeypatch.setitem(sys.modules, name, None)
+    runtime = load_module(monkeypatch, "nvrx_checkpointing.backend", ROOT / "backend.py")
+    facade = load_module(monkeypatch, "nvrx_checkpointing.bridge", ROOT / "bridge.py")
+
+    queue = facade.create_async_calls_queue()
+
+    assert type(queue) is runtime.NativeAsyncCallsQueue
+    queue.close()
+    assert sys.modules["megatron"] is None
+
+
+def test_explicit_snapshot_ids_and_local_completion_share_the_backend(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_collective(*_args: object) -> None:
+        pytest.fail("Explicit local completion invokes no training-rank collective")
+
+    monkeypatch.setattr(backend.runtime, "_gather", unexpected_collective)
+    session = backend.runtime.NativeCheckpointSession(
+        session_id=0,
+        peers=["localhost"],
+        ranks_per_peer=1,
+        collective_checks=False,
+    )
+    queue = backend.runtime.NativeAsyncCallsQueue(collective_checks=False)
+    published = []
+    for iteration in (12, 24):
+        session.register_state_dict({})
+        request = session.submit(Path(f"iter_{iteration:07d}"), snapshot_id=iteration)
+        request.add_finalize_fn(lambda iteration=iteration: published.append(iteration))
+        queue.schedule_async_request(request)
+        queue.maybe_finalize_async_calls(blocking=True)
+    queue.close()
+
+    assert backend.calls.created == [((0, 0, 1), {"peers": ["localhost"], "ranks_per_peer": 1})]
+    assert backend.calls.snapshots == [(12, Path("iter_0000012")), (24, Path("iter_0000024"))]
+    assert backend.calls.durable == [(0, 12), (0, 24)]
+    assert published == [12, 24]
+
+
 def test_factories_keep_the_training_process_group(backend: Any) -> None:
     group = object()
     strategy = backend.facade.create_save_strategy(process_group=group)
     queue = backend.facade.create_async_calls_queue(process_group=group)
-    assert strategy._process_group is group
+    assert strategy._session.process_group is group
     assert queue._process_group is group
     assert (strategy.backend, strategy.version) == ("torch_dist", 1)
     queue.close()
@@ -141,7 +186,7 @@ def test_pending_durability_remains_visible_without_publication(backend: Any) ->
     ready = threading.Event()
     published = []
     queue = backend.facade.create_async_calls_queue()
-    request = backend.module._NativeRequest(lambda: ready.wait(2), [lambda: published.append(True)])
+    request = backend.runtime.NativeSaveRequest(lambda: ready.wait(2), [lambda: published.append(True)])
     queue.schedule_async_request(request)
     try:
         assert queue.maybe_finalize_async_calls() == []
@@ -156,7 +201,7 @@ def test_pending_durability_remains_visible_without_publication(backend: Any) ->
 def test_global_readiness_precedes_callbacks(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     group, published = object(), []
     queue = backend.facade.create_async_calls_queue(process_group=group)
-    queue.schedule_async_request(backend.module._NativeRequest(lambda: None, [lambda: published.append(True)]))
+    queue.schedule_async_request(backend.runtime.NativeSaveRequest(lambda: None, [lambda: published.append(True)]))
     queue._requests[0].future.result(timeout=2)
     groups = []
 
@@ -164,11 +209,11 @@ def test_global_readiness_precedes_callbacks(backend: Any, monkeypatch: pytest.M
         groups.append(process_group)
         return [(0, True, None), (0, False, None)]
 
-    monkeypatch.setattr(backend.module, "_gather", gather)
+    monkeypatch.setattr(backend.runtime, "_gather", gather)
     assert queue.maybe_finalize_async_calls() == []
     assert queue.get_num_unfinalized_calls() == 1
     assert published == []
-    monkeypatch.setattr(backend.module, "_gather", lambda _value, process_group: [(0, True, None)] * 2)
+    monkeypatch.setattr(backend.runtime, "_gather", lambda _value, process_group: [(0, True, None)] * 2)
     assert queue.maybe_finalize_async_calls() == [0]
     assert groups == [group]
     assert published == [True]
@@ -184,11 +229,11 @@ def test_durability_errors_keep_work_pending(backend: Any, monkeypatch: pytest.M
             raise OSError("disk unavailable")
 
     queue = backend.facade.create_async_calls_queue()
-    queue.schedule_async_request(backend.module._NativeRequest(wait, [lambda: published.append(True)]))
+    queue.schedule_async_request(backend.runtime.NativeSaveRequest(wait, [lambda: published.append(True)]))
     pending = queue._requests[0]
     if remote_error:
         pending.future.result(timeout=2)
-        monkeypatch.setattr(backend.module, "_gather", lambda *_args: [(0, True, None), (0, True, "disk unavailable")])
+        monkeypatch.setattr(backend.runtime, "_gather", lambda *_args: [(0, True, None), (0, True, "disk unavailable")])
     try:
         with pytest.raises(RuntimeError, match="disk unavailable"):
             queue.maybe_finalize_async_calls(blocking=True)
@@ -201,9 +246,9 @@ def test_durability_errors_keep_work_pending(backend: Any, monkeypatch: pytest.M
 def test_queue_order_disagreement_prevents_publication(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     published = []
     queue = backend.facade.create_async_calls_queue()
-    queue.schedule_async_request(backend.module._NativeRequest(lambda: None, [lambda: published.append(True)]))
+    queue.schedule_async_request(backend.runtime.NativeSaveRequest(lambda: None, [lambda: published.append(True)]))
     queue._requests[0].future.result(timeout=2)
-    monkeypatch.setattr(backend.module, "_gather", lambda *_args: [(0, True, None), (1, True, None)])
+    monkeypatch.setattr(backend.runtime, "_gather", lambda *_args: [(0, True, None), (1, True, None)])
     try:
         with pytest.raises(RuntimeError, match="pending save order"):
             queue.maybe_finalize_async_calls()
@@ -219,7 +264,7 @@ def test_queue_close_drains_and_rejects_new_work(backend: Any) -> None:
         queue.schedule_async_request(SimpleNamespace())
     assert queue._executor is None
     published = []
-    request = backend.module._NativeRequest(lambda: None)
+    request = backend.runtime.NativeSaveRequest(lambda: None)
     request.add_finalize_fn(lambda: published.append(True))
     assert queue.schedule_async_request(request) == 0
     queue.close()
@@ -230,16 +275,45 @@ def test_queue_close_drains_and_rejects_new_work(backend: Any) -> None:
         queue.schedule_async_request(request)
 
 
+def test_remote_failure_escapes_close_before_local_durability(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    local_done, close_returned = threading.Event(), threading.Event()
+    errors = []
+    queue = backend.facade.create_async_calls_queue()
+    queue.schedule_async_request(backend.runtime.NativeSaveRequest(lambda: local_done.wait(5)))
+    monkeypatch.setattr(backend.runtime, "_gather", lambda *_args: [(0, False, None), (0, True, "remote failure")])
+
+    def close() -> None:
+        try:
+            queue.close()
+        except RuntimeError as error:
+            errors.append(str(error))
+        finally:
+            close_returned.set()
+
+    caller = threading.Thread(target=close)
+    caller.start()
+    try:
+        assert close_returned.wait(2)
+        assert errors
+        assert "remote failure" in errors[0]
+        assert not queue.closed
+    finally:
+        local_done.set()
+        caller.join(timeout=2)
+        queue._executor.shutdown(wait=True)
+    assert not caller.is_alive()
+
+
 def test_sync_request_checks_global_durability(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     group, published = object(), []
-    request = backend.module._NativeRequest(lambda: None, [lambda: published.append(True)], process_group=group)
+    request = backend.runtime.NativeSaveRequest(lambda: None, [lambda: published.append(True)], process_group=group)
     groups = []
 
     def gather(value: object, process_group: object) -> list:
         groups.append(process_group)
         return [None, "remote failure"]
 
-    monkeypatch.setattr(backend.module, "_gather", gather)
+    monkeypatch.setattr(backend.runtime, "_gather", gather)
     with pytest.raises(RuntimeError, match="remote failure"):
         request.execute_sync()
     assert groups == [group]
@@ -272,7 +346,7 @@ def test_object_overflow_precedes_submission_and_preserves_sequence(backend: Any
     with pytest.raises(RuntimeError, match="exceeding its registered"):
         strategy.async_save({"state": obj}, Path("second"))
     assert len(backend.calls.snapshots) == 1
-    assert strategy._sequence == 1
+    assert strategy._session._sequence == 1
 
 
 def test_object_capacities_are_per_strategy_and_nonmain_replicas_are_skipped(backend: Any) -> None:
@@ -292,7 +366,7 @@ def test_flattened_tensor_is_rejected_before_registration(backend: Any) -> None:
     with pytest.raises(RuntimeError, match="flattened tensor"):
         strategy.async_save({"weight": shard}, Path("checkpoint"))
     assert backend.calls.events == []
-    assert strategy._sequence == 0
+    assert strategy._session._sequence == 0
 
 
 def test_registration_fence_failure_precedes_snapshot(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -306,12 +380,12 @@ def test_registration_fence_failure_precedes_snapshot(backend: Any, monkeypatch:
         strategy.async_save({}, Path("checkpoint"))
     assert backend.calls.events == ["register"]
     assert backend.calls.snapshots == []
-    assert strategy._sequence == 0
+    assert strategy._session._sequence == 0
 
 
 def test_submission_fence_failure_is_shared_before_request_return(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     strategy = backend.facade.create_save_strategy()
-    strategy._root = backend.root
+    strategy._session._root = backend.root
     fences = []
 
     def fence() -> None:
@@ -320,23 +394,23 @@ def test_submission_fence_failure_is_shared_before_request_return(backend: Any, 
             raise OSError("snapshot unavailable")
 
     monkeypatch.setattr(backend.root, "wait_for_async_completion", fence)
-    monkeypatch.setattr(backend.module, "_gather", lambda value, _group: [value, None])
+    monkeypatch.setattr(backend.runtime, "_gather", lambda value, _group: [value, None])
     with pytest.raises(RuntimeError, match="snapshot submission failed"):
         strategy.async_save({}, Path("checkpoint"))
-    assert strategy._sequence == 1
+    assert strategy._session._sequence == 1
     assert backend.calls.durable == []
 
 
 @pytest.mark.parametrize("phase", ["preparation", "registration"])
 def test_remote_state_failure_blocks_snapshot(backend: Any, monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
     strategy = backend.facade.create_save_strategy()
-    strategy._root = backend.root
+    strategy._session._root = backend.root
     results = iter([[None, "remote failure"]] if phase == "preparation" else [[None, None], [None, "remote failure"]])
-    monkeypatch.setattr(backend.module, "_gather", lambda *_args: next(results))
+    monkeypatch.setattr(backend.runtime, "_gather", lambda *_args: next(results))
     with pytest.raises(RuntimeError, match=f"state {phase} failed"):
         strategy.async_save({}, Path("checkpoint"))
     assert backend.calls.snapshots == []
-    assert strategy._sequence == 0
+    assert strategy._session._sequence == 0
 
 
 def test_explicit_group_controls_training_topology_and_consensus(backend: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -365,11 +439,12 @@ def test_explicit_group_controls_training_topology_and_consensus(backend: Any, m
 
 
 @pytest.mark.parametrize(
-    ("hosts", "message"), [([], "empty"), ([""], "empty"), (["a", "a", "b"], "equal"), (["a", "b", "a", "b"], "contiguous")],
+    ("hosts", "message"),
+    [([], "empty"), ([""], "empty"), (["a", "a", "b"], "equal"), (["a", "b", "a", "b"], "contiguous")],
 )
 def test_invalid_training_topology_is_rejected(backend: Any, hosts: list, message: str) -> None:
     with pytest.raises(RuntimeError, match=message):
-        backend.module._trainer_peers(hosts)
+        backend.runtime._trainer_peers(hosts)
 
 
 @pytest.mark.parametrize("fail", [False, True])

@@ -7,14 +7,15 @@ import importlib.util
 import shutil
 import sys
 import threading
-from concurrent.futures import Future
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 
 import nvrx_checkpointing.megatron as nvrx_megatron
 import pytest
+from nvrx_checkpointing import checkpoint
+from nvrx_checkpointing.backend import NativeSaveRequest
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -27,7 +28,7 @@ def _module(name: str, **attributes: object) -> ModuleType:
 
 
 @pytest.fixture
-def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
+def save(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Generator[ModuleType]:
     state_dict_utils = _module("megatron.core.dist_checkpointing.state_dict_utils", save_preprocess=lambda state, **_kwargs: (state, {}))
     msc_utils = _module("megatron.core.msc_utils", maybe_msc=SimpleNamespace(open=open))
     rerun = _module("megatron.core.rerun_state_machine", get_rerun_state_machine=SimpleNamespace)
@@ -36,8 +37,8 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         "megatron.training.checkpointing",
         _build_sharded_state_dict_metadata=lambda *_args, **_kwargs: {},
         generate_state_dict=lambda *_args, **_kwargs: {},
-        get_checkpoint_name=lambda *_args, **_kwargs: "checkpoint",
-        get_checkpoint_tracker_filename=lambda *_args, **_kwargs: "tracker",
+        get_checkpoint_name=lambda *_args, **_kwargs: str(tmp_path / "checkpoint"),
+        get_checkpoint_tracker_filename=lambda *_args, **_kwargs: str(tmp_path / "tracker"),
         get_rng_state=lambda *_args, **_kwargs: {},
         maybe_save_dataloader_state=lambda *_args, **_kwargs: None,
     )
@@ -80,11 +81,15 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module.torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(module.torch.distributed, "get_rank", lambda **_kwargs: 0)
+    monkeypatch.setattr(module.torch.distributed, "get_world_size", lambda **_kwargs: 1)
+    monkeypatch.setattr(module, "detect_peers", lambda _rank, _world: module.OrderedPeers(("localhost",), 1))
     yield module
-    module._root = None
-    module._pending = None
-    if module._executor is not None:
-        module._executor.shutdown(wait=True)
+    queue = module._async_calls_queue
+    if queue is not None:
+        with suppress(RuntimeError, ValueError, OSError):
+            queue.close()
 
 
 def _queue(
@@ -92,8 +97,12 @@ def _queue(
     async_fn: Callable[[], None],
     finalize_fn: Callable[[], None] = lambda: None,
 ) -> None:
-    future = save._get_executor().submit(async_fn)
-    save._pending = save._PendingSave(future, finalize_fn)
+    request = NativeSaveRequest(async_fn, [finalize_fn])
+    save._get_async_calls_queue().schedule_async_request(request)
+
+
+def _set_root(monkeypatch: pytest.MonkeyPatch, root: object) -> None:
+    monkeypatch.setattr(checkpoint, "model_state", SimpleNamespace(create_root=lambda *_args, **_kwargs: root))
 
 
 @pytest.fixture
@@ -129,9 +138,9 @@ def retention(
     monkeypatch.setattr(save, "get_checkpoint_name", checkpoint_name)
     monkeypatch.setattr(save, "get_checkpoint_tracker_filename", lambda _directory: tracker)
     monkeypatch.setattr(save.checkpointing_module, "_async_delete_checkpoint_impl", delete, raising=False)
-    monkeypatch.setattr(save.threading, "Thread", start_thread)
+    monkeypatch.setattr(save, "threading", SimpleNamespace(Thread=start_thread))
     monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 0)
     for iteration in (20, 80, 100, 120):
         checkpoint_name(tmp_path, iteration).mkdir()
     yield SimpleNamespace(args=args, tracker=tracker, deleted=deleted, threads=threads, wait=wait, checkpoint=checkpoint_name)
@@ -274,28 +283,6 @@ def test_retention_does_not_delete_when_tracker_publication_fails(
     assert retention.deleted == []
 
 
-def _complete_async_retention_save(
-    save: ModuleType,
-    retention: SimpleNamespace,
-    future: Future[None],
-    wait: tuple[Callable[..., None], tuple[object, ...]],
-    failure: bool,
-) -> None:
-    save.maybe_finalize_async_save()
-    assert retention.tracker.read_text() == "100"
-    assert retention.deleted == []
-    fn, args = wait
-    try:
-        future.set_result(fn(*args))
-    except RuntimeError as exc:
-        future.set_exception(exc)
-    if failure:
-        with pytest.raises(RuntimeError, match="failed during background execution"):
-            save.maybe_finalize_async_save()
-    else:
-        save.maybe_finalize_async_save()
-
-
 @pytest.mark.parametrize("async_save", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 def test_retention_waits_for_successful_durable_completion(
@@ -305,8 +292,7 @@ def test_retention_waits_for_successful_durable_completion(
     async_save: bool,
     failure: bool,
 ) -> None:
-    future: Future[None] = Future()
-    waits: list[tuple[Callable[..., None], tuple[object, ...]]] = []
+    started, release = threading.Event(), threading.Event()
     retention.args.async_save = async_save
     retention.args.use_distributed_optimizer = False
     save_args = save.SaveCheckpointArgs(120, object(), None, None, 0)
@@ -322,15 +308,12 @@ def test_retention_waits_for_successful_durable_completion(
         def wait_for_async_completion() -> None:
             assert retention.tracker.read_text() == "100"
 
-    class ManualExecutor:
-        @staticmethod
-        def submit(fn: Callable[..., None], *args: object) -> Future[None]:
-            waits.append((fn, args))
-            return future
-
     def wait_for_finalize(_session: int, _iteration: int) -> None:
         assert retention.tracker.read_text() == "100"
         assert retention.checkpoint(retention.args.save, 100).is_dir()
+        started.set()
+        if async_save and not release.wait(5):
+            raise TimeoutError("test did not release native durability")
         if failure:
             raise RuntimeError("checkpoint durability failed")
 
@@ -338,22 +321,33 @@ def test_retention_waits_for_successful_durable_completion(
     monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
     monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
-    monkeypatch.setattr(save, "_get_executor", ManualExecutor)
-    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", wait_for_finalize)
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: None)
+    monkeypatch.setattr(checkpoint, "wait_for_ckpt_finalize", wait_for_finalize)
 
-    if not async_save and failure:
-        with pytest.raises(RuntimeError, match="checkpoint durability failed"):
+    try:
+        if not async_save and failure:
+            with pytest.raises(RuntimeError, match="checkpoint durability failed"):
+                save._save_checkpoint_impl(save_args, 123)
+        else:
             save._save_checkpoint_impl(save_args, 123)
-    else:
-        save._save_checkpoint_impl(save_args, 123)
-    if async_save:
-        _complete_async_retention_save(save, retention, future, waits.pop(), failure)
+        if async_save:
+            assert started.wait(2)
+            save.maybe_finalize_async_save()
+            assert retention.tracker.read_text() == "100"
+            assert retention.deleted == []
+            release.set()
+            if failure:
+                with pytest.raises(RuntimeError, match="durability failed"):
+                    save.maybe_finalize_async_save(blocking=True)
+            else:
+                save.maybe_finalize_async_save(blocking=True)
+    finally:
+        release.set()
     retention.wait()
 
     if failure:
         assert retention.tracker.read_text() == "100"
-        assert retention.checkpoint(retention.args.save, 100).is_dir()
         assert retention.deleted == []
     else:
         assert retention.tracker.read_text() == "120"
@@ -397,10 +391,15 @@ def test_native_async_save_runs_and_finalizes_off_thread(save: ModuleType) -> No
     assert background_thread != [threading.get_ident()]
 
 
-def test_next_save_waits_for_previous_save_to_finalize(save: ModuleType) -> None:
+def test_next_save_waits_for_previous_save_to_finalize(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     previous_started = threading.Event()
     release_previous = threading.Event()
     events: list[str] = []
+    errors: list[Exception] = []
 
     def previous_save() -> None:
         previous_started.set()
@@ -408,21 +407,78 @@ def test_next_save_waits_for_previous_save_to_finalize(save: ModuleType) -> None
             raise TimeoutError("test did not release previous save")
         events.append("previous durable")
 
+    class Root:
+        @staticmethod
+        def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
+            events.append("new snapshot")
+
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=False, save=tmp_path)
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: events.append("new state") or {})
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("new registration"))
+    monkeypatch.setattr(checkpoint, "wait_for_ckpt_finalize", lambda *_args: events.append("new durable"))
+    monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda *_args: events.append("new finalized"))
+
+    def next_save() -> None:
+        try:
+            save._save_checkpoint_impl(save.SaveCheckpointArgs(40, object(), None, None, 0), 123)
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
     _queue(save, previous_save, lambda: events.append("previous finalized"))
     assert previous_started.wait(timeout=1)
-
-    waiter = threading.Thread(target=save.maybe_finalize_async_save, kwargs={"blocking": True})
+    waiter = threading.Thread(target=next_save)
     waiter.start()
     try:
         waiter.join(timeout=0.05)
         assert waiter.is_alive()
+        assert events == []
         release_previous.set()
-        waiter.join(timeout=1)
+        waiter.join(timeout=2)
         assert not waiter.is_alive()
-        assert events == ["previous durable", "previous finalized"]
+        assert errors == []
+        assert events == [
+            "previous durable",
+            "previous finalized",
+            "new state",
+            "new registration",
+            "new snapshot",
+            "new durable",
+            "new finalized",
+        ]
     finally:
         release_previous.set()
-        waiter.join(timeout=1)
+        waiter.join(timeout=2)
+
+
+def test_nonblocking_termination_preserves_pending_save(save: ModuleType) -> None:
+    started, release = threading.Event(), threading.Event()
+    finalized = []
+
+    def wait() -> None:
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release native durability")
+
+    _queue(save, wait, lambda: finalized.append(True))
+    try:
+        assert started.wait(2)
+        with pytest.raises(RuntimeError, match=r"cannot terminate.*pending request"):
+            save.maybe_finalize_async_save(terminate=True)
+        assert finalized == []
+        assert not save._async_calls_queue.closed
+    finally:
+        release.set()
+        save.maybe_finalize_async_save(blocking=True, terminate=True)
+    assert finalized == [True]
+    assert save._async_calls_queue.closed
 
 
 def test_native_async_save_propagates_background_failure(save: ModuleType) -> None:
@@ -430,7 +486,7 @@ def test_native_async_save_propagates_background_failure(save: ModuleType) -> No
         raise ValueError("write failed")
 
     _queue(save, fail)
-    with pytest.raises(RuntimeError, match="failed during background execution") as error:
+    with pytest.raises(RuntimeError, match="durability failed") as error:
         save.maybe_finalize_async_save(blocking=True)
 
     assert isinstance(error.value.__cause__, ValueError)
@@ -452,14 +508,6 @@ def test_async_finalize_wait_starts_after_client_send(
         def wait_for_async_completion(self) -> None:
             events.append("client_send_complete")
 
-    class ImmediateExecutor:
-        @staticmethod
-        def submit(fn: Callable[..., None], *args: object) -> Future[None]:
-            events.append("submit_finalize_wait")
-            future: Future[None] = Future()
-            future.set_result(fn(*args))
-            return future
-
     args = SimpleNamespace(use_distributed_optimizer=False, async_save=True, save=tmp_path)
     save_args = save.SaveCheckpointArgs(
         iteration=40,
@@ -473,18 +521,19 @@ def test_async_finalize_wait_starts_after_client_send(
     monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
     monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000040")
-    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
-    monkeypatch.setattr(save, "_get_executor", ImmediateExecutor)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: None)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     monkeypatch.setattr(
-        save.checkpoint,
+        checkpoint,
         "wait_for_ckpt_finalize",
         lambda _session, _iteration: events.append("wait_for_finalize"),
     )
 
     save._save_checkpoint_impl(save_args, 123)
 
-    assert events == ["save_async", "client_send_complete", "submit_finalize_wait", "wait_for_finalize"]
+    save.maybe_finalize_async_save(blocking=True)
+    assert events == ["save_async", "client_send_complete", "wait_for_finalize"]
 
 
 @pytest.mark.parametrize("async_save", [False, True])
@@ -534,11 +583,12 @@ def test_finalize_failure_preserves_tracker_and_prevents_success(
     monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000040")
     monkeypatch.setattr(save, "get_checkpoint_tracker_filename", lambda _path: tracker)
     monkeypatch.setattr(save, "maybe_msc", SimpleNamespace(open=Path.open))
-    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: None)
     monkeypatch.setattr(save, "print_rank_0", messages.append)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 0)
     monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: False)
-    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", fail_finalize)
+    monkeypatch.setattr(checkpoint, "wait_for_ckpt_finalize", fail_finalize)
     monkeypatch.setattr(save.checkpointing_module, "_async_delete_checkpoint_impl", lambda *args: deleted.append(args), raising=False)
 
     if async_save:
@@ -549,10 +599,55 @@ def test_finalize_failure_preserves_tracker_and_prevents_success(
     else:
         with pytest.raises(RuntimeError) as error:
             save._save_checkpoint_impl(save_args, 123)
-        assert error.value is finalize_error
+        assert error.value is finalize_error or error.value.__cause__ is finalize_error
     assert tracker.read_text() == "30"
     assert previous_payload.read_text() == "last successful checkpoint"
     assert deleted == []
+    assert not any("successfully saved checkpoint" in message for message in messages)
+
+
+@pytest.mark.parametrize("async_save", [False, True])
+def test_publication_failure_propagates_without_success_log(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    async_save: bool,
+) -> None:
+    messages = []
+    failure = OSError("tracker publication failed")
+
+    class Root:
+        @staticmethod
+        def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
+            return
+
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
+    def publish(*_args: object) -> None:
+        raise failure
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=async_save, save=tmp_path)
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda *_args: None)
+    monkeypatch.setattr(checkpoint, "wait_for_ckpt_finalize", lambda *_args: None)
+    monkeypatch.setattr(save, "_write_checkpoint_tracker", publish)
+    monkeypatch.setattr(save, "print_rank_0", messages.append)
+
+    if async_save:
+        save._save_checkpoint_impl(save.SaveCheckpointArgs(40, object(), None, None, 0), 123)
+        with pytest.raises(RuntimeError, match="failed during finalization") as error:
+            save.maybe_finalize_async_save(blocking=True)
+        assert error.value.__cause__ is failure
+    else:
+        with pytest.raises(OSError, match="tracker publication failed") as error:
+            save._save_checkpoint_impl(save.SaveCheckpointArgs(40, object(), None, None, 0), 123)
+        assert error.value is failure
     assert not any("successfully saved checkpoint" in message for message in messages)
 
 
@@ -626,11 +721,12 @@ def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913,
     monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000020")
     dataloader_state = current_dataloader_state if supports_cp_group else legacy_dataloader_state
     monkeypatch.setattr(save, "maybe_save_dataloader_state", dataloader_state)
-    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or Root())
+    _set_root(monkeypatch, Root())
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register"))
     monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, _iteration: events.append("tracker"))
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     monkeypatch.setattr(
-        save.checkpoint,
+        checkpoint,
         "wait_for_ckpt_finalize",
         lambda _session, _iteration: events.append("wait_for_finalize"),
     )
@@ -656,6 +752,22 @@ def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913,
     ]
 
 
+def test_megatron_session_uses_detected_topology_and_iteration_session(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    session = object()
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 3)
+    monkeypatch.setattr(save.torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(save, "detect_peers", lambda rank, world: calls.append((rank, world)) or save.OrderedPeers(("node-b", "node-a"), 4))
+    monkeypatch.setattr(save, "NativeCheckpointSession", lambda **kwargs: calls.append(kwargs) or session)
+
+    assert save._get_session() is session
+    assert save._get_session() is session
+    assert calls == [(3, 8), {"session_id": 0, "collective_checks": False, "peers": ["node-b", "node-a"], "ranks_per_peer": 4}]
+
+
 def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     class Root:
         def __init__(self) -> None:
@@ -664,8 +776,12 @@ def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, mo
         def register_state_dict(self, state_dict) -> None:  # noqa: ANN001
             self.registered.append(state_dict)
 
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
     root = Root()
-    save._root = root
+    _set_root(monkeypatch, root)
     monkeypatch.setattr(save, "_prepare_registration_state_dict", lambda state, iteration: {"prepared": state, "iteration": iteration})
     loaded_state = {"model.weight": "loaded tensor"}
     saved_state = {"model.weight": "saved tensor"}
@@ -677,7 +793,7 @@ def test_register_state_dict_reuses_the_process_global_root(save: ModuleType, mo
         {"prepared": loaded_state, "iteration": 0},
         {"prepared": saved_state, "iteration": 12},
     ]
-    assert save._root is root
+    assert save._session.root is root
 
 
 def test_load_registration_synthesizes_rng_with_role_specific_groups(
@@ -692,7 +808,7 @@ def test_load_registration_synthesizes_rng_with_role_specific_groups(
         "get_rng_state",
         lambda *args, **kwargs: calls.append((args, kwargs)) or rng_state,
     )
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     state = {
         "args": SimpleNamespace(no_load_rng=True, no_save_rng=False),
         "model": "model handler",
@@ -773,7 +889,7 @@ def test_load_registers_live_state_after_loading(
     metadata = {"dp_cp_group": "dp-cp", "checkpoint_version": 3.1}
     monkeypatch.setattr(save, "get_args", lambda: args)
     monkeypatch.setattr(save, "_build_sharded_state_dict_metadata", lambda *_args, **_kwargs: metadata)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
 
     @contextmanager
     def preserve_quantized_tensors() -> Generator[None]:
@@ -913,7 +1029,7 @@ def test_load_registration_warns_and_uses_singleton_dp_groups_when_rng_is_unexpe
         return {"sharded": "placeholder rng handler"}
 
     monkeypatch.setattr(save, "get_rng_state", get_rng_state)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     state = {
         "args": SimpleNamespace(no_load_rng=False, no_save_rng=False),
         "rerun_state_machine": "rerun handler",
@@ -933,7 +1049,7 @@ def test_registration_adds_the_stable_rerun_state_when_load_omits_it(
         state_dict=lambda **kwargs: calls.append(kwargs) or rerun_state,
     )
     monkeypatch.setattr(save, "get_rerun_state_machine", lambda: rerun)
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     state = {"model": "model handler"}
 
     prepared = save._prepare_registration_state_dict(state, 0)
@@ -961,7 +1077,7 @@ def test_registration_adds_rng_state_with_default_groups_during_save(
         "get_rng_state",
         lambda *args, **kwargs: calls.append((args, kwargs)) or rng_state,
     )
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     state = {
         "args": SimpleNamespace(no_save_rng=False),
         "model": "model handler",
@@ -985,7 +1101,7 @@ def test_registration_respects_no_save_rng(save: ModuleType, monkeypatch: pytest
         "get_rng_state",
         lambda *_args, **_kwargs: pytest.fail("RNG state should not be generated"),
     )
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     state = {
         "args": SimpleNamespace(no_save_rng=True),
         "model": "model handler",
@@ -998,7 +1114,7 @@ def test_registration_respects_no_save_rng(save: ModuleType, monkeypatch: pytest
 def test_common_state_padding_is_local_to_megatron_serialization(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
 
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 0)
     monkeypatch.setattr(save.torch, "save", lambda _value, buffer: buffer.write(next(payloads)))
     state = {"rerun_state_machine": "rerun handler"}
 
@@ -1028,7 +1144,7 @@ def test_rng_sharded_object_padding_is_local_to_megatron_serialization(
             self.unique_key = "rng_state/shard_0_1"
 
     payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
-    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda **_kwargs: 1)
     monkeypatch.setattr(save.torch, "save", lambda _value, buffer: buffer.write(next(payloads)))
 
     first = ShardedObject({"iteration": 0})

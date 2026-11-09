@@ -119,6 +119,12 @@ native integration.
 
 ### Megatron Bridge backend
 
+The Megatron-LM integration and Bridge adapter share native sessions,
+snapshot submission, durability waits, and the async completion queue through
+`nvrx_checkpointing.backend`. Each adapter prepares its framework's state and
+supplies publication callbacks. The shared queue runs those callbacks after
+every training rank reports durability.
+
 Megatron Bridge integrations can use `nvrx_checkpointing.bridge` to create a
 native save strategy and async calls queue, and wrap checkpoint loads with
 `load_context(sharded_state_dict, sharded_strategy)`. The module imports its

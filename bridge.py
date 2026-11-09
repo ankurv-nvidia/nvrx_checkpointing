@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
-    from .megatron.bridge import NativeAsyncCallsQueue, NativeSaveShardedStrategy
+    from .backend import NativeAsyncCallsQueue
+    from .megatron.bridge import NativeSaveShardedStrategy
 
 
 def create_save_strategy(*, process_group: object | None = None) -> NativeSaveShardedStrategy:
@@ -21,7 +22,7 @@ def create_save_strategy(*, process_group: object | None = None) -> NativeSaveSh
 
 def create_async_calls_queue(*, process_group: object | None = None) -> NativeAsyncCallsQueue:
     """Create a native durability queue for the complete training process group."""
-    from .megatron.bridge import NativeAsyncCallsQueue  # noqa: PLC0415
+    from .backend import NativeAsyncCallsQueue  # noqa: PLC0415
 
     return NativeAsyncCallsQueue(process_group=process_group)
 

@@ -9,7 +9,6 @@ import io
 import threading
 import time
 import warnings
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -34,7 +33,7 @@ from megatron.training.checkpointing import (  # type: ignore[import-not-found]
 from megatron.training.global_vars import get_args  # type: ignore[import-not-found]
 from megatron.training.utils import print_rank_0  # type: ignore[import-not-found]
 
-from .. import checkpoint  # noqa: TID252
+from ..backend import NativeAsyncCallsQueue, NativeCheckpointSession  # noqa: TID252
 from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
 from ..peers import OrderedPeers, detect_environment_peers  # noqa: TID252
 from ..quantized_snapshot import preserve_quantized_tensors  # noqa: TID252
@@ -45,11 +44,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
 
+    from .. import checkpoint  # noqa: TID252
+
 _DCP_COMMON_STATE_KEY = "common_state/shard_0_1"
 _CONTENT_METADATA_KEY = "content_metadata"
 _RERUN_STATE_KEY = "rerun_state_machine"
 _RNG_STATE_KEY = "rng_state"
-_root = None
+_session: NativeCheckpointSession | None = None
+_async_calls_queue: NativeAsyncCallsQueue | None = None
+_SESSION_ID = 0
 _common_state_capacity: int | None = None
 _sharded_object_capacities: dict[str, int] = {}
 
@@ -73,14 +76,6 @@ class SaveCheckpointArgs:
     rng_state_key_prefix: str = ""
 
 
-@dataclass
-class _PendingSave:
-    future: Future[None]
-    finalize_fn: Callable[[], None]
-
-
-_pending: _PendingSave | None = None
-_executor: ThreadPoolExecutor | None = None
 _LOAD_CONTEXT: dict[str, object] | None = None
 
 
@@ -250,12 +245,21 @@ def _prepare_registration_state_dict(state_dict: dict, iteration: int) -> dict:
     return prepared_state
 
 
-def _get_executor() -> ThreadPoolExecutor:
-    """Return the single worker that waits for native durability."""
-    global _executor  # noqa: PLW0603
-    if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="native-ckpt-finalize")
-    return _executor
+def _get_session() -> NativeCheckpointSession:
+    global _session  # noqa: PLW0603
+    if _session is None:
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        ordered_peers = detect_peers(rank, world_size)
+        _session = NativeCheckpointSession(session_id=_SESSION_ID, collective_checks=False, **ordered_peers.checkpoint_args())
+    return _session
+
+
+def _get_async_calls_queue() -> NativeAsyncCallsQueue:
+    global _async_calls_queue  # noqa: PLW0603
+    if _async_calls_queue is None or _async_calls_queue.closed:
+        _async_calls_queue = NativeAsyncCallsQueue(collective_checks=False)
+    return _async_calls_queue
 
 
 def init_persistent_async_worker(rank: int, mp_mode: str = "spawn") -> None:
@@ -264,41 +268,22 @@ def init_persistent_async_worker(rank: int, mp_mode: str = "spawn") -> None:
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate: bool = False) -> None:
-    """Finalize the completed native save or wait for it when requested."""
-    global _executor, _pending  # noqa: PLW0603
-    request = _pending
-    if request is not None and (blocking or request.future.done()):
-        error = request.future.exception()
-        if error is not None:
-            raise RuntimeError("native async checkpoint failed during background execution") from error
-        _pending = None
-        try:
-            request.finalize_fn()
-        except Exception as error:
-            raise RuntimeError("native async checkpoint failed during finalization") from error
-
-    if terminate and _executor is not None:
-        if _pending is not None:
+    """Finalize shared native requests and close an idle queue when requested."""
+    queue = _async_calls_queue
+    if queue is None:
+        return
+    queue.maybe_finalize_async_calls(blocking=blocking)
+    if terminate:
+        if queue.get_num_unfinalized_calls():
             raise RuntimeError("cannot terminate native async worker with a pending request")
-        _executor.shutdown(wait=True)
-        _executor = None
+        queue.close()
 
 
 def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_state:
-    """Register the current state dictionary on the process-global state tree."""
-    global _root  # noqa: PLW0603
-    if _root is None:
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        ordered_peers = detect_peers(rank, world_size)
-        _root = checkpoint.model_state.create_root(0, rank, world_size, **ordered_peers.checkpoint_args())
+    """Register prepared Megatron state with the shared native session."""
+    session = _get_session()
     with preserve_quantized_tensors():
-        _root.register_state_dict(_prepare_registration_state_dict(state_dict, iteration))
-    return _root
-
-
-# The writer and finalizer use the same fixed session.
-_SESSION_ID = 0
+        return session.register_state_dict(state_dict, prepare=lambda state: _prepare_registration_state_dict(state, iteration))
 
 
 def _timestamp() -> str:
@@ -379,12 +364,11 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
     follows publication of the durable checkpoint. Logging hooks, fault tolerance,
     and ModelOpt state are outside this provider's state contract.
     """
-    global _pending  # noqa: PLW0603
     iteration = save_args.iteration
     with _checkpoint_span("nvrx.checkpoint.prepare", iteration):
         with _checkpoint_span("nvrx.checkpoint.wait_previous", iteration):
             wait_started_at = None
-            if _pending is not None and not _pending.future.done():
+            if _async_calls_queue is not None and not _async_calls_queue.is_current_async_call_done():
                 wait_started_at = time.monotonic()
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     print(  # noqa: T201
@@ -444,36 +428,32 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             _save_dataloader_state(save_args, args)
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
-                root = register_state_dict(state_dict, iteration)
-            root.startedAt = started_at_ns
-            root.save_async(iteration, checkpoint_dir)
-
-        if not getattr(args, "async_save", False):
-            # A deferred client send must run before the blocking server wait.
+                register_state_dict(state_dict, iteration)
             with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
-                root.wait_for_async_completion()
-            with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
-                checkpoint.wait_for_ckpt_finalize(_SESSION_ID, iteration)
+                request = _get_session().submit(checkpoint_dir, snapshot_id=iteration, started_at_ns=started_at_ns)
+
+        async_save = getattr(args, "async_save", False)
+
+        def finalize_fn() -> None:
+            try:
                 _write_checkpoint_tracker(args, iteration)
                 print_rank_0(
                     f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
                 )
-        else:
+            except Exception as error:
+                if not async_save:
+                    raise
+                raise RuntimeError("native async checkpoint failed during finalization") from error
 
-            def finalize_fn() -> None:
-                _write_checkpoint_tracker(args, iteration)
-                print_rank_0(
-                    f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
-                )
-
-            with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
-                root.wait_for_async_completion()
-            with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
-                future = _get_executor().submit(checkpoint.wait_for_ckpt_finalize, _SESSION_ID, iteration)
-                _pending = _PendingSave(future, finalize_fn)
+        request.add_finalize_fn(finalize_fn)
+        with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
+            if async_save:
+                _get_async_calls_queue().schedule_async_request(request)
                 print_rank_0(
                     f"  [{_timestamp()}] scheduled an async checkpoint save at iteration {iteration:7d} to {args.save}",
                 )
+            else:
+                request.execute_sync()
 
 
 __all__ = [
