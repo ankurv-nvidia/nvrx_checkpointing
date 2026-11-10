@@ -702,7 +702,7 @@ def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
 
     root.register_state_dict({"step": 2})
     root.save_async(1, tmp_path / "iter_0000001")
-    with pytest.raises(RuntimeError, match=r"registered tensor 'weight' was not supplied for this snapshot"):
+    with pytest.raises(RuntimeError, match=r"Snapshot state 'weight' has no current source data"):
         root.wait_for_async_completion()
 
 
@@ -729,7 +729,7 @@ def test_save_rejects_a_missing_registered_blob(tmp_path: Path) -> None:
     root.register_state_dict({})
     root.save_async(1, tmp_path / "iter_0000001")
 
-    with pytest.raises(RuntimeError, match=r"registered blob 'value' has no snapshot data"):
+    with pytest.raises(RuntimeError, match=r"Snapshot state 'value' has no current source data"):
         root.wait_for_async_completion()
 
 
