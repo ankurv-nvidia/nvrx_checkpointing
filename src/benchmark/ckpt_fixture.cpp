@@ -126,8 +126,7 @@ static void FillSnapshotRegistry(StateTree& tree, StateTree const& globalRegistr
 
     size_t totalAllocSize = 0;
     std::as_const(tree).WalkNodes([&](StateNode const& node) {
-        if (node.GetType() == StateNode::Type::Tensor) { totalAllocSize += std::get<Tensor>(node.data).storageSize; }
-        else if (node.GetType() == StateNode::Type::DTensor) { totalAllocSize += TensorStorageSize(std::get<DTensor>(node.data)); }
+        if (node.GetType() == StateNode::Type::DTensor) { totalAllocSize += TensorStorageSize(std::get<DTensor>(node.data)); }
     });
     std::vector<char> buffer(totalAllocSize);
 
@@ -163,12 +162,7 @@ static void FillSnapshotRegistry(StateTree& tree, StateTree const& globalRegistr
         auto&      node = tree.GetNode(stored.handle);
         auto const type = node.GetType();
         auto const fqn  = tree.GetNodeId(node.handle);
-        if (type == StateNode::Type::Tensor)
-        {
-            auto& tensor  = std::get<Tensor>(node.data);
-            tensor.handle = allocAndCopy(tensor.device, tensor.storageSize, fqn);
-        }
-        else if (type == StateNode::Type::DTensor || type == StateNode::Type::FixedSizeBlob)
+        if (type == StateNode::Type::DTensor || type == StateNode::Type::FixedSizeBlob)
         {
             auto& tensor = type == StateNode::Type::FixedSizeBlob ? static_cast<DTensor&>(std::get<StateNode::FixedSizeBlob>(node.data))
                                                                   : std::get<DTensor>(node.data);
@@ -368,23 +362,7 @@ static void ValidateRoundTrip(StateTree const& localState, ByteStorage const& te
 {
     auto localRank = localState.Topo().rank;
     localState.WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            auto& tnsr          = std::get<Tensor>(node.data);
-            auto* data          = &tensorStorage.At<char>(tnsr.handle);    // NOLINT
-            auto  size          = tnsr.StorageSizeBytes();
-            auto  shardFqn      = localState.GetNodeId(node.handle);
-            auto  actualPattern = std::string_view(static_cast<char const*>(data), std::min(size, static_cast<uint64_t>(shardFqn.size())));
-            if (actualPattern != shardFqn)
-            {
-                throw std::runtime_error(fmt::format("[ERROR] Validation failed for shard {} at offset {} rank = {}. Got: {}\n",
-                                                     shardFqn,
-                                                     tnsr.handle,
-                                                     localRank,
-                                                     actualPattern));
-            }
-        }
-        else if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
             auto& tnsr = std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
@@ -427,16 +405,16 @@ void SaveCheckpointOnly(StateTree& tree, std::filesystem::path const& ckptDir)
     }
 }
 
-static void RoundTripCallback(void*                             cbData,
-                              cipc::SessionId                   sessionId,
-                              cipc::SnapshotId                  snapshotId,
-                              std::string_view const&           name,
-                              std::filesystem::path const&      path,
+static void RoundTripCallback(void*                        cbData,
+                              cipc::SessionId              sessionId,
+                              cipc::SnapshotId             snapshotId,
+                              std::string_view const&      name,
+                              std::filesystem::path const& path,
                               StateTree const&,
                               StateTree const&,
                               StateTree const& snapshotRegistry,
                               StateTree const&,
-                              ByteStorage const&                snapshotData)
+                              ByteStorage const& snapshotData)
 {
     auto localRank = snapshotRegistry.Topo().rank;
     if (localRank != *static_cast<Rank*>(cbData)) { return; }

@@ -1033,7 +1033,6 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     PutU8(b, '(');
     WalkTensorNodes(globalRegistry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        assert(type != StateNode::Type::Tensor);
         if (type != StateNode::Type::DTensor) { return; }
         auto const& tnsr        = std::get<DTensor>(node.data);
         auto const  chunkRanges = CollectChunkRanges(tnsr);
@@ -1149,7 +1148,6 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
     auto const  snapshotBytes = std::span<char const>(base, tensorStorage.size);
     WalkTensorNodes(registry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        assert(type != StateNode::Type::Tensor);
         if (type != StateNode::Type::DTensor) { return; }
         auto const& tnsr = std::get<DTensor>(node.data);
         auto const  fqn  = registry.GetNodeId(node.handle);

@@ -119,19 +119,6 @@ struct StateSerDes
                 WriteRanks(ostrm, scalar.replicas);
             }
             break;
-            case Type::Tensor:
-            {
-#ifdef NATIVE_CKPT_TRACE_NODE
-                auto fqn = tree.GetNodeId(nodeHandle);
-                if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
-                {
-                    fmt::print(stderr, "StateSerDes::Write!Tensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
-                }
-#endif
-                auto const& shard = std::get<Tensor>(node.data);
-                serdes::WriteTrivial(ostrm, shard);
-            }
-            break;
             case Type::DTensor:
             case Type::FixedSizeBlob:
             {
@@ -237,18 +224,6 @@ struct StateSerDes
                 node.data       = std::move(scalar);
             }
             break;
-            case Type::Tensor:
-            {
-#ifdef NATIVE_CKPT_TRACE_NODE
-                auto fqn = tree.GetNodeId(node.handle);
-                if (fqn.contains(NATIVE_CKPT_TRACE_NODE))
-                {
-                    fmt::print(stderr, "StateSerDes::Read!Tensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
-                }
-#endif
-                node.data = serdes::ReadTrivial<Tensor>(istrm);
-            }
-            break;
             case Type::DTensor:
             case Type::FixedSizeBlob:
             {
@@ -329,14 +304,6 @@ struct StateSerDes
             }
             else if (type == StateNode::Type::FixedSizeBlob) { fmt::print(ostrm, "{}: [fixedblob]\n", name); }
             else if (type == StateNode::Type::DynamicSizeBlob) { fmt::print(ostrm, "{}: [dynamicblob]\n", name); }
-            else if (type == StateNode::Type::Tensor)
-            {
-                auto const& tnsr = std::get<Tensor>(node.data);
-                fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-                fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
-                fmt::print(ostrm, "{}.snapshotDtype: {}\n", name, tnsr.snapshotDtype);
-                fmt::print(ostrm, "{}.handle: {}\n", name, tnsr.handle);
-            }
             else if (type == StateNode::Type::DTensor)
             {
                 auto const& tnsr = std::get<DTensor>(node.data);

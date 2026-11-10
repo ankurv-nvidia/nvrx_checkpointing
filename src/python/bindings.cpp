@@ -35,7 +35,6 @@ static constexpr std::string_view StateTypeName(StateNode::Type const& type)
     case StateNode::Type::Dict: return "Dict";
     case StateNode::Type::Scalar: return "Scalar";
     case StateNode::Type::DynamicSizeBlob: return "DynamicSizeBlob";
-    case StateNode::Type::Tensor: return "Tensor";
     case StateNode::Type::DTensor: return "DTensor";
     case StateNode::Type::FixedSizeBlob: return "FixedSizeBlob";
     case StateNode::Type::Unknown: break;
@@ -258,10 +257,6 @@ StateNode* PythonStateTree::RegisterState(StateNode::Handle parent, std::string_
             throw std::runtime_error(fmt::format("State '{}' changed scalar type after registry synchronization", path));
         }
     }
-    else if (data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-    {
-        throw std::logic_error("Unexpected StateNode::Type::Tensor found in state-registry");
-    }
     else if (IsShardedState(data))
     {
         auto const& previous = ShardedState(child.data);
@@ -304,12 +299,7 @@ void PythonStateTree::ClearSnapshotValues_()
 
     std::as_const(*_snapshotRegistry).WalkNodes([&](StateNode const& current) {
         auto& node = _snapshotRegistry->GetNode(current.handle);
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            auto& tensor  = std::get<Tensor>(node.data);
-            tensor.handle = 0;
-        }
-        else if (auto* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data)) { blob->handle = 0; }
+        if (auto* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data)) { blob->handle = 0; }
         else if (auto* scalar = std::get_if<StateNode::Scalar>(&node.data))
         {
             Primitives64Bit::Traits<uint64_t>::Assign(*scalar, uint64_t{});
@@ -345,8 +335,7 @@ void PythonStateTree::ValidateSnapshotRegistry_() const
                 }
             }
         }
-        else if (std::holds_alternative<StateNode::Scalar>(node.data) || std::holds_alternative<StateNode::DynamicSizeBlob>(node.data)
-                 || std::holds_alternative<Tensor>(node.data))
+        else if (std::holds_alternative<StateNode::Scalar>(node.data) || std::holds_alternative<StateNode::DynamicSizeBlob>(node.data))
         {
             if (auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data);
                 blob != nullptr && blob->storageSize != 0 && blob->handle == 0)
