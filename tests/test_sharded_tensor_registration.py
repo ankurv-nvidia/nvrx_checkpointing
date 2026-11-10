@@ -706,16 +706,28 @@ def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-@pytest.mark.parametrize("initial", [1, b"", b"payload"])
-def test_save_rejects_a_missing_registered_value(tmp_path: Path, initial: int | bytes) -> None:
+@pytest.mark.parametrize(("initial", "updated"), [(True, False), (1, 2), (1.5, 2.5), (b"", b"")])
+def test_save_preserves_omitted_registered_value(tmp_path: Path, initial: float | bytes, updated: float | bytes) -> None:
+    session_id = next(_SESSION_IDS)
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+
+    for iteration, state in enumerate(({"value": initial}, {}, {"value": updated}), 1):
+        root.register_state_dict(state)
+        root.save(iteration, tmp_path / f"iter_{iteration:07d}")
+        checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+def test_save_rejects_a_missing_registered_blob(tmp_path: Path) -> None:
     root = _create_root()
-    root.register_state_dict({"value": initial})
+    root.register_state_dict({"value": b"payload"})
     root.finalize_registry()
 
     root.register_state_dict({})
     root.save_async(1, tmp_path / "iter_0000001")
 
-    with pytest.raises(RuntimeError, match=r"registered state 'value' was not supplied for this snapshot"):
+    with pytest.raises(RuntimeError, match=r"registered blob 'value' has no snapshot data"):
         root.wait_for_async_completion()
 
 
