@@ -37,7 +37,8 @@ page = _page_module()
 
 _INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
 _REGISTRY_MAGIC = 0x32525453
-_REGISTRY_VERSION = 2
+_REGISTRY_VERSION = 3
+_METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
     2: "bfloat16",
@@ -159,11 +160,11 @@ def _replicas(reader: _Reader) -> tuple[int, ...]:
 
 def _scalar_value(reader: _Reader, version: int) -> _ScalarMetadata | tuple[int, int]:
     value = reader.unpack(_SCALAR_VALUE)
-    return _ScalarMetadata(value, _replicas(reader)) if version >= _REGISTRY_VERSION else value
+    return _ScalarMetadata(value, _replicas(reader)) if version >= _METADATA_VERSION else value
 
 
 def _blob_value(reader: _Reader, version: int) -> _DynamicBlobMetadata | memoryview:
-    if version < _REGISTRY_VERSION:
+    if version < _METADATA_VERSION:
         return reader.take(reader.unpack(_U32)[0])
     replicas = _replicas(reader)
     _, storage_size = reader.unpack(_BLOB_STORAGE)
@@ -196,6 +197,10 @@ def _shard_value(reader: _Reader) -> _ShardValue:
     return _ShardValue(rank, storage_size, ranges)
 
 
+def _node_kind(kind: int, version: int) -> int:
+    return kind + 1 if version > _METADATA_VERSION and kind >= _TENSOR else kind
+
+
 def read_registry(path: Path, data: bytes | None = None) -> Registry:
     """Parse a registry file into its topology and tree entries."""
     raw = path.read_bytes() if data is None else data
@@ -209,13 +214,14 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
     version = 1
     if count == _REGISTRY_MAGIC:
         (version,) = reader.unpack(_U32)
-        if version != _REGISTRY_VERSION:
+        if version not in (_METADATA_VERSION, _REGISTRY_VERSION):
             raise ValueError(f"{path}: unsupported registry version {version}")
         (count,) = reader.unpack(_U32)
     for _ in range(count):
         start = reader.pos
         kind, name_length, _, handle, parent = reader.unpack(_NODE)
         name = reader.text(name_length)
+        kind = _node_kind(kind, version)
         if kind == _INVALID:
             continue
         if kind == _DICT:

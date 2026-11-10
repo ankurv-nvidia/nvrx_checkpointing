@@ -215,10 +215,6 @@ void LoadStateRegistryFromPath(CheckpointTestContext& ctx, std::filesystem::path
     uint64_t                                                    totalTensorSize = 0;
 
     registry->WalkNodes([&](StateNode& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            throw std::runtime_error("LoadStateRegistryFromPath: unexpected TensorShard in global registry");
-        }
         if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
         {
             auto& tnsr = std::get<DTensor>(node.data);

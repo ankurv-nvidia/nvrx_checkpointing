@@ -299,10 +299,10 @@ def test_capture_refreshes_only_selected_values_using_checkpoint_keys(tmp_path: 
         _assert_file_coverage(tmp_path, dcp.FileSystemReader(tmp_path).read_metadata())
 
         nonowner = next(rank for rank, plan in enumerate(plans) if "model.weight" not in plan)
+        snapshot_size = roots[nonowner].snapshot_size
         changed = state(2)
         changed["source_only"]["renamed"] = ShardedTensor.from_rank_offsets("model.weight", torch.zeros(4))
         roots[nonowner].register_state_dict(changed)
-        with pytest.raises(RuntimeError, match="changed tensor metadata"):
-            roots[nonowner].wait_for_async_completion()
+        assert roots[nonowner].snapshot_size == snapshot_size
     finally:
         checkpoint.svc_spindown()

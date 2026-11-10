@@ -145,7 +145,10 @@ class _Tree:
             out += struct.pack("<II", 0x32525453, version)
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
-            out += struct.pack("<BBHII", kind, len(name), 0, handle, parent) + name.encode()
+            if version >= 3 and kind == _TENSOR:
+                raise ValueError("registry version 3 contains distributed tensors")
+            wire_kind = kind - 1 if version >= 3 and kind >= _DTENSOR else kind
+            out += struct.pack("<BBHII", wire_kind, len(name), 0, handle, parent) + name.encode()
             if kind == _DICT:
                 out += struct.pack(f"<I{len(payload)}I", len(payload), *payload)
             elif kind == _SCALAR:
@@ -411,20 +414,27 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 3])
+def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
     tree.add("objects", _FIXED_BLOB, (5, (2,), shards))
+    tensor_shards = [(rank, [(0, 2)], 4, b"cpu\0", 0) for rank in (0, 1)]
+    tree.add("weights", _DTENSOR, (_BF16, (2,), tensor_shards))
     tree.add("output_path", _BLOB, ((0, 1), 0))
     tree.add("iteration", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
     path = tmp_path / "registry.global.bin"
-    tree.write(path, version=2)
+    tree.write(path, version=version)
 
     parsed = registry_tree.read_registry(path)
     assert parsed.trailing == 0
+    kinds = {parsed.names[handle]: kind for handle, kind, _ in parsed.entries}
+    assert kinds["objects"] == _FIXED_BLOB
+    assert kinds["weights"] == _DTENSOR
     report = registry_tree.analyze([path], expand_blobs=True)
     leaves = {leaf.fqn: leaf for leaf in report.leaves}
     assert leaves["objects"].unique == 8
+    assert leaves["weights"].unique == 4
     assert {rank: value[0] for rank, value in leaves["objects"].ranks.items()} == {0: 8, 1: 8}
     assert {rank: value[0] for rank, value in leaves["output_path"].ranks.items()} == {0: 0, 1: 0}
     assert {rank: value[0] for rank, value in leaves["iteration"].ranks.items()} == {0: 8, 1: 8}
@@ -433,6 +443,6 @@ def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path)
 
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=3)
-    with pytest.raises(ValueError, match="unsupported registry version 3"):
+    _Tree(0).write(path, version=4)
+    with pytest.raises(ValueError, match="unsupported registry version 4"):
         registry_tree.read_registry(path)

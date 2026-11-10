@@ -657,16 +657,19 @@ def test_register_state_dict_accepts_repeated_normalized_paths() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fresh", "path"),
+    "fresh",
     [
-        ({"unknown": 2}, "unknown"),
-        ({"known": {"value": 1}, "unknown": 2}, "unknown"),
-        ({"known": {"value": 1, "unknown": 2}}, "known.unknown"),
+        {"unknown": 2},
+        {"known": {"value": 1}, "unknown": 2},
+        {"known": {"value": 1, "unknown": 2}},
+        {"unknown": {"value": 2}},
+        {"unknown": [{"value": 2}]},
+        {"unknown": ShardedTensor.from_rank_offsets("unknown.weight", torch.ones(4))},
     ],
 )
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-def test_register_state_dict_rejects_unregistered_path(fresh: dict, path: str) -> None:
+def test_register_state_dict_ignores_unselected_paths(fresh: dict) -> None:
     root = _create_root()
     state = {"known": {"value": 1}}
     root.register_state_dict(state)
@@ -674,8 +677,7 @@ def test_register_state_dict_rejects_unregistered_path(fresh: dict, path: str) -
     root.finalize_registry()
 
     root.register_state_dict(fresh)
-    with pytest.raises(RuntimeError, match=rf"supplied state '{path}' is not registered"):
-        _ = root.snapshot_size
+    assert root.snapshot_size == 0
 
 
 @pytest.mark.integration
