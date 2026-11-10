@@ -2775,7 +2775,7 @@ TEST_CASE("a global registry failure releases waiting peer plans", "[server][pla
     std::string observed;
     try
     {
-        plan.get();
+        auto rslt = plan.get();
     } catch (std::runtime_error const& error) { observed = error.what(); }
     CHECK(observed.contains(failure));
     CHECK(server.Stop());
@@ -2828,7 +2828,7 @@ TEST_CASE("the coordinator forwards peer planning failures through global regist
     std::string observed;
     try
     {
-        plan.get();
+        auto rslt = plan.get();
     } catch (std::runtime_error const& error) { observed = error.what(); }
     CHECK(observed.contains(failure));
     REQUIRE(firstNotified.wait_for(10s) == std::future_status::ready);

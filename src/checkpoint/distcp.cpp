@@ -981,15 +981,18 @@ static BlobsByFqn CollectBlobs(StateTree const& registry, ByteStorage const& sto
     return blobs;
 }
 
-static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry)
+static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
 {
     BlobMetadataByFqn blobs;
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::DynamicSizeBlob)
         {
-            auto const& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
-            for (auto rank : blob.replicas) { blobs[registry.GetNodeId(node.handle)][rank] = {.length = blob.storageSize}; }
+            auto const& blob   = std::get<StateNode::DynamicSizeBlob>(node.data);
+            auto const  fqn    = registry.GetNodeId(node.handle);
+            auto const  size   = dynamicBlobSizes.find(fqn);
+            auto const  length = size == dynamicBlobSizes.end() ? blob.storageSize : size->second;
+            for (auto rank : blob.replicas) { blobs[fqn][rank] = {.length = length}; }
         }
         else if (type == StateNode::Type::FixedSizeBlob)
         {
@@ -1191,8 +1194,13 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
 }
 
 void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry)
+{ WriteMetadata(ckptDir, snapshotRegistry, {}); }
+
+void WriteMetadata(std::filesystem::path const&                     ckptDir,
+                   StateTree const&                                 snapshotRegistry,
+                   std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
 {
-    BlobMetadataByFqn const& blobs = CollectBlobMetadata(snapshotRegistry);
+    BlobMetadataByFqn const& blobs = CollectBlobMetadata(snapshotRegistry, dynamicBlobSizes);
     auto const               pkl   = BuildMetadataPkl(snapshotRegistry, blobs);
 
     std::filesystem::create_directories(ckptDir);

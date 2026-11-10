@@ -3,7 +3,10 @@
 #include "state.h"
 #include "tensor.h"
 
+#include <cstdint>
 #include <filesystem>
+#include <string>
+#include <unordered_map>
 
 namespace checkpoint::distcp
 {
@@ -14,4 +17,7 @@ void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree c
 // Emit the global .metadata. Blob ownership is the lowest rank in each FQN's
 // rank map.
 void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry);
+void WriteMetadata(std::filesystem::path const&                     ckptDir,
+                   StateTree const&                                 snapshotRegistry,
+                   std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes);
 }    // namespace checkpoint::distcp

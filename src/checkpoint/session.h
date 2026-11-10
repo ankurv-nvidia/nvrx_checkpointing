@@ -40,6 +40,7 @@ struct Session
     struct RegistryState
     {
         std::shared_ptr<StateTree>                                            globalRegistry;
+        std::shared_ptr<StateTree>                                            dedupedGlobalRegistry;
         std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> localRegistryForRank;
         std::map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>>           snapshotRegistryForRank;
         bool                                                                  planningStarted{false};
@@ -55,7 +56,7 @@ struct Session
 
         std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
-        std::shared_ptr<StateTree> snapshotRegistry;
+        std::unordered_map<std::string, uint64_t> dynamicBlobSizes;
 
         std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<SnapshotState>> snapshotStateForRank;
 
@@ -114,10 +115,6 @@ struct Session
     private:
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
     Snapshot& GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
-
-#ifdef DEBUG_MD5SUM
-    void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;
-#endif
 
     void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
