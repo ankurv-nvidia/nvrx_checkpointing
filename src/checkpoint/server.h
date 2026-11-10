@@ -24,7 +24,9 @@ using ServerSessionCallback = void (*)(void*                        cbData,
                                        std::string_view const&      name,
                                        std::filesystem::path const& path,
                                        StateTree const&             globalRegistry,
-                                       StateTree const&             localState,
-                                       ByteStorage const&           tensorStorage);
+                                       StateTree const&             localRegistry,
+                                       StateTree const&             snapshotRegistry,
+                                       StateTree const&             dedupedGlobalRegistry,
+                                       ByteStorage const&           snapshotData);
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData);

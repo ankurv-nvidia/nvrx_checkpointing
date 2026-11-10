@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace nb = nanobind;
 
@@ -75,8 +77,6 @@ struct TensorState
     std::unique_ptr<checkpoint::quant::Header> header;
 };
 }    // namespace
-
-static bool IsMainReplica(nb::handle replicaId);
 
 static int64_t DtypeNameToId(std::string_view name)
 {
@@ -413,6 +413,10 @@ static auto ReadNVFP4Header(Tensor::DType& durableDtype, nb::handle pyobj, std::
 
 static CachedTypes const& CachedTypesGet()
 {
+    static std::atomic<CachedTypes const*> Cached{nullptr};
+    if (auto const* types = Cached.load(std::memory_order_acquire)) { return *types; }
+    nb::gil_scoped_release release;
+
     static CachedTypes Types = [] {
         nb::gil_scoped_acquire acquire;
         auto                   torchModule                  = nb::module_::import_("torch");
@@ -442,6 +446,7 @@ static CachedTypes const& CachedTypesGet()
             .megatronShardedObject        = std::move(megatronShardedObject),
         };
     }();
+    Cached.store(&Types, std::memory_order_release);
     return Types;
 }
 
@@ -582,7 +587,7 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
 static StateNode::Scalar TorchDtypeState(nb::handle value)
 { return StateNode::Scalar{DtypeNameToId(StrView(nb::str(value)))}; }
 
-static StateNode::Blob TorchGeneratorBlob(std::string_view name, nb::handle value)
+static std::vector<char> TorchGeneratorBlob(std::string_view name, nb::handle value)
 {
     auto state = value.attr("get_state")();
     // get_state() returns a uint8 CPU tensor on modern torch.
@@ -757,7 +762,7 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     return {.meta = ds4tensor, .shard = shard, .owner = std::move(owner), .header = std::move(header)};
 }
 
-static StateNode::Blob ShardedObjectBlob(nb::handle value)
+static std::vector<char> ShardedObjectBlob(nb::handle value)
 {
     static constexpr char const* PreparedBlobAttr = "_nvrx_serialized_blob";
     auto const                   hasPreparedBlob  = PyObject_HasAttrString(value.ptr(), PreparedBlobAttr);
@@ -778,17 +783,17 @@ static StateNode::Blob ShardedObjectBlob(nb::handle value)
     return {raw.c_str(), raw.c_str() + raw.size()};
 }
 
-static StateNode& RegisterTensorState(PyStateDictAccessor&                       scan,
-                                      StateNode::Handle                          parent,
-                                      std::string_view                           name,
-                                      DTensor                                    tensor,
-                                      nb::handle                                 owner,
-                                      std::unique_ptr<checkpoint::quant::Header> header)
+static void RegisterTensorState(PyStateDictAccessor&                       scan,
+                                StateNode::Handle                          parent,
+                                std::string_view                           name,
+                                DTensor                                    tensor,
+                                nb::handle                                 owner,
+                                std::unique_ptr<checkpoint::quant::Header> header)
 {
-    auto& node = name.contains('.') ? scan.RegisterStateByFQN(name, tensor) : scan.RegisterState(parent, name, tensor);
-    scan.AcquireTensorObjectRefForSnapshot(node.handle, nb::borrow<nb::object>(owner));
+    auto* node = name.contains('.') ? scan.RegisterStateByFQN(name, tensor) : scan.RegisterState(parent, name, tensor);
+    if (node == nullptr) { return; }
+    scan.AcquireTensorObjectRefForSnapshot(node->handle, nb::borrow<nb::object>(owner));
     if (header) { scan.RetainQuantHeader(std::move(header)); }
-    return node;
 }
 
 static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& name, nb::handle factory)
@@ -839,49 +844,47 @@ static void RegisterShardedTorchTensorFactory(PyStateDictAccessor& scan, StateNo
                                                  shtKeyView,
                                                  fqn));
         }
-        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-        if (!IsMainReplica(innerContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, innerContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
     }
 }
 
-// Only main replicas own checkpoint payloads.
-// TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-static bool IsMainReplica(nb::handle replicaId)
-{
-    if (replicaId.is_none()) { return true; }
-    if (nb::isinstance<nb::int_>(replicaId)) { return nb::cast<int64_t>(replicaId) == 0; }
-    if (nb::isinstance<nb::tuple>(replicaId))
-    {
-        auto tuple = nb::cast<nb::tuple>(replicaId);
-        return std::ranges::all_of(tuple, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
-    }
-    if (nb::isinstance<nb::list>(replicaId))
-    {
-        auto list = nb::cast<nb::list>(replicaId);
-        return std::ranges::all_of(list, [](auto const& v) { return nb::cast<int64_t>(v) == 0; });
-    }
-    throw std::runtime_error("Unrecognized replica_id type (expected None, int, or tuple/list of int)");
-}
-
 static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
 {
-    // Main-replica objects are serialized fresh for each save as DCP byte entries.
-    if (!IsMainReplica(val.attr("replica_id"))) { return; }
-    auto uniqueKey = nb::cast<std::string>(val.attr("unique_key"));
-    scan.RegisterStateByFQN(uniqueKey, ShardedObjectBlob(val));
+    auto const key    = nb::cast<std::string>(val.attr("key"));
+    auto const shape  = nb::cast<nb::tuple>(val.attr("global_shape"));
+    auto const offset = nb::cast<nb::tuple>(val.attr("global_offset"));
+    if (shape.size() != offset.size() || shape.size() > Tensor::MaxDims)
+    {
+        throw std::runtime_error(fmt::format(
+            "ShardedObject '{}' has invalid dimensions; expected at most {} matching shape and offset axes", key, Tensor::MaxDims));
+    }
+    StateNode::FixedSizeBlob blob;
+    blob.durableDtype = Tensor::DType::UInt8;
+    TensorShard shard{
+        .rank          = scan.GetRankTopo().rank,
+        .snapshotDtype = Tensor::DType::UInt8,
+        .device        = DeviceId("cpu"),
+    };
+    for (size_t axis = 0; axis < shape.size(); ++axis)
+    {
+        auto const extent = nb::cast<int64_t>(shape[axis]);
+        auto const start  = nb::cast<int64_t>(offset[axis]);
+        if (extent <= 0 || start < 0 || start >= extent)
+        {
+            throw std::runtime_error(fmt::format("ShardedObject '{}' has an invalid global shape or offset on axis {}", key, axis));
+        }
+        blob.fulldim.push_back(static_cast<uint64_t>(extent));
+        shard.sharddim.push_back({.begin = static_cast<uint64_t>(start), .end = static_cast<uint64_t>(start + 1)});
+    }
+    auto data         = ShardedObjectBlob(val);
+    shard.storageSize = data.size();
+    shard.handle      = reinterpret_cast<uint64_t>(data.data());
+    blob.AddShard(shard);
+    if (scan.RegisterStateByFQN(key, std::move(blob)) != nullptr) { scan.RetainBlobData(std::move(data)); }
 }
 
-// After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`
-// gets replaced with `[DTensor(...weight.z), DTensor(...weight.x),
-// DTensor(...weight.B), DTensor(...weight.C), DTensor(...weight.dt)]`.
-// Register each main-replica element using its own `.key` as the FQN — same shape as nvrx's
-// post-`save_preprocess` state_dict, so the cross-provider tensor compare can
-// match tensors per-FQN. Returns false when the list isn't an all-DTensor
-// list so the generic walker can fall through to its existing per-element-type
-// handling.
 bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::list const& listObj)
 {
     if (listObj.empty()) { return false; }
@@ -914,8 +917,6 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
 
             // throw std::runtime_error("DTensor list element key '{}' is not a child of state-dict key '{}'", shtKeyView, fqn);
         }
-        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-        if (!IsMainReplica(itemContainer["replica_id"])) { continue; }
         auto tensorName  = shtKey;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, itemContainer);
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
@@ -938,8 +939,6 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     if (IsMegatronShardedTensor(val))
     {
-        // TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-        if (!IsMainReplica(val.attr("replica_id"))) { return true; }
         auto tensorName  = key;
         auto tensorState = ShardedTensorState(scan.GetRankTopo(), tensorName, nb::cast<nb::dict>(val.attr("__dict__")));
         RegisterTensorState(scan, node, StrView(tensorName), tensorState.meta, tensorState.owner, std::move(tensorState.header));
@@ -952,7 +951,6 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     if (IsMegatronShardedObject(val))
     {
-        // The object's unique_key is a full FQN, so it reparents to the state-dict root.
         RegisterShardedObject(scan, val);
         return true;
     }

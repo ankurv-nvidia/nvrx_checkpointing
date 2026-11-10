@@ -7,13 +7,12 @@
 
 struct StateSerDes
 {
-    using Type = StateNode::Type;
+    using Type                            = StateNode::Type;
+    static constexpr uint32_t WireMagic   = 0x32525453U;
+    static constexpr uint32_t WireVersion = 2;
 
     struct DictHeader
     { uint32_t numChild{}; };
-
-    struct BlobHeader
-    { uint32_t dataSize{}; };
 
     struct ShardedTensorHeader
     { uint32_t numShards{}; };
@@ -32,8 +31,25 @@ struct StateSerDes
 #pragma pack(pop)
     // NOLINTEND
 
-    private:
-    public:
+    static void WriteRanks(std::ostream& stream, std::set<Rank> const& ranks)
+    {
+        serdes::WriteTrivial(stream, static_cast<uint32_t>(ranks.size()));
+        for (auto const rank : ranks) { serdes::WriteTrivial(stream, rank); }
+    }
+
+    static std::set<Rank> ReadRanks(std::istream& stream, Rank worldSize)
+    {
+        auto const count = serdes::ReadTrivial<uint32_t>(stream);
+        if (count > static_cast<uint32_t>(worldSize)) { throw std::runtime_error("Too many replica ranks in state registry"); }
+        std::set<Rank> ranks;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            auto const rank = serdes::ReadTrivial<Rank>(stream);
+            if (rank >= worldSize || !ranks.insert(rank).second) { throw std::runtime_error("Invalid replica rank in state registry"); }
+        }
+        return ranks;
+    }
+
     static std::ostream& WriteTopology(std::ostream& ostrm LFTBND, RankTopology const& topo)
     {
         serdes::WriteTrivial(ostrm, topo.rank);
@@ -72,6 +88,9 @@ struct StateSerDes
         serdes::WriteTrivial(ostrm, tree.SessionId());
         WriteTopology(ostrm, tree._topo);
 
+        serdes::WriteTrivial(ostrm, WireMagic);
+        serdes::WriteTrivial(ostrm, WireVersion);
+
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
         {
@@ -85,17 +104,19 @@ struct StateSerDes
             serdes::WriteBlob(ostrm, std::span(node.name));
             switch (hdr.type)
             {
-            case Type::Blob:
+            case Type::DynamicSizeBlob:
             {
-                auto       data = std::get<StateNode::Blob>(node.data);
-                BlobHeader typehdr{.dataSize = static_cast<uint32_t>(data.size())};
-                serdes::WriteTrivial(ostrm, typehdr);
-                serdes::WriteBlob(ostrm, std::span(data));
+                auto const& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
+                WriteRanks(ostrm, blob.replicas);
+                serdes::WriteTrivial(ostrm, blob.handle);
+                serdes::WriteTrivial(ostrm, blob.storageSize);
             }
             break;
             case Type::Scalar:
             {
-                serdes::WriteTrivial(ostrm, std::get<StateNode::Scalar>(node.data));
+                auto const& scalar = std::get<StateNode::Scalar>(node.data);
+                serdes::WriteTrivial(ostrm, static_cast<Primitives64Bit const&>(scalar));
+                WriteRanks(ostrm, scalar.replicas);
             }
             break;
             case Type::Tensor:
@@ -112,6 +133,7 @@ struct StateSerDes
             }
             break;
             case Type::DTensor:
+            case Type::FixedSizeBlob:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(nodeHandle);
@@ -121,7 +143,9 @@ struct StateSerDes
                         stderr, "StateSerDes::Write!DTensor: Found trace node NATIVE_CKPT_TRACE_NODE = {}\n", NATIVE_CKPT_TRACE_NODE);
                 }
 #endif
-                auto const&         shTen = std::get<DTensor>(node.data);
+                auto const&         shTen = hdr.type == Type::FixedSizeBlob
+                                                ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                                : std::get<DTensor>(node.data);
                 ShardedTensorHeader typehdr{.numShards = static_cast<uint32_t>(shTen.shards.size())};
                 if (shTen.shards.empty())
                 {
@@ -162,6 +186,10 @@ struct StateSerDes
 
     static StateTree& Read(std::istream& istrm, StateTree& tree LFTBND)
     {
+        tree.AssertMutable_();
+        auto const magic   = serdes::ReadTrivial<uint32_t>(istrm);
+        auto const version = serdes::ReadTrivial<uint32_t>(istrm);
+        if (magic != WireMagic || version != WireVersion) { throw std::runtime_error("Unsupported state registry wire format"); }
         auto numChild = serdes::ReadTrivial<uint32_t>(istrm);
         tree._nodes.clear();
         tree._nodes.reserve(numChild);
@@ -193,16 +221,20 @@ struct StateSerDes
                 node.data = std::move(dictNode);
             }
             break;
-            case Type::Blob:
+            case Type::DynamicSizeBlob:
             {
-                auto typehdr = serdes::ReadTrivial<BlobHeader>(istrm);
-                auto blob    = serdes::ReadBlob(istrm, typehdr.dataSize);
-                node.data    = StateNode::Blob{blob.begin(), blob.end()};
+                StateNode::DynamicSizeBlob blob;
+                blob.replicas    = ReadRanks(istrm, tree.GlobalWorldSize());
+                blob.handle      = serdes::ReadTrivial<uint64_t>(istrm);
+                blob.storageSize = serdes::ReadTrivial<uint64_t>(istrm);
+                node.data        = std::move(blob);
             }
             break;
             case Type::Scalar:
             {
-                node.data = serdes::ReadTrivial<Primitives64Bit>(istrm);
+                StateNode::Scalar scalar{serdes::ReadTrivial<Primitives64Bit>(istrm)};
+                scalar.replicas = ReadRanks(istrm, tree.GlobalWorldSize());
+                node.data       = std::move(scalar);
             }
             break;
             case Type::Tensor:
@@ -218,6 +250,7 @@ struct StateSerDes
             }
             break;
             case Type::DTensor:
+            case Type::FixedSizeBlob:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
                 auto fqn = tree.GetNodeId(node.handle);
@@ -241,7 +274,7 @@ struct StateSerDes
                     rankshard.AssertShardIsValid(shTen.fulldim);
                     shTen.AddShard(rankshard);
                 }
-                node.data = std::move(shTen);
+                node.data = StateNode::FixedSizeBlob(shTen);
             }
             break;
             case Type::Invalid:    //
@@ -294,7 +327,8 @@ struct StateSerDes
                     fmt::print(ostrm, "{}: {}\n", name, scalar.template Cast<bool>());
                 }
             }
-            else if (type == StateNode::Type::Blob) { fmt::print(ostrm, "{}: [blob]\n", name); }
+            else if (type == StateNode::Type::FixedSizeBlob) { fmt::print(ostrm, "{}: [fixedblob]\n", name); }
+            else if (type == StateNode::Type::DynamicSizeBlob) { fmt::print(ostrm, "{}: [dynamicblob]\n", name); }
             else if (type == StateNode::Type::Tensor)
             {
                 auto const& tnsr = std::get<Tensor>(node.data);
@@ -318,5 +352,4 @@ struct StateSerDes
             }
         });
     }
-
 };    // namespace StateSerDes

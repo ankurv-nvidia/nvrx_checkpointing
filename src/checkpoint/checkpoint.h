@@ -7,16 +7,21 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 
 void SvcIncrRef();
 void SvcDecrRef();
 
-void FinalizeStateRegistry(StateTree& root);
+void FinalizeStateRegistry(StateTree& localRegistry);
 
-[[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
+std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry);
 
-void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
-void WaitForCheckpointSave(StateTree const& root);
+[[noreturn]] void LoadCheckpoint(StateTree& localRegistry, std::filesystem::path const& ckptPath);
+
+void SaveCheckpoint(StateTree const&                   snapshotRegistry,
+                    checkpoint::ipc::SnapshotId const& snapshotId,
+                    std::filesystem::path const&       ckptPath);
+void WaitForCheckpointSave(StateTree const& snapshotRegistry);
 
 void SvcPing();
 void SvcStop();

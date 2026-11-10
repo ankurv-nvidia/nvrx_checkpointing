@@ -102,7 +102,11 @@ wheel_pytest() {
     "${python}" -m nvrx_checkpointing.metadata_compare --help >/dev/null
     "${python}" -m pytest tests ci/tests -v --junitxml=ci/ci-results/pytest.xml
     chmod +x dev_binaries/ckpttest
-    ./dev_binaries/ckpttest
+    ./dev_binaries/ckpttest --list-tests --verbosity quiet > "${scratch}/native-test-cases.txt"
+    while IFS= read -r test_case; do
+        # Skipped cases return status 4.
+        ./dev_binaries/ckpttest "${test_case}" || [[ $? -eq 4 ]]
+    done < "${scratch}/native-test-cases.txt"
 }
 
 ctest_gate() {
@@ -119,6 +123,23 @@ ctest_gate() {
     export PYTHONPATH=${repo_root}/build-test
     "${python}" -c "import torch; print(torch.__version__, torch.__file__)"
     ctest --test-dir build-test --output-on-failure --output-junit "${repo_root}/ci/ci-results/ctest.xml"
+    local cpu_pythonpath=${scratch}/native-test-python
+    mkdir -p "${cpu_pythonpath}"
+    ln -sfn "${repo_root}" "${cpu_pythonpath}/nvrx_checkpointing"
+    (
+        export CUDA_VISIBLE_DEVICES=
+        export MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
+        export MEGATRON_NATIVE_RUN_SERVER_TESTS=1
+        export PYTHONPATH="${cpu_pythonpath}:${repo_root}/build-test"
+        "${python}" -m pytest --collect-only -q tests/test_native_common_state.py tests/test_snapshot_planning.py \
+            tests/test_sharded_tensor_registration.py tests/test_quantized_binding.py > "${scratch}/native-python-cases.txt"
+        local native_test_index=0
+        while IFS= read -r test_case; do
+            [[ ${test_case} == tests/*::* ]] || continue
+            "${python}" -m pytest "${test_case}" -v --junitxml="ci/ci-results/native-pytest-${native_test_index}.xml"
+            native_test_index=$((native_test_index + 1))
+        done < "${scratch}/native-python-cases.txt"
+    )
     "${python}" ci/scripts/ckpt_stress.py --gpus-per-node 2
 }
 

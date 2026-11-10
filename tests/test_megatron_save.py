@@ -872,7 +872,6 @@ def test_load_registers_live_state_after_loading(
             ),
             "preserve end",
             ("register", {"model": "live state", "num_floating_point_operations_so_far": 34}, 0),
-            "wait",
             "finalize",
         ],
     )
@@ -995,7 +994,7 @@ def test_registration_respects_no_save_rng(save: ModuleType, monkeypatch: pytest
     assert save._prepare_registration_state_dict(state, 0) == state
 
 
-def test_common_state_padding_is_local_to_megatron_serialization(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_common_state_serialization_accepts_dynamic_sizes(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
 
     monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
@@ -1004,28 +1003,24 @@ def test_common_state_padding_is_local_to_megatron_serialization(save: ModuleTyp
 
     first = save._prepare_registration_state_dict(state, 0)[save._DCP_COMMON_STATE_KEY]
     second = save._prepare_registration_state_dict(state, 1)[save._DCP_COMMON_STATE_KEY]
-    expected_capacity = save._COMMON_STATE_ALIGNMENT
+    third = save._prepare_registration_state_dict(state, 2)[save._DCP_COMMON_STATE_KEY]
 
-    assert len(first) == len(second) == expected_capacity
-    assert first[:100] == b"a" * 100
-    assert second[:200] == b"b" * 200
-    with pytest.raises(
-        RuntimeError,
-        match=rf"common state serialized to 2048 bytes, exceeding its registered {expected_capacity}-byte capacity",
-    ):
-        save._prepare_registration_state_dict(state, 2)
+    assert first == b"a" * 100
+    assert second == b"b" * 200
+    assert third == b"c" * 2048
 
 
+@pytest.mark.parametrize("replica_id", [0, 1, (0, 1, 0)])
 def test_rng_sharded_object_padding_is_local_to_megatron_serialization(
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
+    replica_id: int | tuple[int, ...],
 ) -> None:
     class ShardedObject:
-        replica_id = 0
-
         def __init__(self, data: object) -> None:
             self.data = data
             self.unique_key = "rng_state/shard_0_1"
+            self.replica_id = replica_id
 
     payloads = iter((b"a" * 100, b"b" * 200, b"c" * 2048))
     monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)

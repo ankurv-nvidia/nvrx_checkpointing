@@ -12,11 +12,15 @@ import types
 import weakref
 from itertools import count
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 try:
     from nvrx_checkpointing import checkpoint
@@ -43,6 +47,16 @@ _REQUIRES_CHECKPOINT_SERVER = pytest.mark.skipif(
     os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1",
     reason="requires checkpoint-server IPC support",
 )
+pytestmark = [pytest.mark.integration, _REQUIRES_CHECKPOINT_SERVER]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_checkpoint_service() -> Iterator[None]:
+    checkpoint.svc_spindown()
+    try:
+        yield
+    finally:
+        checkpoint.svc_spindown()
 
 
 def _create_root():
@@ -272,8 +286,11 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
         return value
 
     shards = [tensor(0x22), tensor(0x44)]
+    build_calls = 0
 
     def build(key: str, *_args: object) -> list[ShardedTensor]:
+        nonlocal build_calls
+        build_calls += 1
         return [
             ShardedTensor(
                 key=key,
@@ -298,9 +315,12 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.wait_for_async_completion()
+    registered_build_calls = build_calls
     checkpoint_dir = tmp_path / "nvfp4-shards"
     try:
         root.save(1, checkpoint_dir)
+        assert build_calls == registered_build_calls
         deadline = time.monotonic() + 30
         while not (checkpoint_dir / ".metadata").is_file():
             if time.monotonic() >= deadline:
@@ -324,8 +344,9 @@ def test_quantized_registration_rejects_components_on_different_devices() -> Non
     tensor._with_gemm_swizzled_scales = False
 
     root = _create_root()
+    root.register_state_dict({"weight": tensor})
     with pytest.raises(RuntimeError, match="components must be on one device"):
-        root.register_state_dict({"weight": tensor})
+        root.wait_for_async_completion()
 
 
 def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:

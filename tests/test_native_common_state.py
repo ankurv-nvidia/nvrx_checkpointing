@@ -126,3 +126,70 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
             }
     finally:
         checkpoint.svc_spindown()
+
+
+def test_daemon_embeds_changing_common_state_lengths(tmp_path: Path) -> None:
+    session_id = 2001
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+    root.register_state_dict({_DCP_COMMON_STATE_KEY: b""})
+    root.finalize_registry()
+
+    try:
+        for iteration, length in enumerate((10, 4096, 0), 1):
+            value = {"payload": "x" * length, "iteration": iteration}
+            buffer = io.BytesIO()
+            torch.save([value], buffer)
+            serialized = buffer.getvalue()
+            checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
+
+            root.register_state_dict({_DCP_COMMON_STATE_KEY: serialized})
+            root.save(iteration, checkpoint_dir)
+            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+            assert _load_common_state(checkpoint_dir) == value
+            metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
+            entry = next(info for index, info in metadata.storage_data.items() if index.fqn == _DCP_COMMON_STATE_KEY)
+            assert entry.length == len(serialized)
+    finally:
+        checkpoint.svc_spindown()
+
+
+def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
+    session_id = 2002
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+
+    def state(iteration: int) -> dict[str, object]:
+        return {
+            "weight": torch.arange(8, dtype=torch.float32) + iteration,
+            "step": iteration,
+            "rng_state": ShardedObject("rng_state", {"iteration": iteration}, (1,), (0,)),
+            "empty_blob": b"",
+            _DCP_COMMON_STATE_KEY: _serialize_common_state(iteration),
+        }
+
+    try:
+        for iteration in (1, 2):
+            directory = tmp_path / f"iter_{iteration:07d}"
+            root.register_state_dict(state(iteration))
+            root.save(iteration, directory)
+            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+            loaded = {"weight": torch.zeros(8, dtype=torch.float32)}
+            dcp.load(loaded, checkpoint_id=str(directory))
+            torch.testing.assert_close(loaded["weight"], torch.arange(8, dtype=torch.float32) + iteration)
+            assert _load_common_state(directory)["iteration"] == iteration
+            assert _load_sharded_object(directory) == {"iteration": iteration}
+            metadata = dcp.FileSystemReader(directory).read_metadata()
+            entries = [info for index, info in metadata.storage_data.items() if index.fqn == "empty_blob"]
+            assert len(entries) == 1
+            assert entries[0].length == 0
+
+        incomplete = state(3)
+        del incomplete[_DCP_COMMON_STATE_KEY]
+        root.register_state_dict(incomplete)
+        root.save_async(3, tmp_path / "iter_0000003")
+        with pytest.raises(RuntimeError, match=r"registered state 'common_state/shard_0_1' was not supplied for this snapshot"):
+            root.wait_for_async_completion()
+        assert not (tmp_path / "iter_0000003").exists()
+    finally:
+        checkpoint.svc_spindown()

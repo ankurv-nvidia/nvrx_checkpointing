@@ -23,27 +23,28 @@
 // Server is defined in server.cpp at file scope; Session only holds a pointer to it.
 struct Server;
 
-struct TensorShardInfo
-{
-    Tensor::DType     durableDtype{};
-    Tensor::Dim       fulldim;
-    DTensor::Shard    tensorInfo;
-    StateTree::NodeId nodeId;
-};
-
 struct Session
 {
-    // State for Devices directly connected to this peer
-    struct LocalState
+    struct SnapshotState
     {
-        std::shared_ptr<StateTree>     localRegistry;
-        ByteStorage                    tensorStorage;
-        checkpoint::distcp::BlobsByFqn blobs;
-        std::chrono::nanoseconds       startedAt{};
+        std::shared_ptr<StateTree> snapshotRegistry;
+        ByteStorage                snapshotData;
+        std::chrono::nanoseconds   startedAt{};
+        int                        numaNode{-1};
 
-        uint64_t writtenTensorRangeBegin{0};
-        uint64_t writtenTensorRangeEnd{0};
-        uint64_t writtenTensorSize{0};
+        uint64_t writtenPayloadRangeBegin{0};
+        uint64_t writtenPayloadRangeEnd{0};
+        uint64_t writtenPayloadSize{0};
+    };
+
+    struct RegistryState
+    {
+        std::shared_ptr<StateTree>                                            globalRegistry;
+        std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> localRegistryForRank;
+        std::map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>>           snapshotRegistryForRank;
+        bool                                                                  planningStarted{false};
+        bool                                                                  planningReady{false};
+        std::string                                                           planningFailure;
     };
 
     struct Snapshot
@@ -54,11 +55,9 @@ struct Session
 
         std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
-        checkpoint::distcp::BlobMetadataByFqn blobMetadata;
-        std::shared_ptr<StateTree>            globalRegistry;
-        std::shared_ptr<StateTree>            dedupedGlobalRegistry;
+        std::shared_ptr<StateTree> snapshotRegistry;
 
-        std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>> localStates;
+        std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<SnapshotState>> snapshotStateForRank;
 
         std::unordered_set<checkpoint::ipc::Rank> finalizedRanks;
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
@@ -76,12 +75,9 @@ struct Session
     mutable std::mutex mutex;
 
     // Session State variables
-    Snapshot                                                 sessionState;    // The tensor storage on this is empty
-    std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
-    std::unordered_set<checkpoint::ipc::Rank>                receivedFrom;    // Ranks from which data has been received.
-    uint64_t                                                 largestSnapshotSize{0};
-
-    checkpoint::distcp::BlobMetadataByFqn blobMetas;
+    RegistryState                             sessionState;
+    std::unordered_set<checkpoint::ipc::Rank> receivedFrom;    // Ranks from which data has been received.
+    uint64_t                                  largestSnapshotSize{0};
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
@@ -98,9 +94,7 @@ struct Session
     void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);
 
-    void   HandleStateRegistryFragment(checkpoint::ipc::Rank                                recvRank,
-                                       std::vector<TensorShardInfo> const&                  tensorShards,
-                                       std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn);
+    void   HandleStateRegistryFragment(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> registry);
     bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
     size_t PeerIndex() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer; }
 
@@ -118,9 +112,8 @@ struct Session
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
 
     private:
-    LocalState& GetSessionLocalState_(checkpoint::ipc::Rank rank) LFTBND;
-    Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
-    Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot& GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 
 #ifdef DEBUG_MD5SUM
     void DebugWriteNativeMetadataInfo_(Snapshot const& snapshot) const;
@@ -128,9 +121,6 @@ struct Session
 
     void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
     void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
-
-    void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
-    void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
