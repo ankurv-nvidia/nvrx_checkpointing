@@ -9,7 +9,7 @@ struct StateSerDes
 {
     using Type                            = StateNode::Type;
     static constexpr uint32_t WireMagic   = 0x32525453U;
-    static constexpr uint32_t WireVersion = 2;
+    static constexpr uint32_t WireVersion = 3;
 
     struct DictHeader
     { uint32_t numChild{}; };
@@ -224,7 +224,7 @@ struct StateSerDes
                 node.data       = std::move(scalar);
             }
             break;
-            case Type::DTensor:
+            case Type::DTensor: [[fallthrough]];
             case Type::FixedSizeBlob:
             {
 #ifdef NATIVE_CKPT_TRACE_NODE
@@ -249,7 +249,11 @@ struct StateSerDes
                     rankshard.AssertShardIsValid(shTen.fulldim);
                     shTen.AddShard(rankshard);
                 }
-                node.data = StateNode::FixedSizeBlob(shTen);
+                if (hdr.type == Type::FixedSizeBlob) { node.data = StateNode::FixedSizeBlob(shTen); }
+                else
+                {
+                    node.data = std::move(shTen);
+                }
             }
             break;
             case Type::Invalid:    //
