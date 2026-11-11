@@ -31,8 +31,6 @@ template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
     }
 };
 
-static constexpr int              MaxRetries                     = 20;
-static constexpr auto             IntervalBetweenRetries         = std::chrono::milliseconds(100);
 static constexpr std::string_view RegistryContentEncoding        = "deflate";
 
 template <typename TStream> static void TryCleanShutdown(TStream& stream)

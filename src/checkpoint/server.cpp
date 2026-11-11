@@ -76,7 +76,6 @@ namespace tel  = checkpoint::telemetry;
 // Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
 
-static constexpr auto ServerWaitTimeout = 900s;
 
 // uint32_t ranks
 // uint32_t iterations
@@ -356,8 +355,6 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
     });
 }
 
-static constexpr auto             IntervalBetweenRetries         = std::chrono::milliseconds(100);
-static constexpr auto             ThreadStallWaitForEventTimeout = std::chrono::seconds(30);
 static constexpr std::string_view RegistryContentEncoding        = "deflate";
 
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
