@@ -44,6 +44,7 @@ template <> struct fmt::formatter<Message::SnapshotData> : fmt::formatter<std::s
     auto format(Message::SnapshotData const& obj, fmt::format_context& ctx) const    // NOLINT
     { return fmt::format_to(ctx.out(), "(sessionId={}, messageSize={}, offset={})", obj.sessionId, obj.messageSize, obj.offset); }
 };
+
 static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool validate, bool debug)
 {
     SetThreadName("ncs:server");

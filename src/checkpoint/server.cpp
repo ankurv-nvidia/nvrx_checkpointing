@@ -76,7 +76,6 @@ namespace tel  = checkpoint::telemetry;
 // Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
 
-
 // uint32_t ranks
 // uint32_t iterations
 using Request = boost::beast::http::request<boost::beast::http::buffer_body>;
@@ -355,7 +354,7 @@ template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& 
     });
 }
 
-static constexpr std::string_view RegistryContentEncoding        = "deflate";
+static constexpr std::string_view RegistryContentEncoding = "deflate";
 
 void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
 {
@@ -483,9 +482,9 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         }
         else
         {
-            localState = std::move(localRegistry);
-            largestSnapshotSize       = std::max(largestSnapshotSize, snapshotSize);
-            registryAccepted          = true;
+            localState          = std::move(localRegistry);
+            largestSnapshotSize = std::max(largestSnapshotSize, snapshotSize);
+            registryAccepted    = true;
             asyncTasks.emplace_back(
                 std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkReceiveLocalStateRegistry_, this, rank));
             if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
@@ -501,7 +500,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     if (registryAccepted)
     {
         DebugOutputToFile(RankRegistryDumpName(rank, registryTopo.worldSize),
-                     [&](std::ostream& ostrm) { ostrm.write(buf.data(), static_cast<std::streamsize>(buf.size())); });
+                          [&](std::ostream& ostrm) { ostrm.write(buf.data(), static_cast<std::streamsize>(buf.size())); });
     }
     // Each reply waits for the node's last registry, so every rank opens finished queues sized for the largest local snapshot.
     auto const firstLocalRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;

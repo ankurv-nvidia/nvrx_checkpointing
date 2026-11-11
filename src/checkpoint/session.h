@@ -48,8 +48,8 @@ struct Session
 
     struct RegistryState
     {
-        std::shared_ptr<StateTree> globalRegistry;
-        std::shared_ptr<StateTree> dedupedGlobalRegistry;
+        std::shared_ptr<StateTree>                                            globalRegistry;
+        std::shared_ptr<StateTree>                                            dedupedGlobalRegistry;
         std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> localRegistryForRank;
     };
 
@@ -113,8 +113,10 @@ struct Session
 
     void HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry);
 
-    void RelayWriteCkptCompleteToPeers(checkpoint::ipc::SnapshotId snapshotId, std::string_view const& failure,
-                                       size_t startPeerIndex, size_t endPeerIndex) const;
+    void RelayWriteCkptCompleteToPeers(checkpoint::ipc::SnapshotId snapshotId,
+                                       std::string_view const&     failure,
+                                       size_t                      startPeerIndex,
+                                       size_t                      endPeerIndex) const;
 
     void RelayGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
 
@@ -131,9 +133,8 @@ struct Session
 
     private:
     std::shared_ptr<StateTree> GetLocalRegistry_(checkpoint::ipc::Rank rank);
-    Snapshot&   GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
-    Snapshot&   GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
-
+    Snapshot&                  GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot&                  GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 
     void AsyncWorkReceiveLocalStateRegistry_(checkpoint::ipc::Rank const& rank);
     void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;

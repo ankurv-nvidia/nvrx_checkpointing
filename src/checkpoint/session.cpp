@@ -1,7 +1,7 @@
 #include "session.h"
+#include "SetThreadName.h"
 #include "logging.h"
 #include "net_utils.h"
-#include "SetThreadName.h"
 #include "server.h"
 #include "stateserdes.h"
 #include "telemetry.h"
@@ -31,7 +31,7 @@ template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
     }
 };
 
-static constexpr std::string_view RegistryContentEncoding        = "deflate";
+static constexpr std::string_view RegistryContentEncoding = "deflate";
 
 template <typename TStream> static void TryCleanShutdown(TStream& stream)
 {
@@ -103,10 +103,7 @@ static void SendToPeerWithRetries(Session const&          session,
         } catch (std::exception const& ex)
         {
             lastError = ex.what();
-            if (attempt < MaxRetries)
-            {
-                WARN("[{}] Attempt {} peer={} failed target={} {}", session, attempt, peer, target, ex.what());
-            }
+            if (attempt < MaxRetries) { WARN("[{}] Attempt {} peer={} failed target={} {}", session, attempt, peer, target, ex.what()); }
             else
             {
                 ERR("[{}] Attempt {} peer={} failed target={} {}", session, attempt, peer, target, ex.what());
@@ -156,8 +153,7 @@ struct TensorReplicaDeduplicationResult
 };
 }    // namespace
 
-static void
-WriteGlobalStateTreeToFile(std::ostream& ostrm, Session const& session, Session::Snapshot const& snapshot)
+static void WriteGlobalStateTreeToFile(std::ostream& ostrm, Session const& session, Session::Snapshot const& snapshot)
 {
     auto start1 = PerfClock::now();
     StateSerDes::Write(ostrm, *snapshot.globalRegistry, StateNode::Handle::Root);
@@ -170,10 +166,10 @@ static void ValidateGlobalStateTree(Session const& session, Session::Snapshot co
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::Tensor)
         {
-            throw std::runtime_error(fmt::format(
-                "[native_ckpt:svr][{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
-                session,
-                snapshot.globalRegistry->GetNodeId(node.handle)));
+            throw std::runtime_error(
+                fmt::format("[native_ckpt:svr][{}][ERROR] DebugWriteMetdataKeyValuePairs: Unexpected TensorShard node in activeGlobalState",
+                            session,
+                            snapshot.globalRegistry->GetNodeId(node.handle)));
         }
         if (type == StateNode::Type::DTensor)
         {
@@ -181,9 +177,7 @@ static void ValidateGlobalStateTree(Session const& session, Session::Snapshot co
             for (auto const& shard : tnsr.shards) { shard.AssertShardIsValid(tnsr.fulldim); }
             if (tnsr.shards.empty())
             {
-                WARN("[{}] empty sharded tensor='{}' in metadata output",
-                     session,
-                     snapshot.globalRegistry->GetNodeId(node.handle));
+                WARN("[{}] empty sharded tensor='{}' in metadata output", session, snapshot.globalRegistry->GetNodeId(node.handle));
                 return;
             }
             snapshot.globalRegistry->AssertShardedTensorHasNoHoles(node.handle);
@@ -293,7 +287,6 @@ static TensorReplicaDeduplicationResult DeduplicateTensorReplicas(StateTree cons
     return {.dedupedRegistry = std::move(dedupedRegistry), .stats = std::move(stats)};
 }
 
-
 static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
 {
     static constexpr int RegistryCompressionLevel = 1;
@@ -312,9 +305,9 @@ static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
 }
 
 void Session::RelayWriteCkptCompleteToPeers(cipc::SnapshotId        snapshotId,
-                                           std::string_view const& failure,
-                                           size_t                  startPeerIndex,
-                                           size_t                  endPeerIndex) const
+                                            std::string_view const& failure,
+                                            size_t                  startPeerIndex,
+                                            size_t                  endPeerIndex) const
 {
     if (startPeerIndex >= endPeerIndex) { return; }
     auto        delegateStart = (startPeerIndex + endPeerIndex) / 2;
@@ -322,7 +315,7 @@ void Session::RelayWriteCkptCompleteToPeers(cipc::SnapshotId        snapshotId,
     auto const  postTarget
         = fmt::format("/api/peer/writeckptcomplete/{}/0/{}?fwd={}:{}", sessionId, snapshotId, delegateStart, endPeerIndex);
     SendToPeerWithRetries(*this, peer, failure, postTarget, {});
-    RelayWriteCkptCompleteToPeers( snapshotId, failure, startPeerIndex, delegateStart);
+    RelayWriteCkptCompleteToPeers(snapshotId, failure, startPeerIndex, delegateStart);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -411,8 +404,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
 
             PERF() << tel::span::SvrWriteMetadata::Begin{.id
                                                          = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
-            DebugOutputToFile("registry.global.bin",
-                         [&](std::ostream& ostrm) { WriteGlobalStateTreeToFile(ostrm, *this, snapshot); });
+            DebugOutputToFile("registry.global.bin", [&](std::ostream& ostrm) { WriteGlobalStateTreeToFile(ostrm, *this, snapshot); });
             ValidateGlobalStateTree(*this, snapshot);
             PERF() << tel::span::SvrWriteMetadata::End{.id
                                                        = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId}};
@@ -503,11 +495,8 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                 checkpoint::distcp::WriteMetadata(snapshot.path.parent_path(), *dedupedGlobalRegistry, snapshot.blobMetadata);
             } catch (std::exception const& ex)
             {
-                throw std::runtime_error(fmt::format("[{}] WriteMetadata failed for snapshot={} rank={}: {}",
-                                                     *this,
-                                                     hdr.snapshotId,
-                                                     hdr.globalRank,
-                                                     ex.what()));
+                throw std::runtime_error(
+                    fmt::format("[{}] WriteMetadata failed for snapshot={} rank={}: {}", *this, hdr.snapshotId, hdr.globalRank, ex.what()));
             }
             std::chrono::microseconds durableUs{};
             {
@@ -540,11 +529,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                 fmt::format("snapshot={} rank={} Finalize failed: {}", hdr.snapshotId, hdr.globalRank, ex.what()));
             failure = fmt::format("{}", fmt::join(snapshot.failures, ", "));
         }
-        ERR("[{}] Snapshot finalization failed for snapshot={} rank={}: {}",
-            *this,
-            hdr.snapshotId,
-            hdr.globalRank,
-            ex.what());
+        ERR("[{}] Snapshot finalization failed for snapshot={} rank={}: {}", *this, hdr.snapshotId, hdr.globalRank, ex.what());
         if (hdr.globalRank == Rank{0})
         {
             BroadcastWriteCkptCompleteToPeers_(snapshot);
@@ -624,10 +609,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                  remainingSnapshots,
                  numActiveSnapshots);
         }
-    } catch (std::exception const& ex)
-    {
-        ERR("[{}] Exception occurred while releasing snapshot buffers: {}", *this, ex.what());
-    }
+    } catch (std::exception const& ex) { ERR("[{}] Exception occurred while releasing snapshot buffers: {}", *this, ex.what()); }
 }
 
 void Session::MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& /* lock */, std::vector<TensorShardInfo> const& tensorShards)
@@ -727,7 +709,7 @@ void Session::BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const
         std::scoped_lock lock(mutex);
         failure = fmt::format("{}", fmt::join(snapshot.failures, ","));
     }
-    RelayWriteCkptCompleteToPeers( snapshot.snapshotId, failure, 1, topo.peers.size());
+    RelayWriteCkptCompleteToPeers(snapshot.snapshotId, failure, 1, topo.peers.size());
 
     INFO("[{}] Broadcast global registry to {} peer(s)", *this, topo.peers.size() - 1);
 }
@@ -761,9 +743,9 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
 
 void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry)
 {
-    auto dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(globalRegistry->GlobalWorldSize()));
+    auto             dedupResult = DeduplicateTensorReplicas(*globalRegistry, static_cast<uint32_t>(globalRegistry->GlobalWorldSize()));
     std::scoped_lock lock(mutex);
-    sessionState.globalRegistry = std::move(globalRegistry);
+    sessionState.globalRegistry        = std::move(globalRegistry);
     sessionState.dedupedGlobalRegistry = std::move(dedupResult.dedupedRegistry);
 }
 
@@ -788,8 +770,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
     auto it = snapshots.find(snapshotId);
     if (it == snapshots.end())
     {
-        throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}][ERROR] GetSnapshot_: no snapshot with id={}", *this, snapshotId));
+        throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] GetSnapshot_: no snapshot with id={}", *this, snapshotId));
     }
     return *it->second;
 }
@@ -860,15 +841,14 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
             }
             if (localState.writtenTensorRangeBegin != 0 || localState.writtenTensorRangeEnd != localState.tensorStorage.size)
             {
-                throw std::runtime_error(
-                    fmt::format("[native_ckpt:svr][{}][ERROR] Tensor data received has invalid range. sessionid={}. "
-                                "rcvd-size={}(range{} - {}) expected range=0 - {}",
-                                *this,
-                                hdr.sessionId,
-                                localState.writtenTensorSize,
-                                localState.writtenTensorRangeBegin,
-                                localState.writtenTensorRangeEnd,
-                                localState.tensorStorage.size));
+                throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Tensor data received has invalid range. sessionid={}. "
+                                                     "rcvd-size={}(range{} - {}) expected range=0 - {}",
+                                                     *this,
+                                                     hdr.sessionId,
+                                                     localState.writtenTensorSize,
+                                                     localState.writtenTensorRangeBegin,
+                                                     localState.writtenTensorRangeEnd,
+                                                     localState.tensorStorage.size));
             }
             if (sessionState.globalRegistry == nullptr)
             {

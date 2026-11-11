@@ -58,7 +58,7 @@ struct Message
 
         // Received from local client or from peers
         LocalStateRegistry,    // Combination of Replicated and Sharded State Registry
-        SnapshotData,        // Could be received multiple times in chunked manner
+        SnapshotData,          // Could be received multiple times in chunked manner
 
         StateRegistryFragment,    // The format is differnt from StateRegistry.
         // ShardedStateData,
