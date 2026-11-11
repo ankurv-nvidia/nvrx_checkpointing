@@ -797,7 +797,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
 void Session::Activate()
 { start = PerfClock::now(); }
 
-void Session::Handle(cipc::Message::LocalStateData const& hdr1, std::span<char const> buf)
+void Session::Handle(cipc::Message::SnapshotData const& hdr1, std::span<char const> buf)
 {
     void* ptr = nullptr;
     {

@@ -866,9 +866,9 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
         SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;
-    case cipc::Message::Type::LocalStateData:
+    case cipc::Message::Type::SnapshotData:
     {
-        auto const& hdr1 = std::get<cipc::Message::LocalStateData>(hdr);
+        auto const& hdr1 = std::get<cipc::Message::SnapshotData>(hdr);
         SessionById_(hdr1.sessionId).Handle(hdr1, buf);
     }
     break;

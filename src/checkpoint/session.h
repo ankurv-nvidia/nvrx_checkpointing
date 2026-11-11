@@ -100,7 +100,7 @@ struct Session
     void Activate();
 
     void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf);
-    void Handle(checkpoint::ipc::Message::LocalStateData const& hdr1, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::SnapshotData const& hdr1, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);

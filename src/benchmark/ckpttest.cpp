@@ -1741,7 +1741,7 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{0});
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
-    queue.Push({checkpoint::ipc::Message::LocalStateData{
+    queue.Push({checkpoint::ipc::Message::SnapshotData{
                    .sessionId   = checkpoint::ipc::SessionId::Default,
                    .snapshotId  = checkpoint::ipc::SnapshotId{40},
                    .globalRank  = Rank{0},
@@ -1897,7 +1897,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     for (uint32_t const rank : {0u, 1u})
     {
         ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
-        queue.Push({checkpoint::ipc::Message::LocalStateData{
+        queue.Push({checkpoint::ipc::Message::SnapshotData{
                        .sessionId   = checkpoint::ipc::SessionId::Default,
                        .snapshotId  = checkpoint::ipc::SnapshotId{40},
                        .globalRank  = Rank{rank},
@@ -2044,7 +2044,7 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             for (uint32_t const rank : {2u, 3u})
             {
                 ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
-                queue.Push({checkpoint::ipc::Message::LocalStateData{
+                queue.Push({checkpoint::ipc::Message::SnapshotData{
                                .sessionId   = checkpoint::ipc::SessionId::Default,
                                .snapshotId  = checkpoint::ipc::SnapshotId{40},
                                .globalRank  = Rank{rank},

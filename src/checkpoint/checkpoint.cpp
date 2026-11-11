@@ -543,7 +543,7 @@ struct CheckpointWriter
 
         void FlushBytes_(size_t sendBytes)
         {
-            auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{
+            auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::SnapshotData{
                 .sessionId   = that->root.SessionId(),
                 .snapshotId  = snapshotId,
                 .globalRank  = that->root.GlobalRank(),
