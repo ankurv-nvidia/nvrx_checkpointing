@@ -13,6 +13,7 @@
 #include <boost/iostreams/filter/zlib.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/iostreams/stream.hpp>
+#include <utility>
 
 template <> struct fmt::formatter<Server>;
 namespace cipc  = checkpoint::ipc;
@@ -20,38 +21,6 @@ namespace tel   = checkpoint::telemetry;
 using PerfClock = std::chrono::system_clock;
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
 
-#if 0
-namespace
-{
-struct WaitingForRanks
-{
-    std::unordered_set<Rank> const& receivedFrom;    // NOLINT
-    Rank                            begin;
-    Rank                            end;
-};
-}    // namespace
-
-template <> struct fmt::formatter<WaitingForRanks> : fmt::formatter<std::string_view>
-{
-    auto format(WaitingForRanks const& wfr, fmt::format_context& ctx) const    // NOLINT
-    {
-        static constexpr size_t MaxWaitingForVerbose = 10;
-
-        auto needed = static_cast<uint32_t>(wfr.end) - static_cast<uint32_t>(wfr.begin) - wfr.receivedFrom.size();
-
-        if (needed > MaxWaitingForVerbose) { return format_to(ctx.out(), "waitingFor=[{} ranks]", needed); }
-
-        std::vector<Rank> waitingFor;
-        for (auto rank = static_cast<uint32_t>(wfr.begin); rank < static_cast<uint32_t>(wfr.end); ++rank)
-        {
-            if (!wfr.receivedFrom.contains(Rank{rank})) { waitingFor.push_back(Rank{rank}); }
-        }
-        return format_to(ctx.out(), "{}", fmt::format("waitingFor=[{}]", fmt::join(waitingFor, ",")));
-    }
-};
-#endif
-
-// Formatter for Server*
 template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
 {
     auto format(Session const& session, fmt::format_context& ctx) const    // NOLINT
@@ -83,33 +52,6 @@ static void SendToPeerWithRetries(Session const&          session,
             req.prepare_payload();
             boost::beast::http::write(stream, req);
 
-#ifdef USE_EXPECT_CONTINUE
-            if (expectContinue) { req.set(boost::beast::http::field::expect, "100-continue"); }
-
-            boost::beast::flat_buffer                                               buffer;
-            boost::beast::http::request_serializer<boost::beast::http::buffer_body> serializer{req};
-
-            // Offer the body rather than upload it. A peer that already holds the registry
-            // answers 204 here and the payload never goes on the wire. Declining mid-upload
-            // instead would race a connection reset against the response.
-            if (expectContinue)
-            {
-                boost::beast::http::write_header(stream, serializer);
-                boost::beast::http::response_parser<boost::beast::http::empty_body> interim;
-                boost::beast::http::read_header(stream, buffer, interim);
-                auto const offerResult = interim.get().result();
-                if (offerResult == boost::beast::http::status::no_content)
-                {
-                    TryCleanShutdown(stream);
-                    return false;
-                }
-                if (offerResult != boost::beast::http::status::continue_)
-                {
-                    throw std::runtime_error(fmt::format("peer answered the body offer with HTTP {}", interim.get().result_int()));
-                }
-            }
-            boost::beast::http::write(stream, serializer);
-#endif
             boost::beast::flat_buffer                                     buffer;
             boost::beast::http::response<boost::beast::http::string_body> res;
             boost::beast::http::read(stream, buffer, res);
@@ -193,8 +135,20 @@ static void FailPlanning(Session& session, std::string failure)
     }));
 }
 
-void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string /* failure */)
+void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
+try
 {
+    if (!failure.empty())
+    {
+        if (IsCoordinatorPeer()) { FailPlanning(*this, std::move(failure)); }
+        else
+        {
+            std::scoped_lock lock(mutex);
+            sessionState.planningFailure = std::move(failure);
+        }
+        return;
+    }
+
     struct Assignment
     {
         StateNode::Handle node{StateNode::Handle::Invalid};
@@ -372,7 +326,7 @@ void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, st
     sessionState.globalRegistry          = std::move(globalRegistry);
     sessionState.snapshotRegistryForRank = std::move(registries);
     sessionState.planningReady           = true;
-}
+} catch (std::exception const& error) { FailPlanning(*this, error.what()); }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& hdr) noexcept
@@ -753,7 +707,6 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
 void Session::Handle(cipc::Message::SnapshotData const& hdr1, std::span<char const> buf)
 {
     void* ptr = nullptr;
-    // int   numaNode = -1;
     {
         std::scoped_lock lock(mutex);
         auto&            snapshot      = GetSnapshot_(lock, hdr1.snapshotId);
@@ -786,15 +739,13 @@ void Session::Handle(cipc::Message::SnapshotData const& hdr1, std::span<char con
         }
 
         ptr = snapshotState.snapshotData[hdr1.offset];
-        // numaNode = snapshotState.numaNode;
     }
-    // TODO_NOMERGE : this should not be on every slot copy BindThreadCpuToNumaNode(numaNode);
     std::memcpy(ptr, buf.data(), hdr1.messageSize);
 }
 
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
-    auto AddSize = [](uint64_t total, uint64_t size) -> uint64_t {
+    auto addSize = [](uint64_t total, uint64_t size) -> uint64_t {
         if (size > std::numeric_limits<uint64_t>::max() - total) { throw std::overflow_error("Snapshot payload size overflow"); }
         return total + size;
     };
@@ -823,7 +774,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                     for (auto shard : tensor.shards)
                     {
                         shard.handle = offset;
-                        offset       = AddSize(offset, shard.storageSize);
+                        offset       = addSize(offset, shard.storageSize);
                         packed.insert(shard);
                     }
                     tensor.shards = std::move(packed);
@@ -832,7 +783,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                 {
                     auto& blob  = std::get<StateNode::DynamicSizeBlob>(node.data);
                     blob.handle = offset;
-                    offset      = AddSize(offset, blob.storageSize);
+                    offset      = addSize(offset, blob.storageSize);
                 }
             });
         }
@@ -890,7 +841,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         .startedAt = hdr.startedAt,
     };
     INFO("[{}] Activated snapshot={} rank={} payload bytes={} path={}", *this, hdr.snapshotId, hdr.globalRank, hdr.snapshotSize, ckptPath);
-}    // namespace
+}
 
 void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char const> /* buf */)
 {
@@ -1075,6 +1026,7 @@ bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
 }
 
 void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
+try
 {
     std::shared_ptr<StateTree> registry;
     {
@@ -1090,4 +1042,4 @@ void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);
         SendToPeerWithRetries(*this, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
     }
-}
+} catch (std::exception const& error) { FailPlanning(*this, error.what()); }

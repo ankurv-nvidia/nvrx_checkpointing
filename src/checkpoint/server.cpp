@@ -665,7 +665,7 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId                           
 
 void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
 {
-    std::scoped_lock lock(_mutex);
+    std::unique_lock lock(_mutex);
     _lastPingTime = PerfClock::now();
 
     BufStream bufStream{buf.data(), buf.size()};
@@ -688,6 +688,16 @@ void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnaps
         if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
         else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
     }
+    auto*                                            session = it->second.get();
+    std::vector<std::unique_ptr<PendingSessionData>> pending;
+    auto const                                       queued = _pendingSessionData.find(sessionId);
+    if (queued != _pendingSessionData.end())
+    {
+        pending = std::move(queued->second);
+        _pendingSessionData.erase(queued);
+    }
+    lock.unlock();
+    for (auto& fragment : pending) { session->HandleLocalStateRegistry(fragment->recvFrom, std::move(fragment->registry)); }
 }
 
 void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf)
@@ -751,14 +761,19 @@ static std::shared_ptr<StateTree> InflateRegistry(std::string_view bytes)
 void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd)
 {
     FindOrWaitForSession_("ReceiveGlobalRegistry", sessionId, [&](Session& session) {
-        if (session.IsCoordinatorPeer()) { throw std::logic_error("The coordinator peer never receives the global registry"); }
-        if (session.PeerIndex() != fwdStart) { throw std::invalid_argument("Global registry forwarding rank does not match daemon"); }
-        session.RelayGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
         BufStream result{body.data(), body.size()};
         result.exceptions(std::ios::failbit | std::ios::badbit);
-        auto failure  = serdes::ReadBlobWithSize<uint32_t>(result);
-        auto registry = failure.empty() ? InflateRegistry(body.substr(sizeof(uint32_t))) : std::shared_ptr<StateTree>{};
-        session.HandleGlobalRegistry(registry, failure);
+        auto failure = serdes::ReadBlobWithSize<uint32_t>(result);
+        if (!failure.empty())
+        {
+            session.HandleGlobalRegistry({}, std::move(failure));
+            return;
+        }
+        if (session.IsCoordinatorPeer()) { throw std::logic_error("The coordinator peer never receives the global registry"); }
+        if (session.PeerIndex() != fwdStart) { throw std::invalid_argument("Global registry forwarding rank does not match daemon"); }
+        auto registry = InflateRegistry(body.substr(sizeof(uint32_t)));
+        session.RelayGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
+        session.HandleGlobalRegistry(std::move(registry), {});
     });
 }
 
@@ -1054,14 +1069,13 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
         bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
         boost::beast::http::read(stream, buffer, bodyParser);
+        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-
-        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
     }
     else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
