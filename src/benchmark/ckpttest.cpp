@@ -985,8 +985,6 @@ TEST_CASE("full-range DTensor preserves a physical shard", "[state][tier1]")
     tensor.AddShard(source);
     tree.AddChild(StateNode::Handle::Root, "weight").data = tensor;
 
-    tree.ConvertTensorsToDTensor();
-
     auto const& dtensor = std::get<DTensor>(tree.GetNode(tree.FindNodeByFQN("weight")).data);
     REQUIRE(dtensor.shards.size() == 1);
     auto const& shard = *dtensor.shards.begin();
@@ -1007,7 +1005,6 @@ TEST_CASE("registries reject duplicate tensor names", "[state][tier1]")
     AddTensorShardLeaf(tree, "weight", Tensor::DType::Float32, {2}, 8);
 
     CHECK_THROWS_AS(tree.FinalizeRegistry(), std::runtime_error);
-    CHECK_THROWS_AS(tree.ConvertTensorsToDTensor(), std::runtime_error);
     CHECK(tree.GetTotalNumTensors() == 2);
 }
 
@@ -1015,8 +1012,6 @@ TEST_CASE("registry validation rejects nonlocal DTensor shards", "[state][tier1]
 {
     StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
     AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2}, Rank{1}, 0);
-
-    CHECK_THROWS_AS(tree.ConvertTensorsToDTensor(), std::runtime_error);
 }
 
 static std::string SerializedStateRegistry(StateTree const& tree)
@@ -1088,7 +1083,6 @@ TEST_CASE("payload traversal groups blobs and tensors independently of node orde
 
     StateTree snapshot(checkpoint::ipc::SessionId{55}, SingleRankTopo());
     tree.CloneInto(snapshot);
-    snapshot.ConvertTensorsToDTensor();
     auto const outDir = CkptDir("payload_traversal");
     std::filesystem::remove_all(outDir);
     checkpoint::distcp::WriteRankShard(outDir, Rank{0}, snapshot, storage);
@@ -1141,7 +1135,6 @@ TEST_CASE("finalized registries reject general mutations", "[state][planning][ti
     CHECK_THROWS(tree.SetScalar("scalar", StateNode::Scalar(int64_t{6})));
     CHECK_THROWS(tree.SetBlobSource("blob", 0, 1));
     CHECK_THROWS(tree.RemoveNode(tree.FindNodeByFQN("blob")));
-    CHECK_THROWS(tree.ConvertTensorsToDTensor());
     CHECK_THROWS(tree.WalkNodes([](StateNode&) {}));
     std::istringstream serialized(frozen);
     static_cast<void>(StateSerDes::ReadSessionId(serialized));

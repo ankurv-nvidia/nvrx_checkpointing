@@ -50,15 +50,9 @@ namespace bip  = boost::interprocess;
 namespace cipc = checkpoint::ipc;
 namespace tel  = checkpoint::telemetry;
 
-// Save timestamps cross the Python/daemon process boundary as Unix-epoch nanoseconds.
-// Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
-
-// uint32_t ranks
-// uint32_t iterations
-using Request = boost::beast::http::request<boost::beast::http::buffer_body>;
-
-using boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
+using Request   = boost::beast::http::request<boost::beast::http::buffer_body>;
+using boost::asio::ip::tcp;
 using tcp_stream
     = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
 
@@ -106,8 +100,7 @@ struct Server
                                     boost::beast::flat_buffer&                                           buffer,
                                     boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser);
 
-    void InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */, size_t totalSize, uint8_t queueCount, size_t slotCount);
-    void InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo);
+    void InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapshotSize, int32_t numaNode);
     void ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf);
     void ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf);
 
@@ -223,97 +216,83 @@ void Server::Start()
     StartTcpListener_(reusePort, acceptorCount);
     _running = true;
     StartTcpAcceptors_();
-    auto const shmSize = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
-    if (shmSize != 0)
-    {
-        auto queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-        auto slotCount  = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
-        if (queueCount == 0) { queueCount = cipc::ExplicitSizeDefaultQueueCount; }
-        if (slotCount == 0) { slotCount = cipc::ExplicitSizeDefaultSlotCount; }
-        InitializeShm_(lock, shmSize, queueCount, slotCount);
-    }
 }
 
-void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
-                            size_t  configuredTotalSize,
-                            uint8_t queueCount,
-                            size_t  slotCount)
+void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapshotSize, int32_t numaNode)
 {
-    if (queueCount == 0) { throw std::invalid_argument("at least one shared-memory queue is required"); }
-    if (queueCount <= _msgQueue.size()) { return; }
-    if (cipc::MsgQueue::MinimumShmSize(slotCount) > std::numeric_limits<size_t>::max() / queueCount)
+    auto const configuredSize       = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
+    auto       configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    if (configuredQueueCount == 0 && configuredSize != 0) { configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount; }
+    auto const queueCount    = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+    auto const localRank     = static_cast<uint32_t>(rank) % topo.ranksPerPeer;
+    auto const queueIndex    = cipc::QueueIndex(localRank, topo.ranksPerPeer, queueCount);
+    auto const producerCount = cipc::QueueProducerCount(queueIndex, topo.ranksPerPeer, queueCount);
+
+    std::scoped_lock lock(_mutex);
+    if (_stopRequested) { throw std::runtime_error("Checkpoint service is stopping"); }
+    if (_msgQueue.size() <= queueIndex) { _msgQueue.resize(static_cast<size_t>(queueIndex) + 1); }
+    if (_msgQueue[queueIndex] != nullptr) { return; }
+
+    auto queueSize = configuredSize / queueCount;
+    if (configuredSize == 0)
     {
-        throw std::overflow_error("configured shared-memory ring-buffer geometry is too large");
+        auto const snapshotSizePerProducer = cipc::RoundSnapshotShmSize(static_cast<size_t>(snapshotSize));
+        if (snapshotSizePerProducer > std::numeric_limits<size_t>::max() / producerCount)
+        {
+            throw std::overflow_error("automatic shared-memory size exceeds the supported range");
+        }
+        queueSize = snapshotSizePerProducer * producerCount;
     }
-
-    auto const minimumTotal = std::max(cipc::MinShmSize, cipc::MsgQueue::MinimumShmSize(slotCount) * queueCount);
-    auto const totalSize    = cipc::MsgQueue::DetectShmSize(
-        cipc::Message::RequestChannelName(_index, queueCount), configuredTotalSize, minimumTotal, slotCount);
-    auto const queueSize = totalSize / queueCount;
-
-    _running              = true;
-    auto       neededMore = queueCount - _msgQueue.size();
-    std::latch queuesReady{static_cast<ptrdiff_t>(neededMore)};
-    // Start server thread
-    //_serverThread = std::thread([this]() {
-    auto origSize = _msgQueue.size();
-    _msgQueue.resize(queueCount);
-    for (auto i = origSize; i < queueCount; ++i)
+    auto slotCount = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
+    if (slotCount == 0)
     {
-        _threads.emplace_back([this, i, queueSize, slotCount, queueCount, &queuesReady] {
-            SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
-            // Map queues across host-memory NUMA domains. Pinning around Create
-            // places the control page; materializing the data pages in the owner
-            // mapping prevents CUDA registration in a restricted client process
-            // from faulting every shared page onto one socket.
-            auto const numaNodes = DetectHostMemoryNumaNodes();
-            int        queueNuma = numaNodes.front();
-            if (numaNodes.size() > 1)
+        slotCount = configuredSize != 0 ? cipc::ExplicitSizeDefaultSlotCount
+                                        : cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, producerCount);
+    }
+    queueSize = cipc::MsgQueue::DetectShmSize(
+        cipc::Message::RequestChannelName(_index, queueIndex), queueSize, cipc::MinShmSize / queueCount, slotCount);
+
+    std::latch         queueReady{1};
+    std::exception_ptr initFailure;
+    _threads.emplace_back([this, queueIndex, numaNode, queueSize, slotCount, &queueReady] {
+        SetThreadName(fmt::format("ncs:svrq:{}", queueIndex).c_str());
+        auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
+        BindThreadCpuToNumaNode(numaNode);
+        if (numaNode >= 0)
+        {
+            auto region = msgQueue.GetShmDataRegion();
+            BindRegionToNumaNode(numaNode, region.data(), region.size());
+            std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
+        }
+        UnbindThreadCpu();
+        // The caller holds _mutex until every queue publishes its geometry.
+        // Each thread owns one pre-sized vector element, and the latch makes
+        // those writes visible before InitializeShm_ returns.
+        _msgQueue[queueIndex] = &msgQueue;
+        queueReady.count_down();
+        INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
+        std::fflush(stderr);
+        while (true) try
             {
-                size_t queuesPerDomain = queueCount / numaNodes.size();
-                if (queuesPerDomain == 0) { queuesPerDomain = 1; }
-                size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
-                queueNuma           = numaNodes[domain];
-                BindThreadCpuToNumaNode(queueNuma);
-            }
-            auto const queueIndex = static_cast<uint8_t>(i);
-            auto       msgQueue   = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
-            if (numaNodes.size() > 1)
-            {
-                auto region = msgQueue.GetShmDataRegion();
-                BindRegionToNumaNode(queueNuma, region.data(), region.size());
-                std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
-            }
-            UnbindThreadCpu();
-            // The caller holds _mutex until every queue publishes its geometry.
-            // Each thread owns one pre-sized vector element, and the latch makes
-            // those writes visible before InitializeShm_ returns.
-            _msgQueue[i] = &msgQueue;
-            queuesReady.count_down();
-            INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
-            std::fflush(stderr);
-            while (true) try
+                auto const [stop, hdr, buf] = msgQueue.BeginRead();
+                if (stop)
                 {
-                    auto const [stop, hdr, buf] = msgQueue.BeginRead();
-                    if (stop)
-                    {
-                        std::scoped_lock lock1(_mutex);
-                        INFO("[{}] Stop requested. Shutting down server thread.", *this);
-                        _msgQueue[i] = nullptr;
-                        return;
-                    }
-                    // The slot returns to the writer even on a throw; a skipped EndRead
-                    // leaks it permanently and a saturated leak wedges the queue.
-                    try
-                    {
-                        HandleMessage(hdr, buf);
-                    } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
-                    msgQueue.EndRead();
+                    std::scoped_lock lock1(_mutex);
+                    INFO("[{}] Stop requested. Shutting down server thread.", *this);
+                    _msgQueue[queueIndex] = nullptr;
+                    return;
+                }
+                // The slot returns to the writer even on a throw; a skipped EndRead
+                // leaks it permanently and a saturated leak wedges the queue.
+                try
+                {
+                    HandleMessage(hdr, buf);
+                } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
+                msgQueue.EndRead();
 
-                } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
-        });
-    }
-    queuesReady.wait();
+            } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
+    });
+    queueReady.wait();
 }
 
 bool Server::AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
@@ -702,52 +681,9 @@ void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnaps
 
 void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf)
 {
-    RankTopology const& registryTopo{};
-    uint64_t            maxSnapshotSize{};
-    tel::Id             waitId{};
     FindOrWaitForSession_("ReceiveLocalRegistry", sessionId, [&](Session& session) {
         session.Handle(cipc::Message::LocalStateRegistry{.sessionId = sessionId, .messageSize = buf.size()}, buf);
-        // registryTopo              = session.topo;
-        // auto const firstLocalRank = static_cast<uint32_t>(session.PeerIndex()) * session.topo.ranksPerPeer;
-        // auto const localRanks     = std::min(session.topo.ranksPerPeer, static_cast<uint32_t>(session.topo.worldSize) - firstLocalRank);
-        // auto const deadline       = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
-        waitId = tel::Id{.sessionId = sessionId, .rank = session.topo.rank, .snapshotId = cipc::SnapshotId::Invalid};
-        PERF() << tel::span::SvrWaitLocalRegistries::Begin{.id = waitId};
     });
-
-    // Each reply waits for the node's last registry, so every rank opens finished queues sized for the largest local snapshot.
-
-    // while (true)
-    //{
-    //  TODO_NOMERGE : Figure out how to determine the largest local snapshot size and update maxSnapshotSize accordingly.
-    // std::this_thread::sleep_for(IntervalBetweenRetries);
-    //}
-    PERF() << tel::span::SvrWaitLocalRegistries::End{.id = waitId};
-    InitializeShmFromRegistry_(maxSnapshotSize, registryTopo);
-}
-
-void Server::InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo)
-{
-    if (topo.ranksPerPeer == 0) { throw std::invalid_argument("local registry has no ranks per peer"); }
-    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-    auto const queueCount           = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
-    auto const maxProducerCount     = (topo.ranksPerPeer + queueCount - 1) / queueCount;
-    auto const snapshotSizePerQueue = cipc::RoundSnapshotShmSize(static_cast<size_t>(snapshotSize));
-    if (snapshotSizePerQueue > std::numeric_limits<size_t>::max() / maxProducerCount / queueCount)
-    {
-        throw std::overflow_error("automatic shared-memory size exceeds the supported range");
-    }
-    auto const totalSize = snapshotSizePerQueue * maxProducerCount * queueCount;
-
-    auto slotCount = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
-    if (slotCount == 0)
-    {
-        auto const queueSize = totalSize / queueCount;
-        slotCount            = cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, maxProducerCount);
-    }
-
-    std::scoped_lock<std::mutex> lock(_mutex);
-    InitializeShm_(lock, totalSize, queueCount, slotCount);
 }
 
 static std::shared_ptr<StateTree> InflateRegistry(std::string_view bytes)
@@ -1182,6 +1118,39 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
+        Ping();
+    }
+    else if (matches({"api", "shmqueue"}) && headers.method() == boost::beast::http::verb::post)
+    {
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        boost::beast::http::read(stream, buffer, bodyParser);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, version};
+        try
+        {
+            if (it == segs.end()) { throw std::invalid_argument("Shared-memory queue requires a session ID"); }
+            auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Shared-memory queue requires a rank"); }
+            auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected shared-memory queue URL segments"); }
+            BufStream request{bodyParser.get().body().data(), bodyParser.get().body().size()};
+            request.exceptions(std::ios::failbit | std::ios::badbit);
+            auto const snapshotSize = serdes::ReadTrivial<uint64_t>(request);
+            auto const numaNode     = serdes::ReadTrivial<int32_t>(request);
+            FindOrWaitForSession_(
+                "InitializeShm", sessionId, [&](Session& session) { InitializeShm_(session.topo, rank, snapshotSize, numaNode); });
+            response.body() = "{}";
+        } catch (std::exception const& error)
+        {
+            response.result(boost::beast::http::status::insufficient_storage);
+            response.body() = error.what();
+        }
+        response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        response.keep_alive(keepAlive);
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
         Ping();
     }
     else if (matches({"api", "snapshot-plan"}) && getOrPost && it != segs.end())

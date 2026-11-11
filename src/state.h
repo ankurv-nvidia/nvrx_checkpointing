@@ -417,32 +417,6 @@ struct StateTree
         }
     }
 
-    void ConvertTensorsToDTensor()
-    {
-        AssertMutable_();
-        std::unordered_set<NodeId> tensorNodeIds;
-        for (auto const& node : _nodes)
-        {
-            auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type != StateNode::Type::DTensor) { continue; }
-
-            auto const nodeId = GetNodeId(node.handle);
-            if (!tensorNodeIds.insert(nodeId).second)
-            {
-                throw std::runtime_error(
-                    fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
-            }
-            for (auto const& shard : std::get<DTensor>(node.data).shards)
-            {
-                if (shard.rank != _topo.rank)
-                {
-                    throw std::runtime_error(
-                        fmt::format("Local tensor '{}' has shard rank={} but registry rank={}", nodeId, shard.rank, _topo.rank));
-                }
-            }
-        }
-    }
-
     template <typename TLambda> void WalkNodes(TLambda const& lambda)
     {
         AssertMutable_();

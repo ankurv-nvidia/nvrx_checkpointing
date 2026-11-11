@@ -77,7 +77,6 @@ struct Session
     // Session State variables
     RegistryState                             sessionState;
     std::unordered_set<checkpoint::ipc::Rank> receivedFrom;    // Ranks from which data has been received.
-    uint64_t                                  largestSnapshotSize{0};
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
@@ -124,8 +123,6 @@ struct Session
 
     void AsyncWorkReceiveLocalStateRegistry_(checkpoint::ipc::Rank const& rank);
     void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
-
-    void SendLocalStateRegistryToCoordinator_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
     void BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const;

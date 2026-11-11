@@ -264,9 +264,11 @@ struct CheckpointWriter
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
-        // Need to determine numa for current device since once cudaHostRegister has faulted+pinned the pages, a later mbind is a no-op
-        // pinned pages won't migrate.
-        numa = DeviceContext::CudaGetCurrentDeviceNumaNode();
+        int deviceIndex = -1;
+        registry.ForEachPayload([&](StateNode::Handle, Tensor::DType, DeviceId device, uint64_t, uint64_t) {
+            if (deviceIndex < 0 && device.IsType("cuda")) { deviceIndex = static_cast<int>(device.index); }
+        });
+        if (deviceIndex >= 0) { numa = DeviceContext::CudaGetDeviceNumaNode(deviceIndex); }
 #endif
         state->numaNode = numa;
         try
@@ -280,15 +282,6 @@ struct CheckpointWriter
             StateSerDes::Write(ostr, registry, StateNode::Handle::Root);
             LocalServiceRequest(ServerIndex(registry), fmt::format("/api/localstateregistry/{}", registry.SessionId()), ostr.str());
 
-            auto const& queueTopo = registry.Topo();
-            state->queue          = OpenMsgQueue(queueTopo);
-#ifdef PHOENIX_HAVE_CUDA
-            auto region = state->queue->GetShmDataRegion();
-            BindRegionToNumaNode(numa, region.data(), region.size());
-            DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
-#else
-            (void)numa;
-#endif
             auto response = LocalServiceRequest(
                 ServerIndex(registry), fmt::format("/api/snapshot-plan/{}/{}", registry.SessionId(), registry.GlobalRank()), {});
             std::istringstream input(response.body(), std::ios::binary);
@@ -298,6 +291,17 @@ struct CheckpointWriter
                 throw std::runtime_error("Snapshot plan does not match the requesting session and rank");
             }
             snapshotRegistry->FinalizeRegistry();
+            ostr.str({});
+            serdes::WriteTrivial<uint64_t>(ostr, snapshotRegistry->GetTotalSnapshotStateSizeInBytes());
+            serdes::WriteTrivial<int32_t>(ostr, numa);
+            LocalServiceRequest(
+                ServerIndex(registry), fmt::format("/api/shmqueue/{}/{}", registry.SessionId(), registry.GlobalRank()), ostr.str());
+            auto const& queueTopo = registry.Topo();
+            state->queue          = OpenMsgQueue(queueTopo);
+#ifdef PHOENIX_HAVE_CUDA
+            auto region = state->queue->GetShmDataRegion();
+            DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+#endif
             state->snapshotRegistry = std::move(snapshotRegistry);
         } catch (...)
         {

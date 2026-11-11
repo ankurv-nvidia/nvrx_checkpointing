@@ -1,6 +1,7 @@
 #include "session.h"
 #include "logging.h"
 #include "net_utils.h"
+#include "numa_utils.h"
 #include "server.h"
 #include "stateserdes.h"
 #include "telemetry.h"
@@ -15,7 +16,6 @@
 #include <boost/iostreams/stream.hpp>
 #include <utility>
 
-template <> struct fmt::formatter<Server>;
 namespace cipc  = checkpoint::ipc;
 namespace tel   = checkpoint::telemetry;
 using PerfClock = std::chrono::system_clock;
@@ -672,7 +672,6 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     Rank rank         = localRegistry->Topo().rank;
     auto snapshotSize = localRegistry->GetTotalSnapshotStateSizeInBytes();
     auto registryTopo = localRegistry->Topo();
-
     INFO("[{}] Received local registry rank={} metadata bytes={} payload bytes={}", *this, rank, hdr.messageSize, snapshotSize);
 
     bool registryAccepted = false;
@@ -687,9 +686,8 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         }
         else
         {
-            registeredRegistry  = std::move(localRegistry);
-            largestSnapshotSize = std::max(largestSnapshotSize, snapshotSize);
-            registryAccepted    = true;
+            registeredRegistry = std::move(localRegistry);
+            registryAccepted   = true;
             asyncTasks.emplace_back(
                 std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkReceiveLocalStateRegistry_, this, rank));
         }
@@ -825,7 +823,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         snapshotState->snapshotData     = ByteStorage(payloadSize);
         if (snapshotState->snapshotData.data != nullptr)
         {
-            // TODO_NOMERGE : BindRegionToNumaNode(hdr.numaNode, snapshotState->snapshotData.data, snapshotState->snapshotData.size);
+            BindRegionToNumaNode(hdr.numaNode, snapshotState->snapshotData.data, snapshotState->snapshotData.size);
         }
         snapshot->snapshotStateForRank.emplace(hdr.globalRank, std::move(snapshotState));
     }
