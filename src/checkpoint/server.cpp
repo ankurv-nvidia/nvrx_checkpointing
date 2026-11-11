@@ -254,45 +254,51 @@ void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapsh
 
     std::latch         queueReady{1};
     std::exception_ptr initFailure;
-    _threads.emplace_back([this, queueIndex, numaNode, queueSize, slotCount, &queueReady] {
-        SetThreadName(fmt::format("ncs:svrq:{}", queueIndex).c_str());
-        auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
-        BindThreadCpuToNumaNode(numaNode);
-        if (numaNode >= 0)
+    _threads.emplace_back([this, queueIndex, numaNode, queueSize, slotCount, &queueReady, &initFailure] {
+        try
         {
-            auto region = msgQueue.GetShmDataRegion();
-            BindRegionToNumaNode(numaNode, region.data(), region.size());
-            std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
-        }
-        UnbindThreadCpu();
-        // The caller holds _mutex until every queue publishes its geometry.
-        // Each thread owns one pre-sized vector element, and the latch makes
-        // those writes visible before InitializeShm_ returns.
-        _msgQueue[queueIndex] = &msgQueue;
-        queueReady.count_down();
-        INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
-        std::fflush(stderr);
-        while (true) try
+            SetThreadName(fmt::format("ncs:svrq:{}", queueIndex).c_str());
+            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
+            BindThreadCpuToNumaNode(numaNode);
+            if (numaNode >= 0)
             {
-                auto const [stop, hdr, buf] = msgQueue.BeginRead();
-                if (stop)
-                {
-                    std::scoped_lock lock1(_mutex);
-                    INFO("[{}] Stop requested. Shutting down server thread.", *this);
-                    _msgQueue[queueIndex] = nullptr;
-                    return;
-                }
-                // The slot returns to the writer even on a throw; a skipped EndRead
-                // leaks it permanently and a saturated leak wedges the queue.
-                try
-                {
-                    HandleMessage(hdr, buf);
-                } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
-                msgQueue.EndRead();
+                auto region = msgQueue.GetShmDataRegion();
+                BindRegionToNumaNode(numaNode, region.data(), region.size());
+                std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
+            }
+            INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
+            std::fflush(stderr);
+            _msgQueue[queueIndex] = &msgQueue;
+            queueReady.count_down();
+            [&]() noexcept {
+                while (true) try
+                    {
+                        auto const [stop, hdr, buf] = msgQueue.BeginRead();
+                        if (stop)
+                        {
+                            std::scoped_lock lock1(_mutex);
+                            INFO("[{}] Stop requested. Shutting down server thread.", *this);
+                            _msgQueue[queueIndex] = nullptr;
+                            return;
+                        }
+                        // The slot returns to the writer even on a throw; a skipped EndRead
+                        // leaks it permanently and a saturated leak wedges the queue.
+                        try
+                        {
+                            HandleMessage(hdr, buf);
+                        } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
+                        msgQueue.EndRead();
 
-            } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
+                    } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
+            }();
+        } catch (...)
+        {
+            initFailure = std::current_exception();
+            queueReady.count_down();
+        }
     });
     queueReady.wait();
+    if (initFailure) { std::rethrow_exception(initFailure); }
 }
 
 bool Server::AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
@@ -737,7 +743,6 @@ void Server::ReceiveLocalStateRegistry_(cipc::SessionId const&                  
     {
         throw std::invalid_argument("Peer registry does not match its session or rank");
     }
-    registry->FinalizeRegistry();
     Session* session = nullptr;
     {
         std::scoped_lock lock(_mutex);

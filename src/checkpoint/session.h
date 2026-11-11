@@ -92,7 +92,7 @@ struct Session
     void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);
 
-    void HandleLocalStateRegistry(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> registry);
+    void HandleLocalStateRegistry(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> const& registry);
     void HandleGlobalRegistry(std::shared_ptr<StateTree> registry, std::string failure);
 
     bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
