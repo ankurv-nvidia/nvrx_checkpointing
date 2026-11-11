@@ -110,223 +110,6 @@ static std::string WriteCkptCompleteBody(std::string_view failure, std::unordere
     }
     return body.str();
 }
-static void FailPlanning(Session& session, std::string failure)
-{
-    std::scoped_lock lock(session.mutex);
-    if (!session.sessionState.planningFailure.empty()) { return; }
-    session.sessionState.planningFailure = std::move(failure);
-    if (session.stopRequested) { return; }
-    ERR("[{}] Snapshot planning failed: {}", session, session.sessionState.planningFailure);
-    auto const message = session.sessionState.planningFailure;
-    session.asyncTasks.emplace_back(std::async(std::launch::async, [&session, message] {
-        std::ostringstream result;
-        serdes::WriteBlobWithSize<uint32_t>(result, message);
-        auto const body      = result.str();
-        auto const firstPeer = session.IsCoordinatorPeer() ? size_t{1} : size_t{0};
-        auto const lastPeer  = session.IsCoordinatorPeer() ? session.topo.peers.size() : size_t{1};
-        for (size_t peer = firstPeer; peer < lastPeer; ++peer)
-        {
-            try
-            {
-                SendToPeerWithRetries(
-                    session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
-            } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
-        }
-    }));
-}
-
-void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
-try
-{
-    if (!failure.empty())
-    {
-        if (IsCoordinatorPeer()) { FailPlanning(*this, std::move(failure)); }
-        else
-        {
-            std::scoped_lock lock(mutex);
-            sessionState.planningFailure = std::move(failure);
-        }
-        return;
-    }
-
-    struct Assignment
-    {
-        StateNode::Handle node{StateNode::Handle::Invalid};
-        std::string       fqn;
-        Tensor::DimRange  ranges;
-        uint64_t          size{};
-        std::vector<Rank> candidates;
-        Rank              owner{Rank::Invalid};
-    };
-
-    globalRegistry->FinalizeRegistry();
-    auto const firstRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
-    auto const rankCount = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstRank);
-    auto const worldSize = static_cast<uint32_t>(globalRegistry->GlobalWorldSize());
-    if (firstRank > worldSize || rankCount > worldSize - firstRank)
-    {
-        throw std::runtime_error("Snapshot registry rank range exceeds the world");
-    }
-    if (worldSize == 0) { throw std::runtime_error("Cannot select owners for a zero-rank state registry"); }
-    std::vector<Assignment> assignments;
-    std::as_const(*globalRegistry).WalkNodes([&](StateNode const& node) {
-        auto const type = node.GetType();
-        if (type == StateNode::Type::Dict || type == StateNode::Type::Invalid) { return; }
-        auto const fqn = globalRegistry->GetNodeId(node.handle);
-        if (type == StateNode::Type::Scalar || type == StateNode::Type::DynamicSizeBlob)
-        {
-            auto const& replicas = type == StateNode::Type::Scalar ? std::get<StateNode::Scalar>(node.data).replicas
-                                                                   : std::get<StateNode::DynamicSizeBlob>(node.data).replicas;
-            if (replicas.empty()) { throw std::runtime_error(fmt::format("State '{}' has no replica ranks", fqn)); }
-            assignments.push_back(Assignment{.node       = node.handle,
-                                             .fqn        = fqn,
-                                             .ranges     = {},
-                                             .size       = type == StateNode::Type::Scalar ? sizeof(Primitives64Bit) : 0,
-                                             .candidates = {replicas.begin(), replicas.end()}});
-            return;
-        }
-        if (type != StateNode::Type::DTensor && type != StateNode::Type::FixedSizeBlob)
-        {
-            throw std::runtime_error(fmt::format("State '{}' is not normalized for owner selection", fqn));
-        }
-        auto const& tensor = type == StateNode::Type::FixedSizeBlob
-                                 ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
-                                 : std::get<DTensor>(node.data);
-        if (!tensor.holes.empty()) { throw std::runtime_error(fmt::format("State '{}' has incomplete global shard coverage", fqn)); }
-        std::unordered_map<Tensor::DimRange, std::vector<TensorShard const*>> groups;
-        for (auto const& shard : tensor.shards)
-        {
-            if (shard.sharddim.size() != tensor.fulldim.size())
-            {
-                throw std::runtime_error(fmt::format("State '{}' has incompatible shard dimensions", fqn));
-            }
-            for (size_t dim = 0; dim < tensor.fulldim.size(); ++dim)
-            {
-                auto const range = shard.sharddim[dim];
-                if (range.begin >= range.end || range.end > tensor.fulldim[dim])
-                {
-                    throw std::runtime_error(fmt::format("State '{}' has an invalid shard range", fqn));
-                }
-                if (type == StateNode::Type::FixedSizeBlob && range.end - range.begin != 1)
-                {
-                    throw std::runtime_error(fmt::format("Fixed blob '{}' shards contain one logical object", fqn));
-                }
-            }
-            groups[shard.sharddim].push_back(&shard);
-        }
-        for (auto const& [ranges, copies] : groups)
-        {
-            Assignment entry{.node = node.handle, .fqn = fqn, .ranges = ranges, .size = copies.front()->storageSize, .candidates = {}};
-            for (auto const* copy : copies)
-            {
-                if (type == StateNode::Type::FixedSizeBlob && copy->storageSize != entry.size)
-                {
-                    throw std::runtime_error(fmt::format("Fixed blob '{}' replicas have inconsistent sizes", fqn));
-                }
-                entry.candidates.push_back(copy->rank);
-            }
-            assignments.push_back(std::move(entry));
-        }
-    });
-    std::ranges::sort(assignments, [](Assignment const& lhs, Assignment const& rhs) {
-        if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
-        if (lhs.size != rhs.size) { return lhs.size > rhs.size; }
-        if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
-        return lhs.ranges < rhs.ranges;
-    });
-    std::vector<uint64_t> assignedBytes(worldSize, 0);
-    for (auto& item : assignments)
-    {
-        auto selected = item.candidates.front();
-        for (auto const candidate : item.candidates)
-        {
-            auto const candidateIndex = static_cast<uint32_t>(candidate);
-            auto const selectedIndex  = static_cast<uint32_t>(selected);
-            if (assignedBytes[candidateIndex] < assignedBytes[selectedIndex]
-                || (assignedBytes[candidateIndex] == assignedBytes[selectedIndex] && candidate < selected))
-            {
-                selected = candidate;
-            }
-        }
-        item.owner       = selected;
-        auto const index = static_cast<uint32_t>(selected);
-        if (item.size > std::numeric_limits<uint64_t>::max() - assignedBytes[index])
-        {
-            throw std::overflow_error("Assigned snapshot payload size overflow");
-        }
-        assignedBytes[index] += item.size;
-    }
-
-    std::unordered_map<Rank, std::shared_ptr<StateTree>> registries;
-    for (uint32_t index = 0; index < rankCount; ++index)
-    {
-        auto topology = globalRegistry->Topo();
-        topology.rank = Rank{firstRank + index};
-        registries.emplace(topology.rank, std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology)));
-    }
-    auto dedupedGlobalRegistry = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
-    std::unordered_map<StateNode::Handle, std::vector<Assignment const*>> byNode;
-    for (auto const& item : assignments)
-    {
-        if (IsCoordinatorPeer() || registries.contains(item.owner)) { byNode[item.node].push_back(&item); }
-    }
-    std::as_const(*globalRegistry).WalkNodes([&](StateNode const& node) {
-        auto const entries = byNode.find(node.handle);
-        if (entries == byNode.end()) { return; }
-        auto appendNode = [&](StateTree& registry, std::vector<Assignment const*> const& selected) {
-            auto const fqn            = globalRegistry->GetNodeId(node.handle);
-            auto const [name, parent] = registry.FindOrAddNodeByFQN(fqn);
-            auto& output              = registry.AddChild(parent, name);
-            output.data               = node.data;
-            if (node.GetType() == StateNode::Type::Scalar)
-            {
-                std::get<StateNode::Scalar>(output.data).replicas = {selected.front()->owner};
-            }
-            else if (node.GetType() == StateNode::Type::DynamicSizeBlob)
-            {
-                std::get<StateNode::DynamicSizeBlob>(output.data).replicas = {selected.front()->owner};
-            }
-            else
-            {
-                auto const& metadata = node.GetType() == StateNode::Type::FixedSizeBlob
-                                           ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
-                                           : std::get<DTensor>(node.data);
-                DTensor     chosen(metadata.durableDtype, metadata.fulldim);
-                for (auto const* entry : selected)
-                {
-                    auto const sourceShard = std::ranges::find_if(metadata.shards, [&](TensorShard const& shard) {
-                        return shard.rank == entry->owner && shard.sharddim == entry->ranges;
-                    });
-                    chosen.AddShard(*sourceShard);
-                }
-                if (node.GetType() == StateNode::Type::FixedSizeBlob) { output.data = StateNode::FixedSizeBlob(chosen); }
-                else
-                {
-                    output.data = std::move(chosen);
-                }
-            }
-        };
-        appendNode(*dedupedGlobalRegistry, entries->second);
-        std::unordered_map<Rank, std::vector<Assignment const*>> byRank;
-        for (auto const* entry : entries->second)
-        {
-            if (registries.contains(entry->owner)) { byRank[entry->owner].push_back(entry); }
-        }
-        for (auto const& [rank, selected] : byRank) { appendNode(*registries.at(rank), selected); }
-    });
-    for (auto const& [rank, registry] : registries)
-    {
-        static_cast<void>(rank);
-        registry->FinalizeRegistry();
-    }
-
-    dedupedGlobalRegistry->FinalizeRegistry();
-    std::scoped_lock lock(mutex);
-    sessionState.dedupedGlobalRegistry   = std::move(dedupedGlobalRegistry);
-    sessionState.globalRegistry          = std::move(globalRegistry);
-    sessionState.snapshotRegistryForRank = std::move(registries);
-    sessionState.planningReady           = true;
-} catch (std::exception const& error) { FailPlanning(*this, error.what()); }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& hdr) noexcept
@@ -652,6 +435,7 @@ Session::Snapshot& Session::GetSnapshot_(std::scoped_lock<std::mutex> const& /* 
     }
     return *it->second;
 }
+
 void Session::Activate()
 { start = PerfClock::now(); }
 
@@ -819,12 +603,7 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         auto snapshotState              = std::make_unique<SnapshotState>();
         snapshotState->snapshotRegistry = registry;
         snapshotState->startedAt        = hdr.startedAt;
-        snapshotState->numaNode         = hdr.numaNode;
         snapshotState->snapshotData     = ByteStorage(payloadSize);
-        if (snapshotState->snapshotData.data != nullptr)
-        {
-            BindRegionToNumaNode(hdr.numaNode, snapshotState->snapshotData.data, snapshotState->snapshotData.size);
-        }
         snapshot->snapshotStateForRank.emplace(hdr.globalRank, std::move(snapshotState));
     }
     if (beginDurableSpan && IsCoordinatorPeer())
@@ -890,7 +669,225 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
 }
 
-void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree> registry)
+static void FailPlanning(Session& session, std::string failure)
+{
+    std::scoped_lock lock(session.mutex);
+    if (!session.sessionState.planningFailure.empty()) { return; }
+    session.sessionState.planningFailure = std::move(failure);
+    if (session.stopRequested) { return; }
+    ERR("[{}] Snapshot planning failed: {}", session, session.sessionState.planningFailure);
+    auto const message = session.sessionState.planningFailure;
+    session.asyncTasks.emplace_back(std::async(std::launch::async, [&session, message] {
+        std::ostringstream result;
+        serdes::WriteBlobWithSize<uint32_t>(result, message);
+        auto const body      = result.str();
+        auto const firstPeer = session.IsCoordinatorPeer() ? size_t{1} : size_t{0};
+        auto const lastPeer  = session.IsCoordinatorPeer() ? session.topo.peers.size() : size_t{1};
+        for (size_t peer = firstPeer; peer < lastPeer; ++peer)
+        {
+            try
+            {
+                SendToPeerWithRetries(
+                    session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
+            } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
+        }
+    }));
+}
+
+void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
+try
+{
+    if (!failure.empty())
+    {
+        if (IsCoordinatorPeer()) { FailPlanning(*this, std::move(failure)); }
+        else
+        {
+            std::scoped_lock lock(mutex);
+            sessionState.planningFailure = std::move(failure);
+        }
+        return;
+    }
+
+    struct Assignment
+    {
+        StateNode::Handle node{StateNode::Handle::Invalid};
+        std::string       fqn;
+        Tensor::DimRange  ranges;
+        uint64_t          size{};
+        std::vector<Rank> candidates;
+        Rank              owner{Rank::Invalid};
+    };
+
+    globalRegistry->FinalizeRegistry();
+    auto const firstRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
+    auto const rankCount = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstRank);
+    auto const worldSize = static_cast<uint32_t>(globalRegistry->GlobalWorldSize());
+    if (firstRank > worldSize || rankCount > worldSize - firstRank)
+    {
+        throw std::runtime_error("Snapshot registry rank range exceeds the world");
+    }
+    if (worldSize == 0) { throw std::runtime_error("Cannot select owners for a zero-rank state registry"); }
+    std::vector<Assignment> assignments;
+    std::as_const(*globalRegistry).WalkNodes([&](StateNode const& node) {
+        auto const type = node.GetType();
+        if (type == StateNode::Type::Dict || type == StateNode::Type::Invalid) { return; }
+        auto const fqn = globalRegistry->GetNodeId(node.handle);
+        if (type == StateNode::Type::Scalar || type == StateNode::Type::DynamicSizeBlob)
+        {
+            auto const& replicas = type == StateNode::Type::Scalar ? std::get<StateNode::Scalar>(node.data).replicas
+                                                                   : std::get<StateNode::DynamicSizeBlob>(node.data).replicas;
+            if (replicas.empty()) { throw std::runtime_error(fmt::format("State '{}' has no replica ranks", fqn)); }
+            assignments.push_back(Assignment{.node       = node.handle,
+                                             .fqn        = fqn,
+                                             .ranges     = {},
+                                             .size       = type == StateNode::Type::Scalar ? sizeof(Primitives64Bit) : 0,
+                                             .candidates = {replicas.begin(), replicas.end()}});
+            return;
+        }
+        if (type != StateNode::Type::DTensor && type != StateNode::Type::FixedSizeBlob)
+        {
+            throw std::runtime_error(fmt::format("State '{}' is not normalized for owner selection", fqn));
+        }
+        auto const& tensor = type == StateNode::Type::FixedSizeBlob
+                                 ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                 : std::get<DTensor>(node.data);
+        if (!tensor.holes.empty()) { throw std::runtime_error(fmt::format("State '{}' has incomplete global shard coverage", fqn)); }
+        std::unordered_map<Tensor::DimRange, std::vector<TensorShard const*>> groups;
+        for (auto const& shard : tensor.shards)
+        {
+            if (shard.sharddim.size() != tensor.fulldim.size())
+            {
+                throw std::runtime_error(fmt::format("State '{}' has incompatible shard dimensions", fqn));
+            }
+            for (size_t dim = 0; dim < tensor.fulldim.size(); ++dim)
+            {
+                auto const range = shard.sharddim[dim];
+                if (range.begin >= range.end || range.end > tensor.fulldim[dim])
+                {
+                    throw std::runtime_error(fmt::format("State '{}' has an invalid shard range", fqn));
+                }
+                if (type == StateNode::Type::FixedSizeBlob && range.end - range.begin != 1)
+                {
+                    throw std::runtime_error(fmt::format("Fixed blob '{}' shards contain one logical object", fqn));
+                }
+            }
+            groups[shard.sharddim].push_back(&shard);
+        }
+        for (auto const& [ranges, copies] : groups)
+        {
+            Assignment entry{.node = node.handle, .fqn = fqn, .ranges = ranges, .size = copies.front()->storageSize, .candidates = {}};
+            for (auto const* copy : copies)
+            {
+                if (type == StateNode::Type::FixedSizeBlob && copy->storageSize != entry.size)
+                {
+                    throw std::runtime_error(fmt::format("Fixed blob '{}' replicas have inconsistent sizes", fqn));
+                }
+                entry.candidates.push_back(copy->rank);
+            }
+            assignments.push_back(std::move(entry));
+        }
+    });
+    std::ranges::sort(assignments, [](Assignment const& lhs, Assignment const& rhs) {
+        if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
+        if (lhs.size != rhs.size) { return lhs.size > rhs.size; }
+        if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
+        return lhs.ranges < rhs.ranges;
+    });
+    std::vector<uint64_t> assignedBytes(worldSize, 0);
+    for (auto& item : assignments)
+    {
+        auto selected = item.candidates.front();
+        for (auto const candidate : item.candidates)
+        {
+            auto const candidateIndex = static_cast<uint32_t>(candidate);
+            auto const selectedIndex  = static_cast<uint32_t>(selected);
+            if (assignedBytes[candidateIndex] < assignedBytes[selectedIndex]
+                || (assignedBytes[candidateIndex] == assignedBytes[selectedIndex] && candidate < selected))
+            {
+                selected = candidate;
+            }
+        }
+        item.owner       = selected;
+        auto const index = static_cast<uint32_t>(selected);
+        if (item.size > std::numeric_limits<uint64_t>::max() - assignedBytes[index])
+        {
+            throw std::overflow_error("Assigned snapshot payload size overflow");
+        }
+        assignedBytes[index] += item.size;
+    }
+
+    std::unordered_map<Rank, std::shared_ptr<StateTree>> registries;
+    for (uint32_t index = 0; index < rankCount; ++index)
+    {
+        auto topology = globalRegistry->Topo();
+        topology.rank = Rank{firstRank + index};
+        registries.emplace(topology.rank, std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology)));
+    }
+    auto dedupedGlobalRegistry = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
+    std::unordered_map<StateNode::Handle, std::vector<Assignment const*>> byNode;
+    for (auto const& item : assignments)
+    {
+        if (IsCoordinatorPeer() || registries.contains(item.owner)) { byNode[item.node].push_back(&item); }
+    }
+    std::as_const(*globalRegistry).WalkNodes([&](StateNode const& node) {
+        auto const entries = byNode.find(node.handle);
+        if (entries == byNode.end()) { return; }
+        auto appendNode = [&](StateTree& registry, std::vector<Assignment const*> const& selected) {
+            auto const fqn            = globalRegistry->GetNodeId(node.handle);
+            auto const [name, parent] = registry.FindOrAddNodeByFQN(fqn);
+            auto& output              = registry.AddChild(parent, name);
+            output.data               = node.data;
+            if (node.GetType() == StateNode::Type::Scalar)
+            {
+                std::get<StateNode::Scalar>(output.data).replicas = {selected.front()->owner};
+            }
+            else if (node.GetType() == StateNode::Type::DynamicSizeBlob)
+            {
+                std::get<StateNode::DynamicSizeBlob>(output.data).replicas = {selected.front()->owner};
+            }
+            else
+            {
+                auto const& metadata = node.GetType() == StateNode::Type::FixedSizeBlob
+                                           ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                           : std::get<DTensor>(node.data);
+                DTensor     chosen(metadata.durableDtype, metadata.fulldim);
+                for (auto const* entry : selected)
+                {
+                    auto const sourceShard = std::ranges::find_if(metadata.shards, [&](TensorShard const& shard) {
+                        return shard.rank == entry->owner && shard.sharddim == entry->ranges;
+                    });
+                    chosen.AddShard(*sourceShard);
+                }
+                if (node.GetType() == StateNode::Type::FixedSizeBlob) { output.data = StateNode::FixedSizeBlob(chosen); }
+                else
+                {
+                    output.data = std::move(chosen);
+                }
+            }
+        };
+        appendNode(*dedupedGlobalRegistry, entries->second);
+        std::unordered_map<Rank, std::vector<Assignment const*>> byRank;
+        for (auto const* entry : entries->second)
+        {
+            if (registries.contains(entry->owner)) { byRank[entry->owner].push_back(entry); }
+        }
+        for (auto const& [rank, selected] : byRank) { appendNode(*registries.at(rank), selected); }
+    });
+    for (auto const& [rank, registry] : registries)
+    {
+        static_cast<void>(rank);
+        registry->FinalizeRegistry();
+    }
+
+    dedupedGlobalRegistry->FinalizeRegistry();
+    std::scoped_lock lock(mutex);
+    sessionState.dedupedGlobalRegistry   = std::move(dedupedGlobalRegistry);
+    sessionState.globalRegistry          = std::move(globalRegistry);
+    sessionState.snapshotRegistryForRank = std::move(registries);
+    sessionState.planningReady           = true;
+} catch (std::exception const& error) { FailPlanning(*this, error.what()); }
+
+void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree> const& registry)
 {
     try
     {
@@ -989,8 +986,8 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                 globalRegistry->FinalizeRegistry();
                 DebugOutputToFile("registry.global.bin",
                                   [&](std::ostream& stream) { StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root); });
-                BroadcastGlobalRegistryToPeers_(*globalRegistry);
                 HandleGlobalRegistry(globalRegistry, {});
+                BroadcastGlobalRegistryToPeers_(*globalRegistry);
             } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
         }));
     } catch (std::exception const& error) { FailPlanning(*this, error.what()); }

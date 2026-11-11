@@ -4,7 +4,6 @@
 #include "checkpoint.h"
 #include "config.h"
 #include "messages.h"
-#include "numa_utils.h"    // IWYU pragma: keep
 #include "quant.h"
 #include "service_client.h"
 #include "state.h"
@@ -232,7 +231,6 @@ struct CheckpointWriter
         std::shared_future<void>        ready;
         std::shared_ptr<StateTree>      snapshotRegistry;
         std::mutex                      snapshotMutex;
-        int                             numaNode{-1};
     };
 
     struct QueueRegistry
@@ -270,7 +268,6 @@ struct CheckpointWriter
         });
         if (deviceIndex >= 0) { numa = DeviceContext::CudaGetDeviceNumaNode(deviceIndex); }
 #endif
-        state->numaNode = numa;
         try
         {
             SvcPing();
@@ -325,7 +322,6 @@ struct CheckpointWriter
 
     std::shared_ptr<QueueState> queueState;
     cipc::MsgQueue&             msgQueue;
-    int const                   numaNode;
     size_t const                slotSize;    // runtime shm slot capacity, set by the server
     uint8_t const               d2hConcurrency;
     std::atomic<uint32_t>       totalD2HRequests{0};
@@ -338,7 +334,6 @@ struct CheckpointWriter
         root(rootIn),
         queueState(GetQueueState(root)),
         msgQueue(*queueState->queue),
-        numaNode(queueState->numaNode),
         slotSize(msgQueue.SlotSize()),
         d2hConcurrency(D2HConcurrencyForQueue(root.Topo(), msgQueue))
     {}
@@ -593,7 +588,6 @@ struct CheckpointWriter
                 .globalRank   = root.GlobalRank(),
                 .snapshotSize = totalTensorStateSizeInBytes,
                 .messageSize  = static_cast<uint32_t>(msg.size()),
-                .numaNode     = numaNode,
                 .startedAt    = root.startedAt,
             };
             std::ostringstream activation;

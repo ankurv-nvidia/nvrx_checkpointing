@@ -29,7 +29,6 @@ struct Session
         std::shared_ptr<StateTree> snapshotRegistry;
         ByteStorage                snapshotData;
         std::chrono::nanoseconds   startedAt{};
-        int                        numaNode{-1};
 
         uint64_t writtenPayloadRangeBegin{0};
         uint64_t writtenPayloadRangeEnd{0};
