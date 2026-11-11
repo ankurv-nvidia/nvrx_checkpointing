@@ -441,6 +441,30 @@ def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path,
     assert leaves["iteration"].blob["v"] == "metadata only"
 
 
+@pytest.mark.parametrize(
+    ("filename", "replicas", "expected_ranks"),
+    [
+        ("registry.1.bin", (), (1,)),
+        ("registry.1.bin", (0, 1), (0, 1)),
+        ("registry.global.bin", (0, 1), (0, 1)),
+    ],
+)
+def test_metadata_counts_local_membership_without_replica_hints(
+    tmp_path: Path, filename: str, replicas: tuple[int, ...], expected_ranks: tuple[int, ...],
+) -> None:
+    tree = _Tree(1)
+    tree.add("counter", _SCALAR, ((_INT64_BITS, 7), replicas))
+    tree.add("payload", _BLOB, (replicas, 17))
+    path = tmp_path / filename
+    tree.write(path, version=3)
+
+    leaves = {leaf.fqn: leaf for leaf in registry_tree.analyze([path]).leaves}
+    assert leaves["counter"].unique == 8
+    assert leaves["payload"].unique == 17
+    assert {rank: value[0] for rank, value in leaves["counter"].ranks.items()} == dict.fromkeys(expected_ranks, 8)
+    assert {rank: value[0] for rank, value in leaves["payload"].ranks.items()} == dict.fromkeys(expected_ranks, 17)
+
+
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
     _Tree(0).write(path, version=4)

@@ -1008,12 +1008,6 @@ TEST_CASE("registries reject duplicate tensor names", "[state][tier1]")
     CHECK(tree.GetTotalNumTensors() == 2);
 }
 
-TEST_CASE("registry validation rejects nonlocal DTensor shards", "[state][tier1]")
-{
-    StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(0, 2));
-    AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2}, Rank{1}, 0);
-}
-
 static std::string SerializedStateRegistry(StateTree const& tree)
 {
     std::ostringstream serialized;
@@ -1193,6 +1187,14 @@ static boost::beast::http::status PostToTestServer(std::string const& target, st
     return response.result();
 }
 
+static auto RequestTestQueue(Rank rank, uint64_t snapshotSize, int32_t numaNode)
+{
+    std::ostringstream body;
+    serdes::WriteTrivial(body, snapshotSize);
+    serdes::WriteTrivial(body, numaNode);
+    return PostToTestServer(fmt::format("/api/shmqueue/{}/{}", checkpoint::ipc::SessionId::Default, rank), body.str());
+}
+
 static std::shared_ptr<StateTree> GetTestSnapshotRegistry(Rank rank, checkpoint::ipc::SessionId sessionId)
 {
     namespace http = boost::beast::http;
@@ -1211,7 +1213,6 @@ static std::shared_ptr<StateTree> GetTestSnapshotRegistry(Rank rank, checkpoint:
     std::istringstream input(response.body());
     auto               registry = StateSerDes::Read(input);
     registry->FinalizeRegistry();
-    registry->ForEachPayload([](StateNode::Handle, Tensor::DType, DeviceId, uint64_t handle, uint64_t) { CHECK(handle == 0); });
     return registry;
 }
 
@@ -1494,7 +1495,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         auto const  name   = fmt::format("typed_scalar{}", index);
         auto const& scalar = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
         CHECK(scalar.GetType() == values[index].GetType());
-        CHECK(std::bit_cast<uint64_t>(scalar.Cast<double>()) == 0);
+        CHECK(scalar == values[index]);
         CHECK(scalar.replicas == values[index].replicas);
         CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN(name)).data) == values[index]);
     }
@@ -1511,6 +1512,8 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         static_cast<Primitives64Bit&>(scalar) = static_cast<Primitives64Bit const&>(values[index]);
     }
     auto& payload       = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
+    CHECK(payload.handle == reinterpret_cast<uint64_t>(bytes.data()));
+    CHECK(payload.storageSize == bytes.size());
     payload.handle      = reinterpret_cast<uint64_t>(bytes.data());
     payload.storageSize = bytes.size();
     auto& fixedShards   = std::get<StateNode::FixedSizeBlob>(selected->GetNode(selected->FindNodeByFQN("fixed_payload")).data).shards;
@@ -1549,13 +1552,14 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
     {
         RunInprocServer(1);
         StateTree         tree(checkpoint::ipc::SessionId{TestSessionId}, SingleRankTopo());
-        StateNode::Scalar counter(int64_t{0});
+        StateNode::Scalar counter(int64_t{37});
         tree.AddChild(StateNode::Handle::Root, "counter").data = counter;
         FinalizeStateRegistry(tree);
         auto const& registered = std::get<StateNode::Scalar>(std::as_const(tree).GetNode(tree.FindNodeByFQN("counter")).data);
-        CHECK(registered.replicas == std::set<Rank>{Rank{0}});
+        CHECK(registered.replicas.empty());
         auto  selected = GetSnapshotRegistry(tree);
         auto& captured = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN("counter")).data);
+        CHECK(captured.replicas == std::set<Rank>{Rank{0}});
         for (uint32_t const iteration : {91u, 92u})
         {
             static_cast<Primitives64Bit&>(captured) = Primitives64Bit(int64_t{iteration});
@@ -1588,7 +1592,12 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
                         REQUIRE(handle != StateNode::Handle::Invalid);
                         auto const& scalar = std::get<StateNode::Scalar>(registry->GetNode(handle).data);
                         CHECK(scalar.GetType() == Primitives64Bit::Type::Of<int64_t>());
-                        CHECK(scalar.Cast<int64_t>() == 0);
+                        CHECK(scalar.Cast<int64_t>() == 37);
+                        if (registry == &localRegistry) { CHECK(scalar.replicas.empty()); }
+                        else
+                        {
+                            CHECK(scalar.replicas == std::set<Rank>{Rank{0}});
+                        }
                     }
                     auto const handle = snapshotRegistry.FindNodeByFQN("counter");
                     REQUIRE(handle != StateNode::Handle::Invalid);
@@ -1609,75 +1618,137 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
     std::filesystem::remove_all(logDir);
 }
 
-TEST_CASE("registry replies wait for every local registry and fit queues to the largest", "[shmem][tier2]")
+TEST_CASE("clients initialize selected-size queues after planning", "[shmem][planning][tier2]")
 {
-    static constexpr uint32_t        RanksPerPeer = 2;
-    static constexpr size_t          MiB          = 1ull << 20u;
-    std::array<size_t, RanksPerPeer> snapshotSizes{1 * MiB, 16 * MiB};
-    auto const                       logDir = CkptDir("largest_registry_sizes_shm");
-    std::filesystem::remove_all(logDir);
-    std::filesystem::create_directories(logDir);
-
-    auto uploadRegistry = [&](uint32_t rank) {
-        StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(rank, RanksPerPeer));
-        auto&     node = tree.AddChild(StateNode::Handle::Root, fmt::format("payload{}", rank));
-        if (rank == 1)
-        {
-            Tensor::Dim shape;
-            shape.push_back(1);
-            StateNode::FixedSizeBlob blob(Tensor::DType::UInt8, shape);
-            Tensor::DimRange         ranges;
-            ranges.push_back({.begin = 0, .end = 1});
-            blob.AddShard({.rank          = Rank{rank},
-                           .snapshotDtype = Tensor::DType::UInt8,
-                           .storageSize   = snapshotSizes[rank],
-                           .sharddim      = ranges,
-                           .device        = DeviceId{"cpu"}});
-            node.data = std::move(blob);
-        }
-        else
-        {
-            Tensor::Dim shape;
-            shape.push_back(snapshotSizes[rank]);
-            DTensor          tensor(Tensor::DType::UInt8, shape);
-            Tensor::DimRange ranges;
-            ranges.push_back({.begin = 0, .end = snapshotSizes[rank]});
-            tensor.AddShard({.rank          = Rank{rank},
-                             .snapshotDtype = Tensor::DType::UInt8,
-                             .storageSize   = snapshotSizes[rank],
-                             .sharddim      = ranges,
-                             .device        = DeviceId{"cpu"}});
-            node.data = std::move(tensor);
-        }
-        tree.FinalizeRegistry();
-        std::stringstream body;
-        StateSerDes::Write(body, tree, StateNode::Handle::Root);
-        return PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), body.str());
-    };
-
-    TestServerProcess server;
-    StartTestServer(server, logDir / "server.log", true);
-    std::stringstream activation;
-    serdes::WriteBlobWithSize<uint16_t>(activation, "");
-    StateSerDes::WriteTopology(activation, SingleRankTopo(0, RanksPerPeer));
-    CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
-          == boost::beast::http::status::ok);
-
-    auto smaller = std::async(std::launch::async, uploadRegistry, 0);
-    CHECK(smaller.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
-    auto duplicate = std::async(std::launch::async, uploadRegistry, 0);
-    CHECK(duplicate.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
-    CHECK(uploadRegistry(1) == boost::beast::http::status::ok);
-    CHECK(smaller.get() == boost::beast::http::status::ok);
-    CHECK(duplicate.get() == boost::beast::http::status::ok);
-    for (uint8_t queueIndex = 0; queueIndex < RanksPerPeer; ++queueIndex)
+    static constexpr uint32_t RanksPerPeer   = 2;
+    static constexpr uint64_t MiB            = 1ull << 20u;
+    static constexpr uint64_t ReplicatedSize = 64 * MiB;
+    static constexpr uint64_t FixedBlobSize  = 16 * MiB;
+    for (int const mode : {0, 1, 2})
     {
-        auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, queueIndex));
-        CHECK(queue.SlotSize() * queue.SlotCount() >= snapshotSizes[1]);
+        bool const shared       = mode == 1;
+        bool const explicitSize = mode == 2;
+        DYNAMIC_SECTION("shared queue=" << shared << " explicit size=" << explicitSize)
+        {
+            auto const logDir = CkptDir(shared ? "client_shared_queue" : "client_rank_queues");
+            std::filesystem::remove_all(logDir);
+            std::filesystem::create_directories(logDir);
+            auto uploadRegistry = [&](uint32_t rank) {
+                StateTree   tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(rank, RanksPerPeer));
+                Tensor::Dim shape;
+                shape.push_back(ReplicatedSize);
+                DTensor          tensor(Tensor::DType::UInt8, shape);
+                Tensor::DimRange ranges;
+                ranges.push_back({.begin = 0, .end = ReplicatedSize});
+                tensor.AddShard({.rank          = Rank{rank},
+                                 .snapshotDtype = Tensor::DType::UInt8,
+                                 .storageSize   = ReplicatedSize,
+                                 .sharddim      = ranges,
+                                 .device        = DeviceId{"cpu"}});
+                tree.AddChild(StateNode::Handle::Root, "replicated").data = std::move(tensor);
+                if (rank == 1)
+                {
+                    Tensor::Dim blobShape;
+                    blobShape.push_back(1);
+                    StateNode::FixedSizeBlob blob(Tensor::DType::UInt8, blobShape);
+                    Tensor::DimRange         blobRange;
+                    blobRange.push_back({.begin = 0, .end = 1});
+                    blob.AddShard({.rank          = Rank{rank},
+                                   .snapshotDtype = Tensor::DType::UInt8,
+                                   .storageSize   = FixedBlobSize,
+                                   .sharddim      = blobRange,
+                                   .device        = DeviceId{"cpu"}});
+                    tree.AddChild(StateNode::Handle::Root, "blob").data = std::move(blob);
+                }
+                tree.FinalizeRegistry();
+                std::ostringstream body;
+                StateSerDes::Write(body, tree, StateNode::Handle::Root);
+                return PostToTestServer("/api/localstateregistry/0", body.str());
+            };
+            auto checkAbsent = [](uint8_t index) {
+                CHECK_THROWS_AS(boost::interprocess::shared_memory_object(boost::interprocess::open_only,
+                                                                          checkpoint::ipc::Message::RequestChannelName(0, index).c_str(),
+                                                                          boost::interprocess::read_write),
+                                boost::interprocess::interprocess_exception);
+            };
+            std::array<char const*, 3> const options{
+                "NATIVE_CKPT_SHM_RING_BUFFER_SIZE", "NATIVE_CKPT_SHM_RING_BUFFER_SLOTS", "NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES"};
+            std::array<std::string, 3> previous;
+            std::array<bool, 3>        present{};
+            for (size_t i = 0; i < options.size(); ++i)
+            {
+                if (auto const* value = ::getenv(options[i]); value != nullptr)
+                {
+                    present[i]  = true;
+                    previous[i] = value;
+                }
+                ::setenv(options[i], i == 0 && explicitSize ? "64MiB" : (i == 2 && shared ? "1" : "0"), 1);
+            }
+            TestServerProcess server;
+            StartTestServer(server, logDir / "server.log", true);
+            for (size_t i = 0; i < options.size(); ++i)
+            {
+                if (present[i]) { ::setenv(options[i], previous[i].c_str(), 1); }
+                else
+                {
+                    ::unsetenv(options[i]);
+                }
+            }
+            checkAbsent(0);
+            checkAbsent(1);
+            std::ostringstream activation;
+            serdes::WriteBlobWithSize<uint16_t>(activation, "");
+            StateSerDes::WriteTopology(activation, SingleRankTopo(0, RanksPerPeer));
+            REQUIRE(PostToTestServer("/api/activatesession/0", activation.str()) == boost::beast::http::status::ok);
+            REQUIRE(uploadRegistry(0) == boost::beast::http::status::ok);
+            checkAbsent(0);
+            REQUIRE(uploadRegistry(0) == boost::beast::http::status::ok);
+            REQUIRE(uploadRegistry(1) == boost::beast::http::status::ok);
+            auto firstPlan  = GetTestSnapshotRegistry(Rank{0}, checkpoint::ipc::SessionId::Default);
+            auto secondPlan = GetTestSnapshotRegistry(Rank{1}, checkpoint::ipc::SessionId::Default);
+            CHECK(firstPlan->GetTotalSnapshotStateSizeInBytes() == ReplicatedSize);
+            CHECK(secondPlan->GetTotalSnapshotStateSizeInBytes() == FixedBlobSize);
+            checkAbsent(0);
+            checkAbsent(1);
+            REQUIRE(RequestTestQueue(Rank{1}, secondPlan->GetTotalSnapshotStateSizeInBytes(), int32_t{-1})
+                    == boost::beast::http::status::ok);
+            auto const index     = static_cast<uint8_t>(shared ? 0 : 1);
+            auto       queue     = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, index));
+            auto const slotSize  = queue.SlotSize();
+            auto const slotCount = queue.SlotCount();
+            CHECK(slotSize * slotCount >= FixedBlobSize);
+            CHECK(slotSize * slotCount < ReplicatedSize);
+            REQUIRE(RequestTestQueue(Rank{1}, ReplicatedSize * 2, int32_t{-1}) == boost::beast::http::status::ok);
+            if (!shared) { checkAbsent(0); }
+            REQUIRE(RequestTestQueue(Rank{0}, firstPlan->GetTotalSnapshotStateSizeInBytes(), int32_t{-1})
+                    == boost::beast::http::status::ok);
+            auto reopened = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, index));
+            CHECK(reopened.SlotSize() == slotSize);
+            CHECK(reopened.SlotCount() == slotCount);
+            if (!shared)
+            {
+                auto firstQueue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
+                if (explicitSize)
+                {
+                    boost::interprocess::shared_memory_object object(boost::interprocess::open_only,
+                                                                     checkpoint::ipc::Message::RequestChannelName(0, 0).c_str(),
+                                                                     boost::interprocess::read_only);
+                    boost::interprocess::offset_t             size{};
+                    REQUIRE(object.get_size(size));
+                    CHECK(static_cast<uint64_t>(size) == 64 * MiB / RanksPerPeer);
+                    CHECK(firstQueue.SlotCount() == checkpoint::ipc::ExplicitSizeDefaultSlotCount);
+                    CHECK(firstQueue.SlotSize() * firstQueue.SlotCount() < ReplicatedSize);
+                }
+                else
+                {
+                    CHECK(firstQueue.SlotSize() * firstQueue.SlotCount() >= ReplicatedSize);
+                }
+            }
+            CHECK(server.Stop());
+            CheckDuplicateRegistryWarning(logDir / "server.log", 0);
+            std::filesystem::remove_all(logDir);
+        }
     }
-    CHECK(server.Stop());
-    CheckDuplicateRegistryWarning(logDir / "server.log", 0);
-    std::filesystem::remove_all(logDir);
 }
 
 // Each rank owns one slice of a tensor shared by the whole world.
@@ -1948,6 +2019,7 @@ static void ActivateTestSnapshot(checkpoint::ipc::MsgQueue&   queue,
     std::stringstream activation;
     serdes::WriteBlobWithSize<uint16_t>(activation, directory.string());
     auto registry = GetTestSnapshotRegistry(rank, checkpoint::ipc::SessionId::Default);
+    REQUIRE(RequestTestQueue(rank, registry->GetTotalSnapshotStateSizeInBytes(), int32_t{-1}) == boost::beast::http::status::ok);
     auto incoming = std::make_shared<StateTree>(registry->SessionId(), registry->Topo());
     registry->CloneInto(*incoming);
     incoming->WalkNodes([&](StateNode& node) {
@@ -2079,6 +2151,7 @@ TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finali
     StartTestServer(server, logDir / "server.log");
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
     PublishTestGlobalRegistry(topology);
+    REQUIRE(RequestTestQueue(Rank{1}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{1});
     queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
@@ -2153,6 +2226,7 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
           == boost::beast::http::status::ok);
     CHECK(finalize.wait_for(3s) == std::future_status::timeout);
     CHECK(notified.wait_for(200ms) == std::future_status::timeout);
+    REQUIRE(RequestTestQueue(Rank{0}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{0});
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
@@ -2235,6 +2309,7 @@ TEST_CASE("a coordinator failure survives later peer snapshot activation", "[ser
     });
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/0/40?fwd=2:4", WriteCompletionBody(failure)) == boost::beast::http::status::ok);
     CHECK(WaitForFinalizeFailure(server).contains(failure));
+    REQUIRE(RequestTestQueue(Rank{2}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{2});
     queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
@@ -2308,6 +2383,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(secondLocal)});
     CHECK(PostToTestServer("/api/peer/localstateregistry/0/2", SerializedSliceFragment(2, topology)) == http::status::ok);
     CHECK(PostToTestServer("/api/peer/localstateregistry/0/3", SerializedSliceFragment(3, topology)) == http::status::ok);
+    REQUIRE(RequestTestQueue(Rank{0}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
     auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
     for (uint32_t const rank : {0u, 1u})
@@ -2432,6 +2508,7 @@ TEST_CASE("peer write completions refresh dynamic blob metadata across snapshots
     StartTestServer(server, logDir / "server.log", true);
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
     REQUIRE(PostToTestServer("/api/peer/localstateregistry/0/1", SerializedStateRegistry(remote)) == http::status::ok);
+    REQUIRE(RequestTestQueue(Rank{0}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
     auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
     for (uint32_t iteration = 40; iteration < 42; ++iteration)
@@ -2551,6 +2628,7 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             });
             auto const            checkpointDir = logDir / "iteration40";
             std::filesystem::create_directories(checkpointDir);
+            REQUIRE(RequestTestQueue(Rank{2}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
             auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
             std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
             for (uint32_t const rank : {2u, 3u})

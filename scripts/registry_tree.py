@@ -368,17 +368,17 @@ class _Builder:
             pairs = tuple(coordinate for bounds in shard.ranges for coordinate in bounds)
             self._shard(leaf, pairs, shard.rank, shard.storage_size)
 
-    def dynamic_blob(self, fqn: str, value: _DynamicBlobMetadata, where: str) -> None:
+    def dynamic_blob(self, fqn: str, value: _DynamicBlobMetadata, where: str, fallback_ranks: tuple[int, ...]) -> None:
         leaf = self._leaf(fqn, "blob", f"dynamic object metadata in {where}; bytes belong to snapshots")
-        for rank in value.replicas:
+        for rank in value.replicas or fallback_ranks:
             leaf.add(rank, value.storage_size, None)
         if self._first(fqn, 0):
             leaf.unique += value.storage_size
 
-    def scalar_metadata(self, fqn: str, value: _ScalarMetadata, where: str) -> None:
+    def scalar_metadata(self, fqn: str, value: _ScalarMetadata, where: str, fallback_ranks: tuple[int, ...]) -> None:
         label, width, _ = _decode_scalar(*value.value)
         leaf = self._leaf(fqn, "scalar", f"scalar type metadata in {where}")
-        for rank in value.replicas:
+        for rank in value.replicas or fallback_ranks:
             leaf.add(rank, width, None)
         if self._first(fqn, 0):
             leaf.unique += width
@@ -399,6 +399,7 @@ class _Builder:
     def add(self, registry: Registry, *, per_rank: bool) -> None:
         resolve = _resolver(registry, self.problems)
         rank = registry.rank if per_rank else page.UNKNOWN_RANK
+        fallback_ranks = (registry.rank,) if per_rank else ()
         where = "per-rank registries" if per_rank else "the global registry"
         for handle, kind, payload in registry.entries:
             fqn = resolve(handle)
@@ -410,11 +411,11 @@ class _Builder:
                 self.fixed_blob(fqn, payload, where)
             elif kind == _BLOB:
                 if isinstance(payload, _DynamicBlobMetadata):
-                    self.dynamic_blob(fqn, payload, where)
+                    self.dynamic_blob(fqn, payload, where, fallback_ranks)
                 else:
                     self.blob(fqn, payload, rank, f"inline blob bytes in {where}")
             elif isinstance(payload, _ScalarMetadata):
-                self.scalar_metadata(fqn, payload, where)
+                self.scalar_metadata(fqn, payload, where, fallback_ranks)
             else:
                 self.scalar(fqn, payload, rank, f"64-bit scalar in {where}")
 

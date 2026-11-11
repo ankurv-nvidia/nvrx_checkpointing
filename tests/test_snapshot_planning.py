@@ -114,8 +114,12 @@ def _assert_plan_ownership(plans: list[Any]) -> None:
     counts = Counter(key for rank_entries in entries for key, (kind, _) in rank_entries.items() if kind != _FIXED_BLOB)
     assert counts == dict.fromkeys(("weight", "step", "path", _COMMON_STATE_KEY), 1)
     assert {key for rank_entries in entries for key, (kind, _) in rank_entries.items() if kind == _FIXED_BLOB} == {"rng_state"}
+    initial_blob_sizes = {
+        "path": len(b"run/x"),
+        _COMMON_STATE_KEY: len(_serialize({"iteration": 0, "message": "x"})),
+    }
     for rank, rank_entries in enumerate(entries):
-        for kind, value in rank_entries.values():
+        for key, (kind, value) in rank_entries.items():
             if kind in {_DTENSOR, _FIXED_BLOB}:
                 assert {shard.rank for shard in value.shards} == {rank}
             else:
@@ -124,7 +128,7 @@ def _assert_plan_ownership(plans: list[Any]) -> None:
                 if kind == _SCALAR:
                     assert value.value[1] == 0
                 else:
-                    assert value.storage_size == 0
+                    assert value.storage_size == initial_blob_sizes[key]
     fixed_shards = Counter(
         shard.ranges
         for rank_entries in entries
