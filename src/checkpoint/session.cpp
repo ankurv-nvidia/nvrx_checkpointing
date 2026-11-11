@@ -1,9 +1,12 @@
 #include "session.h"
 #include "logging.h"
+#include "net_utils.h"
 #include "server.h"
 #include "stateserdes.h"
 #include "telemetry.h"
 
+#include <boost/asio/io_context.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
 #include <boost/iostreams/device/array.hpp>
 #include <boost/iostreams/device/back_inserter.hpp>
 #include <boost/iostreams/filter/counter.hpp>
@@ -16,13 +19,6 @@ namespace cipc  = checkpoint::ipc;
 namespace tel   = checkpoint::telemetry;
 using PerfClock = std::chrono::system_clock;
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
-
-void SendToPeerWithRetries(Server const* const     server,
-                           cipc::SessionId const   sessionId,
-                           std::string_view const& peer,
-                           std::string_view const& body,
-                           std::string_view const& target,
-                           std::string_view const& contentEncoding);
 
 #if 0
 namespace
@@ -65,6 +61,82 @@ template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
         return fmt::format_to(ctx.out(), "{:x}#{}", ptrVal, session.sessionId);
     }
 };
+
+static void SendToPeerWithRetries(Session const&          session,
+                                  std::string_view const& peer,
+                                  std::string_view const& body,
+                                  std::string_view const& target,
+                                  std::string_view const& contentEncoding)
+{
+    std::string lastError;
+    for (int attempt = 1; attempt <= MaxRetries; ++attempt)
+    {
+        try
+        {
+            boost::asio::io_context  ioc;
+            boost::beast::tcp_stream stream(ioc);
+            auto                     req = CreateRequestForPeer(ioc, stream, peer, target);
+            if (!contentEncoding.empty()) { req.set(boost::beast::http::field::content_encoding, contentEncoding); }
+            req.body().data = const_cast<char*>(body.data());    // NOLINT — beast buffer_body is non-owning; body outlives the write
+            req.body().size = body.size();
+            req.body().more = false;
+            req.prepare_payload();
+            boost::beast::http::write(stream, req);
+
+#ifdef USE_EXPECT_CONTINUE
+            if (expectContinue) { req.set(boost::beast::http::field::expect, "100-continue"); }
+
+            boost::beast::flat_buffer                                               buffer;
+            boost::beast::http::request_serializer<boost::beast::http::buffer_body> serializer{req};
+
+            // Offer the body rather than upload it. A peer that already holds the registry
+            // answers 204 here and the payload never goes on the wire. Declining mid-upload
+            // instead would race a connection reset against the response.
+            if (expectContinue)
+            {
+                boost::beast::http::write_header(stream, serializer);
+                boost::beast::http::response_parser<boost::beast::http::empty_body> interim;
+                boost::beast::http::read_header(stream, buffer, interim);
+                auto const offerResult = interim.get().result();
+                if (offerResult == boost::beast::http::status::no_content)
+                {
+                    TryCleanShutdown(stream);
+                    return false;
+                }
+                if (offerResult != boost::beast::http::status::continue_)
+                {
+                    throw std::runtime_error(fmt::format("peer answered the body offer with HTTP {}", interim.get().result_int()));
+                }
+            }
+            boost::beast::http::write(stream, serializer);
+#endif
+            boost::beast::flat_buffer                                     buffer;
+            boost::beast::http::response<boost::beast::http::string_body> res;
+            boost::beast::http::read(stream, buffer, res);
+            if (res.result() != boost::beast::http::status::ok)
+            {
+                throw std::runtime_error(fmt::format("peer returned HTTP {}", res.result_int()));
+            }
+            TryCleanShutdown(stream);
+            return;
+        } catch (std::exception const& ex)
+        {
+            lastError = ex.what();
+            if (attempt < MaxRetries) { WARN("[{}] Attempt {} peer={} failed target={} {}", session, attempt, peer, target, ex.what()); }
+            else
+            {
+                ERR("[{}] Attempt {} peer={} failed target={} {}", session, attempt, peer, target, ex.what());
+            }
+            if (attempt < MaxRetries) { std::this_thread::sleep_for(IntervalBetweenRetries); }
+        }
+    }
+    throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Failed to notify peer={} target={} after {} attempts: {}",
+                                         session,
+                                         peer,
+                                         target,
+                                         MaxRetries,
+                                         lastError));
+}
 
 static void DebugOutputToFile(std::string_view fileName, std::function<void(std::ostream&)> const& write)
 {
@@ -114,12 +186,8 @@ static void FailPlanning(Session& session, std::string failure)
         {
             try
             {
-                SendToPeerWithRetries(session.server,
-                                      session.sessionId,
-                                      session.topo.peers[peer],
-                                      body,
-                                      fmt::format("/api/peer/globalregistry/{}", session.sessionId),
-                                      {});
+                SendToPeerWithRetries(
+                    session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
             } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
         }
     }));
@@ -337,8 +405,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         }
         if (notifyCoordinator)
         {
-            SendToPeerWithRetries(server,
-                                  sessionId,
+            SendToPeerWithRetries(*this,
                                   topo.peers[0],
                                   {},
                                   fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
@@ -355,8 +422,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         });
         if (notifyCoordinator)
         {
-            SendToPeerWithRetries(server,
-                                  sessionId,
+            SendToPeerWithRetries(*this,
                                   topo.peers[0],
                                   WriteCkptCompleteBody({}, dynamicBlobSizes),
                                   fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
@@ -463,8 +529,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
             {
                 try
                 {
-                    SendToPeerWithRetries(server,
-                                          sessionId,
+                    SendToPeerWithRetries(*this,
                                           topo.peers[0],
                                           WriteCkptCompleteBody(failure, {}),
                                           fmt::format("/api/peer/writeckptcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
@@ -567,7 +632,7 @@ void Session::RelayWriteCkptCompleteToPeers(cipc::SnapshotId        snapshotId,
     auto const& peer          = topo.peers[delegateStart];
     auto const  postTarget
         = fmt::format("/api/peer/writeckptcomplete/{}/0/{}?fwd={}:{}", sessionId, snapshotId, delegateStart, endPeerIndex);
-    SendToPeerWithRetries(server, sessionId, peer, msg, postTarget, {});
+    SendToPeerWithRetries(*this, peer, msg, postTarget, {});
     RelayWriteCkptCompleteToPeers(snapshotId, msg, startPeerIndex, delegateStart);
 }
 
@@ -610,7 +675,7 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
     auto        delegateStart = (startPeerIndex + endPeerIndex) / 2;
     auto const& peer          = topo.peers[delegateStart];
     auto const  postTarget    = fmt::format("/api/peer/globalregistry/{}?fwd={}:{}", sessionId, delegateStart, endPeerIndex);
-    SendToPeerWithRetries(server, sessionId, peer, registry, postTarget, {});
+    SendToPeerWithRetries(*this, peer, registry, postTarget, {});
     RelayGlobalRegistryToPeers(registry, startPeerIndex, delegateStart);
 }
 
@@ -729,7 +794,6 @@ void Session::Handle(cipc::Message::SnapshotData const& hdr1, std::span<char con
 
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
-
     auto AddSize = [](uint64_t total, uint64_t size) -> uint64_t {
         if (size > std::numeric_limits<uint64_t>::max() - total) { throw std::overflow_error("Snapshot payload size overflow"); }
         return total + size;
@@ -1024,7 +1088,6 @@ void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
         // Send to coordinator
         std::ostringstream body;
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);
-        SendToPeerWithRetries(
-            server, sessionId, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
+        SendToPeerWithRetries(*this, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
     }
 }
