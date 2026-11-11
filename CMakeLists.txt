@@ -259,11 +259,9 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
 endif()
 
 if (COMMAND vcpkg_install)
-    vcpkg_install(openssl)
     vcpkg_install(cpptrace)
 endif()
 
-find_package(OpenSSL CONFIG REQUIRED)
 # cpptrace symbolizes the checkpoint_server crash backtrace (demangled, file:line).
 find_package(cpptrace CONFIG REQUIRED)
 
@@ -293,7 +291,7 @@ add_library(daemon OBJECT
     src/checkpoint/server.cpp
     src/checkpoint/session.cpp)
 # miniz is pulled in transitively via distcpio (PUBLIC above).
-target_link_libraries(daemon PUBLIC phoenix_checkpoint distcpio fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url OpenSSL::Crypto)
+target_link_libraries(daemon PUBLIC phoenix_checkpoint distcpio fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url)
 
 add_executable(checkpoint_server src/checkpoint/server_main.cpp)
 # distcpio is listed directly because CMake only propagates
