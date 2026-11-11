@@ -17,7 +17,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 // Server is defined in server.cpp at file scope; Session only holds a pointer to it.
@@ -42,7 +41,7 @@ struct Session
         std::shared_ptr<StateTree>                                            globalRegistry;
         std::shared_ptr<StateTree>                                            dedupedGlobalRegistry;
         std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> localRegistryForRank;
-        std::map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>>           snapshotRegistryForRank;
+        std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> snapshotRegistryForRank;
         bool                                                                  planningStarted{false};
         bool                                                                  planningReady{false};
         std::string                                                           planningFailure;
@@ -90,19 +89,26 @@ struct Session
     void Activate();
 
     void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf);
-    void Handle(checkpoint::ipc::Message::LocalStateData const& hdr1, std::span<char const> buf);
+    void Handle(checkpoint::ipc::Message::SnapshotData const& hdr1, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);
 
-    void   HandleStateRegistryFragment(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> registry);
+    void HandleLocalStateRegistry(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> registry);
+    void HandleGlobalRegistry(std::shared_ptr<StateTree> registry, std::string failure);
+
     bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
     size_t PeerIndex() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer; }
 
-    void SendGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
+    void RelayGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
+    void RelayWriteCkptCompleteToPeers(checkpoint::ipc::SnapshotId snapshotId,
+                                       std::string_view const&     msg,
+                                       size_t                      startPeerIndex,
+                                       size_t                      endPeerIndex) const;
 
     size_t ExpectedWriteCompletions() const
     { return IsCoordinatorPeer() ? static_cast<size_t>(topo.worldSize) : static_cast<size_t>(topo.ranksPerPeer); }
+
     bool AllSnapshotsComplete() const
     {
         std::scoped_lock lock(mutex);
@@ -116,11 +122,10 @@ struct Session
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
     Snapshot& GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 
-    void OnReceiveLocalStateRegistryAsync_(checkpoint::ipc::Rank const& rank);
-    void OnFinalizeSnapshotAsync_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
+    void AsyncWorkReceiveLocalStateRegistry_(checkpoint::ipc::Rank const& rank);
+    void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
 
-    void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
-    void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
+    void SendLocalStateRegistryToCoordinator_(checkpoint::ipc::Rank rank, std::string const& peer);
 
     void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
     void BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const;

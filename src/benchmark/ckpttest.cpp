@@ -2153,7 +2153,7 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
     TestServerProcess  server;
     StartTestServer(server, logDir / "server.log");
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
-    CHECK(PostToTestServer("/api/peer/shardedstateregistry/0/1", SerializedSliceFragment(1, topology)) == boost::beast::http::status::ok);
+    CHECK(PostToTestServer("/api/peer/localstateregistry/0/1", SerializedSliceFragment(1, topology)) == boost::beast::http::status::ok);
     auto finalize = std::async(std::launch::async, [] { WaitForCkptFinalize(0, 40); });
     CHECK(finalize.wait_for(200ms) == std::future_status::timeout);
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/1/40", WriteCompletionBody("distcp: peer shard Input/output error"))
@@ -2163,7 +2163,7 @@ TEST_CASE("a peer failure reaches the coordinator before local snapshot activati
     auto queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     ActivateTestSnapshot(queue, logDir / "iteration40", Rank{0});
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
-    queue.Push({checkpoint::ipc::Message::LocalStateData{
+    queue.Push({checkpoint::ipc::Message::SnapshotData{
                    .sessionId   = checkpoint::ipc::SessionId::Default,
                    .snapshotId  = checkpoint::ipc::SnapshotId{40},
                    .globalRank  = Rank{0},
@@ -2255,7 +2255,7 @@ TEST_CASE("a coordinator failure survives later peer snapshot activation", "[ser
     for (size_t attempt = 0; attempt < 100; ++attempt)
     {
         auto const bytes = ReadWholeFile(logDir / "server.log");
-        finalized        = std::string_view{bytes.data(), bytes.size()}.contains("OnFinalizeSnapshotAsync_ for rank=2, snapshotId=40");
+        finalized        = std::string_view{bytes.data(), bytes.size()}.contains("AsyncWorkFinalizeSnapshot_ for rank=2, snapshotId=40");
         if (finalized) { break; }
         std::this_thread::sleep_for(50ms);
     }
@@ -2313,14 +2313,14 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     auto secondLocal = topology;
     secondLocal.rank = Rank{1};
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(secondLocal)});
-    CHECK(PostToTestServer("/api/peer/shardedstateregistry/0/2", SerializedSliceFragment(2, topology)) == http::status::ok);
-    CHECK(PostToTestServer("/api/peer/shardedstateregistry/0/3", SerializedSliceFragment(3, topology)) == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/localstateregistry/0/2", SerializedSliceFragment(2, topology)) == http::status::ok);
+    CHECK(PostToTestServer("/api/peer/localstateregistry/0/3", SerializedSliceFragment(3, topology)) == http::status::ok);
     auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
     for (uint32_t const rank : {0u, 1u})
     {
         ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
-        queue.Push({checkpoint::ipc::Message::LocalStateData{
+        queue.Push({checkpoint::ipc::Message::SnapshotData{
                        .sessionId   = checkpoint::ipc::SessionId::Default,
                        .snapshotId  = checkpoint::ipc::SnapshotId{40},
                        .globalRank  = Rank{rank},
@@ -2350,7 +2350,7 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     for (size_t attempt = 0; attempt < 100; ++attempt)
     {
         auto const bytes = ReadWholeFile(logDir / "server.log");
-        localFinalized   = std::string_view{bytes.data(), bytes.size()}.contains("OnFinalizeSnapshotAsync_ for rank=1, snapshotId=40");
+        localFinalized   = std::string_view{bytes.data(), bytes.size()}.contains("AsyncWorkFinalizeSnapshot_ for rank=1, snapshotId=40");
         if (localFinalized) { break; }
         std::this_thread::sleep_for(50ms);
     }
@@ -2438,7 +2438,7 @@ TEST_CASE("peer write completions refresh dynamic blob metadata across snapshots
     TestServerProcess        server;
     StartTestServer(server, logDir / "server.log", true);
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
-    REQUIRE(PostToTestServer("/api/peer/shardedstateregistry/0/1", SerializedStateRegistry(remote)) == http::status::ok);
+    REQUIRE(PostToTestServer("/api/peer/localstateregistry/0/1", SerializedStateRegistry(remote)) == http::status::ok);
     auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
     for (uint32_t iteration = 40; iteration < 42; ++iteration)
@@ -2448,7 +2448,7 @@ TEST_CASE("peer write completions refresh dynamic blob metadata across snapshots
         auto const blobSize      = iteration == 40 ? uint64_t{3} : uint64_t{9};
         std::filesystem::create_directories(checkpointDir);
         ActivateTestSnapshot(queue, checkpointDir, Rank{0}, snapshotId);
-        queue.Push({checkpoint::ipc::Message::LocalStateData{
+        queue.Push({checkpoint::ipc::Message::SnapshotData{
                        .sessionId   = checkpoint::ipc::SessionId::Default,
                        .snapshotId  = snapshotId,
                        .globalRank  = Rank{0},
@@ -2531,7 +2531,7 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(secondLocal)});
             REQUIRE(registered.wait_for(10s) == std::future_status::ready);
             CHECK_NOTHROW(registered.get());
-            CHECK(registryTargets == std::set<std::string>{"/api/peer/shardedstateregistry/0/2", "/api/peer/shardedstateregistry/0/3"});
+            CHECK(registryTargets == std::set<std::string>{"/api/peer/localstateregistry/0/2", "/api/peer/localstateregistry/0/3"});
             PublishTestGlobalRegistry(topology);
             std::promise<void>    firstWrite;
             auto                  firstWritten = firstWrite.get_future();
@@ -2563,7 +2563,7 @@ TEST_CASE("peer durability waits for the coordinator notification", "[server][fi
             for (uint32_t const rank : {2u, 3u})
             {
                 ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
-                queue.Push({checkpoint::ipc::Message::LocalStateData{
+                queue.Push({checkpoint::ipc::Message::SnapshotData{
                                .sessionId   = checkpoint::ipc::SessionId::Default,
                                .snapshotId  = checkpoint::ipc::SnapshotId{40},
                                .globalRank  = Rank{rank},
@@ -2719,7 +2719,7 @@ TEST_CASE("registry completion publishes plans before snapshot data arrives", "[
             ::setenv("NATIVE_CKPT_SERVER_HANDLER_THREADS", "1", 1);
             StartTestServer(server, logDir / "server.log");
             ::unsetenv("NATIVE_CKPT_SERVER_HANDLER_THREADS");
-            auto postPeer = [&] { return PostToTestServer("/api/peer/shardedstateregistry/0/1", SerializedSliceFragment(1, topo)); };
+            auto postPeer = [&] { return PostToTestServer("/api/peer/localstateregistry/0/1", SerializedSliceFragment(1, topo)); };
             if (peerFirst) { CHECK(postPeer() == boost::beast::http::status::ok); }
             ActivateAndUploadRegistries(topo, {SerializedSliceRegistry(topo)});
             auto plan
@@ -2757,7 +2757,7 @@ TEST_CASE("a global registry failure releases waiting peer plans", "[server][pla
     auto const              peer = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
     RankTopology const topology{.rank = Rank{1}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {peer, "localhost"}};
     auto               registered = ServePeerRequests(ioc, acceptor, [](auto const& request) {
-        CHECK(request.target() == "/api/peer/shardedstateregistry/0/1");
+        CHECK(request.target() == "/api/peer/localstateregistry/0/1");
         return std::pair{std::string{}, true};
     });
     TestServerProcess  server;
@@ -2859,7 +2859,7 @@ TEST_CASE("global registry delegation preserves the reply envelope and builds lo
                                                       "localhost",
                                                       fmt::format("127.0.0.1:{}", downstream.local_endpoint().port())}};
     auto                    registered = ServePeerRequests(coordinatorIoc, coordinator, [](auto const& request) {
-        CHECK(request.target() == "/api/peer/shardedstateregistry/0/1");
+        CHECK(request.target() == "/api/peer/localstateregistry/0/1");
         return std::pair{std::string{}, true};
     });
     std::string             forwarded;
@@ -2911,7 +2911,7 @@ TEST_CASE("peer registry fragments reject invalid tensor dimensions", "[server][
     TestServerProcess server;
     StartTestServer(server, logDir / "server.log");
     CHECK_THROWS(
-        PostToTestServer(fmt::format("/api/peer/shardedstateregistry/{}/1", checkpoint::ipc::SessionId::Default), std::move(fragment)));
+        PostToTestServer(fmt::format("/api/peer/localstateregistry/{}/1", checkpoint::ipc::SessionId::Default), std::move(fragment)));
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);
 }
@@ -2924,7 +2924,7 @@ TEST_CASE("peer registry fragments reject mismatched shard ranks", "[server][tie
 
     TestServerProcess server;
     StartTestServer(server, logDir / "server.log");
-    CHECK_THROWS(PostToTestServer(fmt::format("/api/peer/shardedstateregistry/{}/1", checkpoint::ipc::SessionId::Default),
+    CHECK_THROWS(PostToTestServer(fmt::format("/api/peer/localstateregistry/{}/1", checkpoint::ipc::SessionId::Default),
                                   SerializedSliceFragment(0, 2)));
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);

@@ -454,7 +454,7 @@ struct CheckpointWriter
 
         void FlushBytes_(size_t sendBytes)
         {
-            auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::LocalStateData{
+            auto [slot, slotbuf]                                 = that->msgQueue.AllocSlot(cipc::Message::SnapshotData{
                 .sessionId   = that->root.SessionId(),
                 .snapshotId  = snapshotId,
                 .globalRank  = that->root.GlobalRank(),
@@ -639,9 +639,7 @@ struct CheckpointWriter
 }    // namespace
 
 std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry)
-{
-    return CheckpointWriter::GetQueueState(localRegistry)->snapshotRegistry;
-}
+{ return CheckpointWriter::GetQueueState(localRegistry)->snapshotRegistry; }
 
 void SaveCheckpoint(StateTree const& snapshotRegistry, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
 {
