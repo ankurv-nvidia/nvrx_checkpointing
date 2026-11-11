@@ -60,7 +60,7 @@ inline bool TryConnectToCheckpointService()
         if (connectAttempt + 1 < MaxConnectAttempts) { std::this_thread::sleep_for(RetryInterval); }
     }
 
-    if (ec != boost::asio::error::connection_refused)
+    if (ec && ec != boost::asio::error::connection_refused)
     {
         fmt::print(stderr, "[native_ckpt:cli][ERROR] Attempting to connect with checkpoint service failed with: {}\n", ec.what());
     }

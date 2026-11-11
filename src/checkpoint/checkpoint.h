@@ -9,8 +9,12 @@
 #include <filesystem>
 #include <memory>
 
-void SvcIncrRef();
-void SvcDecrRef();
+namespace checkpoint
+{
+class ServiceReference;
+}
+
+checkpoint::ServiceReference SvcAcquireReference(StateTree const& root);
 
 void FinalizeStateRegistry(StateTree& localRegistry);
 
@@ -22,6 +26,7 @@ void SaveCheckpoint(StateTree const&                   snapshotRegistry,
                     checkpoint::ipc::SnapshotId const& snapshotId,
                     std::filesystem::path const&       ckptPath);
 void WaitForCheckpointSave(StateTree const& snapshotRegistry);
+void FlushCheckpointQueue(StateTree const& root);
 
 void SvcPing();
 void SvcStop();

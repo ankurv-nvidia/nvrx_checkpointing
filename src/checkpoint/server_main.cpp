@@ -244,7 +244,8 @@ try
     fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
     if (!TryConnectToCheckpointService())
     {
-        fmt::print(stderr, "[native_ckpt:svr][ERROR] Elected checkpoint server did not become ready\n");
+        fmt::print(stderr, "[native_ckpt:svr][INFO] Elected checkpoint server is unavailable; retrying election\n");
+        fmt::print(stdout, "RETRY\n");
         return 1;
     }
     fmt::print(stdout, "READY\n");

@@ -80,6 +80,13 @@
             [
               "native",
               "perf"
+            ],
+            [
+              "native",
+              [
+                "perf",
+                "inproc"
+              ]
             ]
           ],
           "staging": {

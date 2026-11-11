@@ -215,13 +215,14 @@ TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[
     CHECK_THROWS_AS(Integer<int8_t>::Parse("-129"), std::overflow_error);
 }
 
-TEST_CASE("server auto-shutdown configuration accepts a disabled sentinel", "[server][config][tier1]")
+TEST_CASE("in-process server mode is enabled by presence", "[server][config][tier1]")
 {
-    using Config           = checkpoint::config::ServerAutoShutdownTimeoutSeconds;
+    using Config           = checkpoint::config::ServerInproc;
     constexpr auto envName = checkpoint::config::detail::EnvName<Config>();
-    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS");
-    CHECK(Config::Default == "900");
-    CHECK(Config::Type::Parse("0") == 0);
+    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_INPROC");
+    CHECK_FALSE(Config::Type::ParsePresence(nullptr));
+    CHECK(Config::Type::ParsePresence(""));
+    CHECK(Config::Type::ParsePresence("0"));
 }
 
 TEST_CASE("shared-memory ring geometry supports runtime slot counts", "[shmem][config][tier1]")
@@ -3063,7 +3064,8 @@ TEST_CASE("checkpoint telemetry preserves the performance record schema", "[tele
 
 TEST_CASE("evicted pending snapshots remain the latest known result", "[server][completion][finalize][tier1]")
 {
-    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo(0, 2));
+    checkpoint::ServiceReferences references;
+    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo(0, 2), references);
     auto    completed     = std::make_unique<Session::Snapshot>();
     completed->snapshotId = checkpoint::ipc::SnapshotId{30};
     completed->complete   = true;
@@ -3088,7 +3090,8 @@ TEST_CASE("evicted pending snapshots remain the latest known result", "[server][
 TEST_CASE("finalize snapshot lookup rejects out-of-range iterations", "[server][completion][finalize][tier1]")
 {
     using SnapshotId = checkpoint::ipc::SnapshotId;
-    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo());
+    checkpoint::ServiceReferences references;
+    Session session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, SingleRankTopo(), references);
     auto    resolved = SnapshotId::Invalid;
     CHECK(session.ResolveSnapshotId(0, resolved));
     CHECK(resolved == SnapshotId{0});

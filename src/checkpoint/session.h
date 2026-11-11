@@ -2,6 +2,7 @@
 #include "byte_storage.h"
 #include "distcp.h"
 #include "messages.h"
+#include "service_reference.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -64,6 +65,7 @@ struct Session
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
     };
 
+    checkpoint::ServiceReferences&        references;
     Server* const                         server;
     checkpoint::ipc::SessionId const      sessionId{checkpoint::ipc::SessionId::Invalid};
     RankTopology const                    topo;
@@ -81,7 +83,11 @@ struct Session
 
     std::vector<std::future<void>> asyncTasks;
 
-    Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
+    Session(Server* serverIn                            LFTBND,
+            checkpoint::ipc::SessionId                  sessionIdIn,
+            std::filesystem::path                       workDirIn,
+            RankTopology                                topoIn,
+            checkpoint::ServiceReferences& referencesIn LFTBND);
     std::atomic<bool> stopRequested{false};
 
     void Activate();

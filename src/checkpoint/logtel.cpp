@@ -345,8 +345,8 @@ struct LogTelState
 
     std::mutex                      mutex;
     checkpoint::telemetry::Id       lastId{};
-    std::once_flag                  poolOnce;
     std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<std::FILE>      output;
 
     std::atomic<bool>                          enabled{false};
     std::shared_ptr<trace_sdk::TracerProvider> traceProvider;
@@ -434,6 +434,8 @@ namespace
 class LoggingSink final : public spdlog::sinks::sink
 {
     public:
+    explicit LoggingSink(std::shared_ptr<std::FILE> output) : _output(std::move(output)) {}
+
     void log(spdlog::details::log_msg const& msg) override
     {
         std::string_view payload{msg.payload.data(), msg.payload.size()};
@@ -475,7 +477,7 @@ class LoggingSink final : public spdlog::sinks::sink
             std::string      line;
             line.reserve(prefix.size() + payload.size() + 1);
             line.append(prefix).append(payload).push_back('\n');
-            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), stderr));
+            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), _output.get()));
         }
 
         LogTelState& state = LogTelState::Get();
@@ -498,14 +500,15 @@ class LoggingSink final : public spdlog::sinks::sink
     void flush() override
     {
         std::scoped_lock lock(_mutex);
-        static_cast<void>(std::fflush(stderr));
+        static_cast<void>(std::fflush(_output.get()));
     }
 
     void set_pattern(std::string const& /*pattern*/) override {}
     void set_formatter(std::unique_ptr<spdlog::formatter> /*formatter*/) override {}
 
     private:
-    std::mutex _mutex;
+    std::mutex                 _mutex;
+    std::shared_ptr<std::FILE> _output;
 };
 
 }    // namespace
@@ -518,13 +521,24 @@ void Init()
     std::scoped_lock lock(state.mutex);
     if (state.logger) { return; }
 
+    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
+    {
+        auto const path   = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
+        auto*      output = std::fopen(path.string().c_str(), "a");
+        if (output == nullptr) { throw std::runtime_error(fmt::format("Cannot open daemon log: {}", path)); }
+        state.output = std::shared_ptr<std::FILE>(output, std::fclose);
+    }
+    else
+    {
+        state.output = std::shared_ptr<std::FILE>(stderr, [](std::FILE*) {});
+    }
+
     static constexpr size_t QueueSize   = 8192;
     static constexpr size_t WorkerCount = 1;
-    std::call_once(state.poolOnce, [] { spdlog::init_thread_pool(QueueSize, WorkerCount); });
+    if (!spdlog::thread_pool()) { spdlog::init_thread_pool(QueueSize, WorkerCount); }
 
-    // The redirected descriptor is shared with async-signal-safe crash logging.
     auto logger = std::make_shared<spdlog::async_logger>(
-        "native_ckpt", std::make_shared<LoggingSink>(), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
+        "native_ckpt", std::make_shared<LoggingSink>(state.output), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
 
     std::string const         levelStr = checkpoint::config::GetConfigValue<checkpoint::config::LogLevel>();
     spdlog::level::level_enum level    = spdlog::level::from_str(levelStr);
@@ -533,6 +547,13 @@ void Init()
     logger->flush_on(spdlog::level::err);
 
     state.logger = std::move(logger);
+}
+
+std::FILE* Output()
+{
+    LogTelState&     state = LogTelState::Get();
+    std::scoped_lock lock(state.mutex);
+    return state.output ? state.output.get() : stderr;
 }
 
 void Flush()
@@ -639,7 +660,7 @@ namespace
 class RoutingAppender : public otlp::OtlpFileAppender
 {
     public:
-    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state)
+    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state), _output(state.output)
     {
         if (!filePath.empty())
         {
@@ -650,6 +671,7 @@ class RoutingAppender : public otlp::OtlpFileAppender
     }
 
     void Export(std::string_view data, std::size_t /*record_count*/) override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open())
@@ -662,26 +684,36 @@ class RoutingAppender : public otlp::OtlpFileAppender
         if (!line.empty() && line.back() == '\n') { line.remove_suffix(1); }
         if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
         _state.Collect(line);
+    } catch (std::exception const& ex)
+    {
+        auto* output = _output ? _output.get() : stderr;
+        std::fputs("[native_ckpt:svr][WARN] Telemetry export failed: ", output);
+        std::fputs(ex.what(), output);
+        std::fputs("\n", output);
+        std::fflush(output);
     }
 
     bool ForceFlush(std::chrono::microseconds /*timeout*/) noexcept override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open()) { _file.flush(); }
         return true;
-    }
+    } catch (std::exception const&) { return false; }
 
     bool Shutdown(std::chrono::microseconds /*timeout*/) noexcept override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open()) { _file.close(); }
         return true;
-    }
+    } catch (std::exception const&) { return false; }
 
     private:
-    std::mutex    _mutex;
-    std::ofstream _file;
-    LogTelState&  _state;
+    std::mutex                 _mutex;
+    std::ofstream              _file;
+    LogTelState&               _state;
+    std::shared_ptr<std::FILE> _output;
 };
 
 }    // namespace
@@ -875,7 +907,7 @@ void Emitter<event::ProcessMemory>::Emit(event::ProcessMemory const& fields)
 
 void Emitter<span::CkptSave::Begin>::Emit(span::CkptSave::Begin const& fields)
 {
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::Output(),
                "[native_ckpt:svr][{}][PERF] Rank={} Begin span={} started_at_ns={} snapshot={}\n",
                static_cast<uint32_t>(fields.id.sessionId),
                static_cast<uint32_t>(fields.id.rank),
@@ -898,7 +930,7 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
     auto const writeSeconds = static_cast<double>(fields.d2hDuration.count()) / 1e6;    // NOLINT
     auto const bwMbps
         = writeSeconds == 0.0 ? 0.0 : static_cast<double>(fields.totalTensorBytes) / (1024.0 * 1024.0) / writeSeconds;    // NOLINT
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::Output(),
                "[native_ckpt:svr][{}][PERF] Rank={} Finished bw_mbps={:.2f} "
                "| Time(us):  wr_tnsr_us={} snapshot_us={} total_us={} "
                "| Count: num_tensors={} total_d2h={} "

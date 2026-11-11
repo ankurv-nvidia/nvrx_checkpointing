@@ -5,7 +5,9 @@
 #include "config.h"
 #include "messages.h"
 #include "quant.h"
+#include "server.h"
 #include "service_client.h"
+#include "service_reference.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -65,7 +67,19 @@ void SvcPing()
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }
+    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
+    {
+        static constexpr auto StartTimeout = 900s;
+        auto const            deadline     = std::chrono::steady_clock::now() + StartTimeout;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (TryConnectToCheckpointService()) { return; }
+            std::this_thread::sleep_for(100ms);
+        }
+        throw std::runtime_error("Timed out waiting for the local-rank-0 checkpoint service");
+    }
 
+    bool retry = false;
     try
     {
         boost::asio::io_context    ctx;
@@ -74,6 +88,7 @@ void SvcPing()
         std::string                line;
         boost::system::error_code  ec;
         boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
+        retry = line == "RETRY\n";
         proc.detach();
     } catch (std::exception const& ex)
     {
@@ -84,6 +99,8 @@ void SvcPing()
                    ex.what());
         throw;
     }
+
+    if (retry) { throw boost::system::system_error(boost::asio::error::try_again, "Checkpoint service election is pending"); }
 
     // Both the elected daemon and losing candidates write READY only after the
     // elected service answers a ping. The two short attempts inside TryConnect
@@ -231,6 +248,21 @@ struct CheckpointWriter
         std::shared_future<void>        ready;
         std::shared_ptr<StateTree>      snapshotRegistry;
         std::mutex                      snapshotMutex;
+        uint64_t                        generation{};
+        bool                            registered{false};
+
+        ~QueueState()
+        {
+#ifdef PHOENIX_HAVE_CUDA
+            if (registered) try
+                {
+                    DeviceContext::CudaUnregisterHostBuffer(queue->GetShmDataRegion().data());
+                } catch (std::exception const& error)
+                {
+                    fmt::print(stderr, "[native_ckpt:cli][ERROR] Queue unregistration failed: {}\n", error.what());
+                }
+#endif
+        }
     };
 
     struct QueueRegistry
@@ -248,17 +280,28 @@ struct CheckpointWriter
         return Registry;
     }
 
+    static void ObserveGeneration(Rank rank, uint64_t generation)
+    {
+        auto&            reg = Registry();
+        std::scoped_lock lock(reg.mu);
+        auto&            state = reg.states[rank];
+        if (state && state->generation == generation) { return; }
+        state             = std::make_shared<QueueState>();
+        state->generation = generation;
+    }
+
     static void SendStateRegistry(StateTree const& registry)
     {
         auto const& topo = registry.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
-        auto               state = std::make_shared<QueueState>();
+        auto&            entry = reg.states[topo.rank];
+        if (entry && entry->ready.valid()) { return; }
+        if (!entry) { entry = std::make_shared<QueueState>(); }
+        auto               state = entry;
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -298,6 +341,7 @@ struct CheckpointWriter
 #ifdef PHOENIX_HAVE_CUDA
             auto region = state->queue->GetShmDataRegion();
             DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            state->registered = true;
 #endif
             state->snapshotRegistry = std::move(snapshotRegistry);
         } catch (...)
@@ -636,6 +680,51 @@ struct CheckpointWriter
 };
 }    // namespace
 
+checkpoint::ServiceReference SvcAcquireReference(StateTree const& root)
+{
+    auto const& topo = root.Topo();
+    if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+    static constexpr auto AcquireTimeout = 900s;
+    auto const            deadline       = std::chrono::steady_clock::now() + AcquireTimeout;
+    while (true)
+    {
+        try
+        {
+            if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>()
+                && !checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>()
+                && static_cast<uint32_t>(topo.rank) % (topo.ranksPerPeer * topo.peersPerNode) == 0)
+            {
+                StartOwnedInprocServer();
+            }
+            else
+            {
+                SvcPing();
+            }
+            auto reference = checkpoint::ServiceReferences::AcquireProcess(root.SessionId(), topo);
+            CheckpointWriter::ObserveGeneration(topo.rank, reference.Generation());
+            return reference;
+        } catch (boost::system::system_error const&)
+        {
+            if (std::chrono::steady_clock::now() >= deadline) { throw; }
+            std::this_thread::sleep_for(100ms);
+        }
+    }
+}
+
+void FlushCheckpointQueue(StateTree const& root)
+{
+    std::shared_ptr<CheckpointWriter::QueueState> state;
+    {
+        auto&            reg = CheckpointWriter::Registry();
+        std::scoped_lock lock(reg.mu);
+        auto             it = reg.states.find(root.Topo().rank);
+        if (it == reg.states.end() || !it->second->ready.valid()) { return; }
+        state = it->second;
+    }
+    state->ready.get();
+    state->queue->Flush();
+}
+
 std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry)
 { return CheckpointWriter::GetQueueState(localRegistry)->snapshotRegistry; }
 
@@ -704,6 +793,3 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
                                          "is this build missing PHOENIX_BUILD_CUDA / PHOENIX_BUILD_METAL?",
                                          device));
 }
-
-void SvcDecrRef()
-{}

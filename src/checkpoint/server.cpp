@@ -9,6 +9,7 @@
 #include "numa_utils.h"
 #include "serdes_utils.h"
 #include "server.h"
+#include "service_reference.h"
 #include "session.h"
 #include "shm_ring_buffer.h"
 #include "state.h"
@@ -43,6 +44,7 @@
 #include <boost/url.hpp>
 #include <hwloc.h>
 
+#include <cstdlib>
 #include <latch>
 
 using namespace std::chrono_literals;
@@ -53,24 +55,23 @@ namespace tel  = checkpoint::telemetry;
 using PerfClock = std::chrono::system_clock;
 using Request   = boost::beast::http::request<boost::beast::http::buffer_body>;
 using boost::asio::ip::tcp;
-using tcp_stream
-    = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
+using tcp_stream = boost::beast::tcp_stream;
 
 struct Server
 {
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    explicit Server(uint16_t index = 0) : _index(index) {}
+    explicit Server(uint16_t index = 0) : _index(index), _references(index) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
     void Start();
+    bool Accepting() const { return _references.Accepting(); }
     bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
     bool AllSessionsComplete();
     bool HasSessionsAndAllSessionsComplete();
     void WaitForShutdown();
-    void Ping();
     void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
     void Stop();
     void QuerySessions(ServerSessionCallback callback, void* cbData);
@@ -139,7 +140,7 @@ struct Server
     uint16_t   _index{};
     std::mutex _mutex;
 
-    PerfClock::time_point        _lastPingTime{PerfClock::now()};
+    checkpoint::ServiceReferences _references;
     std::atomic<bool>            _stopRequested{false};
     std::vector<cipc::MsgQueue*> _msgQueue;
     bool                         _running{false};
@@ -267,7 +268,7 @@ void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapsh
                 std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
             }
             INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::Output());
             _msgQueue[queueIndex] = &msgQueue;
             queueReady.count_down();
             [&]() noexcept {
@@ -320,31 +321,17 @@ bool Server::HasSessionsAndAllSessionsComplete()
 
 void Server::WaitForShutdown()
 {
-    auto const autoShutdownTimeout
-        = std::chrono::seconds{checkpoint::config::GetConfigValue<checkpoint::config::ServerAutoShutdownTimeoutSeconds>()};
-    while (true)
-    {
-        auto const autoShutdown
-            = autoShutdownTimeout != 0s && (_lastPingTime + autoShutdownTimeout) < PerfClock::now() && HasSessionsAndAllSessionsComplete();
-        if (_stopRequested || autoShutdown) { break; }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    _references.WaitForEmpty(_stopRequested);
     Stop();
-}
-
-void Server::Ping()
-{
-    std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
 }
 
 void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
 {
+    auto reference = _references.Acquire("shared-memory request");
     switch (static_cast<cipc::Message::Type>(hdr.index()))
     {
     case cipc::Message::Type::Ping:
     {
-        Ping();
         return;
     }
     case cipc::Message::Type::Shutdown:
@@ -398,8 +385,6 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
 
 void Server::Stop()
 {
-    checkpoint::logging::Shutdown();
-    checkpoint::telemetry::Shutdown();
     bool wasRunning = false;
     {
         std::scoped_lock lock(_mutex);
@@ -432,7 +417,7 @@ void Server::Stop()
                     }
                 }
             }
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::Output());
         }
         for (auto const& msgQueue : _msgQueue)
         {
@@ -472,6 +457,10 @@ void Server::Stop()
     }
 
     if (!wasRunning) { return; }
+
+    checkpoint::logging::Shutdown();
+    checkpoint::telemetry::Shutdown();
+    _references.ReleaseRemoteReferences();
 
     boost::system::error_code ec;
     for (auto& acceptor : _tcpAcceptors)
@@ -527,7 +516,6 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
 Session& Server::SessionById_(cipc::SessionId sessionId) LFTBND
 {
     std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
     auto it       = _activeSessions.find(sessionId);
     if (it == _activeSessions.end())
     {
@@ -651,14 +639,13 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId                           
 void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
 {
     std::unique_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
 
     BufStream bufStream{buf.data(), buf.size()};
     auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
     auto      workDir       = workDirStr.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(workDirStr);
     auto      createSession = [&] {
         auto topo                   = StateSerDes::ReadTopology(bufStream);
-        auto session                = std::make_unique<Session>(this, sessionId, std::move(workDir), std::move(topo));
+        auto session                = std::make_unique<Session>(this, sessionId, std::move(workDir), std::move(topo), _references);
         session->numActiveSnapshots = std::min(numActiveSnapshots, _maxActiveSnapshots);
         session->Activate();
         return session;
@@ -894,6 +881,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     boost::beast::http::request_parser<boost::beast::http::empty_body> headerParser;
     headerParser.body_limit(std::numeric_limits<std::uint64_t>::max());
     boost::beast::http::read_header(stream, buffer, headerParser);
+    if (_references.HandleRequest(stream, buffer, headerParser)) { return; }
 
     auto const& headers = headerParser.get();
     auto        target  = headers.target();
@@ -1045,7 +1033,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "activate-snapshot"}) && headers.method() == boost::beast::http::verb::post)
     {
@@ -1092,7 +1079,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         response.keep_alive(keepAlive);
         response.prepare_payload();
         boost::beast::http::write(stream, response);
-        Ping();
     }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
@@ -1123,7 +1109,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "shmqueue"}) && headers.method() == boost::beast::http::verb::post)
     {
@@ -1156,7 +1141,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         response.keep_alive(keepAlive);
         response.prepare_payload();
         boost::beast::http::write(stream, response);
-        Ping();
     }
     else if (matches({"api", "snapshot-plan"}) && getOrPost && it != segs.end())
     {
@@ -1167,7 +1151,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock waitersLock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& task) { return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, socket = std::move(stream), sessionId, rank] mutable {
+        auto waiter = [this, socket = std::move(stream), sessionId, rank] mutable {
             auto connection = std::move(socket);
             SetThreadName("ncs:planwait");
             connection.expires_never();
@@ -1246,7 +1230,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             boost::system::error_code error;
             boost::beast::http::write(connection, response, error);
             TryCleanShutdown(connection);
-        }));
+        };
+        _finalizeWaits.emplace_back(_references.Async("wait for snapshot plan", std::move(waiter), sessionId));
     }
     else if (matches({"api", "ping"}) && getOrPost && (it == segs.end()))
     {
@@ -1256,7 +1241,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "stop"}) && getOrPost && (it == segs.end()))
     {
@@ -1300,9 +1284,10 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock lock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration] mutable {
-            FinalizeWaitLoop_(std::move(s), sessionId, iteration);
-        }));
+        _finalizeWaits.emplace_back(_references.Async(
+            "wait for durability",
+            [this, s = std::move(stream), sessionId, iteration] mutable { FinalizeWaitLoop_(std::move(s), sessionId, iteration); },
+            sessionId));
     }
     else if ((url.path() == "/v1/traces" || url.path() == "/v1/metrics" || url.path() == "/v1/logs")
              && headers.method() == boost::beast::http::verb::post)
@@ -1456,7 +1441,7 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
             ERR("accept error: {}", ec.message());
             co_return;
         }
-        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)] mutable {
+        auto handler = [this, sock = std::move(socket)] mutable {
             static constexpr auto Timeout = std::chrono::seconds{30};
             tcp_stream            stream(std::move(sock));
             stream.expires_after(Timeout);
@@ -1472,7 +1457,9 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
                 TryCleanShutdown(stream);
                 ERR("Error: {}", e.what());
             }
-        });
+        };
+        boost::asio::post(*_handlerPool,
+                          _references.Bind("http request", std::move(handler), checkpoint::ServiceReferences::NoSession, true));
     }
 }
 
@@ -1481,6 +1468,61 @@ SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
 SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
 static std::vector<std::unique_ptr<Server>> ServerSingletons;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 SUPPRESS_WARNINGS_END
+
+namespace
+{
+struct OwnedServer
+{
+    std::mutex              mutex;
+    std::unique_ptr<Server> server;
+    std::future<void>       shutdown;
+    std::once_flag          exitOnce;
+};
+
+OwnedServer& ProcessServer()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static OwnedServer Instance;
+    SUPPRESS_WARNINGS_END
+    return Instance;
+}
+}    // namespace
+
+void StartOwnedInprocServer()
+{
+    auto&            owner = ProcessServer();
+    std::scoped_lock lock(owner.mutex);
+    if (owner.shutdown.valid())
+    {
+        if (owner.shutdown.wait_for(0s) != std::future_status::ready && owner.server->Accepting()) { return; }
+        owner.shutdown.get();
+        owner.server.reset();
+    }
+    auto server = std::make_unique<Server>();
+    server->Start();
+    owner.server   = std::move(server);
+    owner.shutdown = std::async(std::launch::async, [instance = owner.server.get()] { instance->WaitForShutdown(); });
+    std::call_once(owner.exitOnce, [] {
+        std::atexit(+[] {
+            try
+            {
+                WaitForOwnedInprocServer();
+            } catch (std::exception const& ex)
+            {
+                fmt::print(checkpoint::logging::Output(), "Checkpoint daemon shutdown failed: {}\n", ex.what());
+            }
+        });
+    });
+}
+
+void WaitForOwnedInprocServer()
+{
+    auto&            owner = ProcessServer();
+    std::scoped_lock lock(owner.mutex);
+    if (owner.shutdown.valid()) { owner.shutdown.get(); }
+    owner.server.reset();
+}
 
 void RunInprocServer(uint16_t nodes)
 {
@@ -1492,7 +1534,7 @@ void RunInprocServer(uint16_t nodes)
         ServerSingletons.back()->Start();
     }
     INFO("Inproc server started.");
-    std::fflush(stderr);
+    std::fflush(checkpoint::logging::Output());
 }
 
 void RunServer()    // NOLINT(misc-use-internal-linkage)

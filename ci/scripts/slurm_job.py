@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import glob
 import hashlib
 import importlib
 import importlib.metadata
@@ -51,7 +52,7 @@ import urllib.request
 from collections import namedtuple
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -134,6 +135,7 @@ WORK_ROOT: Path | None = None
 RUN_NAME: str | None = None
 logger = logging.getLogger("native_ci")
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
+_DAEMON_CONTROL_SESSION = (1 << 32) - 2
 _EPILOG_ENTRY_CMD = "__epilog__"
 _RANK_LOGS_ENTRY_CMD = "__rank_logs__"
 _FAILURE_SUMMARY_ENTRY_CMD = "__failure_summary__"
@@ -1930,13 +1932,10 @@ class FlavorPolicy:
     def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server:
             def stop() -> None:
-                pids = CHECKPOINT_SERVER.pids()
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
-                    pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]
-                    _reject_server_errors(
-                        Path(pattern.replace("%h", socket.gethostname()).replace("%p", pid)) for pid in pids
-                    )
+                    pattern = Path(os.environ["NATIVE_CKPT_SERVER_LOG"].replace("%h", socket.gethostname()))
+                    _reject_server_errors(pattern.parent.glob(glob.escape(pattern.name).replace("%p", "*")))
 
             _node_once(tag, stop)
 
@@ -2117,7 +2116,6 @@ class DeterministicFlavor(Flavor):
 
 _VALGRIND_NATIVE_ENV = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH": "1",
-    "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS": "0",
     "NATIVE_CKPT_SERVER_HANDLER_THREADS": "4",
     "NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS": "0",
     "NATIVE_CKPT_SERVER_TCP_ACCEPTORS": "1",
@@ -2144,6 +2142,8 @@ class ValgrindFlavor(Flavor):
         policy.reporter = None
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
+        if "NATIVE_CKPT_SERVER_INPROC" in env:
+            raise ValueError("valgrind requires a separate-process daemon; unset NATIVE_CKPT_SERVER_INPROC")
         _drop(
             opts,
             "--cuda-graph-impl",
@@ -2207,9 +2207,12 @@ class ValgrindFlavor(Flavor):
                 time.sleep(1)
             else:
                 raise RuntimeError(f"checkpoint_server failed to start under valgrind; see {server_log}")
-            marker.with_suffix(".ready").touch()
             try:
-                yield
+                from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+
+                with contextlib.closing(checkpoint.model_state.create_root(_DAEMON_CONTROL_SESSION, 0, 1, ["localhost"], 1)):
+                    marker.with_suffix(".ready").touch()
+                    yield
                 CHECKPOINT_SERVER.request("spindown", 3600)
                 rc = proc.wait(timeout=3600)
                 if rc:
@@ -2221,15 +2224,11 @@ class ValgrindFlavor(Flavor):
                 marker.with_suffix(".done").touch()
 
 
-_FLAVOR_KEYS = ("summary", "priority", *_SCOPES)
+_FLAVOR_KEYS = ("summary", "priority", "env", *_SCOPES)
 
 
 class DeclaredFlavor(Flavor):
-    """A checkpoint variant declared in ``ci/flavors.yaml``.
-
-    A variant that only adds or drops options, or settles a run option, needs no
-    code: it names the axis it puts under test and the options that express it.
-    """
+    """A checkpoint variant declared through options and training environment."""
 
     def __init__(self, name: str, spec: dict):
         if unknown := sorted(set(spec) - set(_FLAVOR_KEYS)):
@@ -2237,6 +2236,7 @@ class DeclaredFlavor(Flavor):
         self.name = name
         self.summary = str(spec.get("summary", ""))
         self.priority = int(spec.get("priority", 0))
+        self.environment = {str(name): str(value) for name, value in (spec.get("env") or {}).items()}
         self.edits = tuple(
             OptionEdit(scope, tuple(spec[scope].get("add") or ()), tuple(spec[scope].get("drop") or ()))
             for scope in _SCOPES
@@ -2245,6 +2245,9 @@ class DeclaredFlavor(Flavor):
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.option_edits += self.edits
+
+    def transform(self, _opts: list[str], env: dict[str, str]) -> None:
+        env.update(self.environment)
 
 
 def _flavor_index(flavors: Iterable[Flavor]) -> dict[str, Flavor]:
@@ -2316,6 +2319,8 @@ class FlavorSelection:
         scope they share, which is what a run cannot carry both of. A variant
         replacing its own option is not a contradiction.
         """
+        if {"vg", "inproc"}.issubset(flavor.name for flavor in self.items):
+            raise ValueError("inproc and vg require different daemon lifetime modes")
         for adder in self.items:
             for dropper in self.items:
                 if adder is dropper:
@@ -2702,25 +2707,6 @@ def _reject_server_errors(logs: Iterable[Path]) -> None:
     if failed:
         raise RuntimeError(f"checkpoint server reported errors; see {', '.join(map(str, failed))}")
 
-def _heartbeat_server(stopped: threading.Event) -> None:
-    while not stopped.wait(60):
-        CHECKPOINT_SERVER.request("ping", 1)
-
-
-@contextlib.contextmanager
-def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
-    if not enabled or _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") != "0":
-        yield
-        return
-    stopped = threading.Event()
-    thread = threading.Thread(target=_heartbeat_server, args=(stopped,), daemon=True)
-    thread.start()
-    try:
-        yield
-    finally:
-        stopped.set()
-        thread.join()
-
 def _extra_options(cfg: str, selected: list[str]) -> list[str]:
     """Split option text, resolving the run-scoped cache directory in it."""
     if not any(selected):
@@ -2846,6 +2832,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             provider == "native" or megatron_otel_enabled or "detr" in flavors.names
         )
         if collect_otel:
+            from nvrx_checkpointing import SERVER_PATH, ckpt_diag  # noqa: PLC0415
+
+            ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
             os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
             env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
         else:
@@ -2877,27 +2866,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         run_id = f"{job_id}-{RUN_NAME}-{cycle_tag}-sr{slurm_restart}-te{elastic_restart}"
         env["MEGATRON_OTEL_RUN_ID"] = run_id
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
-        server_enabled = collect_otel
-        if server_enabled:
-            from nvrx_checkpointing import SERVER_PATH, checkpoint, ckpt_diag  # noqa: PLC0415
-
-            ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
-
-            if relay_otel:
-                if collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-collector".strip("-"), checkpoint.ping)
-                _sync_ranks(f"{label}-{cycle_tag}-otel-collector-ready".strip("-"))
-                if not collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-relay".strip("-"), checkpoint.ping)
-            else:
-                _node_once(f"{label}-{cycle_tag}-otel-listener".strip("-"), checkpoint.ping)
-            _sync_ranks(f"{label}-{cycle_tag}-otel-listeners-ready".strip("-"))
         if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
-        with (
-            flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
-            _server_heartbeat(server_enabled),
-        ):
+        with flavors.policy.server_context(f"{stem}-{cycle_tag}", phase):
             _print_pretrain_env(env, cycle_tag)
             rc = (
                 _tee_rc(
@@ -2920,10 +2891,10 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                 _run_dir(cfg) / f"phase1-checkpoints/iter_{flavors.policy.phase1_train_iters:07d}/.metadata",
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
-        if server_enabled and not collector_node:
+        if collect_otel and not collector_node:
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop")
         _sync_ranks(f"{label}-{cycle_tag}-relays-stopped".strip("-"))
-        if server_enabled and collector_node:
+        if collect_otel and collector_node:
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
         if rank == "0":
@@ -3517,8 +3488,26 @@ def _fill_uninitialized_memory_if_deterministic(args: argparse.Namespace, torch_
         torch_module.utils.deterministic.fill_uninitialized_memory = True
 
 
+@lru_cache(maxsize=1)
+def _training_daemon_reference() -> object | None:
+    if not os.environ.get("NATIVE_CKPT_OTEL_FILE"):
+        return None
+    from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+    from nvrx_checkpointing.peers import OrderedPeers, detect_environment_peers  # noqa: PLC0415
+
+    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
+    peers = detect_environment_peers(rank, world_size)
+    if peers is None:
+        if world_size != 1:
+            raise RuntimeError("Training daemon requires the distributed peer topology")
+        peers = OrderedPeers(("localhost",), 1)
+    return checkpoint.model_state.create_root(_DAEMON_CONTROL_SESSION, rank, world_size, **peers.checkpoint_args())
+
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
+    _training_daemon_reference()
     _prepare_otel_randomness()
     if _install_torch_serialization_compat() and _rank_env("SLURM_PROCID", "RANK", "0") == "0":
         print("[slurm_job] installed missing torch.utils.serialization config compatibility", file=sys.stderr, flush=True)  # noqa: T201
@@ -3622,14 +3611,9 @@ def _worker(args: argparse.Namespace) -> None:
         # uninstall would pull its modules from under the launcher agents.
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    if _in_job_array():
-        # A launcher restart re-runs this worker on nodes whose previous attempt
-        # auto-launched the checkpoint daemon; the leftover belongs to this run,
-        # so terminate it instead of refusing to start.
-        CHECKPOINT_SERVER.terminate()
-    # JET preflights the node before starting worker ranks.
-    elif os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
-        CHECKPOINT_SERVER.require_stopped()
+    if _in_job_array() or os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
+        action = CHECKPOINT_SERVER.terminate if _in_job_array() else CHECKPOINT_SERVER.require_stopped
+        _node_once("server-preflight", action)
     try:
         _perform_runs(cfg, args)
     except BaseException:
@@ -4112,6 +4096,7 @@ _ENV_SCOPES = {
     **dict.fromkeys(_MODEL_ENV_NAMES, "rw"),
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS": "rw",
+    "NATIVE_CKPT_SERVER_INPROC": "rw",
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",

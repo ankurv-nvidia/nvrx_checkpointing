@@ -219,7 +219,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
             // Rank 0 joins last, so the set is now world-size: every shard and the metadata
             // are on disk and the checkpoint is loadable.
             // This raw marker has a strict schema consumed by CI.
-            fmt::print(stderr,
+            fmt::print(checkpoint::logging::Output(),
                        "[native_ckpt:svr][{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
                        *this,
                        hdr.snapshotId,
@@ -275,6 +275,24 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                     ERR("[{}] Failed to report checkpoint failure: {}", *this, notifyError.what());
                 }
             }
+        }
+    }
+
+    if (!onCoordinatorPeer)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + ServerWaitTimeout;
+        while (!stopRequested)
+        {
+            {
+                std::scoped_lock lock(mutex);
+                if (snapshot.complete) { break; }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    snapshot.failures.emplace_back("Timed out waiting for global checkpoint completion");
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
@@ -415,8 +433,12 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
     RelayGlobalRegistryToPeers(registry, startPeerIndex, delegateStart);
 }
 
-Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
-    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
+Session::Session(Server* serverIn                            LFTBND,
+                 cipc::SessionId                             sessionIdIn,
+                 std::filesystem::path                       workDirIn,
+                 RankTopology                                topoIn,
+                 checkpoint::ServiceReferences& referencesIn LFTBND) :
+    references(referencesIn), server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
@@ -472,7 +494,7 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
             registeredRegistry = std::move(localRegistry);
             registryAccepted   = true;
             asyncTasks.emplace_back(
-                std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkReceiveLocalStateRegistry_, this, rank));
+                references.Async("receive registry", [this, rank] { AsyncWorkReceiveLocalStateRegistry_(rank); }, sessionId));
         }
     }
 
@@ -664,7 +686,7 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
     {
         std::scoped_lock lock(mutex);    // local registry uploads can arrive on concurrent HTTP handlers
-        asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkFinalizeSnapshot_, this, hdr));
+        asyncTasks.emplace_back(references.Async("finalize snapshot", [this, hdr] { AsyncWorkFinalizeSnapshot_(hdr); }, sessionId));
     }
 }
 
@@ -676,7 +698,7 @@ static void FailPlanning(Session& session, std::string failure)
     if (session.stopRequested) { return; }
     ERR("[{}] Snapshot planning failed: {}", session, session.sessionState.planningFailure);
     auto const message = session.sessionState.planningFailure;
-    session.asyncTasks.emplace_back(std::async(std::launch::async, [&session, message] {
+    auto       propagate = [&session, message] {
         std::ostringstream result;
         serdes::WriteBlobWithSize<uint32_t>(result, message);
         auto const body      = result.str();
@@ -690,7 +712,8 @@ static void FailPlanning(Session& session, std::string failure)
                     session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
             } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
         }
-    }));
+    };
+    session.asyncTasks.emplace_back(session.references.Async("propagate planning failure", std::move(propagate), session.sessionId));
 }
 
 void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
@@ -983,7 +1006,7 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
         }
         sessionState.planningStarted = true;
         auto globalRegistry          = sessionState.globalRegistry;
-        asyncTasks.emplace_back(std::async(std::launch::async, [this, globalRegistry] {
+        auto plan                    = [this, globalRegistry] {
             try
             {
                 globalRegistry->FinalizeRegistry();
@@ -992,7 +1015,8 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                 HandleGlobalRegistry(globalRegistry, {});
                 BroadcastGlobalRegistryToPeers_(*globalRegistry);
             } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
-        }));
+        };
+        asyncTasks.emplace_back(references.Async("plan snapshot registry", std::move(plan), sessionId));
     } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
 }
 
