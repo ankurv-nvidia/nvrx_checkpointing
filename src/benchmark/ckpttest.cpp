@@ -11,6 +11,7 @@
 #include "quant.h"
 #include "server.h"
 #include "service_client.h"
+#include "service_reference_test.h"
 #include "session.h"
 #include "shm_ring_buffer.h"
 #include "state.h"
@@ -4251,6 +4252,7 @@ int main(int argc, char* argv[])
         RunServer();
         return EXIT_SUCCESS;
     }
+    if (argc >= 2 && std::string_view{argv[1]} == ServiceReferenceChildArg) { return RunServiceReferenceChild(argc, argv); }
 
     Catch::Session session;
     std::string    registry;

@@ -9,6 +9,7 @@
 #include "numa_utils.h"
 #include "serdes_utils.h"
 #include "server.h"
+#include "service_reference.h"
 #include "session.h"
 #include "shm_ring_buffer.h"
 #include "state.h"
@@ -61,9 +62,13 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    explicit Server(uint16_t index = 0) : _index(index) {}
+    explicit Server(uint16_t index = 0, bool linkUpstream = false) : _index(index), _linkUpstream(linkUpstream) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
+
+    [[nodiscard]] uint16_t Index() const { return _index; }
+    void                   ForgetPid(int64_t pid) { _references.ForgetPid(pid); }
+    void                   DrainAndStop(checkpoint::service::Clock::time_point deadline);
 
     void Start();
     bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
@@ -77,6 +82,8 @@ struct Server
 
     private:
     Session& SessionById_(cipc::SessionId sessionId) LFTBND;
+
+    checkpoint::service::SessionReferences AttachSession_(Session& session) LFTBND;
 
     template <typename TLambda>
     void FindOrWaitForSessionAndSnapshot_(std::string_view context,
@@ -136,7 +143,11 @@ struct Server
     boost::asio::awaitable<void> DoListen_(boost::asio::ip::tcp::acceptor& acceptor);
 
     private:
+    // Declared first so sessions and handlers release their references before it is destroyed.
+    checkpoint::service::Registry _references;
+
     uint16_t   _index{};
+    bool       _linkUpstream{};
     std::mutex _mutex;
 
     PerfClock::time_point        _lastPingTime{PerfClock::now()};
@@ -324,8 +335,7 @@ void Server::WaitForShutdown()
         = std::chrono::seconds{checkpoint::config::GetConfigValue<checkpoint::config::ServerAutoShutdownTimeoutSeconds>()};
     while (true)
     {
-        auto const autoShutdown
-            = autoShutdownTimeout != 0s && (_lastPingTime + autoShutdownTimeout) < PerfClock::now() && HasSessionsAndAllSessionsComplete();
+        auto const autoShutdown = autoShutdownTimeout != 0s && _references.DrainedFor() > autoShutdownTimeout;
         if (_stopRequested || autoShutdown) { break; }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -524,6 +534,31 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
     }
 }
 
+checkpoint::service::SessionReferences Server::AttachSession_(Session& session) LFTBND
+{
+    bool const linked = _linkUpstream && !session.IsCoordinatorPeer() && session.PeerIndex() < session.topo.peers.size();
+    return _references.AttachSession(
+        session.sessionId,
+        [&session] { return session.PendingWork_(); },
+        linked ? session.topo.peers.front() : std::string{},
+        linked ? session.topo.peers[session.PeerIndex()] : std::string{});
+}
+
+void Server::DrainAndStop(checkpoint::service::Clock::time_point deadline)
+{
+    if (!_references.WaitUntilDrained(deadline))
+    {
+        ERR("[{}] service references outlived the wind-down deadline; aborting in-flight work", *this);
+        std::scoped_lock lock(_mutex);
+        for (auto& session : _activeSessions)
+        {
+            std::scoped_lock slock(session.second->mutex);
+            session.second->stopRequested = true;
+        }
+    }
+    Stop();
+}
+
 Session& Server::SessionById_(cipc::SessionId sessionId) LFTBND
 {
     std::scoped_lock lock(_mutex);
@@ -660,6 +695,7 @@ void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnaps
         auto topo                   = StateSerDes::ReadTopology(bufStream);
         auto session                = std::make_unique<Session>(this, sessionId, std::move(workDir), std::move(topo));
         session->numActiveSnapshots = std::min(numActiveSnapshots, _maxActiveSnapshots);
+        session->references         = AttachSession_(*session);
         session->Activate();
         return session;
     };
@@ -783,7 +819,7 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
     bool hardStop = false;
     while (!ec)
     {
-        if (AllSessionsComplete()) { break; }
+        if (!_references.HasValidReference(checkpoint::service::Kinds::Self)) { break; }
         if (_stopRequested) { break; }    // another path already began shutdown
         if (PerfClock::now() >= deadline)
         {
@@ -889,6 +925,7 @@ void Server::FinalizeWaitLoop_(tcp_stream stream, cipc::SessionId sessionId, int
 
 void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-function-cognitive-complexity)
 {
+    auto                      reference = _references.AcquireSelf("request");
     boost::beast::flat_buffer buffer;
     // First, read only the headers to determine the endpoint
     boost::beast::http::request_parser<boost::beast::http::empty_body> headerParser;
@@ -1283,6 +1320,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         // Hand the connection off to a dedicated waiter thread and return at once: the
         // accept loop must stay free to service the peer writeckptcomplete/snapshotcomplete
         // notifications that idle-ness depends on, otherwise the wait would deadlock.
+        // The waiter must not count this request as in-flight work.
+        reference = {};
         std::scoped_lock lock(_mutex);
         _spinDownThreads.emplace_back([this, s = std::move(stream)] mutable { SpinDownWaitLoop_(std::move(s)); });
     }
@@ -1336,6 +1375,21 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
         res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
+    else if (matches({"api", "reference"}))
+    {
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+        auto const method    = headers.method();
+
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        boost::beast::http::read(stream, buffer, bodyParser);
+        boost::beast::http::response<boost::beast::http::string_body> res{_references.Handle(method, url.path(), bodyParser.get().body()),
+                                                                          version};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }
@@ -1493,6 +1547,62 @@ void RunInprocServer(uint16_t nodes)
     }
     INFO("Inproc server started.");
     std::fflush(stderr);
+}
+
+static void WindDownInprocServers()
+{
+    INFO("Winding down {} in-process server(s)", ServerSingletons.size());
+    auto const deadline = checkpoint::service::Clock::now() + ServerWaitTimeout;
+    auto const self     = checkpoint::service::CurrentPid();
+    for (auto const& server : ServerSingletons) { server->ForgetPid(self); }
+    for (auto const& server : ServerSingletons) { server->DrainAndStop(deadline); }
+    ServerSingletons.clear();
+}
+
+namespace
+{
+// Destroyed at normal process exit, after the interpreter has finalized, to drain and stop the hosted servers.
+struct InprocHost
+{
+    InprocHost() = default;
+    ~InprocHost() { WindDownInprocServers(); }
+    CLASS_DELETE_COPY_AND_MOVE(InprocHost);
+};
+}    // namespace
+
+static void StartInprocServer(uint16_t index)
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::mutex StartMutex;
+    SUPPRESS_WARNINGS_END
+
+    std::scoped_lock lock(StartMutex);
+    if (std::ranges::any_of(ServerSingletons, [index](auto const& server) { return server->Index() == index; })) { return; }
+    checkpoint::logging::Init();
+    INFO("Starting in-process server for peer index={}", index);
+    auto server = std::make_unique<Server>(index, true);
+    server->Start();
+    ServerSingletons.push_back(std::move(server));
+
+    // Constructed after the server's logging and telemetry state so it is destroyed before them.
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static InprocHost const Host;
+    SUPPRESS_WARNINGS_END
+}
+
+void EnsureInprocServer(RankTopology const& topo)
+{
+    if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+    auto const rank        = static_cast<uint32_t>(topo.rank);
+    auto const serverIndex = static_cast<uint16_t>((rank / topo.ranksPerPeer) % topo.peersPerNode);
+    if (rank % topo.ranksPerPeer == 0)
+    {
+        StartInprocServer(serverIndex);
+        return;
+    }
+    checkpoint::service::WaitForService(static_cast<uint16_t>(Server::Port + serverIndex), ServerWaitTimeout);
 }
 
 void RunServer()    // NOLINT(misc-use-internal-linkage)

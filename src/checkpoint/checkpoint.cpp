@@ -5,7 +5,9 @@
 #include "config.h"
 #include "messages.h"
 #include "quant.h"
+#include "server.h"
 #include "service_client.h"
+#include "service_reference.h"
 #include "state.h"
 #include "stateserdes.h"
 #include "tensor.h"
@@ -64,6 +66,10 @@ void SvcPing()
     if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
+    }
+    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
+    {
+        throw std::runtime_error("In-process checkpoint service is not running");
     }
 
     try
@@ -270,7 +276,11 @@ struct CheckpointWriter
 #endif
         try
         {
-            SvcPing();
+            if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>()) { EnsureInprocServer(topo); }
+            else
+            {
+                SvcPing();
+            }
             std::ostringstream ostr;
             serdes::WriteBlobWithSize<uint16_t>(ostr, "");
             StateSerDes::WriteTopology(ostr, topo);
@@ -663,6 +673,11 @@ void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
     CheckpointWriter::SendStateRegistry(localRegistry);
+    if (!localRegistry.serviceReference)
+    {
+        localRegistry.serviceReference = checkpoint::service::AcquireClientReference(
+            static_cast<uint16_t>(cipc::Message::Port + ServerIndex(localRegistry)), localRegistry.SessionId());
+    }
 }
 
 // For now, we don't have any deferred tensors to save, so this is a no-op. In the future, we can add logic here to save any remaining
@@ -704,6 +719,3 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
                                          "is this build missing PHOENIX_BUILD_CUDA / PHOENIX_BUILD_METAL?",
                                          device));
 }
-
-void SvcDecrRef()
-{}

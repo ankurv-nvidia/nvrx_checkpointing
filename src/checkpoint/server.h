@@ -12,6 +12,9 @@ void RunServer();
 
 void RunInprocServer(uint16_t nodes);
 
+// Starts the in-process server on the first rank of the topology's peer and waits for it on every other rank.
+void EnsureInprocServer(RankTopology const& topo);
+
 // Waits until every in-process daemon has made its active snapshots durable.
 // This is intended for test and benchmark teardown, not the measured save path.
 void WaitForInprocServerWrites();

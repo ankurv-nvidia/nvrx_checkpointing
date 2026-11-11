@@ -30,11 +30,13 @@ template <> struct fmt::formatter<boost::asio::ip::address> : fmt::ostream_forma
 inline auto ResolveEndpoint(boost::asio::io_context& ioc, std::string_view const& address)
 {
     // Cached results avoid intermittent host-not-found errors on repeated resolution.
+    // The cache is never destroyed, so lookups stay valid while the process exits.
     SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
     SUPPRESS_CLANG_WARNING("-Wunique-object-duplication")
-    static std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type> EndpointCache;
-    static std::mutex                                                                         Mutex;
+    // NOLINTBEGIN(cppcoreguidelines-owning-memory)
+    static auto& EndpointCache = *new std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type>();
+    static auto& Mutex         = *new std::mutex();
+    // NOLINTEND(cppcoreguidelines-owning-memory)
     SUPPRESS_WARNINGS_END
 
     boost::urls::url endpoint;

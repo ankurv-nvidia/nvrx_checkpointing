@@ -2,6 +2,7 @@
 #include "byte_storage.h"
 #include "distcp.h"
 #include "messages.h"
+#include "service_reference.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -84,6 +85,9 @@ struct Session
     Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
     std::atomic<bool> stopRequested{false};
 
+    // Declared last so it detaches before the state its callback reads is destroyed.
+    checkpoint::service::SessionReferences references;
+
     void Activate();
 
     void Handle(checkpoint::ipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf);
@@ -119,6 +123,8 @@ struct Session
     private:
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
     Snapshot& GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+
+    [[nodiscard]] std::string PendingWork_() const;
 
     void AsyncWorkReceiveLocalStateRegistry_(checkpoint::ipc::Rank const& rank);
     void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;

@@ -419,6 +419,18 @@ Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::file
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
+std::string Session::PendingWork_() const
+{
+    std::scoped_lock lock(mutex);
+    for (auto const& [snapshotId, snapshot] : snapshots)
+    {
+        if (!snapshot->complete) { return fmt::format("snapshot={} incomplete", snapshotId); }
+    }
+    auto const running = std::ranges::count_if(
+        asyncTasks, [](auto const& task) { return task.valid() && task.wait_for(std::chrono::seconds{0}) != std::future_status::ready; });
+    return running == 0 ? std::string{} : fmt::format("{} async tasks running", running);
+}
+
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
 {
     std::scoped_lock lock(mutex);
