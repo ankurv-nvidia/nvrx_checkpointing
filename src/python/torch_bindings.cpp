@@ -582,7 +582,7 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
 static StateNode::Scalar TorchDtypeState(nb::handle value)
 { return StateNode::Scalar{DtypeNameToId(StrView(nb::str(value)))}; }
 
-static StateNode::Blob TorchGeneratorBlob(std::string_view name, nb::handle value)
+static std::vector<char> TorchGeneratorBlob(std::string_view name, nb::handle value)
 {
     auto state = value.attr("get_state")();
     // get_state() returns a uint8 CPU tensor on modern torch.
@@ -757,7 +757,7 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     return {.meta = ds4tensor, .shard = shard, .owner = std::move(owner), .header = std::move(header)};
 }
 
-static StateNode::Blob ShardedObjectBlob(nb::handle value)
+static std::vector<char> ShardedObjectBlob(nb::handle value)
 {
     static constexpr char const* PreparedBlobAttr = "_nvrx_serialized_blob";
     auto const                   hasPreparedBlob  = PyObject_HasAttrString(value.ptr(), PreparedBlobAttr);
@@ -868,10 +868,39 @@ static bool IsMainReplica(nb::handle replicaId)
 
 static void RegisterShardedObject(PyStateDictAccessor& scan, nb::handle val)
 {
-    // Main-replica objects are serialized fresh for each save as DCP byte entries.
     if (!IsMainReplica(val.attr("replica_id"))) { return; }
-    auto uniqueKey = nb::cast<std::string>(val.attr("unique_key"));
-    scan.RegisterStateByFQN(uniqueKey, ShardedObjectBlob(val));
+    auto const key    = nb::cast<std::string>(val.attr("key"));
+    auto const shape  = nb::cast<nb::tuple>(val.attr("global_shape"));
+    auto const offset = nb::cast<nb::tuple>(val.attr("global_offset"));
+    if (shape.size() != offset.size() || shape.size() > Tensor::MaxDims)
+    {
+        throw std::runtime_error(fmt::format(
+            "ShardedObject '{}' has invalid dimensions; expected at most {} matching shape and offset axes", key, Tensor::MaxDims));
+    }
+    StateNode::FixedSizeBlob blob;
+    blob.durableDtype = Tensor::DType::UInt8;
+    TensorShard shard{
+        .rank          = scan.GetRankTopo().rank,
+        .snapshotDtype = Tensor::DType::UInt8,
+        .device        = DeviceId("cpu"),
+    };
+    for (size_t axis = 0; axis < shape.size(); ++axis)
+    {
+        auto const extent = nb::cast<int64_t>(shape[axis]);
+        auto const start  = nb::cast<int64_t>(offset[axis]);
+        if (extent <= 0 || start < 0 || start >= extent)
+        {
+            throw std::runtime_error(fmt::format("ShardedObject '{}' has an invalid global shape or offset on axis {}", key, axis));
+        }
+        blob.fulldim.push_back(static_cast<uint64_t>(extent));
+        shard.sharddim.push_back({.begin = static_cast<uint64_t>(start), .end = static_cast<uint64_t>(start + 1)});
+    }
+    auto data         = ShardedObjectBlob(val);
+    shard.storageSize = data.size();
+    shard.handle      = reinterpret_cast<uint64_t>(data.data());
+    blob.AddShard(shard);
+    scan.RegisterStateByFQN(key, std::move(blob));
+    scan.RetainBlobData(std::move(data));
 }
 
 // After `apply_factories`, a key like `decoder.layers.0.mixer.in_proj.weight`

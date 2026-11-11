@@ -594,24 +594,10 @@ struct CheckpointWriter
         public:
         void WriteTensors()
         {
-            that->root.WalkNodes([&](StateNode const& node) {
-                auto type = static_cast<StateNode::Type>(node.data.index());
-                if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
+            that->root.ForEachPayload([&](StateNode::Handle node, Tensor::DType dtype, DeviceId device, uint64_t handle, uint64_t size) {
                 try
                 {
-                    if (type == StateNode::Type::Tensor)
-                    {
-                        auto const& tensor = std::get<Tensor>(node.data);
-                        ProcessTensor_(node.handle, tensor.snapshotDtype, tensor.device, tensor.StorageSizeBytes(), tensor.handle);
-                    }
-                    else if (type == StateNode::Type::DTensor)
-                    {
-                        auto const& tensor = std::get<DTensor>(node.data);
-                        for (auto const& shard : tensor.shards)
-                        {
-                            ProcessTensor_(node.handle, shard.snapshotDtype, shard.device, shard.StorageSizeBytes(), shard.handle);
-                        }
-                    }
+                    ProcessTensor_(node, dtype, device, size, handle);
                 } catch (std::exception& e)
                 {
                     fmt::print(stderr,
@@ -642,7 +628,7 @@ struct CheckpointWriter
 
     void WriteTensors(cipc::SnapshotId const& snapshotId)
     {
-        auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
+        auto totalTensorStateSizeInBytes = root.GetTotalPayloadSizeInBytes();
         if (totalTensorStateSizeInBytes == 0) { return; }
 
         std::array<std::future<void>, cipc::D2HConcurrency> writerTasks{};
@@ -676,7 +662,7 @@ struct CheckpointWriter
     {
         SetThreadName("ncc:sendsvr");
 
-        auto totalTensorStateSizeInBytes = root.GetTotalTensorStateSizeInBytes();
+        auto totalTensorStateSizeInBytes = root.GetTotalPayloadSizeInBytes();
         auto numTensors                  = root.GetTotalNumTensors();
         auto stop1                       = Clock::now();
 
@@ -689,23 +675,22 @@ struct CheckpointWriter
             uint32_t numBlobs   = 0;
             uint32_t numScalars = 0;
             root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Blob) { ++numBlobs; }
-                else if (type == StateNode::Type::Scalar) { ++numScalars; }
+                if (node.GetType() == StateNode::Type::DynamicSizeBlob) { ++numBlobs; }
+                else if (node.GetType() == StateNode::Type::Scalar) { ++numScalars; }
             });
             serdes::WriteTrivial(sstrm, numBlobs);
             root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Blob)
+                if (node.GetType() == StateNode::Type::DynamicSizeBlob)
                 {
-                    auto const& blob = std::get<StateNode::Blob>(node.data);
-                    serdes::WriteBlobWithSize<uint32_t>(sstrm, std::string_view(blob.data(), blob.size()));
+                    serdes::WriteTrivial(sstrm, std::get<StateNode::DynamicSizeBlob>(node.data).storageSize);
                 }
             });
             serdes::WriteTrivial(sstrm, numScalars);
             root.WalkNodes([&](StateNode const& node) {
-                auto const type = static_cast<StateNode::Type>(node.data.index());
-                if (type == StateNode::Type::Scalar) { serdes::WriteTrivial(sstrm, std::get<StateNode::Scalar>(node.data)); }
+                if (node.GetType() == StateNode::Type::Scalar)
+                {
+                    serdes::WriteTrivial(sstrm, static_cast<Primitives64Bit const&>(std::get<StateNode::Scalar>(node.data)));
+                }
             });
             auto msg = sstrm.str();
             msgQueue.Push({cipc::Message::ActivateSnapshot{
@@ -761,6 +746,12 @@ struct CheckpointWriter
 
 void SaveCheckpoint(StateTree const& root, cipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath)
 {
+    root.ForEachPayload([&](StateNode::Handle node, Tensor::DType, DeviceId, uint64_t handle, uint64_t storageSize) {
+        if (storageSize != 0 && handle == 0)
+        {
+            throw std::runtime_error(fmt::format("Snapshot state '{}' has no current source data", root.GetNodeId(node)));
+        }
+    });
     CheckpointWriter writer{root};
     writer.SendToServer(snapshotId, ckptPath);
 }

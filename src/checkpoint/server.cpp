@@ -115,7 +115,11 @@ struct Server
     template <typename TLambda> void FindOrWaitForSession_(std::string_view context, cipc::SessionId sessionId, TLambda const& lambda);
 
     void NotifySnapshotComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank, std::string failure);
-    void NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank, std::string failure);
+    void NotifyWriteCkptComplete_(cipc::SessionId                           sessionId,
+                                  cipc::SnapshotId                          snapshotId,
+                                  cipc::Rank                                fromRank,
+                                  std::string                               failure,
+                                  std::unordered_map<std::string, uint64_t> dynamicBlobSizes);
     void ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd);
 
     void ReceiveStateRegistryFragments_(cipc::SessionId const&                                               sessionId,
@@ -256,19 +260,12 @@ static std::string RankRegistryDumpName(Rank rank, Rank worldSize)
                 fmt::print(ostrm, "{}: {}\n", name, scalar.template Cast<bool>());
             }
         }
-        else if (type == StateNode::Type::Blob) { fmt::print(ostrm, "{}: [blob]\n", name); }
-        else if (type == StateNode::Type::Tensor)
+        else if (type == StateNode::Type::DynamicSizeBlob) { fmt::print(ostrm, "{}: [blob]\n", name); }
+        else if (type == StateNode::Type::DTensor || type == StateNode::Type::FixedSizeBlob)
         {
-            auto const& tnsr = std::get<Tensor>(node.data);
-            // fmt::print(ostrm, "{}.sharddim: [{}]\n", name, tnsr.sharddim);
-            fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
-            fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
-            fmt::print(ostrm, "{}.snapshotDtype: {}\n", name, tnsr.snapshotDtype);
-            // fmt::print(ostrm, "{}.device: {}\n", name, tnsr.device);
-        }
-        else if (type == StateNode::Type::DTensor)
-        {
-            auto const& tnsr = std::get<DTensor>(node.data);
+            auto const& tnsr = type == StateNode::Type::FixedSizeBlob
+                                   ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                   : std::get<DTensor>(node.data);
             if (tnsr.shards.size() == 0) throw std::runtime_error(fmt::format("Empty Sharded tensor={}", name));
             fmt::print(ostrm, "{}.fulldim: [{}]\n", name, tnsr.fulldim);
             fmt::print(ostrm, "{}.durableDtype: {}\n", name, tnsr.durableDtype);
@@ -286,8 +283,9 @@ static std::string RankRegistryDumpName(Rank rank, Rank worldSize)
 // tag-prefixed records terminated by a clean end-of-stream at a record boundary:
 // tensor shards (the merged global tensor view) followed by ShardedObject metadata
 // (fqn + length; the owning rank writes the bytes itself).
-static constexpr uint8_t PeerRecordTensor = 0;
-static constexpr uint8_t PeerRecordBlob   = 1;
+static constexpr uint8_t PeerRecordTensor    = 0;
+static constexpr uint8_t PeerRecordBlob      = 1;
+static constexpr uint8_t PeerRecordFixedBlob = 2;
 
 static void WriteTensorShardInfo(std::ostream& ostrm, TensorShardInfo const& info)
 {
@@ -302,7 +300,7 @@ static void ValidateLocalTensorMetadata(StateTree const& registry)
     std::unordered_set<StateTree::NodeId> tensorNodeIds;
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        if (type != StateNode::Type::Tensor && type != StateNode::Type::DTensor) { return; }
+        if (type != StateNode::Type::FixedSizeBlob && type != StateNode::Type::DTensor) { return; }
 
         auto const nodeId = registry.GetNodeId(node.handle);
         if (!tensorNodeIds.insert(nodeId).second)
@@ -310,9 +308,10 @@ static void ValidateLocalTensorMetadata(StateTree const& registry)
             throw std::runtime_error(
                 fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
         }
-        if (type != StateNode::Type::DTensor) { return; }
-
-        for (auto const& shard : std::get<DTensor>(node.data).shards)
+        auto const& tensor = type == StateNode::Type::FixedSizeBlob
+                                 ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                 : std::get<DTensor>(node.data);
+        for (auto const& shard : tensor.shards)
         {
             if (shard.rank != registry.Topo().rank)
             {
@@ -325,30 +324,17 @@ static void ValidateLocalTensorMetadata(StateTree const& registry)
 
 template <typename TLambda> static void ForeachTensorShardInfo(StateTree const& registry, TLambda const& lambda)
 {
-    auto rank = registry.Topo().rank;
     registry.WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::DTensor || type == StateNode::Type::FixedSizeBlob)
         {
-            auto&            tnsr = std::get<Tensor>(node.data);
-            Tensor::DimRange sharddim;
-            for (auto const dim : tnsr.fulldim) { sharddim.push_back({.begin = 0, .end = dim}); }
-            auto shard = TensorShard{
-                .rank          = rank,
-                .snapshotDtype = tnsr.snapshotDtype,
-                .handle        = tnsr.handle,
-                .storageSize   = tnsr.storageSize,
-                .sharddim      = sharddim,
-                .device        = tnsr.device,
-            };
-            lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
-        }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
-        {
-            auto& tnsr = std::get<DTensor>(node.data);
+            auto const& tnsr = type == StateNode::Type::FixedSizeBlob
+                                   ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                   : std::get<DTensor>(node.data);
             for (auto const& shard : tnsr.shards)
             {
                 shard.AssertShardIsValid(tnsr.fulldim);
-                lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle)});
+                lambda({tnsr.durableDtype, tnsr.fulldim, shard, registry.GetNodeId(node.handle), type});
             }
         }
     });
@@ -374,7 +360,7 @@ void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string 
         ForeachTensorShardInfo(*localRegistry, [&](TensorShardInfo const& info) {
             // TODO : use constant sized stack based buffer streams later
             std::ostringstream oss;
-            serdes::WriteTrivial(oss, PeerRecordTensor);
+            serdes::WriteTrivial(oss, info.type == StateNode::Type::FixedSizeBlob ? PeerRecordFixedBlob : PeerRecordTensor);
             WriteTensorShardInfo(oss, info);
             boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(oss.str())));
             numTensors++;
@@ -384,11 +370,11 @@ void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string 
         // send only fqn + length. The bytes stay on this rank and are written locally.
         size_t numBlobs = 0;
         localRegistry->WalkNodes([&](StateNode const& node) {
-            if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::Blob) { return; }
-            auto const&        blob = std::get<StateNode::Blob>(node.data);
+            if (static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DynamicSizeBlob) { return; }
+            auto const&        blob = std::get<StateNode::DynamicSizeBlob>(node.data);
             std::ostringstream oss;
             serdes::WriteTrivial(oss, PeerRecordBlob);
-            serdes::WriteTrivial(oss, static_cast<uint64_t>(blob.size()));
+            serdes::WriteTrivial(oss, blob.storageSize);
             serdes::WriteBlobWithSize<uint32_t>(oss, localRegistry->GetNodeId(node.handle));
             boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(oss.str())));
             numBlobs++;
@@ -439,28 +425,33 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
     auto snapshotSize = localRegistry->GetTotalSnapshotStateSizeInBytes();
     auto registryTopo = localRegistry->Topo();
 
-    // Reset tensor handles to be offsets in the local tensor storage.
     uint64_t offset = 0;
-    localRegistry->WalkNodes([&](auto& node) {
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
-        {
-            auto& tnsr  = std::get<Tensor>(node.data);
-            tnsr.handle = offset;
-            offset += tnsr.StorageSizeBytes();
-        }
-        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
-        {
-            auto&                 tnsr = std::get<DTensor>(node.data);
-            decltype(tnsr.shards) newShards;
-            for (auto shard : tnsr.shards)
+    for (auto const group : {StateNode::Type::DTensor, StateNode::Type::FixedSizeBlob, StateNode::Type::DynamicSizeBlob})
+    {
+        localRegistry->WalkNodes([&](StateNode& node) {
+            if (static_cast<StateNode::Type>(node.data.index()) != group) { return; }
+            if (group == StateNode::Type::DynamicSizeBlob)
             {
-                shard.handle = offset;
-                newShards.insert(shard);
-                offset += shard.StorageSizeBytes();
-            }    // will be filled in when tensor data is received
-            tnsr.shards = std::move(newShards);
-        }
-    });
+                auto& blob  = std::get<StateNode::DynamicSizeBlob>(node.data);
+                blob.handle = offset;
+                offset += blob.storageSize;
+            }
+            else
+            {
+                auto&                 tensor = group == StateNode::Type::FixedSizeBlob
+                                                   ? static_cast<DTensor&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                                   : std::get<DTensor>(node.data);
+                std::set<TensorShard> shards;
+                for (auto shard : tensor.shards)
+                {
+                    shard.handle = offset;
+                    offset += shard.StorageSizeBytes();
+                    shards.insert(shard);
+                }
+                tensor.shards = std::move(shards);
+            }
+        });
+    }
     INFO("[{}#{}] Received sharded state registry from rank={} data of size={}, Total Tensor Size={}",
          *server,
          sessionId,
@@ -530,22 +521,19 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
 void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
 {
     BufStream bufStream{buf.data(), buf.size()};
-    auto      ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
+    bufStream.exceptions(std::ios::failbit | std::ios::badbit);
+    auto ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(bufStream));
 
-    auto                         numSnapshotBlobs = serdes::ReadTrivial<uint32_t>(bufStream);
-    std::vector<StateNode::Blob> snapshotBlobs;
-    snapshotBlobs.reserve(numSnapshotBlobs);
+    auto                  numSnapshotBlobs = serdes::ReadTrivial<uint32_t>(bufStream);
+    std::vector<uint64_t> snapshotBlobSizes;
+    snapshotBlobSizes.reserve(numSnapshotBlobs);
     auto const startedAt = hdr.startedAt;
-    for (uint32_t i = 0; i < numSnapshotBlobs; ++i)
-    {
-        auto data = serdes::ReadBlobWithSize<uint32_t>(bufStream);
-        snapshotBlobs.emplace_back(data.begin(), data.end());
-    }
+    for (uint32_t i = 0; i < numSnapshotBlobs; ++i) { snapshotBlobSizes.push_back(serdes::ReadTrivial<uint64_t>(bufStream)); }
 
-    auto                           numSnapshotScalars = serdes::ReadTrivial<uint32_t>(bufStream);
-    std::vector<StateNode::Scalar> snapshotScalars;
+    auto                         numSnapshotScalars = serdes::ReadTrivial<uint32_t>(bufStream);
+    std::vector<Primitives64Bit> snapshotScalars;
     snapshotScalars.reserve(numSnapshotScalars);
-    for (uint32_t i = 0; i < numSnapshotScalars; ++i) { snapshotScalars.emplace_back(serdes::ReadTrivial<StateNode::Scalar>(bufStream)); }
+    for (uint32_t i = 0; i < numSnapshotScalars; ++i) { snapshotScalars.emplace_back(serdes::ReadTrivial<Primitives64Bit>(bufStream)); }
     bool                                  beginDurableSpan = false;
     std::chrono::system_clock::time_point durableStartedAt;
     {
@@ -586,14 +574,15 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
                             hdr.globalRank,
                             hdr.snapshotId));
         }
-        auto localState            = std::make_unique<LocalState>();
-        localState->localRegistry  = it->second->Clone();
+        auto localState           = std::make_unique<LocalState>();
+        localState->localRegistry = std::make_shared<StateTree>(it->second->SessionId(), it->second->Topo());
+        it->second->CloneInto(*localState->localRegistry);
         localState->startedAt      = startedAt;
         uint32_t registeredBlobs   = 0;
         uint32_t registeredScalars = 0;
         localState->localRegistry->WalkNodes([&](StateNode const& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::Blob) { ++registeredBlobs; }
+            if (type == StateNode::Type::DynamicSizeBlob) { ++registeredBlobs; }
             else if (type == StateNode::Type::Scalar) { ++registeredScalars; }
         });
         if (numSnapshotBlobs != registeredBlobs || numSnapshotScalars != registeredScalars)
@@ -613,32 +602,55 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         size_t scalarIndex = 0;
         localState->localRegistry->WalkNodes([&](StateNode& node) {
             auto const type = static_cast<StateNode::Type>(node.data.index());
-            if (type == StateNode::Type::Blob)
+            if (type == StateNode::Type::DynamicSizeBlob)
             {
-                auto& blob = snapshotBlobs[blobIndex++];
-                if (std::get<StateNode::Blob>(node.data).size() != blob.size())
-                {
-                    throw std::runtime_error(fmt::format(
-                        "[native_ckpt:svr][{}#{}][ERROR] Snapshot={} rank={} Blob '{}' changed size after registry synchronization",
-                        *server,
-                        sessionId,
-                        hdr.snapshotId,
-                        hdr.globalRank,
-                        localState->localRegistry->GetNodeId(node.handle)));
-                }
-                node.data = std::move(blob);
+                std::get<StateNode::DynamicSizeBlob>(node.data).storageSize = snapshotBlobSizes[blobIndex++];
             }
-            else if (type == StateNode::Type::Scalar) { node.data = snapshotScalars[scalarIndex++]; }
+            else if (type == StateNode::Type::Scalar)
+            {
+                auto&       scalar = std::get<StateNode::Scalar>(node.data);
+                auto const& value  = snapshotScalars[scalarIndex++];
+                if (scalar.GetType() != value.GetType()) { throw std::runtime_error("Snapshot scalar type does not match its registry"); }
+                static_cast<Primitives64Bit&>(scalar) = value;
+            }
         });
 
-        if (hdr.snapshotSize != it->second->GetTotalTensorStateSizeInBytes())
+        uint64_t offset = 0;
+        for (auto const group : {StateNode::Type::DTensor, StateNode::Type::FixedSizeBlob, StateNode::Type::DynamicSizeBlob})
+        {
+            localState->localRegistry->WalkNodes([&](StateNode& node) {
+                if (static_cast<StateNode::Type>(node.data.index()) != group) { return; }
+                if (group == StateNode::Type::DynamicSizeBlob)
+                {
+                    auto& blob  = std::get<StateNode::DynamicSizeBlob>(node.data);
+                    blob.handle = offset;
+                    offset += blob.storageSize;
+                }
+                else
+                {
+                    auto&                 tensor = group == StateNode::Type::FixedSizeBlob
+                                                       ? static_cast<DTensor&>(std::get<StateNode::FixedSizeBlob>(node.data))
+                                                       : std::get<DTensor>(node.data);
+                    std::set<TensorShard> shards;
+                    for (auto shard : tensor.shards)
+                    {
+                        shard.handle = offset;
+                        offset += shard.StorageSizeBytes();
+                        shards.insert(shard);
+                    }
+                    tensor.shards = std::move(shards);
+                }
+            });
+        }
+
+        if (hdr.snapshotSize != localState->localRegistry->GetTotalPayloadSizeInBytes())
         {
             throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Snapshot size={} does not match expected total tensor "
                                                  "state size={} from local registry for global rank={} when activating snapshot={}",
                                                  *server,
                                                  sessionId,
                                                  hdr.snapshotSize,
-                                                 it->second->GetTotalTensorStateSizeInBytes(),
+                                                 localState->localRegistry->GetTotalPayloadSizeInBytes(),
                                                  hdr.globalRank,
                                                  hdr.snapshotId));
         }
@@ -1012,7 +1024,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
                          snapshotId,
                          snapshot->name,
                          snapshot->path,
-                         *snapshot->globalRegistry,
+                         *session->sessionState.globalRegistry,
                          *localState->localRegistry,
                          localState->tensorStorage);
             }
@@ -1118,14 +1130,22 @@ void Server::NotifySnapshotComplete_(cipc::SessionId sessionId, cipc::SnapshotId
                                      });
 }
 
-void Server::NotifyWriteCkptComplete_(cipc::SessionId sessionId, cipc::SnapshotId snapshotId, cipc::Rank fromRank, std::string failure)
+void Server::NotifyWriteCkptComplete_(cipc::SessionId                           sessionId,
+                                      cipc::SnapshotId                          snapshotId,
+                                      cipc::Rank                                fromRank,
+                                      std::string                               failure,
+                                      std::unordered_map<std::string, uint64_t> dynamicBlobSizes)
 {
     FindOrWaitForSessionAndSnapshot_(fmt::format("NotifyWriteCkptComplete rank={}", fromRank),
                                      sessionId,
                                      snapshotId,
                                      [&](Session& session, Session::Snapshot& snapshot) {
                                          auto const onCoordinator = session.IsCoordinatorPeer();
-                                         if (onCoordinator) { snapshot.writeCkptCompletedRanks.insert(fromRank); }
+                                         if (onCoordinator)
+                                         {
+                                             snapshot.dynamicBlobSizes.merge(dynamicBlobSizes);
+                                             snapshot.writeCkptCompletedRanks.insert(fromRank);
+                                         }
                                          if (!failure.empty())
                                          {
                                              snapshot.failures.push_back(
@@ -1272,10 +1292,11 @@ void Server::ReceiveStateRegistryFragments_(cipc::SessionId const&              
         {
             break;    // Clean end-of-stream at a record boundary
         }
-        if (recordTag == PeerRecordTensor)
+        if (recordTag == PeerRecordTensor || recordTag == PeerRecordFixedBlob)
         {
             TensorShardInfo info;
-            uint32_t        nodeIdLen{};
+            info.type = recordTag == PeerRecordFixedBlob ? StateNode::Type::FixedSizeBlob : StateNode::Type::DTensor;
+            uint32_t nodeIdLen{};
             readTrivial(info.durableDtype);
             readTrivial(info.fulldim);
             readTrivial(info.tensorInfo);
@@ -1536,7 +1557,18 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
         // TODO_NOSTALL : move it before we send 200 once we dont stall for session+snaphot anymore
-        NotifyWriteCkptComplete_(sessionId, snapshotId, rank, parser.get().body());
+        BufStream completion{parser.get().body().data(), parser.get().body().size()};
+        completion.exceptions(std::ios::failbit | std::ios::badbit);
+        auto                                      failure = serdes::ReadBlobWithSize<uint32_t>(completion);
+        std::unordered_map<std::string, uint64_t> dynamicBlobSizes;
+        auto const                                count = serdes::ReadTrivial<uint32_t>(completion);
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            auto fqn  = serdes::ReadBlobWithSize<uint32_t>(completion);
+            auto size = serdes::ReadTrivial<uint64_t>(completion);
+            dynamicBlobSizes.emplace(std::move(fqn), size);
+        }
+        NotifyWriteCkptComplete_(sessionId, snapshotId, rank, std::move(failure), std::move(dynamicBlobSizes));
         if (auto const fwdParam = url.params().find("fwd"); fwdParam != url.params().end())
         {
             auto const range     = (*fwdParam).value;
@@ -1892,24 +1924,14 @@ void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
 
         if (sessionState.globalRegistry == nullptr)
         {
-            sessionState.globalRegistry = localRegistry.Clone();
-            sessionState.globalRegistry->ConvertTensorsToDTensor();
+            sessionState.globalRegistry = std::make_shared<StateTree>(localRegistry.SessionId(), localRegistry.Topo());
+            localRegistry.CloneInto(*sessionState.globalRegistry);
             sessionState.globalRegistry->WalkNodes([&](auto& node) {
-                if (node.data.index() == static_cast<size_t>(StateNode::Type::Tensor))
+                if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)
+                    && node.data.index() != static_cast<size_t>(StateNode::Type::FixedSizeBlob))
                 {
-                    throw std::runtime_error(fmt::format("[native_ckpt:svr][{}#{}][ERROR] Unexpected TensorShard node in "
-                                                         "activeGlobalState. Should only contain DTensor nodes",
-                                                         *server,
-                                                         sessionId,
-                                                         sessionState.globalRegistry->GetNodeId(node.handle)));
-                }
-                if (node.data.index() == static_cast<size_t>(StateNode::Type::Blob))
-                {
-                    // Payload bytes stay on their owning rank; the coordinator keeps the node only.
-                    node.data = StateNode::Blob{};
                     return;
                 }
-                if (node.data.index() != static_cast<size_t>(StateNode::Type::DTensor)) { return; }
                 tensorMap[localRegistry.GetNodeId(node.handle)] = node.handle;
             });
         }
@@ -1920,7 +1942,18 @@ void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
             MergeFragmentToGlobalState_(lock, tensorShards);
         }
 
-        if (IsCoordinatorPeer()) { RecordBlobMetasLocked_(lock, rank, localRegistry); }
+        if (IsCoordinatorPeer())
+        {
+            std::vector<std::pair<std::string, uint64_t>> blobMetas;
+            localRegistry.WalkNodes([&](StateNode const& node) {
+                if (node.data.index() == static_cast<size_t>(StateNode::Type::DynamicSizeBlob))
+                {
+                    blobMetas.emplace_back(localRegistry.GetNodeId(node.handle),
+                                           std::get<StateNode::DynamicSizeBlob>(node.data).storageSize);
+                }
+            });
+            RecordBlobMetasLocked_(lock, rank, blobMetas);
+        }
     }
     {
         // TODO_NOPENDING_STRUCT

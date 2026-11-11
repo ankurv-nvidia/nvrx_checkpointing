@@ -324,8 +324,9 @@ def test_quantized_registration_rejects_components_on_different_devices() -> Non
     tensor._with_gemm_swizzled_scales = False
 
     root = _create_root()
+    root.register_state_dict({"weight": tensor})
     with pytest.raises(RuntimeError, match="components must be on one device"):
-        root.register_state_dict({"weight": tensor})
+        root.wait_for_async_completion()
 
 
 def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:

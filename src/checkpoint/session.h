@@ -29,6 +29,7 @@ struct TensorShardInfo
     Tensor::Dim       fulldim;
     DTensor::Shard    tensorInfo;
     StateTree::NodeId nodeId;
+    StateNode::Type   type{StateNode::Type::DTensor};
 };
 
 struct Session
@@ -36,10 +37,9 @@ struct Session
     // State for Devices directly connected to this peer
     struct LocalState
     {
-        std::shared_ptr<StateTree>     localRegistry;
-        ByteStorage                    tensorStorage;
-        checkpoint::distcp::BlobsByFqn blobs;
-        std::chrono::nanoseconds       startedAt{};
+        std::shared_ptr<StateTree> localRegistry;
+        ByteStorage                tensorStorage;
+        std::chrono::nanoseconds   startedAt{};
 
         uint64_t writtenTensorRangeBegin{0};
         uint64_t writtenTensorRangeEnd{0};
@@ -61,9 +61,9 @@ struct Session
 
         std::chrono::system_clock::time_point activatedAt = std::chrono::system_clock::now();
 
-        checkpoint::distcp::BlobMetadataByFqn blobMetadata;
-        std::shared_ptr<StateTree>            globalRegistry;
-        std::shared_ptr<StateTree>            dedupedGlobalRegistry;
+        std::unordered_map<std::string, uint64_t> dynamicBlobSizes;
+        std::shared_ptr<StateTree>                globalRegistry;
+        std::shared_ptr<StateTree>                dedupedGlobalRegistry;
 
         std::unordered_map<checkpoint::ipc::Rank, std::unique_ptr<LocalState>> localStates;
 
@@ -87,8 +87,6 @@ struct Session
     std::unordered_map<StateTree::NodeId, StateNode::Handle> tensorMap;       // Only needed for constructing sessionState
     std::unordered_set<checkpoint::ipc::Rank>                receivedFrom;    // Ranks from which data has been received.
     uint64_t                                                 largestSnapshotSize{0};
-
-    checkpoint::distcp::BlobMetadataByFqn blobMetas;
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
@@ -140,7 +138,9 @@ struct Session
     void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
 
     void MergeFragmentToGlobalState_(std::scoped_lock<std::mutex> const& lock, std::vector<TensorShardInfo> const& tensorShards);
-    void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::Rank rank, StateTree const& localRegistry);
+    void RecordBlobMetasLocked_(std::scoped_lock<std::mutex> const&                  lock,
+                                checkpoint::ipc::Rank                                rank,
+                                std::vector<std::pair<std::string, uint64_t>> const& blobMetasIn);
 
     void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
     void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
