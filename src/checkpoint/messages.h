@@ -98,7 +98,7 @@ struct Message
         std::chrono::nanoseconds startedAt{};
         /*Message Format
         std::string ckptPath;
-        Blob and Scalar counts followed by values in this rank's registered StateTree order;
+        Dynamic blob sizes and scalar values;
         */
     };
 

@@ -568,11 +568,10 @@ def test_state_registration_accepts_integer_enum_list() -> None:
         root.snapshot_size = 0
 
 
-@pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-def test_register_state_dict_rejects_blob_size_changes(rank: int) -> None:
-    root = _create_root(rank, 2, ["coordinator", "remote"], 1)
+def test_register_state_dict_rejects_blob_size_changes() -> None:
+    root = _create_root()
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {"rng_state": initial}
     root.register_state_dict(state)
@@ -644,4 +643,69 @@ def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
     root.register_state_dict({"step": 2})
     root.save_async(1, tmp_path / "iter_0000001")
     with pytest.raises(RuntimeError, match=r"registered tensor 'weight' was not supplied for this snapshot"):
+        root.wait_for_async_completion()
+
+
+@pytest.mark.parametrize("replica_id", [0, (0, 0, 0)])
+def test_register_state_dict_accepts_main_object_shards(replica_id: int | tuple[int, ...]) -> None:
+    first = ShardedObject("objects", None, (2,), (0,), replica_id=replica_id)
+    second = ShardedObject("objects", None, (2,), (1,), replica_id=replica_id)
+    vars(first)["_nvrx_serialized_blob"] = b"first"
+    vars(second)["_nvrx_serialized_blob"] = b"second payload"
+    root = _create_root()
+
+    root.register_state_dict({"first": first, "nested": {"second": second}})
+
+    assert root.snapshot_size == len(b"first") + len(b"second payload")
+
+
+@pytest.mark.parametrize("value", ["", b""])
+def test_register_state_dict_accepts_empty_dynamic_blob(value: str | bytes) -> None:
+    root = _create_root()
+    root.register_state_dict({"value": value})
+
+    assert root.snapshot_size == 0
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+@pytest.mark.parametrize("initial", [b"", b"short"])
+def test_register_state_dict_refreshes_dynamic_blob_size(initial: bytes) -> None:
+    root = _create_root()
+    root.register_state_dict({"message": initial})
+    assert root.snapshot_size == len(initial)
+    root.finalize_registry()
+    refreshed = b"a longer serialized value"
+
+    root.register_state_dict({"message": refreshed})
+
+    assert root.snapshot_size == len(refreshed)
+
+
+@pytest.mark.parametrize("replica_id", [1, (0, 3, 0)])
+def test_register_state_dict_skips_non_main_object_shards(replica_id: int | tuple[int, ...]) -> None:
+    value = ShardedObject("objects", None, (1,), (0,), replica_id=replica_id)
+    vars(value)["_nvrx_serialized_blob"] = b"replicated payload"
+    root = _create_root()
+
+    root.register_state_dict({"value": value})
+
+    assert root.snapshot_size == 0
+
+
+def test_register_state_dict_rejects_empty_fixed_blob() -> None:
+    root = _create_root()
+    value = ShardedObject("value", None, (1,), (0,))
+    vars(value)["_nvrx_serialized_blob"] = b""
+    root.register_state_dict({"value": value})
+
+    with pytest.raises(RuntimeError, match="Tensor shard storage size must be nonzero"):
+        root.wait_for_async_completion()
+
+
+def test_register_state_dict_rejects_empty_tensor_shard() -> None:
+    root = _create_root()
+    root.register_state_dict({"value": torch.empty(0)})
+
+    with pytest.raises(RuntimeError, match="non-positive dim"):
         root.wait_for_async_completion()

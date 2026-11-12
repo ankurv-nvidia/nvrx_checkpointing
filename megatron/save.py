@@ -52,7 +52,6 @@ _SERIALIZED_SHARDED_OBJECT_ATTR = "_nvrx_serialized_blob"
 _COMMON_STATE_PADDING = 512
 _COMMON_STATE_ALIGNMENT = 1024
 _root = None
-_common_state_capacity: int | None = None
 _sharded_object_capacities: dict[str, int] = {}
 
 
@@ -262,19 +261,11 @@ def _prepare_registration_state_dict(state_dict: dict, iteration: int) -> dict:
     snapshot_state = {}
     if torch.distributed.get_rank() == 0:
         with _checkpoint_span("nvrx.checkpoint.register_state_dict.serialize_common_state", iteration):
-            global _common_state_capacity  # noqa: PLW0603
             buffer = io.BytesIO()
             # TODO_BG_SERIALIZE: Measure and move this GIL-held archive creation.  # noqa: FIX002, TD002, TD003, TD004
             torch.save([common], buffer)
-            common_state = buffer.getvalue()
-            if _common_state_capacity is None:
-                _common_state_capacity = _snapshot_blob_capacity(len(common_state))
-            if len(common_state) > _common_state_capacity:
-                raise RuntimeError(
-                    f"common state serialized to {len(common_state)} bytes, exceeding its "
-                    f"registered {_common_state_capacity}-byte capacity",
-                )
-            snapshot_state[_DCP_COMMON_STATE_KEY] = common_state.ljust(_common_state_capacity, b"\0")
+            snapshot_state[_DCP_COMMON_STATE_KEY] = buffer.getvalue()
+
     prepared_state = dict(sharded_part)
     prepared_state.update(snapshot_state)
     return prepared_state

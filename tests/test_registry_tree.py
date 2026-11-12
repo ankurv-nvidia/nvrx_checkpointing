@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# ruff: noqa: INP001, PLR2004, S101
 """Unit tests for ``scripts/registry_tree.py``.
 
 Writes small registries in the checkpoint daemon's binary serialization
@@ -39,7 +41,7 @@ _spec.loader.exec_module(registry_tree)
 page = registry_tree.page
 
 _BF16, _F32, _I64 = 2, 3, 12
-_DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR = 1, 2, 3, 4, 5
+_DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = 1, 2, 3, 4, 5, 6
 _INT64_BITS = 0b10100
 _DOUBLE_BITS = 0b11100
 _LR = struct.unpack("<Q", struct.pack("<d", 0.25))[0]
@@ -88,6 +90,21 @@ def _logical_size(dtype: int, dims: tuple[int, ...]) -> int:
     return math.prod(dims) * {_BF16: 2, _F32: 4, _I64: 8}[dtype]
 
 
+def _scalar_payload(payload: object, version: int) -> bytes:
+    value, replicas = payload if version >= 2 else (payload, ())
+    result = struct.pack("<B7xQ", *value)
+    if version >= 2:
+        result += struct.pack(f"<I{len(replicas)}I", len(replicas), *replicas)
+    return result
+
+
+def _blob_payload(payload: object, version: int) -> bytes:
+    if version < 2:
+        return struct.pack("<I", len(payload)) + payload
+    replicas, storage_size = payload
+    return struct.pack(f"<I{len(replicas)}IQQ", len(replicas), *replicas, 0, storage_size)
+
+
 class _Tree:
     """Serializes a hand-built state tree the way the checkpoint daemon does."""
 
@@ -121,23 +138,28 @@ class _Tree:
     def removed(self) -> None:
         self.nodes.append([_REMOVED, _REMOVED, "", 0, None])
 
-    def write(self, path: Path) -> None:
+    def write(self, path: Path, version: int = 1) -> None:
         out = bytearray(struct.pack("<IIIII", self.session_id, self.rank, self.world, 2, 1))
         out += struct.pack("<I", len(_PEER)) + _PEER.encode()
+        if version >= 2:
+            out += struct.pack("<II", 0x32525453, version)
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
-            out += struct.pack("<BBHII", kind, len(name), 0, handle, parent) + name.encode()
+            if version >= 3 and kind == _TENSOR:
+                raise ValueError("registry version 3 contains distributed tensors")
+            wire_kind = kind - 1 if version >= 3 and kind >= _DTENSOR else kind
+            out += struct.pack("<BBHII", wire_kind, len(name), 0, handle, parent) + name.encode()
             if kind == _DICT:
                 out += struct.pack(f"<I{len(payload)}I", len(payload), *payload)
             elif kind == _SCALAR:
-                out += struct.pack("<B7xQ", *payload)
+                out += _scalar_payload(payload, version)
             elif kind == _BLOB:
-                out += struct.pack("<I", len(payload)) + payload
+                out += _blob_payload(payload, version)
             elif kind == _TENSOR:
                 dtype, fulldim, storage_size, device, device_index = payload
                 out += struct.pack("<B7xQQ", dtype, 0x1000 + handle, storage_size)
                 out += _dim(fulldim) + struct.pack("<4sI", device, device_index)
-            elif kind == _DTENSOR:
+            elif kind in {_DTENSOR, _FIXED_BLOB}:
                 dtype, fulldim, shards = payload
                 out += struct.pack("<IB", len(shards), dtype) + _dim(fulldim)
                 for shard_index, (rank, ranges, storage_size, device, device_index) in enumerate(shards):
@@ -390,3 +412,61 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
+    tree = _Tree(0)
+    shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
+    tree.add("objects", _FIXED_BLOB, (5, (2,), shards))
+    tensor_shards = [(rank, [(0, 2)], 4, b"cpu\0", 0) for rank in (0, 1)]
+    tree.add("weights", _DTENSOR, (_BF16, (2,), tensor_shards))
+    tree.add("output_path", _BLOB, ((0, 1), 0))
+    tree.add("iteration", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
+    path = tmp_path / "registry.global.bin"
+    tree.write(path, version=version)
+
+    parsed = registry_tree.read_registry(path)
+    assert parsed.trailing == 0
+    kinds = {parsed.names[handle]: kind for handle, kind, _ in parsed.entries}
+    assert kinds["objects"] == _FIXED_BLOB
+    assert kinds["weights"] == _DTENSOR
+    report = registry_tree.analyze([path], expand_blobs=True)
+    leaves = {leaf.fqn: leaf for leaf in report.leaves}
+    assert leaves["objects"].unique == 8
+    assert leaves["weights"].unique == 4
+    assert {rank: value[0] for rank, value in leaves["objects"].ranks.items()} == {0: 8, 1: 8}
+    assert {rank: value[0] for rank, value in leaves["output_path"].ranks.items()} == {0: 0, 1: 0}
+    assert {rank: value[0] for rank, value in leaves["iteration"].ranks.items()} == {0: 8, 1: 8}
+    assert leaves["iteration"].blob["v"] == "metadata only"
+
+
+@pytest.mark.parametrize(
+    ("filename", "replicas", "expected_ranks"),
+    [
+        ("registry.1.bin", (), (1,)),
+        ("registry.1.bin", (0, 1), (0, 1)),
+        ("registry.global.bin", (0, 1), (0, 1)),
+    ],
+)
+def test_metadata_counts_local_membership_without_replica_hints(
+    tmp_path: Path, filename: str, replicas: tuple[int, ...], expected_ranks: tuple[int, ...],
+) -> None:
+    tree = _Tree(1)
+    tree.add("counter", _SCALAR, ((_INT64_BITS, 7), replicas))
+    tree.add("payload", _BLOB, (replicas, 17))
+    path = tmp_path / filename
+    tree.write(path, version=3)
+
+    leaves = {leaf.fqn: leaf for leaf in registry_tree.analyze([path]).leaves}
+    assert leaves["counter"].unique == 8
+    assert leaves["payload"].unique == 17
+    assert {rank: value[0] for rank, value in leaves["counter"].ranks.items()} == dict.fromkeys(expected_ranks, 8)
+    assert {rank: value[0] for rank, value in leaves["payload"].ranks.items()} == dict.fromkeys(expected_ranks, 17)
+
+
+def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
+    path = tmp_path / "registry.global.bin"
+    _Tree(0).write(path, version=4)
+    with pytest.raises(ValueError, match="unsupported registry version 4"):
+        registry_tree.read_registry(path)
