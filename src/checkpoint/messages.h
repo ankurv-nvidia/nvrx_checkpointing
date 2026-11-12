@@ -58,7 +58,7 @@ struct Message
 
         // Received from local client or from peers
         LocalStateRegistry,    // Combination of Replicated and Sharded State Registry
-        LocalStateData,        // Could be received multiple times in chunked manner
+        SnapshotData,          // Could be received multiple times in chunked manner
 
         StateRegistryFragment,    // The format is differnt from StateRegistry.
         // ShardedStateData,
@@ -131,7 +131,7 @@ struct Message
          */
     };
 
-    struct LocalStateData
+    struct SnapshotData
     {
         SessionId  sessionId;
         SnapshotId snapshotId;
@@ -149,7 +149,7 @@ struct Message
                                 ActivateSnapshot,
                                 FinalizeSnapshot,
                                 LocalStateRegistry,
-                                LocalStateData,
+                                SnapshotData,
                                 StateRegistryFragment
                                 //, StateDataFragment
                                 >;
@@ -162,7 +162,7 @@ struct Message
     static_assert(std::is_same_v<ActivateSnapshot, std::variant_alternative_t<static_cast<size_t>(Type::ActivateSnapshot), Header>>);
     static_assert(std::is_same_v<FinalizeSnapshot, std::variant_alternative_t<static_cast<size_t>(Type::FinalizeSnapshot), Header>>);
     static_assert(std::is_same_v<LocalStateRegistry, std::variant_alternative_t<static_cast<size_t>(Type::LocalStateRegistry), Header>>);
-    static_assert(std::is_same_v<LocalStateData, std::variant_alternative_t<static_cast<size_t>(Type::LocalStateData), Header>>);
+    static_assert(std::is_same_v<SnapshotData, std::variant_alternative_t<static_cast<size_t>(Type::SnapshotData), Header>>);
     static_assert(
         std::is_same_v<StateRegistryFragment, std::variant_alternative_t<static_cast<size_t>(Type::StateRegistryFragment), Header>>);
     // static_assert(std::is_same_v<StateDataFragment, std::variant_alternative_t<static_cast<size_t>(Type::StateDataFragment), Header>>);
@@ -193,7 +193,7 @@ template <> struct fmt::formatter<checkpoint::ipc::Message::Header> : fmt::forma
         case cipc::Message::Type::ActivateSnapshot: typeStr = "ActivateSnapshot"; break;
         case cipc::Message::Type::FinalizeSnapshot: typeStr = "FinalizeSnapshot"; break;
         case cipc::Message::Type::LocalStateRegistry: typeStr = "LocalStateRegistry"; break;
-        case cipc::Message::Type::LocalStateData: typeStr = "LocalStateData"; break;
+        case cipc::Message::Type::SnapshotData: typeStr = "SnapshotData"; break;
         case cipc::Message::Type::StateRegistryFragment:
             typeStr = "StateRegistryFragment";
             break;

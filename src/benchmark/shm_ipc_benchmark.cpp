@@ -39,11 +39,12 @@ static std::atomic<PerfMetrics::Clock::time_point> StartTime{};    // NOLINT
 static std::atomic<PerfMetrics::Clock::duration>   Duration{};     // NOLINT
 using namespace std::chrono_literals;
 
-template <> struct fmt::formatter<Message::LocalStateData> : fmt::formatter<std::string_view>
+template <> struct fmt::formatter<Message::SnapshotData> : fmt::formatter<std::string_view>
 {
-    auto format(Message::LocalStateData const& obj, fmt::format_context& ctx) const    // NOLINT
+    auto format(Message::SnapshotData const& obj, fmt::format_context& ctx) const    // NOLINT
     { return fmt::format_to(ctx.out(), "(sessionId={}, messageSize={}, offset={})", obj.sessionId, obj.messageSize, obj.offset); }
 };
+
 static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool validate, bool debug)
 {
     SetThreadName("ncs:server");
@@ -62,17 +63,17 @@ static void Server(size_t ranks, size_t msgCount, size_t memorySize, bool valida
         auto msgIndex                        = i / slotSize;
         auto const [stopRequested, hdr, buf] = msgQueue.BeginRead();
         if (stopRequested) { throw std::runtime_error("Stop requested"); }
-        auto  hdr1    = std::get<Message::LocalStateData>(hdr);
+        auto  hdr1    = std::get<Message::SnapshotData>(hdr);
         auto* destptr = buffer[i % buffer.size];
         if (debug) { fmt::print("[s] recv msg[{}/{}] {} msgQ = {}\n", msgIndex, totalMessages, hdr1, msgQueue); }
         std::memcpy(destptr, buf.data(), hdr1.messageSize);
         if (validate)
         {
-            if (hdr.index() != static_cast<size_t>(Message::Type::LocalStateData))
+            if (hdr.index() != static_cast<size_t>(Message::Type::SnapshotData))
             {
                 throw std::runtime_error(fmt::format("Validation failed for msg {}. Expected message type {} but got {}",
                                                      msgIndex,
-                                                     static_cast<uint32_t>(Message::Type::LocalStateData),
+                                                     static_cast<uint32_t>(Message::Type::SnapshotData),
                                                      hdr.index()));
             }
             if (hdr1.messageSize != slotSize)
@@ -119,7 +120,7 @@ static void Client(uint32_t rank, uint32_t /* worldSize */, size_t msgCount, siz
     {
         auto  msgIndex   = i / slotSize;
         auto* srcptr     = data.data() + (i % memorySize);
-        auto [slot, buf] = msgQueue.AllocSlot(Message::LocalStateData{
+        auto [slot, buf] = msgQueue.AllocSlot(Message::SnapshotData{
             .sessionId   = SessionId{0},
             .snapshotId  = SnapshotId{0},
             .globalRank  = Rank{rank},
