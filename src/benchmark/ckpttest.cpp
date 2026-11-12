@@ -1596,39 +1596,8 @@ static std::string SerializedSliceRegistry(RankTopology topo)
     return body.str();
 }
 
-static std::string SerializedPeerRegistry(StateTree const& tree)
-{
-    std::ostringstream body;
-    tree.WalkNodes([&](StateNode const& node) {
-        auto const type = node.GetType();
-        if (type != StateNode::Type::DTensor && type != StateNode::Type::FixedSizeBlob) { return; }
-        auto const& tensor = type == StateNode::Type::FixedSizeBlob
-                                 ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
-                                 : std::get<DTensor>(node.data);
-        for (auto const& shard : tensor.shards)
-        {
-            serdes::WriteTrivial(body, type == StateNode::Type::FixedSizeBlob ? uint8_t{2} : uint8_t{0});
-            serdes::WriteTrivial(body, tensor.durableDtype);
-            serdes::WriteTrivial(body, tensor.fulldim);
-            serdes::WriteTrivial(body, shard);
-            serdes::WriteBlobWithSize<uint32_t>(body, tree.GetNodeId(node.handle));
-        }
-    });
-    tree.WalkNodes([&](StateNode const& node) {
-        if (node.GetType() != StateNode::Type::DynamicSizeBlob) { return; }
-        serdes::WriteTrivial(body, uint8_t{1});
-        serdes::WriteTrivial(body, std::get<StateNode::DynamicSizeBlob>(node.data).storageSize);
-        serdes::WriteBlobWithSize<uint32_t>(body, tree.GetNodeId(node.handle));
-    });
-    return body.str();
-}
-
 static std::string SerializedSliceFragment(uint32_t rank, uint32_t worldSize)
-{
-    StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo(rank, worldSize));
-    tree.AddChild(StateNode::Handle::Root, "weight").data = SliceOfSharedTensor(rank, worldSize);
-    return SerializedPeerRegistry(tree);
-}
+{ return SerializedSliceRegistry(SingleRankTopo(rank, worldSize)); }
 
 TEST_CASE("duplicate registries preserve the first upload during forwarding", "[server][registry][tier2]")
 {
@@ -1658,8 +1627,7 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
     static constexpr std::string_view TensorName = "weight";
     static constexpr std::string_view BlobName   = "metadata";
     auto const streamBudget = std::max(4 * MiB, (2 * maximumSendBuffer) + (4 * static_cast<size_t>(receiveBuffer.value())));
-    auto const recordSize
-        = sizeof(uint8_t) + sizeof(Tensor::DType) + sizeof(Tensor::Dim) + sizeof(TensorShard) + sizeof(uint32_t) + TensorName.size();
+    auto const                        recordSize   = sizeof(TensorShard);
     auto const shardCount   = (streamBudget / recordSize) + 1;
     auto       makeRegistry = [&](size_t blobSize) {
         StateTree   tree(checkpoint::ipc::SessionId::Default, topology);
@@ -1672,7 +1640,7 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
             sharddim.push_back({.begin = index, .end = index + 1});
             tensor.AddShard({.rank          = Rank{1},
                              .snapshotDtype = Tensor::DType::Float32,
-                             .handle        = index * sizeof(float),
+                             .handle        = 0,
                              .storageSize   = sizeof(float),
                              .sharddim      = sharddim,
                              .device        = DeviceId{"cpu"}});
@@ -1685,7 +1653,6 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
         blobRange.push_back({.begin = 0, .end = 1});
         blob.AddShard({.rank          = Rank{1},
                        .snapshotDtype = Tensor::DType::UInt8,
-                       .handle        = shardCount * sizeof(float),
                        .storageSize   = blobSize,
                        .sharddim      = blobRange,
                        .device        = DeviceId{"cpu"}});
@@ -1693,7 +1660,7 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
         tree.FinalizeRegistry();
         std::stringstream registry;
         StateSerDes::Write(registry, tree, StateNode::Handle::Root);
-        return std::make_pair(registry.str(), SerializedPeerRegistry(tree));
+        return std::make_pair(registry.str(), registry.str());
     };
 
     // The stream exceeds the sender and receiver TCP buffer limits.
@@ -2277,7 +2244,7 @@ TEST_CASE("peer write completions refresh dynamic blob metadata across snapshots
     TestServerProcess        server;
     StartTestServer(server, logDir / "server.log", true);
     ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology)});
-    REQUIRE(PostToTestServer("/api/peer/shardedstateregistry/0/1", SerializedPeerRegistry(remote)) == http::status::ok);
+    REQUIRE(PostToTestServer("/api/peer/shardedstateregistry/0/1", SerializedStateRegistry(remote)) == http::status::ok);
     auto                       queue = checkpoint::ipc::MsgQueue::Open(checkpoint::ipc::Message::RequestChannelName(0, 0));
     std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
     for (uint32_t iteration = 40; iteration < 42; ++iteration)
@@ -2566,9 +2533,12 @@ TEST_CASE("peer registry fragments reject invalid tensor dimensions", "[server][
     std::filesystem::remove_all(logDir);
     std::filesystem::create_directories(logDir);
 
-    auto       fragment     = SerializedSliceFragment(1, 2);
-    auto const sizeOffset   = sizeof(uint8_t) + sizeof(Tensor::DType) + (sizeof(uint64_t) * Tensor::MaxDims);
-    fragment.at(sizeOffset) = static_cast<char>(Tensor::MaxDims + 1);
+    auto              fragment = SerializedSliceFragment(1, 2);
+    auto const        shape    = SliceOfSharedTensor(1, 2).fulldim;
+    std::string const encoded(reinterpret_cast<char const*>(&shape), sizeof(shape));
+    auto const        offset = fragment.find(encoded);
+    REQUIRE(offset != std::string::npos);
+    fragment.at(offset + (sizeof(uint64_t) * Tensor::MaxDims)) = static_cast<char>(Tensor::MaxDims + 1);
 
     TestServerProcess server;
     StartTestServer(server, logDir / "server.log");
@@ -2687,10 +2657,10 @@ TEST_CASE("evicted pending snapshots remain the latest known result", "[server][
     session.snapshots.emplace(completed->snapshotId, std::move(completed));
     auto snapshot        = std::make_unique<Session::Snapshot>();
     snapshot->snapshotId = checkpoint::ipc::SnapshotId{40};
-    snapshot->localStates.emplace(Rank{0}, std::make_unique<Session::LocalState>());
+    snapshot->snapshotStateForRank.emplace(Rank{0}, std::make_unique<Session::SnapshotState>());
     auto* const pending = snapshot.get();
     session.snapshots.emplace(snapshot->snapshotId, std::move(snapshot));
-    pending->localStates.clear();
+    pending->snapshotStateForRank.clear();
     checkpoint::ipc::SnapshotId latest{checkpoint::ipc::SnapshotId::Invalid};
     REQUIRE(session.ResolveSnapshotId(-1, latest));
     CHECK(latest == checkpoint::ipc::SnapshotId{40});
