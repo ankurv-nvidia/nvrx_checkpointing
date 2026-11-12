@@ -258,8 +258,8 @@ void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapsh
         try
         {
             SetThreadName(fmt::format("ncs:svrq:{}", queueIndex).c_str());
-            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
             BindThreadCpuToNumaNode(numaNode);
+            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
             if (numaNode >= 0)
             {
                 auto region = msgQueue.GetShmDataRegion();
