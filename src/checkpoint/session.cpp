@@ -25,7 +25,7 @@ template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
 {
     auto format(Session const& session, fmt::format_context& ctx) const    // NOLINT
     {
-        uint32_t ptrVal = reinterpret_cast<uintptr_t>(session.server) % std::numeric_limits<uint32_t>::max();    // NOLINT
+        uint32_t ptrVal = reinterpret_cast<uintptr_t>(&session.server) % std::numeric_limits<uint32_t>::max();    // NOLINT
 
         return fmt::format_to(ctx.out(), "{:x}#{}", ptrVal, session.sessionId);
     }
