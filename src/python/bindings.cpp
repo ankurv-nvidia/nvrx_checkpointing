@@ -78,6 +78,26 @@ static DTensor const& ShardedState(StateNode::Variant const& data)
 static bool IsShardedState(StateNode::Variant const& data)
 { return std::holds_alternative<DTensor>(data) || std::holds_alternative<StateNode::FixedSizeBlob>(data); }
 
+static void ClearSnapshotValues(StateTree& registry)
+{
+    if (!registry.IsFinalized()) { return; }
+
+    std::as_const(registry).WalkNodes([&](StateNode const& current) {
+        auto& node = registry.GetNode(current.handle);
+        if (auto* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data)) { blob->handle = 0; }
+        else if (IsShardedState(node.data))
+        {
+            auto&                 tensor = ShardedState(node.data);
+            std::set<TensorShard> clearedShards;
+            for (auto shard : tensor.shards)
+            {
+                shard.handle = 0;
+                clearedShards.insert(shard);
+            }
+            tensor.shards = std::move(clearedShards);
+        }
+    });
+}
 namespace
 {
 struct PythonStateTree
@@ -101,7 +121,7 @@ struct PythonStateTree
         PythonStateTree* _state{nullptr};
     };
 
-    explicit PythonStateTree(cipc::SessionId sessionId, RankTopology topology) : _registry(sessionId, std::move(topology)) {}
+    explicit PythonStateTree(cipc::SessionId sessionId, RankTopology topology) : _localRegistry(sessionId, std::move(topology)) {}
 
     ~PythonStateTree()
     {
@@ -167,8 +187,8 @@ struct PythonStateTree
         if (_async.valid()) { _async.get(); }
     }
 
-    [[nodiscard]] StateTree&       SnapshotRegistry() { return _snapshotRegistry ? *_snapshotRegistry : _registry; }
-    [[nodiscard]] StateTree const& SnapshotRegistry() const { return _snapshotRegistry ? *_snapshotRegistry : _registry; }
+    [[nodiscard]] StateTree&       SnapshotRegistry() { return _snapshotRegistry ? *_snapshotRegistry : _localRegistry; }
+    [[nodiscard]] StateTree const& SnapshotRegistry() const { return _snapshotRegistry ? *_snapshotRegistry : _localRegistry; }
 
     void SetStartedAt(int64_t startedAt) { SnapshotRegistry().startedAt = std::chrono::nanoseconds{startedAt}; }
 
@@ -178,7 +198,7 @@ struct PythonStateTree
 
     void OnSnapshotComplete_()
     {
-        ClearSnapshotValues_();
+        ClearSnapshotValues(SnapshotRegistry());
         {
             nb::gil_scoped_acquire acquire;
             ReleasePythonObjects_();
@@ -231,6 +251,7 @@ StateNode* PythonStateTree::Accessor::RegisterStateByFQN(std::string_view fqn, S
 
 StateNode* PythonStateTree::Accessor::RegisterState(StateNode::Handle parent, std::string_view stateName, StateNode::Variant data)
 {
+    if (parent == StateNode::Handle::Invalid) { return nullptr; }
     if (!_registry->IsFinalized())
     {
         auto [exists, childHandle] = _registry->FindChildNodeIfExists(parent, stateName);
@@ -325,28 +346,6 @@ uint64_t PythonStateTree::Accessor::RetainBlobData(std::vector<char> data)
 std::string PythonStateTree::Accessor::GetNodeId(StateNode::Handle node) const
 { return _registry->GetNodeId(node); }
 
-void PythonStateTree::ClearSnapshotValues_()
-{
-    if (!_registry.IsFinalized()) { return; }
-    if (!_snapshotRegistry) { return; }
-
-    std::as_const(*_snapshotRegistry).WalkNodes([&](StateNode const& current) {
-        auto& node = _snapshotRegistry->GetNode(current.handle);
-        if (auto* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data)) { blob->handle = 0; }
-        else if (IsShardedState(node.data))
-        {
-            auto&                 tensor = ShardedState(node.data);
-            std::set<TensorShard> clearedShards;
-            for (auto shard : tensor.shards)
-            {
-                shard.handle = 0;
-                clearedShards.insert(shard);
-            }
-            tensor.shards = std::move(clearedShards);
-        }
-    });
-}
-
 void PythonStateTree::ReleasePythonObjects_()
 {
     _tensorRefObjects.clear();
@@ -357,7 +356,7 @@ void PythonStateTree::ReleasePythonObjects_()
 
 void PythonStateTree::Scan(nb::dict stateDict)
 {
-    ClearSnapshotValues_();
+    ClearSnapshotValues(_localRegistry);
     {
         nb::gil_scoped_acquire acquire;
         ReleasePythonObjects_();

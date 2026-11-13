@@ -404,23 +404,28 @@ static auto ReadNVFP4Header(Tensor::DType& durableDtype, nb::handle pyobj, std::
 }
 
 // === Megatron / torch type predicates ===
-//
-// Per-leaf `nb::module_::import_(...)` + `attr(...)` adds ~3-5us of overhead
-// on a 2k-tensor state_dict (~6-10ms total per save). Cache the type objects
-// the first time we see them. Stored as `nb::object*` and intentionally
-// leaked to avoid decref-after-Python-finalization at process exit.
 
+// Cached Python references have process lifetime.
 static CachedTypes const& CachedTypesGet()
 {
-    static CachedTypes Types = [] {
-        nb::gil_scoped_acquire acquire;
-        auto                   torchModule                  = nb::module_::import_("torch");
-        auto                   mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
-        auto                   megatronShardedTensor        = nb::object(nb::none());
-        auto                   megatronShardedTensorFactory = nb::object(nb::none());
-        auto                   megatronShardedObject        = nb::object(nb::none());
-        auto                   importlibUtil                = nb::module_::import_("importlib.util");
-        auto                   findSpec                     = importlibUtil.attr("find_spec");
+    static std::mutex   Mutex;
+    static CachedTypes* Types = nullptr;
+    std::unique_lock    lock(Mutex, std::defer_lock);
+    if (!lock.try_lock())
+    {
+        nb::gil_scoped_release release;
+        lock.lock();
+    }
+
+    if (Types == nullptr)
+    {
+        auto torchModule                  = nb::module_::import_("torch");
+        auto mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
+        auto megatronShardedTensor        = nb::object(nb::none());
+        auto megatronShardedTensorFactory = nb::object(nb::none());
+        auto megatronShardedObject        = nb::object(nb::none());
+        auto importlibUtil                = nb::module_::import_("importlib.util");
+        auto findSpec                     = importlibUtil.attr("find_spec");
         if (!findSpec("megatron").is_none() && !findSpec("megatron.core").is_none()
             && !findSpec("megatron.core.dist_checkpointing").is_none() && !findSpec("megatron.core.dist_checkpointing.mapping").is_none())
         {
@@ -429,7 +434,7 @@ static CachedTypes const& CachedTypesGet()
             megatronShardedTensorFactory = megatronMappingModule.attr("ShardedTensorFactory");
             megatronShardedObject        = megatronMappingModule.attr("ShardedObject");
         }
-        return CachedTypes{
+        Types = new CachedTypes{
             .torchTensor                  = torchModule.attr("Tensor"),
             .torchDtype                   = torchModule.attr("dtype"),
             .torchGenerator               = torchModule.attr("Generator"),
@@ -440,8 +445,8 @@ static CachedTypes const& CachedTypesGet()
             .megatronShardedTensorFactory = std::move(megatronShardedTensorFactory),
             .megatronShardedObject        = std::move(megatronShardedObject),
         };
-    }();
-    return Types;
+    }
+    return *Types;
 }
 
 static bool IsTorchTensor(nb::handle obj)
