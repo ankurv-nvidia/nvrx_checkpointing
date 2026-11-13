@@ -4070,7 +4070,10 @@ def test_native_perf_baselines_only_stable_checkpoint_save_gpu_gates(
 
     candidate = yaml.safe_load((tmp_path / "baselines" / f"{stem}.yaml").read_text())
     checkpoint_metrics = {name for name in candidate["metrics"] if name.startswith("checkpoint_save_gpu_")}
-    assert checkpoint_metrics == slurm_job.CHECKPOINT_SAVE_GPU_BASELINE_GATES
+    assert checkpoint_metrics == {
+        "checkpoint_save_gpu_transient_activity_within_limit",
+        "checkpoint_save_gpu_invariant_satisfied",
+    }
     assert candidate["metrics"]["total_written_bytes"] == 100.25
 
 
@@ -4267,10 +4270,7 @@ def test_a_changed_collective_timeout_passes_as_recorded(
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("PLATFORM", "gb200")
-    recorded = (
-        "  distributed_timeout_minutes ..................... 10\n"
-        "  micro_batch_size ................................ 1\n"
-    )
+    recorded = "  distributed_timeout_minutes ..................... 10\n  micro_batch_size ................................ 1\n"
     # JET widens the collective timeout for large allocations.
     widened = recorded.replace("10\n", "60\n")
 
@@ -4650,6 +4650,8 @@ def test_perf_report_can_enforce_only_memory(
         "gpu_hbm_peak_bytes": slurm_job.otel_report.metric([120], "B", higher_is_better=False),
         "training_process_peak_rss_bytes": slurm_job.otel_report.metric([100], "B", higher_is_better=False),
         "checkpoint_daemon_peak_rss_bytes": slurm_job.otel_report.metric([200], "B", higher_is_better=False),
+        "checkpoint_save_gpu_allocator_unchanged": slurm_job.otel_report.metric([0], "bool", higher_is_better=None),
+        "checkpoint_save_gpu_invariant_satisfied": slurm_job.otel_report.metric([1], "bool", higher_is_better=None),
     }
     monkeypatch.setattr(
         slurm_job.log_report,
@@ -4687,6 +4689,8 @@ def test_perf_report_can_enforce_only_memory(
         otel_reporting=False,
         enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
     )
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["comparison"]["checkpoint_save_gpu_allocator_unchanged"]["status"] == "WARN"
 
     baseline["metrics"]["gpu_peak_bytes"] = 50
     assert not slurm_job.PerfReport.report(
@@ -4717,6 +4721,20 @@ def test_perf_report_can_enforce_only_memory(
 
     baseline["metrics"]["training_process_peak_rss_bytes"] = 100
     baseline["metrics"]["gpu_hbm_peak_bytes"] = 100
+    assert not slurm_job.PerfReport.report(
+        "detr",
+        "pico_1x1",
+        "detr-native",
+        tmp_path / "run.log",
+        baseline,
+        tmp_path / "report.json",
+        1,
+        otel_reporting=False,
+        enforced_metrics=slurm_job.MEMORY_REGRESSION_METRICS,
+    )
+
+    baseline["metrics"]["gpu_hbm_peak_bytes"] = 120
+    metrics["checkpoint_save_gpu_invariant_satisfied"] = slurm_job.otel_report.metric([1, 0], "bool", higher_is_better=None)
     assert not slurm_job.PerfReport.report(
         "detr",
         "pico_1x1",
@@ -4934,6 +4952,93 @@ def test_a_metric_missing_from_the_baseline_does_not_fail_the_job() -> None:
 
     assert passed
     assert result["ckpt_durable_ms"]["status"] == "no_baseline"
+
+
+@pytest.mark.parametrize(
+    ("case", "legacy_baseline"),
+    [
+        ((0, (1,), 10, 1, True), True),
+        ((None, (1,), 10, 1, True), True),
+        ((0, (0,), 10, 1, False), True),
+        ((0, (1, 0), 10, 1, False), True),
+        ((0, None, 10, 1, False), True),
+        ((0, (1,), 11, 1, False), True),
+        ((0, (1,), 10, 0, False), True),
+        ((1, (1,), 10, 1, True), True),
+        ((0, (1,), 10, 1, True), False),
+        ((0, (0,), 10, 1, False), False),
+        ((0, (1, 0), 10, 1, False), False),
+        ((0, (1,), 11, 1, False), False),
+        ((0, (1,), 10, 0, False), False),
+        ((1, (1,), 10, 1, True), False),
+    ],
+)
+def test_allocator_diagnostics_warn_without_masking_perf_failures(
+    case: tuple[int | None, tuple[int, ...] | None, int, int, bool],
+    legacy_baseline: bool,
+    *,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    allocator_value, invariant_samples, write_us, transient, passed = case
+    slurm_job = _load_slurm_job()
+    metric = slurm_job.otel_report.metric
+    allocator_names = (
+        "checkpoint_save_gpu_allocator_unchanged",
+        "checkpoint_save_gpu_invariant_satisfied",
+    )
+    metrics = {
+        "wr_tnsr_us": metric([write_us], "us", higher_is_better=False),
+        "checkpoint_save_gpu_transient_activity_within_limit": metric([transient], "bool", higher_is_better=None),
+    }
+    if allocator_value is not None:
+        metrics[allocator_names[0]] = metric([allocator_value], "bool", higher_is_better=None)
+    if invariant_samples is not None:
+        metrics[allocator_names[1]] = metric(invariant_samples, "bool", higher_is_better=None)
+    monkeypatch.setattr(
+        slurm_job.otel_report,
+        "post_process",
+        lambda *_args: {"source": "otlp", "metrics": metrics, "validation": None},
+    )
+    baseline = {
+        "metrics": (dict.fromkeys(allocator_names, 1) if legacy_baseline else {})
+        | {"wr_tnsr_us": 10, "checkpoint_save_gpu_transient_activity_within_limit": 1},
+    }
+    report_path = tmp_path / "report.json"
+
+    with caplog.at_level("WARNING"):
+        assert (
+            slurm_job.PerfReport.report(
+                "perf",
+                "pico_1x1",
+                "perf-native",
+                tmp_path / "run.log",
+                baseline,
+                report_path,
+                1,
+                otel_reporting=True,
+            )
+            is passed
+        )
+
+    report = json.loads(report_path.read_text())
+    assert report["passed"] is passed
+    invariant_value = sum(invariant_samples) / len(invariant_samples) if invariant_samples else None
+    for name, value, status in (
+        (allocator_names[0], allocator_value, "PASS" if allocator_value == 1 else "WARN"),
+        (allocator_names[1], invariant_value, "PASS" if invariant_samples and all(invariant_samples) else "FAIL"),
+    ):
+        assert report["comparison"][name]["status"] == status
+        assert report["comparison"][name]["measured"] == value
+        if status == "WARN":
+            assert f"[WARN] {name}:" in caplog.text
+        if value is None:
+            assert report["comparison"][name]["reason"] == "missing_metric"
+        else:
+            assert report["metrics"][name]["mean"] == value
+    assert report["comparison"]["wr_tnsr_us"]["status"] == ("FAIL" if write_us > baseline["metrics"]["wr_tnsr_us"] else "PASS")
+    assert report["comparison"]["checkpoint_save_gpu_transient_activity_within_limit"]["status"] == ("PASS" if transient else "FAIL")
 
 
 def test_gpu_peak_regression_fails_the_baseline_comparison() -> None:

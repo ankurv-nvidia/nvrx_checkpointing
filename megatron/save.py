@@ -152,7 +152,6 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
             root = register_state_dict(state_dict, 0)
-            root.wait_for_async_completion()
             root.finalize_registry()
             return result
         finally:
@@ -199,13 +198,6 @@ def _prepare_rng_sharded_object_blobs(value: object) -> None:
             _prepare_rng_sharded_object_blobs(child)
         return
     if type(value).__name__ != "ShardedObject" or not hasattr(value, "data") or not hasattr(value, "unique_key"):
-        return
-
-    # TODO_NOREPLICAID : # Remove reliance on replica_id to prune state-dict/snapshotted tensors
-    replica_id = getattr(value, "replica_id", 0)
-    if (isinstance(replica_id, int) and replica_id != 0) or (
-        not isinstance(replica_id, int) and any(component != 0 for component in replica_id)
-    ):
         return
 
     buffer = io.BytesIO()
@@ -465,7 +457,10 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             _save_dataloader_state(save_args, args)
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
+                initialize_registry = _root is None
                 root = register_state_dict(state_dict, iteration)
+                if initialize_registry:
+                    root.finalize_registry()
             root.startedAt = started_at_ns
             root.save_async(iteration, checkpoint_dir)
 

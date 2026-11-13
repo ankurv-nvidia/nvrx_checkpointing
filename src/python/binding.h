@@ -13,6 +13,8 @@
 #include <nanobind/stl/vector.h>
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 template <typename T, typename TPy> static bool IsTuple(TPy const& tupleObj)
 {
@@ -50,23 +52,23 @@ class PyStateDictAccessor
     virtual ~PyStateDictAccessor() = default;
     CLASS_DELETE_COPY_AND_MOVE(PyStateDictAccessor);
 
-    virtual RankTopology GetRankTopo()                                                                           = 0;
-    virtual StateNode&   AddDictionaryChild(StateNode::Handle parent, std::string_view name)                     = 0;
-    virtual StateNode&   RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) = 0;
-    virtual StateNode&   RegisterStateByFQN(std::string_view name, StateNode::Variant data)                      = 0;
-    virtual void         AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nanobind::object const& obj)  = 0;
-    virtual void         RetainQuantHeader(std::unique_ptr<checkpoint::quant::Header> header)                    = 0;
-    virtual uint64_t     RetainBlobData(std::vector<char> data)                                                  = 0;
+    [[nodiscard]] virtual RankTopology GetRankTopo() const                     = 0;
+    [[nodiscard]] virtual std::string  GetNodeId(StateNode::Handle node) const = 0;
 
-    [[nodiscard]] virtual std::string GetNodeId(StateNode::Handle node) const = 0;
+    virtual StateNode* AddDictionaryChild(StateNode::Handle parent, std::string_view name)                     = 0;
+    virtual StateNode* RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) = 0;
+    virtual StateNode* RegisterStateByFQN(std::string_view name, StateNode::Variant data)                      = 0;
+    virtual void       AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nanobind::object const& obj)  = 0;
+    virtual void       RetainQuantHeader(std::unique_ptr<checkpoint::quant::Header> header)                    = 0;
+    virtual uint64_t   RetainBlobData(std::vector<char> data)                                                  = 0;
 
-    StateNode& RegisterState(StateNode::Handle parent, std::string_view name, std::vector<char> data)
+    StateNode* RegisterState(StateNode::Handle parent, std::string_view name, std::vector<char> data)
     {
         auto const size   = data.size();
         auto const handle = reinterpret_cast<uint64_t>(data.data());
-        auto&      node   = RegisterState(
+        auto*      node   = RegisterState(
             parent, name, StateNode::DynamicSizeBlob{.replicas = {GetRankTopo().rank}, .handle = handle, .storageSize = size});
-        RetainBlobData(std::move(data));
+        if (node != nullptr) { RetainBlobData(std::move(data)); }
         return node;
     }
 };

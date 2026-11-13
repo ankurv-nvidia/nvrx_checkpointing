@@ -12,11 +12,15 @@ import types
 import weakref
 from itertools import count
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 try:
     from nvrx_checkpointing import checkpoint
@@ -43,6 +47,16 @@ _REQUIRES_CHECKPOINT_SERVER = pytest.mark.skipif(
     os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1",
     reason="requires checkpoint-server IPC support",
 )
+pytestmark = [pytest.mark.integration, _REQUIRES_CHECKPOINT_SERVER]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_checkpoint_service() -> Iterator[None]:
+    checkpoint.svc_spindown()
+    try:
+        yield
+    finally:
+        checkpoint.svc_spindown()
 
 
 def _create_root():
@@ -117,6 +131,7 @@ def test_fp8_registration_reads_raw_components(fp8_dtype: object) -> None:
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
     assert root.snapshot_size == (
         _QUANTIZED_HEADER_BYTES + tensor._data.numel() + tensor._scale_inv.numel() * tensor._scale_inv.element_size()
     )
@@ -144,6 +159,7 @@ def test_mxfp8_registration_reads_raw_components_without_gtp_marker(fp8_dtype: o
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     assert root.snapshot_size == (_QUANTIZED_HEADER_BYTES + tensor._rowwise_data.numel() + tensor._rowwise_scale_inv.numel())
 
 
@@ -159,6 +175,7 @@ def test_bare_mxfp8_registration_reads_raw_components(fp8_dtype: object) -> None
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
 
 
 @pytest.mark.parametrize("fp4_dtype", [_FP4DType(), _NumericFP4DType()])
@@ -188,6 +205,7 @@ def test_nvfp4_registration_reads_raw_components(fp4_dtype: object) -> None:
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     assert root.snapshot_size == (
         _QUANTIZED_HEADER_BYTES
         + tensor._rowwise_data.numel()
@@ -212,6 +230,7 @@ def test_bare_nvfp4_registration_reads_raw_components(fp4_dtype: object) -> None
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
 
 
 @pytest.mark.integration
@@ -241,6 +260,7 @@ def test_cpu_quantized_snapshot_dequantizes_during_dcp_write(tmp_path: Path, sto
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
     checkpoint_dir = tmp_path / storage_type
     try:
         root.save(1, checkpoint_dir)
@@ -272,8 +292,11 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
         return value
 
     shards = [tensor(0x22), tensor(0x44)]
+    build_calls = 0
 
     def build(key: str, *_args: object) -> list[ShardedTensor]:
+        nonlocal build_calls
+        build_calls += 1
         return [
             ShardedTensor(
                 key=key,
@@ -298,9 +321,13 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
+    root.wait_for_async_completion()
+    registered_build_calls = build_calls
     checkpoint_dir = tmp_path / "nvfp4-shards"
     try:
         root.save(1, checkpoint_dir)
+        assert build_calls == registered_build_calls
         deadline = time.monotonic() + 30
         while not (checkpoint_dir / ".metadata").is_file():
             if time.monotonic() >= deadline:
@@ -353,6 +380,7 @@ def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:
     state, first_ref = make_state()
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     del state
     gc.collect()
     assert first_ref() is not None
@@ -364,9 +392,10 @@ def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:
     del refreshed
     assert root.snapshot_size > 0
     gc.collect()
-    assert first_ref() is None
+    assert first_ref() is not None
     assert second_ref() is not None
 
     del root
     gc.collect()
+    assert first_ref() is None
     assert second_ref() is None

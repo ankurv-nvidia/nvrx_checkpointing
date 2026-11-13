@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib.util
 import random
 import sys
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -124,7 +124,10 @@ def test_managed_span_uses_application_provider(monkeypatch: pytest.MonkeyPatch)
     ]
 
 
-def test_cuda_memory_assertion_reports_unchanged_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cuda_memory_assertion_reports_unchanged_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     telemetry = _load_telemetry()
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -146,6 +149,7 @@ def test_cuda_memory_assertion_reports_unchanged_boundary(monkeypatch: pytest.Mo
     with telemetry.assert_cuda_memory_unchanged(Span()):
         pass
 
+    assert capsys.readouterr().err == ""
     assert [name for name, _ in events] == [
         "nvrx.checkpoint.save.gpu_memory.entry",
         "nvrx.checkpoint.save.gpu_memory.exit",
@@ -198,21 +202,47 @@ def test_cuda_memory_assertion_reports_transient_activity(monkeypatch: pytest.Mo
     assert events[1][1]["nvrx.gpu.memory.invariant_satisfied"] is True
 
 
-def test_cuda_memory_assertion_rejects_changed_allocator_state(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("allocated_delta", "reserved_delta", "error"),
+    [
+        (-4096, 0, False),
+        (-4608, 0, False),
+        (0, -4096, False),
+        (-4096, -4096, False),
+        (1, 0, True),
+        (0, 4096, True),
+        (4096, -4096, True),
+        (-4096, 4096, True),
+    ],
+)
+def test_cuda_memory_assertion_warns_on_decreases_and_rejects_increases(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    allocated_delta: int,
+    reserved_delta: int,
+    error: bool,
+) -> None:
     telemetry = _load_telemetry()
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class Span:
+        @staticmethod
+        def add_event(name: str, *, attributes: dict[str, object]) -> None:
+            events.append((name, attributes))
+
     stats = iter(
         [
             {
-                "allocated_bytes.all.current": 100,
-                "reserved_bytes.all.current": 200,
-                "allocated_bytes.all.allocated": 300,
-                "allocated_bytes.all.freed": 200,
+                "allocated_bytes.all.current": 1 << 20,
+                "reserved_bytes.all.current": 2 << 20,
+                "allocated_bytes.all.allocated": 3 << 20,
+                "allocated_bytes.all.freed": 2 << 20,
             },
             {
-                "allocated_bytes.all.current": 101,
-                "reserved_bytes.all.current": 200,
-                "allocated_bytes.all.allocated": 301,
-                "allocated_bytes.all.freed": 200,
+                "allocated_bytes.all.current": (1 << 20) + allocated_delta,
+                "reserved_bytes.all.current": (2 << 20) + reserved_delta,
+                "allocated_bytes.all.allocated": (3 << 20) + max(allocated_delta, 0),
+                "allocated_bytes.all.freed": (2 << 20) - min(allocated_delta, 0),
             },
         ],
     )
@@ -220,8 +250,27 @@ def test_cuda_memory_assertion_rejects_changed_allocator_state(monkeypatch: pyte
     monkeypatch.setattr(telemetry.torch.cuda, "memory_stats", lambda: next(stats))
     monkeypatch.setattr(telemetry.torch.cuda, "mem_get_info", lambda: (700, 1_000))
 
-    with pytest.raises(RuntimeError, match="allocated_delta_bytes=1"), telemetry.assert_cuda_memory_unchanged(None):
+    expected = (
+        pytest.raises(RuntimeError, match=f"allocated_delta_bytes={allocated_delta}, reserved_delta_bytes={reserved_delta}")
+        if error
+        else nullcontext()
+    )
+    with expected, telemetry.assert_cuda_memory_unchanged(Span()):
         pass
+
+    warning = capsys.readouterr().err
+    if error:
+        assert warning == ""
+    else:
+        assert "[native_ckpt][WARNING]" in warning
+        assert f"allocated_delta_bytes={allocated_delta}" in warning
+        assert f"reserved_delta_bytes={reserved_delta}" in warning
+        assert "Checkpoint save continues" in warning
+    attributes = events[-1][1]
+    assert attributes["nvrx.gpu.memory.allocated_delta_bytes"] == allocated_delta
+    assert attributes["nvrx.gpu.memory.reserved_delta_bytes"] == reserved_delta
+    assert attributes["nvrx.gpu.memory.allocator_unchanged"] is False
+    assert attributes["nvrx.gpu.memory.invariant_satisfied"] is not error
 
 
 def test_cuda_memory_assertion_rejects_unavailable_counters_before_save(monkeypatch: pytest.MonkeyPatch) -> None:

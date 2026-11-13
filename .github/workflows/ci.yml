@@ -116,6 +116,7 @@ jobs:
           name: ctest-x86_64
           path: |
             ci/ci-results/ctest.xml
+            ci/ci-results/native-pytest-*.xml
             ci/ci-results/*.log
           retention-days: 7
 

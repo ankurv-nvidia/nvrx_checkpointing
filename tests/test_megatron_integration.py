@@ -408,7 +408,7 @@ def test_native_load_defers_registration_until_the_outer_load_finishes(monkeypat
     assert calls.async_completions_waited == 0
 
 
-def test_native_load_restores_the_replica_ids_assigned_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_load_keeps_the_loader_replica_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     calls.rewrite_replica_ids = True
     main = calls.sharded_tensor("decoder.weight", (0, 0, 0))
@@ -418,7 +418,7 @@ def test_native_load_restores_the_replica_ids_assigned_before_loading(monkeypatc
     calls.dist_checkpointing.load(state, "/checkpoint")
 
     assert calls.registered_replica_ids == []
-    assert (main.replica_id, replica.replica_id) == ((0, 0, 0), (0, 0, 1))
+    assert (main.replica_id, replica.replica_id) == (1, 1)
 
 
 @pytest.mark.parametrize(

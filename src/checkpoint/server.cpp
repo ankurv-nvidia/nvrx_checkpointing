@@ -43,44 +43,16 @@
 #include <boost/url.hpp>
 #include <hwloc.h>
 
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstddef>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
 #include <latch>
-#include <limits>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <span>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <thread>
-#include <tuple>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
 
 using namespace std::chrono_literals;
 namespace bip  = boost::interprocess;
 namespace cipc = checkpoint::ipc;
 namespace tel  = checkpoint::telemetry;
 
-// Save timestamps cross the Python/daemon process boundary as Unix-epoch nanoseconds.
-// Keep every server-side calculation on the same wall-clock epoch.
 using PerfClock = std::chrono::system_clock;
-
-// uint32_t ranks
-// uint32_t iterations
-using Request = boost::beast::http::request<boost::beast::http::buffer_body>;
-
-using boost::asio::ip::tcp;    // from <boost/asio/ip/tcp.hpp>
+using Request   = boost::beast::http::request<boost::beast::http::buffer_body>;
+using boost::asio::ip::tcp;
 using tcp_stream
     = boost::beast::tcp_stream::rebind_executor<boost::asio::use_awaitable_t<>::executor_with_default<boost::asio::any_io_executor>>::other;
 
@@ -122,10 +94,13 @@ struct Server
                                   std::unordered_map<std::string, uint64_t> dynamicBlobSizes);
     void ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd);
 
-    void ReceiveStateRegistryFragments_(cipc::SessionId const& sessionId, cipc::Rank fromRank, std::string_view body);
+    void ReceiveLocalStateRegistry_(cipc::SessionId const&                                               sessionId,
+                                    cipc::Rank                                                           fromRank,
+                                    tcp_stream&                                                          stream,
+                                    boost::beast::flat_buffer&                                           buffer,
+                                    boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser);
 
-    void InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */, size_t totalSize, uint8_t queueCount, size_t slotCount);
-    void InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo);
+    void InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapshotSize, int32_t numaNode);
     void ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf);
     void ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf);
 
@@ -189,7 +164,6 @@ struct Server
     // TODO_NOPENDING_STRUCT
     struct PendingSessionData
     {
-        PerfClock::time_point      receivedAt;
         Rank                       recvFrom{Rank::Invalid};
         std::shared_ptr<StateTree> registry;
     };
@@ -209,295 +183,8 @@ template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
         return fmt::format_to(ctx.out(), "{:x}", ptrVal);
     }
 };
-template <typename TStream> static void TryCleanShutdown(TStream& stream)
-{
-    boost::system::error_code ec;
-    ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-    if (ec && ec != boost::system::errc::not_connected)
-    {    //
-        ERR("Shutdown Error: {}", ec.what());
-    }
-}
 
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
-
-// Every rank of a run pads to the digit count of the world size so a plain name sort orders the dumps by rank.
-static std::string RankRegistryDumpName(Rank rank, Rank worldSize)
-{
-    auto const digits = static_cast<size_t>(std::log10(std::max(static_cast<double>(static_cast<uint32_t>(worldSize)), 1.0))) + 1;
-    return fmt::format("registry.{:0{}}.bin", static_cast<uint32_t>(rank), digits);
-}
-
-static void ValidateLocalTensorMetadata(StateTree const& registry)
-{
-    std::unordered_set<StateTree::NodeId> tensorNodeIds;
-    registry.WalkNodes([&](StateNode const& node) {
-        auto const type = node.GetType();
-        if (type != StateNode::Type::DTensor && type != StateNode::Type::FixedSizeBlob) { return; }
-        auto const nodeId = registry.GetNodeId(node.handle);
-        if (!tensorNodeIds.insert(nodeId).second)
-        {
-            throw std::runtime_error(
-                fmt::format("Local tensor '{}' is registered more than once; represent multiple shards with one DTensor node", nodeId));
-        }
-        auto const& tensor = type == StateNode::Type::FixedSizeBlob
-                                 ? static_cast<DTensor const&>(std::get<StateNode::FixedSizeBlob>(node.data))
-                                 : std::get<DTensor>(node.data);
-        for (auto const& shard : tensor.shards)
-        {
-            if (shard.rank != registry.Topo().rank)
-            {
-                throw std::runtime_error(
-                    fmt::format("Local tensor '{}' has shard rank={} but registry rank={}", nodeId, shard.rank, registry.Topo().rank));
-            }
-        }
-    });
-}
-
-static constexpr std::string_view RegistryContentEncoding = "deflate";
-
-void Session::SendLocalShardedStateRegistryToPeer_(cipc::Rank rank, std::string const& peer)
-{
-    auto               registry = GetLocalRegistry_(rank);
-    std::ostringstream serialized;
-    StateSerDes::Write(serialized, *registry, StateNode::Handle::Root);
-    auto const               body = serialized.str();
-    boost::asio::io_context  ioc;
-    boost::beast::tcp_stream stream(ioc);
-    auto request        = CreateRequestForPeer(ioc, stream, peer, fmt::format("/api/peer/shardedstateregistry/{}/{}", sessionId, rank));
-    request.body().data = const_cast<char*>(body.data());
-    request.body().size = body.size();
-    request.body().more = false;
-    request.prepare_payload();
-    boost::beast::http::write(stream, request);
-    boost::beast::flat_buffer                                     buffer;
-    boost::beast::http::response<boost::beast::http::string_body> response;
-    boost::beast::http::read(stream, buffer, response);
-    if (response.result() != boost::beast::http::status::ok)
-    {
-        throw std::runtime_error(
-            fmt::format("[native_ckpt:svr][{}#{}][ERROR] Peer={} returned error={}", *server, sessionId, peer, response.result_int()));
-    }
-    TryCleanShutdown(stream);
-}
-
-static std::shared_ptr<StateTree> InflateRegistry(std::string_view bytes)
-{
-    boost::iostreams::filtering_istream istrm;
-    istrm.push(boost::iostreams::zlib_decompressor());
-    istrm.push(boost::iostreams::array_source(bytes.data(), bytes.size()));
-    return StateSerDes::Read(istrm);
-}
-
-void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<char const> buf)
-{
-    if (hdr.messageSize > buf.size())
-    {
-        throw std::invalid_argument(
-            fmt::format("Local state registry declares {} bytes but only {} bytes were received", hdr.messageSize, buf.size()));
-    }
-    BufStream istrm{buf.data(), static_cast<size_t>(hdr.messageSize)};
-    auto      localRegistry = StateSerDes::Read(istrm);
-    if (localRegistry->SessionId() != sessionId)
-    {
-        throw std::invalid_argument(
-            fmt::format("Local registry session {} does not match request session {}", localRegistry->SessionId(), sessionId));
-    }
-    ValidateLocalTensorMetadata(*localRegistry);
-    Rank rank         = localRegistry->Topo().rank;
-    auto snapshotSize = localRegistry->GetTotalSnapshotStateSizeInBytes();
-    auto registryTopo = localRegistry->Topo();
-
-    INFO("[{}#{}] Received sharded state registry from rank={} data of size={}, Total Payload Size={}",
-         *server,
-         sessionId,
-         rank,
-         hdr.messageSize,
-         snapshotSize);
-    bool registryAccepted = false;
-    {
-        // Concurrent handlers push here; an unlocked emplace corrupts sibling futures.
-        std::scoped_lock lock(mutex);
-        auto&            localState = sessionState.localRegistryForRank[rank];
-        if (localState != nullptr)
-        {
-            WARN("[{}#{}] Received a duplicate local state registry from rank={} for an unknown reason; ignoring it",
-                 *server,
-                 sessionId,
-                 rank);
-            registryTopo = localState->Topo();
-        }
-        else
-        {
-            localState          = std::move(localRegistry);
-            largestSnapshotSize = std::max(largestSnapshotSize, snapshotSize);
-            registryAccepted    = true;
-            asyncTasks.emplace_back(
-                std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkReceiveLocalStateRegistry_, this, rank));
-            if (static_cast<uint32_t>(rank) / topo.ranksPerPeer != 0)    // TODO_MULTILOCAL_CKPT
-            {
-                asyncTasks.push_back(std::async(std::launch::async | std::launch::deferred,
-                                                &Session::SendLocalShardedStateRegistryToPeerWithRetries_,
-                                                this,
-                                                rank,
-                                                topo.peers[0]));
-            }
-        }
-    }
-    if (registryAccepted)
-    {
-        DebugOutputToFile(RankRegistryDumpName(rank, registryTopo.worldSize),
-                          [&](std::ostream& ostrm) { ostrm.write(buf.data(), static_cast<std::streamsize>(buf.size())); });
-    }
-    // Each reply waits for the node's last registry, so every rank opens finished queues sized for the largest local snapshot.
-    auto const firstLocalRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
-    auto const localRanks     = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstLocalRank);
-    auto const deadline       = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
-    auto const waitId         = tel::Id{.sessionId = sessionId, .rank = rank, .snapshotId = cipc::SnapshotId::Invalid};
-    uint64_t   maxSnapshotSize{};
-    PERF() << tel::span::SvrWaitLocalRegistries::Begin{.id = waitId};
-    while (true)
-    {
-        {
-            std::scoped_lock lock(mutex);
-            maxSnapshotSize = largestSnapshotSize;
-            if (PerfClock::now() >= deadline)
-            {
-                WARN("[native_ckpt:svr][{}#{}][WARN] Wait for local registries timed out", *server, sessionId);
-                break;
-            }
-            if (sessionState.localRegistryForRank.size() >= localRanks || stopRequested) { break; }
-        }
-        std::this_thread::sleep_for(IntervalBetweenRetries);
-    }
-    PERF() << tel::span::SvrWaitLocalRegistries::End{.id = waitId};
-    server->InitializeShmFromRegistry_(maxSnapshotSize, registryTopo);
-}
-
-void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char const> buf)
-{
-    BufStream stream{buf.data(), buf.size()};
-    stream.exceptions(std::ios::failbit | std::ios::badbit);
-    auto const                 ckptPath = std::filesystem::path(serdes::ReadBlobWithSize<uint16_t>(stream));
-    std::shared_ptr<StateTree> registered;
-    {
-        std::scoped_lock lock(mutex);
-        auto const       found = sessionState.localRegistryForRank.find(hdr.globalRank);
-        if (found == sessionState.localRegistryForRank.end())
-        {
-            throw std::invalid_argument("Snapshot rank is not registered on this daemon");
-        }
-        registered = found->second;
-    }
-    auto registry = std::make_shared<StateTree>(sessionId, registered->Topo());
-    registered->CloneInto(*registry);
-    uint32_t registeredBlobs   = 0;
-    uint32_t registeredScalars = 0;
-    std::as_const(*registered).WalkNodes([&](StateNode const& node) {
-        if (node.GetType() == StateNode::Type::DynamicSizeBlob) { ++registeredBlobs; }
-        else if (node.GetType() == StateNode::Type::Scalar) { ++registeredScalars; }
-    });
-    auto const numBlobs = serdes::ReadTrivial<uint32_t>(stream);
-    if (numBlobs != registeredBlobs) { throw std::runtime_error("Snapshot dynamic blob count does not match its registry"); }
-    registry->WalkNodes([&](StateNode& node) {
-        if (node.GetType() == StateNode::Type::DynamicSizeBlob)
-        {
-            std::get<StateNode::DynamicSizeBlob>(node.data).storageSize = serdes::ReadTrivial<uint64_t>(stream);
-        }
-    });
-    auto const numScalars = serdes::ReadTrivial<uint32_t>(stream);
-    if (numScalars != registeredScalars) { throw std::runtime_error("Snapshot scalar count does not match its registry"); }
-    registry->WalkNodes([&](StateNode& node) {
-        if (node.GetType() == StateNode::Type::Scalar)
-        {
-            auto&      scalar = std::get<StateNode::Scalar>(node.data);
-            auto const value  = serdes::ReadTrivial<Primitives64Bit>(stream);
-            if (scalar.GetType() != value.GetType()) { throw std::runtime_error("Snapshot scalar type does not match its registry"); }
-            static_cast<Primitives64Bit&>(scalar) = value;
-        }
-    });
-    registry->FinalizeRegistry();
-    uint64_t offset = 0;
-    for (auto const group : {StateNode::Type::DTensor, StateNode::Type::FixedSizeBlob, StateNode::Type::DynamicSizeBlob})
-    {
-        std::as_const(*registry).WalkNodes([&](StateNode const& stored) {
-            auto& node = registry->GetNode(stored.handle);
-            if (node.GetType() != group) { return; }
-            if (group == StateNode::Type::DynamicSizeBlob)
-            {
-                auto& blob  = std::get<StateNode::DynamicSizeBlob>(node.data);
-                blob.handle = offset;
-                offset += blob.storageSize;
-            }
-            else
-            {
-                auto&                 tensor = group == StateNode::Type::FixedSizeBlob
-                                                   ? static_cast<DTensor&>(std::get<StateNode::FixedSizeBlob>(node.data))
-                                                   : std::get<DTensor>(node.data);
-                std::set<TensorShard> packed;
-                for (auto shard : tensor.shards)
-                {
-                    shard.handle = offset;
-                    offset += shard.storageSize;
-                    packed.insert(shard);
-                }
-                tensor.shards = std::move(packed);
-            }
-        });
-    }
-    if (hdr.snapshotSize != offset) { throw std::invalid_argument("Snapshot payload size does not match its registry"); }
-    bool                                  beginDurableSpan = false;
-    std::chrono::system_clock::time_point durableStartedAt;
-    {
-        std::scoped_lock lock(mutex);
-        if (!sessionState.localRegistryForRank.contains(hdr.globalRank))
-        {
-            throw std::invalid_argument("Snapshot rank is not registered on this daemon");
-        }
-        auto& snapshot = snapshots[hdr.snapshotId];
-        if (snapshot == nullptr)
-        {
-            snapshot             = std::make_unique<Snapshot>();
-            snapshot->snapshotId = hdr.snapshotId;
-        }
-        if (snapshot->snapshotStateForRank.contains(hdr.globalRank) || snapshot->finalizedRanks.contains(hdr.globalRank))
-        {
-            throw std::runtime_error("Snapshot rank is already activated or finalized");
-        }
-        if (snapshot->path.empty())
-        {
-            snapshot->name        = fmt::format("snapshot_{}", hdr.snapshotId);
-            snapshot->path        = ckptPath / fmt::format("checkpoint_session_{}.snapshot_{}.bin", sessionId, hdr.snapshotId);
-            snapshot->activatedAt = PerfClock::now();
-            durableStartedAt      = snapshot->activatedAt;
-            beginDurableSpan      = true;
-        }
-        auto snapshotState              = std::make_unique<SnapshotState>();
-        snapshotState->snapshotRegistry = std::move(registry);
-        snapshotState->startedAt        = hdr.startedAt;
-        snapshotState->snapshotData     = ByteStorage(hdr.snapshotSize);
-        if (snapshotState->snapshotData.data != nullptr)
-        {
-            BindRegionToNumaNode(hdr.numaNode, snapshotState->snapshotData.data, snapshotState->snapshotData.size);
-        }
-        BindThreadCpuToNumaNode(hdr.numaNode);
-        snapshot->snapshotStateForRank.emplace(hdr.globalRank, std::move(snapshotState));
-    }
-    if (beginDurableSpan && IsCoordinatorPeer())
-    {
-        PERF() << tel::span::SvrDurable::Begin{.id        = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId},
-                                               .startedAt = durableStartedAt};
-    }
-    PERF() << tel::span::CkptSave::Begin{.id        = {.sessionId = sessionId, .rank = hdr.globalRank, .snapshotId = hdr.snapshotId},
-                                         .startedAt = hdr.startedAt};
-    INFO("[{}#{}] Activated snapshot={} for global rank={} with expected tensor data size={} path={}",
-         *server,
-         sessionId,
-         hdr.snapshotId,
-         hdr.globalRank,
-         hdr.snapshotSize,
-         ckptPath);
-}
 
 void Server::Start()
 {
@@ -529,97 +216,89 @@ void Server::Start()
     StartTcpListener_(reusePort, acceptorCount);
     _running = true;
     StartTcpAcceptors_();
-    auto const shmSize = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
-    if (shmSize != 0)
-    {
-        auto queueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-        auto slotCount  = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>();
-        if (queueCount == 0) { queueCount = cipc::ExplicitSizeDefaultQueueCount; }
-        if (slotCount == 0) { slotCount = cipc::ExplicitSizeDefaultSlotCount; }
-        InitializeShm_(lock, shmSize, queueCount, slotCount);
-    }
 }
 
-void Server::InitializeShm_(std::scoped_lock<std::mutex> const& /* lock */,
-                            size_t  configuredTotalSize,
-                            uint8_t queueCount,
-                            size_t  slotCount)
+void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapshotSize, int32_t numaNode)
 {
-    if (queueCount == 0) { throw std::invalid_argument("at least one shared-memory queue is required"); }
-    if (queueCount <= _msgQueue.size()) { return; }
-    if (cipc::MsgQueue::MinimumShmSize(slotCount) > std::numeric_limits<size_t>::max() / queueCount)
+    auto const configuredSize       = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSize>();
+    auto       configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
+    if (configuredQueueCount == 0 && configuredSize != 0) { configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount; }
+    auto const queueCount    = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+    auto const localRank     = static_cast<uint32_t>(rank) % topo.ranksPerPeer;
+    auto const queueIndex    = cipc::QueueIndex(localRank, topo.ranksPerPeer, queueCount);
+    auto const producerCount = cipc::QueueProducerCount(queueIndex, topo.ranksPerPeer, queueCount);
+
+    std::scoped_lock lock(_mutex);
+    if (_stopRequested) { throw std::runtime_error("Checkpoint service is stopping"); }
+    if (_msgQueue.size() <= queueIndex) { _msgQueue.resize(static_cast<size_t>(queueIndex) + 1); }
+    if (_msgQueue[queueIndex] != nullptr) { return; }
+
+    auto queueSize = configuredSize / queueCount;
+    if (configuredSize == 0)
     {
-        throw std::overflow_error("configured shared-memory ring-buffer geometry is too large");
+        auto const snapshotSizePerProducer = cipc::RoundSnapshotShmSize(static_cast<size_t>(snapshotSize));
+        if (snapshotSizePerProducer > std::numeric_limits<size_t>::max() / producerCount)
+        {
+            throw std::overflow_error("automatic shared-memory size exceeds the supported range");
+        }
+        queueSize = snapshotSizePerProducer * producerCount;
     }
-
-    auto const minimumTotal = std::max(cipc::MinShmSize, cipc::MsgQueue::MinimumShmSize(slotCount) * queueCount);
-    auto const totalSize    = cipc::MsgQueue::DetectShmSize(
-        cipc::Message::RequestChannelName(_index, queueCount), configuredTotalSize, minimumTotal, slotCount);
-    auto const queueSize = totalSize / queueCount;
-
-    _running              = true;
-    auto       neededMore = queueCount - _msgQueue.size();
-    std::latch queuesReady{static_cast<ptrdiff_t>(neededMore)};
-    // Start server thread
-    //_serverThread = std::thread([this]() {
-    auto origSize = _msgQueue.size();
-    _msgQueue.resize(queueCount);
-    for (auto i = origSize; i < queueCount; ++i)
+    auto slotCount = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
+    if (slotCount == 0)
     {
-        _threads.emplace_back([this, i, queueSize, slotCount, queueCount, &queuesReady] {
-            SetThreadName(fmt::format("ncs:svrq:{}", i).c_str());
-            // Map queues across host-memory NUMA domains. Pinning around Create
-            // places the control page; materializing the data pages in the owner
-            // mapping prevents CUDA registration in a restricted client process
-            // from faulting every shared page onto one socket.
-            auto const numaNodes = DetectHostMemoryNumaNodes();
-            int        queueNuma = numaNodes.front();
-            if (numaNodes.size() > 1)
-            {
-                size_t queuesPerDomain = queueCount / numaNodes.size();
-                if (queuesPerDomain == 0) { queuesPerDomain = 1; }
-                size_t const domain = std::min(numaNodes.size() - 1, static_cast<size_t>(i) / queuesPerDomain);
-                queueNuma           = numaNodes[domain];
-                BindThreadCpuToNumaNode(queueNuma);
-            }
-            auto const queueIndex = static_cast<uint8_t>(i);
-            auto       msgQueue   = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
-            if (numaNodes.size() > 1)
+        slotCount = configuredSize != 0 ? cipc::ExplicitSizeDefaultSlotCount
+                                        : cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, producerCount);
+    }
+    queueSize = cipc::MsgQueue::DetectShmSize(
+        cipc::Message::RequestChannelName(_index, queueIndex), queueSize, cipc::MinShmSize / queueCount, slotCount);
+
+    std::latch         queueReady{1};
+    std::exception_ptr initFailure;
+    _threads.emplace_back([this, queueIndex, numaNode, queueSize, slotCount, &queueReady, &initFailure] {
+        try
+        {
+            SetThreadName(fmt::format("ncs:svrq:{}", queueIndex).c_str());
+            BindThreadCpuToNumaNode(numaNode);
+            auto msgQueue = cipc::MsgQueue::Create(cipc::Message::RequestChannelName(_index, queueIndex), queueSize, slotCount);
+            if (numaNode >= 0)
             {
                 auto region = msgQueue.GetShmDataRegion();
-                BindRegionToNumaNode(queueNuma, region.data(), region.size());
+                BindRegionToNumaNode(numaNode, region.data(), region.size());
                 std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
             }
-            UnbindThreadCpu();
-            // The caller holds _mutex until every queue publishes its geometry.
-            // Each thread owns one pre-sized vector element, and the latch makes
-            // those writes visible before InitializeShm_ returns.
-            _msgQueue[i] = &msgQueue;
-            queuesReady.count_down();
             INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
             std::fflush(stderr);
-            while (true) try
-                {
-                    auto const [stop, hdr, buf] = msgQueue.BeginRead();
-                    if (stop)
+            _msgQueue[queueIndex] = &msgQueue;
+            queueReady.count_down();
+            [&]() noexcept {
+                while (true) try
                     {
-                        std::scoped_lock lock1(_mutex);
-                        INFO("[{}] Stop requested. Shutting down server thread.", *this);
-                        _msgQueue[i] = nullptr;
-                        return;
-                    }
-                    // The slot returns to the writer even on a throw; a skipped EndRead
-                    // leaks it permanently and a saturated leak wedges the queue.
-                    try
-                    {
-                        HandleMessage(hdr, buf);
-                    } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
-                    msgQueue.EndRead();
+                        auto const [stop, hdr, buf] = msgQueue.BeginRead();
+                        if (stop)
+                        {
+                            std::scoped_lock lock1(_mutex);
+                            INFO("[{}] Stop requested. Shutting down server thread.", *this);
+                            _msgQueue[queueIndex] = nullptr;
+                            return;
+                        }
+                        // The slot returns to the writer even on a throw; a skipped EndRead
+                        // leaks it permanently and a saturated leak wedges the queue.
+                        try
+                        {
+                            HandleMessage(hdr, buf);
+                        } catch (std::exception const& e) { ERR("[{}] Exception handling message (slot released): {}", *this, e.what()); }
+                        msgQueue.EndRead();
 
-                } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
-        });
-    }
-    queuesReady.wait();
+                    } catch (std::exception const& e) { ERR("[{}] Exception: {}", *this, e.what()); }
+            }();
+        } catch (...)
+        {
+            initFailure = std::current_exception();
+            queueReady.count_down();
+        }
+    });
+    queueReady.wait();
+    if (initFailure) { std::rethrow_exception(initFailure); }
 }
 
 bool Server::AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */)
@@ -971,7 +650,7 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId                           
 
 void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
 {
-    std::scoped_lock lock(_mutex);
+    std::unique_lock lock(_mutex);
     _lastPingTime = PerfClock::now();
 
     BufStream bufStream{buf.data(), buf.size()};
@@ -994,6 +673,16 @@ void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnaps
         if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
         else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
     }
+    auto*                                            session = it->second.get();
+    std::vector<std::unique_ptr<PendingSessionData>> pending;
+    auto const                                       queued = _pendingSessionData.find(sessionId);
+    if (queued != _pendingSessionData.end())
+    {
+        pending = std::move(queued->second);
+        _pendingSessionData.erase(queued);
+    }
+    lock.unlock();
+    for (auto& fragment : pending) { session->HandleLocalStateRegistry(fragment->recvFrom, std::move(fragment->registry)); }
 }
 
 void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view const& buf)
@@ -1003,73 +692,72 @@ void Server::ReceiveLocalRegistry_(cipc::SessionId sessionId, std::string_view c
     });
 }
 
-void Server::InitializeShmFromRegistry_(uint64_t snapshotSize, RankTopology const& topo)
+static std::shared_ptr<StateTree> InflateRegistry(std::string_view bytes)
 {
-    if (topo.ranksPerPeer == 0) { throw std::invalid_argument("local registry has no ranks per peer"); }
-    auto const configuredQueueCount = checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferNumQueues>();
-    auto const queueCount           = cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
-    auto const maxProducerCount     = (topo.ranksPerPeer + queueCount - 1) / queueCount;
-    auto const snapshotSizePerQueue = cipc::RoundSnapshotShmSize(static_cast<size_t>(snapshotSize));
-    if (snapshotSizePerQueue > std::numeric_limits<size_t>::max() / maxProducerCount / queueCount)
-    {
-        throw std::overflow_error("automatic shared-memory size exceeds the supported range");
-    }
-    auto const totalSize = snapshotSizePerQueue * maxProducerCount * queueCount;
-
-    auto slotCount = static_cast<size_t>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferSlots>());
-    if (slotCount == 0)
-    {
-        auto const queueSize = totalSize / queueCount;
-        slotCount            = cipc::MsgQueue::SlotCountForShmSize(queueSize, cipc::MsgQueue::DefaultSlotCount, maxProducerCount);
-    }
-
-    std::scoped_lock<std::mutex> lock(_mutex);
-    InitializeShm_(lock, totalSize, queueCount, slotCount);
+    boost::iostreams::filtering_istream istrm;
+    istrm.push(boost::iostreams::zlib_decompressor());
+    istrm.push(boost::iostreams::array_source(bytes.data(), bytes.size()));
+    return StateSerDes::Read(istrm);
 }
 
 void Server::ReceiveGlobalRegistry_(cipc::SessionId sessionId, std::string_view const& body, size_t fwdStart, size_t fwdEnd)
 {
     FindOrWaitForSession_("ReceiveGlobalRegistry", sessionId, [&](Session& session) {
-        if (session.PeerIndex() != fwdStart)
+        BufStream result{body.data(), body.size()};
+        result.exceptions(std::ios::failbit | std::ios::badbit);
+        auto failure = serdes::ReadBlobWithSize<uint32_t>(result);
+        if (!failure.empty())
         {
-            throw std::logic_error(fmt::format("[native_ckpt:svr][{}#{}] ReceiveGlobalRegistry expected fwdStart={} but got PeerIndex()={}",
-                                               *this,
-                                               sessionId,
-                                               fwdStart,
-                                               session.PeerIndex()));
+            session.HandleGlobalRegistry({}, std::move(failure));
+            return;
         }
-
+        if (session.IsCoordinatorPeer()) { throw std::logic_error("The coordinator peer never receives the global registry"); }
+        if (session.PeerIndex() != fwdStart) { throw std::invalid_argument("Global registry forwarding rank does not match daemon"); }
+        auto registry = InflateRegistry(body.substr(sizeof(uint32_t)));
         session.RelayGlobalRegistryToPeers(body, fwdStart + 1, fwdEnd);
-        std::shared_ptr<StateTree> globalRegistry = InflateRegistry(body);
-        session.HandleGlobalRegistry(std::move(globalRegistry));
+        session.HandleGlobalRegistry(std::move(registry), {});
     });
 }
 
-void Server::ReceiveStateRegistryFragments_(cipc::SessionId const& sessionId, cipc::Rank fromRank, std::string_view body)
+void Server::ReceiveLocalStateRegistry_(cipc::SessionId const&                                               sessionId,
+                                        Rank                                                                 fromRank,
+                                        tcp_stream&                                                          stream,
+                                        boost::beast::flat_buffer&                                           buffer,
+                                        boost::beast::http::request_parser<boost::beast::http::buffer_body>& parser)
 {
-    BufStream                  input{body.data(), body.size()};
-    std::shared_ptr<StateTree> registry = StateSerDes::Read(input);
+    std::string             body;
+    std::array<char, 65536> chunk{};
+    while (!parser.is_done())
+    {
+        parser.get().body().data = chunk.data();
+        parser.get().body().size = chunk.size();
+        parser.get().body().more = true;
+        boost::system::error_code error;
+        boost::beast::http::read_some(stream, buffer, parser, error);
+        if (error && error != boost::beast::http::error::need_buffer) { throw boost::system::system_error(error); }
+        body.append(chunk.data(), chunk.size() - parser.get().body().size);
+    }
+    BufStream metadata{body.data(), body.size()};
+    auto      registry = StateSerDes::Read(metadata);
     if (registry->SessionId() != sessionId || registry->GlobalRank() != fromRank)
     {
         throw std::invalid_argument("Peer registry does not match its session or rank");
     }
-    ValidateLocalTensorMetadata(*registry);
     Session* session = nullptr;
     {
         std::scoped_lock lock(_mutex);
-        auto const       it = _activeSessions.find(sessionId);
-        if (it == _activeSessions.end() || it->second->sessionState.globalRegistry == nullptr)
+        auto             item = _activeSessions.find(sessionId);
+        if (item == _activeSessions.end())
         {
-            auto pending        = std::make_unique<PendingSessionData>();
-            pending->registry   = std::move(registry);
-            pending->recvFrom   = fromRank;
-            pending->receivedAt = PerfClock::now();
+            auto pending      = std::make_unique<PendingSessionData>();
+            pending->recvFrom = fromRank;
+            pending->registry = std::move(registry);
             _pendingSessionData[sessionId].push_back(std::move(pending));
             return;
         }
-        session = it->second.get();
+        session = item->second.get();
     }
-    session->HandleLocalStateRegistry(fromRank, registry);
+    session->HandleLocalStateRegistry(fromRank, std::move(registry));
 }
 
 void Server::SpinDownWaitLoop_(tcp_stream stream)
@@ -1211,6 +899,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     auto        target  = headers.target();
     SetThreadName(fmt::format("ncs:w:{}", target).c_str());
 
+    auto const getOrPost = headers.method() == boost::beast::http::verb::get || headers.method() == boost::beast::http::verb::post;
+
     auto url     = boost::urls::parse_origin_form(target).value();
     auto segs    = url.segments();
     auto it      = segs.begin();
@@ -1224,17 +914,15 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         return true;
     };
 
-    // Check if this is the state upload endpoint: POST /api/peer/shardedstateregistry/{sessionId}/{rank}
-    if (matches({"api", "peer", "shardedstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
+    // Check if this is the state upload endpoint: POST /api/peer/localstateregistry/{sessionId}/{rank}
+    if (matches({"api", "peer", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
         auto rank      = cipc::Rank{boost::lexical_cast<uint32_t>(*(it++))};
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in state registry upload endpoint"); }
 
-        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
-        bodyParser.body_limit(std::numeric_limits<uint64_t>::max());
-        boost::beast::http::read(stream, buffer, bodyParser);
-        ReceiveStateRegistryFragments_(sessionId, rank, bodyParser.get().body());
+        boost::beast::http::request_parser<boost::beast::http::buffer_body> bufferParser{std::move(headerParser)};
+        ReceiveLocalStateRegistry_(sessionId, rank, stream, buffer, bufferParser);
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
@@ -1242,8 +930,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }
-    // Check if this is the state upload endpoint: POST /api/peer/snapshotcomplete/{sessionId}/{rank}/{snapshotId}
-
     else if (matches({"api", "peer", "snapshotcomplete"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId  = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -1272,12 +958,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::response<boost::beast::http::string_body>       res{boost::beast::http::status::ok, headers.version()};
         boost::beast::http::request_parser<boost::beast::http::string_body> parser{std::move(headerParser)};
         boost::beast::http::read(stream, buffer, parser);
-        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-        res.keep_alive(headers.keep_alive());
-        res.body() = "{}";
-        res.prepare_payload();
-        boost::beast::http::write(stream, res);
-        // TODO_NOSTALL : move it before we send 200 once we dont stall for session+snaphot anymore
         BufStream completion{parser.get().body().data(), parser.get().body().size()};
         completion.exceptions(std::ios::failbit | std::ios::badbit);
         auto                                      failure = serdes::ReadBlobWithSize<uint32_t>(completion);
@@ -1290,6 +970,12 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             dynamicBlobSizes.emplace(std::move(fqn), size);
         }
         NotifyWriteCkptComplete_(sessionId, snapshotId, rank, std::move(failure), std::move(dynamicBlobSizes));
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.keep_alive(headers.keep_alive());
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+
         if (auto const fwdParam = url.params().find("fwd"); fwdParam != url.params().end())
         {
             auto const range     = (*fwdParam).value;
@@ -1301,7 +987,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             });
         }
     }
-    // The global registry for a snapshot (body = deflated serialized tree).
     else if (matches({"api", "peer", "globalregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -1322,24 +1007,16 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             return {boost::lexical_cast<size_t>(fwdValue.substr(0, sepPos)), boost::lexical_cast<size_t>(fwdValue.substr(sepPos + 1))};
         }();
 
-        auto const encoding = headers[boost::beast::http::field::content_encoding];
-        if (encoding != RegistryContentEncoding)
-        {
-            throw std::invalid_argument(
-                fmt::format("globalregistry body is '{}'-encoded, expected '{}'", encoding, RegistryContentEncoding));
-        }
-
         boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
         bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
         boost::beast::http::read(stream, buffer, bodyParser);
+        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-
-        ReceiveGlobalRegistry_(sessionId, bodyParser.get().body(), fwdRangeStart, fwdRangeEnd);
     }
     else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
@@ -1358,7 +1035,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         try
         {
             ActivateSession_(sessionId, 1, body);
-            res.result(boost::beast::http::status::accepted);
             res.body() = "{}";
         } catch (std::exception const& e)
         {
@@ -1369,6 +1045,53 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
+        Ping();
+    }
+    else if (matches({"api", "activate-snapshot"}) && headers.method() == boost::beast::http::verb::post)
+    {
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        bodyParser.body_limit(std::numeric_limits<std::uint64_t>::max());
+        boost::beast::http::read(stream, buffer, bodyParser);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, version};
+        try
+        {
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a session ID"); }
+            auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a rank"); }
+            auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Snapshot activation requires a snapshot ID"); }
+            auto const snapshotId = cipc::SnapshotId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot activation URL segments"); }
+            auto const& body = bodyParser.get().body();
+            if (body.size() < sizeof(cipc::Message::ActivateSnapshot))
+            {
+                throw std::invalid_argument("Snapshot activation header is truncated");
+            }
+            cipc::Message::ActivateSnapshot activation;
+            std::memcpy(&activation, body.data(), sizeof(activation));
+            auto const descriptor = std::span<char const>(body.data() + sizeof(activation), body.size() - sizeof(activation));
+            if (activation.sessionId != sessionId || activation.globalRank != rank || activation.snapshotId != snapshotId)
+            {
+                throw std::invalid_argument("Snapshot activation header does not match its URL");
+            }
+            if (activation.messageSize != descriptor.size())
+            {
+                throw std::invalid_argument("Snapshot activation size does not match its descriptor");
+            }
+            FindOrWaitForSession_("ActivateSnapshot", sessionId, [&](Session& session) { session.Handle(activation, descriptor); });
+            response.body() = "{}";
+        } catch (std::exception const& error)
+        {
+            response.result(boost::beast::http::status::internal_server_error);
+            response.body() = error.what();
+        }
+        response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        response.keep_alive(keepAlive);
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
         Ping();
     }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
@@ -1390,7 +1113,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         try
         {
             ReceiveLocalRegistry_(sessionId, body);
-            res.result(boost::beast::http::status::accepted);
             res.body() = "{}";
         } catch (std::exception const& e)
         {
@@ -1403,7 +1125,130 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::write(stream, res);
         Ping();
     }
-    else if (matches({"api", "ping"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
+    else if (matches({"api", "shmqueue"}) && headers.method() == boost::beast::http::verb::post)
+    {
+        auto const version   = headers.version();
+        auto const keepAlive = headers.keep_alive();
+        stream.expires_never();
+        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
+        boost::beast::http::read(stream, buffer, bodyParser);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, version};
+        try
+        {
+            if (it == segs.end()) { throw std::invalid_argument("Shared-memory queue requires a session ID"); }
+            auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it == segs.end()) { throw std::invalid_argument("Shared-memory queue requires a rank"); }
+            auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+            if (it != segs.end()) { throw std::invalid_argument("Unexpected shared-memory queue URL segments"); }
+            BufStream request{bodyParser.get().body().data(), bodyParser.get().body().size()};
+            request.exceptions(std::ios::failbit | std::ios::badbit);
+            auto const snapshotSize = serdes::ReadTrivial<uint64_t>(request);
+            auto const numaNode     = serdes::ReadTrivial<int32_t>(request);
+            FindOrWaitForSession_(
+                "InitializeShm", sessionId, [&](Session& session) { InitializeShm_(session.topo, rank, snapshotSize, numaNode); });
+            response.body() = "{}";
+        } catch (std::exception const& error)
+        {
+            response.result(boost::beast::http::status::insufficient_storage);
+            response.body() = error.what();
+        }
+        response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        response.keep_alive(keepAlive);
+        response.prepare_payload();
+        boost::beast::http::write(stream, response);
+        Ping();
+    }
+    else if (matches({"api", "snapshot-plan"}) && getOrPost && it != segs.end())
+    {
+        auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it == segs.end()) { throw std::invalid_argument("Snapshot plan requires a rank"); }
+        auto const rank = Rank{boost::lexical_cast<uint32_t>(*(it++))};
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
+        std::scoped_lock waitersLock(_mutex);
+        std::erase_if(_finalizeWaits,
+                      [](std::future<void>& task) { return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, socket = std::move(stream), sessionId, rank] mutable {
+            auto connection = std::move(socket);
+            SetThreadName("ncs:planwait");
+            connection.expires_never();
+            auto const                 deadline = std::chrono::steady_clock::now() + ServerWaitTimeout;
+            std::shared_ptr<StateTree> plan;
+            std::string                failure;
+            while (true)
+            {
+                if (_stopRequested)
+                {
+                    failure = "Server is stopping";
+                    break;
+                }
+                {
+                    std::scoped_lock lock(_mutex);
+                    auto const       item = _activeSessions.find(sessionId);
+                    if (item != _activeSessions.end())
+                    {
+                        auto&            session = *item->second;
+                        std::scoped_lock sessionLock(session.mutex);
+                        auto const       firstRank = static_cast<uint32_t>(session.PeerIndex()) * session.topo.ranksPerPeer;
+                        auto const       lastRank
+                            = std::min(firstRank + session.topo.ranksPerPeer, static_cast<uint32_t>(session.topo.worldSize));
+                        if (static_cast<uint32_t>(rank) < firstRank || static_cast<uint32_t>(rank) >= lastRank)
+                        {
+                            failure = "Requested snapshot plan rank is not local to this daemon";
+                            break;
+                        }
+                        if (session.stopRequested)
+                        {
+                            failure = "Session is stopping";
+                            break;
+                        }
+                        if (!session.sessionState.planningFailure.empty())
+                        {
+                            failure = session.sessionState.planningFailure;
+                            break;
+                        }
+                        if (session.sessionState.planningReady)
+                        {
+                            auto const selected = session.sessionState.snapshotRegistryForRank.find(rank);
+                            if (selected == session.sessionState.snapshotRegistryForRank.end())
+                            {
+                                failure = "Local snapshot plan is unavailable";
+                            }
+                            else
+                            {
+                                plan = selected->second;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    failure = "Snapshot planning timed out";
+                    break;
+                }
+                std::this_thread::sleep_for(IntervalBetweenRetries);
+            }
+            auto const status = failure.empty() ? boost::beast::http::status::ok : boost::beast::http::status::internal_server_error;
+            boost::beast::http::response<boost::beast::http::string_body> response{status, HttpVersion11};
+            response.set(boost::beast::http::field::server, "NativeCheckpointServer");
+            if (plan != nullptr)
+            {
+                std::ostringstream metadata;
+                StateSerDes::Write(metadata, *plan, StateNode::Handle::Root);
+                response.body() = metadata.str();
+                response.set(boost::beast::http::field::content_type, "application/octet-stream");
+            }
+            else
+            {
+                response.body() = failure;
+            }
+            response.prepare_payload();
+            boost::system::error_code error;
+            boost::beast::http::write(connection, response, error);
+            TryCleanShutdown(connection);
+        }));
+    }
+    else if (matches({"api", "ping"}) && getOrPost && (it == segs.end()))
     {
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
@@ -1413,7 +1258,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         boost::beast::http::write(stream, res);
         Ping();
     }
-    else if (matches({"api", "stop"}) && headers.method() == boost::beast::http::verb::get && (it == segs.end()))
+    else if (matches({"api", "stop"}) && getOrPost && (it == segs.end()))
     {
         // Reply OK first, then signal shutdown via the flag that WaitForShutdown polls.
         // We can't call Stop() inline: it joins _threads and we're running on one of them.
@@ -1432,7 +1277,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             }
         }
     }
-    else if (matches({"api", "spindown"}) && headers.method() == boost::beast::http::verb::get)
+    else if (matches({"api", "spindown"}) && getOrPost)
     {
         if (it != segs.end()) { throw std::invalid_argument("Unexpected extra URL segments in spindown endpoint"); }
         // Hand the connection off to a dedicated waiter thread and return at once: the
@@ -1441,9 +1286,9 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock lock(_mutex);
         _spinDownThreads.emplace_back([this, s = std::move(stream)] mutable { SpinDownWaitLoop_(std::move(s)); });
     }
-    // Block until a checkpoint is durable: GET /api/wait-for-ckpt-finalize/{sessionId}/{iteration}.
+    // The response completes when the selected checkpoint is durable.
     // `iteration` is signed — negative values index back from the newest snapshot (-1 = latest).
-    else if (matches({"api", "wait-for-ckpt-finalize"}) && headers.method() == boost::beast::http::verb::get && (it != segs.end()))
+    else if (matches({"api", "wait-for-ckpt-finalize"}) && getOrPost && (it != segs.end()))
     {
         auto sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
         if (it == segs.end()) { throw std::invalid_argument("wait-for-ckpt-finalize requires a /{sessionId}/{iteration} path"); }
@@ -1628,19 +1473,6 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
                 ERR("Error: {}", e.what());
             }
         });
-    }
-}
-
-void Session::AsyncWorkReceiveLocalStateRegistry_(Rank const& rank)
-{
-    auto registry = GetLocalRegistry_(rank);
-    HandleLocalStateRegistry(rank, registry);
-    std::scoped_lock lock(server->_mutex);
-    auto const       pending = server->_pendingSessionData.find(sessionId);
-    if (pending != server->_pendingSessionData.end())
-    {
-        for (auto const& entry : pending->second) { HandleLocalStateRegistry(entry->recvFrom, entry->registry); }
-        server->_pendingSessionData.erase(pending);
     }
 }
 
