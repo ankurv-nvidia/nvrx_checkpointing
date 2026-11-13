@@ -1930,7 +1930,7 @@ class FlavorPolicy:
     def run_worker(self, cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
         (self.worker or _run_routine)(cfg, args, provider, label)
 
-    def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
+    def stop_server(self, _provider: str, tag: str, graceful: bool = True, host_log: Path | None = None) -> None:
         if self.manages_native_server:
             def stop() -> None:
                 pids = CHECKPOINT_SERVER.pids()
@@ -1940,6 +1940,9 @@ class FlavorPolicy:
                     _reject_server_errors(
                         Path(pattern.replace("%h", socket.gethostname()).replace("%p", pid)) for pid in pids
                     )
+                    # An in-process daemon logs into the output of the rank hosting it.
+                    if host_log and os.environ.get("NATIVE_CKPT_SERVER_INPROC") == "1":
+                        _reject_server_errors([host_log], r"(?m)^.*\[native_ckpt(?::svr)?\].*\[ERROR\]")
 
             _node_once(tag, stop)
 
@@ -2696,12 +2699,12 @@ def _sync_ranks(tag: str) -> None:
             raise TimeoutError(f"timed out waiting for ranks after {tag}")
         time.sleep(0.25)
 
-def _reject_server_errors(logs: Iterable[Path]) -> None:
+def _reject_server_errors(logs: Iterable[Path], errors: str = r"(?m)^(?:.*\[ERROR\]|Error:)") -> None:
     contents = {log: log.read_text(errors="replace") for log in logs if log.exists()}
     hard_stops = [log for log, text in contents.items() if "spindown timed out before idle" in text]
     if hard_stops:
         raise RuntimeError(f"checkpoint server aborted in-flight work; see {', '.join(map(str, hard_stops))}")
-    failed = [log for log, text in contents.items() if re.search(r"(?m)^(?:.*\[ERROR\]|Error:)", text)]
+    failed = [log for log, text in contents.items() if re.search(errors, text)]
     if failed:
         raise RuntimeError(f"checkpoint server reported errors; see {', '.join(map(str, failed))}")
 
@@ -2930,10 +2933,10 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
         if server_enabled and not collector_node:
-            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop")
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop", host_log=log)
         _sync_ranks(f"{label}-{cycle_tag}-relays-stopped".strip("-"))
         if server_enabled and collector_node:
-            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop", host_log=log)
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
         if rank == "0":
             otel_data = otel_report.OtelData([])

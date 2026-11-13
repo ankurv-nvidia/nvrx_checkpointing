@@ -397,6 +397,36 @@ def test_server_log_error_is_a_failure(
         slurm_job.FlavorPolicy().stop_server("native", "phase2")
 
 
+@pytest.mark.parametrize(
+    ("message", "fails"),
+    [
+        ("[native_ckpt:svr][ERROR] peer finalize request failed\n", True),
+        ("[native_ckpt][ERROR] Failed to allocate byte storage of size 8 bytes\n", True),
+        ("[native_ckpt:cli][ERROR] Shutdown Error: Broken pipe\n", False),
+        ("Error: training output outside the checkpoint daemon\n", False),
+    ],
+)
+def test_inproc_server_error_in_the_host_log_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    message: str,
+    fails: bool,
+) -> None:
+    slurm_job = _load_slurm_job()
+    log = tmp_path / "nano3_8x4_run-routine_rank0.log"
+    log.write_text(message)
+    monkeypatch.setenv("NATIVE_CKPT_SERVER_LOG", str(tmp_path / "checkpoint_server.%h.%p.log"))
+    monkeypatch.setenv("NATIVE_CKPT_SERVER_INPROC", "1")
+    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(pids=list, stop=lambda _graceful: None))
+    monkeypatch.setattr(slurm_job, "_node_once", lambda _tag, action: action())
+
+    if fails:
+        with pytest.raises(RuntimeError, match="reported errors"):
+            slurm_job.FlavorPolicy().stop_server("native", "phase2", host_log=log)
+    else:
+        slurm_job.FlavorPolicy().stop_server("native", "phase2", host_log=log)
+
+
 def test_host_memory_metrics_distinguish_training_process_and_daemon(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1917,6 +1947,7 @@ def test_routine_validates_each_collected_cycle(
     tmp_path: Path,
     routing: tuple[str, list[str], str, str, str | None, str, int],
 ) -> None:
+    monkeypatch.setenv("NATIVE_CKPT_SERVER_INPROC", "1")
     slurm_job = _load_slurm_job()
     provider, flavor_names, rank, host, collector, server_role, phase1_checkpoints = routing
     args = _args(tmp_path, repeat=1)
@@ -1973,6 +2004,7 @@ def test_routine_validates_each_collected_cycle(
         "42-otel-run-cycle1-sr0-te0",
     ]
     assert all("NATIVE_CKPT_TRAINING_MEMORY_FILE" not in env for env in child_envs)
+    assert all(env.get("NATIVE_CKPT_SERVER_INPROC") == ("1" if provider == "native" else None) for env in child_envs)
     assert sum(event == ("ping", "") for event in lifecycle) == 2  # noqa: PLR2004
     if provider == "native":
         expected_startup = [("ping", ""), ("sync", "phase1-otel-listeners-ready")]
