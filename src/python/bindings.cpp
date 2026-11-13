@@ -148,16 +148,25 @@ struct PythonStateTree
 
     CLASS_DELETE_COPY_AND_MOVE(PythonStateTree);
 
-    void Scan(nb::dict stateDict);
-    void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
-
     void FinalizeRegistry()
     {
         ChainAsyncCall([this] {
-            FinalizeStateRegistry(_localRegistry);
-            OnSnapshotComplete_();
+            if (!_snapshotRegistry)
+            {
+                FinalizeStateRegistry(_localRegistry);
+                _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
+                Scan(*_snapshotRegistry, _dictToScan);
+            }
         });
     }
+
+    void RegisterStateDict(nb::dict stateDict)
+    {
+        ChainAsyncCall([this, stateDict = std::move(stateDict)] mutable { Scan(SnapshotRegistry(), stateDict); });
+    }
+
+    void Scan(StateTree& registry, nb::dict stateDict);
+    void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
 
     template <typename TCall> void ChainAsyncCall(TCall&& call)    // NOLINT(cppcoreguidelines-missing-std-forward)
     {
@@ -193,7 +202,6 @@ struct PythonStateTree
     void SetStartedAt(int64_t startedAt) { SnapshotRegistry().startedAt = std::chrono::nanoseconds{startedAt}; }
 
     private:
-    void ClearSnapshotValues_();
     void ReleasePythonObjects_();
 
     void OnSnapshotComplete_()
@@ -354,7 +362,7 @@ void PythonStateTree::ReleasePythonObjects_()
     _dictToScan.reset();
 }
 
-void PythonStateTree::Scan(nb::dict stateDict)
+void PythonStateTree::Scan(StateTree& registry, nb::dict stateDict)
 {
     ClearSnapshotValues(_localRegistry);
     {
@@ -749,7 +757,7 @@ static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
 {
     auto                   extraDictRef = nb::dict(stateDict);
     nb::gil_scoped_release release;
-    self.ChainAsyncCall([&self, stateDict = std::move(extraDictRef)] mutable { self.Scan(std::move(stateDict)); });
+    self.RegisterStateDict(std::move(extraDictRef));
 }
 
 static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
@@ -831,7 +839,11 @@ NB_MODULE(checkpoint, m)    // NOLINT
             "startedAt",
             [](PythonStateTree const& self) { return self.SnapshotRegistry().startedAt.count(); },
             [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
-        .def("register_state_dict", &RegisterStateDict)
+        .def("register_state_dict",
+             [](PythonStateTree& self, nb::dict stateDict) {
+                 nb::gil_scoped_release release;
+                 self.RegisterStateDict(std::move(stateDict));
+             })
         .def("finalize_registry",
              [](PythonStateTree& self) {
                  nb::gil_scoped_release release;
