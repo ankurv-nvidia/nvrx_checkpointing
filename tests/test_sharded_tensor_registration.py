@@ -261,22 +261,35 @@ def test_register_state_dict_includes_all_tensor_replicas() -> None:
 
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-def test_register_state_dict_releases_superseded_python_objects() -> None:
-    root = _create_root()
+def test_save_releases_retained_python_objects(tmp_path: Path) -> None:
+    session_id = next(_SESSION_IDS)
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
     tensor = torch.arange(4, dtype=torch.float32)
     tensor_ref = weakref.ref(tensor)
     state = {"weight": ShardedTensor.from_rank_offsets("weight", tensor, (0, 0, 1))}
 
     root.register_state_dict(state)
     root.finalize_registry()
+    fresh = tensor + 10
+    fresh_ref = weakref.ref(fresh)
     root.register_state_dict(
-        {"weight": ShardedTensor.from_rank_offsets("weight", torch.arange(4, dtype=torch.float32), (0, 0, 1))},
+        {"weight": ShardedTensor.from_rank_offsets("weight", fresh, (0, 0, 1))},
     )
     assert root.snapshot_size == 4 * 4
-    del state, tensor
+    del state, tensor, fresh
     gc.collect()
+    assert tensor_ref() is not None
+    assert fresh_ref() is not None
 
+    root.save(1, tmp_path)
+    checkpoint.wait_for_ckpt_finalize(session_id, 1)
+    gc.collect()
     assert tensor_ref() is None
+    assert fresh_ref() is None
+
+    loaded = {"weight": torch.zeros(4)}
+    dcp.load(loaded, checkpoint_id=str(tmp_path))
+    torch.testing.assert_close(loaded["weight"], torch.arange(4, dtype=torch.float32) + 10)
 
 
 @pytest.mark.integration
@@ -297,8 +310,7 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
     first_materializations = list(_StorageLessQuantizedTensor.dequantized)
     assert first_materializations
     gc.collect()
-    assert first_materializations[-1]() is not None
-    assert all(ref() is None for ref in first_materializations[:-1])
+    assert all(ref() is not None for ref in first_materializations)
 
     fresh_data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16) + 1)
     root.register_state_dict(
@@ -309,8 +321,12 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
     refreshed_materializations = _StorageLessQuantizedTensor.dequantized[len(first_materializations) :]
     assert len(refreshed_materializations) == 1
     gc.collect()
-    assert all(ref() is None for ref in first_materializations)
+    assert all(ref() is not None for ref in first_materializations)
     assert refreshed_materializations[0]() is not None
+
+    del root
+    gc.collect()
+    assert all(ref() is None for ref in first_materializations + refreshed_materializations)
 
 
 def test_register_state_dict_materializes_non_mxfp8_float8_tensor() -> None:
@@ -324,7 +340,11 @@ def test_register_state_dict_materializes_non_mxfp8_float8_tensor() -> None:
 
     assert root.snapshot_size == 16
     gc.collect()
-    assert sum(ref() is not None for ref in _StorageLessQuantizedTensor.dequantized) == 1
+    assert _StorageLessQuantizedTensor.dequantized
+    assert all(ref() is not None for ref in _StorageLessQuantizedTensor.dequantized)
+    del root
+    gc.collect()
+    assert all(ref() is None for ref in _StorageLessQuantizedTensor.dequantized)
 
 
 def test_register_state_dict_retains_all_factory_shard_materializations() -> None:
@@ -351,8 +371,7 @@ def test_register_state_dict_retains_all_factory_shard_materializations() -> Non
     assert len(first_materializations) == 2
 
     gc.collect()
-    assert all(ref() is None for ref in initial_materializations[:-2])
-    assert all(ref() is not None for ref in first_materializations)
+    assert all(ref() is not None for ref in initial_materializations)
 
     root.register_state_dict({"weight": factory(10)})
     assert root.snapshot_size == 16
@@ -360,8 +379,12 @@ def test_register_state_dict_retains_all_factory_shard_materializations() -> Non
     assert len(first_materializations) == len(second_materializations) == 2
 
     gc.collect()
-    assert all(ref() is None for ref in first_materializations)
+    assert all(ref() is not None for ref in initial_materializations)
     assert all(ref() is not None for ref in second_materializations)
+
+    del root
+    gc.collect()
+    assert all(ref() is None for ref in initial_materializations + second_materializations)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires one CUDA GPU")
@@ -382,7 +405,7 @@ def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
 
     first_materializations = list(_StorageLessQuantizedTensor.dequantized)
     assert first_materializations
-    assert all(ref() is None for ref in first_materializations[:-1])
+    assert all(ref() is not None for ref in first_materializations)
     materialized = first_materializations[-1]()
     assert materialized is not None
     assert materialized.is_cuda
@@ -780,20 +803,6 @@ def test_register_state_dict_allows_missing_registered_path() -> None:
 
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
-    root = _create_root()
-    root.register_state_dict({"weight": torch.arange(4, dtype=torch.float32), "step": 1})
-    root.finalize_registry()
-    assert root.snapshot_size == 4 * 4
-
-    root.register_state_dict({"step": 2})
-    root.save_async(1, tmp_path / "iter_0000001")
-    with pytest.raises(RuntimeError, match=r"Snapshot state 'weight' has no current source data"):
-        root.wait_for_async_completion()
-
-
-@pytest.mark.integration
-@_REQUIRES_CHECKPOINT_SERVER
 @pytest.mark.parametrize(("initial", "updated"), [(True, False), (1, 2), (1.5, 2.5), (b"", b"")])
 def test_save_preserves_omitted_registered_value(tmp_path: Path, initial: float | bytes, updated: float | bytes) -> None:
     session_id = next(_SESSION_IDS)
@@ -805,20 +814,6 @@ def test_save_preserves_omitted_registered_value(tmp_path: Path, initial: float 
             root.finalize_registry()
         root.save(iteration, tmp_path / f"iter_{iteration:07d}")
         checkpoint.wait_for_ckpt_finalize(session_id, iteration)
-
-
-@pytest.mark.integration
-@_REQUIRES_CHECKPOINT_SERVER
-def test_save_rejects_a_missing_registered_blob(tmp_path: Path) -> None:
-    root = _create_root()
-    root.register_state_dict({"value": b"payload"})
-    root.finalize_registry()
-
-    root.register_state_dict({})
-    root.save_async(1, tmp_path / "iter_0000001")
-
-    with pytest.raises(RuntimeError, match=r"Snapshot state 'value' has no current source data"):
-        root.wait_for_async_completion()
 
 
 def test_register_state_dict_rejects_empty_fixed_blob() -> None:

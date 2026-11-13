@@ -78,26 +78,6 @@ static DTensor const& ShardedState(StateNode::Variant const& data)
 static bool IsShardedState(StateNode::Variant const& data)
 { return std::holds_alternative<DTensor>(data) || std::holds_alternative<StateNode::FixedSizeBlob>(data); }
 
-static void ClearSnapshotValues(StateTree& registry)
-{
-    if (!registry.IsFinalized()) { return; }
-
-    std::as_const(registry).WalkNodes([&](StateNode const& current) {
-        auto& node = registry.GetNode(current.handle);
-        if (auto* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data)) { blob->handle = 0; }
-        else if (IsShardedState(node.data))
-        {
-            auto&                 tensor = ShardedState(node.data);
-            std::set<TensorShard> clearedShards;
-            for (auto shard : tensor.shards)
-            {
-                shard.handle = 0;
-                clearedShards.insert(shard);
-            }
-            tensor.shards = std::move(clearedShards);
-        }
-    });
-}
 namespace
 {
 struct PythonStateTree
@@ -155,7 +135,7 @@ struct PythonStateTree
             {
                 FinalizeStateRegistry(_localRegistry);
                 _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
-                Scan(*_snapshotRegistry, _dictToScan);
+                Scan(*_snapshotRegistry);
             }
         });
     }
@@ -167,11 +147,11 @@ struct PythonStateTree
                 nb::gil_scoped_acquire acquire;
                 _dictToScan = stateDict;
             }
-            Scan(SnapshotRegistry(), stateDict);
+            Scan(SnapshotRegistry());
         });
     }
 
-    void Scan(StateTree& registry, nb::dict const& stateDict);
+    void Scan(StateTree& registry);
     void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
 
     template <typename TCall> void ChainAsyncCall(TCall&& call)    // NOLINT(cppcoreguidelines-missing-std-forward)
@@ -232,14 +212,18 @@ struct PythonStateTree
 
 StateNode* PythonStateTree::Accessor::AddDictionaryChild(StateNode::Handle parent, std::string_view name)
 {
+    // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
+    if (parent == StateNode::Handle::Invalid) { return nullptr; }
     if (_registry->IsFinalized())
     {
-        auto const [exists, handle] = _registry->FindChildNodeIfExists(parent, name);
-        if (!exists) { return nullptr; }
+        auto const parentPath = _registry->GetNodeId(parent);
+        auto const fqn        = parentPath.empty() ? std::string(name) : fmt::format("{}.{}", parentPath, name);
+        auto const handle     = _registry->FindNodeByFQN(fqn);
+        // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
+        if (handle == StateNode::Handle::Invalid) { return nullptr; }
         auto& child = _registry->GetNode(handle);
         if (!std::holds_alternative<StateNode::Dict>(child.data))
         {
-            if (_registry->FindNodeByFQN(_registry->GetNodeId(handle)) == StateNode::Handle::Invalid) { return nullptr; }
             throw std::runtime_error(fmt::format("supplied state '{}' changed container type", _registry->GetNodeId(child.handle)));
         }
         return &child;
@@ -356,8 +340,9 @@ uint64_t PythonStateTree::Accessor::RetainBlobData(std::vector<char> data)
     return reinterpret_cast<uint64_t>(_state->_blobStorage.back().data());
 }
 
+// TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
 std::string PythonStateTree::Accessor::GetNodeId(StateNode::Handle node) const
-{ return _registry->GetNodeId(node); }
+{ return node == StateNode::Handle::Invalid ? std::string{} : _registry->GetNodeId(node); }
 
 void PythonStateTree::ReleasePythonObjects_()
 {
@@ -367,7 +352,7 @@ void PythonStateTree::ReleasePythonObjects_()
     _dictToScan.reset();
 }
 
-void PythonStateTree::Scan(StateTree& registry, nb::dict const& stateDict)
+void PythonStateTree::Scan(StateTree& registry)
 {
     std::unordered_set<PyObject*> visited;
 
@@ -624,12 +609,13 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
             {
                 for (size_t i = 0; i < listObj.size(); ++i)
                 {
-                    auto  item  = listObj[i];
-                    auto* child = scan.AddDictionaryChild(node, fmt::format("{}.[list]#{}", keyView, i));
-                    if (child == nullptr) { continue; }
+                    auto                   item      = listObj[i];
+                    auto*                  child     = scan.AddDictionaryChild(node, fmt::format("{}.[list]#{}", keyView, i));
                     auto                   childDict = nb::cast<nb::dict>(item);
                     nb::gil_scoped_release release;
-                    RegisterStateDictRecr(scan, child->handle, childDict, recursive, visited);
+                    // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
+                    RegisterStateDictRecr(
+                        scan, child == nullptr ? StateNode::Handle::Invalid : child->handle, childDict, recursive, visited);
                 }
             }
         }
@@ -661,20 +647,20 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
     {
         if (nb::isinstance<nb::dict>(val))
         {
-            auto* child = scan.AddDictionaryChild(node, keyView);
-            if (child == nullptr) { return; }
+            auto*                  child     = scan.AddDictionaryChild(node, keyView);
             auto                   childDict = nb::cast<nb::dict>(val);
             nb::gil_scoped_release release;
-            RegisterStateDictRecr(scan, child->handle, childDict, recursive, visited);
+            // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
+            RegisterStateDictRecr(scan, child == nullptr ? StateNode::Handle::Invalid : child->handle, childDict, recursive, visited);
         }
         // if namespace
         else if (IsNamespace(val))
         {
-            auto* child = scan.AddDictionaryChild(node, keyView);
-            if (child == nullptr) { return; }
+            auto*                  child     = scan.AddDictionaryChild(node, keyView);
             auto                   childDict = nb::cast<nb::dict>(val.attr("__dict__"));
             nb::gil_scoped_release release;
-            RegisterStateDictRecr(scan, child->handle, childDict, recursive, visited);
+            // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
+            RegisterStateDictRecr(scan, child == nullptr ? StateNode::Handle::Invalid : child->handle, childDict, recursive, visited);
         }
     }
     else

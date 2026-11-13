@@ -392,9 +392,10 @@ def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:
     del refreshed
     assert root.snapshot_size > 0
     gc.collect()
-    assert first_ref() is None
+    assert first_ref() is not None
     assert second_ref() is not None
 
     del root
     gc.collect()
+    assert first_ref() is None
     assert second_ref() is None
