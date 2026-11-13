@@ -117,9 +117,11 @@ GPU_MEMORY_METRICS = frozenset({"gpu_peak_bytes", "gpu_hbm_peak_bytes"})
 MEMORY_REGRESSION_METRICS = HOST_MEMORY_METRICS | GPU_MEMORY_METRICS
 # Baselines keep stable save-boundary gates while raw allocator and NVML values remain diagnostic.
 CHECKPOINT_SAVE_GPU_BASELINE_GATES = frozenset({
-    "checkpoint_save_gpu_allocator_unchanged",
     "checkpoint_save_gpu_transient_activity_within_limit",
     "checkpoint_save_gpu_invariant_satisfied",
+})
+CHECKPOINT_SAVE_GPU_DIAGNOSTICS = frozenset({
+    "checkpoint_save_gpu_allocator_unchanged",
 })
 RESULTS_DIR = REPO_ROOT / "ci/ci-results"
 RUN_ROOT: Path | None = None
@@ -1307,25 +1309,30 @@ class PerfReport:
         expected, tolerances = baseline.get("metrics", {}), baseline.get("tolerances", {})
         result, passed = {}, True
         for name in sorted(expected.keys() - metrics.keys()):
-            logger.warning(f"[slurm_job:perf] WARNING required baseline metric {name!r} was not measured")
+            diagnostic = name in CHECKPOINT_SAVE_GPU_DIAGNOSTICS
+            kind = "diagnostic" if diagnostic else "required baseline"
+            logger.warning(f"[slurm_job:perf] WARNING {kind} metric {name!r} was not measured")
             result[name] = {
-                "status": "FAIL",
+                "status": "WARN" if diagnostic else "FAIL",
                 "measured": None,
                 "baseline": expected[name],
                 "reason": "missing_metric",
             }
-            passed = False
+            passed &= diagnostic
         for name, measured in metrics.items():
             statistic = PerfReport._statistic(name, measured)
             value, higher = measured[statistic], measured["higher_is_better"]
+            diagnostic = name in CHECKPOINT_SAVE_GPU_DIAGNOSTICS
             improved_beyond_tolerance = False
-            if name == "bw_socket_imbalance":
+            if name == "checkpoint_save_gpu_invariant_satisfied":
+                ok, target, tolerance = value == 1, 1, 0
+            elif name == "bw_socket_imbalance":
                 ok, target, tolerance = value <= MAX_BW_SOCKET_IMBALANCE, MAX_BW_SOCKET_IMBALANCE, 0
-            elif name not in expected:
+            elif name not in expected and not diagnostic:
                 result[name] = {"status": "info" if higher is None else "no_baseline", "measured": value}
                 continue
             else:
-                target = float(expected[name])
+                target = float(expected.get(name, 1))
                 fallback = WIDE_TOLERANCE_METRICS.get(name, 0 if higher is None else default_tolerance)
                 tolerance = tolerances.get(name, fallback)
                 low, high = target * (1 - tolerance), target * (1 + tolerance)
@@ -1337,9 +1344,9 @@ class PerfReport:
                     improved_beyond_tolerance = value < low
                 else:
                     ok = low <= value <= high
-            passed &= ok
+            passed &= ok or diagnostic
             result[name] = {
-                "status": "WARN" if improved_beyond_tolerance else ("PASS" if ok else "FAIL"),
+                "status": "WARN" if improved_beyond_tolerance or (diagnostic and not ok) else ("PASS" if ok else "FAIL"),
                 "measured": value,
                 "baseline": target,
                 "tolerance_pct": tolerance * 100,
@@ -1382,7 +1389,10 @@ class PerfReport:
             raise RuntimeError(f"no perf metrics found in {processed['source']} report data for {results_dir}")
         comparison, passed = PerfReport._compare_to_baseline(metrics, baseline, PERF_TOLERANCE)
         if enforced_metrics is not None:
-            passed = all(comparison.get(name, {}).get("status") != "FAIL" for name in enforced_metrics)
+            passed = all(
+                comparison.get(name, {}).get("status") != "FAIL"
+                for name in enforced_metrics | {"checkpoint_save_gpu_invariant_satisfied"}
+            )
         validation = processed["validation"]
         if validation:
             comparison[validation["name"]] = {
