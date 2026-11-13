@@ -156,11 +156,6 @@ struct PythonStateTree
                 FinalizeStateRegistry(_localRegistry);
                 _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
                 Scan(*_snapshotRegistry, _dictToScan);
-                ClearSnapshotValues(_localRegistry);
-                {
-                    nb::gil_scoped_acquire acquire;
-                    ReleasePythonObjects_();
-                }
             }
         });
     }
@@ -168,7 +163,10 @@ struct PythonStateTree
     void RegisterStateDict(nb::dict stateDict)
     {
         ChainAsyncCall([this, stateDict = std::move(stateDict)] mutable {
-            _dictToScan = stateDict;
+            {
+                nb::gil_scoped_acquire acquire;
+                _dictToScan = stateDict;
+            }
             Scan(SnapshotRegistry(), stateDict);
         });
     }
@@ -214,7 +212,6 @@ struct PythonStateTree
 
     void OnSnapshotComplete_()
     {
-        ClearSnapshotValues(SnapshotRegistry());
         {
             nb::gil_scoped_acquire acquire;
             ReleasePythonObjects_();
@@ -375,32 +372,15 @@ void PythonStateTree::Scan(StateTree& registry, nb::dict const& stateDict)
     std::unordered_set<PyObject*> visited;
 
     Accessor accessor{&SnapshotRegistry(), this};
-    try
-    {
-        RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
-    } catch (nb::python_error const& error)
-    {
-        auto const message = std::string(error.what());
-        OnSnapshotComplete_();
-        throw std::runtime_error(message);
-    } catch (...)
-    {
-        OnSnapshotComplete_();
-        throw;
-    }
+    RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
+}
 }
 
 void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath)
 {
-    try
-    {
-        if (!_snapshotRegistry) { throw std::runtime_error("Snapshot registry is not available"); }
-        ::SaveCheckpoint(*_snapshotRegistry, iteration, dirpath);
-    } catch (...)
-    {
-        OnSnapshotComplete_();
-        throw;
-    }
+
+    if (!_snapshotRegistry) { throw std::runtime_error("Snapshot registry is not available"); }
+    ::SaveCheckpoint(*_snapshotRegistry, iteration, dirpath);
     OnSnapshotComplete_();
 }
 
