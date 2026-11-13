@@ -127,7 +127,6 @@ struct StateTree
 
     auto& FindOrAddDictChild(StateNode::Handle node, std::string_view const& stateName) LFTBND
     {
-        AssertMutable_();
         auto& parent = _nodes[static_cast<size_t>(node)].data;
         if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
         for (auto childHandle : std::get<StateNode::Dict>(parent))
@@ -145,7 +144,6 @@ struct StateTree
 
     auto& AddChild(StateNode::Handle node, std::string_view const& stateName, [[maybe_unused]] bool allowDuplicates = true) LFTBND
     {
-        AssertMutable_();
         auto& parent = _nodes[static_cast<size_t>(node)].data;
         if (parent.index() != static_cast<size_t>(StateNode::Type::Dict)) { throw std::runtime_error("Node data is not of type Dict"); }
 #ifndef NDEBUG
@@ -260,7 +258,6 @@ struct StateTree
 
     void SetBlobSource(std::string_view const& fqn, uint64_t address, uint64_t size)
     {
-        AssertMutable_();
         auto const handle = FindNodeByFQN(fqn);
         if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("State '{}' is not registered", fqn)); }
         auto& node = GetNode(handle);
@@ -275,7 +272,6 @@ struct StateTree
 
     void SetScalar(std::string_view const& fqn, StateNode::Scalar const& data)
     {
-        AssertMutable_();
         auto const handle = FindNodeByFQN(fqn);
         if (handle == StateNode::Handle::Invalid) { throw std::runtime_error(fmt::format("State '{}' is not registered", fqn)); }
         auto& node = GetNode(handle);
@@ -419,7 +415,6 @@ struct StateTree
 
     template <typename TLambda> void WalkNodes(TLambda const& lambda)
     {
-        AssertMutable_();
         for (auto& node : _nodes)
         {
             // TODO_PURGE_INVALID
@@ -438,85 +433,24 @@ struct StateTree
         }
     }
 
-    void FinalizeRegistry()
-    {
-        if (_finalized) { return; }
-        auto& root = _nodes[0];
-        try
-        {
-            SortDictionaryNode_(root);
-        } catch (std::exception const& ex)
-        {
-            fmt::print(stderr, "Error finalizing registry: {}\n", ex.what());
-            std::unordered_set<StateNode::Handle> visited;
-            DebugPrintRecr_(0, root.handle, visited);
-            for (auto const& node : _nodes)
-            {
-                if (visited.contains(node.handle)) { continue; }
-                fmt::print(stderr,
-                           "Unvisited node : [{}]{} Parent Node: [{}]{}\n",
-                           node.handle,
-                           node.name,
-                           static_cast<uint32_t>(node.parent),
-                           GetNodeId(node.parent));
-            }
-            throw;
-        }
-        _finalized = true;
-    }
-
-    [[nodiscard]] bool IsFinalized() const { return _finalized; }
-
     void CloneInto(StateTree& clone) const
     {
-        clone.AssertMutable_();
         clone._nodes.reserve(_nodes.size());
         clone._nodes.clear();
         for (auto const& node : _nodes) { clone._nodes.emplace_back(node.handle, node.parent, node.name, StateNode::Variant{node.data}); }
-        clone.startedAt  = startedAt;
-        clone._finalized = false;
+        clone.startedAt = startedAt;
     }
 
     [[nodiscard]] auto Clone() const
     {
         auto clonedTree = std::make_shared<StateTree>(_sessionId, _topo);
         CloneInto(*clonedTree);
-        clonedTree->_finalized = _finalized;
         return clonedTree;
-    }
-
-    void RemoveNode(StateNode::Handle nodeHandle)
-    {
-        AssertMutable_();
-        if (nodeHandle == StateNode::Handle::Root) { throw std::runtime_error("Cannot remove root node"); }
-        auto& node       = GetNode(nodeHandle);
-        auto  parent     = node.parent;
-        auto& parentNode = GetNode(parent);
-        if (parentNode.data.index() != static_cast<size_t>(StateNode::Type::Dict))
-        {
-            throw std::runtime_error(fmt::format("Parent node is not of type dict. Node : [{}]{} Parent Node: [{}]{} \n",
-                                                 node.handle,
-                                                 node.name,
-                                                 parentNode.handle,
-                                                 parentNode.name));
-        }
-        auto& parentChildren = std::get<StateNode::Dict>(parentNode.data);
-        auto  e              = std::ranges::remove(parentChildren, node.handle);
-        parentChildren.erase(e.begin(), e.end());
-        node.parent = StateNode::Handle::Invalid;
-        node.handle = StateNode::Handle::Invalid;
-        node.data   = std::monostate{};
-        node.name   = {};
     }
 
     [[nodiscard]] auto const& Topo() const LFTBND { return _topo; }
 
     private:
-    void AssertMutable_() const
-    {
-        if (_finalized) { throw std::logic_error("Finalized state trees are immutable"); }
-    }
-
     void DebugPrintRecr_(size_t depth, StateNode::Handle nodeHandle, std::unordered_set<StateNode::Handle>& visited) const
     {
         if (visited.contains(nodeHandle))
@@ -638,8 +572,6 @@ struct StateTree
     }
 
     std::vector<StateNode> _nodes;
-
-    bool _finalized{false};
 
     checkpoint::ipc::SessionId _sessionId{};
     RankTopology const         _topo{};

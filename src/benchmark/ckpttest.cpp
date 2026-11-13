@@ -1003,8 +1003,6 @@ TEST_CASE("registries reject duplicate tensor names", "[state][tier1]")
     StateTree tree(checkpoint::ipc::SessionId::Default, SingleRankTopo());
     AddTensorShardLeaf(tree, "weight", Tensor::DType::Float32, {2}, 0);
     AddTensorShardLeaf(tree, "weight", Tensor::DType::Float32, {2}, 8);
-
-    CHECK_THROWS_AS(tree.FinalizeRegistry(), std::runtime_error);
     CHECK(tree.GetTotalNumTensors() == 2);
 }
 
@@ -1053,8 +1051,6 @@ TEST_CASE("payload traversal groups blobs and tensors independently of node orde
         tree.AddChild(StateNode::Handle::Root, name).data = std::move(blob);
     }
 
-    tree.FinalizeRegistry();
-    CHECK(tree.IsFinalized());
     CHECK(tree.GetTotalPayloadSizeInBytes() == 13);
     std::vector<std::string> names;
     std::vector<uint64_t>    offsets;
@@ -1112,9 +1108,7 @@ TEST_CASE("payload traversal groups blobs and tensors independently of node orde
 
     auto const frozen = SerializedStateRegistry(tree);
     auto       clone  = tree.Clone();
-    CHECK(clone->IsFinalized());
     CHECK(SerializedStateRegistry(*clone) == frozen);
-    CHECK_NOTHROW(tree.FinalizeRegistry());
     CHECK(SerializedStateRegistry(tree) == frozen);
 }
 
@@ -1123,12 +1117,10 @@ TEST_CASE("finalized registries reject general mutations", "[state][planning][ti
     StateTree tree(checkpoint::ipc::SessionId{56}, SingleRankTopo());
     tree.AddChild(StateNode::Handle::Root, "scalar").data = StateNode::Scalar(int64_t{5});
     tree.AddChild(StateNode::Handle::Root, "blob").data = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = 0};
-    tree.FinalizeRegistry();
-    auto const frozen = SerializedStateRegistry(tree);
+    auto const frozen                                   = SerializedStateRegistry(tree);
     CHECK_THROWS(tree.AddChild(StateNode::Handle::Root, "extra"));
     CHECK_THROWS(tree.SetScalar("scalar", StateNode::Scalar(int64_t{6})));
     CHECK_THROWS(tree.SetBlobSource("blob", 0, 1));
-    CHECK_THROWS(tree.RemoveNode(tree.FindNodeByFQN("blob")));
     CHECK_THROWS(tree.WalkNodes([](StateNode&) {}));
     std::istringstream serialized(frozen);
     static_cast<void>(StateSerDes::ReadSessionId(serialized));
@@ -1212,7 +1204,6 @@ static std::shared_ptr<StateTree> GetTestSnapshotRegistry(Rank rank, checkpoint:
     if (response.result() != http::status::ok) { throw std::runtime_error(response.body()); }
     std::istringstream input(response.body());
     auto               registry = StateSerDes::Read(input);
-    registry->FinalizeRegistry();
     return registry;
 }
 
@@ -1511,7 +1502,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         auto&      scalar                     = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
         static_cast<Primitives64Bit&>(scalar) = static_cast<Primitives64Bit const&>(values[index]);
     }
-    auto& payload       = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
+    auto& payload = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
     CHECK(payload.handle == reinterpret_cast<uint64_t>(bytes.data()));
     CHECK(payload.storageSize == bytes.size());
     payload.handle      = reinterpret_cast<uint64_t>(bytes.data());
@@ -1528,7 +1519,6 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
     auto invalid = std::make_shared<StateTree>(selected->SessionId(), selected->Topo());
     selected->CloneInto(*invalid);
     invalid->SetBlobSource("payload", 0, bytes.size());
-    invalid->FinalizeRegistry();
     REQUIRE_THROWS(SaveCheckpoint(*invalid, checkpoint::ipc::SnapshotId{39}, checkpointDir));
     REQUIRE_NOTHROW(SaveCheckpoint(*selected, checkpoint::ipc::SnapshotId{40}, checkpointDir));
     auto       durable = std::async(std::launch::async, [] { WaitForCkptFinalize(TestSessionId, 40); });
@@ -1660,7 +1650,6 @@ TEST_CASE("clients initialize selected-size queues after planning", "[shmem][pla
                                    .device        = DeviceId{"cpu"}});
                     tree.AddChild(StateNode::Handle::Root, "blob").data = std::move(blob);
                 }
-                tree.FinalizeRegistry();
                 std::ostringstream body;
                 StateSerDes::Write(body, tree, StateNode::Handle::Root);
                 return PostToTestServer("/api/localstateregistry/0", body.str());
@@ -1777,7 +1766,6 @@ static std::string SerializedSliceRegistry(RankTopology topo)
     StateTree  tree(checkpoint::ipc::SessionId::Default, std::move(topo));
     auto [leafName, parent]              = tree.FindOrAddNodeByFQN("weight");
     tree.AddChild(parent, leafName).data = SliceOfSharedTensor(rank, worldSize);
-    tree.FinalizeRegistry();
     std::stringstream body;
     StateSerDes::Write(body, tree, StateNode::Handle::Root);
     return body.str();
@@ -1850,7 +1838,6 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
                        .sharddim      = blobRange,
                        .device        = DeviceId{"cpu"}});
         tree.AddChild(StateNode::Handle::Root, BlobName).data = std::move(blob);
-        tree.FinalizeRegistry();
         std::stringstream registry;
         StateSerDes::Write(registry, tree, StateNode::Handle::Root);
         return std::make_pair(registry.str(), registry.str());
@@ -1993,7 +1980,6 @@ static std::string PublishTestGlobalRegistry(RankTopology const& topology, size_
         tensor.AddShard(*SliceOfSharedTensor(rank, static_cast<uint32_t>(topology.worldSize)).shards.begin());
     }
     global.AddChild(StateNode::Handle::Root, "weight").data = std::move(tensor);
-    global.FinalizeRegistry();
     std::ostringstream registry;
     StateSerDes::Write(registry, global, StateNode::Handle::Root);
     auto const                          bytes = registry.str();
@@ -2035,7 +2021,6 @@ static void ActivateTestSnapshot(checkpoint::ipc::MsgQueue&   queue,
         }
         tensor.shards = std::move(current);
     });
-    incoming->FinalizeRegistry();
     auto const snapshotSize = incoming->GetTotalPayloadSizeInBytes();
     StateSerDes::Write(activation, *incoming, StateNode::Handle::Root);
     auto const payload = activation.str();
@@ -2487,7 +2472,6 @@ TEST_CASE("peer write completions refresh dynamic blob metadata across snapshots
     fixed.AddShard(
         {.rank = Rank{1}, .snapshotDtype = Tensor::DType::UInt8, .storageSize = 5, .sharddim = ranges, .device = DeviceId{"cpu"}});
     remote.AddChild(StateNode::Handle::Root, "z_fixed").data = std::move(fixed);
-    remote.FinalizeRegistry();
     std::vector<std::string> targets;
     uint32_t                 completed{0};
     auto                     notified = ServePeerRequests(ioc, acceptor, [&](auto const& request) {

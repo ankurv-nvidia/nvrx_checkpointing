@@ -539,7 +539,6 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         throw std::invalid_argument("Snapshot registry session or rank does not match activation");
     }
     {
-        registry->FinalizeRegistry();
         uint64_t offset = 0;
         for (auto const group : {StateNode::Type::DTensor, StateNode::Type::FixedSizeBlob, StateNode::Type::DynamicSizeBlob})
         {
@@ -717,7 +716,6 @@ try
         Rank              owner{Rank::Invalid};
     };
 
-    globalRegistry->FinalizeRegistry();
     auto const firstRank = static_cast<uint32_t>(PeerIndex()) * topo.ranksPerPeer;
     auto const rankCount = std::min(topo.ranksPerPeer, static_cast<uint32_t>(topo.worldSize) - firstRank);
     auto const worldSize = static_cast<uint32_t>(globalRegistry->GlobalWorldSize());
@@ -872,13 +870,8 @@ try
         }
         for (auto const& [rank, selected] : byRank) { appendNode(*registries.at(rank), selected); }
     });
-    for (auto const& [rank, registry] : registries)
-    {
-        static_cast<void>(rank);
-        registry->FinalizeRegistry();
-    }
+    for (auto const& [rank, registry] : registries) { static_cast<void>(rank); }
 
-    dedupedGlobalRegistry->FinalizeRegistry();
     std::scoped_lock lock(mutex);
     sessionState.dedupedGlobalRegistry   = std::move(dedupedGlobalRegistry);
     sessionState.globalRegistry          = std::move(globalRegistry);
@@ -894,6 +887,8 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
             std::scoped_lock lock(mutex);
             if (receivedFrom.contains(recvRank)) { return; }
             if (sessionState.planningStarted) { throw std::runtime_error("Registry arrived after planning started"); }
+            if (sessionState.planningReady) { throw std::logic_error("Cannot merge into a finalized registry"); }
+
             if (sessionState.globalRegistry == nullptr) { sessionState.globalRegistry = std::make_shared<StateTree>(sessionId, topo); }
             auto&       global   = *sessionState.globalRegistry;
             auto const& incoming = *registry;
@@ -903,7 +898,6 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
             {
                 throw std::runtime_error("Cannot merge state registries from incompatible sessions or topologies");
             }
-            if (global.IsFinalized()) { throw std::logic_error("Cannot merge into a finalized registry"); }
             incoming.WalkNodes([&](StateNode const& supplied) {
                 auto const type = supplied.GetType();
                 if (type == StateNode::Type::Invalid || supplied.handle == StateNode::Handle::Root) { return; }
@@ -986,7 +980,6 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
         asyncTasks.emplace_back(std::async(std::launch::async, [this, globalRegistry] {
             try
             {
-                globalRegistry->FinalizeRegistry();
                 DebugOutputToFile("registry.global.bin",
                                   [&](std::ostream& stream) { StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root); });
                 HandleGlobalRegistry(globalRegistry, {});

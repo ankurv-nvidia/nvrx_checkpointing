@@ -90,8 +90,7 @@ static std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& c
                 shard.handle = 0;
                 local.AddShard(shard);
             }
-            if (local.shards.empty()) { tree->RemoveNode(node.handle); }
-            else
+            // TODO_NOMERGE if (local.shards.empty()) { tree->RemoveNode(node.handle); }
             {
                 tensor = std::move(local);
             }
@@ -99,8 +98,7 @@ static std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& c
         else if (type == StateNode::Type::DynamicSizeBlob)
         {
             auto& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
-            if (!blob.replicas.contains(tree->Topo().rank)) { tree->RemoveNode(node.handle); }
-            else
+            // TODO_NOMERGE if (!blob.replicas.contains(tree->Topo().rank)) { tree->RemoveNode(node.handle); }
             {
                 blob.replicas    = {tree->Topo().rank};
                 blob.handle      = 0;
@@ -110,8 +108,7 @@ static std::unique_ptr<StateTree> BuildPerRankStateTree(CheckpointTestContext& c
         else if (type == StateNode::Type::Scalar)
         {
             auto& scalar = std::get<StateNode::Scalar>(node.data);
-            if (!scalar.replicas.contains(tree->Topo().rank)) { tree->RemoveNode(node.handle); }
-            else
+            // TODO_NOMERGE if (!scalar.replicas.contains(tree->Topo().rank)) { tree->RemoveNode(node.handle); }
             {
                 scalar.replicas = {tree->Topo().rank};
             }

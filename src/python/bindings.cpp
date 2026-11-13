@@ -121,13 +121,12 @@ struct PythonStateTree
 
     void FinalizeRegistry()
     {
+        if (_finalized) { return; }
+        _finalized = true;
         ChainAsyncCall([this] {
-            if (!_snapshotRegistry)
-            {
-                FinalizeStateRegistry(_localRegistry);
-                _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
-                Scan(*_snapshotRegistry);
-            }
+            FinalizeStateRegistry(_localRegistry);
+            _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
+            Scan(*_snapshotRegistry);
         });
     }
 
@@ -198,6 +197,7 @@ struct PythonStateTree
     std::vector<std::vector<char>>                          _blobStorage;
     std::mutex                                              _asyncMutex;
     std::future<void>                                       _async;
+    bool                                                    _finalized{false};
 };
 }    // namespace
 
@@ -205,7 +205,7 @@ StateNode* PythonStateTree::Accessor::AddDictionaryChild(StateNode::Handle paren
 {
     // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree
     if (parent == StateNode::Handle::Invalid) { return nullptr; }
-    if (_registry->IsFinalized())
+    if (_state->_finalized)
     {
         auto const parentPath = _registry->GetNodeId(parent);
         auto const fqn        = parentPath.empty() ? std::string(name) : fmt::format("{}.{}", parentPath, name);
@@ -226,7 +226,7 @@ StateNode* PythonStateTree::Accessor::AddDictionaryChild(StateNode::Handle paren
 
 StateNode* PythonStateTree::Accessor::RegisterStateByFQN(std::string_view fqn, StateNode::Variant data)
 {
-    if (_registry->IsFinalized())
+    if (_state->_finalized)
     {
         auto const handle = _registry->FindNodeByFQN(fqn);
         if (handle == StateNode::Handle::Invalid) { return nullptr; }
@@ -240,7 +240,7 @@ StateNode* PythonStateTree::Accessor::RegisterStateByFQN(std::string_view fqn, S
 StateNode* PythonStateTree::Accessor::RegisterState(StateNode::Handle parent, std::string_view stateName, StateNode::Variant data)
 {
     if (parent == StateNode::Handle::Invalid) { return nullptr; }
-    if (!_registry->IsFinalized())
+    if (!_state->_finalized)
     {
         auto [exists, childHandle] = _registry->FindChildNodeIfExists(parent, stateName);
         if (exists)

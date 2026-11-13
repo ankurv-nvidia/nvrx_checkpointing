@@ -173,7 +173,6 @@ struct StateSerDes
 
     static StateTree& Read(std::istream& istrm, StateTree& tree LFTBND)
     {
-        tree.AssertMutable_();
         auto const magic   = serdes::ReadTrivial<uint32_t>(istrm);
         auto const version = serdes::ReadTrivial<uint32_t>(istrm);
         if (magic != WireMagic || version != WireVersion) { throw std::runtime_error("Unsupported state registry wire format"); }

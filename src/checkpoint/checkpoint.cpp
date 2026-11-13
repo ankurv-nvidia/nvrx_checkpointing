@@ -287,7 +287,6 @@ struct CheckpointWriter
             {
                 throw std::runtime_error("Snapshot plan does not match the requesting session and rank");
             }
-            snapshotRegistry->FinalizeRegistry();
             ostr.str({});
             serdes::WriteTrivial<uint64_t>(ostr, snapshotRegistry->GetTotalSnapshotStateSizeInBytes());
             serdes::WriteTrivial<int32_t>(ostr, numa);
@@ -660,10 +659,7 @@ void WaitForCheckpointSave(StateTree const& snapshotRegistry)
 }
 
 void FinalizeStateRegistry(StateTree& localRegistry)
-{
-    if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
-    CheckpointWriter::SendStateRegistry(localRegistry);
-}
+{ CheckpointWriter::SendStateRegistry(localRegistry); }
 
 // For now, we don't have any deferred tensors to save, so this is a no-op. In the future, we can add logic here to save any remaining
 // tensors that were deferred during registration.
