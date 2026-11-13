@@ -210,6 +210,7 @@ _PRETRAIN_ENV_NAMES = {
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
     "NATIVE_CKPT_SERVER_CORE_DUMP",
     "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS",
+    "NATIVE_CKPT_SERVER_INPROC",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
     "NCCL_NET",
@@ -237,6 +238,8 @@ _PRETRAIN_ENV_NAMES = {
     *_MEGATRON_OTEL_ENV_DEFAULTS,
     "MEGATRON_OTEL_RUN_ID",
 }
+# Native training hosts its node's checkpoint daemon unless the launcher exports 0.
+_INPROC_SERVER = os.environ.get("NATIVE_CKPT_SERVER_INPROC", "1") != "0"
 _ARGUMENTS_RE = re.compile(
     r"-{24} arguments -{24}.*?-{20} end of arguments -{21}",
     re.DOTALL,
@@ -2851,6 +2854,12 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         else:
             os.environ.pop("NATIVE_CKPT_OTEL_FILE", None)
             env.pop("NATIVE_CKPT_OTEL_FILE", None)
+        # Other providers keep the standalone daemon as their telemetry collector.
+        if _INPROC_SERVER and provider == "native" and flavors.policy.manages_native_server:
+            os.environ["NATIVE_CKPT_SERVER_INPROC"] = env["NATIVE_CKPT_SERVER_INPROC"] = "1"
+        else:
+            os.environ.pop("NATIVE_CKPT_SERVER_INPROC", None)
+            env.pop("NATIVE_CKPT_SERVER_INPROC", None)
         otel_reporting = flavors.policy.otel_reporting and (
             bool(env.get("NATIVE_CKPT_OTEL_FILE")) or megatron_otel_enabled
         )
@@ -4123,7 +4132,7 @@ _ENV_SCOPES = {
     "CI_DIR": "r", "DOCKER_IMAGE_BASE": "r", "LD_LIBRARY_PATH": "r", "PATH": "r",
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
-    "NATIVE_CKPT_SERVER_CORE_DUMP": "rw", "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS": "rw",
+    "NATIVE_CKPT_SERVER_CORE_DUMP": "rw", "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS": "rw", "NATIVE_CKPT_SERVER_INPROC": "rw",
     "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
     "MEGATRON_OTEL_RUN_ID": "rw",
     **dict.fromkeys(_MEGATRON_OTEL_ENV_DEFAULTS, "rw"),
