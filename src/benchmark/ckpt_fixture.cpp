@@ -428,9 +428,10 @@ void SaveCheckpointAndValidate(StateTree& tree, std::filesystem::path const& ckp
 
 void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree)
 {
-    std::vector<std::vector<char>> blobStorage;
-    FillSnapshotRegistry(tree, *ctx.globalRegistry, blobStorage);
     FinalizeStateRegistry(tree);
+    auto                           snapshotRegistry = GetSnapshotRegistry(tree);
+    std::vector<std::vector<char>> blobStorage;
+    FillSnapshotRegistry(*snapshotRegistry, *ctx.globalRegistry, blobStorage);
     while (!ctx.stopRequested.load(std::memory_order_acquire))
     {
         FixtureFunc           func{nullptr};
@@ -449,7 +450,7 @@ void RunCheckpointClient(CheckpointTestContext& ctx, StateTree& tree)
             std::exception_ptr workerExc;
             try
             {
-                func(tree, ckptDir);
+                func(*snapshotRegistry, ckptDir);
             } catch (...) { workerExc = std::current_exception(); }
             {
                 std::unique_lock<std::mutex> lock(ctx.mutex);

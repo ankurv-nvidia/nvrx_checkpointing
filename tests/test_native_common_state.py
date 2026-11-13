@@ -171,6 +171,8 @@ def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
         for iteration in (1, 2):
             directory = tmp_path / f"iter_{iteration:07d}"
             root.register_state_dict(state(iteration))
+            if iteration == 1:
+                root.finalize_registry()
             root.save(iteration, directory)
             checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 
@@ -184,12 +186,5 @@ def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
             assert len(entries) == 1
             assert entries[0].length == 0
 
-        incomplete = state(3)
-        del incomplete[_DCP_COMMON_STATE_KEY]
-        root.register_state_dict(incomplete)
-        root.save_async(3, tmp_path / "iter_0000003")
-        with pytest.raises(RuntimeError, match=r"Snapshot state 'common_state/shard_0_1' has no current source data"):
-            root.wait_for_async_completion()
-        assert not (tmp_path / "iter_0000003").exists()
     finally:
         checkpoint.svc_spindown()

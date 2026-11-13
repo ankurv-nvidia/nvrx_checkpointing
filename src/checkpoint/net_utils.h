@@ -80,3 +80,13 @@ inline auto ResolveEndpoint(boost::asio::io_context& ioc, std::string_view const
     req.target(target);
     return req;
 }
+
+template <typename TStream> void TryCleanShutdown(TStream& stream)
+{
+    boost::system::error_code ec;
+    ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+    if (ec && ec != boost::system::errc::not_connected)
+    {    //
+        ERR("Shutdown Error: {}", ec.what());
+    }
+}

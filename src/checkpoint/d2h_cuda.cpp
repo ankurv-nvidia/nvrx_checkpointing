@@ -145,10 +145,11 @@ void DeviceContext::CudaUnregisterHostBuffer(void* ptr)
     CUDA_CHECK(cudaHostUnregister(ptr), "Failed to unregister host buffer at {:p}", ptr);    //
 }
 
-int DeviceContext::CudaGetCurrentDeviceNumaNode()
+int DeviceContext::CudaGetDeviceNumaNode(int deviceIndex)
 {
-    int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess) { return -1; }
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) { return -1; }
+    auto const           device = deviceIndex % deviceCount;
     std::array<char, 32> busId{};
     if (cudaDeviceGetPCIBusId(busId.data(), static_cast<int>(busId.size()), device) != cudaSuccess) { return -1; }
     // sysfs PCI paths are lowercase; cudaDeviceGetPCIBusId yields uppercase hex.

@@ -17,7 +17,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 // Server is defined in server.cpp at file scope; Session only holds a pointer to it.
@@ -41,6 +40,10 @@ struct Session
         std::shared_ptr<StateTree>                                            globalRegistry;
         std::shared_ptr<StateTree>                                            dedupedGlobalRegistry;
         std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> localRegistryForRank;
+        std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<StateTree>> snapshotRegistryForRank;
+        bool                                                                  planningStarted{false};
+        bool                                                                  planningReady{false};
+        std::string                                                           planningFailure;
     };
 
     struct Snapshot
@@ -73,7 +76,6 @@ struct Session
     // Session State variables
     RegistryState                             sessionState;
     std::unordered_set<checkpoint::ipc::Rank> receivedFrom;    // Ranks from which data has been received.
-    uint64_t                                  largestSnapshotSize{0};
 
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
@@ -90,21 +92,21 @@ struct Session
     void Handle(checkpoint::ipc::Message::FinalizeSnapshot const& hdr, std::span<char const> buf);
     void Handle(checkpoint::ipc::Message::FinalizeSession const& hdr, std::span<char const> buf);
 
-    void   HandleLocalStateRegistry(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> const& registry);
+    void HandleLocalStateRegistry(checkpoint::ipc::Rank recvRank, std::shared_ptr<StateTree> const& registry);
+    void HandleGlobalRegistry(std::shared_ptr<StateTree> registry, std::string failure);
+
     bool   IsCoordinatorPeer() const { return PeerIndex() == 0; }
     size_t PeerIndex() const { return static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer; }
 
-    void HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry);
-
+    void RelayGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
     void RelayWriteCkptCompleteToPeers(checkpoint::ipc::SnapshotId snapshotId,
                                        std::string_view const&     msg,
                                        size_t                      startPeerIndex,
                                        size_t                      endPeerIndex) const;
 
-    void RelayGlobalRegistryToPeers(std::string_view const& registry, size_t startPeerIndex, size_t endPeerIndex) const;
-
     size_t ExpectedWriteCompletions() const
     { return IsCoordinatorPeer() ? static_cast<size_t>(topo.worldSize) : static_cast<size_t>(topo.ranksPerPeer); }
+
     bool AllSnapshotsComplete() const
     {
         std::scoped_lock lock(mutex);
@@ -115,46 +117,14 @@ struct Session
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
 
     private:
-    std::shared_ptr<StateTree> GetLocalRegistry_(checkpoint::ipc::Rank rank);
-    Snapshot&                  GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
-    Snapshot&                  GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;
+    Snapshot& GetSnapshot_(std::scoped_lock<std::mutex> const& lock, checkpoint::ipc::SnapshotId snapshotId) LFTBND;
 
     void AsyncWorkReceiveLocalStateRegistry_(checkpoint::ipc::Rank const& rank);
     void AsyncWorkFinalizeSnapshot_(checkpoint::ipc::Message::FinalizeSnapshot const& hdr) noexcept;
 
-    void SendLocalShardedStateRegistryToPeer_(checkpoint::ipc::Rank rank, std::string const& peer);
-    void SendLocalShardedStateRegistryToPeerWithRetries_(checkpoint::ipc::Rank rank, std::string const& peer);
-
     void BroadcastGlobalRegistryToPeers_(StateTree const& globalRegistry) const;
     void BroadcastWriteCkptCompleteToPeers_(Snapshot const& snapshot) const;
 
-    static void DebugOutputToFile(std::string_view fileName, std::function<void(std::ostream&)> const& write);
-
     friend struct Server;
-};
-
-struct WaitingForRanks
-{
-    std::unordered_set<Rank> const& receivedFrom;    // NOLINT
-    Rank                            begin;
-    Rank                            end;
-};
-
-template <> struct fmt::formatter<WaitingForRanks> : fmt::formatter<std::string_view>
-{
-    auto format(WaitingForRanks const& wfr, fmt::format_context& ctx) const    // NOLINT
-    {
-        static constexpr size_t MaxWaitingForVerbose = 10;
-
-        auto needed = static_cast<uint32_t>(wfr.end) - static_cast<uint32_t>(wfr.begin) - wfr.receivedFrom.size();
-
-        if (needed > MaxWaitingForVerbose) { return format_to(ctx.out(), "waitingFor=[{} ranks]", needed); }
-
-        std::vector<Rank> waitingFor;
-        for (auto rank = static_cast<uint32_t>(wfr.begin); rank < static_cast<uint32_t>(wfr.end); ++rank)
-        {
-            if (!wfr.receivedFrom.contains(Rank{rank})) { waitingFor.push_back(Rank{rank}); }
-        }
-        return format_to(ctx.out(), "{}", fmt::format("waitingFor=[{}]", fmt::join(waitingFor, ",")));
-    }
 };

@@ -3,7 +3,7 @@
 // At large training scale (thousands of nodes) every non-coordinator node's
 // checkpoint server opens a *fresh* TCP connection to the coordinator (peers[0],
 // "node:0") for each notify/data message — snapshotcomplete, writeckptcomplete,
-// shardedstateregistry. node:0 services those with a single accept coroutine that
+// localstateregistry. node:0 services those with a single accept coroutine that
 // runs each request handler synchronously before accepting the next connection, so
 // accepts are serialized and pending connections queue in the kernel listen backlog
 // (SOMAXCONN). When the offered connection rate outruns the serial drain and the
@@ -79,7 +79,7 @@ enum class Endpoint : uint8_t
 {
     // GET /api/ping — cheapest handler; isolates the accept/backlog scaling axis.
     Ping,
-    // POST /api/peer/shardedstateregistry/{sess}/{rank} with an empty body — the
+    // POST /api/peer/localstateregistry/{sess}/{rank} with an empty body — the
     // real "send data" path (header + body read + pending-map lock). Needs no live
     // session: an unknown session parks the (empty) fragment list in pending data.
     ShardedState,
@@ -431,7 +431,7 @@ try
     cfg.endpoint       = (endpointStr == "shardedstate") ? Endpoint::ShardedState : Endpoint::Ping;
     cfg.hostHeader     = fmt::format("{}:{}", cfg.host, cfg.port);
     // sessionId=0, rank=0: an unknown session parks the empty fragment in pending data.
-    cfg.target = "/api/peer/shardedstateregistry/0/0";
+    cfg.target = "/api/peer/localstateregistry/0/0";
 
     RaiseFdLimit();
     rlimit rl{};
