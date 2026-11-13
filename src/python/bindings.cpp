@@ -156,16 +156,24 @@ struct PythonStateTree
                 FinalizeStateRegistry(_localRegistry);
                 _snapshotRegistry = GetSnapshotRegistry(_localRegistry);
                 Scan(*_snapshotRegistry, _dictToScan);
+                ClearSnapshotValues(_localRegistry);
+                {
+                    nb::gil_scoped_acquire acquire;
+                    ReleasePythonObjects_();
+                }
             }
         });
     }
 
     void RegisterStateDict(nb::dict stateDict)
     {
-        ChainAsyncCall([this, stateDict = std::move(stateDict)] mutable { Scan(SnapshotRegistry(), stateDict); });
+        ChainAsyncCall([this, stateDict = std::move(stateDict)] mutable {
+            _dictToScan = stateDict;
+            Scan(SnapshotRegistry(), stateDict);
+        });
     }
 
-    void Scan(StateTree& registry, nb::dict stateDict);
+    void Scan(StateTree& registry, nb::dict const& stateDict);
     void SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath);
 
     template <typename TCall> void ChainAsyncCall(TCall&& call)    // NOLINT(cppcoreguidelines-missing-std-forward)
@@ -362,14 +370,8 @@ void PythonStateTree::ReleasePythonObjects_()
     _dictToScan.reset();
 }
 
-void PythonStateTree::Scan(StateTree& registry, nb::dict stateDict)
+void PythonStateTree::Scan(StateTree& registry, nb::dict const& stateDict)
 {
-    ClearSnapshotValues(_localRegistry);
-    {
-        nb::gil_scoped_acquire acquire;
-        ReleasePythonObjects_();
-        _dictToScan = std::move(stateDict);
-    }
     std::unordered_set<PyObject*> visited;
 
     Accessor accessor{&SnapshotRegistry(), this};
