@@ -28,9 +28,17 @@ REQUIRED_PERF_METRICS = frozenset(
 logger = logging.getLogger("native_ci")
 _MIN_SOCKET_RANKS = 4
 _CHECKPOINT_TIMING_SPANS = {
-    "megatron.checkpoint.exposed_save",
-    "megatron.checkpoint.load",
+    "megatron.checkpoint.exposed_save": "save-checkpoint",
+    "megatron.checkpoint.load": "load-checkpoint",
 }
+FINALIZE_SPAN = "nvrx.checkpoint.finalize"
+_FINALIZER_SPANS = frozenset(
+    {
+        "megatron.checkpoint.save.finalize",
+        "megatron.checkpoint.exit_finalize",
+        "nvrx.checkpoint.wait_previous",
+    },
+)
 _ANALYSIS_NAME = "native_ckpt_otel.report.json"
 
 
@@ -89,6 +97,7 @@ def _iter_spans(records: list[tuple[Path, dict]]) -> Iterator[dict]:
                         "name": span.get("name", ""),
                         "trace_id": identity[0],
                         "span_id": identity[1],
+                        "parent_span_id": str(span.get("parentSpanId", "")),
                         "resource": resource,
                         "attributes": _attributes(span),
                         "events": [
@@ -513,28 +522,30 @@ def _checkpoint_timing_report(
     by_checkpoint: dict[tuple[str, int | None], dict[int, list[float]]] = {}
     started: dict[tuple[str, int | None], int] = {}
     run_id = _checkpoint_timing_run_id(spans, path, run_id)
-    for span in spans:
-        name = span["name"]
-        if str(span["resource"].get("nemo.run.id")) != run_id:
-            continue
-        if name not in _CHECKPOINT_TIMING_SPANS:
-            continue
+    run_spans = [span for span in spans if str(span["resource"].get("nemo.run.id")) == run_id]
+    measured = [
+        (label, span["attributes"].get("megatron.iteration"), int(span["resource"]["dl.rank"]), span)
+        for span in run_spans
+        if (label := _CHECKPOINT_TIMING_SPANS.get(span["name"])) is not None
+    ]
+    measured += [
+        ("finalize-checkpoint", iteration, rank, finalizer)
+        for iteration, rank, finalizer in completed_finalize_calls(run_spans)
+        if finalizer["end_time_unix_nano"] > finalizer["start_time_unix_nano"]
+    ]
+    for label, iteration, rank, span in measured:
         start, end = span["start_time_unix_nano"], span["end_time_unix_nano"]
         if end <= start:
-            raise RuntimeError(f"checkpoint timing span {name} has invalid timestamps in {path}")
-        rank = int(span["resource"]["dl.rank"])
-        iteration = span["attributes"].get("megatron.iteration")
-        key = name, int(iteration) if iteration is not None else None
+            raise RuntimeError(f"checkpoint timing span {span['name']} has invalid timestamps in {path}")
+        key = label, int(iteration) if iteration is not None else None
         by_checkpoint.setdefault(key, {}).setdefault(rank, []).append((end - start) / 1e6)
         started[key] = min(started.get(key, start), start)
-    if not any(name == "megatron.checkpoint.exposed_save" for name, _iteration in by_checkpoint):
+    if not any(label == "save-checkpoint" for label, _iteration in by_checkpoint):
         raise RuntimeError(f"no megatron.checkpoint.exposed_save spans found for run {run_id!r} in {path}")
     timings = []
-    for (name, iteration), by_rank in sorted(by_checkpoint.items(), key=lambda item: started[item[0]]):
+    for (kind, iteration), by_rank in sorted(by_checkpoint.items(), key=lambda item: started[item[0]]):
         values = [statistics.median(samples) for samples in by_rank.values()]
-        label = "load-checkpoint" if name.endswith(".load") else "save-checkpoint"
-        if iteration is not None:
-            label += f" iteration {iteration}"
+        label = kind if iteration is None else f"{kind} iteration {iteration}"
         timings.append(
             {
                 "label": label,
@@ -657,12 +668,15 @@ def native_spans_valid(samples: list[dict]) -> bool:
     return not invalid and not invalid_timestamps
 
 
+_FinalizerMismatches = dict[tuple[tuple[int, ...], tuple[int, ...]], list[int]]
+
+
 def _match_checkpoint_finalizers(
     saves: list[tuple[int, int | None, dict]],
-    finalizers: dict[int, list[tuple[int, list[int]]]],
-) -> dict[int, int]:
-    finalized: dict[int, int] = {}
-    mismatches: dict[tuple[tuple[int, ...], tuple[int, ...]], list[int]] = {}
+    finalizers: dict[int, list[tuple[int, list[int], dict]]],
+) -> tuple[dict[int, dict], _FinalizerMismatches]:
+    finalized: dict[int, dict] = {}
+    mismatches: _FinalizerMismatches = {}
     for rank in sorted({rank for rank, _call_idx, _span in saves}):
         pending = [
             (position, call_idx, span["start_time_unix_nano"])
@@ -672,15 +686,15 @@ def _match_checkpoint_finalizers(
         expected = [int(call_idx) for _position, call_idx, _start in pending if call_idx is not None]
         if len(set(expected)) != len(expected):
             raise RuntimeError(f"Megatron OTLP save spans have duplicate nvrx.call_idx values for rank={rank}")
-        completions = sorted(finalizers.get(rank, []))
-        advertised = [(call_idx, end) for end, indices in completions for call_idx in indices]
+        completions = sorted(finalizers.get(rank, []), key=lambda item: item[:2])
+        advertised = [(call_idx, finalizer) for _end, indices, finalizer in completions for call_idx in indices]
         if not advertised and not expected:
             continue
         if len(expected) == len(pending) and len(advertised) == len(pending) and {
-            call_idx for call_idx, _end in advertised
+            call_idx for call_idx, _finalizer in advertised
         } == set(expected):
-            end_by_call_idx = dict(advertised)
-            finalized.update({position: end_by_call_idx[call_idx] for position, call_idx, _start in pending})
+            finalizer_by_call_idx = dict(advertised)
+            finalized.update({position: finalizer_by_call_idx[call_idx] for position, call_idx, _start in pending})
             continue
         if not advertised:
             raise RuntimeError(f"Megatron OTLP save span has no finalizer for rank={rank}")
@@ -689,54 +703,81 @@ def _match_checkpoint_finalizers(
                 f"Megatron OTLP finalizer count mismatch for rank={rank}: expected {len(pending)}, found {len(advertised)}",
             )
         if expected:
-            key = tuple(expected), tuple(call_idx for call_idx, _end in advertised)
+            key = tuple(expected), tuple(call_idx for call_idx, _finalizer in advertised)
             mismatches.setdefault(key, []).append(rank)
-        for (position, _call_idx, _start), (_advertised_idx, end) in zip(
+        for (position, _call_idx, _start), (_advertised_idx, finalizer) in zip(
             sorted(pending, key=lambda item: item[2]),
-            sorted(advertised, key=lambda item: item[1]),
+            sorted(advertised, key=lambda item: item[1]["end_time_unix_nano"]),
         ):
-            finalized[position] = end
-    for (expected, found), ranks in mismatches.items():
-        rendered_ranks = f"{ranks[0]}-{ranks[-1]} ({len(ranks)} total)"
-        logger.warning(
-            f"[slurm_job:perf] WARNING Megatron OTLP finalizer call indices mismatch for ranks={rendered_ranks}; "
-            f"expected {list(expected)}, found {list(found)}; pairing in FIFO order",
-        )
-    return finalized
+            finalized[position] = finalizer
+    return finalized, mismatches
 
 
-def checkpoint_durability_ms(spans: list[dict]) -> tuple[list[float], list[int]]:
+def _checkpoint_finalizers(
+    spans: list[dict],
+) -> tuple[list[tuple[int, int | None, dict]], dict[int, dict], _FinalizerMismatches]:
+    """Pair each Megatron save span with its finalizer span by call index, or in save order when indices disagree."""
     saves: list[tuple[int, int | None, dict]] = []
-    finalizers: dict[int, list[tuple[int, list[int]]]] = {}
+    finalizers: dict[int, list[tuple[int, list[int], dict]]] = {}
     for span in spans:
         rank = int(span["resource"].get("dl.rank", -1))
         if span["name"] == "megatron.checkpoint.save":
             call_idx = span["attributes"].get("nvrx.call_idx")
             saves.append((rank, int(call_idx) if call_idx is not None else None, span))
             continue
-        if span["name"] not in {
-            "megatron.checkpoint.save.finalize",
-            "megatron.checkpoint.exit_finalize",
-            "nvrx.checkpoint.wait_previous",
-        }:
+        if span["name"] not in _FINALIZER_SPANS:
             continue
         indices = span["attributes"].get("nvrx.call_idx", [])
         if not isinstance(indices, list):
             indices = [indices]
         if indices:
             finalizers.setdefault(rank, []).append(
-                (span["end_time_unix_nano"], [int(index) for index in indices]),
+                (span["end_time_unix_nano"], [int(index) for index in indices], span),
             )
-    finalized = _match_checkpoint_finalizers(saves, finalizers)
+    return saves, *_match_checkpoint_finalizers(saves, finalizers)
+
+
+def checkpoint_durability_ms(spans: list[dict]) -> tuple[list[float], list[int]]:
+    saves, finalized, mismatches = _checkpoint_finalizers(spans)
+    for (expected, found), ranks in mismatches.items():
+        rendered_ranks = f"{ranks[0]}-{ranks[-1]} ({len(ranks)} total)"
+        logger.warning(
+            f"[slurm_job:perf] WARNING Megatron OTLP finalizer call indices mismatch for ranks={rendered_ranks}; "
+            f"expected {list(expected)}, found {list(found)}; pairing in FIFO order",
+        )
     elapsed = []
     ranks = []
     for position, (rank, _call_idx, span) in enumerate(saves):
-        end = finalized.get(position, span["end_time_unix_nano"])
+        end = finalized[position]["end_time_unix_nano"] if position in finalized else span["end_time_unix_nano"]
         if end < span["end_time_unix_nano"] or end <= span["start_time_unix_nano"]:
             raise RuntimeError("Megatron OTLP save span has invalid timestamps")
         elapsed.append((end - span["start_time_unix_nano"]) / 1e6)
         ranks.append(rank)
     return elapsed, ranks
+
+
+def _span_key(span: dict, span_id: str) -> tuple[str, str, str]:
+    return str(span["resource"].get("dl.rank")), str(span.get("trace_id", "")), span_id
+
+
+def completed_finalize_calls(spans: list[dict]) -> list[tuple[int, int, dict]]:
+    """Return the iteration, rank, and finalizer span of every finalize call that completed a save."""
+    by_key = {_span_key(span, span["span_id"]): span for span in spans if span.get("span_id")}
+    completed: dict[tuple[int, int], dict] = {}
+    for span in spans:
+        iteration = span["attributes"].get("megatron.iteration")
+        if span["name"] != FINALIZE_SPAN or iteration is None:
+            continue
+        # A native finalize span sits beneath the finalizer call that ran it.
+        parent = by_key.get(_span_key(span, span.get("parent_span_id", "")))
+        if parent is not None and parent["name"] in _FINALIZER_SPANS:
+            completed.setdefault((int(iteration), int(span["resource"].get("dl.rank", -1))), parent)
+    saves, finalized, _mismatches = _checkpoint_finalizers(spans)
+    for position, finalizer in finalized.items():
+        rank, _call_idx, save = saves[position]
+        if (iteration := save["attributes"].get("megatron.iteration")) is not None:
+            completed.setdefault((int(iteration), rank), finalizer)
+    return [(iteration, rank, finalizer) for (iteration, rank), finalizer in completed.items()]
 
 
 def _native_metrics(samples: list[dict], gpus_per_node: int | None) -> dict:

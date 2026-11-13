@@ -91,7 +91,9 @@ OTLP/HTTP protobuf ─────────────── terminal decode
 - Python checkpoint boundary spans use the application's process-global OpenTelemetry
   provider. They are no-ops when `MEGATRON_OTEL_ENABLED` is not `1` or the
   OpenTelemetry Python API is unavailable; otherwise the training job's provider owns
-  sampling, OTLP export, resource attributes, and shutdown.
+  sampling, OTLP export, resource attributes, and shutdown. The native provider
+  publishes each asynchronous save inside an `nvrx.checkpoint.finalize` span that
+  carries `megatron.iteration` and `nvrx.snapshot_id`.
 
 ## Analysis
 
@@ -142,13 +144,28 @@ the collected OTLP data after a run:
   `process.memory` events in one `process_memory_all.svg`: daemon processes use
   blue shades and training processes use red shades. The graph contains host RSS
   only and is generated solely from that OTel JSONL.
-- CI compresses the final OTel JSONL and Perfetto JSON as `.gz` files after all
-  validation and report generation have completed.
+- At the end of every job, CI concatenates each run's collected OTLP records, in run
+  and phase order, into one `<stem>_otel.jsonl` beside the job log and converts it to
+  `<stem>_perfetto.json`, a Chrome trace with one process per run phase and host.
+  Failed jobs merge whatever their phases collected, and incomplete records are
+  dropped with a warning. A merge or conversion error is logged without changing the
+  job's result. JET archives both files with the job's other results in place of the
+  per-phase OTLP copies.
 
 Metrics carrying `dl.rank` retain per-rank medians plus min, median, and max across
 ranks in the JSON report and generated baseline candidate. Checkpoint durability is
 paired and summarized independently for every Megatron exporter rank. Coordinator-only
 durability has no rank aggregation.
+
+After the reports, the epilog logs each phase's checkpoint timings as min, max, and
+median milliseconds across ranks: every load, every exposed save, and, for each
+asynchronous save, the finalize call that completed it
+(`finalize-checkpoint iteration N`). That finalizer is the Megatron
+`megatron.checkpoint.save.finalize` or `megatron.checkpoint.exit_finalize` span, or
+the native provider's `nvrx.checkpoint.wait_previous`. Megatron's asynchronous saves
+pair with it through `nvrx.call_idx`, in save order when the indices disagree; native
+saves identify it as the parent of their `nvrx.checkpoint.finalize` span. Synchronous
+saves finalize inside the save span.
 
 OTel takes precedence whenever `NATIVE_CKPT_OTEL_FILE` is nonempty or
 `MEGATRON_OTEL_ENABLED` is enabled. Missing, malformed, mismatched, or incomplete
@@ -166,12 +183,15 @@ The wiring:
   span groups plus `load_checkpoint` cover both checkpoint directions.
 - CI starts one daemon per node before the trainer so startup exports reach the
   pre-topology buffer rather than waiting for checkpoint warmup to launch it.
-- Image preparation installs the pinned Megatron checkout's `otel` extra; the
-  underlying PyTorch base-image tag is unchanged.
+- Image preparation installs the pinned Megatron checkout's `otel` extra, whose
+  nemo-lens instrumentation exports Megatron's spans and metrics; the underlying
+  PyTorch base-image tag is unchanged.
 - `_run_routine` gives each phase or cycle one `native_ckpt_otel.jsonl` beneath
   `ci-results/otel/{cycle_tag}`. Every node-local daemon relays to the rank-zero
   daemon, which writes that single file. Native checkpoint topology selects the route;
-  NVRx runs configure the collector-only daemons explicitly.
+  NVRx runs configure the collector-only daemons explicitly. `MEGATRON_OTEL_RUN_ID`
+  (`nemo.run.id`) names the job, the run (`ref`, `cmp`, or `run`), the phase, and the
+  Slurm and elastic restart counts.
 - Each cycle requires checkpoint save spans, all four Megatron performance metrics,
   and all four resource gauges from every world rank. Native cycles additionally require
   complete `ckpt.save` rank sets for every session and snapshot.

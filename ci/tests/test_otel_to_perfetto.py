@@ -136,6 +136,30 @@ def test_mixed_otlp_jsonl_converts_to_perfetto_events(tmp_path: Path) -> None:
     assert any(event.get("name") == "thread_name" and event["args"]["name"] == "rank 3 · megatron-lm" for event in events)
 
 
+def test_processes_are_titled_by_what_distinguishes_their_run(tmp_path: Path) -> None:
+    source = tmp_path / "job_otel.jsonl"
+    output = tmp_path / "job_perfetto.json"
+    records = []
+    for run_id in ("42-job-ref-phase1-sr0-te0", "42-job-cmp-phase1-sr0-te0"):
+        resource = _resource()
+        resource["attributes"] = [
+            _attribute("nemo.run.id", run_id) if attribute["key"] == "nemo.run.id" else attribute
+            for attribute in resource["attributes"]
+        ]
+        span = {"traceId": run_id, "spanId": "span-1", "name": "checkpoint", "startTimeUnixNano": "1000", "endTimeUnixNano": "2000"}
+        records.append({"resourceSpans": [{"resource": resource, "scopeSpans": [{"spans": [span]}]}]})
+    _write(source, records)
+
+    otel_to_perfetto.convert([source], output)
+    process_names = [
+        event["args"]["name"]
+        for event in json.loads(output.read_text())["traceEvents"]
+        if event.get("name") == "process_name"
+    ]
+
+    assert process_names == ["ref-phase1 · node-1", "cmp-phase1 · node-1"]
+
+
 def test_unknown_jsonl_record_fails_with_location(tmp_path: Path) -> None:
     source = tmp_path / "unknown.jsonl"
     output = tmp_path / "trace.json"
