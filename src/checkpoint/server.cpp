@@ -1549,6 +1549,9 @@ void RunInprocServer(uint16_t nodes)
     std::fflush(stderr);
 }
 
+// Resolved only when an embedding Python interpreter hosts this library.
+extern "C" int Py_AtExit(void (*func)()) __attribute__((weak));
+
 static void WindDownInprocServers()
 {
     INFO("Winding down {} in-process server(s)", ServerSingletons.size());
@@ -1561,10 +1564,13 @@ static void WindDownInprocServers()
 
 namespace
 {
-// Destroyed at normal process exit, after the interpreter has finalized, to drain and stop the hosted servers.
+// Drains and stops the hosted servers at normal process exit, before static destruction when an interpreter embeds them.
 struct InprocHost
 {
-    InprocHost() = default;
+    InprocHost()
+    {
+        if (Py_AtExit != nullptr) { static_cast<void>(Py_AtExit(&WindDownInprocServers)); }
+    }
     ~InprocHost() { WindDownInprocServers(); }
     CLASS_DELETE_COPY_AND_MOVE(InprocHost);
 };
