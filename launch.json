@@ -34,65 +34,6 @@
       ]
     },
     {
-      "name": "py-pretrain-mamba",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
-      "args": [
-        "pretrain-native",
-        "--gpus-per-node=1"
-      ]
-    },
-    {
-      "name": "py-pretrain-mamba-multi",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/ci/scripts/slurm_job.py",
-      "args": [
-        "pretrain-native",
-        "--gpus-per-node=2"
-      ],
-      "subProcess": true
-    },
-    {
-      "name": "lldb-pretrain-mamba",
-      "type": "lldb-dap",
-      "request": "launch",
-      "program": "${command:python.interpreterPath}",
-      "args": [
-        "${workspaceFolder}/ci/scripts/slurm_job.py",
-        "pretrain-native",
-        "--gpus-per-node=1",
-        "--save-iter-zero"
-      ],
-      "cwd": "${command:cmake.getLaunchTargetDirectory}",
-      "env": {
-        //"PATH": "/opt/homebrew/bin:$PATH",
-        "PYTHONPATH": "${workspaceFolder}/../.."
-      },
-      "disableASLR": false
-    },
-    {
-      "name": "lldb-multi-pretrain",
-      "type": "lldb-dap",
-      "request": "launch",
-      "program": "${command:python.interpreterPath}",
-      "args": [
-        "${workspaceFolder}/ci/scripts/slurm_job.py",
-        "pretrain-native",
-        "--gpus-per-node=2"
-      ],
-      "cwd": "${command:cmake.getLaunchTargetDirectory}",
-      "env": {
-        //"PATH": "/opt/homebrew/bin:$PATH",
-        "PYTHONPATH": "${workspaceFolder}/../.."
-      },
-      "disableASLR": false,
-      "initCommands": [
-        "settings set target.process.follow-fork-mode child"
-      ]
-    },
-    {
       "name": "benchmark-1dev-ckpt",
       "type": "lldb-dap",
       "request": "launch",

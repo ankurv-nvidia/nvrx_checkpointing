@@ -1,33 +1,5 @@
 # Using `nvrx_checkpointing` from an sbatch script
 
-For named Ultra v3 runs, background submission, per-run work directories, and
-custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
-
-## Install a wheel from the project's pip index
-
-Successful `main` wheel builds publish x86_64 and aarch64 wheels to the
-project's pip index on GitHub Pages. Install the newest wheel compatible with
-the current machine (Python 3.12 or newer) with:
-
-```bash
-python3 -m pip install --upgrade --pre \
-  --index-url https://ankurv-nvidia.github.io/nvrx_checkpointing/simple/ \
-  nvrx-checkpointing
-```
-
-The aarch64 wheel targets Grace (Neoverse V2) CPUs, as in GB200 and GB300
-systems.
-
-Published versions have the form `0.0.1.dev<RUN_NUMBER>+g<COMMIT_SHORT_SHA>`,
-and the index keeps the newest 50 builds. To reproduce a particular build,
-replace `VERSION` below with its published version:
-
-```bash
-python3 -m pip install \
-  --index-url https://ankurv-nvidia.github.io/nvrx_checkpointing/simple/ \
-  "nvrx-checkpointing==VERSION"
-```
-
 Use the public Megatron-LM checkout pinned by this repository
 (`16251ac1221f4814cd39350def05cefa3c36734a`) and make sure the
 `nvrx_checkpointing` package is installed in the training container on every

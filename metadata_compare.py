@@ -29,7 +29,7 @@ Exit codes (callers decide whether to warn or hard-fail on each):
       already be in metadata/).
   3 — baseline mismatch (reference.metadata.info differs from baseline).
 
-Runs as a subprocess from ``_compare_iters_to_baseline`` in ``slurm_job.py``:
+Runs as a subprocess of the in-srun CI harness:
 the in-srun parent process lacks the ``TORCHINDUCTOR_WORKER_START`` env
 overlay that the training subprocess gets, so importing ``megatron.core``
 (transitively pulled in by ``nvrx_checkpointing.debug``) there trips

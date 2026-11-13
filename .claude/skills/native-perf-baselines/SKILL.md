@@ -1,1 +1,0 @@
-../../../.agents/skills/native-perf-baselines/SKILL.md
