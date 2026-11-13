@@ -37,7 +37,7 @@ page = _page_module()
 
 _INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
 _REGISTRY_MAGIC = 0x32525453
-_REGISTRY_VERSION = 3
+_REGISTRY_VERSION = 4
 _METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
@@ -214,8 +214,15 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
     version = 1
     if count == _REGISTRY_MAGIC:
         (version,) = reader.unpack(_U32)
-        if version not in (_METADATA_VERSION, _REGISTRY_VERSION):
+        if version not in (_METADATA_VERSION, 3, _REGISTRY_VERSION):
             raise ValueError(f"{path}: unsupported registry version {version}")
+        if version >= 4:
+            reader.take(reader.unpack(_U32)[0])
+            for _ in range(reader.unpack(_U32)[0]):
+                reader.take(_U32.size)
+                for _ in range(reader.unpack(_U32)[0]):
+                    reader.take(1 + 8 + _DIM.size)
+                    reader.take(reader.unpack(_U32)[0])
         (count,) = reader.unpack(_U32)
     for _ in range(count):
         start = reader.pos

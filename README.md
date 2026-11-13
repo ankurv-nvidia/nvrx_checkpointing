@@ -116,3 +116,13 @@ log line.
 Comparison harnesses that need a `native`/`nvrx` selector can opt in to
 `nvrx_checkpointing.megatron.provider`; reference runs should not install the
 native integration.
+
+Megatron-FSDP runs use `--use-megatron-fsdp --ckpt-format fsdp_dtensor` with
+the same integration entrypoint. Native saves store tensor shards and
+non-tensor state bundles in their owning ranks' checkpoint files. Load these
+checkpoints through the integration entrypoint too. Its load adapter restores
+the bundled values and delegates tensor loading to PyTorch DCP. Existing
+Megatron `fsdp_dtensor` checkpoints remain loadable through this entrypoint.
+
+The `fsdp_2gpu` CI profile keeps eight experts with EP2 and uses TP1. Select
+it in the CI launcher with `--config fsdp_2gpu --gpus-per-node 2`.

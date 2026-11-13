@@ -125,7 +125,7 @@ jobs:
     uses: ./.github/workflows/jet.yml
     with:
       platform: gb200
-      workloads: '["gb200-native-detr-pico-1x4", "gb200-native-perf-pico-1x4"]'
+      workloads: '["gb200-native-detr-pico-1x4", "gb200-native-perf-pico-1x4", "gb200-native-detr-fsdp-1x4"]'
       wheel-aarch64-artifact-id: ${{ needs.wheel-aarch64.outputs.artifact-id }}
     secrets:
       JET_GITLAB_TOKEN: ${{ secrets.JET_GITLAB_TOKEN }}

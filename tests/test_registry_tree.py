@@ -105,6 +105,15 @@ def _blob_payload(payload: object, version: int) -> bytes:
     return struct.pack(f"<I{len(replicas)}IQQ", len(replicas), *replicas, 0, storage_size)
 
 
+def _metadata_prefix(version: int) -> bytes:
+    if version < 2:
+        return b""
+    prefix = struct.pack("<II", 0x32525453, version)
+    if version >= 4:
+        prefix += struct.pack("<II", 0, 0)
+    return prefix
+
+
 class _Tree:
     """Serializes a hand-built state tree the way the checkpoint daemon does."""
 
@@ -141,8 +150,7 @@ class _Tree:
     def write(self, path: Path, version: int = 1) -> None:
         out = bytearray(struct.pack("<IIIII", self.session_id, self.rank, self.world, 2, 1))
         out += struct.pack("<I", len(_PEER)) + _PEER.encode()
-        if version >= 2:
-            out += struct.pack("<II", 0x32525453, version)
+        out += _metadata_prefix(version)
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
             if version >= 3 and kind == _TENSOR:
@@ -414,7 +422,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("version", [2, 3, 4])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -467,6 +475,27 @@ def test_metadata_counts_local_membership_without_replica_hints(
 
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=4)
-    with pytest.raises(ValueError, match="unsupported registry version 4"):
+    _Tree(0).write(path, version=5)
+    with pytest.raises(ValueError, match="unsupported registry version 5"):
         registry_tree.read_registry(path)
+
+
+def test_capture_descriptions_do_not_change_registry_values(tmp_path: Path) -> None:
+    path = tmp_path / "registry.global.bin"
+    tree = _Tree(0)
+    tree.add("step", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
+    tree.write(path, version=4)
+    original = registry_tree.read_registry(path)
+    data = path.read_bytes()
+    prefix_size = 20 + 4 + len(_PEER) + 8
+    key = b"checkpoint.objects"
+    metadata = struct.pack("<I", len(key)) + key + struct.pack("<III", 1, 0, 2)
+    for name, offsets in ((b"weight", (0,)), (b"step", None)):
+        metadata += struct.pack("<?Q", offsets is not None, 8 if offsets else 1)
+        metadata += _dim(offsets or ()) + struct.pack("<I", len(name)) + name
+    path.write_bytes(data[:prefix_size] + metadata + data[prefix_size + 8 :])
+
+    parsed = registry_tree.read_registry(path)
+
+    assert parsed.entries == original.entries
+    assert parsed.trailing == 0

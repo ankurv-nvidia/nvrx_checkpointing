@@ -11,6 +11,7 @@
 #include <fmt/ranges.h>
 
 #include <mutex>
+#include <optional>
 
 namespace nb = nanobind;
 
@@ -51,6 +52,7 @@ constexpr auto KDtypeIds = std::array<DtypeIdEntry, 13>{
 struct CachedTypes
 {
     nb::object torchTensor;
+    nb::object torchDTensor;
     nb::object torchDtype;
     nb::object torchGenerator;
     nb::object localShardedTensor;
@@ -414,11 +416,16 @@ static CachedTypes const& CachedTypesGet()
     {
         auto torchModule                  = nb::module_::import_("torch");
         auto mappingModule                = nb::module_::import_("nvrx_checkpointing.megatron.mapping");
+        auto torchDTensor                 = nb::object(nb::none());
         auto megatronShardedTensor        = nb::object(nb::none());
         auto megatronShardedTensorFactory = nb::object(nb::none());
         auto megatronShardedObject        = nb::object(nb::none());
         auto importlibUtil                = nb::module_::import_("importlib.util");
         auto findSpec                     = importlibUtil.attr("find_spec");
+        if (nb::cast<bool>(nb::module_::import_("torch.distributed").attr("is_available")()))
+        {
+            torchDTensor = nb::module_::import_("torch.distributed.tensor").attr("DTensor");
+        }
         if (!findSpec("megatron").is_none() && !findSpec("megatron.core").is_none()
             && !findSpec("megatron.core.dist_checkpointing").is_none() && !findSpec("megatron.core.dist_checkpointing.mapping").is_none())
         {
@@ -429,6 +436,7 @@ static CachedTypes const& CachedTypesGet()
         }
         Types = new CachedTypes{
             .torchTensor                  = torchModule.attr("Tensor"),
+            .torchDTensor                 = std::move(torchDTensor),
             .torchDtype                   = torchModule.attr("dtype"),
             .torchGenerator               = torchModule.attr("Generator"),
             .localShardedTensor           = mappingModule.attr("ShardedTensor"),
@@ -444,6 +452,11 @@ static CachedTypes const& CachedTypesGet()
 
 static bool IsTorchTensor(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchTensor); }
+static bool IsTorchDTensor(nb::handle obj)
+{
+    auto const& type = CachedTypesGet().torchDTensor;
+    return !type.is_none() && nb::isinstance(obj, type);
+}
 static bool IsTorchDtype(nb::handle obj)
 { return nb::isinstance(obj, CachedTypesGet().torchDtype); }
 static bool IsTorchGenerator(nb::handle obj)
@@ -570,6 +583,56 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
     {
         throw std::runtime_error(fmt::format(
             "Tensor {} size mismatch: dimensions imply {} bytes, tensor storage implies {}", name, logicalBytes, state.shard.storageSize));
+    }
+    state.shard.AssertShardIsValid(state.meta.fulldim);
+    state.meta.AddShard(state.shard);
+    return state;
+}
+
+static std::optional<TensorState> TorchDTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
+{
+    if (value.attr("device_mesh").attr("get_coordinate")().is_none()) { return std::nullopt; }
+    for (auto const& placement : nb::cast<nb::tuple>(value.attr("placements")))
+    {
+        if (nb::cast<bool>(placement.attr("is_partial")())) { throw std::runtime_error("DTensor with a partial placement"); }
+    }
+    auto const chunks = nb::cast<nb::list>(value.attr("__create_chunk_list__")());
+    if (chunks.size() != 1) { throw std::runtime_error(fmt::format("DTensor {} has {} local chunks, expected one", name, chunks.size())); }
+    auto const offsets     = nb::cast<nb::tuple>(chunks[0].attr("offsets"));
+    auto const sizes       = nb::cast<nb::tuple>(chunks[0].attr("sizes"));
+    auto const globalShape = nb::cast<nb::tuple>(value.attr("shape"));
+    if (globalShape.size() > Tensor::MaxDims || offsets.size() != globalShape.size() || sizes.size() != globalShape.size())
+    {
+        throw std::runtime_error(fmt::format("DTensor {} chunk dimensions do not match its global shape", name));
+    }
+    if (std::ranges::any_of(sizes, [](auto const& size) { return nb::cast<uint64_t>(size) == 0; })) { return std::nullopt; }
+
+    auto state = TensorStorageState(topo, name, value.attr("_local_tensor"));
+    if (globalShape.empty())
+    {
+        state.meta.fulldim.push_back(1);
+        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
+    }
+    uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
+    for (size_t axis = 0; axis < globalShape.size(); ++axis)
+    {
+        auto const extent = nb::cast<uint64_t>(globalShape[axis]);
+        auto const begin  = nb::cast<uint64_t>(offsets[axis]);
+        auto const size   = nb::cast<uint64_t>(sizes[axis]);
+        if (begin > extent || size > extent - begin)
+        {
+            throw std::runtime_error(fmt::format("DTensor {} chunk exceeds its global shape on axis {}", name, axis));
+        }
+        state.meta.fulldim.push_back(extent);
+        state.shard.sharddim.push_back(Tensor::Range{.begin = begin, .end = begin + size});
+        logicalBytes *= size;
+    }
+    if (!state.header && state.shard.storageSize != logicalBytes)
+    {
+        throw std::runtime_error(fmt::format("DTensor {} size mismatch: chunk implies {} bytes, local tensor storage implies {}",
+                                             name,
+                                             logicalBytes,
+                                             state.shard.storageSize));
     }
     state.shard.AssertShardIsValid(state.meta.fulldim);
     state.meta.AddShard(state.shard);
@@ -754,6 +817,14 @@ static TensorState ShardedTensorState(RankTopology const& topo, nb::str& name, n
     return {.meta = ds4tensor, .shard = shard, .owner = std::move(owner), .header = std::move(header)};
 }
 
+static std::vector<char> TorchSaveBlob(nb::handle value)
+{
+    auto buffer = nb::module_::import_("io").attr("BytesIO")();
+    nb::module_::import_("torch").attr("save")(value, buffer);
+    auto const raw = nb::cast<nb::bytes>(buffer.attr("getvalue")());
+    return {raw.c_str(), raw.c_str() + raw.size()};
+}
+
 static std::vector<char> ShardedObjectBlob(nb::handle value)
 {
     static constexpr char const* PreparedBlobAttr = "_nvrx_serialized_blob";
@@ -765,14 +836,9 @@ static std::vector<char> ShardedObjectBlob(nb::handle value)
         return {raw.c_str(), raw.c_str() + raw.size()};
     }
 
-    nb::object io    = nb::module_::import_("io");
-    nb::object torch = nb::module_::import_("torch");
-    nb::object buf   = io.attr("BytesIO")();
-    nb::list   one;
+    nb::list one;
     one.append(value.attr("data"));
-    torch.attr("save")(one, buf);
-    auto const raw = nb::cast<nb::bytes>(buf.attr("getvalue")());
-    return {raw.c_str(), raw.c_str() + raw.size()};
+    return TorchSaveBlob(one);
 }
 
 static void RegisterTensorState(PyStateDictAccessor&                       scan,
@@ -918,8 +984,21 @@ bool TryRegisterTorchStateDictList(PyStateDictAccessor& scan, StateNode::Handle 
 
 bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nb::str const& key, nb::handle val)
 {
+    if (IsTorchDTensor(val))
+    {
+        if (auto tensorState = TorchDTensorState(scan.GetRankTopo(), StrView(key), val))
+        {
+            RegisterTensorState(scan, node, StrView(key), tensorState->meta, tensorState->owner, std::move(tensorState->header));
+        }
+        return true;
+    }
     if (IsTorchTensor(val))
     {
+        if (scan.HasCommonStateBundle() && nb::cast<int64_t>(val.attr("numel")()) == 0)
+        {
+            scan.RegisterState(node, StrView(key), TorchSaveBlob(val.attr("cpu")()));
+            return true;
+        }
         auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
         RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;

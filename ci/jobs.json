@@ -43,6 +43,17 @@
           ]
         },
         {
+          "config": "fsdp",
+          "nodes": 1,
+          "pipeline_suite": "default",
+          "jobs": [
+            [
+              "native",
+              "detr"
+            ]
+          ]
+        },
+        {
           "config": "nano3",
           "nodes": 8,
           "pipeline_suite": "main-branch-runs",

@@ -1,0 +1,13 @@
+# A one-node GPT-MoE regression covers Megatron-FSDP checkpointing.
+inherits: gpt_moe
+
+use-megatron-fsdp: true
+data-parallel-sharding-strategy: optim_grads_params
+ckpt-format: fsdp_dtensor
+
+# Experts use unquantized parameters and unfused gradient accumulation.
+expert-tensor-parallel-size: 1
+fp8-format: null
+fp8-recipe: null
+fp8-param-gather: false
+no-gradient-accumulation-fusion: true

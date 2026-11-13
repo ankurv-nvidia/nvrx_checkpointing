@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import shutil
 import sys
 import threading
@@ -26,8 +27,7 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
-@pytest.fixture
-def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
+def _megatron_stubs() -> dict[str, ModuleType | None]:
     state_dict_utils = _module("megatron.core.dist_checkpointing.state_dict_utils", save_preprocess=lambda state, **_kwargs: (state, {}))
     msc_utils = _module("megatron.core.msc_utils", maybe_msc=SimpleNamespace(open=open))
     rerun = _module("megatron.core.rerun_state_machine", get_rerun_state_machine=SimpleNamespace)
@@ -40,6 +40,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         get_checkpoint_tracker_filename=lambda *_args, **_kwargs: "tracker",
         get_rng_state=lambda *_args, **_kwargs: {},
         maybe_save_dataloader_state=lambda *_args, **_kwargs: None,
+        preprocess_fsdp_dtensor_state_dict=lambda _args, state_dict, _model: state_dict,
     )
     global_vars = _module("megatron.training.global_vars", get_args=SimpleNamespace)
     training_utils = _module("megatron.training.utils", print_rank_0=lambda _message: None)
@@ -57,7 +58,7 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     training.checkpointing = checkpointing
     megatron = _module("megatron", core=core, training=training)
     megatron.__path__ = []
-    modules = {
+    return {
         "megatron": megatron,
         "megatron.core": core,
         "megatron.core.dist_checkpointing.state_dict_utils": state_dict_utils,
@@ -70,16 +71,24 @@ def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
         "megatron.training.utils": training_utils,
         "nemo": None,
     }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
 
+
+def _load_save(set_module: Callable[[str, ModuleType | None], object]) -> ModuleType:
+    for name, module in _megatron_stubs().items():
+        set_module(name, module)
     package_dir = Path(nvrx_megatron.__path__[0])
     spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron._save_test", package_dir / "save.py")
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
+    set_module(spec.name, module)
     spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def save(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
+    module = _load_save(lambda name, value: monkeypatch.setitem(sys.modules, name, value))
     yield module
     module._root = None
     module._pending = None
@@ -566,6 +575,142 @@ def test_finalize_failure_preserves_tracker_and_prevents_success(
     assert previous_payload.read_text() == "last successful checkpoint"
     assert deleted == []
     assert not any("successfully saved checkpoint" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("ckpt_format", "expected"),
+    [
+        ("torch_dist", [("rng", "torch_dist"), ("rerun", "torch_dist"), "register", "finalize_registry", "save_async"]),
+        (
+            "fsdp_dtensor",
+            [("rng", "fsdp_dtensor"), ("rerun", "fsdp_dtensor"), "preprocess", "register_dtensor", "finalize_registry", "save_async"],
+        ),
+    ],
+)
+def test_save_registers_the_state_of_its_format(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ckpt_format: str,
+    expected: list[object],
+) -> None:
+    events: list[object] = []
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        def finalize_registry(self) -> None:
+            events.append("finalize_registry")
+
+        def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
+            events.append("save_async")
+
+        def wait_for_async_completion(self) -> None:
+            pass
+
+    def rerun_state(**kwargs: object) -> dict:
+        events.append(("rerun", kwargs["ckpt_format"]))
+        return {}
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=False, save=tmp_path, ckpt_format=ckpt_format)
+    save_args = save.SaveCheckpointArgs(
+        iteration=10,
+        model=[object()],
+        optimizer=None,
+        opt_param_scheduler=None,
+        num_floating_point_operations_so_far=0,
+    )
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda fmt, *_args, **_kwargs: events.append(("rng", fmt)) or {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=rerun_state))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "preprocess_fsdp_dtensor_state_dict", lambda _args, state, _model: events.append("preprocess") or state)
+    monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000010")
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or Root())
+    monkeypatch.setattr(save, "register_dtensor_state_dict", lambda _state: events.append("register_dtensor") or Root())
+    monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, _iteration: None)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", lambda _session, _iteration: None)
+
+    save._save_checkpoint_impl(save_args, 123)
+
+    assert events == expected
+
+
+def test_dtensor_registration_captures_local_values_without_planning(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    registered: list[dict] = []
+    descriptions: list[list] = []
+
+    def register(state: dict, *, write_items: list, common_state_key: str) -> None:
+        assert common_state_key == save._DCP_COMMON_STATE_KEY
+        registered.append(state)
+        descriptions.append(write_items)
+
+    root = SimpleNamespace(register_state_dict=register)
+    monkeypatch.setattr(save, "_ensure_root", lambda: root)
+
+    def collective(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("registration called a distributed collective")
+
+    monkeypatch.setattr(save.torch.distributed, "gather_object", collective)
+    monkeypatch.setattr(save.torch.distributed, "scatter_object_list", collective)
+    weight = save.torch.ones(2)
+    args = SimpleNamespace(lr=0.1)
+    first_iteration, later_iteration = 7, 123456
+    later_args = SimpleNamespace(lr=0.2)
+    state = {"model": {"weight": weight}, "iteration": first_iteration, "peer": 0, "args": args, "enabled": True, "empty": None}
+
+    save.register_dtensor_state_dict(state)
+    save.register_dtensor_state_dict({**state, "iteration": later_iteration, "args": later_args})
+
+    first, second = registered
+    assert set(first) == set(second) == {"model.weight", "iteration", "peer", "args", "enabled", "empty"}
+    assert first["model.weight"] is weight
+    assert first["iteration"] == first_iteration
+    assert second["iteration"] == later_iteration
+    assert first["args"] != second["args"]
+    assert save.torch.load(io.BytesIO(second["args"]), weights_only=False).lr == later_args.lr
+    assert save.torch.load(io.BytesIO(first["enabled"]), weights_only=False) is True
+    assert save.torch.load(io.BytesIO(first["empty"]), weights_only=False) is None
+    expected_items = [
+        ("model.weight", [0], weight.numel() * weight.element_size()),
+        ("iteration", None, 1),
+        ("peer", None, 1),
+        ("args", None, 1),
+        ("enabled", None, 1),
+        ("empty", None, 1),
+    ]
+    assert descriptions == [expected_items, expected_items]
+
+
+def test_write_descriptions_match_dcp_metadata_without_global_planning(save: ModuleType) -> None:
+    state = {
+        "weight": save.torch.ones(2, 3),
+        "empty": save.torch.empty(0),
+        "scalar_tensor": save.torch.tensor(5),
+        "iteration": 7,
+        "enabled": True,
+        "args": SimpleNamespace(lr=0.1),
+    }
+    planner = save.torch.distributed.checkpoint.DefaultSavePlanner()
+    planner.set_up_planner(state, is_coordinator=True)
+    expected = [
+        (item.index.fqn, list(item.index.offset) if item.index.offset is not None else None, item.tensor_storage_size() or 1)
+        for item in planner.create_local_plan().items
+    ]
+
+    assert save._dtensor_write_items(state) == expected
+
+
+def test_dtensor_registration_accepts_growing_objects(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    registered: list[dict] = []
+    root = SimpleNamespace(register_state_dict=lambda state, **_kwargs: registered.append(state))
+    monkeypatch.setattr(save, "_ensure_root", lambda: root)
+    save.register_dtensor_state_dict({"text": "a"})
+    save.register_dtensor_state_dict({"text": "a" * 8192})
+
+    assert len(registered[1]["text"]) > len(registered[0]["text"])
+    assert save.torch.load(io.BytesIO(registered[1]["text"]), weights_only=False) == "a" * 8192
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ struct StateSerDes
 {
     using Type                            = StateNode::Type;
     static constexpr uint32_t WireMagic   = 0x32525453U;
-    static constexpr uint32_t WireVersion = 3;
+    static constexpr uint32_t WireVersion = 4;
 
     struct DictHeader
     { uint32_t numChild{}; };
@@ -83,13 +83,28 @@ struct StateSerDes
         return topo;
     }
 
-    static std::ostream& Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle)
+    static std::ostream&
+    Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle, bool scrubScalarValues = false)
     {
         serdes::WriteTrivial(ostrm, tree.SessionId());
         WriteTopology(ostrm, tree._topo);
 
         serdes::WriteTrivial(ostrm, WireMagic);
         serdes::WriteTrivial(ostrm, WireVersion);
+        serdes::WriteBlobWithSize<uint32_t>(ostrm, tree.commonStateKey);
+        serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree.checkpointWriteItems.size()));
+        for (auto const& [rank, items] : tree.checkpointWriteItems)
+        {
+            serdes::WriteTrivial(ostrm, rank);
+            serdes::WriteTrivial(ostrm, static_cast<uint32_t>(items.size()));
+            for (auto const& item : items)
+            {
+                serdes::WriteTrivial(ostrm, item.isTensor);
+                serdes::WriteTrivial(ostrm, item.sizeBytes);
+                serdes::WriteTrivial(ostrm, item.offsets);
+                serdes::WriteBlobWithSize<uint32_t>(ostrm, item.fqn);
+            }
+        }
 
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
@@ -115,7 +130,9 @@ struct StateSerDes
             case Type::Scalar:
             {
                 auto const& scalar = std::get<StateNode::Scalar>(node.data);
-                serdes::WriteTrivial(ostrm, static_cast<Primitives64Bit const&>(scalar));
+                auto        value  = static_cast<Primitives64Bit const&>(scalar);
+                if (scrubScalarValues) { Primitives64Bit::UnsignedTraits<uint64_t>::Assign(value, uint64_t{0}); }
+                serdes::WriteTrivial(ostrm, value);
                 WriteRanks(ostrm, scalar.replicas);
             }
             break;
@@ -177,6 +194,30 @@ struct StateSerDes
         auto const magic   = serdes::ReadTrivial<uint32_t>(istrm);
         auto const version = serdes::ReadTrivial<uint32_t>(istrm);
         if (magic != WireMagic || version != WireVersion) { throw std::runtime_error("Unsupported state registry wire format"); }
+        tree.commonStateKey = serdes::ReadBlobWithSize<uint32_t>(istrm);
+        tree.checkpointWriteItems.clear();
+        auto const ranks = serdes::ReadTrivial<uint32_t>(istrm);
+        if (ranks > static_cast<uint32_t>(tree.GlobalWorldSize())) { throw std::runtime_error("Too many checkpoint write-item ranks"); }
+        for (uint32_t i = 0; i < ranks; ++i)
+        {
+            auto const rank = serdes::ReadTrivial<Rank>(istrm);
+            if (rank >= tree.GlobalWorldSize() || tree.checkpointWriteItems.contains(rank))
+            {
+                throw std::runtime_error("Invalid checkpoint write-item rank");
+            }
+            auto&      items = tree.checkpointWriteItems[rank];
+            auto const count = serdes::ReadTrivial<uint32_t>(istrm);
+            for (uint32_t j = 0; j < count; ++j)
+            {
+                CheckpointWriteItem item;
+                item.isTensor  = serdes::ReadTrivial<bool>(istrm);
+                item.sizeBytes = serdes::ReadTrivial<uint64_t>(istrm);
+                item.offsets   = serdes::ReadTrivial<Tensor::Dim>(istrm);
+                item.fqn       = serdes::ReadBlobWithSize<uint32_t>(istrm);
+                if (!istrm || item.fqn.empty()) { throw std::runtime_error("Invalid checkpoint write-item metadata"); }
+                items.push_back(std::move(item));
+            }
+        }
         auto numChild = serdes::ReadTrivial<uint32_t>(istrm);
         tree._nodes.clear();
         tree._nodes.reserve(numChild);

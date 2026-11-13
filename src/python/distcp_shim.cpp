@@ -281,9 +281,75 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
+template <typename TCall> static auto WithCommonState(nb::dict const& values, TCall const& call)
+{
+    size_t totalBytes = 0;
+    for (auto const& [key, value] : values)
+    {
+        static_cast<void>(key);
+        if (nb::isinstance<nb::bytes>(value)) { totalBytes += nb::cast<nb::bytes>(value).size(); }
+    }
+    ByteStorage  storage(totalBytes);
+    RankTopology topo{
+        .rank         = Rank{0},
+        .worldSize    = Rank{1},
+        .ranksPerPeer = 1,
+        .peersPerNode = 1,
+        .peers        = {"localhost"},
+    };
+    StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
+    uint64_t  offset = 0;
+    for (auto const& [key, value] : values)
+    {
+        auto const fqn          = nb::cast<std::string>(key);
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        auto& leaf              = tree.AddChild(parent, leafName);
+        if (nb::isinstance<nb::bytes>(value))
+        {
+            auto const bytes = nb::cast<nb::bytes>(value);
+            if (bytes.size() != 0) { std::memcpy(storage[offset], bytes.c_str(), bytes.size()); }
+            leaf.data = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = offset, .storageSize = bytes.size()};
+            offset += bytes.size();
+        }
+        else
+        {
+            StateNode::Scalar scalar;
+            if (nb::isinstance<nb::int_>(value)) { scalar = StateNode::Scalar{nb::cast<int64_t>(value)}; }
+            else if (nb::isinstance<nb::float_>(value)) { scalar = StateNode::Scalar{nb::cast<double>(value)}; }
+            else
+            {
+                throw std::runtime_error("distcp_shim: common state supports integers, floats, and bytes");
+            }
+            scalar.replicas.insert(Rank{0});
+            leaf.data = std::move(scalar);
+        }
+    }
+    return call(tree, storage);
+}
+
+static nb::bytes CommonStateArchiveImpl(nb::dict const& values)
+{
+    return WithCommonState(values, [](StateTree const& tree, ByteStorage const& storage) {
+        auto const archive = checkpoint::distcp::BuildCommonStateArchive(tree, storage);
+        return nb::bytes(archive.data(), archive.size());
+    });
+}
+
+static void WriteCommonStateImpl(std::string const& outDir, std::string const& commonStateKey, nb::dict const& values)
+{
+    WithCommonState(values, [&](StateTree& tree, ByteStorage const& storage) {
+        tree.commonStateKey = commonStateKey;
+        auto const sizes    = checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{0}, tree, storage);
+        checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, sizes);
+    });
+}
+
 NB_MODULE(_distcp_shim, m)    // NOLINT
 {
     m.doc() = "Single-process shim around distcp::WriteRankShard / WriteMetadata for parity tests.";
+
+    m.def("common_state_archive", &CommonStateArchiveImpl, nb::arg("values"));
+    m.def("write_common_state", &WriteCommonStateImpl, nb::arg("out_dir"), nb::arg("common_state_key"), nb::arg("values"));
 
     m.def("write_rank_shard",
           &WriteRankShardImpl,

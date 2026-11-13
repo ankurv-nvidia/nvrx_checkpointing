@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import pickle
+from argparse import Namespace
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from nvrx_checkpointing import debug
@@ -117,3 +120,68 @@ def test_native_server_blob_claim_uses_exact_archive_bytes(tmp_path: Path, monke
 
     monkeypatch.setattr(debug, "try_ping", lambda: None)
     debug.distcp_trace(checkpoint, extract_tensor_data=False)
+
+
+def test_fsdp_dtensor_objects_are_compared_as_common_state(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "fsdp_dtensor"
+    dcp.save({"model": {"weight": torch.arange(4.0)}, "iteration": 7}, checkpoint_id=str(checkpoint))
+    # Megatron-FSDP records its chunk sizes as tuples.
+    metadata_file = checkpoint / ".metadata"
+    metadata = pickle.loads(metadata_file.read_bytes())  # noqa: S301
+    chunks = metadata.state_dict_metadata["model.weight"].chunks
+    chunks[:] = [dataclasses.replace(chunk, sizes=tuple(chunk.sizes)) for chunk in chunks]
+    metadata_file.write_bytes(pickle.dumps(metadata))
+
+    distcp_trace(checkpoint, extract_tensor_data=False, verify_native_server=False)
+
+    assert (checkpoint / "common_pt_dump.info").read_text().splitlines() == ["iteration=7"]
+    traced = (checkpoint / "reference.metadata.info").read_text()
+    assert "model.weight.chunks.0.md5sum=" in traced
+    assert "iteration" not in traced
+
+
+def test_fsdp_bundle_compares_the_decoded_object_state(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    bundled = tmp_path / "bundled"
+    arguments = Namespace(lr=0.1, iteration=7)
+    weight = torch.arange(4.0)
+    dcp.save(
+        {"model": {"weight": weight}, "args": arguments, "iteration": 7, "optimizer": {"group": {"lr": 0.125}}},
+        checkpoint_id=str(reference),
+    )
+    opaque = io.BytesIO()
+    torch.save(arguments, opaque)
+    dcp.save(
+        {
+            "model": {"weight": weight},
+            _COMMON_KEY: _archive({"args": opaque.getvalue(), "iteration": 7}),
+            f"{_COMMON_KEY}.rank_1": _archive({"optimizer.group.lr": 0.125}),
+        },
+        checkpoint_id=str(bundled),
+    )
+
+    distcp_trace(reference, extract_tensor_data=False, verify_native_server=False)
+    distcp_trace(bundled, extract_tensor_data=False, verify_native_server=False)
+
+    assert (reference / "common_pt_dump.info").read_text() == (bundled / "common_pt_dump.info").read_text()
+    assert compare_reference_metadata(bundled, reference) == 0
+
+
+def test_native_server_bundle_claim_uses_the_physical_archive(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    checkpoint = tmp_path / "checkpoint"
+    dcp.save({_COMMON_KEY: _archive({"iteration": 7})}, checkpoint_id=str(checkpoint))
+    metadata = pickle.loads((checkpoint / ".metadata").read_bytes())  # noqa: S301
+    storage = next(info for index, info in metadata.storage_data.items() if index.fqn == _COMMON_KEY)
+    with (checkpoint / storage.relative_path).open("rb") as stream:
+        stream.seek(storage.offset)
+        raw = stream.read(storage.length)
+    checksum = hashlib.md5(raw).hexdigest()  # noqa: S324
+    manifest = checkpoint / "0.metadata.info"
+    manifest.write_text(f"{_COMMON_KEY}.bytes.md5sum={checksum}")
+    monkeypatch.setattr(debug, "try_ping", lambda: None)
+
+    distcp_trace(checkpoint, extract_tensor_data=False)
+
+    manifest.write_text(f"{_COMMON_KEY}.bytes.md5sum=incorrect")
+    with pytest.raises(ValueError, match="Differences found"):
+        distcp_trace(checkpoint, extract_tensor_data=False)
