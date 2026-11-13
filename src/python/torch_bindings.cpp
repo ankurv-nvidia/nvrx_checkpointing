@@ -10,6 +10,8 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <mutex>
+
 namespace nb = nanobind;
 
 namespace
