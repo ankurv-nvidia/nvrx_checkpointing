@@ -67,10 +67,8 @@ void SvcPing()
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }
-    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
-    {
-        throw std::runtime_error("In-process checkpoint service is not running");
-    }
+    // The hosting rank starts the in-process service when it registers state.
+    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>()) { return; }
 
     try
     {
