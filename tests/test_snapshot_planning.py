@@ -14,6 +14,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -153,6 +154,7 @@ def test_plan_waits_for_registration_and_selects_each_value_once(tmp_path: Path)
     roots = _roots(session_id)
     checkpoint.ping()
     roots[0].register_state_dict(_state(0, 0, 1))
+    roots[0].finalize_registry()
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -166,6 +168,7 @@ def test_plan_waits_for_registration_and_selects_each_value_once(tmp_path: Path)
                 assert response.status == 200
 
             roots[1].register_state_dict(_state(1, 0, 1))
+            roots[1].finalize_registry()
             roots[1].wait_for_async_completion()
             pending.result(timeout=20)
             plans = [_read_plan(session_id, rank, tmp_path) for rank in range(2)]
@@ -218,6 +221,7 @@ def test_fixed_blob_planning_rejects_invalid_global_metadata(
             value = ShardedObject("objects", None, shape, (0,), replica_id=rank + 1)
             vars(value)["_nvrx_serialized_blob"] = b"x" * sizes[rank]
             root.register_state_dict({"objects": value})
+            root.finalize_registry()
         for root in roots:
             with pytest.raises(RuntimeError, match=error):
                 root.wait_for_async_completion()
@@ -234,6 +238,7 @@ def test_rank_with_empty_capture_plan_still_finalizes(tmp_path: Path, *, replica
     try:
         for rank, root in enumerate(roots):
             root.register_state_dict({"weight": source} if rank == 0 or replicated else {})
+            root.finalize_registry()
         for root in roots:
             root.wait_for_async_completion()
         plans = [_entries(_read_plan(session_id, rank, tmp_path)) for rank in range(2)]
@@ -257,6 +262,62 @@ def test_rank_with_empty_capture_plan_still_finalizes(tmp_path: Path, *, replica
         checkpoint.svc_spindown()
 
 
+def test_capture_updates_normalized_dotted_paths(tmp_path: Path) -> None:
+    checkpoint.svc_spindown()
+    session_id = next(_SESSION_IDS)
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+    try:
+        for iteration in (1, 2):
+            directory = tmp_path / f"iter_{iteration:07d}"
+            root.register_state_dict(
+                {
+                    "scalar.value": iteration,
+                    "blob.value": _serialize({"iteration": iteration}),
+                    "model.layer": {"weight": torch.arange(4, dtype=torch.float32) + iteration},
+                },
+            )
+            if iteration == 1:
+                root.finalize_registry()
+            root.save_async(iteration, directory)
+            root.wait_for_async_completion()
+            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+            loaded = {"model": {"layer": {"weight": torch.zeros(4)}}}
+            dcp.load(loaded, checkpoint_id=str(directory))
+            torch.testing.assert_close(loaded["model"]["layer"]["weight"], torch.arange(4, dtype=torch.float32) + iteration)
+            assert _load_object(directory, "blob.value") == {"iteration": iteration}
+
+        root.register_state_dict({"scalar.value": 1.5})
+        with pytest.raises(RuntimeError, match="changed scalar type"):
+            root.wait_for_async_completion()
+    finally:
+        checkpoint.svc_spindown()
+
+
+@pytest.mark.parametrize("container", ["namespace", "list"])
+def test_capture_reads_checkpoint_keys_in_source_only_containers(tmp_path: Path, container: str) -> None:
+    checkpoint.svc_spindown()
+    session_id = next(_SESSION_IDS)
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+    try:
+        for iteration in (1, 2):
+            directory = tmp_path / f"iter_{iteration:07d}"
+            tensor = ShardedTensor.from_rank_offsets("model.weight", torch.arange(4, dtype=torch.float32) + iteration)
+            wrapped = SimpleNamespace(alias=tensor) if container == "namespace" else [{"alias": [tensor]}]
+            root.register_state_dict({"source_only": wrapped})
+            if iteration == 1:
+                root.finalize_registry()
+            root.save_async(iteration, directory)
+            root.wait_for_async_completion()
+            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+
+            loaded = {"model": {"weight": torch.zeros(4)}}
+            dcp.load(loaded, checkpoint_id=str(directory))
+            torch.testing.assert_close(loaded["model"]["weight"], torch.arange(4, dtype=torch.float32) + iteration)
+    finally:
+        checkpoint.svc_spindown()
+
+
 def test_capture_refreshes_only_selected_values_using_checkpoint_keys(tmp_path: Path) -> None:
     checkpoint.svc_spindown()
     session_id = next(_SESSION_IDS)
@@ -264,6 +325,7 @@ def test_capture_refreshes_only_selected_values_using_checkpoint_keys(tmp_path: 
 
     def state(iteration: int) -> dict[str, Any]:
         return {
+            "weight": torch.full((2,), iteration + 10, dtype=torch.float32),
             "source_only": {
                 "renamed": ShardedTensor.from_rank_offsets("model.weight", torch.arange(8, dtype=torch.float32) + iteration),
             },
@@ -274,6 +336,7 @@ def test_capture_refreshes_only_selected_values_using_checkpoint_keys(tmp_path: 
     try:
         for root in roots:
             root.register_state_dict(state(0))
+            root.finalize_registry()
         for root in roots:
             root.wait_for_async_completion()
         plans = [_entries(_read_plan(session_id, rank, tmp_path)) for rank in range(2)]
@@ -289,14 +352,16 @@ def test_capture_refreshes_only_selected_values_using_checkpoint_keys(tmp_path: 
                 if selected is None or not any(shard.ranges == ((index, index + 1),) for shard in selected[1].shards):
                     del supplied[f"object{index}"]
             assert len(supplied) < len(state(1))
+            supplied.setdefault("source_only", {})["weight"] = torch.full((2,), -100.0)
             root.register_state_dict(supplied)
             root.save_async(1, tmp_path)
         for root in roots:
             root.wait_for_async_completion()
         checkpoint.wait_for_ckpt_finalize(session_id, 1)
 
-        loaded = {"model": {"weight": torch.zeros(8, dtype=torch.float32)}}
+        loaded = {"weight": torch.zeros(2), "model": {"weight": torch.zeros(8, dtype=torch.float32)}}
         dcp.load(loaded, checkpoint_id=str(tmp_path))
+        torch.testing.assert_close(loaded["weight"], torch.full((2,), 11.0))
         torch.testing.assert_close(loaded["model"]["weight"], torch.arange(8, dtype=torch.float32) + 1)
         for index in range(2):
             assert _load_object(tmp_path, f"objects/shard_{index}_2") == {"iteration": 1, "part": index}

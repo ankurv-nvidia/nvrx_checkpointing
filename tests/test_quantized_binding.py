@@ -131,6 +131,7 @@ def test_fp8_registration_reads_raw_components(fp8_dtype: object) -> None:
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
     assert root.snapshot_size == (
         _QUANTIZED_HEADER_BYTES + tensor._data.numel() + tensor._scale_inv.numel() * tensor._scale_inv.element_size()
     )
@@ -158,6 +159,7 @@ def test_mxfp8_registration_reads_raw_components_without_gtp_marker(fp8_dtype: o
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     assert root.snapshot_size == (_QUANTIZED_HEADER_BYTES + tensor._rowwise_data.numel() + tensor._rowwise_scale_inv.numel())
 
 
@@ -173,6 +175,7 @@ def test_bare_mxfp8_registration_reads_raw_components(fp8_dtype: object) -> None
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
 
 
 @pytest.mark.parametrize("fp4_dtype", [_FP4DType(), _NumericFP4DType()])
@@ -202,6 +205,7 @@ def test_nvfp4_registration_reads_raw_components(fp4_dtype: object) -> None:
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     assert root.snapshot_size == (
         _QUANTIZED_HEADER_BYTES
         + tensor._rowwise_data.numel()
@@ -226,6 +230,7 @@ def test_bare_nvfp4_registration_reads_raw_components(fp4_dtype: object) -> None
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
 
 
 @pytest.mark.integration
@@ -255,6 +260,7 @@ def test_cpu_quantized_snapshot_dequantizes_during_dcp_write(tmp_path: Path, sto
 
     root = _create_root()
     root.register_state_dict({"weight": tensor})
+    root.finalize_registry()
     checkpoint_dir = tmp_path / storage_type
     try:
         root.save(1, checkpoint_dir)
@@ -315,6 +321,7 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
     }
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     root.wait_for_async_completion()
     registered_build_calls = build_calls
     checkpoint_dir = tmp_path / "nvfp4-shards"
@@ -373,6 +380,7 @@ def test_quantized_sharded_tensor_data_follows_registration_lifecycle() -> None:
     state, first_ref = make_state()
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     del state
     gc.collect()
     assert first_ref() is not None

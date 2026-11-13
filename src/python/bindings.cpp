@@ -374,7 +374,6 @@ void PythonStateTree::Scan(StateTree& registry, nb::dict const& stateDict)
     Accessor accessor{&SnapshotRegistry(), this};
     RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
 }
-}
 
 void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath)
 {

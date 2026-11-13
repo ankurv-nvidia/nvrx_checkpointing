@@ -457,7 +457,10 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             _save_dataloader_state(save_args, args)
         with _checkpoint_span("nvrx.checkpoint.cpp.save_async", iteration):
             with _checkpoint_span("nvrx.checkpoint.register_state_dict", iteration):
+                initialize_registry = _root is None
                 root = register_state_dict(state_dict, iteration)
+                if initialize_registry:
+                    root.finalize_registry()
             root.startedAt = started_at_ns
             root.save_async(iteration, checkpoint_dir)
 

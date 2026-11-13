@@ -171,6 +171,8 @@ def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
         for iteration in (1, 2):
             directory = tmp_path / f"iter_{iteration:07d}"
             root.register_state_dict(state(iteration))
+            if iteration == 1:
+                root.finalize_registry()
             root.save(iteration, directory)
             checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 

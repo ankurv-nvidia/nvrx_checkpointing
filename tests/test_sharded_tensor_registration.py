@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import gc
 import os
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -92,6 +94,72 @@ class _StorageLessQuantizedTensor(torch.Tensor):
         return result
 
 
+def test_concurrent_first_registration_initializes_type_cache(tmp_path: Path) -> None:
+    script = """
+import importlib.util
+import threading
+import time
+
+import torch
+from nvrx_checkpointing import checkpoint
+
+entered = threading.Event()
+second_scan = threading.Event()
+find_spec = importlib.util.find_spec
+initializations = []
+
+
+def paused_find_spec(name, *args, **kwargs):
+    if name == "megatron":
+        initializations.append(threading.get_ident())
+        entered.set()
+        assert second_scan.wait(10), "second registration did not enter its scan"
+        time.sleep(0.05)
+    return find_spec(name, *args, **kwargs)
+
+
+class SecondState(dict):
+    def keys(self):
+        second_scan.set()
+        return super().keys()
+
+
+checkpoint.svc_spindown()
+try:
+    roots = [checkpoint.model_state.create_root(97201, rank, 2, ["localhost"], 2) for rank in range(2)]
+    importlib.util.find_spec = paused_find_spec
+    roots[0].register_state_dict({"weight": torch.arange(4), "dtype": torch.int64})
+    assert entered.wait(10), "first registration did not initialize its type cache"
+    roots[1].register_state_dict(SecondState(weight=torch.arange(4), dtype=torch.int64))
+    for root in roots:
+        root.finalize_registry()
+    for root in roots:
+        root.wait_for_async_completion()
+    assert len(initializations) == 1
+    assert sum(root.snapshot_size for root in roots) == 32
+    for root in roots:
+        root.register_state_dict({"weight": torch.arange(4) + 10, "dtype": torch.int64})
+    for root in roots:
+        root.wait_for_async_completion()
+    assert len(initializations) == 1
+    assert sum(root.snapshot_size for root in roots) == 32
+    print("cold and warm registrations completed", flush=True)
+finally:
+    importlib.util.find_spec = find_spec
+    checkpoint.svc_spindown()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cold and warm registrations completed" in result.stdout
+
+
 def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
     tensors = [
         ShardedTensor.from_rank_offsets(
@@ -109,6 +177,7 @@ def test_register_state_dict_accepts_multiple_two_axis_shards() -> None:
     root = _create_root()
 
     root.register_state_dict({"weight_shards": tensors})
+    root.finalize_registry()
     assert root.snapshot_size == sum(tensor.data.numel() * tensor.data.element_size() for tensor in tensors)
 
 
@@ -183,8 +252,8 @@ def test_register_state_dict_includes_all_tensor_replicas() -> None:
     expected_size = (1 + 2 + 3 * 4 + 8) * 4
     root = _create_root()
     root.register_state_dict(state(0.0))
-    assert root.snapshot_size == expected_size
     root.finalize_registry()
+    assert root.snapshot_size == expected_size
 
     root.register_state_dict(state(1.0))
     assert root.snapshot_size == expected_size
@@ -222,6 +291,7 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
 
     root = _create_root()
     root.register_state_dict(state)
+    root.finalize_registry()
     assert root.snapshot_size == 16
 
     first_materializations = list(_StorageLessQuantizedTensor.dequantized)
@@ -230,7 +300,6 @@ def test_register_state_dict_materializes_storage_less_quantized_tensor() -> Non
     assert first_materializations[-1]() is not None
     assert all(ref() is None for ref in first_materializations[:-1])
 
-    root.finalize_registry()
     fresh_data = _StorageLessQuantizedTensor(torch.arange(8, dtype=torch.bfloat16) + 1)
     root.register_state_dict(
         {"weight": ShardedTensor.from_rank_offsets("weight", fresh_data, (0, 0, 1))},
@@ -251,6 +320,7 @@ def test_register_state_dict_materializes_non_mxfp8_float8_tensor() -> None:
 
     root = _create_root()
     root.register_state_dict({"weight": data})
+    root.finalize_registry()
 
     assert root.snapshot_size == 16
     gc.collect()
@@ -274,6 +344,7 @@ def test_register_state_dict_retains_all_factory_shard_materializations() -> Non
     _StorageLessQuantizedTensor.dequantized.clear()
     root = _create_root()
     root.register_state_dict({"weight": factory(0)})
+    root.finalize_registry()
     assert root.snapshot_size == 16
     initial_materializations = list(_StorageLessQuantizedTensor.dequantized)
     first_materializations = initial_materializations[-2:]
@@ -306,6 +377,7 @@ def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
     root.register_state_dict(
         {"weight": ShardedTensor.from_rank_offsets("weight", data, (0, 0, 1))},
     )
+    root.finalize_registry()
     assert root.snapshot_size == 16
 
     first_materializations = list(_StorageLessQuantizedTensor.dequantized)
@@ -332,8 +404,8 @@ def test_register_state_dict_refreshes_when_the_same_dictionary_is_reused() -> N
     root = _create_root()
     state = {"rng_state": ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))}
     root.register_state_dict(state)
-    assert root.snapshot_size > 0
     root.finalize_registry()
+    assert root.snapshot_size > 0
     state["rng_state"] = ShardedObject("rng_state", {"iteration": 2, "payload": "x" * 4096}, (1,), (0,))
 
     root.register_state_dict(state)
@@ -401,8 +473,8 @@ def test_register_state_dict_refreshes_sharded_tensor_factory_outputs() -> None:
 
     root = _create_root()
     root.register_state_dict({"weight": factory(torch.float32)})
-    assert root.snapshot_size == 4 * 4
     root.finalize_registry()
+    assert root.snapshot_size == 4 * 4
 
     root.register_state_dict({"weight": factory(torch.float64)})
     with pytest.raises(RuntimeError, match=r"changed tensor metadata"):
@@ -425,8 +497,8 @@ def test_state_registration_runs_asynchronously() -> None:
 
     root = _create_root()
     root.register_state_dict({"weight": factory(1)})
-    assert root.snapshot_size == 4 * 4
     root.finalize_registry()
+    assert root.snapshot_size == 4 * 4
     root.register_state_dict({"weight": factory(2)})
     assert root.snapshot_size == 4 * 4
 
@@ -528,14 +600,14 @@ def test_register_state_dict_accepts_float16_optimizer_master_weights() -> None:
     expected_size = (6 + 6 + 2) * 4 + 2 * 8
     root = _create_root()
     root.register_state_dict(_float16_optimizer_state(0.0))
-    assert root.snapshot_size == expected_size
     root.finalize_registry()
+    assert root.snapshot_size == expected_size
 
     root.register_state_dict(_float16_optimizer_state(1.0))
     assert root.snapshot_size == expected_size
 
 
-def test_register_state_dict_accepts_factory_shards_inside_nested_lists() -> None:
+def test_register_state_dict_accepts_factory_shards_inside_nested_lists(tmp_path: Path) -> None:
     fc1_key = "optimizer.state.fp32_param.decoder.mlp.linear_fc1.weight"
     swiglu_halves = [ShardedTensor.from_rank_offsets(fc1_key, torch.arange(4, dtype=torch.float32), (0, half, 2)) for half in range(2)]
     in_proj = ShardedTensorFactory(
@@ -544,11 +616,21 @@ def test_register_state_dict_accepts_factory_shards_inside_nested_lists() -> Non
         build_fn=lambda key, data, *_args: [ShardedTensor.from_rank_offsets(f"{key}.z", data, (0, 0, 1))],
         merge_fn=None,
     )
-    root = _create_root()
+    session_id = next(_SESSION_IDS)
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
 
     root.register_state_dict({"optimizer": {"fp32_from_fp16_params": [[swiglu_halves, in_proj], [{"step": 1}]]}})
+    root.finalize_registry()
 
     assert root.snapshot_size == 3 * 4 * 4
+    root.save_async(1, tmp_path)
+    root.wait_for_async_completion()
+    checkpoint.wait_for_ckpt_finalize(session_id, 1)
+
+    loaded = {fc1_key: torch.zeros(8), f"{in_proj.key}.z": torch.zeros(4)}
+    dcp.load(loaded, checkpoint_id=str(tmp_path))
+    torch.testing.assert_close(loaded[fc1_key], torch.cat([half.data for half in swiglu_halves]))
+    torch.testing.assert_close(loaded[f"{in_proj.key}.z"], in_proj.data)
 
 
 @pytest.mark.parametrize("replica_id", [1, (0, 3, 0)])
@@ -560,6 +642,7 @@ def test_register_state_dict_includes_all_object_shards(replica_id: int | tuple[
     root = _create_root()
 
     root.register_state_dict({"first": first, "nested": {"second": second}})
+    root.finalize_registry()
 
     assert root.snapshot_size == len(b"first") + len(b"second payload")
 
@@ -568,6 +651,7 @@ def test_register_state_dict_includes_all_object_shards(replica_id: int | tuple[
 def test_register_state_dict_accepts_empty_dynamic_blob(value: str | bytes) -> None:
     root = _create_root()
     root.register_state_dict({"value": value})
+    root.finalize_registry()
 
     assert root.snapshot_size == 0
 
@@ -578,8 +662,8 @@ def test_register_state_dict_accepts_empty_dynamic_blob(value: str | bytes) -> N
 def test_register_state_dict_refreshes_dynamic_blob_size(initial: bytes) -> None:
     root = _create_root()
     root.register_state_dict({"message": initial})
-    assert root.snapshot_size == len(initial)
     root.finalize_registry()
+    assert root.snapshot_size == len(initial)
     refreshed = b"a longer serialized value"
 
     root.register_state_dict({"message": refreshed})
@@ -602,6 +686,7 @@ def test_register_load_factory_uses_dotted_checkpoint_key() -> None:
     root = _create_root()
 
     root.register_state_dict({"decoder.layers.0.mixer.conv1d_weight": factory})
+    root.finalize_registry()
 
     assert root.snapshot_size == tensor.numel() * tensor.element_size()
 
@@ -620,6 +705,7 @@ def test_state_registration_accepts_integer_enum_list() -> None:
             },
         },
     )
+    root.finalize_registry()
 
     assert root.snapshot_size == 3 * 8
     with pytest.raises(AttributeError):
@@ -633,8 +719,8 @@ def test_register_state_dict_rejects_blob_size_changes() -> None:
     initial = ShardedObject("rng_state", {"iteration": 1}, (1,), (0,))
     state = {"rng_state": initial}
     root.register_state_dict(state)
-    assert root.snapshot_size > 0
     root.finalize_registry()
+    assert root.snapshot_size > 0
     fresh = ShardedObject("rng_state", {"iteration": 2, "payload": "x" * 4096}, (1,), (0,))
 
     root.register_state_dict({"rng_state": fresh})
@@ -673,8 +759,8 @@ def test_register_state_dict_ignores_unselected_paths(fresh: dict) -> None:
     root = _create_root()
     state = {"known": {"value": 1}}
     root.register_state_dict(state)
-    assert root.snapshot_size == 0
     root.finalize_registry()
+    assert root.snapshot_size == 0
 
     root.register_state_dict(fresh)
     assert root.snapshot_size == 0
@@ -685,8 +771,8 @@ def test_register_state_dict_ignores_unselected_paths(fresh: dict) -> None:
 def test_register_state_dict_allows_missing_registered_path() -> None:
     root = _create_root()
     root.register_state_dict({"known": {"value": 1}})
-    assert root.snapshot_size == 0
     root.finalize_registry()
+    assert root.snapshot_size == 0
 
     root.register_state_dict({"known": {}})
     assert root.snapshot_size == 0
@@ -697,8 +783,8 @@ def test_register_state_dict_allows_missing_registered_path() -> None:
 def test_save_rejects_a_missing_registered_tensor(tmp_path: Path) -> None:
     root = _create_root()
     root.register_state_dict({"weight": torch.arange(4, dtype=torch.float32), "step": 1})
-    assert root.snapshot_size == 4 * 4
     root.finalize_registry()
+    assert root.snapshot_size == 4 * 4
 
     root.register_state_dict({"step": 2})
     root.save_async(1, tmp_path / "iter_0000001")
@@ -715,6 +801,8 @@ def test_save_preserves_omitted_registered_value(tmp_path: Path, initial: float 
 
     for iteration, state in enumerate(({"value": initial}, {}, {"value": updated}), 1):
         root.register_state_dict(state)
+        if iteration == 1:
+            root.finalize_registry()
         root.save(iteration, tmp_path / f"iter_{iteration:07d}")
         checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 

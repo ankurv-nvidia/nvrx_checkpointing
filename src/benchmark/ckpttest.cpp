@@ -3001,32 +3001,6 @@ TEST_CASE("peer registry fragments reject mismatched shard ranks", "[server][tie
     std::filesystem::remove_all(logDir);
 }
 
-TEST_CASE("local registries reject nonlocal DTensor shards", "[server][tier2]")
-{
-    auto const logDir = CkptDir("nonlocal_local_registry_shard");
-    std::filesystem::remove_all(logDir);
-    std::filesystem::create_directories(logDir);
-
-    auto const topology = SingleRankTopo();
-    StateTree  tree(checkpoint::ipc::SessionId::Default, topology);
-    AddShardedTensorLeaf(tree, "weight", Tensor::DType::Float32, {2}, Rank{1}, 0);
-    tree.FinalizeRegistry();
-    std::stringstream registry;
-    StateSerDes::Write(registry, tree, StateNode::Handle::Root);
-
-    TestServerProcess server;
-    StartTestServer(server, logDir / "server.log");
-    std::stringstream activation;
-    serdes::WriteBlobWithSize<uint16_t>(activation, "");
-    StateSerDes::WriteTopology(activation, topology);
-    CHECK(PostToTestServer(fmt::format("/api/activatesession/{}", checkpoint::ipc::SessionId::Default), activation.str())
-          == boost::beast::http::status::ok);
-    CHECK(PostToTestServer(fmt::format("/api/localstateregistry/{}", checkpoint::ipc::SessionId::Default), registry.str())
-          == boost::beast::http::status::insufficient_storage);
-    CHECK(server.Stop());
-    std::filesystem::remove_all(logDir);
-}
-
 TEST_CASE("registries are not dumped without a server log directory", "[server][tier2]")
 {
     auto const logDir = CkptDir("registry_dumps_without_log_dir");

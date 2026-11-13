@@ -315,6 +315,10 @@ def test_retention_waits_for_successful_durable_completion(
         startedAt = 0  # noqa: N815
 
         @staticmethod
+        def finalize_registry() -> None:
+            return
+
+        @staticmethod
         def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
             assert retention.tracker.read_text() == "100"
 
@@ -446,6 +450,10 @@ def test_async_finalize_wait_starts_after_client_send(
     class Root:
         startedAt = 0  # noqa: N815
 
+        @staticmethod
+        def finalize_registry() -> None:
+            return
+
         def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
             events.append("save_async")
 
@@ -510,6 +518,10 @@ def test_finalize_failure_preserves_tracker_and_prevents_success(
         startedAt = 0  # noqa: N815
 
         @staticmethod
+        def finalize_registry() -> None:
+            return
+
+        @staticmethod
         def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
             return
 
@@ -561,6 +573,7 @@ def test_finalize_failure_preserves_tracker_and_prevents_success(
     [("dp-gtp-remat", "dp-gtp-remat"), (None, "dp")],
 )
 @pytest.mark.parametrize("supports_cp_group", [True, False])
+@pytest.mark.parametrize("initialized", [False, True])
 def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913, PLR0917
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -568,11 +581,15 @@ def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913,
     dp_gtp_remat_group: str | None,
     expected_dp_group: str,
     supports_cp_group: bool,
+    initialized: bool,
 ) -> None:
     events: list[object] = []
 
     class Root:
         startedAt = 0  # noqa: N815
+
+        def finalize_registry(self) -> None:
+            events.append("finalize_registry")
 
         def save_async(self, _iteration: int, _checkpoint_dir: Path) -> None:
             events.append("save_async")
@@ -626,7 +643,10 @@ def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913,
     monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000020")
     dataloader_state = current_dataloader_state if supports_cp_group else legacy_dataloader_state
     monkeypatch.setattr(save, "maybe_save_dataloader_state", dataloader_state)
-    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or Root())
+    root = Root()
+    if initialized:
+        save._root = root
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: events.append("register") or root)
     monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, _iteration: events.append("tracker"))
     monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(
@@ -649,6 +669,7 @@ def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913,
             expected_groups,
         ),
         "register",
+        *([] if initialized else ["finalize_registry"]),
         "save_async",
         "client_send_complete",
         "wait_for_finalize",
