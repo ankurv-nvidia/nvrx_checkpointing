@@ -666,7 +666,7 @@ class RoutingAppender : public otlp::OtlpFileAppender
             _state.Collect(line);
         } catch (std::exception const& error)
         {
-            // The exporter cannot report failures, so an unreachable collector costs this batch rather than the process.
+            // The exporter cannot report failures, so an unreachable collector drops this batch.
             fmt::print(stderr, "[native_ckpt:svr][WARN] Dropped a telemetry batch: {}\n", error.what());
         }
     }
