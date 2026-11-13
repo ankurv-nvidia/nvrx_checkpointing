@@ -12,17 +12,8 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
-#include <cstdio>
-#include <cstring>
-#include <functional>
 #include <future>
 #include <mutex>
-#include <optional>
-#include <ranges>
-#include <set>
-#include <stdexcept>
-#include <utility>
-#include <vector>
 
 namespace nb   = nanobind;
 namespace cipc = checkpoint::ipc;
@@ -356,7 +347,7 @@ void PythonStateTree::Scan(StateTree& registry)
 {
     std::unordered_set<PyObject*> visited;
 
-    Accessor accessor{&SnapshotRegistry(), this};
+    Accessor accessor{&registry, this};
     RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
 }
 
