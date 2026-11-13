@@ -1,7 +1,6 @@
 #include "session.h"
 #include "logging.h"
 #include "net_utils.h"
-#include "numa_utils.h"
 #include "server.h"
 #include "stateserdes.h"
 #include "telemetry.h"
@@ -25,7 +24,7 @@ template <> struct fmt::formatter<Session> : fmt::formatter<std::string_view>
 {
     auto format(Session const& session, fmt::format_context& ctx) const    // NOLINT
     {
-        uint32_t ptrVal = reinterpret_cast<uintptr_t>(&session.server) % std::numeric_limits<uint32_t>::max();    // NOLINT
+        uint32_t ptrVal = reinterpret_cast<uintptr_t>(session.server) % std::numeric_limits<uint32_t>::max();    // NOLINT
 
         return fmt::format_to(ctx.out(), "{:x}#{}", ptrVal, session.sessionId);
     }
@@ -916,7 +915,13 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                     if (type == StateNode::Type::Dict) { global.FindOrAddDictChild(parent, name); }
                     else
                     {
-                        global.AddChild(parent, name).data = supplied.data;
+                        auto& added = global.AddChild(parent, name);
+                        added.data  = supplied.data;
+                        if (type == StateNode::Type::Scalar) { std::get<StateNode::Scalar>(added.data).replicas = {recvRank}; }
+                        else if (type == StateNode::Type::DynamicSizeBlob)
+                        {
+                            std::get<StateNode::DynamicSizeBlob>(added.data).replicas = {recvRank};
+                        }
                     }
                     return;
                 }
@@ -934,13 +939,11 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                     {
                         throw std::runtime_error(fmt::format("Scalar '{}' has conflicting types", fqn));
                     }
-                    target.replicas.insert(value.replicas.begin(), value.replicas.end());
+                    target.replicas.insert(recvRank);
                 }
                 else if (type == StateNode::Type::DynamicSizeBlob)
                 {
-                    auto&       target = std::get<StateNode::DynamicSizeBlob>(registered.data);
-                    auto const& value  = std::get<StateNode::DynamicSizeBlob>(supplied.data);
-                    target.replicas.insert(value.replicas.begin(), value.replicas.end());
+                    std::get<StateNode::DynamicSizeBlob>(registered.data).replicas.insert(recvRank);
                 }
                 else if (type == StateNode::Type::DTensor || type == StateNode::Type::FixedSizeBlob)
                 {

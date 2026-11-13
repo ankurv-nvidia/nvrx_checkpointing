@@ -289,9 +289,7 @@ target_link_libraries(distcpio PUBLIC
 
 add_library(daemon OBJECT
     src/checkpoint/server.cpp
-    src/checkpoint/session.cpp
-
-)
+    src/checkpoint/session.cpp)
 # miniz is pulled in transitively via distcpio (PUBLIC above).
 target_link_libraries(daemon PUBLIC phoenix_checkpoint distcpio fmt::fmt-header-only Boost::interprocess Boost::iostreams Boost::url)
 

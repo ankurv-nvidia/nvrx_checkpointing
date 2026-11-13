@@ -10,7 +10,6 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -413,10 +412,6 @@ static auto ReadNVFP4Header(Tensor::DType& durableDtype, nb::handle pyobj, std::
 
 static CachedTypes const& CachedTypesGet()
 {
-    static std::atomic<CachedTypes const*> Cached{nullptr};
-    if (auto const* types = Cached.load(std::memory_order_acquire)) { return *types; }
-    nb::gil_scoped_release release;
-
     static CachedTypes Types = [] {
         nb::gil_scoped_acquire acquire;
         auto                   torchModule                  = nb::module_::import_("torch");
@@ -446,7 +441,6 @@ static CachedTypes const& CachedTypesGet()
             .megatronShardedObject        = std::move(megatronShardedObject),
         };
     }();
-    Cached.store(&Types, std::memory_order_release);
     return Types;
 }
 
