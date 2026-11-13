@@ -661,7 +661,14 @@ class RoutingAppender : public otlp::OtlpFileAppender
         std::string_view line{data.data(), data.size()};
         if (!line.empty() && line.back() == '\n') { line.remove_suffix(1); }
         if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
-        _state.Collect(line);
+        try
+        {
+            _state.Collect(line);
+        } catch (std::exception const& error)
+        {
+            // The exporter cannot report failures, so an unreachable collector costs this batch rather than the process.
+            fmt::print(stderr, "[native_ckpt:svr][WARN] Dropped a telemetry batch: {}\n", error.what());
+        }
     }
 
     bool ForceFlush(std::chrono::microseconds /*timeout*/) noexcept override
