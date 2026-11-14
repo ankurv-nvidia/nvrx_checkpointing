@@ -16,7 +16,6 @@ import torch
 import torch.distributed.checkpoint as dcp
 from nvrx_checkpointing import checkpoint
 from nvrx_checkpointing.megatron import load as native_load
-from nvrx_checkpointing.megatron.native_state import decode_native_schema, is_native_state, read_native_state, restore_native_value
 from torch.distributed.checkpoint.metadata import BytesStorageMetadata, MetadataIndex
 
 if TYPE_CHECKING:
@@ -138,7 +137,7 @@ def test_prepared_registration_persists_independent_scalars(tmp_path: Path, monk
             checkpoint.wait_for_ckpt_finalize(session, iteration)
             metadata = dcp.FileSystemReader(directory).read_metadata()
 
-            assert not is_native_state(metadata)
+            assert not any(key.startswith("__nvrx_native_state_rank_") for key in metadata.state_dict_metadata)
             assert (directory / "metadata.json").is_file()
             assert set(metadata.state_dict_metadata) == {"model.weight", *(f"values.{key}" for key in values)}
             for name, kind, code in (
@@ -219,8 +218,8 @@ def test_native_values_round_trip_without_torch_archives(tmp_path: Path, monkeyp
         checkpoint.wait_for_ckpt_finalize(session, 1)
         reader = dcp.FileSystemReader(tmp_path)
         metadata = reader.read_metadata()
-        assert is_native_state(metadata)
-        restored = read_native_state(reader, metadata)
+        assert any(key.startswith("__nvrx_native_state_rank_") for key in metadata.state_dict_metadata)
+        restored = checkpoint.read_common_state(tmp_path)
 
         for key in ("step", "maximum", "minimum", "enabled", "nothing", "mapping", "python_rng", "dtype", "device"):
             assert restored[key] == state[key]
@@ -233,10 +232,12 @@ def test_native_values_round_trip_without_torch_archives(tmp_path: Path, monkeyp
         assert restored["numpy_rng"][0] == numpy_state[0]
         np.testing.assert_array_equal(restored["numpy_rng"][1], numpy_state[1])
         assert restored["numpy_rng"][2:] == numpy_state[2:]
-        assert restored["generator"].device == "cpu"
-        assert restored["generator"].state == generator_state.numpy().tobytes()
+        assert restored["generator"].device == torch.device("cpu")
+        assert torch.equal(restored["generator"].get_state(), generator_state)
         destination_generator = torch.Generator(device="cpu").manual_seed(0)
-        assert restore_native_value(restored["generator"], destination_generator) is destination_generator
+        generator_target = {"generator": destination_generator}
+        checkpoint.load_checkpoint(tmp_path, generator_target)
+        assert generator_target["generator"] is destination_generator
         torch.testing.assert_close(destination_generator.get_state(), generator_state, rtol=0, atol=0)
         torch.testing.assert_close(
             torch.rand(5, generator=destination_generator),
@@ -266,8 +267,10 @@ def test_native_dictionary_and_sequence_growth_refreshes_payloads(tmp_path: Path
             directory = tmp_path / str(iteration)
             root.save(iteration, directory)
             checkpoint.wait_for_ckpt_finalize(session, iteration)
-            reader = dcp.FileSystemReader(directory)
-            assert read_native_state(reader, reader.read_metadata()) == state
+            assert checkpoint.read_common_state(directory) == state
+            target = {"values": {}, "sequence": ()}
+            checkpoint.load_checkpoint(directory, target)
+            assert target == state
     finally:
         checkpoint.svc_spindown()
 
@@ -323,9 +326,33 @@ def test_native_schema_tracks_stock_dcp_item_order_and_cost(tmp_path: Path) -> N
         location = metadata.storage_data[index]
         with (tmp_path / location.relative_path).open("rb") as stream:
             stream.seek(location.offset)
-            schema = decode_native_schema(stream.read(location.length))
+            schema = stream.read(location.length)
 
-        assert schema.version == 2
-        assert schema.write_items == expected
+        assert schema[:8] == b"NVRXNST2"
+        cursor = 8
+
+        def number(width: int) -> int:
+            nonlocal cursor
+            value = int.from_bytes(schema[cursor : cursor + width], "little")
+            cursor += width
+            return value
+
+        def text() -> str:
+            nonlocal cursor
+            length = number(4)
+            value = schema[cursor : cursor + length].decode("utf-8")
+            cursor += length
+            return value
+
+        for _ in range(number(4)):
+            text()
+            number(1)
+        actual = []
+        for _ in range(number(4)):
+            key = text()
+            offsets = tuple(number(8) for _ in range(number(4))) if number(1) else None
+            actual.append((key, offsets, number(8)))
+        assert cursor == len(schema)
+        assert actual == expected
     finally:
         checkpoint.svc_spindown()

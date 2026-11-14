@@ -1,8 +1,8 @@
 
 #include "binding.h"
 #include "checkpoint.h"
+#include "distcp.h"
 #include "messages.h"
-#include "native_state.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -13,11 +13,555 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
 #include <future>
+#include <map>
 #include <mutex>
+#include <optional>
+#include <set>
+#include <span>
+#include <tuple>
 
 namespace nb   = nanobind;
 namespace cipc = checkpoint::ipc;
+
+namespace checkpoint::python
+{
+namespace nb = nanobind;
+
+class NativeStateRegistration
+{
+    static constexpr size_t MaxNestingDepth = 100;
+    using Buffer                            = std::vector<char>;
+
+    enum class Kind : uint8_t
+    {
+        None,
+        Int,
+        UInt,
+        Float,
+        Bool,
+        String,
+        Bytes,
+        List,
+        Tuple,
+        Dict,
+        Namespace,
+        Array,
+        Dtype,
+        Enum,
+        Device,
+        EmptyTensor,
+        Generator,
+    };
+
+    struct Scalar
+    {
+        StateNode::Scalar value;
+        Kind              kind;
+    };
+
+    struct WriteItem
+    {
+        std::string           path;
+        bool                  tensor;
+        std::vector<uint64_t> offsets;
+        uint64_t              cost;
+    };
+
+    class Visit
+    {
+        public:
+        Visit(std::unordered_set<PyObject*>& active, nb::handle value) : _active(active), _value(value.ptr())
+        {
+            if (!_active.insert(_value).second) { throw std::invalid_argument("Native state contains a recursive container"); }
+        }
+        ~Visit() { _active.erase(_value); }
+        CLASS_DELETE_COPY_AND_MOVE(Visit);
+
+        private:
+        std::unordered_set<PyObject*>& _active;
+        PyObject*                      _value;
+    };
+
+    public:
+    explicit NativeStateRegistration(PyStateDictAccessor& scan) :
+        _scan(scan),
+        _torch(nb::module_::import_("torch")),
+        _tensor(_torch.attr("Tensor")),
+        _dtype(_torch.attr("dtype")),
+        _device(_torch.attr("device")),
+        _generator(_torch.attr("Generator")),
+        _mapping(nb::module_::import_("collections.abc").attr("Mapping")),
+        _enum(nb::module_::import_("enum").attr("Enum")),
+        _namespace(nb::module_::import_("argparse").attr("Namespace")),
+        _simpleNamespace(nb::module_::import_("types").attr("SimpleNamespace")),
+        _numpy(nb::module_::import_("numpy")),
+        _array(_numpy.attr("ndarray")),
+        _numpyScalar(_numpy.attr("generic"))
+    {
+        if (nb::cast<bool>(nb::module_::import_("torch.distributed").attr("is_available")()))
+        {
+            _dtensor        = nb::module_::import_("torch.distributed.tensor").attr("DTensor");
+            _shapeAndOffset = nb::module_::import_("torch.distributed.tensor._utils").attr("compute_local_shape_and_global_offset");
+        }
+        else
+        {
+            _dtensor        = nb::none();
+            _shapeAndOffset = nb::none();
+        }
+    }
+
+    void Register(nb::dict const& state)
+    {
+        CollectMappingWriteItems({}, state, 0);
+        Visit guard(_active, state);
+        for (auto const& [key, value] : state) { RegisterValue(Path({}, key), value); }
+        Buffer marker;
+        Append(marker, "NVRXNST2");
+        Put32(marker, _records.size());
+        for (auto const& [path, kind] : _records)
+        {
+            PutString(marker, path);
+            Put8(marker, kind);
+        }
+        Put32(marker, _writeItems.size());
+        for (auto const& item : _writeItems)
+        {
+            PutString(marker, item.path);
+            Put8(marker, item.tensor ? 1 : 0);
+            if (item.tensor)
+            {
+                Put32(marker, item.offsets.size());
+                for (auto const offset : item.offsets) { Put64(marker, offset); }
+            }
+            Put64(marker, item.cost);
+        }
+        RegisterBlob(fmt::format("__nvrx_native_state_rank_{}__", _scan.GetRankTopo().rank), std::move(marker));
+    }
+
+    private:
+    static void Put8(Buffer& output, uint8_t value) { output.push_back(static_cast<char>(value)); }
+
+    static void Put32(Buffer& output, size_t value)
+    {
+        if (value > std::numeric_limits<uint32_t>::max()) { throw std::length_error("Native state count exceeds its wire limit"); }
+        for (unsigned int shift = 0; shift < 32; shift += 8) { Put8(output, static_cast<uint8_t>(value >> shift)); }
+    }
+
+    static void Put64(Buffer& output, uint64_t value)
+    {
+        for (unsigned int shift = 0; shift < 64; shift += 8) { Put8(output, static_cast<uint8_t>(value >> shift)); }
+    }
+
+    static void Append(Buffer& output, std::string_view value) { output.insert(output.end(), value.begin(), value.end()); }
+
+    static void PutString(Buffer& output, std::string_view value)
+    {
+        Put32(output, value.size());
+        Append(output, value);
+    }
+
+    static void PutByteString(Buffer& output, nb::bytes const& value)
+    {
+        Put64(output, value.size());
+        Append(output, {value.c_str(), value.size()});
+    }
+
+    static std::string Path(std::string_view parent, nb::handle key)
+    {
+        auto const name = Str(nb::str(key));
+        if (name.empty()) { throw std::invalid_argument("Native state keys must have nonempty addresses"); }
+        return parent.empty() ? name : fmt::format("{}.{}", parent, name);
+    }
+
+    static std::string DtypeName(nb::handle value)
+    {
+        auto name = Str(nb::str(value));
+        if (name.starts_with("torch.")) { name.erase(0, 6); }
+        return name;
+    }
+
+    bool IsNamespace(nb::handle value) const { return nb::isinstance(value, _namespace) || nb::isinstance(value, _simpleNamespace); }
+
+    bool IsContainer(nb::handle value) const
+    { return nb::isinstance<nb::dict>(value) || nb::isinstance<nb::list>(value) || nb::isinstance<nb::tuple>(value) || IsNamespace(value); }
+
+    bool ContainsTensor(nb::handle value, size_t depth = 0)
+    {
+        if (depth > MaxNestingDepth) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+        if (nb::isinstance(value, _tensor)) { return true; }
+        if (!IsContainer(value)) { return false; }
+        Visit guard(_active, value);
+        if (nb::isinstance<nb::dict>(value) || IsNamespace(value))
+        {
+            auto const items = IsNamespace(value) ? nb::cast<nb::dict>(value.attr("__dict__")) : nb::cast<nb::dict>(value);
+            for (auto const& [key, child] : items)
+            {
+                static_cast<void>(key);
+                if (ContainsTensor(child, depth + 1)) { return true; }
+            }
+        }
+        else
+        {
+            for (auto const child : nb::cast<nb::iterable>(value))
+            {
+                if (ContainsTensor(child, depth + 1)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    bool IsTerminalWriteItem(nb::handle value, size_t depth)
+    {
+        if (depth > MaxNestingDepth) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+        if (nb::isinstance(value, _mapping)) { return false; }
+        if (!nb::isinstance<nb::list>(value)) { return true; }
+        Visit guard(_writeActive, value);
+        for (auto const child : nb::cast<nb::list>(value))
+        {
+            if ((nb::isinstance(child, _mapping) || nb::isinstance<nb::list>(child)) && !IsTerminalWriteItem(child, depth + 1))
+            {
+                return false;
+            }
+            if (nb::isinstance(child, _tensor)) { return false; }
+        }
+        return true;
+    }
+
+    void CollectMappingWriteItems(std::string_view path, nb::handle value, size_t depth)
+    {
+        Visit      guard(_writeActive, value);
+        auto const items = value.attr("items")();
+        for (auto const item : nb::cast<nb::iterable>(items))
+        {
+            auto const pair = nb::cast<nb::tuple>(item);
+            CollectWriteItems(Path(path, pair[0]), pair[1], depth);
+        }
+    }
+
+    void CollectWriteItems(std::string const& path, nb::handle value, size_t depth)
+    {
+        if (depth > MaxNestingDepth) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+        if (nb::isinstance(value, _mapping))
+        {
+            CollectMappingWriteItems(path, value, depth + 1);
+            return;
+        }
+        if (!IsTerminalWriteItem(value, depth))
+        {
+            Visit  guard(_writeActive, value);
+            size_t index = 0;
+            for (auto const child : nb::cast<nb::iterable>(value))
+            {
+                CollectWriteItems(fmt::format("{}.{}", path, index), child, depth + 1);
+                ++index;
+            }
+            return;
+        }
+        if (!_writePaths.insert(path).second)
+        {
+            throw std::invalid_argument(fmt::format("Native checkpoint addresses overlap at '{}'", path));
+        }
+        if (!nb::isinstance(value, _tensor))
+        {
+            _writeItems.push_back({path, false, {}, 1});
+            return;
+        }
+        auto const count = nb::cast<uint64_t>(value.attr("numel")());
+        auto const width = nb::cast<uint64_t>(value.attr("element_size")());
+        if (width != 0 && count > std::numeric_limits<uint64_t>::max() / width)
+        {
+            throw std::overflow_error("Native checkpoint tensor write cost exceeds the supported range");
+        }
+        auto const cost = std::max<uint64_t>(count * width, 1);
+        if (!_dtensor.is_none() && nb::isinstance(value, _dtensor))
+        {
+            if (value.attr("device_mesh").attr("get_coordinate")().is_none()) { return; }
+            nb::object const local = value.attr("_local_tensor");
+            if (nb::hasattr(local, "__create_write_items__"))
+            {
+                if (nb::cast<uint64_t>(local.attr("numel")()) == 0) { return; }
+                for (auto const chunk : nb::cast<nb::iterable>(value.attr("__create_chunk_list__")()))
+                {
+                    AddTensorWriteItem(path, chunk.attr("offsets"), cost);
+                }
+            }
+            else
+            {
+                auto const geometry = _shapeAndOffset(value.attr("shape"), value.attr("device_mesh"), value.attr("placements"));
+                AddTensorWriteItem(path, geometry[1], cost);
+            }
+            return;
+        }
+        nb::object const shape = value.attr("shape");
+        _writeItems.push_back({path, true, std::vector<uint64_t>(nb::len(shape), 0), cost});
+    }
+
+    void AddTensorWriteItem(std::string const& path, nb::handle offsets, uint64_t cost)
+    {
+        WriteItem item{path, true, {}, cost};
+        for (auto const offset : nb::cast<nb::iterable>(offsets)) { item.offsets.push_back(nb::cast<uint64_t>(offset)); }
+        _writeItems.push_back(std::move(item));
+    }
+
+    static Scalar Integer(nb::handle value)
+    {
+        int        overflow    = 0;
+        auto const signedValue = PyLong_AsLongLongAndOverflow(value.ptr(), &overflow);
+        if (PyErr_Occurred() != nullptr) { throw nb::python_error(); }
+        if (overflow == 0) { return {StateNode::Scalar{static_cast<int64_t>(signedValue)}, Kind::Int}; }
+        if (overflow < 0) { throw std::out_of_range("Native state integer is below the signed 64-bit range"); }
+        auto const unsignedValue = PyLong_AsUnsignedLongLong(value.ptr());
+        if (PyErr_Occurred() != nullptr) { throw nb::python_error(); }
+        return {StateNode::Scalar{static_cast<uint64_t>(unsignedValue)}, Kind::UInt};
+    }
+
+    void Encode(Buffer& output, nb::handle value, size_t depth = 0)
+    {
+        if (depth > MaxNestingDepth) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+        if (value.is_none()) { Put8(output, static_cast<uint8_t>(Kind::None)); }
+        else if (nb::isinstance(value, _enum))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Enum));
+            Encode(output, value.attr("value"), depth + 1);
+        }
+        else if (nb::isinstance<bool>(value))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Bool));
+            Put8(output, nb::cast<bool>(value) ? 1 : 0);
+        }
+        else if (nb::isinstance<nb::int_>(value))
+        {
+            auto const integer = Integer(value);
+            Put8(output, static_cast<uint8_t>(integer.kind));
+            Put64(output,
+                  integer.kind == Kind::Int ? std::bit_cast<uint64_t>(integer.value.Cast<int64_t>()) : integer.value.Cast<uint64_t>());
+        }
+        else if (nb::isinstance<nb::float_>(value))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Float));
+            Put64(output, std::bit_cast<uint64_t>(nb::cast<double>(value)));
+        }
+        else if (nb::isinstance<nb::str>(value))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::String));
+            PutString(output, StrView(nb::cast<nb::str>(value)));
+        }
+        else if (nb::isinstance<nb::bytes>(value))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Bytes));
+            PutByteString(output, nb::cast<nb::bytes>(value));
+        }
+        else if (nb::isinstance<nb::list>(value) || nb::isinstance<nb::tuple>(value))
+        {
+            Visit guard(_active, value);
+            Put8(output, static_cast<uint8_t>(nb::isinstance<nb::list>(value) ? Kind::List : Kind::Tuple));
+            auto const sequence = nb::cast<nb::sequence>(value);
+            Put32(output, nb::len(sequence));
+            for (auto const child : sequence) { Encode(output, child, depth + 1); }
+        }
+        else if (nb::isinstance<nb::dict>(value) || IsNamespace(value))
+        {
+            Visit      guard(_active, value);
+            auto const isNamespace = IsNamespace(value);
+            auto const mapping     = isNamespace ? nb::cast<nb::dict>(value.attr("__dict__")) : nb::cast<nb::dict>(value);
+            Put8(output, static_cast<uint8_t>(isNamespace ? Kind::Namespace : Kind::Dict));
+            Put32(output, mapping.size());
+            for (auto const& [key, child] : mapping)
+            {
+                Encode(output, key, depth + 1);
+                Encode(output, child, depth + 1);
+            }
+        }
+        else if (nb::isinstance(value, _array))
+        {
+            nb::object const dtype = value.attr("dtype");
+            if (nb::cast<bool>(dtype.attr("hasobject")) || !dtype.attr("fields").is_none())
+            {
+                throw std::invalid_argument("Native state supports NumPy arrays with primitive dtypes");
+            }
+            auto const array = _numpy.attr("ascontiguousarray")(value);
+            Put8(output, static_cast<uint8_t>(Kind::Array));
+            PutString(output, Str(nb::str(dtype)));
+            PutShape(output, value.attr("shape"));
+            PutByteString(output, nb::cast<nb::bytes>(array.attr("tobytes")()));
+        }
+        else if (nb::isinstance(value, _numpyScalar))
+        {
+            auto const item = value.attr("item")();
+            if (nb::isinstance(item, _numpyScalar))
+            {
+                throw std::invalid_argument("Unsupported native checkpoint value type: NumPy scalar without a Python equivalent");
+            }
+            Encode(output, item, depth);
+        }
+        else if (nb::isinstance(value, _dtype))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Dtype));
+            PutString(output, DtypeName(value));
+        }
+        else if (nb::isinstance(value, _device))
+        {
+            Put8(output, static_cast<uint8_t>(Kind::Device));
+            PutString(output, Str(nb::str(value)));
+        }
+        else if (nb::isinstance(value, _generator))
+        {
+            nb::object const device = value.attr("device");
+            Put8(output, static_cast<uint8_t>(Kind::Generator));
+            PutString(output, Str(nb::str(device)));
+            auto const bytes = value.attr("get_state")().attr("cpu")().attr("numpy")().attr("tobytes")();
+            PutByteString(output, nb::cast<nb::bytes>(bytes));
+        }
+        else if (nb::isinstance(value, _tensor) && nb::cast<uint64_t>(value.attr("numel")()) == 0)
+        {
+            Put8(output, static_cast<uint8_t>(Kind::EmptyTensor));
+            PutString(output, DtypeName(value.attr("dtype")));
+            PutShape(output, value.attr("shape"));
+        }
+        else
+        {
+            throw std::invalid_argument(fmt::format("Unsupported native checkpoint value type: {}", nb::str(value.type())));
+        }
+    }
+
+    static void PutShape(Buffer& output, nb::handle shape)
+    {
+        auto const dimensions = nb::cast<nb::sequence>(shape);
+        Put32(output, nb::len(dimensions));
+        for (auto const size : dimensions) { Put64(output, nb::cast<uint64_t>(size)); }
+    }
+
+    void ReservePath(std::string const& path)
+    {
+        if (path.starts_with("__nvrx_native_state_rank_") || path.starts_with("__nvrx_native_dict_rank_"))
+        {
+            throw std::invalid_argument("Native checkpoint state uses a reserved metadata address");
+        }
+        for (auto position = path.find('.'); position != std::string::npos; position = path.find('.', position + 1))
+        {
+            if (_paths.contains(path.substr(0, position)))
+            {
+                throw std::invalid_argument(fmt::format("Native checkpoint addresses overlap at '{}'", path));
+            }
+        }
+        auto const childPrefix = path + '.';
+        auto const child       = _paths.lower_bound(childPrefix);
+        if ((child != _paths.end() && child->starts_with(childPrefix)) || !_paths.insert(path).second)
+        {
+            throw std::invalid_argument(fmt::format("Native checkpoint addresses overlap at '{}'", path));
+        }
+    }
+
+    void RegisterBlob(std::string_view path, Buffer bytes)
+    {
+        auto const size   = bytes.size();
+        auto const handle = reinterpret_cast<uint64_t>(bytes.data());
+        auto*      node   = _scan.RegisterStateByFQN(
+            path, StateNode::DynamicSizeBlob{.replicas = {_scan.GetRankTopo().rank}, .handle = handle, .storageSize = size});
+        if (node != nullptr) { _scan.RetainBlobData(std::move(bytes)); }
+    }
+
+    void RegisterValue(std::string const& path, nb::handle value)
+    {
+        if (nb::isinstance(value, _tensor))
+        {
+            ReservePath(path);
+            if ((!_dtensor.is_none() && nb::isinstance(value, _dtensor)) || nb::cast<uint64_t>(value.attr("numel")()) != 0)
+            {
+                if (!TryRegisterTorchStateDict(_scan, StateNode::Handle::Root, nb::str(path.c_str(), path.size()), value))
+                {
+                    throw std::invalid_argument(fmt::format("Native tensor '{}' cannot be registered", path));
+                }
+                return;
+            }
+        }
+        else if (IsContainer(value) && ContainsTensor(value))
+        {
+            Visit guard(_active, value);
+            if (nb::isinstance<nb::dict>(value) || IsNamespace(value))
+            {
+                auto const mapping = IsNamespace(value) ? nb::cast<nb::dict>(value.attr("__dict__")) : nb::cast<nb::dict>(value);
+                for (auto const& [key, child] : mapping) { RegisterValue(Path(path, key), child); }
+            }
+            else
+            {
+                size_t index = 0;
+                for (auto const child : nb::cast<nb::iterable>(value))
+                {
+                    RegisterValue(fmt::format("{}.{}", path, index), child);
+                    ++index;
+                }
+            }
+            return;
+        }
+        else
+        {
+            ReservePath(path);
+        }
+
+        if (!nb::isinstance(value, _enum) && nb::isinstance<bool>(value))
+        {
+            _scan.RegisterStateByFQN(path, StateNode::Scalar{nb::cast<bool>(value)});
+            _records.emplace_back(path, uint8_t{4});
+        }
+        else if (!nb::isinstance(value, _enum) && nb::isinstance<nb::int_>(value))
+        {
+            auto integer = Integer(value);
+            _scan.RegisterStateByFQN(path, std::move(integer.value));
+            _records.emplace_back(path, static_cast<uint8_t>(integer.kind));
+        }
+        else if (!nb::isinstance(value, _enum) && nb::isinstance<nb::float_>(value))
+        {
+            _scan.RegisterStateByFQN(path, StateNode::Scalar{nb::cast<double>(value)});
+            _records.emplace_back(path, uint8_t{3});
+        }
+        else
+        {
+            Buffer bytes;
+            Append(bytes, "NVRXOBJ1");
+            Encode(bytes, value);
+            if (nb::isinstance<nb::dict>(value))
+            {
+                auto const physicalPath = fmt::format("__nvrx_native_dict_rank_{}__.{}", _scan.GetRankTopo().rank, path);
+                RegisterBlob(physicalPath, std::move(bytes));
+                _records.emplace_back(physicalPath, uint8_t{20});
+            }
+            else
+            {
+                RegisterBlob(path, std::move(bytes));
+                _records.emplace_back(path, uint8_t{10});
+            }
+        }
+    }
+
+    PyStateDictAccessor&                         _scan;
+    nb::module_                                  _torch;
+    nb::object                                   _tensor;
+    nb::object                                   _dtype;
+    nb::object                                   _device;
+    nb::object                                   _generator;
+    nb::object                                   _mapping;
+    nb::object                                   _enum;
+    nb::object                                   _namespace;
+    nb::object                                   _simpleNamespace;
+    nb::module_                                  _numpy;
+    nb::object                                   _array;
+    nb::object                                   _numpyScalar;
+    nb::object                                   _dtensor;
+    nb::object                                   _shapeAndOffset;
+    std::unordered_set<PyObject*>                _active;
+    std::set<std::string>                        _paths;
+    std::vector<std::pair<std::string, uint8_t>> _records;
+    std::unordered_set<PyObject*>                _writeActive;
+    std::set<std::string>                        _writePaths;
+    std::vector<WriteItem>                       _writeItems;
+};
+}    // namespace checkpoint::python
 
 static constexpr std::string_view StateTypeName(StateNode::Type const& type)
 {
@@ -759,6 +1303,995 @@ static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::pat
     self.ChainAsyncCall([&self, iteration, dirpath] { self.SaveCheckpoint(static_cast<cipc::SnapshotId>(iteration), dirpath); });
 }
 
+namespace
+{
+using PythonTargets    = std::map<std::string, nb::object>;
+using LogicalIndex     = std::tuple<std::string, bool, std::vector<uint64_t>>;
+using LogicalItem      = std::pair<LogicalIndex, uint64_t>;
+using LogicalPlans     = std::map<uint32_t, std::vector<LogicalItem>>;
+using ObjectCandidates = std::map<uint32_t, nb::object>;
+
+nb::dict LoadPythonTypes()
+{
+    nb::dict   types;
+    auto const torch          = nb::module_::import_("torch");
+    auto const numpy          = nb::module_::import_("numpy");
+    types["torch"]            = torch;
+    types["numpy"]            = numpy;
+    types["tensor"]           = torch.attr("Tensor");
+    types["enum"]             = nb::module_::import_("enum").attr("Enum");
+    types["namespace"]        = nb::module_::import_("argparse").attr("Namespace");
+    types["simple_namespace"] = nb::module_::import_("types").attr("SimpleNamespace");
+    types["array"]            = numpy.attr("ndarray");
+    types["numpy_scalar"]     = numpy.attr("generic");
+    types["generator"]        = torch.attr("Generator");
+    return types;
+}
+
+bool LoadIsNamespace(nb::handle value, nb::dict const& types)
+{ return nb::isinstance(value, types["namespace"]) || nb::isinstance(value, types["simple_namespace"]); }
+
+std::string LoadPath(std::string_view parent, nb::handle key)
+{
+    auto name = Str(nb::str(key));
+    return parent.empty() ? name : fmt::format("{}.{}", parent, name);
+}
+
+nb::object ExpectedChild(nb::handle target, nb::handle key, nb::dict const& types)
+{
+    if (LoadIsNamespace(target, types)) { return nb::cast<nb::dict>(target.attr("__dict__")).get(key, nb::none()); }
+    if (nb::isinstance<nb::dict>(target)) { return nb::cast<nb::dict>(target).get(key, nb::none()); }
+    return nb::none();
+}
+
+std::string_view TakeNative(std::string_view data, size_t& cursor, size_t count)
+{
+    if (cursor > data.size() || count > data.size() - cursor) { throw std::invalid_argument("Truncated native checkpoint value"); }
+    auto result = data.substr(cursor, count);
+    cursor += count;
+    return result;
+}
+
+uint64_t NativeNumber(std::string_view data, size_t& cursor, size_t width)
+{
+    auto     bytes = TakeNative(data, cursor, width);
+    uint64_t value = 0;
+    for (size_t index = 0; index < width; ++index)
+    {
+        value |= static_cast<uint64_t>(static_cast<unsigned char>(bytes[index])) << (index * 8);
+    }
+    return value;
+}
+
+std::string NativeString(std::string_view data, size_t& cursor)
+{
+    auto const count = NativeNumber(data, cursor, 4);
+    return std::string(TakeNative(data, cursor, count));
+}
+
+std::vector<uint64_t> NativeShape(std::string_view data, size_t& cursor)
+{
+    auto const dimensions = NativeNumber(data, cursor, 4);
+    if (dimensions > 64) { throw std::invalid_argument("Native checkpoint array has too many dimensions"); }
+    std::vector<uint64_t> shape;
+    shape.reserve(dimensions);
+    for (uint64_t index = 0; index < dimensions; ++index) { shape.push_back(NativeNumber(data, cursor, 8)); }
+    return shape;
+}
+
+nb::tuple PythonShape(std::vector<uint64_t> const& shape)
+{
+    nb::list result;
+    for (auto const size : shape) { result.append(nb::int_(size)); }
+    return nb::tuple(result);
+}
+
+nb::object NativeEnumType(nb::handle target, std::string_view path, nb::dict const& types)
+{
+    if (nb::isinstance(target, types["enum"])) { return nb::borrow<nb::object>(target.type()); }
+    if (path == "args.exit_signal") { return nb::module_::import_("signal").attr("Signals"); }
+    if (path == "args.attention_backend") { return nb::module_::import_("megatron.core.transformer.enums").attr("AttnBackend"); }
+    if (path == "args.inference_cuda_graph_scope")
+    {
+        return nb::module_::import_("megatron.core.transformer.enums").attr("InferenceCudaGraphScope");
+    }
+    return nb::none();
+}
+
+nb::object DecodeNativeObject(std::string_view   data,
+                              size_t&            cursor,
+                              nb::handle         target,
+                              std::string const& path,
+                              nb::dict const&    types,
+                              bool               materialize,
+                              size_t             depth = 0)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    auto const kind = NativeNumber(data, cursor, 1);
+    switch (kind)
+    {
+    case 0: return nb::none();
+    case 1: return nb::int_(std::bit_cast<int64_t>(NativeNumber(data, cursor, 8)));
+    case 2: return nb::int_(NativeNumber(data, cursor, 8));
+    case 3: return nb::float_(std::bit_cast<double>(NativeNumber(data, cursor, 8)));
+    case 4:
+    {
+        auto const value = NativeNumber(data, cursor, 1);
+        if (value > 1) { throw std::invalid_argument("Invalid native boolean value"); }
+        return nb::bool_(value != 0);
+    }
+    case 5:
+    {
+        auto const value = NativeString(data, cursor);
+        return nb::str(value.data(), value.size());
+    }
+    case 6:
+    {
+        auto const count = NativeNumber(data, cursor, 8);
+        auto const value = TakeNative(data, cursor, count);
+        return nb::bytes(value.data(), value.size());
+    }
+    case 7: [[fallthrough]];
+    case 8:
+    {
+        auto const count = NativeNumber(data, cursor, 4);
+        if (count > data.size() - cursor) { throw std::invalid_argument("Truncated native sequence"); }
+        nb::list   values;
+        auto const sequence = nb::isinstance<nb::list>(target) || nb::isinstance<nb::tuple>(target);
+        for (uint64_t index = 0; index < count; ++index)
+        {
+            nb::object old = sequence && index < nb::len(target) ? nb::borrow<nb::object>(target[index]) : nb::none();
+            values.append(DecodeNativeObject(data, cursor, old, fmt::format("{}.{}", path, index), types, materialize, depth + 1));
+        }
+        return kind == 8 ? nb::object(nb::tuple(values)) : nb::object(values);
+    }
+    case 9: [[fallthrough]];
+    case 10:
+    {
+        auto const count = NativeNumber(data, cursor, 4);
+        if (count > (data.size() - cursor) / 2) { throw std::invalid_argument("Truncated native dictionary"); }
+        nb::dict values;
+        for (uint64_t index = 0; index < count; ++index)
+        {
+            auto key = DecodeNativeObject(data, cursor, nb::none(), {}, types, true, depth + 1);
+            if (values.contains(key)) { throw std::invalid_argument("Duplicate native dictionary key"); }
+            if (kind == 10 && !nb::isinstance<nb::str>(key))
+            {
+                throw std::invalid_argument("Native namespace attributes require string names");
+            }
+            auto const known = nb::isinstance<nb::dict>(target) || LoadIsNamespace(target, types);
+            auto const mapping
+                = known ? (LoadIsNamespace(target, types) ? nb::cast<nb::dict>(target.attr("__dict__")) : nb::cast<nb::dict>(target))
+                        : nb::dict();
+            auto const inspect = materialize || (known && !mapping.contains(key));
+            values[key]
+                = DecodeNativeObject(data, cursor, ExpectedChild(target, key, types), LoadPath(path, key), types, inspect, depth + 1);
+        }
+        if (kind == 9) { return values; }
+        auto result = types["namespace"]();
+        nb::cast<nb::dict>(result.attr("__dict__")).update(values);
+        return result;
+    }
+    case 11:
+    {
+        auto const dtype = types["numpy"].attr("dtype")(NativeString(data, cursor));
+        if (nb::cast<bool>(dtype.attr("hasobject"))) { throw std::invalid_argument("Native checkpoint arrays require a non-object dtype"); }
+        auto const shape = NativeShape(data, cursor);
+        auto const count = NativeNumber(data, cursor, 8);
+        uint64_t   bytes = nb::cast<uint64_t>(dtype.attr("itemsize"));
+        for (auto const dimension : shape)
+        {
+            if (dimension != 0 && bytes > std::numeric_limits<uint64_t>::max() / dimension)
+            {
+                throw std::overflow_error("Native checkpoint array size overflow");
+            }
+            bytes *= dimension;
+        }
+        if (bytes != count) { throw std::invalid_argument("Native array byte length does not match its shape"); }
+        auto const raw = TakeNative(data, cursor, count);
+        return types["numpy"]
+            .attr("frombuffer")(nb::bytes(raw.data(), raw.size()), nb::arg("dtype") = dtype)
+            .attr("copy")()
+            .attr("reshape")(PythonShape(shape));
+    }
+    case 12:
+    {
+        auto const name  = NativeString(data, cursor);
+        auto const torch = types["torch"];
+        if (!nb::hasattr(torch, name.c_str())) { throw std::invalid_argument("Unknown native tensor dtype"); }
+        auto dtype = torch.attr(name.c_str());
+        if (!nb::isinstance(dtype, torch.attr("dtype"))) { throw std::invalid_argument("Unknown native tensor dtype"); }
+        return dtype;
+    }
+    case 13:
+    {
+        auto value    = DecodeNativeObject(data, cursor, nb::none(), path, types, materialize, depth + 1);
+        auto enumType = NativeEnumType(target, path, types);
+        if (!enumType.is_none()) { return enumType(value); }
+        if (materialize) { return value; }
+        throw std::invalid_argument(fmt::format("Missing destination enum type for: {}", path));
+    }
+    case 14: return types["torch"].attr("device")(NativeString(data, cursor));
+    case 15:
+    {
+        auto const name  = NativeString(data, cursor);
+        auto const shape = NativeShape(data, cursor);
+        bool       empty = false;
+        for (auto const dimension : shape) { empty = empty || dimension == 0; }
+        if (!empty) { throw std::invalid_argument("Native empty tensor has a nonempty shape"); }
+        auto const torch = types["torch"];
+        if (!nb::hasattr(torch, name.c_str())) { throw std::invalid_argument("Unknown native tensor dtype"); }
+        return torch.attr("empty")(PythonShape(shape), nb::arg("dtype") = torch.attr(name.c_str()));
+    }
+    case 16:
+    {
+        auto const device = NativeString(data, cursor);
+        auto const count  = NativeNumber(data, cursor, 8);
+        auto const raw    = TakeNative(data, cursor, count);
+        auto const torch  = types["torch"];
+        nb::object actualDevice
+            = nb::isinstance(target, types["generator"]) ? nb::object(target.attr("device")) : nb::object(nb::str(device.c_str()));
+        auto result = torch.attr("Generator")(nb::arg("device") = actualDevice);
+        auto state  = torch.attr("frombuffer")(nb::module_::import_("builtins").attr("bytearray")(nb::bytes(raw.data(), raw.size())),
+                                               nb::arg("dtype") = torch.attr("uint8"));
+        result.attr("set_state")(state);
+        return result;
+    }
+    default: throw std::invalid_argument(fmt::format("Unsupported native checkpoint value kind: {}", kind));
+    }
+}
+
+nb::object ScalarPythonValue(StateNode::Scalar const& scalar)
+{
+    auto const type = scalar.GetType();
+    if (Primitives64Bit::Type::IsBoolean(type)) { return nb::bool_(scalar.Cast<bool>()); }
+    if (Primitives64Bit::Type::IsSigned(type)) { return nb::int_(scalar.Cast<int64_t>()); }
+    if (Primitives64Bit::Type::IsUnsigned(type)) { return nb::int_(scalar.Cast<uint64_t>()); }
+    if (Primitives64Bit::Type::IsFloat(type)) { return nb::float_(scalar.Cast<double>()); }
+    throw std::invalid_argument("Unsupported checkpoint scalar type");
+}
+
+std::string_view BlobPythonBytes(StateNode::DynamicSizeBlob const& blob)
+{
+    if (blob.storageSize != 0 && blob.handle == 0) { throw std::invalid_argument("Checkpoint blob has no backing storage"); }
+    return {reinterpret_cast<char const*>(blob.handle), static_cast<size_t>(blob.storageSize)};    // NOLINT
+}
+
+bool SameLoadedValue(nb::handle left, nb::handle right, nb::dict const& types, size_t depth = 0)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    if (!left.type().is(right.type())) { return false; }
+    if (nb::isinstance(left, types["array"]))
+    {
+        auto const kind = Str(nb::str(left.attr("dtype").attr("kind")));
+        return left.attr("dtype").equal(right.attr("dtype")) && left.attr("shape").equal(right.attr("shape"))
+               && nb::cast<bool>(types["numpy"].attr("array_equal")(left, right, nb::arg("equal_nan") = (kind == "f" || kind == "c")));
+    }
+    if (nb::isinstance(left, types["tensor"]))
+    {
+        return left.attr("dtype").equal(right.attr("dtype")) && left.attr("shape").equal(right.attr("shape"))
+               && nb::cast<bool>(types["torch"].attr("equal")(left, right));
+    }
+    if (nb::isinstance(left, types["generator"]))
+    {
+        return left.attr("device").equal(right.attr("device"))
+               && nb::cast<bool>(types["torch"].attr("equal")(left.attr("get_state")(), right.attr("get_state")()));
+    }
+    if (nb::isinstance<nb::float_>(left) && std::isnan(nb::cast<double>(left)) && std::isnan(nb::cast<double>(right))) { return true; }
+    if (LoadIsNamespace(left, types)) { return SameLoadedValue(left.attr("__dict__"), right.attr("__dict__"), types, depth + 1); }
+    if (nb::isinstance<nb::dict>(left))
+    {
+        auto const a = nb::cast<nb::dict>(left);
+        auto const b = nb::cast<nb::dict>(right);
+        if (a.size() != b.size()) { return false; }
+        for (auto const& [key, value] : a)
+        {
+            if (!b.contains(key) || !SameLoadedValue(value, b[key], types, depth + 1)) { return false; }
+        }
+        return true;
+    }
+    if (nb::isinstance<nb::list>(left) || nb::isinstance<nb::tuple>(left))
+    {
+        if (nb::len(left) != nb::len(right)) { return false; }
+        for (size_t index = 0; index < nb::len(left); ++index)
+        {
+            if (!SameLoadedValue(left[index], right[index], types, depth + 1)) { return false; }
+        }
+        return true;
+    }
+    return left.equal(right);
+}
+
+bool TerminalLoadedValue(nb::handle value, nb::dict const& types)
+{
+    if (nb::isinstance<nb::dict>(value)) { return false; }
+    if (!nb::isinstance<nb::list>(value)) { return true; }
+    for (auto child : nb::cast<nb::list>(value))
+    {
+        if (nb::isinstance(child, types["tensor"]) || !TerminalLoadedValue(child, types)) { return false; }
+    }
+    return true;
+}
+
+nb::object MergeLoadedSources(ObjectCandidates const&                 candidates,
+                              std::string const&                      path,
+                              std::map<LogicalIndex, uint32_t> const& sources,
+                              nb::dict const&                         types,
+                              bool                                    described,
+                              size_t                                  depth = 0)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    auto const&  first = candidates.begin()->second;
+    LogicalIndex index{path, nb::isinstance(first, types["tensor"]), {}};
+    if (std::get<1>(index)) { std::get<2>(index).resize(nb::len(nb::borrow<nb::object>(first.attr("shape"))), 0); }
+    if (auto const source = sources.find(index); source != sources.end())
+    {
+        auto const selected = candidates.find(source->second);
+        if (selected == candidates.end())
+        {
+            throw std::invalid_argument(fmt::format("Missing selected native dictionary source for: {}", path));
+        }
+        return selected->second;
+    }
+    bool dictionaries = true;
+    bool lists        = true;
+    for (auto const& [rank, value] : candidates)
+    {
+        static_cast<void>(rank);
+        dictionaries = dictionaries && nb::isinstance<nb::dict>(value);
+        lists        = lists && nb::isinstance<nb::list>(value) && !TerminalLoadedValue(value, types);
+    }
+    if (dictionaries)
+    {
+        nb::dict result;
+        for (auto const& [rank, value] : candidates)
+        {
+            static_cast<void>(rank);
+            for (auto const& [key, child] : nb::cast<nb::dict>(value))
+            {
+                static_cast<void>(child);
+                if (result.contains(key)) { continue; }
+                ObjectCandidates children;
+                for (auto const& [owner, item] : candidates)
+                {
+                    auto const dictionary = nb::cast<nb::dict>(item);
+                    if (dictionary.contains(key)) { children.emplace(owner, nb::borrow<nb::object>(dictionary[key])); }
+                }
+                result[key] = MergeLoadedSources(children, LoadPath(path, key), sources, types, described, depth + 1);
+            }
+        }
+        return result;
+    }
+    if (lists)
+    {
+        size_t count = 0;
+        for (auto const& [rank, value] : candidates)
+        {
+            static_cast<void>(rank);
+            count = std::max(count, nb::len(value));
+        }
+        nb::list result;
+        for (size_t position = 0; position < count; ++position)
+        {
+            ObjectCandidates children;
+            for (auto const& [rank, value] : candidates)
+            {
+                if (position < nb::len(value)) { children.emplace(rank, nb::borrow<nb::object>(value[position])); }
+            }
+            result.append(MergeLoadedSources(children, fmt::format("{}.{}", path, position), sources, types, described, depth + 1));
+        }
+        return result;
+    }
+    for (auto const& [rank, value] : candidates)
+    {
+        static_cast<void>(rank);
+        if (!SameLoadedValue(first, value, types))
+        {
+            throw std::invalid_argument(
+                fmt::format(fmt::runtime(described ? "Missing logical source description for conflicting dictionary value: {}"
+                                                   : "Conflicting replicated dictionary value: {}"),
+                            path));
+        }
+    }
+    return first;
+}
+
+std::map<LogicalIndex, uint32_t> SelectLoadedSources(LogicalPlans const& plans)
+{
+    std::vector<LogicalIndex>                  order;
+    std::map<LogicalIndex, std::set<uint32_t>> holders;
+    std::map<LogicalIndex, uint64_t>           costs;
+    std::map<uint32_t, uint64_t>               assigned;
+    for (auto const& [rank, items] : plans)
+    {
+        assigned.emplace(rank, 0);
+        for (auto const& [index, cost] : items)
+        {
+            auto [found, inserted] = holders.try_emplace(index);
+            if (inserted) { order.push_back(index); }
+            found->second.insert(rank);
+            costs[index] = cost;
+        }
+    }
+    std::map<LogicalIndex, uint32_t> selected;
+    for (auto const& index : order)
+    {
+        auto const& ranks = holders.at(index);
+        auto        rank  = *ranks.begin();
+        for (auto const candidate : ranks)
+        {
+            if (assigned.at(candidate) < assigned.at(rank)) { rank = candidate; }
+        }
+        selected.emplace(index, rank);
+        assigned.at(rank) += costs.at(index);
+    }
+    return selected;
+}
+
+void ReadNativeSchema(std::string_view data, uint32_t rank, std::map<std::string, uint8_t>& kinds, LogicalPlans& plans)
+{
+    size_t     cursor = 0;
+    auto const magic  = TakeNative(data, cursor, 8);
+    if (magic != "NVRXNST1" && magic != "NVRXNST2") { throw std::invalid_argument("Unsupported native state schema"); }
+    auto const            count = NativeNumber(data, cursor, 4);
+    std::set<std::string> local;
+    for (uint64_t item = 0; item < count; ++item)
+    {
+        auto key  = NativeString(data, cursor);
+        auto kind = static_cast<uint8_t>(NativeNumber(data, cursor, 1));
+        if (key.empty() || !local.insert(key).second || (kind != 1 && kind != 2 && kind != 3 && kind != 4 && kind != 10 && kind != 20))
+        {
+            throw std::invalid_argument("Invalid native state schema entry");
+        }
+        auto [found, inserted] = kinds.emplace(key, kind);
+        if (!inserted && found->second != kind)
+        {
+            throw std::invalid_argument(fmt::format("Conflicting native storage kinds for: {}", key));
+        }
+    }
+    if (magic == "NVRXNST2")
+    {
+        auto&      items     = plans[rank];
+        auto const itemCount = NativeNumber(data, cursor, 4);
+        for (uint64_t item = 0; item < itemCount; ++item)
+        {
+            auto       key    = NativeString(data, cursor);
+            auto const tensor = NativeNumber(data, cursor, 1);
+            if (key.empty() || tensor > 1) { throw std::invalid_argument("Invalid native logical checkpoint description"); }
+            auto offsets = tensor != 0 ? NativeShape(data, cursor) : std::vector<uint64_t>{};
+            auto cost    = NativeNumber(data, cursor, 8);
+            if (cost == 0) { throw std::invalid_argument("Native logical checkpoint costs are positive"); }
+            items.emplace_back(LogicalIndex{std::move(key), tensor != 0, std::move(offsets)}, cost);
+        }
+    }
+    if (cursor != data.size()) { throw std::invalid_argument("Trailing bytes in native checkpoint value"); }
+}
+
+std::optional<uint32_t> NativeRecordRank(std::string_view path, std::string_view prefix, std::string_view suffix)
+{
+    if (!path.starts_with(prefix) || !path.ends_with(suffix) || path.size() <= prefix.size() + suffix.size()) { return std::nullopt; }
+    path.remove_prefix(prefix.size());
+    path.remove_suffix(suffix.size());
+    uint64_t value = 0;
+    for (auto const digit : path)
+    {
+        if (digit < '0' || digit > '9') { return std::nullopt; }
+        value = value * 10 + static_cast<uint64_t>(digit - '0');
+        if (value > std::numeric_limits<uint32_t>::max())
+        {
+            throw std::invalid_argument("Native checkpoint rank exceeds its supported range");
+        }
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool IsTorchObjectArchive(std::string_view data)
+{
+    constexpr std::string_view LegacyMagic = "\x80\x02\x8a\x0a\x6c\xfc\x9c\x46\xf9\x20\x6a\xa8\x50\x19\x2e";
+    return data.starts_with(LegacyMagic)
+           || (data.size() >= 22 && data.starts_with("PK\003\004") && data.find("/data.pkl") != std::string_view::npos
+               && data.rfind("PK\005\006") != std::string_view::npos);
+}
+
+nb::object LoadArchiveBytes(std::string_view data, nb::dict const& types)
+{
+    auto       value   = types["torch"].attr("load")(nb::module_::import_("io").attr("BytesIO")(nb::bytes(data.data(), data.size())),
+                                                     nb::arg("map_location") = "cpu",
+                                                     nb::arg("weights_only") = false);
+    auto const bytesIO = nb::module_::import_("io").attr("BytesIO");
+    if (nb::isinstance(value, bytesIO))
+    {
+        value.attr("seek")(0);
+        value = types["torch"].attr("load")(value, nb::arg("map_location") = "cpu", nb::arg("weights_only") = false);
+    }
+    return value;
+}
+
+PythonTargets DecodeLoadedObjects(StateTree const& registry, PythonTargets const& targets, nb::dict const& types, bool materialize)
+{
+    std::map<std::string, uint8_t> kinds;
+    LogicalPlans                   plans;
+    bool                           native = false;
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data);
+        if (blob == nullptr) { return; }
+        auto const key  = registry.GetNodeId(node.handle);
+        auto const rank = NativeRecordRank(key, "__nvrx_native_state_rank_", "__");
+        if (rank)
+        {
+            native = true;
+            ReadNativeSchema(BlobPythonBytes(*blob), *rank, kinds, plans);
+        }
+    });
+    PythonTargets                           objects;
+    std::map<std::string, ObjectCandidates> dictionaries;
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const key = registry.GetNodeId(node.handle);
+        if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data))
+        {
+            objects.emplace(key, ScalarPythonValue(*scalar));
+            return;
+        }
+        auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data);
+        if (blob == nullptr || NativeRecordRank(key, "__nvrx_native_state_rank_", "__")) { return; }
+        auto const              raw        = BlobPythonBytes(*blob);
+        std::string             logicalKey = key;
+        std::optional<uint32_t> dictionaryRank;
+        uint8_t                 kind = 0;
+        if (native)
+        {
+            auto found = kinds.find(key);
+            if (found == kinds.end()) { throw std::invalid_argument(fmt::format("Missing native storage schema for: {}", key)); }
+            kind = found->second;
+            if (kind == 20)
+            {
+                auto const split = key.find("__.");
+                if (split == std::string::npos) { throw std::invalid_argument("Invalid rank-local dictionary address"); }
+                dictionaryRank = NativeRecordRank(std::string_view(key).substr(0, split + 2), "__nvrx_native_dict_rank_", "__");
+                if (!dictionaryRank) { throw std::invalid_argument("Invalid rank-local dictionary address"); }
+                logicalKey = key.substr(split + 3);
+            }
+        }
+        auto const expected = targets.find(logicalKey);
+        if (!materialize && expected == targets.end()) { return; }
+        nb::object target = expected == targets.end() ? nb::none() : expected->second;
+        nb::object value;
+        if (native && kind >= 1 && kind <= 4)
+        {
+            if (raw.size() != 8) { throw std::invalid_argument("Native scalar payloads contain exactly eight bytes"); }
+            size_t     cursor = 0;
+            auto const bits   = NativeNumber(raw, cursor, 8);
+            if (kind == 1) { value = nb::int_(std::bit_cast<int64_t>(bits)); }
+            else if (kind == 2) { value = nb::int_(bits); }
+            else if (kind == 3) { value = nb::float_(std::bit_cast<double>(bits)); }
+            else
+            {
+                if (bits > 1) { throw std::invalid_argument("Invalid native boolean value"); }
+                value = nb::bool_(bits != 0);
+            }
+        }
+        else if (native)
+        {
+            size_t cursor = 0;
+            if (TakeNative(raw, cursor, 8) != "NVRXOBJ1") { throw std::invalid_argument("Unsupported native object payload"); }
+            value = DecodeNativeObject(raw, cursor, target, logicalKey, types, materialize || expected == targets.end());
+            if (cursor != raw.size()) { throw std::invalid_argument("Trailing bytes in native checkpoint value"); }
+        }
+        else if (IsTorchObjectArchive(raw)) { value = LoadArchiveBytes(raw, types); }
+        else
+        {
+            value = nb::bytes(raw.data(), raw.size());
+        }
+        if (dictionaryRank)
+        {
+            if (!nb::isinstance<nb::dict>(value))
+            {
+                throw std::invalid_argument("Rank-local native dictionary records contain dictionaries");
+            }
+            dictionaries[logicalKey].emplace(*dictionaryRank, value);
+        }
+        else if (!objects.emplace(logicalKey, value).second)
+        {
+            throw std::invalid_argument(fmt::format("Duplicate native checkpoint object: {}", logicalKey));
+        }
+    });
+    auto const sources = SelectLoadedSources(plans);
+    for (auto const& [key, candidates] : dictionaries)
+    {
+        if (objects.contains(key)) { throw std::invalid_argument(fmt::format("Conflicting native object records: {}", key)); }
+        objects.emplace(key, MergeLoadedSources(candidates, key, sources, types, !plans.empty()));
+    }
+    return objects;
+}
+
+nb::object
+RestoreLoadedValue(nb::handle value, nb::handle target, std::string const& path, nb::dict const& types, size_t depth = 0);    // NOLINT
+
+void RestoreLoadedMapping(nb::dict const& values, nb::dict const& target, std::string const& path, nb::dict const& types, size_t depth)
+{
+    auto const original = target.keys();
+    for (auto const key : original)
+    {
+        if (!values.contains(key))
+        {
+            if (PyDict_DelItem(target.ptr(), key.ptr()) != 0) { throw nb::python_error(); }
+        }
+    }
+    for (auto const& [key, value] : values)
+    {
+        target[key] = RestoreLoadedValue(value, target.get(key, nb::none()), LoadPath(path, key), types, depth + 1);
+    }
+}
+
+nb::object
+RestoreLoadedValue(nb::handle value, nb::handle target, std::string const& path, nb::dict const& types, size_t depth)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    if (nb::isinstance(target, types["enum"])) { return nb::borrow<nb::object>(target.type())(value); }
+    if (nb::isinstance(value, types["generator"]))
+    {
+        auto result = nb::isinstance(target, types["generator"]) ? nb::borrow<nb::object>(target) : nb::borrow<nb::object>(value);
+        result.attr("set_state")(value.attr("get_state")());
+        return result;
+    }
+    if (nb::isinstance(target, types["numpy_scalar"]))
+    {
+        auto const kind = Str(nb::str(target.attr("dtype").attr("kind")));
+        if (kind == "S" || kind == "U") { return nb::borrow<nb::object>(target.type())(value); }
+        auto scalar = types["numpy"].attr("asarray")(value, nb::arg("dtype") = target.attr("dtype"));
+        if (nb::cast<uint64_t>(scalar.attr("ndim")) != 0)
+        {
+            throw std::invalid_argument("Native value does not match the NumPy scalar destination");
+        }
+        return scalar[nb::tuple()];
+    }
+    if (LoadIsNamespace(value, types))
+    {
+        auto result = LoadIsNamespace(target, types) ? nb::borrow<nb::object>(target) : types["namespace"]();
+        RestoreLoadedMapping(nb::cast<nb::dict>(value.attr("__dict__")), nb::cast<nb::dict>(result.attr("__dict__")), path, types, depth);
+        return result;
+    }
+    if (nb::isinstance<nb::dict>(value))
+    {
+        auto result = nb::isinstance<nb::dict>(target) ? nb::cast<nb::dict>(target) : nb::dict();
+        RestoreLoadedMapping(nb::cast<nb::dict>(value), result, path, types, depth);
+        return result;
+    }
+    if (nb::isinstance<nb::list>(value))
+    {
+        auto       result   = nb::isinstance<nb::list>(target) ? nb::cast<nb::list>(target) : nb::list();
+        auto const original = nb::list(result);
+        nb::list   restored;
+        size_t     index = 0;
+        for (auto const child : nb::cast<nb::list>(value))
+        {
+            restored.append(RestoreLoadedValue(child,
+                                               index < original.size() ? nb::borrow<nb::object>(original[index]) : nb::none(),
+                                               fmt::format("{}.{}", path, index),
+                                               types,
+                                               depth + 1));
+            ++index;
+        }
+        result.clear();
+        result.extend(restored);
+        return result;
+    }
+    if (nb::isinstance<nb::tuple>(value))
+    {
+        nb::list restored;
+        size_t   index = 0;
+        for (auto const child : nb::cast<nb::tuple>(value))
+        {
+            auto old = nb::isinstance<nb::tuple>(target) && index < nb::len(target) ? nb::borrow<nb::object>(target[index]) : nb::none();
+            restored.append(RestoreLoadedValue(child, old, fmt::format("{}.{}", path, index), types, depth + 1));
+            ++index;
+        }
+        if (nb::isinstance<nb::tuple>(target) && nb::hasattr(target, "_fields"))
+        {
+            return nb::borrow<nb::object>(target.type())(*restored);
+        }
+        if (nb::isinstance<nb::tuple>(target)) { return nb::borrow<nb::object>(target.type())(restored); }
+        return nb::tuple(restored);
+    }
+    if (nb::isinstance(value, types["array"]))
+    {
+        if (nb::isinstance(target, types["array"]) && target.attr("shape").equal(value.attr("shape"))
+            && target.attr("dtype").equal(value.attr("dtype")))
+        {
+            types["numpy"].attr("copyto")(target, value);
+            return nb::borrow<nb::object>(target);
+        }
+        return nb::borrow<nb::object>(value);
+    }
+    if (nb::isinstance(value, types["tensor"]))
+    {
+        if (nb::isinstance(target, types["tensor"]))
+        {
+            if (!target.attr("shape").equal(value.attr("shape")) || !target.attr("dtype").equal(value.attr("dtype")))
+            {
+                throw std::invalid_argument(fmt::format("Native tensor does not match the destination at: {}", path));
+            }
+            target.attr("detach")().attr("copy_")(value);
+            return nb::borrow<nb::object>(target);
+        }
+        return nb::borrow<nb::object>(value);
+    }
+    if (nb::isinstance<nb::bytes>(value) && nb::isinstance<nb::str>(target)) { return value.attr("decode")("utf-8"); }
+    return nb::borrow<nb::object>(value);
+}
+
+void ScanLoadDestinations(PyStateDictAccessor&           scan,
+                          PythonTargets&                 targets,
+                          nb::handle                     target,
+                          std::string const&             path,
+                          nb::dict const&                types,
+                          std::unordered_set<PyObject*>& active,
+                          size_t                         depth = 0)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    if (!path.empty()) { targets.emplace(path, nb::borrow<nb::object>(target)); }
+    if (nb::isinstance(target, types["tensor"]))
+    {
+        if (!TryRegisterTorchLoadStateDict(scan, nb::str(path.c_str(), path.size()), target))
+        {
+            throw std::invalid_argument(fmt::format("Unsupported tensor destination at: {}", path));
+        }
+        return;
+    }
+    bool const dictionary = nb::isinstance<nb::dict>(target) || LoadIsNamespace(target, types);
+    bool const sequence   = nb::isinstance<nb::list>(target) || nb::isinstance<nb::tuple>(target);
+    if (!dictionary && !sequence)
+    {
+        scan.RegisterStateByFQN(path, std::monostate{});
+        return;
+    }
+    if (!active.insert(target.ptr()).second) { throw std::invalid_argument("Native state contains a recursive container"); }
+    if (dictionary)
+    {
+        auto const values = LoadIsNamespace(target, types) ? nb::cast<nb::dict>(target.attr("__dict__")) : nb::cast<nb::dict>(target);
+        for (auto const& [key, value] : values)
+        {
+            ScanLoadDestinations(scan, targets, value, LoadPath(path, key), types, active, depth + 1);
+        }
+    }
+    else
+    {
+        size_t index = 0;
+        for (auto const value : nb::cast<nb::sequence>(target))
+        {
+            ScanLoadDestinations(scan, targets, value, fmt::format("{}.{}", path, index), types, active, depth + 1);
+            ++index;
+        }
+    }
+    active.erase(target.ptr());
+}
+
+char const* LoadedDtypeName(DType dtype)
+{
+    switch (dtype)
+    {
+    case DType::Float16: return "float16";
+    case DType::BFloat16: return "bfloat16";
+    case DType::Float32: return "float32";
+    case DType::Float64: return "float64";
+    case DType::UInt8: return "uint8";
+    case DType::UInt16: return "uint16";
+    case DType::UInt32: return "uint32";
+    case DType::UInt64: return "uint64";
+    case DType::Int8: return "int8";
+    case DType::Int16: return "int16";
+    case DType::Int32: return "int32";
+    case DType::Int64: return "int64";
+    case DType::Bool: return "bool";
+    default: throw std::invalid_argument("Unsupported loaded tensor dtype");
+    }
+}
+
+void FillTensorDestination(StateNode const& node, nb::handle target, nb::dict const& types)
+{
+    auto const& tensor = std::get<DTensor>(node.data);
+    nb::object  destination
+        = nb::hasattr(target, "_local_tensor") ? nb::object(target.attr("_local_tensor")) : nb::borrow<nb::object>(target);
+    if (tensor.shards.empty())
+    {
+        if (nb::cast<uint64_t>(destination.attr("numel")()) == 0) { return; }
+        throw std::invalid_argument("Loaded tensor has no local storage");
+    }
+    if (tensor.shards.size() != 1) { throw std::invalid_argument("Dense tensor destination requires one local shard"); }
+    auto const& shard = *tensor.shards.begin();
+    if (nb::cast<uint64_t>(destination.attr("numel")()) * Tensor::GetDTypeSize(tensor.durableDtype) != shard.storageSize)
+    {
+        throw std::invalid_argument("Loaded tensor size does not match destination storage");
+    }
+    if (shard.storageSize == 0) { return; }
+    auto const raw   = nb::bytes(reinterpret_cast<char const*>(shard.handle), static_cast<size_t>(shard.storageSize));    // NOLINT
+    auto const torch = types["torch"];
+    auto       value = torch.attr("frombuffer")(nb::module_::import_("builtins").attr("bytearray")(raw),
+                                                nb::arg("dtype") = torch.attr(LoadedDtypeName(tensor.durableDtype)));
+    value            = value.attr("reshape")(destination.attr("shape"));
+    destination.attr("detach")().attr("copy_")(value);
+}
+
+nb::object FillLoadDestinations(StateTree const&     registry,
+                                PythonTargets const& objects,
+                                nb::handle           target,
+                                std::string const&   path,
+                                nb::dict const&      types,
+                                bool                 allowPartial,
+                                size_t               depth = 0)    // NOLINT
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    if (auto found = objects.find(path); found != objects.end())
+    {
+        nb::object destination = nb::borrow<nb::object>(target);
+        if (path == "args" && !target.is_none()) { destination = nb::module_::import_("copy").attr("deepcopy")(target); }
+        return RestoreLoadedValue(found->second, destination, path, types);
+    }
+    if (nb::isinstance(target, types["tensor"]))
+    {
+        auto const handle = registry.FindNodeByFQN(path);
+        if (handle != StateNode::Handle::Invalid && std::holds_alternative<DTensor>(registry.GetNode(handle).data))
+        {
+            FillTensorDestination(registry.GetNode(handle), target, types);
+            return nb::borrow<nb::object>(target);
+        }
+        if (allowPartial) { return nb::borrow<nb::object>(target); }
+        if (nb::hasattr(target, "device_mesh") && target.attr("device_mesh").attr("get_coordinate")().is_none())
+        {
+            return nb::borrow<nb::object>(target);
+        }
+        if (nb::cast<uint64_t>(target.attr("numel")()) == 0) { return nb::borrow<nb::object>(target); }
+        throw std::invalid_argument(fmt::format("Missing checkpoint tensor: {}", path));
+    }
+    if (nb::isinstance<nb::dict>(target) || LoadIsNamespace(target, types))
+    {
+        auto       values = LoadIsNamespace(target, types) ? nb::cast<nb::dict>(target.attr("__dict__")) : nb::cast<nb::dict>(target);
+        auto const keys   = values.keys();
+        for (auto const key : keys)
+        {
+            values[key] = FillLoadDestinations(registry, objects, values[key], LoadPath(path, key), types, allowPartial, depth + 1);
+        }
+        return nb::borrow<nb::object>(target);
+    }
+    if (nb::isinstance<nb::list>(target))
+    {
+        auto values = nb::cast<nb::list>(target);
+        for (size_t index = 0; index < values.size(); ++index)
+        {
+            values[index]
+                = FillLoadDestinations(registry, objects, values[index], fmt::format("{}.{}", path, index), types, allowPartial, depth + 1);
+        }
+        return values;
+    }
+    if (nb::isinstance<nb::tuple>(target))
+    {
+        nb::list values;
+        size_t   index = 0;
+        for (auto const value : nb::cast<nb::tuple>(target))
+        {
+            values.append(
+                FillLoadDestinations(registry, objects, value, fmt::format("{}.{}", path, index), types, allowPartial, depth + 1));
+            ++index;
+        }
+        return nb::hasattr(target, "_fields") ? nb::borrow<nb::object>(target.type())(*values) : nb::object(nb::tuple(values));
+    }
+    if (allowPartial) { return nb::borrow<nb::object>(target); }
+    throw std::invalid_argument(fmt::format("Missing checkpoint value: {}", path));
+}
+
+RankTopology LoadTopology(uint32_t rank, uint32_t worldSize)
+{
+    if (worldSize == 0 || rank >= worldSize) { throw std::invalid_argument("Checkpoint rank is outside its world size"); }
+    return {.rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"}};
+}
+
+void LoadPythonCheckpoint(std::filesystem::path const& path, nb::dict const& state, uint32_t rank, uint32_t worldSize, bool allowPartial)
+{
+    auto                          types    = LoadPythonTypes();
+    auto                          topology = LoadTopology(rank, worldSize);
+    StateTree                     registry(cipc::SessionId::Default, topology);
+    PythonStateTree               owner(cipc::SessionId::Default, std::move(topology));
+    PythonStateTree::Accessor     accessor(&registry, &owner);
+    PythonTargets                 targets;
+    std::unordered_set<PyObject*> active;
+    ScanLoadDestinations(accessor, targets, state, {}, types, active);
+    std::vector<ByteStorage> storage;
+    {
+        nb::gil_scoped_release release;
+        storage = checkpoint::distcp::ReadCheckpoint(path, registry, allowPartial);
+    }
+    auto objects = DecodeLoadedObjects(registry, targets, types, false);
+    static_cast<void>(FillLoadDestinations(registry, objects, state, {}, types, allowPartial));
+}
+
+std::optional<nb::object>
+FindCommonDestination(nb::handle root, std::string const& requested, std::string const& path, nb::dict const& types, size_t depth = 0)
+{
+    if (depth > 100) { throw std::invalid_argument("Native checkpoint nesting exceeds the supported depth"); }
+    if (path == requested) { return nb::borrow<nb::object>(root); }
+    if (!path.empty() && !requested.starts_with(path + '.')) { return std::nullopt; }
+    if (nb::isinstance<nb::dict>(root) || LoadIsNamespace(root, types))
+    {
+        auto const values = LoadIsNamespace(root, types) ? nb::cast<nb::dict>(root.attr("__dict__")) : nb::cast<nb::dict>(root);
+        for (auto const& [key, value] : values)
+        {
+            auto match = FindCommonDestination(value, requested, LoadPath(path, key), types, depth + 1);
+            if (match) { return match; }
+        }
+    }
+    else if (nb::isinstance<nb::list>(root) || nb::isinstance<nb::tuple>(root))
+    {
+        size_t index = 0;
+        for (auto const value : nb::cast<nb::sequence>(root))
+        {
+            auto match = FindCommonDestination(value, requested, fmt::format("{}.{}", path, index), types, depth + 1);
+            if (match) { return match; }
+            ++index;
+        }
+    }
+    return std::nullopt;
+}
+
+nb::dict ReadPythonCommonState(std::filesystem::path const& path)
+{
+    auto                     types = LoadPythonTypes();
+    StateTree                registry(cipc::SessionId::Default, LoadTopology(0, 1));
+    std::vector<ByteStorage> storage;
+    {
+        nb::gil_scoped_release release;
+        storage = checkpoint::distcp::ReadCheckpoint(path, registry);
+    }
+    auto     objects = DecodeLoadedObjects(registry, {}, types, true);
+    nb::dict result;
+    for (auto common = objects.begin(); common != objects.end();)
+    {
+        if (common->first != "common_state/shard_0_1" && !common->first.starts_with("common_state/shard_0_1.rank_"))
+        {
+            ++common;
+            continue;
+        }
+        nb::object value = common->second;
+        if (nb::isinstance<nb::list>(value) && nb::len(value) == 1) { value = value[0]; }
+        if (!nb::isinstance<nb::dict>(value)) { throw std::invalid_argument("Expected one bundled non-tensor state dictionary"); }
+        for (auto const& [key, item] : nb::cast<nb::dict>(value))
+        {
+            if (result.contains(key)) { throw std::invalid_argument("Duplicate bundled checkpoint object"); }
+            nb::object decoded = nb::borrow<nb::object>(item);
+            if (nb::isinstance<nb::bytes>(item))
+            {
+                auto const       bytes = nb::cast<nb::bytes>(item);
+                std::string_view raw(bytes.c_str(), bytes.size());
+                if (IsTorchObjectArchive(raw)) { decoded = LoadArchiveBytes(raw, types); }
+            }
+            result[key] = decoded;
+        }
+        common = objects.erase(common);
+    }
+    for (auto const& [key, value] : objects)
+    {
+        nb::str name(key.c_str(), key.size());
+        auto    previous = FindCommonDestination(result, key, {}, types);
+        if (previous)
+        {
+            auto comparable = value;
+            if (nb::isinstance(*previous, types["enum"]) || nb::isinstance(*previous, types["numpy_scalar"]))
+            {
+                comparable = RestoreLoadedValue(value, *previous, key, types);
+            }
+            if (!SameLoadedValue(*previous, comparable, types))
+            {
+                throw std::invalid_argument(fmt::format("Conflicting archived and independent scalar value: {}", key));
+            }
+        }
+        else
+        {
+            result[name] = value;
+        }
+    }
+    return result;
+}
+}    // namespace
+
 NB_MODULE(checkpoint, m)    // NOLINT
 {
     m.def("ping", &SvcPing);
@@ -772,6 +2305,14 @@ NB_MODULE(checkpoint, m)    // NOLINT
         },
         nb::arg("session_id"),
         nb::arg("iteration"));
+    m.def("load_checkpoint",
+          &LoadPythonCheckpoint,
+          nb::arg("path"),
+          nb::arg("state_dict"),
+          nb::arg("rank")               = 0,
+          nb::arg("world_size")         = 1,
+          nb::arg("allow_partial_load") = false);
+    m.def("read_common_state", &ReadPythonCommonState, nb::arg("path"));
     auto cls = nb::class_<PythonStateTree>(std::move(m), "model_state");
 
     cls.def_static(

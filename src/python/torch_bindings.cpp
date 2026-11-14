@@ -1017,3 +1017,65 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     return false;
 }
+
+bool TryRegisterTorchLoadStateDict(PyStateDictAccessor& scan, nb::str const& key, nb::handle value)
+{
+    if (!IsTorchTensor(value)) { return false; }
+    bool const distributed = IsTorchDTensor(value);
+    if (distributed && value.attr("device_mesh").attr("get_coordinate")().is_none()) { return true; }
+    nb::object const local       = distributed ? nb::object(value.attr("_local_tensor")) : nb::borrow<nb::object>(value);
+    nb::object const dtypeObject = local.attr("dtype");
+    auto const       dtype       = static_cast<DType>(DtypeNameToId(StrView(nb::str(nb::handle(dtypeObject)))));
+    auto const       shape       = nb::cast<nb::tuple>(value.attr("shape"));
+    if (shape.size() > Tensor::MaxDims) { throw std::invalid_argument("Tensor destination has too many dimensions"); }
+    DTensor metadata;
+    metadata.durableDtype = dtype;
+    TensorShard shard{
+        .rank          = scan.GetRankTopo().rank,
+        .snapshotDtype = dtype,
+        .handle        = 0,
+        .storageSize   = Tensor::GetDTypeSize(dtype),
+        .device        = DeviceId{"cpu"},
+    };
+    nb::tuple offsets;
+    nb::tuple sizes;
+    if (distributed)
+    {
+        for (auto const& placement : nb::cast<nb::tuple>(value.attr("placements")))
+        {
+            if (nb::cast<bool>(placement.attr("is_partial")()))
+            {
+                throw std::invalid_argument("DTensor destination has a partial placement");
+            }
+        }
+        auto const chunks = nb::cast<nb::list>(value.attr("__create_chunk_list__")());
+        if (chunks.size() != 1) { throw std::invalid_argument("DTensor destination requires one local chunk"); }
+        offsets = nb::cast<nb::tuple>(chunks[0].attr("offsets"));
+        sizes   = nb::cast<nb::tuple>(chunks[0].attr("sizes"));
+        if (offsets.size() != shape.size() || sizes.size() != shape.size())
+        {
+            throw std::invalid_argument("DTensor destination chunk dimensions do not match its global shape");
+        }
+    }
+    for (size_t axis = 0; axis < shape.size(); ++axis)
+    {
+        auto const extent = nb::cast<uint64_t>(shape[axis]);
+        auto const begin  = distributed ? nb::cast<uint64_t>(offsets[axis]) : 0;
+        auto const count  = distributed ? nb::cast<uint64_t>(sizes[axis]) : extent;
+        if (begin > extent || count > extent - begin) { throw std::invalid_argument("Tensor destination chunk exceeds its global shape"); }
+        if (count != 0 && shard.storageSize > std::numeric_limits<uint64_t>::max() / count)
+        {
+            throw std::overflow_error("Tensor destination size overflows its supported range");
+        }
+        metadata.fulldim.push_back(extent);
+        shard.sharddim.push_back({.begin = begin, .end = begin + count});
+        shard.storageSize *= count;
+    }
+    if (shard.storageSize == 0) { metadata.shards.insert(shard); }
+    else
+    {
+        metadata.AddShard(shard);
+    }
+    scan.RegisterStateByFQN(StrView(key), std::move(metadata));
+    return true;
+}

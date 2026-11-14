@@ -8,7 +8,6 @@ import enum
 import importlib.util
 import io
 import math
-import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -17,25 +16,17 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint._nested_dict import flatten_state_dict
-from torch.distributed.checkpoint.api import CheckpointException
 
 
 @pytest.fixture
-def bundle_load(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    root = Path(__file__).parents[1] / "megatron"
-    native_spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron.native_state", root / "native_state.py")
-    assert native_spec is not None
-    assert native_spec.loader is not None
-    native_module = importlib.util.module_from_spec(native_spec)
-    monkeypatch.setitem(sys.modules, native_spec.name, native_module)
-    native_spec.loader.exec_module(native_module)
-    spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron.native_bundle_load_test", root / "load.py")
+def dictionary_load(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    path = Path(__file__).parents[1] / "megatron" / "load.py"
+    spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron.dictionary_load_test", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for name in ("load", "load_state_dict", "FileSystemReader"):
+    for name in ("load", "load_state_dict"):
         monkeypatch.setattr(dcp, name, getattr(dcp, name))
     monkeypatch.setattr(dcp, module._INSTALL_MARKER, False, raising=False)
     module.install(ModuleType("megatron.training.checkpointing"))
@@ -48,20 +39,18 @@ def _archive(value: object) -> bytes:
     return buffer.getvalue()
 
 
-def _save_bundle(path: Path, objects: dict[str, object], tensors: dict[str, object] | None = None) -> None:
-    state, _ = flatten_state_dict(tensors or {})
-    state["common_state/shard_0_1"] = [objects]
-    dcp.save(state, checkpoint_id=path, planner=DefaultSavePlanner(flatten_state_dict=False))
-
-
 def _save_independent_scalars(path: Path, scalars: dict, objects: tuple = ()) -> None:
     _distcp_shim.write_rank_shard(str(path), 0, [], list(objects), scalars=scalars)
     _distcp_shim.write_metadata(str(path), [], list(objects), scalars=scalars)
 
 
+def _mark_torch_dist(path: Path) -> None:
+    (path / "metadata.json").write_text('{"sharded_backend": "torch_dist", "sharded_backend_version": 1}')
+
+
 @pytest.mark.parametrize("flatten", [True, False])
-def test_independent_scalars_restore_without_object_archives(bundle_load: ModuleType, tmp_path: Path, flatten: bool) -> None:
-    del bundle_load
+def test_independent_scalars_restore_without_object_archives(dictionary_load: ModuleType, tmp_path: Path, flatten: bool) -> None:
+    del dictionary_load
     captured = {"step": -(1 << 63), "maximum": (1 << 64) - 1, "enabled": True, "negative_zero": -0.0}
     _save_independent_scalars(tmp_path, captured)
     target = {"step": 0, "maximum": 0, "enabled": False, "negative_zero": 1.0}
@@ -73,8 +62,8 @@ def test_independent_scalars_restore_without_object_archives(bundle_load: Module
     assert math.copysign(1.0, target["negative_zero"]) == -1.0
 
 
-def test_independent_scalars_load_into_nested_destinations(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_independent_scalars_load_into_nested_destinations(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     _save_independent_scalars(tmp_path, {"optimizer.step": 17, "settings.enabled": True})
     optimizer = {"step": 0}
     target = {"optimizer": optimizer, "settings": {"enabled": False}}
@@ -85,8 +74,8 @@ def test_independent_scalars_load_into_nested_destinations(bundle_load: ModuleTy
     assert target["optimizer"] is optimizer
 
 
-def test_independent_scalar_restores_destination_enum(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_independent_scalar_restores_destination_enum(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
 
     class Mode(enum.IntEnum):
         DISABLED = 0
@@ -100,8 +89,8 @@ def test_independent_scalar_restores_destination_enum(bundle_load: ModuleType, t
     assert target["mode"] is Mode.ENABLED
 
 
-def test_independent_scalars_coexist_with_untouched_common_archive(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_independent_scalars_coexist_with_untouched_common_archive(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     common = {"iteration": 17, "enabled": True, "payload": b"12345678"}
     key = "common_state/shard_0_1"
     _save_independent_scalars(tmp_path, {"iteration": 17, "enabled": True}, ((key, _archive([common])),))
@@ -115,8 +104,8 @@ def test_independent_scalars_coexist_with_untouched_common_archive(bundle_load: 
     assert (tmp_path / "metadata.json").is_file()
 
 
-def test_unmarked_eight_byte_blob_is_not_read_as_a_scalar(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_unmarked_eight_byte_blob_is_not_read_as_a_scalar(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     _save_independent_scalars(tmp_path, {"iteration": 17}, (("opaque", b"12345678"),))
     target = {"iteration": 0}
 
@@ -127,12 +116,10 @@ def test_unmarked_eight_byte_blob_is_not_read_as_a_scalar(bundle_load: ModuleTyp
     assert not hasattr(metadata.state_dict_metadata["opaque"], "nvrx_scalar_type")
 
 
-def test_bootstrap_restores_arguments_and_scalars(bundle_load: ModuleType, tmp_path: Path) -> None:
+def test_bootstrap_restores_arguments_and_scalars(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     arguments = argparse.Namespace(num_layers=12, consumed_train_samples=384)
-    _save_bundle(
-        tmp_path,
-        {"args": _archive(arguments), "iteration": 50, "checkpoint_version": 3.0},
-    )
+    dcp.save({"args": arguments, "iteration": 50, "checkpoint_version": 3.0}, checkpoint_id=tmp_path)
     target = {"args": None, "iteration": None, "checkpoint_version": None}
 
     dcp.load(target, checkpoint_id=tmp_path)
@@ -140,23 +127,23 @@ def test_bootstrap_restores_arguments_and_scalars(bundle_load: ModuleType, tmp_p
     assert vars(target["args"]) == vars(arguments)
     assert target["iteration"] == 50
     assert target["checkpoint_version"] == 3.0
-    assert "iteration" in bundle_load.BundleFileSystemReader(tmp_path).read_metadata().state_dict_metadata
 
 
-def test_full_load_preserves_tensor_and_optimizer_aliases(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_full_load_preserves_tensor_and_optimizer_aliases(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     expected_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     expected_average = torch.ones(2, 3)
-    _save_bundle(
-        tmp_path,
+    dcp.save(
         {
+            "model": {"weight": expected_weight},
+            "optimizer": {
+                "state": {"weight": {"exp_avg": expected_average}},
+                "param_to_group_meta": {"weight": {"lr": 0.002, "step": 7, "betas": (0.8, 0.95)}},
+            },
             "iteration": 7,
-            "optimizer.param_to_group_meta.weight.lr": 0.002,
-            "optimizer.param_to_group_meta.weight.step": 7,
-            "optimizer.param_to_group_meta.weight.betas": _archive((0.8, 0.95)),
-            "rng_state.(0, 0).0.random_rng_state": _archive((3, (1, 2, 3), None)),
+            "rng_state": {"(0, 0)": [{"random_rng_state": (3, (1, 2, 3), None)}]},
         },
-        {"model": {"weight": expected_weight}, "optimizer": {"state": {"weight": {"exp_avg": expected_average}}}},
+        checkpoint_id=tmp_path,
     )
     weight = torch.zeros_like(expected_weight)
     average = torch.zeros_like(expected_average)
@@ -180,18 +167,18 @@ def test_full_load_preserves_tensor_and_optimizer_aliases(bundle_load: ModuleTyp
     assert target["iteration"] == 7
 
 
-def test_missing_bundled_object_is_rejected(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
-    _save_bundle(tmp_path, {"iteration": 7})
+def test_missing_checkpoint_value_is_rejected(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
+    _save_independent_scalars(tmp_path, {"iteration": 7})
 
-    with pytest.raises(CheckpointException, match=r"Missing bundled checkpoint object: optimizer\.step"):
+    with pytest.raises((RuntimeError, ValueError), match=r"(?i)missing.*optimizer.step"):
         dcp.load_state_dict({"optimizer": {"step": 0}}, storage_reader=dcp.FileSystemReader(tmp_path), no_dist=True)
 
 
-def test_bundled_empty_tensor_preserves_destination_identity(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_empty_tensor_preserves_destination_identity(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     empty = torch.empty(0, 3)
-    _save_bundle(tmp_path, {"model.empty": _archive(empty)}, {"model": {"weight": torch.ones(2)}})
+    dcp.save({"model": {"empty": empty, "weight": torch.ones(2)}}, checkpoint_id=tmp_path)
     destination = torch.empty_like(empty, requires_grad=True)
     target = {"model": {"empty": destination, "weight": torch.zeros(2)}}
 
@@ -202,20 +189,10 @@ def test_bundled_empty_tensor_preserves_destination_identity(bundle_load: Module
     torch.testing.assert_close(target["model"]["weight"], torch.ones(2))
 
 
-def test_existing_dcp_checkpoint_uses_default_decoding(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
-    dcp.save({"iteration": 7, "model": {"weight": torch.ones(2)}}, checkpoint_id=tmp_path)
-    target = {"iteration": 0, "model": {"weight": torch.zeros(2)}}
-
-    dcp.load(target, checkpoint_id=tmp_path)
-
-    assert target["iteration"] == 7
-    torch.testing.assert_close(target["model"]["weight"], torch.ones(2))
-
-
-def test_standard_checkpoint_retains_custom_planner_callbacks(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_torch_dist_checkpoint_retains_custom_planner_callbacks(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     dcp.save({"iteration": 7}, checkpoint_id=tmp_path)
+    _mark_torch_dist(tmp_path)
     calls = []
 
     class CustomPlanner(DefaultLoadPlanner):
@@ -231,54 +208,15 @@ def test_standard_checkpoint_retains_custom_planner_callbacks(bundle_load: Modul
     assert target["iteration"] == 107
 
 
-def test_bundle_decode_failure_uses_dcp_error_handling(bundle_load: ModuleType, tmp_path: Path) -> None:
-    _save_bundle(tmp_path, {"args": b"invalid object archive"})
-    reader = bundle_load.BundleFileSystemReader(tmp_path)
-    metadata = reader.read_metadata()
-
-    assert "args" in metadata.state_dict_metadata
-    assert reader.objects == {"args": b"invalid object archive"}
-    with pytest.raises(CheckpointException, match="UnpicklingError"):
-        dcp.load({"args": None}, storage_reader=reader)
-
-
-def test_peer_bundle_restores_rank_specific_objects(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
-    dcp.save(
-        {
-            "common_state/shard_0_1": [{"iteration": 7}],
-            "common_state/shard_0_1.rank_1": io.BytesIO(_archive([{"optimizer.expert4.lr": 0.002}])),
-        },
-        checkpoint_id=tmp_path,
-        planner=DefaultSavePlanner(flatten_state_dict=False),
-    )
-    target = {"iteration": 0, "optimizer": {"expert4": {"lr": 1.0}}}
-
-    dcp.load(target, checkpoint_id=tmp_path)
-
-    assert target == {"iteration": 7, "optimizer": {"expert4": {"lr": 0.002}}}
-
-
-def test_duplicate_peer_bundle_objects_are_rejected(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
-    dcp.save(
-        {
-            "common_state/shard_0_1": [{"iteration": 7}],
-            "common_state/shard_0_1.rank_1": [{"iteration": 8}],
-        },
-        checkpoint_id=tmp_path,
-        planner=DefaultSavePlanner(flatten_state_dict=False),
-    )
-
-    with pytest.raises(CheckpointException, match="Duplicate bundled checkpoint objects"):
-        dcp.load({"iteration": 0}, checkpoint_id=tmp_path)
-
-
-def test_torch_dist_common_state_remains_opaque(bundle_load: ModuleType, tmp_path: Path) -> None:
-    del bundle_load
+def test_torch_dist_common_state_remains_opaque(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    del dictionary_load
     common = {"iteration": 7, "args": argparse.Namespace(num_layers=12)}
-    _save_bundle(tmp_path, common)
-    (tmp_path / "metadata.json").write_text('{"sharded_backend": "torch_dist", "sharded_backend_version": 1}')
+    dcp.save(
+        {"common_state/shard_0_1": [common]},
+        checkpoint_id=tmp_path,
+        planner=DefaultSavePlanner(flatten_state_dict=False),
+    )
+    _mark_torch_dist(tmp_path)
     target = {"common_state/shard_0_1": io.BytesIO()}
 
     dcp.load(target, checkpoint_id=tmp_path)
@@ -286,3 +224,78 @@ def test_torch_dist_common_state_remains_opaque(bundle_load: ModuleType, tmp_pat
     loaded = target["common_state/shard_0_1"]
     assert loaded[0]["iteration"] == 7
     assert vars(loaded[0]["args"]) == {"num_layers": 12}
+
+
+def test_hook_passes_rank_and_partial_load_to_native_binding(
+    dictionary_load: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".metadata").write_bytes(b"native")
+    target = {"iteration": 0}
+    calls = []
+
+    def native_load(path: Path, state: dict, *, rank: int, world_size: int, allow_partial_load: bool) -> None:
+        calls.append((path, state is target, rank, world_size, allow_partial_load))
+        state["iteration"] = 7
+
+    monkeypatch.setattr(dictionary_load.checkpoint, "load_checkpoint", native_load)
+    monkeypatch.setattr(dictionary_load.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dictionary_load.dist, "get_rank", lambda: 2)
+    monkeypatch.setattr(dictionary_load.dist, "get_world_size", lambda: 4)
+
+    dcp.load(target, checkpoint_id=tmp_path, planner=DefaultLoadPlanner(allow_partial_load=True))
+
+    assert calls == [(tmp_path, True, 2, 4, True)]
+    assert target == {"iteration": 7}
+
+
+def test_bootstrap_supplies_runtime_template_without_mutating_it(
+    dictionary_load: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Mode(enum.Enum):
+        SLOW = "slow"
+        FAST = "fast"
+
+    (tmp_path / ".metadata").write_bytes(b"native")
+    checkpointing = ModuleType("native_checkpoint_bootstrap_test")
+    runtime = argparse.Namespace(mode=Mode.SLOW, layers=4)
+
+    def native_load(_path: Path, state: dict, **_kwargs: object) -> None:
+        assert state["args"] is not runtime
+        assert state["args"].mode is Mode.SLOW
+        state["args"].mode = Mode.FAST
+        state["args"].layers = 12
+
+    def load_base_checkpoint(_directory: Path, args: argparse.Namespace, rank0: bool = False) -> dict:
+        assert args is runtime
+        assert rank0
+        target = {"args": None}
+        dcp.load(target, checkpoint_id=tmp_path)
+        return target
+
+    monkeypatch.setattr(dictionary_load.checkpoint, "load_checkpoint", native_load)
+    checkpointing._load_base_checkpoint = load_base_checkpoint
+    dictionary_load.install(checkpointing)
+
+    target = checkpointing._load_base_checkpoint(tmp_path, runtime, rank0=True)
+
+    assert target["args"].mode is Mode.FAST
+    assert target["args"].layers == 12
+    assert runtime.mode is Mode.SLOW
+    assert runtime.layers == 4
+    assert dictionary_load._BOOTSTRAP_TEMPLATE.get() is None
+
+
+def test_install_preserves_filesystem_reader_and_is_idempotent(dictionary_load: ModuleType) -> None:
+    original_reader = dcp.FileSystemReader
+    installed_load = dcp.load
+    installed_load_state_dict = dcp.load_state_dict
+
+    dictionary_load.install(ModuleType("megatron.training.checkpointing"))
+
+    assert dcp.FileSystemReader is original_reader
+    assert dcp.load is installed_load
+    assert dcp.load_state_dict is installed_load_state_dict

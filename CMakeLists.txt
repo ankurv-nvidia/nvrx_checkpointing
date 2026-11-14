@@ -237,7 +237,7 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     SupressWarningForTarget(nanobind-static-abi3)
     SupressLintingForTarget(nanobind-static)
     SupressLintingForTarget(nanobind-static-abi3)
-    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
+    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint distcpio fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
     if (PHOENIX_BUILD_TESTS)
         if (PHOENIX_BUILD_CUDA)
@@ -265,19 +265,7 @@ endif()
 # cpptrace symbolizes the checkpoint_server crash backtrace (demangled, file:line).
 find_package(cpptrace CONFIG REQUIRED)
 
-# Writer library — pure-C++ ZIP+pickle emitter (no Python, no nanobind, no
-# libtorch). Both the production server and the parity-test shim link against
-# this. Format spec lives in the header comment at the top of
-# `src/checkpoint/distcp.cpp`.
-#
-# NOTE: OBJECT library so the same .o files feed both `checkpoint_server` and
-# `_distcp_shim`. CMake propagates OBJECT-lib object files one consumer hop
-# deep, so STATIC/EXECUTABLE consumers more than one level removed must list
-# this target directly in their `target_link_libraries` (see
-# `phoenix_checkpoint_fixture` and `checkpoint_server` below). Promoting to
-# STATIC + POSITION_INDEPENDENT_CODE=ON would let transitive PUBLIC
-# propagation handle this naturally; defer that until a third consumer hits
-# the same wall.
+# Native checkpoint I/O has no Python or libtorch dependency.
 add_library(distcpio OBJECT
     src/checkpoint/distcp.cpp
     src/checkpoint/host_dequant.cpp)

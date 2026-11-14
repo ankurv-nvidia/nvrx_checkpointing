@@ -4507,3 +4507,128 @@ int main(int argc, char* argv[])
 }
 
 // NOLINTEND(readability-magic-numbers)
+
+TEST_CASE("distcp reader assembles local ranges across writer files", "[distcp][read][tier1]")
+{
+    auto const output = CkptDir("reader_shards");
+    std::filesystem::remove_all(output);
+    StateTree   saved(checkpoint::ipc::SessionId{30}, SingleRankTopo(0, 2));
+    Tensor::Dim shape;
+    shape.push_back(4);
+    shape.push_back(3);
+    DTensor weight(Tensor::DType::Float32, shape);
+    for (uint32_t rank = 0; rank < 2; ++rank)
+    {
+        Tensor::DimRange ranges;
+        ranges.push_back({.begin = 2 * rank, .end = 2 * rank + 2});
+        ranges.push_back({.begin = 0, .end = 3});
+        weight.AddShard({.rank          = Rank{rank},
+                         .snapshotDtype = Tensor::DType::Float32,
+                         .handle        = 0,
+                         .storageSize   = 24,
+                         .sharddim      = ranges,
+                         .device        = DeviceId("cpu")});
+    }
+    saved.AddChild(StateNode::Handle::Root, "weight").data  = std::move(weight);
+    auto step                                               = StateNode::Scalar(int64_t{17});
+    step.replicas                                           = {Rank{0}};
+    saved.AddChild(StateNode::Handle::Root, "step").data    = step;
+    auto maximum                                            = StateNode::Scalar(std::numeric_limits<uint64_t>::max());
+    maximum.replicas                                        = {Rank{0}};
+    saved.AddChild(StateNode::Handle::Root, "maximum").data = maximum;
+    auto enabled                                            = StateNode::Scalar(true);
+    enabled.replicas                                        = {Rank{0}};
+    saved.AddChild(StateNode::Handle::Root, "enabled").data = enabled;
+    saved.AddChild(StateNode::Handle::Root, "payload").data
+        = StateNode::DynamicSizeBlob{.replicas = {Rank{1}}, .handle = 24, .storageSize = 8};
+    ByteStorage                first(24), second(32);
+    std::array<float, 6> const firstValues{0, 1, 2, 3, 4, 5}, secondValues{6, 7, 8, 9, 10, 11};
+    std::memcpy(first.data, firstValues.data(), 24);
+    std::memcpy(second.data, secondValues.data(), 24);
+    std::memcpy(static_cast<char*>(second.data) + 24, "12345678", 8);
+    checkpoint::distcp::WriteRankShard(output, Rank{0}, saved, first);
+    checkpoint::distcp::WriteRankShard(output, Rank{1}, saved, second);
+    checkpoint::distcp::WriteMetadata(output, saved);
+
+    StateTree        local(saved.SessionId(), SingleRankTopo(3, 4));
+    DTensor          request(Tensor::DType::Float64, shape);
+    Tensor::DimRange ranges;
+    ranges.push_back({.begin = 1, .end = 3});
+    ranges.push_back({.begin = 1, .end = 3});
+    request.shards.insert({.rank          = Rank{3},
+                           .snapshotDtype = Tensor::DType::Float64,
+                           .handle        = 0,
+                           .storageSize   = 32,
+                           .sharddim      = ranges,
+                           .device        = DeviceId("cpu")});
+    local.AddChild(StateNode::Handle::Root, "weight").data = std::move(request);
+    auto buffers                                           = checkpoint::distcp::ReadCheckpoint(output, local);
+    REQUIRE(buffers.size() == 2);
+    auto const& tensor = std::get<DTensor>(local.GetNode(local.FindNodeByFQN("weight")).data);
+    CHECK(tensor.durableDtype == Tensor::DType::Float32);
+    REQUIRE(tensor.shards.size() == 1);
+    auto const& shard = *tensor.shards.begin();
+    CHECK(shard.rank == Rank{3});
+    CHECK(shard.sharddim == ranges);
+    CHECK(shard.device == DeviceId("cpu"));
+    CHECK(shard.storageSize == 16);
+    std::array<float, 4> values{};
+    std::memcpy(values.data(), reinterpret_cast<void const*>(shard.handle), 16);
+    CHECK(values == (std::array<float, 4>{4, 5, 7, 8}));
+    CHECK(std::get<StateNode::Scalar>(local.GetNode(local.FindNodeByFQN("step")).data).Cast<int64_t>() == 17);
+    CHECK(std::get<StateNode::Scalar>(local.GetNode(local.FindNodeByFQN("maximum")).data).Cast<uint64_t>()
+          == std::numeric_limits<uint64_t>::max());
+    auto const& loadedEnabled = std::get<StateNode::Scalar>(local.GetNode(local.FindNodeByFQN("enabled")).data);
+    CHECK(Primitives64Bit::Type::IsBoolean(loadedEnabled.GetType()));
+    CHECK(loadedEnabled.Cast<bool>());
+    auto const& blob = std::get<StateNode::DynamicSizeBlob>(local.GetNode(local.FindNodeByFQN("payload")).data);
+    CHECK(blob.storageSize == 8);
+    CHECK(std::string_view(reinterpret_cast<char const*>(blob.handle), blob.storageSize) == "12345678");
+    CHECK_FALSE(std::filesystem::exists(output / "__3_0.distcp"));
+    std::filesystem::remove_all(output);
+}
+
+TEST_CASE("distcp reader rejects missing tensors and truncated payloads", "[distcp][read][tier1]")
+{
+    auto const output = CkptDir("reader_errors");
+    std::filesystem::remove_all(output);
+    StateTree saved(checkpoint::ipc::SessionId{31}, SingleRankTopo());
+    AddShardedTensorLeaf(saved, "weight", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+    ByteStorage source(16);
+    std::memset(source.data, 0, 16);
+    checkpoint::distcp::WriteRankShard(output, Rank{0}, saved, source);
+    checkpoint::distcp::WriteMetadata(output, saved);
+    StateTree missing(saved.SessionId(), SingleRankTopo());
+    AddShardedTensorLeaf(missing, "absent", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+    REQUIRE_THROWS_WITH(checkpoint::distcp::ReadCheckpoint(output, missing), "distcp: missing checkpoint tensor 'absent'");
+    REQUIRE_NOTHROW(checkpoint::distcp::ReadCheckpoint(output, missing, true));
+    CHECK(missing.GetNode(missing.FindNodeByFQN("absent")).GetType() == StateNode::Type::Invalid);
+    StateTree target(saved.SessionId(), SingleRankTopo());
+    AddShardedTensorLeaf(target, "weight", Tensor::DType::Float32, {2, 2}, Rank{0}, 0);
+    auto const file = output / "__0_0.distcp";
+    std::filesystem::resize_file(file, std::filesystem::file_size(file) - 1);
+    REQUIRE_THROWS_WITH(checkpoint::distcp::ReadCheckpoint(output, target), "distcp: truncated checkpoint payload '__0_0.distcp'");
+    std::filesystem::remove_all(output);
+}
+
+TEST_CASE("distcp metadata reader treats pickle globals as inert data", "[distcp][read][tier1]")
+{
+    auto const output = CkptDir("reader_pickle");
+    std::filesystem::remove_all(output);
+    std::filesystem::create_directories(output);
+    auto const  sentinel = output / "unexpected";
+    auto const  command  = "touch " + sentinel.string();
+    std::string pickle("\x80\x02"
+                       "cos\nsystem\n",
+                       13);
+    pickle.push_back('X');
+    auto const count = static_cast<uint32_t>(command.size());
+    for (size_t index = 0; index < 4; ++index) { pickle.push_back(static_cast<char>((count >> (index * 8)) & 0xff)); }
+    pickle += command;
+    pickle += "\x85R.";
+    std::ofstream(output / ".metadata", std::ios::binary).write(pickle.data(), static_cast<std::streamsize>(pickle.size()));
+    StateTree target(checkpoint::ipc::SessionId{32}, SingleRankTopo());
+    REQUIRE_THROWS(checkpoint::distcp::ReadCheckpoint(output, target));
+    CHECK_FALSE(std::filesystem::exists(sentinel));
+    std::filesystem::remove_all(output);
+}

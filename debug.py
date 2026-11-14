@@ -271,20 +271,12 @@ def _is_plain_dcp(checkpoint_dir: Path, state_dict_metadata: dict) -> bool:
     return not (checkpoint_dir / "common.pt").is_file() and _DCP_COMMON_STATE_KEY not in state_dict_metadata
 
 
-def _native_common_state(reader: FileSystemReader, metadata: object) -> dict:
+def _native_common_state(reader: FileSystemReader) -> dict:
     from torch.distributed.checkpoint._nested_dict import flatten_state_dict  # noqa: PLC0415
 
-    from .megatron.native_state import (  # noqa: PLC0415
-        materialize_native_value,
-        read_native_state,
-        restore_native_value,
-    )
+    from . import checkpoint  # noqa: PLC0415
 
-    objects = read_native_state(reader, metadata)
-    args = objects.get("args")
-    if isinstance(args, argparse.Namespace):
-        objects["args"] = restore_native_value(args, None, "args")
-    return flatten_state_dict({key: materialize_native_value(value) for key, value in objects.items()})[0]
+    return flatten_state_dict(checkpoint.read_common_state(Path(reader.path)))[0]
 
 
 def _scalar_locations(common: dict, scalars: dict) -> dict:
@@ -317,20 +309,43 @@ def _scalar_locations(common: dict, scalars: dict) -> dict:
     return locations
 
 
-def _merge_scalar_state(common: dict, reader: FileSystemReader, metadata: object) -> dict:
-    from .megatron.native_state import _read_entry, restore_native_value  # noqa: PLC0415
+def _read_checkpoint_entry(reader: FileSystemReader, metadata: object, key: str) -> bytes:
+    location = metadata.storage_data[MetadataIndex(key)]
+    with (Path(reader.path) / location.relative_path).open("rb") as stream:
+        stream.seek(location.offset)
+        raw = stream.read(location.length)
+    if len(raw) != location.length:
+        raise ValueError(f"Truncated checkpoint entry: {key}")
+    return raw
 
-    scalars = {
-        key: decode_scalar(storage, _read_entry(reader, metadata, key))
-        for key, storage in metadata.state_dict_metadata.items()
-        if scalar_storage_type(storage) is not None
-    }
+
+def _bundled_common_state(reader: FileSystemReader, metadata: object) -> dict:
+    common = {}
+    for key in metadata.state_dict_metadata:
+        if key != _DCP_COMMON_STATE_KEY and not key.startswith(f"{_DCP_COMMON_STATE_KEY}.rank_"):
+            continue
+        values = _load_bytes_storage_value(_read_checkpoint_entry(reader, metadata, key))
+        if not isinstance(values, dict):
+            raise TypeError("Expected a bundled non-tensor state dictionary")
+        if duplicates := common.keys() & values.keys():
+            raise ValueError(f"Duplicate bundled checkpoint objects: {sorted(duplicates)}")
+        common.update({name: _load_bytes_storage_value(value) if isinstance(value, bytes) else value for name, value in values.items()})
+    return common
+
+
+def _merge_scalar_state(common: dict, reader: FileSystemReader, metadata: object) -> dict:
+    scalars = {}
+    for key, storage in metadata.state_dict_metadata.items():
+        if scalar_storage_type(storage) is None:
+            continue
+        scalars[key] = decode_scalar(storage, _read_checkpoint_entry(reader, metadata, key))
     locations = _scalar_locations(common, scalars)
     for key, value in scalars.items():
         if key in locations:
             expected, actual = {}, {}
             flatten_to_entries(key, locations[key], expected)
-            flatten_to_entries(key, restore_native_value(value, locations[key], key), actual)
+            restored = type(locations[key])(value) if isinstance(locations[key], (enum.Enum, np.generic)) else value
+            flatten_to_entries(key, restored, actual)
             if actual != expected:
                 raise ValueError(f"Conflicting archived and independent scalar value: {key}")
         else:
@@ -350,10 +365,8 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
 
     reader = FileSystemReader(str(checkpoint_dir))
     metadata = reader.read_metadata()
-    from .megatron.native_state import is_native_state  # noqa: PLC0415
-
-    if is_native_state(metadata):
-        return _native_common_state(reader, metadata)
+    if any(re.fullmatch(r"__nvrx_native_state_rank_\d+__", key) for key in metadata.state_dict_metadata):
+        return _native_common_state(reader)
     state_dict_metadata = metadata.state_dict_metadata
     if _is_plain_dcp(checkpoint_dir, state_dict_metadata):
         objects = {
@@ -365,9 +378,7 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
         return _merge_scalar_state(objects, reader, metadata)
 
     if not (checkpoint_dir / "metadata.json").is_file():
-        from .megatron.load import read_common_state  # noqa: PLC0415
-
-        return _merge_scalar_state(read_common_state(reader, metadata), reader, metadata)
+        return _merge_scalar_state(_bundled_common_state(reader, metadata), reader, metadata)
 
     state_dict = {_DCP_COMMON_STATE_KEY: io.BytesIO()}
     torch.distributed.checkpoint.load(

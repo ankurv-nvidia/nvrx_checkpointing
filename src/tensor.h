@@ -264,8 +264,8 @@ struct Tensor
         case DType::UInt16: return 2;
         case DType::UInt32: return 4;
         case DType::UInt64: return 8;
+        case DType::Bool: return 1;
 
-        case DType::Bool:
         case DType::FP8E4M3:
         case DType::MXFP8:
         case DType::NVFP4:

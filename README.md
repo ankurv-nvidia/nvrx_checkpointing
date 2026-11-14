@@ -135,12 +135,16 @@ Megatron's existing preprocessing still gathers uneven shard geometry across
 training ranks.
 
 Load these checkpoints through the integration entrypoint too. Its load
-adapter restores native values using the supplied destination dictionary's
-types and delegates tensor reads to PyTorch DCP. Rank-local dictionaries retain
-peer-owned optimizer entries. Supported objects include namespaces, ordinary
-containers, NumPy arrays, enums, and RNG generators; arbitrary Python objects
-are rejected during capture. Existing Megatron `fsdp_dtensor` checkpoints
-remain loadable through this entrypoint.
+hook calls the native binding, which scans the destination dictionary into a
+local state tree. The C++ reader uses global DCP metadata to read the requested
+tensor ranges and non-tensor payloads into that tree and owned buffers. A
+second dictionary scan restores values and copies tensors into their existing
+storage. DTensors retain their local storage and aliases. Runtime templates
+supply Python types for bootstrap arguments and dynamic containers.
+Rank-local dictionaries retain peer-owned optimizer entries. Supported objects
+include namespaces, ordinary containers, NumPy arrays, enums, and RNG
+generators; arbitrary Python objects are rejected during capture. Existing
+Megatron `fsdp_dtensor` checkpoints remain loadable through this entrypoint.
 
 The `fsdp_2gpu` CI profile keeps eight experts with EP2 and uses TP1. Select
 it in the CI launcher with `--config fsdp_2gpu --gpus-per-node 2`.

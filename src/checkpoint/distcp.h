@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace checkpoint::distcp
 {
@@ -17,8 +18,9 @@ WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const&
 
 // Emit the global .metadata. Blob ownership is the lowest rank in each FQN's
 // rank map.
-void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry);
-void WriteMetadata(std::filesystem::path const&                     ckptDir,
-                   StateTree const&                                 snapshotRegistry,
-                   std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes);
+void                     WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry);
+void                     WriteMetadata(std::filesystem::path const&                     ckptDir,
+                                       StateTree const&                                 snapshotRegistry,
+                                       std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes);
+std::vector<ByteStorage> ReadCheckpoint(std::filesystem::path const& ckptDir, StateTree& localRegistry, bool allowPartialLoad = false);
 }    // namespace checkpoint::distcp

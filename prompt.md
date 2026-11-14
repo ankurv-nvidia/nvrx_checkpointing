@@ -1,5 +1,60 @@
 # Hand-off: the `dtensor` branch of nvrx_checkpointing
 
+## Native three-stage load, 2026-11-14
+
+The owner approves a native load path with three stages:
+
+1. The binding scans the supplied dictionary into a local request registry.
+   Tensor requests contain destination global shape, datatype, and local chunk
+   ranges. The scan reads metadata without copying destination tensor data.
+2. The reader in `distcp.cpp` parses global `.metadata`, locates the requested
+   chunks across writer files, and fills the registry and owned byte buffers.
+   It decodes tensor ZIP archives and assembles overlapping saved ranges.
+   Writer rank is independent of the destination rank.
+3. The binding traverses the destination dictionary again and restores values.
+   Tensor copies target existing local storage. Containers, arrays, enums, and
+   generators use the supplied destinations; missing members are restored from
+   saved structure. Runtime argument templates support bootstrap loads.
+
+The public bindings are `checkpoint.load_checkpoint(path, state_dict, rank=0,
+world_size=1, allow_partial_load=False)` and `checkpoint.read_common_state(path)`.
+The existing I/O header declares `distcp::ReadCheckpoint`, which returns owned
+backing storage for the populated state tree. The metadata parser treats pickle
+globals as inert data. It supports the metadata and tensor archive structures
+covered by native checkpoints and stock PyTorch metadata protocols 2, 4, and 5.
+
+`megatron/load.py` contains only function hooks. The Python reader/planner
+classes and Python native codec are removed. The separate `native_state.h` is
+removed; save conversion and load restoration live in the existing binding
+sources. The structured save format, scalar metadata, and daemon owner policy
+retain their existing behavior. Ordinary `torch_dist` loads that use Megatron's
+custom planner continue through that planner.
+
+Unmarked generic DCP byte entries use standard object-archive interpretation.
+A complete Torch archive stored as an unmarked opaque blob is ambiguous with
+a standard DCP object archive. Structured native byte values have an explicit
+storage kind and retain exact bytes, including embedded Torch archives. Debug
+tools retain inspection of the earlier branch's common-state bundles.
+
+Validation passes 651 Python tests with 84 environment-dependent skips. The
+focused load/debug suite passes all 80 cases, including native loads with
+Python checkpoint readers disabled. The CPU public-load suite passes all 69
+cases. Of 94 native CTest cases, 92 pass in the isolated environment; the
+forwarding case separately passes all 17 assertions, and the external registry
+fixture is unavailable. The three new native reader cases pass 21 assertions.
+Another 21 stock-checkpoint variants cover metadata protocols, tensor views,
+booleans, scalar tensors, and empty tensors.
+The isolated daemon suite passes 98 cases with two CUDA-only skips, including
+all 28 focused native cases.
+
+The fresh two-GPU eight-expert MoE CI run resumes both ranks at iteration 50
+and saves through 125. All five checkpoints match the reference exactly:
+3,209 entries at 25/50 and 3,208 at 75/100/125, with no missing, extra, or
+changed entries. Worker, epilog, argument, save-span, and telemetry checks pass.
+
+The earlier four-GPU tensor comparison issue remains open. Globally empty
+DTensor capture remains the separate coverage boundary described below.
+
 ## Independent scalar storage, 2026-11-14
 
 The owner requires independent scalar persistence for every state node,

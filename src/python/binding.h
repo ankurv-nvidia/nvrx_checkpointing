@@ -75,6 +75,7 @@ class PyStateDictAccessor
 };
 
 bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nanobind::str const& key, nanobind::handle val);
+bool TryRegisterTorchLoadStateDict(PyStateDictAccessor& scan, nanobind::str const& key, nanobind::handle value);
 
 // Detect a list-of-DTensor (what `apply_factories` produces in place of a
 // ShardedTensorFactory) and register every element. Returns false on any other

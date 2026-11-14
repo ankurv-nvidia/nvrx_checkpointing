@@ -21,6 +21,7 @@
 #include <ios>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <span>
@@ -1296,6 +1297,844 @@ void WriteMetadata(std::filesystem::path const&                     ckptDir,
     auto configOutput = OpenOutputFile(configPath);
     WriteBytes(configOutput, ConfigJson.data(), ConfigJson.size(), configPath.string());
     FinishOutputFile(configOutput, configPath);
+}
+
+namespace
+{
+struct PickleValue
+{
+    enum class Kind : uint8_t
+    {
+        None,
+        Integer,
+        String,
+        Sequence,
+        Dictionary,
+        Global,
+        Object,
+        Mark
+    };
+    using Ref = std::shared_ptr<PickleValue>;
+    Kind                             kind{Kind::None};
+    uint64_t                         integer{};
+    bool                             negative{};
+    std::string                      text;
+    std::vector<Ref>                 items;
+    std::vector<std::pair<Ref, Ref>> entries;
+    Ref                              state;
+};
+
+using PickleRef = PickleValue::Ref;
+
+struct PickleReader
+{
+    std::span<char const>  bytes;
+    size_t                 cursor{};
+    std::vector<PickleRef> stack;
+    std::vector<PickleRef> memo;
+
+    explicit PickleReader(std::span<char const> input LFTBND) : bytes(input) {}
+
+    std::span<char const> Take(uint64_t count)
+    {
+        if (count > bytes.size() - cursor) { throw std::runtime_error("distcp: truncated pickle metadata"); }
+        auto result = bytes.subspan(cursor, static_cast<size_t>(count));
+        cursor += static_cast<size_t>(count);
+        return result;
+    }
+    uint64_t Number(size_t width)
+    {
+        uint64_t   result{};
+        auto const data = Take(width);
+        for (size_t index = 0; index < width; ++index)
+        {
+            result |= static_cast<uint64_t>(static_cast<unsigned char>(data[index])) << (index * 8);
+        }
+        return result;
+    }
+    std::string Text(uint64_t length)
+    {
+        auto const data = Take(length);
+        return {data.data(), data.size()};
+    }
+    std::string Line()
+    {
+        auto const start = cursor;
+        while (cursor < bytes.size() && bytes[cursor] != '\n') { ++cursor; }
+        if (cursor == bytes.size()) { throw std::runtime_error("distcp: unterminated pickle string"); }
+        auto result = std::string(bytes.data() + start, cursor - start);
+        ++cursor;
+        return result;
+    }
+    static PickleRef Make(PickleValue::Kind kind)
+    {
+        auto value  = std::make_shared<PickleValue>();
+        value->kind = kind;
+        return value;
+    }
+    void PushText(std::string text, PickleValue::Kind kind = PickleValue::Kind::String)
+    {
+        auto value  = Make(kind);
+        value->text = std::move(text);
+        stack.push_back(std::move(value));
+    }
+    void PushNumber(uint64_t number, bool negative = false)
+    {
+        auto value      = Make(PickleValue::Kind::Integer);
+        value->integer  = number;
+        value->negative = negative;
+        stack.push_back(std::move(value));
+    }
+    PickleRef Pop()
+    {
+        if (stack.empty()) { throw std::runtime_error("distcp: invalid pickle stack"); }
+        auto value = stack.back();
+        stack.pop_back();
+        return value;
+    }
+    size_t Mark() const
+    {
+        for (size_t index = stack.size(); index != 0; --index)
+        {
+            if (stack[index - 1]->kind == PickleValue::Kind::Mark) { return index - 1; }
+        }
+        throw std::runtime_error("distcp: missing pickle mark");
+    }
+    void Sequence(size_t count)
+    {
+        if (count > stack.size()) { throw std::runtime_error("distcp: invalid pickle sequence"); }
+        auto       value = Make(PickleValue::Kind::Sequence);
+        auto const start = stack.size() - count;
+        value->items.assign(stack.begin() + static_cast<std::ptrdiff_t>(start), stack.end());
+        stack.resize(start);
+        stack.push_back(std::move(value));
+    }
+    void Store(size_t index)
+    {
+        if (stack.empty() || index > bytes.size()) { throw std::runtime_error("distcp: invalid pickle memo index"); }
+        if (memo.size() <= index) { memo.resize(index + 1); }
+        memo[index] = stack.back();
+    }
+    void Recall(size_t index)
+    {
+        if (index >= memo.size() || !memo[index]) { throw std::runtime_error("distcp: missing pickle memo value"); }
+        stack.push_back(memo[index]);
+    }
+    void Object()
+    {
+        auto args = Pop();
+        auto type = Pop();
+        if (type->kind != PickleValue::Kind::Global || args->kind != PickleValue::Kind::Sequence)
+        {
+            throw std::runtime_error("distcp: invalid pickle object");
+        }
+        if (type->text == "torch.Size")
+        {
+            if (args->items.size() != 1 || args->items[0]->kind != PickleValue::Kind::Sequence)
+            {
+                throw std::runtime_error("distcp: invalid tensor size metadata");
+            }
+            stack.push_back(args->items[0]);
+            return;
+        }
+        auto value   = Make(PickleValue::Kind::Object);
+        value->text  = type->text;
+        value->items = args->items;
+        stack.push_back(std::move(value));
+    }
+    PickleRef Read()
+    {
+        while (cursor < bytes.size())
+        {
+            auto const opcode = Number(1);
+            switch (opcode)
+            {
+            case 0x80:
+                if (Number(1) > 5) { throw std::runtime_error("distcp: unsupported pickle protocol"); }
+                break;
+            case 0x95:
+                if (Number(8) > bytes.size() - cursor) { throw std::runtime_error("distcp: truncated pickle frame"); }
+                break;
+            case '.':
+                if (stack.size() != 1 || cursor != bytes.size()) { throw std::runtime_error("distcp: invalid pickle result"); }
+                return stack.back();
+            case '(': stack.push_back(Make(PickleValue::Kind::Mark)); break;
+            case 'N': stack.push_back(Make(PickleValue::Kind::None)); break;
+            case 0x88: PushNumber(1); break;
+            case 0x89: PushNumber(0); break;
+            case 'K': PushNumber(Number(1)); break;
+            case 'M': PushNumber(Number(2)); break;
+            case 'J':
+            {
+                auto const number = Number(4);
+                PushNumber(number, (number & 0x80000000ULL) != 0);
+                break;
+            }
+            case 0x8a:
+            case 0x8b:
+            {
+                auto const length = Number(opcode == 0x8a ? 1 : 4);
+                if (length > 9) { throw std::runtime_error("distcp: pickle integer exceeds 64 bits"); }
+                auto data  = Take(length);
+                auto value = uint64_t{};
+                for (size_t index = 0; index < std::min<size_t>(data.size(), 8); ++index)
+                {
+                    value |= static_cast<uint64_t>(static_cast<unsigned char>(data[index])) << (index * 8);
+                }
+                if (length == 9 && data[8] != 0) { throw std::runtime_error("distcp: pickle integer exceeds 64 bits"); }
+                PushNumber(value, length != 0 && (static_cast<unsigned char>(data.back()) & 0x80U) != 0);
+                break;
+            }
+            case 'G':
+                Take(8);
+                stack.push_back(Make(PickleValue::Kind::None));
+                break;
+            case 'X':
+            case 'B':
+            case 'T': PushText(Text(Number(4))); break;
+            case 0x8c:
+            case 'C':
+            case 'U': PushText(Text(Number(1))); break;
+            case 0x8d:
+            case 0x8e:
+            case 0x96: PushText(Text(Number(8))); break;
+            case 'c':
+            {
+                auto module = Line();
+                auto name   = Line();
+                PushText(module + "." + name, PickleValue::Kind::Global);
+                break;
+            }
+            case 0x93:
+            {
+                auto name   = Pop();
+                auto module = Pop();
+                if (name->kind != PickleValue::Kind::String || module->kind != PickleValue::Kind::String)
+                {
+                    throw std::runtime_error("distcp: invalid pickle global");
+                }
+                PushText(module->text + "." + name->text, PickleValue::Kind::Global);
+                break;
+            }
+            case ')':
+            case ']': stack.push_back(Make(PickleValue::Kind::Sequence)); break;
+            case '}': stack.push_back(Make(PickleValue::Kind::Dictionary)); break;
+            case 0x85: Sequence(1); break;
+            case 0x86: Sequence(2); break;
+            case 0x87: Sequence(3); break;
+            case 't':
+            case 'l':
+            {
+                auto const mark = Mark();
+                Sequence(stack.size() - mark - 1);
+                auto value = Pop();
+                Pop();
+                stack.push_back(std::move(value));
+                break;
+            }
+            case 'd':
+            {
+                auto const mark = Mark();
+                if (((stack.size() - mark - 1) % 2) != 0) { throw std::runtime_error("distcp: invalid pickle dictionary"); }
+                auto value = Make(PickleValue::Kind::Dictionary);
+                for (size_t index = mark + 1; index < stack.size(); index += 2)
+                {
+                    value->entries.emplace_back(stack[index], stack[index + 1]);
+                }
+                stack.resize(mark);
+                stack.push_back(std::move(value));
+                break;
+            }
+            case 'a':
+            {
+                auto value = Pop();
+                if (stack.empty() || stack.back()->kind != PickleValue::Kind::Sequence)
+                {
+                    throw std::runtime_error("distcp: invalid pickle append");
+                }
+                stack.back()->items.push_back(std::move(value));
+                break;
+            }
+            case 'e':
+            case 'u':
+            {
+                auto const mark = Mark();
+                if (mark == 0) { throw std::runtime_error("distcp: invalid pickle container"); }
+                auto& target = stack[mark - 1];
+                if (opcode == 'e' && target->kind == PickleValue::Kind::Sequence)
+                {
+                    target->items.insert(target->items.end(), stack.begin() + static_cast<std::ptrdiff_t>(mark + 1), stack.end());
+                }
+                else if (opcode == 'u' && target->kind == PickleValue::Kind::Dictionary && ((stack.size() - mark - 1) % 2) == 0)
+                {
+                    for (size_t index = mark + 1; index < stack.size(); index += 2)
+                    {
+                        target->entries.emplace_back(stack[index], stack[index + 1]);
+                    }
+                }
+                else
+                {
+                    throw std::runtime_error("distcp: invalid pickle container contents");
+                }
+                stack.resize(mark);
+                break;
+            }
+            case 's':
+            {
+                auto value = Pop();
+                auto key   = Pop();
+                if (stack.empty() || stack.back()->kind != PickleValue::Kind::Dictionary)
+                {
+                    throw std::runtime_error("distcp: invalid pickle item");
+                }
+                stack.back()->entries.emplace_back(std::move(key), std::move(value));
+                break;
+            }
+            case 0x81:
+            case 'R': Object(); break;
+            case 0x92:
+            {
+                auto kwargs = Pop();
+                if (kwargs->kind != PickleValue::Kind::Dictionary) { throw std::runtime_error("distcp: invalid pickle keyword arguments"); }
+                Object();
+                break;
+            }
+            case 'b':
+            {
+                auto state = Pop();
+                if (stack.empty() || stack.back()->kind != PickleValue::Kind::Object)
+                {
+                    throw std::runtime_error("distcp: invalid pickle object state");
+                }
+                stack.back()->state = std::move(state);
+                break;
+            }
+            case 'Q':
+            {
+                auto value  = Make(PickleValue::Kind::Object);
+                value->text = "persistent";
+                value->items.push_back(Pop());
+                stack.push_back(std::move(value));
+                break;
+            }
+            case 'q': Store(static_cast<size_t>(Number(1))); break;
+            case 'r': Store(static_cast<size_t>(Number(4))); break;
+            case 0x94: Store(memo.size()); break;
+            case 'h': Recall(static_cast<size_t>(Number(1))); break;
+            case 'j': Recall(static_cast<size_t>(Number(4))); break;
+            case '0': Pop(); break;
+            case '1': stack.resize(Mark()); break;
+            case '2':
+                if (stack.empty()) { throw std::runtime_error("distcp: invalid pickle duplicate"); }
+                stack.push_back(stack.back());
+                break;
+            default: throw std::runtime_error(fmt::format("distcp: unsupported pickle opcode {:#x}", opcode));
+            }
+        }
+        throw std::runtime_error("distcp: missing pickle stop");
+    }
+};
+
+static PickleRef Field(PickleRef const& object, std::string_view name, bool required = true)
+{
+    auto value = object;
+    if (value && value->kind == PickleValue::Kind::Object) { value = value->state; }
+    if (value && value->kind == PickleValue::Kind::Dictionary)
+    {
+        for (auto item = value->entries.rbegin(); item != value->entries.rend(); ++item)
+        {
+            if (item->first->kind == PickleValue::Kind::String && item->first->text == name) { return item->second; }
+        }
+    }
+    if (required) { throw std::runtime_error(fmt::format("distcp: missing metadata field '{}'", name)); }
+    return {};
+}
+
+static uint64_t MetadataNumber(PickleRef const& value)
+{
+    if (!value || value->kind != PickleValue::Kind::Integer || value->negative)
+    {
+        throw std::runtime_error("distcp: metadata requires an unsigned integer");
+    }
+    return value->integer;
+}
+
+static std::string const& MetadataText(PickleRef const& value)
+{
+    if (!value || value->kind != PickleValue::Kind::String) { throw std::runtime_error("distcp: metadata requires a string"); }
+    return value->text;
+}
+
+static Tensor::Dim MetadataDimensions(PickleRef const& value)
+{
+    if (!value || value->kind != PickleValue::Kind::Sequence || value->items.size() > Tensor::MaxDims)
+    {
+        throw std::runtime_error("distcp: invalid tensor dimensions");
+    }
+    Tensor::Dim result;
+    for (auto const& dimension : value->items) { result.push_back(MetadataNumber(dimension)); }
+    return result;
+}
+
+static uint64_t CheckedMultiply(uint64_t left, uint64_t right)
+{
+    if (right != 0 && left > std::numeric_limits<uint64_t>::max() / right) { throw std::overflow_error("distcp: tensor size overflow"); }
+    return left * right;
+}
+
+static uint64_t ElementSize(Tensor::DType dtype)
+{ return dtype == Tensor::DType::Bool ? uint64_t{1} : Tensor::GetDTypeSize(dtype); }
+
+static uint64_t DenseSize(Tensor::DimRange const& ranges, Tensor::DType dtype)
+{
+    uint64_t result = ElementSize(dtype);
+    for (auto const range : ranges)
+    {
+        if (range.end < range.begin) { throw std::runtime_error("distcp: inverted tensor range"); }
+        result = CheckedMultiply(result, range.end - range.begin);
+    }
+    return result;
+}
+
+static Tensor::DType MetadataDtype(PickleRef const& properties)
+{
+    auto value = Field(properties, "dtype", false);
+    if (!value && properties->state && properties->state->kind == PickleValue::Kind::Sequence && !properties->state->items.empty())
+    {
+        value = properties->state->items[0];
+    }
+    if (!value || value->kind != PickleValue::Kind::Global || !value->text.starts_with("torch."))
+    {
+        throw std::runtime_error("distcp: invalid tensor datatype");
+    }
+    auto const name = std::string_view(value->text).substr(6);
+    for (auto dtype : {Tensor::DType::Float16,
+                       Tensor::DType::BFloat16,
+                       Tensor::DType::Float32,
+                       Tensor::DType::Float64,
+                       Tensor::DType::UInt8,
+                       Tensor::DType::UInt16,
+                       Tensor::DType::UInt32,
+                       Tensor::DType::UInt64,
+                       Tensor::DType::Int8,
+                       Tensor::DType::Int16,
+                       Tensor::DType::Int32,
+                       Tensor::DType::Int64,
+                       Tensor::DType::Bool})
+    {
+        if (DTypeName(dtype) == name) { return dtype; }
+    }
+    throw std::runtime_error(fmt::format("distcp: unsupported tensor datatype '{}'", name));
+}
+
+struct ReadLocation
+{
+    std::string path;
+    uint64_t    offset{};
+    uint64_t    length{};
+};
+
+using ReadIndex = std::pair<std::string, std::vector<uint64_t>>;
+
+static ByteStorage ReadFileRange(std::filesystem::path const& directory, ReadLocation const& location)
+{
+    auto const relative = std::filesystem::path(location.path);
+    if (relative.empty() || relative.is_absolute()) { throw std::runtime_error("distcp: invalid checkpoint payload path"); }
+    for (auto const& component : relative)
+    {
+        if (component == "..") { throw std::runtime_error("distcp: checkpoint payload path escapes its directory"); }
+    }
+    auto const    path = directory / relative;
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) { throw std::runtime_error(fmt::format("distcp: cannot open checkpoint payload '{}'", path.string())); }
+    auto const length = stream.tellg();
+    if (length < 0 || location.offset > static_cast<uint64_t>(length) || location.length > static_cast<uint64_t>(length) - location.offset
+        || location.length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()))
+    {
+        throw std::runtime_error(fmt::format("distcp: truncated checkpoint payload '{}'", location.path));
+    }
+    ByteStorage bytes(static_cast<size_t>(location.length));
+    stream.seekg(static_cast<std::streamoff>(location.offset));
+    if (location.length != 0)
+    {
+        stream.read(static_cast<char*>(bytes.data), static_cast<std::streamsize>(location.length));
+        if (!stream) { throw std::runtime_error("distcp: cannot read checkpoint payload"); }
+    }
+    return bytes;
+}
+
+static ByteBuffer ZipEntry(mz_zip_archive& archive, std::string const& name)
+{
+    auto const               index = mz_zip_reader_locate_file(&archive, name.c_str(), nullptr, 0);
+    mz_zip_archive_file_stat stat{};
+    if (index < 0 || mz_zip_reader_file_stat(&archive, static_cast<mz_uint>(index), &stat) != MZ_TRUE
+        || !std::in_range<size_t>(stat.m_uncomp_size))
+    {
+        throw std::runtime_error(fmt::format("distcp: missing tensor archive entry '{}'", name));
+    }
+    ByteBuffer result(static_cast<size_t>(stat.m_uncomp_size));
+    char       empty{};
+    if (mz_zip_reader_extract_to_mem(&archive, static_cast<mz_uint>(index), result.empty() ? &empty : result.data(), result.size(), 0)
+        != MZ_TRUE)
+    {
+        throw std::runtime_error(fmt::format("distcp: corrupt tensor archive entry '{}'", name));
+    }
+    return result;
+}
+
+static ByteStorage ReadTensorArchive(ByteStorage const& bytes, Tensor::DimRange const& ranges, Tensor::DType dtype)
+{
+    mz_zip_archive archive{};
+    if (mz_zip_reader_init_mem(&archive, bytes.data, bytes.size, 0) != MZ_TRUE)
+    {
+        throw std::runtime_error("distcp: invalid tensor ZIP archive");
+    }
+    try
+    {
+        std::string prefix;
+        for (mz_uint index = 0; index < mz_zip_reader_get_num_files(&archive); ++index)
+        {
+            mz_zip_archive_file_stat stat{};
+            if (mz_zip_reader_file_stat(&archive, index, &stat) != MZ_TRUE)
+            {
+                throw std::runtime_error("distcp: invalid tensor ZIP directory");
+            }
+            auto const name = std::string_view(stat.m_filename);
+            if (name.ends_with("/data.pkl"))
+            {
+                prefix = name.substr(0, name.size() - std::string_view("data.pkl").size());
+                break;
+            }
+        }
+        if (prefix.empty()) { throw std::runtime_error("distcp: tensor archive has no metadata"); }
+        if (mz_zip_reader_locate_file(&archive, (prefix + "byteorder").c_str(), nullptr, 0) >= 0)
+        {
+            auto const byteorder = ZipEntry(archive, prefix + "byteorder");
+            if (std::string_view(byteorder.data(), byteorder.size()) != "little")
+            {
+                throw std::runtime_error("distcp: tensor archive byte order is unsupported");
+            }
+        }
+        auto const metadataBytes = ZipEntry(archive, prefix + "data.pkl");
+        auto const tensor        = PickleReader(metadataBytes).Read();
+        if (tensor->kind != PickleValue::Kind::Object
+            || (tensor->text != "torch._utils._rebuild_tensor_v2" && tensor->text != "torch._utils._rebuild_tensor_v3"
+                && tensor->text != "torch._utils._rebuild_tensor")
+            || tensor->items.size() < 4)
+        {
+            throw std::runtime_error("distcp: unsupported tensor archive metadata");
+        }
+        auto const shape   = MetadataDimensions(tensor->items[2]);
+        auto const strides = MetadataDimensions(tensor->items[3]);
+        if (shape.size() != ranges.size() || strides.size() != ranges.size())
+        {
+            throw std::runtime_error("distcp: tensor archive dimensions disagree with checkpoint metadata");
+        }
+        auto size = ElementSize(dtype);
+        for (size_t axis = 0; axis < ranges.size(); ++axis)
+        {
+            if (shape[axis] != ranges[axis].end - ranges[axis].begin)
+            {
+                throw std::runtime_error("distcp: tensor archive shape disagrees with checkpoint metadata");
+            }
+            size = CheckedMultiply(size, shape[axis]);
+        }
+        auto const& persistent = tensor->items[0];
+        if (persistent->text != "persistent" || persistent->items.size() != 1 || persistent->items[0]->kind != PickleValue::Kind::Sequence
+            || persistent->items[0]->items.size() < 3)
+        {
+            throw std::runtime_error("distcp: invalid tensor storage reference");
+        }
+        auto const& storageType  = persistent->items[0]->items[1];
+        auto const  expectedType = PickleInfoForDtype(dtype);
+        if (storageType->kind != PickleValue::Kind::Global
+            || storageType->text != std::string(expectedType.storageMod) + "." + std::string(expectedType.storageName))
+        {
+            throw std::runtime_error("distcp: tensor archive datatype disagrees with checkpoint metadata");
+        }
+        if (expectedType.useV3
+            && (tensor->items.size() <= 6 || tensor->items[6]->kind != PickleValue::Kind::Global
+                || tensor->items[6]->text != "torch." + std::string(DTypeName(dtype))))
+        {
+            throw std::runtime_error("distcp: untyped tensor archive datatype disagrees with checkpoint metadata");
+        }
+        ByteStorage result(static_cast<size_t>(size));
+        if (size != 0)
+        {
+            auto const storageKey    = MetadataText(persistent->items[0]->items[2]);
+            auto const raw           = ZipEntry(archive, prefix + "data/" + storageKey);
+            auto const storageOffset = MetadataNumber(tensor->items[1]);
+            auto const elementSize   = ElementSize(dtype);
+            auto const elements      = size / elementSize;
+            uint64_t   blockElements{1};
+            for (size_t axis = shape.size(); axis != 0; --axis)
+            {
+                if (shape[axis - 1] > 1 && strides[axis - 1] != blockElements) { break; }
+                blockElements = CheckedMultiply(blockElements, shape[axis - 1]);
+            }
+            auto const blockBytes = CheckedMultiply(blockElements, elementSize);
+            for (uint64_t element = 0; element < elements; element += blockElements)
+            {
+                auto remainder = element;
+                auto source    = storageOffset;
+                for (size_t axis = shape.size(); axis != 0; --axis)
+                {
+                    auto const coordinate = remainder % shape[axis - 1];
+                    remainder /= shape[axis - 1];
+                    auto const delta = CheckedMultiply(coordinate, strides[axis - 1]);
+                    if (source > std::numeric_limits<uint64_t>::max() - delta)
+                    {
+                        throw std::overflow_error("distcp: tensor storage offset overflow");
+                    }
+                    source += delta;
+                }
+                auto const sourceByte = CheckedMultiply(source, elementSize);
+                if (sourceByte > raw.size() || blockBytes > raw.size() - sourceByte)
+                {
+                    throw std::runtime_error("distcp: tensor storage is shorter than its view");
+                }
+                std::memcpy(
+                    static_cast<char*>(result.data) + element * elementSize, raw.data() + sourceByte, static_cast<size_t>(blockBytes));
+            }
+        }
+        mz_zip_reader_end(&archive);
+        return result;
+    } catch (...)
+    {
+        mz_zip_reader_end(&archive);
+        throw;
+    }
+}
+
+static StateNode& LoadedNode(StateTree& registry LFTBND, std::string_view path)
+{
+    auto   parent = StateNode::Handle::Root;
+    size_t start{};
+    for (;;)
+    {
+        auto const separator = path.find('.', start);
+        auto const name      = path.substr(start, separator == std::string_view::npos ? path.size() - start : separator - start);
+        if (name.empty()) { throw std::runtime_error("distcp: empty checkpoint address component"); }
+        auto [found, handle] = registry.FindChildNodeIfExists(parent, name);
+        if (!found) { handle = registry.AddChild(parent, name).handle; }
+        auto& node = registry.GetNode(handle);
+        if (separator == std::string_view::npos) { return node; }
+        if (node.GetType() == StateNode::Type::Invalid) { node.data = StateNode::Dict{}; }
+        if (node.GetType() != StateNode::Type::Dict) { throw std::runtime_error("distcp: overlapping checkpoint addresses"); }
+        parent = handle;
+        start  = separator + 1;
+    }
+}
+
+static uint64_t CopyIntersection(ByteStorage const&      source,
+                                 Tensor::DimRange const& sourceRanges,
+                                 ByteStorage&            target,
+                                 Tensor::DimRange const& targetRanges,
+                                 Tensor::DType           dtype)
+{
+    Tensor::DimRange intersection;
+    for (size_t axis = 0; axis < sourceRanges.size(); ++axis)
+    {
+        auto const begin = std::max(sourceRanges[axis].begin, targetRanges[axis].begin);
+        auto const end   = std::min(sourceRanges[axis].end, targetRanges[axis].end);
+        if (end <= begin) { return 0; }
+        intersection.push_back({.begin = begin, .end = end});
+    }
+    auto const elementSize = ElementSize(dtype);
+    auto const size        = DenseSize(intersection, dtype);
+    uint64_t   blockElements{1};
+    size_t     blockAxis = intersection.size();
+    for (size_t axis = intersection.size(); axis != 0; --axis)
+    {
+        blockAxis     = axis - 1;
+        blockElements = CheckedMultiply(blockElements, intersection[blockAxis].end - intersection[blockAxis].begin);
+        if (intersection[blockAxis] != sourceRanges[blockAxis] || intersection[blockAxis] != targetRanges[blockAxis]) { break; }
+    }
+    auto const blockBytes = CheckedMultiply(blockElements, elementSize);
+    auto const blocks     = size / blockBytes;
+    for (uint64_t block = 0; block < blocks; ++block)
+    {
+        auto     remainder = block;
+        uint64_t sourceElement{}, targetElement{}, sourceStride{1}, targetStride{1};
+        for (size_t axis = intersection.size(); axis != 0; --axis)
+        {
+            auto const index      = axis - 1;
+            auto       coordinate = intersection[index].begin;
+            if (index < blockAxis)
+            {
+                coordinate += remainder % (intersection[index].end - intersection[index].begin);
+                remainder /= intersection[index].end - intersection[index].begin;
+            }
+            sourceElement += CheckedMultiply(coordinate - sourceRanges[index].begin, sourceStride);
+            targetElement += CheckedMultiply(coordinate - targetRanges[index].begin, targetStride);
+            sourceStride = CheckedMultiply(sourceStride, sourceRanges[index].end - sourceRanges[index].begin);
+            targetStride = CheckedMultiply(targetStride, targetRanges[index].end - targetRanges[index].begin);
+        }
+        std::memcpy(static_cast<char*>(target.data) + targetElement * elementSize,
+                    static_cast<char const*>(source.data) + sourceElement * elementSize,
+                    static_cast<size_t>(blockBytes));
+    }
+    return size;
+}
+}    // namespace
+
+std::vector<ByteStorage> ReadCheckpoint(std::filesystem::path const& ckptDir, StateTree& localRegistry, bool allowPartialLoad)
+{
+    auto metadataStorage
+        = ReadFileRange(ckptDir, {.path = ".metadata", .offset = 0, .length = std::filesystem::file_size(ckptDir / ".metadata")});
+    auto const metadata    = PickleReader({static_cast<char const*>(metadataStorage.data), metadataStorage.size}).Read();
+    auto const definitions = Field(metadata, "state_dict_metadata");
+    auto const locations   = Field(metadata, "storage_data");
+    if (definitions->kind != PickleValue::Kind::Dictionary || locations->kind != PickleValue::Kind::Dictionary)
+    {
+        throw std::runtime_error("distcp: checkpoint metadata dictionaries are invalid");
+    }
+    std::map<ReadIndex, ReadLocation> storage;
+    for (auto const& [key, value] : locations->entries)
+    {
+        auto const            offset = Field(key, "offset", false);
+        std::vector<uint64_t> coordinates;
+        if (offset && offset->kind != PickleValue::Kind::None)
+        {
+            auto const shape = MetadataDimensions(offset);
+            coordinates.assign(shape.begin(), shape.end());
+        }
+        auto const   fqn = MetadataText(Field(key, "fqn"));
+        ReadLocation location{.path   = MetadataText(Field(value, "relative_path")),
+                              .offset = MetadataNumber(Field(value, "offset")),
+                              .length = MetadataNumber(Field(value, "length"))};
+        if (!storage.emplace(ReadIndex{fqn, std::move(coordinates)}, std::move(location)).second)
+        {
+            throw std::runtime_error("distcp: duplicate checkpoint storage index");
+        }
+    }
+    std::map<std::string, PickleRef> entries;
+    for (auto const& [key, value] : definitions->entries)
+    {
+        if (!entries.emplace(MetadataText(key), value).second) { throw std::runtime_error("distcp: duplicate checkpoint key"); }
+    }
+    std::vector<std::pair<std::string, DTensor>> requests;
+    localRegistry.WalkNodes([&](StateNode const& node) {
+        if (node.GetType() == StateNode::Type::DTensor)
+        {
+            requests.emplace_back(localRegistry.GetNodeId(node.handle), std::get<DTensor>(node.data));
+        }
+    });
+    std::vector<ByteStorage> buffers;
+    for (auto const& [fqn, definition] : entries)
+    {
+        if (definition->text != std::string(KMetadataModule) + ".BytesStorageMetadata") { continue; }
+        auto const location = storage.find({fqn, {}});
+        if (location == storage.end()) { throw std::runtime_error(fmt::format("distcp: missing byte storage for '{}'", fqn)); }
+        auto       bytes      = ReadFileRange(ckptDir, location->second);
+        auto const scalarType = Field(definition, "nvrx_scalar_type", false);
+        if (scalarType)
+        {
+            if (bytes.size != sizeof(uint64_t)) { throw std::runtime_error("distcp: scalar payload contains exactly eight bytes"); }
+            uint64_t raw{};
+            std::memcpy(&raw, bytes.data, sizeof(raw));
+            auto const&       type = MetadataText(scalarType);
+            StateNode::Scalar scalar;
+            if (type == "int64") { scalar = StateNode::Scalar(std::bit_cast<int64_t>(raw)); }
+            else if (type == "uint64") { scalar = StateNode::Scalar(raw); }
+            else if (type == "float64") { scalar = StateNode::Scalar(std::bit_cast<double>(raw)); }
+            else if (type == "bool" && raw <= 1) { scalar = StateNode::Scalar(raw != 0); }
+            else
+            {
+                throw std::runtime_error("distcp: invalid checkpoint scalar datatype or value");
+            }
+            scalar.replicas                     = {localRegistry.GlobalRank()};
+            LoadedNode(localRegistry, fqn).data = std::move(scalar);
+        }
+        else
+        {
+            LoadedNode(localRegistry, fqn).data = StateNode::DynamicSizeBlob{
+                .replicas = {localRegistry.GlobalRank()}, .handle = reinterpret_cast<uint64_t>(bytes.data), .storageSize = bytes.size};
+            buffers.push_back(std::move(bytes));
+        }
+    }
+    for (auto const& [fqn, request] : requests)
+    {
+        auto const entry = entries.find(fqn);
+        if (entry == entries.end())
+        {
+            if (!allowPartialLoad) { throw std::runtime_error(fmt::format("distcp: missing checkpoint tensor '{}'", fqn)); }
+            LoadedNode(localRegistry, fqn).data = std::monostate{};
+            continue;
+        }
+        if (entry->second->text == std::string(KMetadataModule) + ".BytesStorageMetadata") { continue; }
+        if (entry->second->text != std::string(KMetadataModule) + ".TensorStorageMetadata")
+        {
+            throw std::runtime_error("distcp: unsupported checkpoint storage metadata");
+        }
+        auto const dtype     = MetadataDtype(Field(entry->second, "properties"));
+        auto const fullShape = MetadataDimensions(Field(entry->second, "size"));
+        if (request.fulldim != fullShape)
+        {
+            throw std::runtime_error(fmt::format("distcp: checkpoint tensor '{}' shape or datatype does not match destination", fqn));
+        }
+        auto const chunks = Field(entry->second, "chunks");
+        if (chunks->kind != PickleValue::Kind::Sequence) { throw std::runtime_error("distcp: invalid checkpoint tensor chunks"); }
+        DTensor loaded(dtype, fullShape);
+        for (auto const& requestedShard : request.shards)
+        {
+            if (requestedShard.sharddim.size() != fullShape.size()) { throw std::runtime_error("distcp: invalid destination shard rank"); }
+            for (size_t axis = 0; axis < fullShape.size(); ++axis)
+            {
+                if (requestedShard.sharddim[axis].end > fullShape[axis])
+                {
+                    throw std::runtime_error("distcp: destination shard exceeds tensor");
+                }
+            }
+            auto const                    size = DenseSize(requestedShard.sharddim, dtype);
+            ByteStorage                   destination(static_cast<size_t>(size));
+            uint64_t                      copied{};
+            std::vector<Tensor::DimRange> covered;
+            for (auto const& chunk : chunks->items)
+            {
+                auto const offsets = MetadataDimensions(Field(chunk, "offsets"));
+                auto const sizes   = MetadataDimensions(Field(chunk, "sizes"));
+                if (offsets.size() != fullShape.size() || sizes.size() != fullShape.size())
+                {
+                    throw std::runtime_error("distcp: invalid checkpoint chunk rank");
+                }
+                Tensor::DimRange      ranges;
+                std::vector<uint64_t> index;
+                for (size_t axis = 0; axis < fullShape.size(); ++axis)
+                {
+                    if (offsets[axis] > fullShape[axis] || sizes[axis] > fullShape[axis] - offsets[axis])
+                    {
+                        throw std::runtime_error("distcp: checkpoint chunk exceeds tensor");
+                    }
+                    ranges.push_back({.begin = offsets[axis], .end = offsets[axis] + sizes[axis]});
+                    index.push_back(offsets[axis]);
+                }
+                if (size == 0 || !DTensor::Intersects(ranges, requestedShard.sharddim)) { continue; }
+                for (auto const& previous : covered)
+                {
+                    if (DTensor::Intersects(previous, ranges)) { throw std::runtime_error("distcp: overlapping saved tensor chunks"); }
+                }
+                covered.push_back(ranges);
+                auto const location = storage.find({fqn, std::move(index)});
+                if (location == storage.end()) { throw std::runtime_error("distcp: missing tensor chunk storage"); }
+                auto       archive = ReadFileRange(ckptDir, location->second);
+                auto const source  = ReadTensorArchive(archive, ranges, dtype);
+                auto const count   = CopyIntersection(source, ranges, destination, requestedShard.sharddim, dtype);
+                if (copied > size || count > size - copied) { throw std::runtime_error("distcp: overlapping tensor chunk coverage"); }
+                copied += count;
+            }
+            if (copied != size) { throw std::runtime_error(fmt::format("distcp: incomplete tensor chunk coverage for '{}'", fqn)); }
+            auto shard          = requestedShard;
+            shard.snapshotDtype = dtype;
+            shard.device        = DeviceId("cpu");
+            shard.handle        = reinterpret_cast<uint64_t>(destination.data);
+            shard.storageSize   = size;
+            loaded.shards.insert(shard);
+            buffers.push_back(std::move(destination));
+        }
+        LoadedNode(localRegistry, fqn).data = std::move(loaded);
+    }
+    return buffers;
 }
 
 }    // namespace checkpoint::distcp

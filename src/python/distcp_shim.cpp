@@ -313,9 +313,78 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
+static nb::dict ReadCheckpointImpl(std::string const& path, nb::list const& requests, bool allowPartialLoad)
+{
+    RankTopology topo{.rank = Rank{0}, .worldSize = Rank{1}, .ranksPerPeer = 1, .peersPerNode = 1, .peers = {"localhost"}};
+    StateTree    tree(checkpoint::ipc::SessionId::Default, std::move(topo));
+    for (auto const& request : requests)
+    {
+        auto entry = nb::cast<nb::tuple>(request);
+        if (entry.size() != 4) { throw std::runtime_error("distcp_shim: read request requires FQN, dtype, global shape, and ranges"); }
+        auto const  name  = nb::cast<std::string>(entry[0]);
+        auto const  dtype = ParseDType(nb::cast<std::string>(entry[1]));
+        Tensor::Dim shape;
+        for (auto const extent : nb::cast<std::vector<uint64_t>>(entry[2])) { shape.push_back(extent); }
+        Tensor::DimRange ranges;
+        uint64_t         size = dtype == Tensor::DType::Bool ? 1 : Tensor::GetDTypeSize(dtype);
+        for (auto const& item : nb::cast<nb::list>(entry[3]))
+        {
+            auto       pair  = nb::cast<nb::tuple>(item);
+            auto const begin = nb::cast<uint64_t>(pair[0]);
+            auto const end   = nb::cast<uint64_t>(pair[1]);
+            if (end < begin) { throw std::runtime_error("distcp_shim: inverted read range"); }
+            ranges.push_back({.begin = begin, .end = end});
+            size *= end - begin;
+        }
+        DTensor tensor(dtype, shape);
+        tensor.shards.insert(
+            {.rank = Rank{0}, .snapshotDtype = dtype, .handle = 0, .storageSize = size, .sharddim = ranges, .device = DeviceId("cpu")});
+        auto [leaf, parent]              = tree.FindOrAddNodeByFQN(name);
+        tree.AddChild(parent, leaf).data = std::move(tensor);
+    }
+    auto     buffers = checkpoint::distcp::ReadCheckpoint(path, tree, allowPartialLoad);
+    nb::dict result;
+    tree.WalkNodes([&](StateNode const& node) {
+        auto const name = tree.GetNodeId(node.handle);
+        if (node.GetType() == StateNode::Type::Scalar)
+        {
+            auto const& value = std::get<StateNode::Scalar>(node.data);
+            auto const  type  = value.GetType();
+            if (Primitives64Bit::Type::IsBoolean(type)) { result[nb::str(name.c_str())] = nb::bool_(value.Cast<bool>()); }
+            else if (Primitives64Bit::Type::IsSigned(type)) { result[nb::str(name.c_str())] = nb::int_(value.Cast<int64_t>()); }
+            else if (Primitives64Bit::Type::IsUnsigned(type)) { result[nb::str(name.c_str())] = nb::int_(value.Cast<uint64_t>()); }
+            else
+            {
+                result[nb::str(name.c_str())] = nb::float_(value.Cast<double>());
+            }
+        }
+        else if (node.GetType() == StateNode::Type::DynamicSizeBlob)
+        {
+            auto const& value             = std::get<StateNode::DynamicSizeBlob>(node.data);
+            result[nb::str(name.c_str())] = nb::bytes(reinterpret_cast<char const*>(value.handle), value.storageSize);
+        }
+        else if (node.GetType() == StateNode::Type::DTensor)
+        {
+            auto const& value = std::get<DTensor>(node.data);
+            nb::list    shape, shards;
+            for (auto const extent : value.fulldim) { shape.append(extent); }
+            for (auto const& shard : value.shards)
+            {
+                nb::list ranges;
+                for (auto const& range : shard.sharddim) { ranges.append(nb::make_tuple(range.begin, range.end)); }
+                shards.append(nb::make_tuple(ranges, nb::bytes(reinterpret_cast<char const*>(shard.handle), shard.storageSize)));
+            }
+            result[nb::str(name.c_str())] = nb::make_tuple(static_cast<int>(value.durableDtype), shape, shards);
+        }
+    });
+    return result;
+}
+
 NB_MODULE(_distcp_shim, m)    // NOLINT
 {
     m.doc() = "Single-process shim around distcp::WriteRankShard / WriteMetadata for parity tests.";
+
+    m.def("read_checkpoint", &ReadCheckpointImpl, nb::arg("path"), nb::arg("requests") = nb::list(), nb::arg("allow_partial_load") = false);
 
     m.def("write_rank_shard",
           &WriteRankShardImpl,
