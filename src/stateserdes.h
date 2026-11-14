@@ -9,7 +9,7 @@ struct StateSerDes
 {
     using Type                            = StateNode::Type;
     static constexpr uint32_t WireMagic   = 0x32525453U;
-    static constexpr uint32_t WireVersion = 7;
+    static constexpr uint32_t WireVersion = 8;
 
     struct DictHeader
     { uint32_t numChild{}; };
@@ -91,7 +91,6 @@ struct StateSerDes
 
         serdes::WriteTrivial(ostrm, WireMagic);
         serdes::WriteTrivial(ostrm, WireVersion);
-        serdes::WriteTrivial(ostrm, tree.nativeState);
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
         {
@@ -180,8 +179,7 @@ struct StateSerDes
         auto const magic   = serdes::ReadTrivial<uint32_t>(istrm);
         auto const version = serdes::ReadTrivial<uint32_t>(istrm);
         if (magic != WireMagic || version != WireVersion) { throw std::runtime_error("Unsupported state registry wire format"); }
-        tree.nativeState = serdes::ReadTrivial<bool>(istrm);
-        auto numChild    = serdes::ReadTrivial<uint32_t>(istrm);
+        auto numChild = serdes::ReadTrivial<uint32_t>(istrm);
         tree._nodes.clear();
         tree._nodes.reserve(numChild);
         for (uint32_t i = 0; i < numChild; ++i)

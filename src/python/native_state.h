@@ -489,7 +489,7 @@ class NativeStateRegistration
 
         if (!nb::isinstance(value, _enum) && nb::isinstance<bool>(value))
         {
-            _scan.RegisterStateByFQN(path, StateNode::Scalar{static_cast<uint64_t>(nb::cast<bool>(value))});
+            _scan.RegisterStateByFQN(path, StateNode::Scalar{nb::cast<bool>(value)});
             _records.emplace_back(path, uint8_t{4});
         }
         else if (!nb::isinstance(value, _enum) && nb::isinstance<nb::int_>(value))

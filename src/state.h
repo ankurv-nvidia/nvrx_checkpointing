@@ -473,9 +473,8 @@ struct StateTree
         clone._nodes.reserve(_nodes.size());
         clone._nodes.clear();
         for (auto const& node : _nodes) { clone._nodes.emplace_back(node.handle, node.parent, node.name, StateNode::Variant{node.data}); }
-        clone.startedAt   = startedAt;
-        clone.nativeState = nativeState;
-        clone._finalized  = false;
+        clone.startedAt  = startedAt;
+        clone._finalized = false;
     }
 
     [[nodiscard]] auto Clone() const
@@ -648,8 +647,6 @@ struct StateTree
     friend struct StateSerDes;
 
     public:
-    bool nativeState{false};
-
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/
         = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());

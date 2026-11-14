@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed.checkpoint as dcp
+from nvrx_checkpointing.scalar import decode_scalar, scalar_storage_type
 from torch.distributed.checkpoint._traverse import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, create_default_local_load_plan
 from torch.distributed.checkpoint.filesystem import FileSystemReader
@@ -207,8 +208,10 @@ class BundleLoadPlanner(LoadPlanner):
         self.reader = reader
         self.base_planner = planner if planner is not None else DefaultLoadPlanner()
         self.planner = self.base_planner
+        self.metadata: Metadata | None = None
 
     def set_up_planner(self, state_dict: dict[str, Any], metadata: Metadata | None = None, is_coordinator: bool = False) -> None:
+        self.metadata = metadata
         self.planner = self.base_planner
         if self.reader.native_objects is not None:
             self.planner = _NativeLoadPlanner(self.reader.native_objects, self.base_planner)
@@ -226,6 +229,20 @@ class BundleLoadPlanner(LoadPlanner):
         return self.planner.finish_plan(new_plan)
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
+        storage = self.metadata.state_dict_metadata[read_item.storage_index.fqn] if self.metadata is not None else None
+        if scalar_storage_type(storage) is not None:
+            key = read_item.dest_index.fqn
+            destinations = getattr(self.planner, "state_dict", None)
+            original = getattr(self.planner, "original_state_dict", None)
+            if destinations is None or original is None:
+                raise TypeError("Scalar loading requires a planner exposing destination state")
+            restored = restore_native_value(decode_scalar(storage, value.getvalue()), destinations[key], key)
+            destinations[key] = restored
+            if getattr(self.planner, "flatten_state_dict", False):
+                set_element(original, self.planner.mappings[key], restored)
+            else:
+                original[key] = restored
+            return
         self.planner.load_bytes(read_item, value)
 
     def resolve_tensor(self, read_item: ReadItem) -> torch.Tensor:

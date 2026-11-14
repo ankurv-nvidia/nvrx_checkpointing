@@ -1234,7 +1234,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
             if (plan != nullptr)
             {
                 std::ostringstream metadata;
-                StateSerDes::Write(metadata, *plan, StateNode::Handle::Root, plan->nativeState);
+                StateSerDes::Write(metadata, *plan, StateNode::Handle::Root, true);
                 response.body() = metadata.str();
                 response.set(boost::beast::http::field::content_type, "application/octet-stream");
             }

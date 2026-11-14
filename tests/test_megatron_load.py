@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import enum
 import importlib.util
 import io
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
 
+import _distcp_shim
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -49,6 +52,79 @@ def _save_bundle(path: Path, objects: dict[str, object], tensors: dict[str, obje
     state, _ = flatten_state_dict(tensors or {})
     state["common_state/shard_0_1"] = [objects]
     dcp.save(state, checkpoint_id=path, planner=DefaultSavePlanner(flatten_state_dict=False))
+
+
+def _save_independent_scalars(path: Path, scalars: dict, objects: tuple = ()) -> None:
+    _distcp_shim.write_rank_shard(str(path), 0, [], list(objects), scalars=scalars)
+    _distcp_shim.write_metadata(str(path), [], list(objects), scalars=scalars)
+
+
+@pytest.mark.parametrize("flatten", [True, False])
+def test_independent_scalars_restore_without_object_archives(bundle_load: ModuleType, tmp_path: Path, flatten: bool) -> None:
+    del bundle_load
+    captured = {"step": -(1 << 63), "maximum": (1 << 64) - 1, "enabled": True, "negative_zero": -0.0}
+    _save_independent_scalars(tmp_path, captured)
+    target = {"step": 0, "maximum": 0, "enabled": False, "negative_zero": 1.0}
+
+    dcp.load(target, checkpoint_id=tmp_path, planner=DefaultLoadPlanner(flatten_state_dict=flatten))
+
+    assert target == captured
+    assert type(target["enabled"]) is bool
+    assert math.copysign(1.0, target["negative_zero"]) == -1.0
+
+
+def test_independent_scalars_load_into_nested_destinations(bundle_load: ModuleType, tmp_path: Path) -> None:
+    del bundle_load
+    _save_independent_scalars(tmp_path, {"optimizer.step": 17, "settings.enabled": True})
+    optimizer = {"step": 0}
+    target = {"optimizer": optimizer, "settings": {"enabled": False}}
+
+    dcp.load(target, checkpoint_id=tmp_path)
+
+    assert target == {"optimizer": {"step": 17}, "settings": {"enabled": True}}
+    assert target["optimizer"] is optimizer
+
+
+def test_independent_scalar_restores_destination_enum(bundle_load: ModuleType, tmp_path: Path) -> None:
+    del bundle_load
+
+    class Mode(enum.IntEnum):
+        DISABLED = 0
+        ENABLED = 1
+
+    _save_independent_scalars(tmp_path, {"mode": 1})
+    target = {"mode": Mode.DISABLED}
+
+    dcp.load(target, checkpoint_id=tmp_path)
+
+    assert target["mode"] is Mode.ENABLED
+
+
+def test_independent_scalars_coexist_with_untouched_common_archive(bundle_load: ModuleType, tmp_path: Path) -> None:
+    del bundle_load
+    common = {"iteration": 17, "enabled": True, "payload": b"12345678"}
+    key = "common_state/shard_0_1"
+    _save_independent_scalars(tmp_path, {"iteration": 17, "enabled": True}, ((key, _archive([common])),))
+    target = {key: io.BytesIO(), "iteration": 0, "enabled": False}
+
+    dcp.load(target, checkpoint_id=tmp_path)
+
+    assert target[key] == [common]
+    assert target["iteration"] == 17
+    assert target["enabled"] is True
+    assert (tmp_path / "metadata.json").is_file()
+
+
+def test_unmarked_eight_byte_blob_is_not_read_as_a_scalar(bundle_load: ModuleType, tmp_path: Path) -> None:
+    del bundle_load
+    _save_independent_scalars(tmp_path, {"iteration": 17}, (("opaque", b"12345678"),))
+    target = {"iteration": 0}
+
+    dcp.load(target, checkpoint_id=tmp_path)
+
+    assert target == {"iteration": 17}
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    assert not hasattr(metadata.state_dict_metadata["opaque"], "nvrx_scalar_type")
 
 
 def test_bootstrap_restores_arguments_and_scalars(bundle_load: ModuleType, tmp_path: Path) -> None:

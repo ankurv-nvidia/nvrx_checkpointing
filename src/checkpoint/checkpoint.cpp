@@ -276,7 +276,7 @@ struct CheckpointWriter
             StateSerDes::WriteTopology(ostr, topo);
             LocalServiceRequest(ServerIndex(registry), fmt::format("/api/activatesession/{}", registry.SessionId()), ostr.str());
             ostr.str({});
-            StateSerDes::Write(ostr, registry, StateNode::Handle::Root);
+            StateSerDes::Write(ostr, registry, StateNode::Handle::Root, true);
             LocalServiceRequest(ServerIndex(registry), fmt::format("/api/localstateregistry/{}", registry.SessionId()), ostr.str());
 
             auto response = LocalServiceRequest(

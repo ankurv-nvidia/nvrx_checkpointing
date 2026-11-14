@@ -103,7 +103,7 @@ def test_registers_empty_tensors_as_native_values(single_rank_mesh: DeviceMesh, 
         pytest.fail("native registration called torch.save")
 
     monkeypatch.setattr(torch, "save", reject_archive)
-    root.register_state_dict({"full": torch.ones(4), "empty": empty}, native=True)
+    root.register_native_state_dict({"full": torch.ones(4), "empty": empty})
     root.wait_for_async_completion()
 
     assert root.snapshot_size > 4 * 4
@@ -118,7 +118,12 @@ def test_rejects_partial_placements(single_rank_mesh: DeviceMesh) -> None:
 
 @pytest.mark.integration
 @_REQUIRES_CHECKPOINT_SERVER
-def test_scalar_dtensor_preserves_its_zero_dimensional_shape(tmp_path: Path, single_rank_mesh: DeviceMesh) -> None:
+@pytest.mark.parametrize("register", ["register_state_dict", "register_native_state_dict"])
+def test_scalar_dtensor_preserves_its_zero_dimensional_shape(
+    tmp_path: Path,
+    single_rank_mesh: DeviceMesh,
+    register: str,
+) -> None:
     session_id = random.randrange(1, 1 << 31)  # noqa: S311
     root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
     source = distribute_tensor(torch.tensor(7.0), single_rank_mesh, [Replicate()])
@@ -126,7 +131,7 @@ def test_scalar_dtensor_preserves_its_zero_dimensional_shape(tmp_path: Path, sin
     plain_source = torch.tensor(11, dtype=torch.int64)
     plain_destination = torch.tensor(0, dtype=torch.int64)
     try:
-        root.register_state_dict({"model": {"scalar": source, "plain_scalar": plain_source}}, native=True)
+        getattr(root, register)({"model": {"scalar": source, "plain_scalar": plain_source}})
         root.finalize_registry()
         root.save(1, tmp_path)
         checkpoint.wait_for_ckpt_finalize(session_id, 1)

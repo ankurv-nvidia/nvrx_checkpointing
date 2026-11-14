@@ -25,6 +25,7 @@ struct Primitives64Bit
             Unsigned,
             Signed,
             Float,
+            Boolean,
         };
 
         enum class Width
@@ -36,16 +37,16 @@ struct Primitives64Bit
             W8,
         };
 
-        uint8_t  width : 3;       // 00: 0 , 01: 1, 10: 2, 11: 4, 100: 8
-        Category category : 2;    // 00: unknown,  01: unsigned , 2: signed, 3: float
+        uint8_t  width : 3;    // 00: 0 , 01: 1, 10: 2, 11: 4, 100: 8
+        Category category : 3;
 
         private:
         static constexpr unsigned GetWidth_(unsigned x) { return x < 2 ? x : 1 + GetWidth_(x >> 1u); }
 
         template <uint8_t W, typename T> static constexpr Type Create_()
         {
-            // Apparently chars can be signed or unsigned
-            if constexpr (std::is_same_v<T, char>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Signed}; }
+            if constexpr (std::is_same_v<T, bool>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Boolean}; }
+            else if constexpr (std::is_same_v<T, char>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Signed}; }
             else if constexpr (std::is_floating_point_v<T>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Float}; }
             else if constexpr (std::is_unsigned_v<T>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Unsigned}; }
             else if constexpr (std::is_signed_v<T>) { return Type{.width = W, .category = Primitives64Bit::Type::Category::Signed}; }
@@ -63,6 +64,7 @@ struct Primitives64Bit
         static constexpr bool IsFloat(Type t) { return t.category == Category::Float; }
         static constexpr bool IsSigned(Type t) { return t.category == Category::Signed; }
         static constexpr bool IsUnsigned(Type t) { return t.category == Category::Unsigned; }
+        static constexpr bool IsBoolean(Type t) { return t.category == Category::Boolean; }
 
         constexpr bool operator==(Type const& t) const { return width == t.width && category == t.category; }
         constexpr bool operator!=(Type const& t) const { return width != t.width || category != t.category; }
@@ -162,6 +164,7 @@ struct Primitives64Bit
             {
             case Primitives64Bit::Type::Category::Float: return Traits<T>::Convert(_val.d);
             case Primitives64Bit::Type::Category::Signed: return Traits<T>::Convert(static_cast<double>(_val.i));
+            case Primitives64Bit::Type::Category::Boolean: [[fallthrough]];
             case Primitives64Bit::Type::Category::Unsigned: return Traits<T>::Convert(static_cast<double>(_val.u));
             case Primitives64Bit::Type::Category::Unknown: [[fallthrough]];
             default: throw std::logic_error("Unsupported Cast");
@@ -172,18 +175,20 @@ struct Primitives64Bit
             switch (_type.category)
             {
             case Primitives64Bit::Type::Category::Float: return Traits<T>::Convert(static_cast<int64_t>(_val.d));
+            case Primitives64Bit::Type::Category::Boolean: [[fallthrough]];
             case Primitives64Bit::Type::Category::Unsigned: return Traits<T>::Convert(static_cast<int64_t>(_val.u));
             case Primitives64Bit::Type::Category::Signed: return Traits<T>::Convert(_val.i);
             case Primitives64Bit::Type::Category::Unknown: [[fallthrough]];
             default: throw std::logic_error("Unsupported Cast");
             }
         }
-        else if constexpr (Primitives64Bit::Type::IsUnsigned(Traits<T>::Type()))
+        else if constexpr (Primitives64Bit::Type::IsUnsigned(Traits<T>::Type()) || Primitives64Bit::Type::IsBoolean(Traits<T>::Type()))
         {
             switch (_type.category)
             {
             case Primitives64Bit::Type::Category::Float: return Traits<T>::Convert(static_cast<uint64_t>(_val.d));
             case Primitives64Bit::Type::Category::Signed: return Traits<T>::Convert(static_cast<uint64_t>(_val.i));
+            case Primitives64Bit::Type::Category::Boolean: [[fallthrough]];
             case Primitives64Bit::Type::Category::Unsigned: return Traits<T>::Convert(_val.u);
             case Primitives64Bit::Type::Category::Unknown: [[fallthrough]];
             default: throw std::logic_error("Unsupported Cast");

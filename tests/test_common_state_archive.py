@@ -17,11 +17,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _write(path: Path, scalars: dict, objects: tuple = (), *, native: bool = True, tensors: tuple = ()) -> None:
+def _write(path: Path, scalars: dict, objects: tuple = (), *, tensors: tuple = ()) -> None:
     entries = [(key, "float32", list(value.shape), value.numpy().tobytes()) for key, value in tensors]
-    _distcp_shim.write_rank_shard(str(path), 0, entries, list(objects), scalars=scalars, native=native)
+    _distcp_shim.write_rank_shard(str(path), 0, entries, list(objects), scalars=scalars)
     layouts = [(key, "float32", list(value.shape), [(0, [(0, size) for size in value.shape])]) for key, value in tensors]
-    _distcp_shim.write_metadata(str(path), layouts, list(objects), scalars=scalars, native=native)
+    _distcp_shim.write_metadata(str(path), layouts, list(objects), scalars=scalars)
 
 
 def _records(path: Path) -> dict[str, bytes]:
@@ -34,7 +34,7 @@ def _records(path: Path) -> dict[str, bytes]:
     return result
 
 
-def test_native_scalars_preserve_exact_eight_byte_encodings(tmp_path: Path) -> None:
+def test_scalars_preserve_exact_eight_byte_encodings(tmp_path: Path) -> None:
     scalars = {
         "minimum": -(1 << 63),
         "maximum": (1 << 64) - 1,
@@ -56,16 +56,26 @@ def test_native_scalars_preserve_exact_eight_byte_encodings(tmp_path: Path) -> N
     assert (tmp_path / "__0_0.distcp").stat().st_size == 8 * len(scalars)
     metadata = dcp.FileSystemReader(tmp_path).read_metadata()
     assert all(isinstance(value, BytesStorageMetadata) for value in metadata.state_dict_metadata.values())
-    assert not (tmp_path / "metadata.json").exists()
+    assert {key: value.nvrx_scalar_type for key, value in metadata.state_dict_metadata.items()} == {
+        "minimum": "int64",
+        "maximum": "uint64",
+        "iteration": "uint64",
+        "negative_zero": "float64",
+        "lr": "float64",
+        "positive_infinity": "float64",
+        "negative_infinity": "float64",
+        "enabled": "bool",
+    }
+    assert (tmp_path / "metadata.json").exists()
 
 
-def test_native_scalar_nan_is_preserved(tmp_path: Path) -> None:
+def test_scalar_nan_is_preserved(tmp_path: Path) -> None:
     _write(tmp_path, {"value": math.nan})
 
     assert math.isnan(struct.unpack("<d", _records(tmp_path)["value"])[0])
 
 
-def test_native_scalars_share_a_contiguous_file_with_tensors_and_blobs(tmp_path: Path) -> None:
+def test_scalars_share_a_contiguous_file_with_tensors_and_blobs(tmp_path: Path) -> None:
     weight = torch.arange(4, dtype=torch.float32)
     _write(tmp_path, {"iteration": 7}, (("args", b"native arguments"),), tensors=(("model.weight", weight),))
 
@@ -82,7 +92,7 @@ def test_native_scalars_share_a_contiguous_file_with_tensors_and_blobs(tmp_path:
     assert cursor == (tmp_path / "__0_0.distcp").stat().st_size
 
 
-def test_native_scalar_and_blob_records_refresh_on_every_save(tmp_path: Path) -> None:
+def test_scalar_and_blob_records_refresh_on_every_save(tmp_path: Path) -> None:
     marker = tmp_path / "metadata.json"
     marker.write_text('{"sharded_backend": "torch_dist"}')
     lengths = []
@@ -90,21 +100,24 @@ def test_native_scalar_and_blob_records_refresh_on_every_save(tmp_path: Path) ->
         _write(tmp_path, {"iteration": iteration}, (("payload", payload),))
 
         assert _records(tmp_path) == {"iteration": struct.pack("<Q", iteration), "payload": payload}
-        assert not marker.exists()
+        assert marker.exists()
         lengths.append((tmp_path / "__0_0.distcp").stat().st_size)
     assert lengths == [8 + len(b"short"), 8 + 256 * 1024]
 
 
-def test_standard_mode_retains_its_scalar_and_format_behavior(tmp_path: Path) -> None:
-    _write(tmp_path, {"iteration": 7}, (("payload", b"opaque"),), native=False)
+def test_scalars_and_eight_byte_blobs_have_distinct_metadata(tmp_path: Path) -> None:
+    _write(tmp_path, {"iteration": 7}, (("payload", b"12345678"),))
 
-    assert _records(tmp_path) == {"payload": b"opaque"}
+    assert _records(tmp_path) == {"iteration": struct.pack("<Q", 7), "payload": b"12345678"}
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata().state_dict_metadata
+    assert metadata["iteration"].nvrx_scalar_type == "uint64"
+    assert not hasattr(metadata["payload"], "nvrx_scalar_type")
     assert (tmp_path / "metadata.json").exists()
 
 
-def test_empty_native_state_has_no_orphan_shard(tmp_path: Path) -> None:
+def test_empty_state_has_no_orphan_shard(tmp_path: Path) -> None:
     _write(tmp_path, {})
 
     assert _records(tmp_path) == {}
     assert not (tmp_path / "__0_0.distcp").exists()
-    assert not (tmp_path / "metadata.json").exists()
+    assert (tmp_path / "metadata.json").exists()

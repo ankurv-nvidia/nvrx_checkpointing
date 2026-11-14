@@ -407,6 +407,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
             megatron@megatron
             megatron_stubs@megatron_stubs
             quantized_snapshot.py
+            scalar.py
             metadata_compare.py
             peers.py
             telemetry.py

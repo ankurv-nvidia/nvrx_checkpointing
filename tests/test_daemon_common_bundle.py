@@ -60,7 +60,7 @@ def _save(rank: int, world_size: int, session: int, directory: str) -> None:
 
             torch.save = forbidden_save
             try:
-                root.register_state_dict(state, native=True)
+                root.register_native_state_dict(state)
                 if iteration == 1:
                     root.finalize_registry()
                 root.save_async(iteration, path / f"native-{iteration}")

@@ -8,9 +8,11 @@ import dataclasses
 import hashlib
 import io
 import pickle
+import struct
 from argparse import Namespace
 from typing import TYPE_CHECKING
 
+import _distcp_shim
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -32,6 +34,12 @@ def _archive(value: object, *, legacy: bool = False) -> io.BytesIO:
     torch.save([value], buffer, _use_new_zipfile_serialization=not legacy)
     buffer.seek(0)
     return buffer
+
+
+def _write_scalar_checkpoint(path: Path, scalars: dict[str, bool | int | float], common: dict | None = None) -> None:
+    objects = [] if common is None else [(_COMMON_KEY, _archive(common).getvalue())]
+    _distcp_shim.write_rank_shard(str(path), 0, [], objects, scalars=scalars)
+    _distcp_shim.write_metadata(str(path), [], objects, scalars=scalars)
 
 
 def _write_checkpoint(
@@ -185,3 +193,77 @@ def test_native_server_bundle_claim_uses_the_physical_archive(tmp_path: Path, mo
     manifest.write_text(f"{_COMMON_KEY}.bytes.md5sum=incorrect")
     with pytest.raises(ValueError, match="Differences found"):
         distcp_trace(checkpoint, extract_tensor_data=False)
+
+
+def test_independent_scalars_are_decoded_and_traced_as_common_state(tmp_path: Path) -> None:
+    scalars = {"iteration": 7, "enabled": True, "maximum": (1 << 64) - 1, "optimizer.lr": 0.125}
+    _write_scalar_checkpoint(tmp_path, scalars)
+
+    loaded = debug.load_common_state_dict(tmp_path)
+    distcp_trace(tmp_path, extract_tensor_data=False, verify_native_server=False)
+
+    assert loaded == scalars
+    assert loaded["enabled"] is True
+    assert (tmp_path / "common_pt_dump.info").read_text().splitlines() == [
+        "enabled=True",
+        "iteration=7",
+        "maximum=18446744073709551615",
+        "optimizer.lr=0.125",
+    ]
+    assert (tmp_path / "reference.metadata.info").read_text() == ""
+
+
+@pytest.mark.parametrize("format_marker", [True, False])
+def test_independent_scalars_preserve_matching_archived_containers(tmp_path: Path, format_marker: bool) -> None:
+    common = {"iteration": 7, "optimizer": {"group": {"lr": 0.125}, "steps": [3, 4]}, "args": Namespace(enabled=True)}
+    scalars = {"iteration": 7, "optimizer.group.lr": 0.125, "optimizer.steps.0": 3, "args.enabled": True}
+    _write_scalar_checkpoint(tmp_path, scalars, common)
+    if not format_marker:
+        (tmp_path / "metadata.json").unlink()
+
+    loaded = debug.load_common_state_dict(tmp_path)
+    distcp_trace(tmp_path, extract_tensor_data=False, verify_native_server=False)
+
+    assert loaded == common
+    assert set(loaded) == {"iteration", "optimizer", "args"}
+    assert isinstance(loaded["optimizer"], dict)
+    assert isinstance(loaded["optimizer"]["steps"], list)
+    assert isinstance(loaded["args"], Namespace)
+    assert (tmp_path / "common_pt_dump.info").read_text().splitlines() == [
+        "args.enabled=True",
+        "iteration=7",
+        "optimizer.group.lr=0.125",
+        "optimizer.steps=[3, 4]",
+    ]
+    assert (tmp_path / "reference.metadata.info").read_text() == ""
+
+
+def test_independent_scalar_conflicts_with_archived_leaf(tmp_path: Path) -> None:
+    _write_scalar_checkpoint(tmp_path, {"optimizer.group.lr": 0.5}, {"optimizer": {"group": {"lr": 0.125}}})
+
+    with pytest.raises(ValueError, match=r"Conflicting archived and independent scalar value: optimizer\.group\.lr"):
+        debug.load_common_state_dict(tmp_path)
+    with pytest.raises(ValueError, match=r"Conflicting archived and independent scalar value: optimizer\.group\.lr"):
+        distcp_trace(tmp_path, extract_tensor_data=False, verify_native_server=False)
+
+
+def test_native_server_scalar_claim_uses_the_eight_payload_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_scalar_checkpoint(tmp_path, {"iteration": 7})
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    storage = next(info for index, info in metadata.storage_data.items() if index.fqn == "iteration")
+    with (tmp_path / storage.relative_path).open("rb") as stream:
+        stream.seek(storage.offset)
+        raw = stream.read(storage.length)
+    assert storage.length == struct.calcsize("<Q")
+    assert raw == struct.pack("<Q", 7)
+    checksum = hashlib.md5(raw).hexdigest()  # noqa: S324
+    (tmp_path / "0.metadata.info").write_text(f"iteration.bytes.md5sum={checksum}")
+    monkeypatch.setattr(debug, "try_ping", lambda: None)
+
+    distcp_trace(tmp_path, extract_tensor_data=False)
+
+    with (tmp_path / storage.relative_path).open("r+b") as stream:
+        stream.seek(storage.offset)
+        stream.write(struct.pack("<Q", 8))
+    with pytest.raises(ValueError, match="Differences found"):
+        distcp_trace(tmp_path, extract_tensor_data=False)

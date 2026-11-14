@@ -7,6 +7,7 @@ import os
 import random
 import struct
 from argparse import Namespace
+from types import ModuleType
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,7 +15,9 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from nvrx_checkpointing import checkpoint
+from nvrx_checkpointing.megatron import load as native_load
 from nvrx_checkpointing.megatron.native_state import decode_native_schema, is_native_state, read_native_state, restore_native_value
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata, MetadataIndex
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -30,14 +33,20 @@ def _root() -> tuple[int, object]:
     return session, checkpoint.model_state.create_root(session, 0, 1, ["localhost"], 1)
 
 
-@pytest.mark.parametrize("initial", [True, False])
-def test_registration_rejects_mode_changes(initial: bool) -> None:
+@pytest.mark.parametrize(
+    ("initial", "later"),
+    [
+        ("register_native_state_dict", "register_state_dict"),
+        ("register_state_dict", "register_native_state_dict"),
+    ],
+)
+def test_registration_rejects_api_changes(initial: str, later: str) -> None:
     _, root = _root()
-    root.register_state_dict({"step": 1}, native=initial)
+    getattr(root, initial)({"step": 1})
     root.wait_for_async_completion()
-    root.register_state_dict({"step": 2}, native=not initial)
+    getattr(root, later)({"step": 2})
 
-    with pytest.raises(RuntimeError, match="registration mode changed"):
+    with pytest.raises(RuntimeError, match="registration API changed"):
         root.wait_for_async_completion()
 
 
@@ -48,7 +57,7 @@ def test_registration_rejects_mode_changes(initial: bool) -> None:
 )
 def test_native_registration_accepts_arrays_and_generators(value: object) -> None:
     _, root = _root()
-    root.register_state_dict({"value": value}, native=True)
+    root.register_native_state_dict({"value": value})
 
     root.wait_for_async_completion()
 
@@ -56,7 +65,7 @@ def test_native_registration_accepts_arrays_and_generators(value: object) -> Non
 @pytest.mark.parametrize("value", [object(), lambda: None, np.longdouble("1.234567890123456789")])
 def test_native_registration_rejects_unsupported_objects(value: object) -> None:
     _, root = _root()
-    root.register_state_dict({"value": value}, native=True)
+    root.register_native_state_dict({"value": value})
 
     with pytest.raises(ValueError, match="Unsupported native checkpoint value type"):
         root.wait_for_async_completion()
@@ -66,7 +75,7 @@ def test_native_registration_rejects_recursive_containers() -> None:
     value = []
     value.append(value)
     _, root = _root()
-    root.register_state_dict({"value": value}, native=True)
+    root.register_native_state_dict({"value": value})
 
     with pytest.raises(ValueError, match="recursive container"):
         root.wait_for_async_completion()
@@ -78,7 +87,7 @@ def test_native_registration_enforces_the_decoder_depth_limit(depth: int) -> Non
     for _ in range(depth):
         value = [value]
     _, root = _root()
-    root.register_state_dict({"value": value}, native=True)
+    root.register_native_state_dict({"value": value})
 
     if depth > 100:
         with pytest.raises(ValueError, match="nesting exceeds the supported depth"):
@@ -90,7 +99,7 @@ def test_native_registration_enforces_the_decoder_depth_limit(depth: int) -> Non
 @pytest.mark.parametrize("prefix", ["__nvrx_native_state_rank_", "__nvrx_native_dict_rank_"])
 def test_native_registration_rejects_reserved_addresses(prefix: str) -> None:
     _, root = _root()
-    root.register_state_dict({f"{prefix}0__": 1}, native=True)
+    root.register_native_state_dict({f"{prefix}0__": 1})
 
     with pytest.raises(ValueError, match="reserved metadata address"):
         root.wait_for_async_completion()
@@ -98,10 +107,71 @@ def test_native_registration_rejects_reserved_addresses(prefix: str) -> None:
 
 def test_native_registration_rejects_ambiguous_addresses() -> None:
     _, root = _root()
-    root.register_state_dict({"model.weight": torch.ones(1), "model": {"weight": torch.zeros(1)}}, native=True)
+    root.register_native_state_dict({"model.weight": torch.ones(1), "model": {"weight": torch.zeros(1)}})
 
     with pytest.raises(ValueError, match="addresses overlap"):
         root.wait_for_async_completion()
+
+
+@pytest.mark.integration
+@_requires_server
+def test_prepared_registration_persists_independent_scalars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("load", "load_state_dict", "FileSystemReader"):
+        monkeypatch.setattr(dcp, name, getattr(dcp, name))
+    monkeypatch.setattr(dcp, native_load._INSTALL_MARKER, False, raising=False)  # noqa: SLF001
+    native_load.install(ModuleType("megatron.training.checkpointing"))
+    session, root = _root()
+    try:
+        for iteration in (1, 2):
+            values = {
+                "enabled": iteration == 1,
+                "maximum": (1 << 64) - iteration,
+                "minimum": -(1 << 63) + iteration - 1,
+                "floating": -0.0 if iteration == 1 else 2.5,
+            }
+            weight = torch.arange(4, dtype=torch.float32) + iteration
+            root.register_state_dict({"model": {"weight": weight}, "values": values})
+            if iteration == 1:
+                root.finalize_registry()
+            directory = tmp_path / str(iteration)
+            root.save(iteration, directory)
+            checkpoint.wait_for_ckpt_finalize(session, iteration)
+            metadata = dcp.FileSystemReader(directory).read_metadata()
+
+            assert not is_native_state(metadata)
+            assert (directory / "metadata.json").is_file()
+            assert set(metadata.state_dict_metadata) == {"model.weight", *(f"values.{key}" for key in values)}
+            for name, kind, code in (
+                ("enabled", "bool", "Q"),
+                ("maximum", "uint64", "Q"),
+                ("minimum", "int64", "q"),
+                ("floating", "float64", "d"),
+            ):
+                key = f"values.{name}"
+                entry = metadata.state_dict_metadata[key]
+                assert isinstance(entry, BytesStorageMetadata)
+                assert entry.nvrx_scalar_type == kind
+                location = metadata.storage_data[MetadataIndex(key)]
+                assert location.length == 8
+                with (directory / location.relative_path).open("rb") as stream:
+                    stream.seek(location.offset)
+                    assert stream.read(location.length) == struct.pack(f"<{code}", values[name])
+
+            target = {
+                "model": {"weight": torch.zeros_like(weight)},
+                "values": {"enabled": False, "maximum": 0, "minimum": 0, "floating": 0.0},
+            }
+            tensor_destination = target["model"]["weight"]
+            dcp.load(target, checkpoint_id=directory)
+
+            assert target["model"]["weight"] is tensor_destination
+            torch.testing.assert_close(tensor_destination, weight, rtol=0, atol=0)
+            for name, expected in values.items():
+                assert type(target["values"][name]) is type(expected)
+                assert target["values"][name] == expected
+            assert struct.pack("<d", target["values"]["floating"]) == struct.pack("<d", values["floating"])
+    finally:
+        checkpoint.svc_spindown()
 
 
 @pytest.mark.integration
@@ -143,7 +213,7 @@ def test_native_values_round_trip_without_torch_archives(tmp_path: Path, monkeyp
         "empty": torch.empty(0, 3),
     }
     try:
-        root.register_state_dict(state, native=True)
+        root.register_native_state_dict(state)
         root.finalize_registry()
         root.save(1, tmp_path)
         checkpoint.wait_for_ckpt_finalize(session, 1)
@@ -190,7 +260,7 @@ def test_native_dictionary_and_sequence_growth_refreshes_payloads(tmp_path: Path
     try:
         for iteration, length in enumerate((0, 1024, 2), 1):
             state = {"values": {str(i): [i, None] for i in range(length)}, "sequence": tuple(range(length))}
-            root.register_state_dict(state, native=True)
+            root.register_native_state_dict(state)
             if iteration == 1:
                 root.finalize_registry()
             directory = tmp_path / str(iteration)
@@ -208,7 +278,7 @@ def test_native_tensor_addresses_retain_dotted_parent_prefix(tmp_path: Path) -> 
     session, root = _root()
     tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     try:
-        root.register_state_dict({"model": {"decoder.layers.0.weight": tensor}, "items": [tensor + 1]}, native=True)
+        root.register_native_state_dict({"model": {"decoder.layers.0.weight": tensor}, "items": [tensor + 1]})
         root.finalize_registry()
         root.save(1, tmp_path)
         checkpoint.wait_for_ckpt_finalize(session, 1)
@@ -244,7 +314,7 @@ def test_native_schema_tracks_stock_dcp_item_order_and_cost(tmp_path: Path) -> N
         for item in reference.create_local_plan().items
     ]
     try:
-        root.register_state_dict(state, native=True)
+        root.register_native_state_dict(state)
         root.finalize_registry()
         root.save(1, tmp_path)
         checkpoint.wait_for_ckpt_finalize(session, 1)

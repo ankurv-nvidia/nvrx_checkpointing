@@ -122,8 +122,7 @@ static nb::list WriteRankShardImpl(std::string const& outDir,
                                    uint32_t           rank,
                                    nb::list const&    entriesPy,
                                    nb::list const&    objectsPy,
-                                   nb::dict const&    scalarsPy,
-                                   bool               native)
+                                   nb::dict const&    scalarsPy)
 {
     std::vector<InputEntry> entries;
     entries.reserve(entriesPy.size());
@@ -157,7 +156,6 @@ static nb::list WriteRankShardImpl(std::string const& outDir,
         .peers        = {"localhost"},
     };
     StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
-    tree.nativeState = native;
     AddScalars(tree, Rank{rank}, scalarsPy);
 
     // Build the tree in the post-merge global-registry shape — DTensor
@@ -248,8 +246,7 @@ static Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
 // The (file_offset, length) values are used as the verification side-channel
 // inside WriteMetadata — they're asserted against the analytical prediction.
-static void
-WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects, nb::dict const& scalars, bool native)
+static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects, nb::dict const& scalars)
 {
     RankTopology topo{
         .rank         = Rank{0},
@@ -259,7 +256,6 @@ WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list c
         .peers        = {"localhost"},
     };
     StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
-    tree.nativeState = native;
     AddScalars(tree, Rank{0}, scalars);
 
     for (auto const& tensor : tensors)
@@ -328,7 +324,6 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("entries"),
           nb::arg("objects") = nb::list(),
           nb::arg("scalars") = nb::dict(),
-          nb::arg("native")  = false,
           "Write `<out_dir>/__<rank>_0.distcp` from a list of (fqn, dtype_name, "
           "shape, data_bytes) entries and optional (fqn, bytes) objects. Returns the populated writeLog as a list of "
           "(fqn, sharddim, file_offset, length) tuples.");
@@ -339,7 +334,6 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("tensors"),
           nb::arg("objects") = nb::list(),
           nb::arg("scalars") = nb::dict(),
-          nb::arg("native")  = false,
           "Write `<out_dir>/.metadata` from a list of (fqn, dtype_name, full_shape, "
           "shards) tuples and optional (fqn, bytes) objects, where each shards entry is (rank, sharddim). The "
           "per-shard (file_offset, length) is inferred analytically from the "

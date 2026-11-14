@@ -40,7 +40,7 @@ _REGISTRY_MAGIC = 0x32525453
 _ORDERED_REGISTRY_VERSION = 4
 _NATIVE_REGISTRY_VERSION = 5
 _PLANNED_REGISTRY_VERSION = 6
-_REGISTRY_VERSION = 7
+_REGISTRY_VERSION = 8
 _METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
@@ -60,7 +60,7 @@ _DTYPES = {
 _MAX_DIMS = 4
 _INVALID_RANK = 0xFFFFFFFF
 _ROOT = 0
-_UNSIGNED, _SIGNED, _FLOAT = 1, 2, 3
+_UNSIGNED, _SIGNED, _FLOAT, _BOOLEAN = 1, 2, 3, 4
 _SCALAR_WIDTHS = {1: 1, 2: 2, 3: 4, 4: 8}
 _TOPOLOGY = struct.Struct("<IIII")
 _U32 = struct.Struct("<I")
@@ -163,6 +163,8 @@ def _replicas(reader: _Reader) -> tuple[int, ...]:
 
 def _scalar_value(reader: _Reader, version: int) -> _ScalarMetadata | tuple[int, int]:
     value = reader.unpack(_SCALAR_VALUE)
+    if version < _REGISTRY_VERSION:
+        value = (value[0] & 0b11111, value[1])
     return _ScalarMetadata(value, _replicas(reader)) if version >= _METADATA_VERSION else value
 
 
@@ -210,7 +212,13 @@ def _registry_header(reader: _Reader, path: Path) -> tuple[int, int]:
         return 1, count
     (version,) = reader.unpack(_U32)
     if version not in (
-        _METADATA_VERSION, 3, _ORDERED_REGISTRY_VERSION, _NATIVE_REGISTRY_VERSION, _PLANNED_REGISTRY_VERSION, _REGISTRY_VERSION,
+        _METADATA_VERSION,
+        3,
+        _ORDERED_REGISTRY_VERSION,
+        _NATIVE_REGISTRY_VERSION,
+        _PLANNED_REGISTRY_VERSION,
+        7,
+        _REGISTRY_VERSION,
     ):
         raise ValueError(f"{path}: unsupported registry version {version}")
     if version == _ORDERED_REGISTRY_VERSION:
@@ -220,7 +228,7 @@ def _registry_header(reader: _Reader, path: Path) -> tuple[int, int]:
             for _ in range(reader.unpack(_U32)[0]):
                 reader.take(1 + 8 + _DIM.size)
                 reader.take(reader.unpack(_U32)[0])
-    elif version >= _NATIVE_REGISTRY_VERSION:
+    elif _NATIVE_REGISTRY_VERSION <= version < _REGISTRY_VERSION:
         reader.take(1)
         if version == _PLANNED_REGISTRY_VERSION:
             for _ in range(reader.unpack(_U32)[0]):
@@ -299,7 +307,9 @@ def _ndim(ndim: int) -> int:
 
 def _decode_scalar(bits: int, raw: int) -> tuple[str, int, str]:
     width = _SCALAR_WIDTHS.get(bits & 0b111, 8)
-    category = (bits >> 3) & 0b11
+    category = (bits >> 3) & 0b111
+    if category == _BOOLEAN:
+        return "bool", width, str(bool(raw))
     if category == _FLOAT:
         return f"float{8 * width}", width, repr(_DOUBLE.unpack(raw.to_bytes(8, "little"))[0])
     if category == _SIGNED:

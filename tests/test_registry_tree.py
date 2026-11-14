@@ -111,7 +111,7 @@ def _metadata_prefix(version: int) -> bytes:
     prefix = struct.pack("<II", 0x32525453, version)
     if version == 4:
         prefix += struct.pack("<II", 0, 0)
-    elif version >= 5:
+    elif 5 <= version <= 7:
         prefix += b"\x01"
         if version == 6:
             prefix += struct.pack("<I", 0)
@@ -426,7 +426,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7, 8])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -498,9 +498,24 @@ def test_metadata_counts_local_membership_without_replica_hints(
 
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=8)
-    with pytest.raises(ValueError, match="unsupported registry version 8"):
+    _Tree(0).write(path, version=9)
+    with pytest.raises(ValueError, match="unsupported registry version 9"):
         registry_tree.read_registry(path)
+
+
+@pytest.mark.parametrize("version", [5, 6, 7, 8])
+def test_boolean_scalar_type_uses_current_wire_category(tmp_path: Path, version: int) -> None:
+    tree = _Tree(0)
+    tree.add("enabled", _SCALAR, (((4 << 3) | 1, 1), (0,)))
+    tree.add("byte", _SCALAR, (((1 << 3) | 1, 1), (0,)))
+    path = tmp_path / "registry.global.bin"
+    tree.write(path, version=version)
+
+    leaves = {leaf.fqn: leaf for leaf in registry_tree.analyze([path]).leaves}
+
+    assert leaves["enabled"].blob["t"] == ("bool" if version == 8 else "unknown")
+    assert leaves["byte"].blob["t"] == "uint8"
+    assert leaves["enabled"].unique == 1
 
 
 def test_capture_descriptions_do_not_change_registry_values(tmp_path: Path) -> None:

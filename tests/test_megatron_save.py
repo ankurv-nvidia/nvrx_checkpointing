@@ -642,11 +642,10 @@ def test_dtensor_registration_preserves_nested_values_without_python_serializati
 ) -> None:
     registered: list[dict] = []
 
-    def register(state: dict, *, native: bool) -> None:
-        assert native is True
+    def register(state: dict) -> None:
         registered.append(state)
 
-    root = SimpleNamespace(register_state_dict=register)
+    root = SimpleNamespace(register_native_state_dict=register)
     monkeypatch.setattr(save, "_ensure_root", lambda: root)
 
     def forbidden(*_args: object, **_kwargs: object) -> None:
@@ -672,7 +671,7 @@ def test_dtensor_registration_preserves_nested_values_without_python_serializati
 
 def test_dtensor_registration_accepts_growing_objects(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     registered: list[dict] = []
-    root = SimpleNamespace(register_state_dict=lambda state, **_kwargs: registered.append(state))
+    root = SimpleNamespace(register_native_state_dict=registered.append)
     monkeypatch.setattr(save, "_ensure_root", lambda: root)
     first = {"objects": {"text": "a", "values": []}}
     later = {"objects": {"text": "a" * 8192, "values": [1, None, ()]}}

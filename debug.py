@@ -32,6 +32,7 @@ from torch.distributed.checkpoint.filesystem import _StorageInfo
 from torch.distributed.checkpoint.metadata import MetadataIndex
 
 from .megatron import mapping
+from .scalar import decode_scalar, scalar_storage_type
 
 
 def transform_complex_obj(obj: object, visited: set[object] | None = None) -> str | dict[str, object] | list[object]:  # noqa: C901, PLR0911, PLR0912
@@ -286,6 +287,57 @@ def _native_common_state(reader: FileSystemReader, metadata: object) -> dict:
     return flatten_state_dict({key: materialize_native_value(value) for key, value in objects.items()})[0]
 
 
+def _scalar_locations(common: dict, scalars: dict) -> dict:
+    locations = {}
+    active = set()
+
+    def visit(value: object, path: str) -> None:
+        if path in scalars:
+            locations[path] = value
+            return
+        if not any(key.startswith(f"{path}.") for key in scalars) or id(value) in active:
+            return
+        active.add(id(value))
+        try:
+            if isinstance(value, dict):
+                children = value.items()
+            elif isinstance(value, (list, tuple)):
+                children = enumerate(value)
+            elif hasattr(value, "__dict__"):
+                children = vars(value).items()
+            else:
+                return
+            for key, child in children:
+                visit(child, f"{path}.{key}")
+        finally:
+            active.remove(id(value))
+
+    for key, value in common.items():
+        visit(value, str(key))
+    return locations
+
+
+def _merge_scalar_state(common: dict, reader: FileSystemReader, metadata: object) -> dict:
+    from .megatron.native_state import _read_entry, restore_native_value  # noqa: PLC0415
+
+    scalars = {
+        key: decode_scalar(storage, _read_entry(reader, metadata, key))
+        for key, storage in metadata.state_dict_metadata.items()
+        if scalar_storage_type(storage) is not None
+    }
+    locations = _scalar_locations(common, scalars)
+    for key, value in scalars.items():
+        if key in locations:
+            expected, actual = {}, {}
+            flatten_to_entries(key, locations[key], expected)
+            flatten_to_entries(key, restore_native_value(value, locations[key], key), actual)
+            if actual != expected:
+                raise ValueError(f"Conflicting archived and independent scalar value: {key}")
+        else:
+            common[key] = value
+    return common
+
+
 def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
     """Load non-sharded state from legacy or current Megatron checkpoints.
 
@@ -304,14 +356,18 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
         return _native_common_state(reader, metadata)
     state_dict_metadata = metadata.state_dict_metadata
     if _is_plain_dcp(checkpoint_dir, state_dict_metadata):
-        objects = {fqn: io.BytesIO() for fqn, meta in state_dict_metadata.items() if isinstance(meta, BytesStorageMetadata)}
+        objects = {
+            fqn: io.BytesIO()
+            for fqn, meta in state_dict_metadata.items()
+            if isinstance(meta, BytesStorageMetadata) and scalar_storage_type(meta) is None
+        }
         torch.distributed.checkpoint.load(objects, storage_reader=reader, no_dist=True)
-        return objects
+        return _merge_scalar_state(objects, reader, metadata)
 
     if not (checkpoint_dir / "metadata.json").is_file():
         from .megatron.load import read_common_state  # noqa: PLC0415
 
-        return read_common_state(reader, metadata)
+        return _merge_scalar_state(read_common_state(reader, metadata), reader, metadata)
 
     state_dict = {_DCP_COMMON_STATE_KEY: io.BytesIO()}
     torch.distributed.checkpoint.load(
@@ -328,7 +384,7 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
     common_state = loaded[0]
     if not isinstance(common_state, dict):
         raise TypeError(f"Expected common state dict, got {type(common_state).__name__}")
-    return common_state
+    return _merge_scalar_state(common_state, reader, metadata)
 
 
 def _load_bytes_storage_value(raw: bytes) -> object:
@@ -478,14 +534,15 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             data_size = math.prod(chunk.sizes) * torch.tensor([], dtype=meta.properties.dtype).element_size()
             reads_by_file.setdefault(si.relative_path, []).append(("tensor", si.offset, si.length, fqn, i, data_size))
     plain_dcp = _is_plain_dcp(checkpoint_dir, metadata.state_dict_metadata)
-    for fqn in bytemeta:
+    for fqn, meta in bytemeta.items():
+        scalar = scalar_storage_type(meta) is not None
         # Embedded common state, like every object of a plain DCP checkpoint, is compared through common_pt_dump.info.
-        if plain_dcp or fqn == _DCP_COMMON_STATE_KEY or fqn.startswith(f"{_DCP_COMMON_STATE_KEY}.rank_"):
+        if not scalar and (plain_dcp or fqn == _DCP_COMMON_STATE_KEY or fqn.startswith(f"{_DCP_COMMON_STATE_KEY}.rank_")):
             continue
         si = chunk_storage.get((fqn, ()))
         if si is None:
             continue
-        reads_by_file.setdefault(si.relative_path, []).append(("bytes", si.offset, si.length, fqn, 0, None))
+        reads_by_file.setdefault(si.relative_path, []).append(("scalar" if scalar else "bytes", si.offset, si.length, fqn, 0, None))
 
     if verify_native_server:
         try_ping()
@@ -520,11 +577,14 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
                     raise ValueError(
                         f"[native_ckpt:cli] {relative_path}:{fqn}.chunk.{i} offset={offset}: Got {len(raw)} of {length} bytes\n",
                     )
-                if kind == "bytes":
+                if kind in ("bytes", "scalar"):
                     t1 = time.monotonic()
                     raw_blobs[f"{fqn}.bytes.md5sum"] = hashlib.md5(raw).hexdigest()  # noqa: S324
-                    value = _load_bytes_storage_value(raw)
-                    flatten_to_entries(f"{fqn}.object", value, local)
+                    if kind == "scalar":
+                        decode_scalar(bytemeta[fqn], raw)
+                    else:
+                        value = _load_bytes_storage_value(raw)
+                        flatten_to_entries(f"{fqn}.object", value, local)
                     md5_s += time.monotonic() - t1
                     continue
                 # Each chunk is a complete torch.save() ZIP64 archive; the raw tensor

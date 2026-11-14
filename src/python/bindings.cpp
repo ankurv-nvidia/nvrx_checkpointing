@@ -72,6 +72,21 @@ static bool IsShardedState(StateNode::Variant const& data)
 
 namespace
 {
+using StateDictScanner = void (*)(PyStateDictAccessor&, nb::dict const&);
+
+void ScanPreparedStateDict(PyStateDictAccessor& accessor, nb::dict const& stateDict)
+{
+    std::unordered_set<PyObject*> visited;
+    RegisterStateDictRecr(accessor, StateNode::Handle::Root, stateDict, true, visited);
+}
+
+void ScanNativeStateDict(PyStateDictAccessor& accessor, nb::dict const& stateDict)
+{
+    nb::gil_scoped_acquire                      acquire;
+    checkpoint::python::NativeStateRegistration registration(accessor);
+    registration.Register(stateDict);
+}
+
 struct PythonStateTree
 {
     struct Accessor : PyStateDictAccessor
@@ -80,7 +95,6 @@ struct PythonStateTree
 
         [[nodiscard]] RankTopology GetRankTopo() const override { return _registry->Topo(); }
         [[nodiscard]] std::string  GetNodeId(StateNode::Handle node) const override;
-        [[nodiscard]] bool         IsNativeState() const override { return _registry->nativeState; }
 
         StateNode* AddDictionaryChild(StateNode::Handle parent, std::string_view name) override;
         StateNode* RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) override;
@@ -133,10 +147,18 @@ struct PythonStateTree
         });
     }
 
-    void RegisterStateDict(nb::dict stateDict, bool native)
+    void RegisterStateDict(nb::dict stateDict, StateDictScanner scanner)
     {
-        ChainAsyncCall([this, stateDict = std::move(stateDict), native] mutable {
-            ConfigureRegistrationMetadata_(native);
+        ChainAsyncCall([this, stateDict = std::move(stateDict), scanner] mutable {
+            if (_scanner != nullptr && _scanner != scanner)
+            {
+                throw std::runtime_error("Checkpoint registration API changed after initial registration");
+            }
+            if (_scanner == nullptr && _localRegistry.IsFinalized())
+            {
+                throw std::runtime_error("Checkpoint state must be registered before registry synchronization");
+            }
+            _scanner = scanner;
             {
                 nb::gil_scoped_acquire acquire;
                 _dictToScan = stateDict;
@@ -182,24 +204,6 @@ struct PythonStateTree
     void SetStartedAt(int64_t startedAt) { SnapshotRegistry().startedAt = std::chrono::nanoseconds{startedAt}; }
 
     private:
-    void ConfigureRegistrationMetadata_(bool native)
-    {
-        if (_registrationMetadataConfigured)
-        {
-            if (_localRegistry.nativeState != native)
-            {
-                throw std::runtime_error("Checkpoint registration mode changed after initial registration");
-            }
-            return;
-        }
-        if (_localRegistry.IsFinalized() && native)
-        {
-            throw std::runtime_error("Native checkpoint registration must be configured before registry synchronization");
-        }
-        _localRegistry.nativeState      = native;
-        _registrationMetadataConfigured = true;
-    }
-
     void ReleasePythonObjects_();
 
     void OnSnapshotComplete_()
@@ -219,7 +223,7 @@ struct PythonStateTree
     std::vector<std::vector<char>>                          _blobStorage;
     std::mutex                                              _asyncMutex;
     std::future<void>                                       _async;
-    bool                                                    _registrationMetadataConfigured{false};
+    StateDictScanner                                        _scanner{nullptr};
 };
 }    // namespace
 
@@ -367,17 +371,9 @@ void PythonStateTree::ReleasePythonObjects_()
 
 void PythonStateTree::Scan(StateTree& registry)
 {
-    std::unordered_set<PyObject*> visited;
-
+    if (_scanner == nullptr) { return; }
     Accessor accessor{&registry, this};
-    if (registry.nativeState)
-    {
-        nb::gil_scoped_acquire                      acquire;
-        checkpoint::python::NativeStateRegistration registration(accessor);
-        registration.Register(_dictToScan);
-        return;
-    }
-    RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
+    _scanner(accessor, _dictToScan);
 }
 
 void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem::path const& dirpath)
@@ -390,9 +386,19 @@ void PythonStateTree::SaveCheckpoint(cipc::SnapshotId iteration, std::filesystem
 
 static StateNode::Scalar ScalarState(nb::handle obj)
 {
-    if (nb::isinstance<int64_t>(obj)) { return StateNode::Scalar{nb::cast<int64_t>(obj)}; }
-    if (nb::isinstance<double>(obj)) { return StateNode::Scalar{nb::cast<double>(obj)}; }
     if (nb::isinstance<bool>(obj)) { return StateNode::Scalar{nb::cast<bool>(obj)}; }
+    if (nb::isinstance<nb::int_>(obj))
+    {
+        int        overflow    = 0;
+        auto const signedValue = PyLong_AsLongLongAndOverflow(obj.ptr(), &overflow);
+        if (PyErr_Occurred() != nullptr) { throw nb::python_error(); }
+        if (overflow == 0) { return StateNode::Scalar{static_cast<int64_t>(signedValue)}; }
+        if (overflow < 0) { throw std::out_of_range("Checkpoint integer is below the signed 64-bit range"); }
+        auto const unsignedValue = PyLong_AsUnsignedLongLong(obj.ptr());
+        if (PyErr_Occurred() != nullptr) { throw nb::python_error(); }
+        return StateNode::Scalar{static_cast<uint64_t>(unsignedValue)};
+    }
+    if (nb::isinstance<nb::float_>(obj)) { return StateNode::Scalar{nb::cast<double>(obj)}; }
     throw std::out_of_range("Conversion of nanobind::object to Scalar failed");
 }
 
@@ -576,7 +582,7 @@ static void RegisterStateDictRecrContainerItem(PyStateDictAccessor&           sc
             fmt::format("[TODO]StateDict::Register] {} key = {} is not string or int\n", scan.GetNodeId(node), keyView));
     }
 
-    if (nb::isinstance<int64_t>(val) || nb::isinstance<double>(val) || nb::isinstance<bool>(val))
+    if (nb::isinstance<nb::int_>(val) || nb::isinstance<nb::float_>(val) || nb::isinstance<bool>(val))
     {    //
         scan.RegisterState(node, keyView, ScalarState(val));
     }
@@ -740,11 +746,11 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
     }
 }
 
-static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict, bool native)
+template <StateDictScanner Scanner> static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
 {
     auto                   extraDictRef = nb::dict(stateDict);
     nb::gil_scoped_release release;
-    self.RegisterStateDict(std::move(extraDictRef), native);
+    self.RegisterStateDict(std::move(extraDictRef), Scanner);
 }
 
 static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
@@ -826,7 +832,8 @@ NB_MODULE(checkpoint, m)    // NOLINT
             "startedAt",
             [](PythonStateTree const& self) { return self.SnapshotRegistry().startedAt.count(); },
             [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
-        .def("register_state_dict", &RegisterStateDict, nb::arg("state_dict"), nb::kw_only(), nb::arg("native") = false)
+        .def("register_state_dict", &RegisterStateDict<ScanPreparedStateDict>, nb::arg("state_dict"))
+        .def("register_native_state_dict", &RegisterStateDict<ScanNativeStateDict>, nb::arg("state_dict"))
         .def("finalize_registry",
              [](PythonStateTree& self) {
                  nb::gil_scoped_release release;

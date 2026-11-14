@@ -430,6 +430,8 @@ def restore_native_value(value: Any, target: Any, path: str = "") -> Any:  # noq
         if enum_type is None:
             raise TypeError(f"Missing destination enum type for: {path}")
         return enum_type(value.value)
+    if isinstance(target, enum.Enum) and isinstance(value, (bool, int, float, str, bytes, tuple)):
+        return type(target)(value)
     if isinstance(value, NativeGenerator):
         generator = target if isinstance(target, torch.Generator) else torch.Generator(device=value.device)
         generator.set_state(torch.frombuffer(bytearray(value.state), dtype=torch.uint8))

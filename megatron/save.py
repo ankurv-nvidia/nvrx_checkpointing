@@ -320,7 +320,7 @@ def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_st
 def register_dtensor_state_dict(state_dict: dict) -> checkpoint.model_state:
     """Register nested DTensor state with native object encodings."""
     root = _ensure_root()
-    root.register_state_dict(state_dict, native=True)
+    root.register_native_state_dict(state_dict)
     return root
 
 

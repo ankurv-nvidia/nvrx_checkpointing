@@ -1,5 +1,52 @@
 # Hand-off: the `dtensor` branch of nvrx_checkpointing
 
+## Independent scalar storage, 2026-11-14
+
+The owner requires independent scalar persistence for every state node,
+including `torch_dist`, without a native-format boolean. Existing common-state
+archive generation is retained for a separate cleanup.
+
+- State registries, planning, and the daemon contain no format mode. Registry
+  wire version 8 contains the node tree without a format byte. Debug tools
+  retain support for earlier registry versions.
+- Every scalar is an eight-byte little-endian DCP byte entry. Its byte-storage
+  metadata records `int64`, `uint64`, `float64`, or `bool`; unmarked blobs remain
+  distinct. Booleans have an intrinsic primitive category. Full signed and
+  unsigned 64-bit integer ranges are supported.
+- The prepared registration API retains its existing input conversion. The
+  structured registration API accepts the nested FSDP state dictionary. The
+  binding retains the scanner locally so later captures use the same traversal;
+  that choice does not enter state registries or daemon planning.
+- Planning and peer messages scrub scalar values. Captures contain current
+  local values. The load adapter restores raw scalars into destination objects
+  while retaining tensor and container references. Debug comparisons merge
+  independent scalars with existing archives and reject conflicting values.
+- Structured state records identify `fsdp_dtensor` output. Ordinary output
+  retains the `torch_dist` format marker and common-state archive.
+
+The class layout in the load adapter and the separate native encoder/decoder
+files are implementation choices. They are not requirements of DTensor or DCP.
+The adapter retains compatibility with the branch's earlier object bundles.
+The structured codec supports container keys, arrays, enums, namespaces, and
+RNG generators without generating Python `torch.save` object archives.
+
+The fresh two-GPU eight-expert MoE CI run uses EP2, TP1, and DP2. Both ranks
+resume at iteration 50 and save through 125. All five checkpoints match the
+reference exactly: 3,209 entries at 25/50 and 3,208 at 75/100/125. Its worker,
+epilog, argument, save-span, and telemetry checks pass. There is no new
+four-GPU result; the discrepancy described below remains unresolved.
+
+Validation passes 639 Python tests with 84 environment-dependent skips and
+98 isolated daemon cases with two CUDA-only skips. All 28 focused native
+cases pass. Of 91 native CTest cases, 89 pass in the isolated environment;
+the forwarding case separately passes all 17 assertions, and the external
+registry fixture is unavailable. All 18 Python-backed CTests also pass against
+the final wheel.
+
+Globally empty DTensors remain a coverage boundary: capture omits their keys,
+so strict loading lacks their metadata. Empty ordinary tensors are supported.
+The exercised MoE models do not contain globally empty DTensors.
+
 ## Replica consistency cleanup, 2026-11-14
 
 The owner requires identical data for replicas of the same logical tensor

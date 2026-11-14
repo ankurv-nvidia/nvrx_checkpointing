@@ -1015,72 +1015,100 @@ static std::string SerializedStateRegistry(StateTree const& tree)
     return serialized.str();
 }
 
-TEST_CASE("native registry messages retain scalar types without their values", "[state][planning][tier1]")
+TEST_CASE("registry metadata retains scalar types without their values", "[state][planning][tier1]")
 {
-    StateTree tree(checkpoint::ipc::SessionId{17}, SingleRankTopo(0, 2));
-    tree.nativeState = true;
-    StateNode::Scalar scalar(int64_t{-57});
-    scalar.replicas                                        = {Rank{0}, Rank{1}};
-    tree.AddChild(StateNode::Handle::Root, "counter").data = scalar;
+    StateTree                        tree(checkpoint::ipc::SessionId{17}, SingleRankTopo(0, 2));
+    std::array<StateNode::Scalar, 5> values{StateNode::Scalar(int64_t{-57}),
+                                            StateNode::Scalar(uint64_t{99}),
+                                            StateNode::Scalar(0.25),
+                                            StateNode::Scalar(true),
+                                            StateNode::Scalar(uint8_t{1})};
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        values[index].replicas                                                      = {Rank{0}, Rank{1}};
+        tree.AddChild(StateNode::Handle::Root, fmt::format("scalar{}", index)).data = values[index];
+    }
     tree.FinalizeRegistry();
     std::ostringstream bytes;
     StateSerDes::Write(bytes, tree, StateNode::Handle::Root, true);
     std::istringstream input(bytes.str());
     auto               restored = StateSerDes::Read(input);
-    REQUIRE(restored->nativeState);
-    CHECK(restored->Clone()->nativeState);
-    auto const& value = std::get<StateNode::Scalar>(restored->GetNode(restored->FindNodeByFQN("counter")).data);
-    CHECK(value.GetType() == scalar.GetType());
-    CHECK(value.Cast<int64_t>() == 0);
-    CHECK(value.replicas == scalar.replicas);
-    CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN("counter")).data).Cast<int64_t>() == -57);
+    auto const         cloned   = restored->Clone();
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        auto const  name  = fmt::format("scalar{}", index);
+        auto const& value = std::get<StateNode::Scalar>(restored->GetNode(restored->FindNodeByFQN(name)).data);
+        CHECK(value.GetType() == values[index].GetType());
+        CHECK(value.Cast<double>() == 0.0);
+        CHECK(value.replicas == (std::set<Rank>{Rank{0}, Rank{1}}));
+        CHECK(std::get<StateNode::Scalar>(cloned->GetNode(cloned->FindNodeByFQN(name)).data) == value);
+        CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN(name)).data) == values[index]);
+    }
+    CHECK(values[3].GetType() != values[4].GetType());
+    CHECK(values[3].Cast<bool>());
+    CHECK(values[3].Cast<uint64_t>() == 1);
+    CHECK(values[4].Cast<bool>());
     CHECK(input.peek() == std::char_traits<char>::eof());
+    std::istringstream captured(SerializedStateRegistry(tree));
+    auto const         capture = StateSerDes::Read(captured);
+    CHECK(std::get<StateNode::Scalar>(capture->GetNode(capture->FindNodeByFQN("scalar0")).data) == values[0]);
 }
 
-TEST_CASE("native checkpoint scalars occupy eight raw bytes beside current blob payloads", "[distcp][scalar][tier1]")
+TEST_CASE("checkpoint scalars occupy eight typed bytes beside opaque blobs", "[distcp][scalar][tier1]")
 {
-    auto const output = CkptDir("native_scalars");
+    auto const output = CkptDir("scalar_entries");
     std::filesystem::remove_all(output);
     StateTree tree(checkpoint::ipc::SessionId{18}, SingleRankTopo());
-    tree.nativeState = true;
-    auto add         = [&](std::string_view name, StateNode::Scalar scalar) {
+    auto      add = [&](std::string_view name, StateNode::Scalar scalar) {
         scalar.replicas                                   = {Rank{0}};
         tree.AddChild(StateNode::Handle::Root, name).data = scalar;
     };
     add("a_unsigned", StateNode::Scalar(std::numeric_limits<uint64_t>::max()));
     add("b_signed", StateNode::Scalar(std::numeric_limits<int64_t>::min()));
     add("d_float", StateNode::Scalar(-0.0));
-    ByteStorage storage(3);
-    std::memcpy(storage.data, "xyz", 3);
+    add("e_bool", StateNode::Scalar(true));
+    add("f_byte", StateNode::Scalar(uint8_t{255}));
+    ByteStorage storage(8);
+    std::memcpy(storage.data, "abcdefgh", 8);
     tree.AddChild(StateNode::Handle::Root, "c_payload").data
-        = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = 3};
+        = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = 8};
     tree.FinalizeRegistry();
     auto const lengths = checkpoint::distcp::WriteRankShard(output, Rank{0}, tree, storage);
     checkpoint::distcp::WriteMetadata(output, tree, lengths);
-    std::unordered_map<std::string, uint64_t> const expectedLengths{{"c_payload", 3}};
+    std::unordered_map<std::string, uint64_t> const expectedLengths{{"c_payload", 8}};
     CHECK(lengths == expectedLengths);
     auto const bytes = ReadWholeFile(output / "__0_0.distcp");
-    REQUIRE(bytes.size() == 27);
-    std::array<char, 27> expected{};
+    REQUIRE(bytes.size() == 48);
+    std::array<char, 48> expected{};
     std::fill_n(expected.begin(), 8, static_cast<char>(0xff));
     expected[15] = static_cast<char>(0x80);
-    std::memcpy(expected.data() + 16, "xyz", 3);
-    expected[26] = static_cast<char>(0x80);
+    std::memcpy(expected.data() + 16, "abcdefgh", 8);
+    expected[31] = static_cast<char>(0x80);
+    expected[32] = 1;
+    expected[40] = static_cast<char>(0xff);
     CHECK(std::equal(bytes.begin(), bytes.end(), expected.begin()));
+    CHECK(std::filesystem::exists(output / "metadata.json"));
+#ifdef PHOENIX_VENV_PYTHON
+    auto const command
+        = fmt::format("{} -c \"import pickle; from pathlib import Path; p=Path(r'{}'); m=pickle.load(open(p/'.metadata','rb')); "
+                      "expected={{'a_unsigned':'uint64','b_signed':'int64','d_float':'float64','e_bool':'bool','f_byte':'uint64'}}; "
+                      "assert all(m.state_dict_metadata[k].nvrx_scalar_type==v for k,v in expected.items()); "
+                      "assert not hasattr(m.state_dict_metadata['c_payload'],'nvrx_scalar_type'); "
+                      "assert all(v.length==8 for v in m.storage_data.values())\"",
+                      PHOENIX_VENV_PYTHON,
+                      output.string());
+    REQUIRE(std::system(command.c_str()) == 0);
+#endif
+    StateTree structured(tree.SessionId(), tree.Topo());
+    tree.CloneInto(structured);
+    structured.AddChild(StateNode::Handle::Root, "__nvrx_native_state_rank_0__").data
+        = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = 0};
+    checkpoint::distcp::WriteMetadata(output, structured);
     CHECK_FALSE(std::filesystem::exists(output / "metadata.json"));
-
-    auto standard             = tree.Clone();
-    standard->nativeState     = false;
-    auto const standardOutput = output / "standard";
-    checkpoint::distcp::WriteRankShard(standardOutput, Rank{0}, *standard, storage);
-    checkpoint::distcp::WriteMetadata(standardOutput, *standard);
-    std::vector<char> const expectedStandard{'x', 'y', 'z'};
-    CHECK(ReadWholeFile(standardOutput / "__0_0.distcp") == expectedStandard);
-    CHECK(std::filesystem::exists(standardOutput / "metadata.json"));
     std::filesystem::remove_all(output);
 }
 
-TEST_CASE("native mode retains the main capture owner policy", "[server][planning][tier1]")
+TEST_CASE("capture planning balances scalar and replicated tensor owners", "[server][planning][tier1]")
 {
     auto topology = SingleRankTopo(0, 2);
     auto source   = std::make_shared<StateTree>(checkpoint::ipc::SessionId::Default, topology);
@@ -1091,29 +1119,18 @@ TEST_CASE("native mode retains the main capture owner policy", "[server][plannin
     StateNode::Scalar scalar(int64_t{99});
     scalar.replicas                                           = {Rank{0}, Rank{1}};
     source->AddChild(StateNode::Handle::Root, "counter").data = scalar;
-    Session standard(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    standard.HandleGlobalRegistry(source->Clone(), {});
-    REQUIRE(standard.sessionState.planningReady);
-    auto native         = source->Clone();
-    native->nativeState = true;
-    Session structured(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    structured.HandleGlobalRegistry(native, {});
-    REQUIRE(structured.sessionState.planningReady);
-    auto const& expected = *standard.sessionState.dedupedGlobalRegistry;
-    auto const& actual   = *structured.sessionState.dedupedGlobalRegistry;
-    CHECK(actual.nativeState);
-    CHECK(std::get<StateNode::Scalar>(actual.GetNode(actual.FindNodeByFQN("counter")).data).replicas
-          == std::get<StateNode::Scalar>(expected.GetNode(expected.FindNodeByFQN("counter")).data).replicas);
-    CHECK(std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("weight")).data).shards
-          == std::get<DTensor>(expected.GetNode(expected.FindNodeByFQN("weight")).data).shards);
-    for (auto const& [rank, registry] : structured.sessionState.snapshotRegistryForRank)
-    {
-        static_cast<void>(rank);
-        CHECK(registry->nativeState);
-    }
+    Session session(nullptr, source->SessionId(), std::filesystem::path{}, topology);
+    session.HandleGlobalRegistry(source, {});
+    REQUIRE(session.sessionState.planningReady);
+    auto const& actual   = *session.sessionState.dedupedGlobalRegistry;
+    auto const& selected = std::get<StateNode::Scalar>(actual.GetNode(actual.FindNodeByFQN("counter")).data);
+    CHECK(selected.replicas == std::set<Rank>{Rank{0}});
+    auto const& shards = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("weight")).data).shards;
+    REQUIRE(shards.size() == 1);
+    CHECK(shards.begin()->rank == Rank{1});
 }
 
-TEST_CASE("native owner selection retains distinct uneven tensor shards", "[server][planning][tier1]")
+TEST_CASE("owner selection retains distinct uneven tensor shards", "[server][planning][tier1]")
 {
     auto        topology = SingleRankTopo(0, 4);
     auto        source   = std::make_shared<StateTree>(checkpoint::ipc::SessionId::Default, topology);
@@ -1132,22 +1149,16 @@ TEST_CASE("native owner selection retains distinct uneven tensor shards", "[serv
                          .device        = DeviceId{"cpu"}});
     }
     source->AddChild(StateNode::Handle::Root, "uneven").data = std::move(uneven);
-    Session standard(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    standard.HandleGlobalRegistry(source->Clone(), {});
-    REQUIRE(standard.sessionState.planningReady);
-    source->nativeState = true;
-    Session structured(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    structured.HandleGlobalRegistry(source, {});
-    REQUIRE(structured.sessionState.planningReady);
-    auto const& actual   = *structured.sessionState.dedupedGlobalRegistry;
-    auto const& chunks   = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("uneven")).data).shards;
-    auto const& expected = *standard.sessionState.dedupedGlobalRegistry;
-    CHECK(chunks == std::get<DTensor>(expected.GetNode(expected.FindNodeByFQN("uneven")).data).shards);
+    Session session(nullptr, source->SessionId(), std::filesystem::path{}, topology);
+    session.HandleGlobalRegistry(source, {});
+    REQUIRE(session.sessionState.planningReady);
+    auto const& actual = *session.sessionState.dedupedGlobalRegistry;
+    auto const& chunks = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("uneven")).data).shards;
     REQUIRE(chunks.size() == 2);
     for (auto const& chunk : chunks) { CHECK(chunk.rank == (chunk.sharddim[0].begin == 0 ? Rank{0} : Rank{1})); }
 }
 
-TEST_CASE("native scalar values and growing blobs remain local across daemons", "[server][scalar][blob][tier2]")
+TEST_CASE("scalar values and growing blobs remain local across daemons", "[server][scalar][blob][tier2]")
 {
     auto const output = CkptDir("native_peer_values");
     std::filesystem::remove_all(output);
@@ -1164,9 +1175,8 @@ TEST_CASE("native scalar values and growing blobs remain local across daemons", 
     {
         RankTopology topology{
             .rank = Rank{rank}, .worldSize = Rank{2}, .ranksPerPeer = 1, .peersPerNode = 2, .peers = {"localhost:4100", "localhost:4101"}};
-        auto& tree        = trees[rank];
-        tree              = std::make_shared<StateTree>(checkpoint::ipc::SessionId{71}, topology);
-        tree->nativeState = true;
+        auto& tree = trees[rank];
+        tree       = std::make_shared<StateTree>(checkpoint::ipc::SessionId{71}, topology);
         AddTensorShardLeaf(*tree, "weight", Tensor::DType::Float32, {1}, reinterpret_cast<uint64_t>(values[rank].data()));
         StateNode::Scalar scalar(int64_t{100});
         scalar.replicas                                        = {Rank{rank}};
@@ -1201,7 +1211,7 @@ TEST_CASE("native scalar values and growing blobs remain local across daemons", 
         }
         REQUIRE_NOTHROW(WaitForCkptFinalize(71, iteration));
         REQUIRE(std::filesystem::exists(checkpointDir / ".metadata"));
-        CHECK_FALSE(std::filesystem::exists(checkpointDir / "metadata.json"));
+        CHECK(std::filesystem::exists(checkpointDir / "metadata.json"));
 #ifdef PHOENIX_VENV_PYTHON
         auto const command = fmt::format(
             "{} -c \"import io,pickle,struct,torch; from pathlib import Path; p=Path(r'{}'); m=pickle.load(open(p/'.metadata','rb')); "
@@ -1291,11 +1301,14 @@ TEST_CASE("payload traversal groups blobs and tensors independently of node orde
     auto const tensorBytes = checkpoint::distcp::ComputeShardArchiveSize(Tensor::DType::UInt8, sharded.fulldim, 2)
                              + checkpoint::distcp::ComputeShardArchiveSize(Tensor::DType::UInt8, full.fulldim, 3);
     auto const written     = ReadWholeFile(outDir / "__0_0.distcp");
-    REQUIRE(written.size() == tensorBytes + 8);
+    REQUIRE(written.size() == tensorBytes + 16);
     auto const writtenBytes = std::string_view(written.data(), written.size());
     CHECK(writtenBytes.substr(tensorBytes, 4) == "TAIL");
     CHECK(writtenBytes.substr(tensorBytes + 4, 2) == "AB");
-    CHECK(writtenBytes.substr(tensorBytes + 6, 2) == "CD");
+    std::array<char, 8> expectedScalar{};
+    expectedScalar[0] = 71;
+    CHECK(std::ranges::equal(writtenBytes.substr(tensorBytes + 6, 8), expectedScalar));
+    CHECK(writtenBytes.substr(tensorBytes + 14, 2) == "CD");
     auto const metadata      = ReadWholeFile(outDir / ".metadata");
     auto const metadataBytes = std::string_view(metadata.data(), metadata.size());
     CHECK(metadataBytes.contains("a_dynamic"));
@@ -1305,15 +1318,17 @@ TEST_CASE("payload traversal groups blobs and tensors independently of node orde
 #ifdef PHOENIX_VENV_PYTHON
     auto const cmd = fmt::format("{} -c \"import pickle; m=pickle.load(open(r'{}','rb')); "
                                  "s={{i.fqn:(v.offset,v.length) for i,v in m.storage_data.items()}}; "
-                                 "assert len(s)==6; assert s['a_dynamic']==({},4); "
-                                 "assert s['b_fixed/shard_0_1']==({},2); assert s['z_empty']==({},0); "
-                                 "assert s['z_fixed/shard_0_1']==({},2)\"",
+                                 "assert len(s)==7; assert s['a_dynamic']==({},4); "
+                                 "assert s['b_fixed/shard_0_1']==({},2); assert s['step']==({},8); "
+                                 "assert m.state_dict_metadata['step'].nvrx_scalar_type=='int64'; "
+                                 "assert s['z_empty']==({},0); assert s['z_fixed/shard_0_1']==({},2)\"",
                                  PHOENIX_VENV_PYTHON,
                                  (outDir / ".metadata").string(),
                                  tensorBytes,
                                  tensorBytes + 4,
                                  tensorBytes + 6,
-                                 tensorBytes + 6);
+                                 tensorBytes + 14,
+                                 tensorBytes + 14);
     REQUIRE(std::system(cmd.c_str()) == 0);    // NOLINT
 #endif
 
@@ -1702,7 +1717,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         auto const  name   = fmt::format("typed_scalar{}", index);
         auto const& scalar = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
         CHECK(scalar.GetType() == values[index].GetType());
-        CHECK(scalar == values[index]);
+        CHECK(scalar.Cast<double>() == 0.0);
         CHECK(scalar.replicas == values[index].replicas);
         CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN(name)).data) == values[index]);
     }
@@ -1743,9 +1758,28 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
     if (status != std::future_status::ready) { CHECK(server.Stop()); }
     REQUIRE(status == std::future_status::ready);
     CHECK_NOTHROW(durable.get());
-    auto const saved = ReadWholeFile(checkpointDir / "__0_0.distcp");
-    CHECK(std::string(saved.begin(), saved.end()) == fixedBytes + bytes);
+    auto const saved  = ReadWholeFile(checkpointDir / "__0_0.distcp");
+    auto const prefix = fixedBytes + bytes;
+    REQUIRE(saved.size() == prefix.size() + (512 + values.size()) * sizeof(uint64_t));
+    CHECK(std::string_view(saved.data(), prefix.size()) == prefix);
     CHECK(std::filesystem::exists(checkpointDir / ".metadata"));
+#ifdef PHOENIX_VENV_PYTHON
+    auto const command
+        = fmt::format("{} -c \"import pickle,struct; from pathlib import Path; p=Path(r'{}'); m=pickle.load(open(p/'.metadata','rb')); "
+                      "s={{i.fqn:v for i,v in m.storage_data.items()}}; "
+                      "read=lambda k:(p/s[k].relative_path).read_bytes()[s[k].offset:s[k].offset+s[k].length]; "
+                      "assert len(s)==518; "
+                      "assert all(s['scalar_%04d_'%i+'x'*128].length==8 and "
+                      "m.state_dict_metadata['scalar_%04d_'%i+'x'*128].nvrx_scalar_type=='uint64' and "
+                      "struct.unpack('<Q',read('scalar_%04d_'%i+'x'*128))[0]==i for i in range(512)); "
+                      "expected=[('int64','<q',-7),('uint64','<Q',91),('float64','<d',2.5),('bool','<Q',1)]; "
+                      "assert all(s['typed_scalar%d'%i].length==8 and "
+                      "m.state_dict_metadata['typed_scalar%d'%i].nvrx_scalar_type==t and "
+                      "struct.unpack(f,read('typed_scalar%d'%i))[0]==v for i,(t,f,v) in enumerate(expected))\"",
+                      PHOENIX_VENV_PYTHON,
+                      checkpointDir.string());
+    REQUIRE(std::system(command.c_str()) == 0);
+#endif
     CHECK(server.Stop());
     std::filesystem::remove_all(logDir);
 }
@@ -1799,7 +1833,7 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
                         REQUIRE(handle != StateNode::Handle::Invalid);
                         auto const& scalar = std::get<StateNode::Scalar>(registry->GetNode(handle).data);
                         CHECK(scalar.GetType() == Primitives64Bit::Type::Of<int64_t>());
-                        CHECK(scalar.Cast<int64_t>() == 37);
+                        CHECK(scalar.Cast<int64_t>() == 0);
                         if (registry == &localRegistry) { CHECK(scalar.replicas.empty()); }
                         else
                         {

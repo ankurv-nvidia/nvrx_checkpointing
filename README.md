@@ -125,6 +125,9 @@ the FSDP save path does not flatten it or serialize objects with `torch.save`.
 The binding captures supported values and local DTensor storage in the state
 tree. Daemons exchange metadata, select local writers, and persist snapshots.
 Scalar leaves occupy eight payload bytes each, alongside their DCP metadata.
+This applies to all scalar state nodes, including the `torch_dist` path. Each
+entry records its primitive datatype in DCP byte-storage metadata. Existing
+`torch_dist` common-state archives are also retained.
 The daemon selects writers using tensor FQNs and global shard ranges. Replicas
 of the same chunk and replicated scalar values are assumed identical across
 ranks; distinct shard ranges are persisted independently.

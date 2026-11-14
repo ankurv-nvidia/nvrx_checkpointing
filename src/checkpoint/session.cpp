@@ -344,7 +344,7 @@ static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
         ostrm.push(boost::iostreams::counter());
         ostrm.push(boost::iostreams::zlib_compressor(boost::iostreams::zlib_params(RegistryCompressionLevel)));
         ostrm.push(boost::iostreams::back_inserter(out));
-        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root, registry.nativeState);
+        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root, true);
         ostrm.strict_sync();
         rawSize = static_cast<uint64_t>(ostrm.component<boost::iostreams::counter>(0)->characters());
     }
@@ -571,10 +571,6 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         if (!sessionState.snapshotRegistryForRank.contains(hdr.globalRank))
         {
             throw std::invalid_argument("Snapshot rank is not local to this daemon");
-        }
-        if (registry->nativeState != sessionState.snapshotRegistryForRank.at(hdr.globalRank)->nativeState)
-        {
-            throw std::invalid_argument("Snapshot encoding does not match its capture plan");
         }
         auto const payloadSize = registry->GetTotalSnapshotStateSizeInBytes();
         if (hdr.snapshotSize != payloadSize) { throw std::invalid_argument("Snapshot payload size does not match its registry"); }
@@ -815,14 +811,12 @@ try
     std::unordered_map<Rank, std::shared_ptr<StateTree>> registries;
     for (uint32_t index = 0; index < rankCount; ++index)
     {
-        auto topology         = globalRegistry->Topo();
-        topology.rank         = Rank{firstRank + index};
-        auto registry         = std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology));
-        registry->nativeState = globalRegistry->nativeState;
+        auto topology = globalRegistry->Topo();
+        topology.rank = Rank{firstRank + index};
+        auto registry = std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology));
         registries.emplace(registry->GlobalRank(), std::move(registry));
     }
-    auto dedupedGlobalRegistry         = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
-    dedupedGlobalRegistry->nativeState = globalRegistry->nativeState;
+    auto dedupedGlobalRegistry = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
     std::unordered_map<StateNode::Handle, std::vector<Assignment const*>> byNode;
     for (auto const& item : assignments)
     {
@@ -904,11 +898,6 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                 throw std::runtime_error("Cannot merge state registries from incompatible sessions or topologies");
             }
             if (global.IsFinalized()) { throw std::logic_error("Cannot merge into a finalized registry"); }
-            if (receivedFrom.empty()) { global.nativeState = incoming.nativeState; }
-            else if (global.nativeState != incoming.nativeState)
-            {
-                throw std::runtime_error("State registries use different value encodings");
-            }
             incoming.WalkNodes([&](StateNode const& supplied) {
                 auto const type = supplied.GetType();
                 if (type == StateNode::Type::Invalid || supplied.handle == StateNode::Handle::Root) { return; }
@@ -926,7 +915,7 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                         {
                             auto& scalar    = std::get<StateNode::Scalar>(added.data);
                             scalar.replicas = {recvRank};
-                            if (global.nativeState) { Primitives64Bit::UnsignedTraits<uint64_t>::Assign(scalar, uint64_t{0}); }
+                            Primitives64Bit::UnsignedTraits<uint64_t>::Assign(scalar, uint64_t{0});
                         }
                         else if (type == StateNode::Type::DynamicSizeBlob)
                         {
@@ -997,8 +986,9 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
             try
             {
                 globalRegistry->FinalizeRegistry();
-                DebugOutputToFile("registry.global.bin",
-                                  [&](std::ostream& stream) { StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root); });
+                DebugOutputToFile("registry.global.bin", [&](std::ostream& stream) {
+                    StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root, true);
+                });
                 HandleGlobalRegistry(globalRegistry, {});
                 BroadcastGlobalRegistryToPeers_(*globalRegistry);
             } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
@@ -1047,7 +1037,7 @@ try
     {
         // Send to coordinator
         std::ostringstream body;
-        StateSerDes::Write(body, *registry, StateNode::Handle::Root, registry->nativeState);
+        StateSerDes::Write(body, *registry, StateNode::Handle::Root, true);
         SendToPeerWithRetries(*this, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
     }
 } catch (std::exception const& error) { FailPlanning(*this, error.what()); }

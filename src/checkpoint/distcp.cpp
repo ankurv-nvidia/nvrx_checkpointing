@@ -35,7 +35,7 @@ static_assert(std::endian::native == std::endian::little,
               "distcp writer assumes a little-endian host: archive/byteorder is hardcoded "
               "to \"little\" and the LE serializers are direct memcpys.");
 
-// Each rank shard concatenates byte-compatible torch.save ZIP archives.
+// Each rank shard stores tensor archives and raw scalar and blob payloads.
 
 namespace checkpoint::distcp
 {
@@ -904,9 +904,24 @@ static void EmitStorageInfo(ByteBuffer& b, std::string_view relativePath, uint64
     EmitNewObjBuildEnd(b);
 }
 
-static void EmitBytesStorageMetadata(ByteBuffer& b)
+static std::string_view ScalarTypeName(StateNode::Scalar const& scalar)
+{
+    auto const type = scalar.GetType();
+    if (Primitives64Bit::Type::IsBoolean(type)) { return "bool"; }
+    if (Primitives64Bit::Type::IsUnsigned(type)) { return "uint64"; }
+    if (Primitives64Bit::Type::IsSigned(type)) { return "int64"; }
+    if (Primitives64Bit::Type::IsFloat(type)) { return "float64"; }
+    throw std::runtime_error("distcp: unsupported scalar type");
+}
+
+static void EmitBytesStorageMetadata(ByteBuffer& b, StateNode::Scalar const* scalar)
 {
     EmitNewObjBuildBegin(b, KMetadataModule, "BytesStorageMetadata");
+    if (scalar != nullptr)
+    {
+        PickleBinunicode(b, "nvrx_scalar_type");
+        PickleBinunicode(b, ScalarTypeName(*scalar));
+    }
     EmitNewObjBuildEnd(b);
 }
 
@@ -990,10 +1005,10 @@ static std::array<char, sizeof(uint64_t)> EncodeScalar(StateNode::Scalar const& 
     uint64_t   bits{};
     if (Primitives64Bit::Type::IsFloat(type)) { bits = std::bit_cast<uint64_t>(scalar.Cast<double>()); }
     else if (Primitives64Bit::Type::IsSigned(type)) { bits = std::bit_cast<uint64_t>(scalar.Cast<int64_t>()); }
-    else if (Primitives64Bit::Type::IsUnsigned(type)) { bits = scalar.Cast<uint64_t>(); }
+    else if (Primitives64Bit::Type::IsUnsigned(type) || Primitives64Bit::Type::IsBoolean(type)) { bits = scalar.Cast<uint64_t>(); }
     else
     {
-        throw std::runtime_error("distcp: unsupported native scalar type");
+        throw std::runtime_error("distcp: unsupported scalar type");
     }
     std::array<char, sizeof(bits)> bytes{};
     for (size_t index = 0; index < bytes.size(); ++index) { bytes[index] = static_cast<char>((bits >> (index * 8)) & ByteMask); }
@@ -1022,7 +1037,7 @@ static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::uno
                     = {.length = shard.storageSize};
             }
         }
-        else if (type == StateNode::Type::Scalar && registry.nativeState)
+        else if (type == StateNode::Type::Scalar)
         {
             auto const& scalar = std::get<StateNode::Scalar>(node.data);
             auto const  fqn    = registry.GetNodeId(node.handle);
@@ -1087,7 +1102,10 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
         }
         if (tensorFqns.contains(fqn)) { throw std::runtime_error(fmt::format("distcp: fqn '{}' is both a tensor and a Blob", fqn)); }
         PickleBinunicode(b, fqn);
-        EmitBytesStorageMetadata(b);
+        auto const  handle = globalRegistry.FindNodeByFQN(fqn);
+        auto const* scalar
+            = handle == StateNode::Handle::Invalid ? nullptr : std::get_if<StateNode::Scalar>(&globalRegistry.GetNode(handle).data);
+        EmitBytesStorageMetadata(b, scalar);
     }
     PutU8(b, 'u');
 
@@ -1155,16 +1173,13 @@ WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const&
         {
             if (blob->replicas.contains(rank)) { dynamicBlobSizes.emplace(registry.GetNodeId(node.handle), blob->storageSize); }
         }
-        else if (registry.nativeState)
+        else if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data); scalar != nullptr && scalar->replicas.contains(rank))
         {
-            if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data); scalar != nullptr && scalar->replicas.contains(rank))
+            auto const fqn               = registry.GetNodeId(node.handle);
+            auto const [entry, inserted] = scalarData.emplace(fqn, EncodeScalar(*scalar));
+            if (!inserted || !blobs.emplace(fqn, std::string_view(entry->second.data(), entry->second.size())).second)
             {
-                auto const fqn               = registry.GetNodeId(node.handle);
-                auto const [entry, inserted] = scalarData.emplace(fqn, EncodeScalar(*scalar));
-                if (!inserted || !blobs.emplace(fqn, std::string_view(entry->second.data(), entry->second.size())).second)
-                {
-                    throw std::runtime_error("Snapshot contains duplicate native scalar keys");
-                }
+                throw std::runtime_error("Snapshot contains duplicate scalar keys");
             }
         }
     });
@@ -1258,9 +1273,22 @@ void WriteMetadata(std::filesystem::path const&                     ckptDir,
     FinishOutputFile(output, filepath);
 
     // The format marker makes the directory loadable as a torch_dist checkpoint.
-    static constexpr std::string_view ConfigJson = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
-    auto const                        configPath = ckptDir / "metadata.json";
-    if (snapshotRegistry.nativeState)
+    static constexpr std::string_view ConfigJson      = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
+    auto const                        configPath      = ckptDir / "metadata.json";
+    bool                              hasNativeSchema = false;
+    snapshotRegistry.WalkNodes([&](StateNode const& node) {
+        constexpr std::string_view Prefix = "__nvrx_native_state_rank_";
+        constexpr std::string_view Suffix = "__";
+        auto const                 name   = std::string_view(node.name);
+        if (node.parent != StateNode::Handle::Root || node.GetType() != StateNode::Type::DynamicSizeBlob || !name.starts_with(Prefix)
+            || !name.ends_with(Suffix) || name.size() <= Prefix.size() + Suffix.size())
+        {
+            return;
+        }
+        auto const rank = name.substr(Prefix.size(), name.size() - Prefix.size() - Suffix.size());
+        if (std::ranges::all_of(rank, [](char digit) { return digit >= '0' && digit <= '9'; })) { hasNativeSchema = true; }
+    });
+    if (hasNativeSchema)
     {
         std::filesystem::remove(configPath);
         return;

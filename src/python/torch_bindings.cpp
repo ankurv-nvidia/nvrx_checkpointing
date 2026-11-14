@@ -557,7 +557,7 @@ static TensorState TensorStorageState(RankTopology const& topo, std::string_view
     return state;
 }
 
-static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value, bool preserveScalarShape)
+static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
 {
     auto       state = TensorStorageState(topo, name, value);
     auto const shape = nb::cast<nb::tuple>(state.owner.attr("shape"));
@@ -566,11 +566,6 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
         throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, shape.size()));
     }
     uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
-    if (shape.empty() && !preserveScalarShape)
-    {
-        state.meta.fulldim.push_back(1);
-        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
-    }
     for (auto const& dimension : shape)
     {
         auto const dim = nb::cast<int64_t>(dimension);
@@ -989,7 +984,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     if (IsTorchTensor(val))
     {
-        auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val, scan.IsNativeState());
+        auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
         RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;
     }
