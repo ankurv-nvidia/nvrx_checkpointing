@@ -88,7 +88,6 @@ struct PythonStateTree
         void       AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nb::object const& obj) override;
         void       RetainQuantHeader(std::unique_ptr<checkpoint::quant::Header> header) override;
         uint64_t   RetainBlobData(std::vector<char> data) override;
-        void       SetNativeWriteItems(std::vector<CheckpointWriteItem> items) override;
 
         private:
         StateTree*       _registry{nullptr};
@@ -352,14 +351,6 @@ uint64_t PythonStateTree::Accessor::RetainBlobData(std::vector<char> data)
 {
     _state->_blobStorage.push_back(std::move(data));
     return reinterpret_cast<uint64_t>(_state->_blobStorage.back().data());
-}
-
-void PythonStateTree::Accessor::SetNativeWriteItems(std::vector<CheckpointWriteItem> items)
-{
-    if (_state->_snapshotRegistry) { return; }
-    auto&      registry = _state->_localRegistry;
-    auto const rank     = registry.GlobalRank();
-    registry.nativeWriteItems.insert_or_assign(rank, std::move(items));
 }
 
 // TODO_NO_REPARENT : We need to traverse the dictionary even if the node isnt in the snapshotTree

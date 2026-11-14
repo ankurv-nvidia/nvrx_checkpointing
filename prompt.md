@@ -1,6 +1,44 @@
 # Hand-off: the `dtensor` branch of nvrx_checkpointing
 
-## Native structured state, 2026-11-14
+## Replica consistency cleanup, 2026-11-14
+
+The owner requires identical data for replicas of the same logical tensor
+chunk. Distinct global shard ranges represent distinct data and remain separate
+in the checkpoint. Under this invariant, DCP's choice between replica holders
+does not affect checkpoint contents.
+
+The cleanup removes the daemon's `CheckpointWriteItem` and `nativeWriteItems`
+representations, binding export, wire table, and DCP-specific tensor owner
+override. Native tensor capture uses main's existing FQN/range owner selection.
+Registry wire version 7 contains the native-format flag and node tree; the debug
+reader retains support for historical registry formats. Scalar persistence,
+metadata-only peer exchange, native value encoding, and load-into behavior stay
+in place. The persisted native schema retains its descriptions for restoring
+rank-specific non-tensor objects; those descriptions are not daemon hints.
+
+Tests use identical tensor replicas across ranks, retain distinct-shard and
+uneven-shard coverage, and compare saved values with stock DCP. Fixtures no
+longer require a particular DCP writer for inconsistent replica values.
+
+The earlier four-GPU comparison failure remains unexplained. Matching DCP's
+writer choice made the comparison pass, but the archived artifacts do not
+contain per-rank input or captured payload hashes. They do not establish that
+valid replicas contained different values. Aggregate emitted shapes and chunk
+ranges match reference metadata. Diagnosing the difference requires per-rank
+FQN, mesh, placements, global shape, chunk ranges, and payload hashes before
+registration and capture. The successful run below applies to the earlier
+implementation with the DCP owner override enabled.
+
+Fresh cleanup validation passes 610 Python tests with 82 environment-dependent
+skips, 90 native CTest cases with one absent-registry fixture skip, and all 26
+focused native cases. The two/four-rank CPU comparisons match stock DCP with
+consistent replicas and peer-owned entries. The local two-GPU eight-expert MoE
+CI flow resumes at iteration 50 and saves through 125; all five checkpoints
+match exactly, with 3,209 entries at 25/50 and 3,208 at 75/100/125. Its worker,
+epilog, argument-baseline, save-span, and telemetry checks pass. The cleanup has
+no fresh four-GPU model result; the unexplained comparison issue remains open.
+
+## Earlier native structured state, 2026-11-14
 
 The owner subsequently approved preserving the nested state dictionary, removing
 Python `torch.save` serialization from the FSDP save path, and restoring values

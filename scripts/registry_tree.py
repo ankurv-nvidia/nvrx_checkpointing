@@ -39,7 +39,8 @@ _INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
 _REGISTRY_MAGIC = 0x32525453
 _ORDERED_REGISTRY_VERSION = 4
 _NATIVE_REGISTRY_VERSION = 5
-_REGISTRY_VERSION = 6
+_PLANNED_REGISTRY_VERSION = 6
+_REGISTRY_VERSION = 7
 _METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
@@ -208,7 +209,9 @@ def _registry_header(reader: _Reader, path: Path) -> tuple[int, int]:
     if count != _REGISTRY_MAGIC:
         return 1, count
     (version,) = reader.unpack(_U32)
-    if version not in (_METADATA_VERSION, 3, _ORDERED_REGISTRY_VERSION, _NATIVE_REGISTRY_VERSION, _REGISTRY_VERSION):
+    if version not in (
+        _METADATA_VERSION, 3, _ORDERED_REGISTRY_VERSION, _NATIVE_REGISTRY_VERSION, _PLANNED_REGISTRY_VERSION, _REGISTRY_VERSION,
+    ):
         raise ValueError(f"{path}: unsupported registry version {version}")
     if version == _ORDERED_REGISTRY_VERSION:
         reader.take(reader.unpack(_U32)[0])
@@ -219,7 +222,7 @@ def _registry_header(reader: _Reader, path: Path) -> tuple[int, int]:
                 reader.take(reader.unpack(_U32)[0])
     elif version >= _NATIVE_REGISTRY_VERSION:
         reader.take(1)
-        if version >= _REGISTRY_VERSION:
+        if version == _PLANNED_REGISTRY_VERSION:
             for _ in range(reader.unpack(_U32)[0]):
                 reader.take(_U32.size)
                 for _ in range(reader.unpack(_U32)[0]):

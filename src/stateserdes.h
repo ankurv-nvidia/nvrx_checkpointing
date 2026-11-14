@@ -9,7 +9,7 @@ struct StateSerDes
 {
     using Type                            = StateNode::Type;
     static constexpr uint32_t WireMagic   = 0x32525453U;
-    static constexpr uint32_t WireVersion = 6;
+    static constexpr uint32_t WireVersion = 7;
 
     struct DictHeader
     { uint32_t numChild{}; };
@@ -92,20 +92,6 @@ struct StateSerDes
         serdes::WriteTrivial(ostrm, WireMagic);
         serdes::WriteTrivial(ostrm, WireVersion);
         serdes::WriteTrivial(ostrm, tree.nativeState);
-        serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree.nativeWriteItems.size()));
-        for (auto const& [rank, items] : tree.nativeWriteItems)
-        {
-            serdes::WriteTrivial(ostrm, rank);
-            serdes::WriteTrivial(ostrm, static_cast<uint32_t>(items.size()));
-            for (auto const& item : items)
-            {
-                serdes::WriteTrivial(ostrm, item.isTensor);
-                serdes::WriteTrivial(ostrm, item.sizeBytes);
-                serdes::WriteTrivial(ostrm, item.offsets);
-                serdes::WriteBlobWithSize<uint32_t>(ostrm, item.fqn);
-            }
-        }
-
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
         {
@@ -195,36 +181,7 @@ struct StateSerDes
         auto const version = serdes::ReadTrivial<uint32_t>(istrm);
         if (magic != WireMagic || version != WireVersion) { throw std::runtime_error("Unsupported state registry wire format"); }
         tree.nativeState = serdes::ReadTrivial<bool>(istrm);
-        tree.nativeWriteItems.clear();
-        auto const rankCount = serdes::ReadTrivial<uint32_t>(istrm);
-        if (rankCount > static_cast<uint32_t>(tree.GlobalWorldSize()))
-        {
-            throw std::runtime_error("Too many logical checkpoint rank plans");
-        }
-        for (uint32_t index = 0; index < rankCount; ++index)
-        {
-            auto const rank = serdes::ReadTrivial<Rank>(istrm);
-            if (rank >= tree.GlobalWorldSize() || tree.nativeWriteItems.contains(rank))
-            {
-                throw std::runtime_error("Invalid logical checkpoint rank plan");
-            }
-            auto const count = serdes::ReadTrivial<uint32_t>(istrm);
-            auto&      items = tree.nativeWriteItems[rank];
-            for (uint32_t itemIndex = 0; itemIndex < count; ++itemIndex)
-            {
-                CheckpointWriteItem item;
-                item.isTensor  = serdes::ReadTrivial<bool>(istrm);
-                item.sizeBytes = serdes::ReadTrivial<uint64_t>(istrm);
-                item.offsets   = serdes::ReadTrivial<Tensor::Dim>(istrm);
-                item.fqn       = serdes::ReadBlobWithSize<uint32_t>(istrm);
-                if (item.fqn.empty() || item.sizeBytes == 0 || (!item.isTensor && !item.offsets.empty()))
-                {
-                    throw std::runtime_error("Invalid logical checkpoint write item");
-                }
-                items.push_back(std::move(item));
-            }
-        }
-        auto numChild = serdes::ReadTrivial<uint32_t>(istrm);
+        auto numChild    = serdes::ReadTrivial<uint32_t>(istrm);
         tree._nodes.clear();
         tree._nodes.reserve(numChild);
         for (uint32_t i = 0; i < numChild; ++i)

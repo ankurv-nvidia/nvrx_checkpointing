@@ -125,8 +125,9 @@ the FSDP save path does not flatten it or serialize objects with `torch.save`.
 The binding captures supported values and local DTensor storage in the state
 tree. Daemons exchange metadata, select local writers, and persist snapshots.
 Scalar leaves occupy eight payload bytes each, alongside their DCP metadata.
-Tensor replica selection follows DCP's ordered planning metadata. Replicated
-scalar values are assumed consistent across ranks.
+The daemon selects writers using tensor FQNs and global shard ranges. Replicas
+of the same chunk and replicated scalar values are assumed identical across
+ranks; distinct shard ranges are persisted independently.
 Megatron's existing preprocessing still gathers uneven shard geometry across
 training ranks.
 

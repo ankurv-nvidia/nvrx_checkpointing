@@ -1018,9 +1018,7 @@ static std::string SerializedStateRegistry(StateTree const& tree)
 TEST_CASE("native registry messages retain scalar types without their values", "[state][planning][tier1]")
 {
     StateTree tree(checkpoint::ipc::SessionId{17}, SingleRankTopo(0, 2));
-    tree.nativeState               = true;
-    tree.nativeWriteItems[Rank{0}] = {{.fqn = "counter", .sizeBytes = 1}, {.fqn = "scalar_tensor", .sizeBytes = 4, .isTensor = true}};
-    tree.nativeWriteItems[Rank{1}] = {};
+    tree.nativeState = true;
     StateNode::Scalar scalar(int64_t{-57});
     scalar.replicas                                        = {Rank{0}, Rank{1}};
     tree.AddChild(StateNode::Handle::Root, "counter").data = scalar;
@@ -1031,8 +1029,6 @@ TEST_CASE("native registry messages retain scalar types without their values", "
     auto               restored = StateSerDes::Read(input);
     REQUIRE(restored->nativeState);
     CHECK(restored->Clone()->nativeState);
-    CHECK(restored->nativeWriteItems == tree.nativeWriteItems);
-    CHECK(restored->Clone()->nativeWriteItems == tree.nativeWriteItems);
     auto const& value = std::get<StateNode::Scalar>(restored->GetNode(restored->FindNodeByFQN("counter")).data);
     CHECK(value.GetType() == scalar.GetType());
     CHECK(value.Cast<int64_t>() == 0);
@@ -1117,72 +1113,13 @@ TEST_CASE("native mode retains the main capture owner policy", "[server][plannin
     }
 }
 
-TEST_CASE("native tensor owners follow logical object and tensor order", "[server][planning][tier1]")
+TEST_CASE("native owner selection retains distinct uneven tensor shards", "[server][planning][tier1]")
 {
-    auto topology = SingleRankTopo(0, 2);
-    auto source   = std::make_shared<StateTree>(checkpoint::ipc::SessionId::Default, topology);
-    auto item     = [](std::string_view path, bool tensor, uint64_t cost) {
-        CheckpointWriteItem result{.fqn = std::string(path), .sizeBytes = cost, .isTensor = tensor};
-        if (tensor) { result.offsets.push_back(0); }
-        return result;
-    };
-    for (uint32_t rank = 0; rank < 2; ++rank)
-    {
-        AddShardedTensorLeaf(*source, "large", Tensor::DType::Float32, {8}, Rank{rank}, uint64_t{rank} * 32);
-        AddShardedTensorLeaf(*source, "small", Tensor::DType::Float32, {1}, Rank{rank}, uint64_t{rank} * 4);
-        AddShardedTensorLeaf(*source, "opaque.0", Tensor::DType::Float32, {1}, Rank{rank}, uint64_t{rank} * 4);
-        source->nativeWriteItems[Rank{rank}] = {
-            item("args", false, 1), item("large", true, 32), item("small", true, 4), item("counter", false, 1), item("opaque", false, 1)};
-        source->AddChild(StateNode::Handle::Root, std::string("local_") + std::to_string(rank)).data
-            = StateNode::DynamicSizeBlob{.replicas = {Rank{rank}}};
-    }
-    StateNode::Scalar scalar(int64_t{99});
-    scalar.replicas                                           = {Rank{0}, Rank{1}};
-    source->AddChild(StateNode::Handle::Root, "counter").data = scalar;
-    Session standard(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    standard.HandleGlobalRegistry(source->Clone(), {});
-    REQUIRE(standard.sessionState.planningReady);
-    source->nativeState = true;
-    Session structured(nullptr, source->SessionId(), std::filesystem::path{}, topology);
-    structured.HandleGlobalRegistry(source, {});
-    REQUIRE(structured.sessionState.planningReady);
-    auto const& expected = *standard.sessionState.dedupedGlobalRegistry;
-    auto const& actual   = *structured.sessionState.dedupedGlobalRegistry;
-    auto        owner    = [](StateTree const& tree, std::string_view path) {
-        return std::get<DTensor>(tree.GetNode(tree.FindNodeByFQN(path)).data).shards.begin()->rank;
-    };
-    CHECK(owner(expected, "large") == Rank{0});
-    CHECK(owner(expected, "small") == Rank{1});
-    CHECK(owner(actual, "large") == Rank{1});
-    CHECK(owner(actual, "small") == Rank{0});
-    CHECK(owner(actual, "opaque.0") == Rank{0});
-    CHECK(std::get<StateNode::Scalar>(actual.GetNode(actual.FindNodeByFQN("counter")).data).replicas
-          == std::get<StateNode::Scalar>(expected.GetNode(expected.FindNodeByFQN("counter")).data).replicas);
-    auto missing = source->Clone();
-    for (auto& [rank, items] : missing->nativeWriteItems)
-    {
-        static_cast<void>(rank);
-        std::erase_if(items, [](auto const& description) { return description.fqn == "large"; });
-    }
-    Session incomplete(nullptr, missing->SessionId(), std::filesystem::path{}, topology);
-    incomplete.HandleGlobalRegistry(missing, {});
-    CHECK_FALSE(incomplete.sessionState.planningReady);
-    CHECK(incomplete.sessionState.planningFailure.find("omit tensor 'large'") != std::string::npos);
-}
-
-TEST_CASE("native tensor owners use global costs for uneven replicated chunks", "[server][planning][tier1]")
-{
-    auto topology       = SingleRankTopo(0, 4);
-    auto source         = std::make_shared<StateTree>(checkpoint::ipc::SessionId::Default, topology);
-    source->nativeState = true;
+    auto        topology = SingleRankTopo(0, 4);
+    auto        source   = std::make_shared<StateTree>(checkpoint::ipc::SessionId::Default, topology);
     Tensor::Dim shape;
     shape.push_back(11);
     DTensor uneven(Tensor::DType::Float32, shape);
-    auto    item = [](std::string_view path, uint64_t offset, uint64_t cost) {
-        CheckpointWriteItem result{.fqn = std::string(path), .sizeBytes = cost, .isTensor = true};
-        result.offsets.push_back(offset);
-        return result;
-    };
     for (uint32_t rank = 0; rank < 4; ++rank)
     {
         bool const       first = rank % 2 == 0;
@@ -1193,27 +1130,21 @@ TEST_CASE("native tensor owners use global costs for uneven replicated chunks", 
                          .storageSize   = first ? 28U : 16U,
                          .sharddim      = ranges,
                          .device        = DeviceId{"cpu"}});
-        auto& items = source->nativeWriteItems[Rank{rank}];
-        if (first)
-        {
-            AddShardedTensorLeaf(*source, "prefix", Tensor::DType::Float32, {10}, Rank{rank}, 0);
-            AddShardedTensorLeaf(*source, "tail", Tensor::DType::Float32, {1}, Rank{rank}, 0);
-            items = {item("prefix", 0, 40), item("uneven", 0, 44), item("tail", 0, 4)};
-        }
-        else
-        {
-            items = {item("uneven", 7, 44)};
-        }
     }
     source->AddChild(StateNode::Handle::Root, "uneven").data = std::move(uneven);
+    Session standard(nullptr, source->SessionId(), std::filesystem::path{}, topology);
+    standard.HandleGlobalRegistry(source->Clone(), {});
+    REQUIRE(standard.sessionState.planningReady);
+    source->nativeState = true;
     Session structured(nullptr, source->SessionId(), std::filesystem::path{}, topology);
     structured.HandleGlobalRegistry(source, {});
     REQUIRE(structured.sessionState.planningReady);
-    auto const& actual = *structured.sessionState.dedupedGlobalRegistry;
-    auto const& chunks = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("uneven")).data).shards;
+    auto const& actual   = *structured.sessionState.dedupedGlobalRegistry;
+    auto const& chunks   = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("uneven")).data).shards;
+    auto const& expected = *standard.sessionState.dedupedGlobalRegistry;
+    CHECK(chunks == std::get<DTensor>(expected.GetNode(expected.FindNodeByFQN("uneven")).data).shards);
     REQUIRE(chunks.size() == 2);
-    for (auto const& chunk : chunks) { CHECK(chunk.rank == (chunk.sharddim[0].begin == 0 ? Rank{2} : Rank{1})); }
-    CHECK(std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("tail")).data).shards.begin()->rank == Rank{0});
+    for (auto const& chunk : chunks) { CHECK(chunk.rank == (chunk.sharddim[0].begin == 0 ? Rank{0} : Rank{1})); }
 }
 
 TEST_CASE("native scalar values and growing blobs remain local across daemons", "[server][scalar][blob][tier2]")
@@ -1225,7 +1156,7 @@ TEST_CASE("native scalar values and growing blobs remain local across daemons", 
     {
         ~Cleanup() { StopInprocServer(); }
     } cleanup;
-    std::array<std::array<float, 1>, 2>       values{{{11.0f}, {29.0f}}};
+    std::array<std::array<float, 1>, 2>       values{{{11.0f}, {11.0f}}};
     std::array<std::string, 2>                blobs{"rank-zero", "peer-value"};
     std::array<std::shared_ptr<StateTree>, 2> trees;
     std::array<std::future<void>, 2>          registrations;
@@ -1243,10 +1174,7 @@ TEST_CASE("native scalar values and growing blobs remain local across daemons", 
         auto const name                                        = rank == 0 ? "rank0_only" : "peer_only";
         tree->AddChild(StateNode::Handle::Root, name).data     = StateNode::DynamicSizeBlob{
             .replicas = {Rank{rank}}, .handle = reinterpret_cast<uint64_t>(blobs[rank].data()), .storageSize = blobs[rank].size()};
-        CheckpointWriteItem weight{.fqn = "weight", .sizeBytes = sizeof(float), .isTensor = true};
-        weight.offsets.push_back(0);
-        tree->nativeWriteItems[Rank{rank}] = {weight, {.fqn = "shared", .sizeBytes = 1}, {.fqn = name, .sizeBytes = 1}};
-        registrations[rank]                = std::async(std::launch::async, [tree] { FinalizeStateRegistry(*tree); });
+        registrations[rank] = std::async(std::launch::async, [tree] { FinalizeStateRegistry(*tree); });
     }
     for (auto& registration : registrations) { REQUIRE_NOTHROW(registration.get()); }
     std::array<std::shared_ptr<StateTree>, 2> selected{GetSnapshotRegistry(*trees[0]), GetSnapshotRegistry(*trees[1])};
@@ -1254,8 +1182,8 @@ TEST_CASE("native scalar values and growing blobs remain local across daemons", 
     REQUIRE(shared != StateNode::Handle::Invalid);
     CHECK(std::get<StateNode::Scalar>(selected[0]->GetNode(shared).data).Cast<int64_t>() == 0);
     REQUIRE(selected[1]->FindNodeByFQN("shared") == StateNode::Handle::Invalid);
-    REQUIRE(selected[0]->FindNodeByFQN("weight") != StateNode::Handle::Invalid);
-    REQUIRE(selected[1]->FindNodeByFQN("weight") == StateNode::Handle::Invalid);
+    REQUIRE(selected[0]->FindNodeByFQN("weight") == StateNode::Handle::Invalid);
+    REQUIRE(selected[1]->FindNodeByFQN("weight") != StateNode::Handle::Invalid);
     for (uint32_t iteration = 1; iteration <= 2; ++iteration)
     {
         auto& scalar                          = std::get<StateNode::Scalar>(selected[0]->GetNode(shared).data);
