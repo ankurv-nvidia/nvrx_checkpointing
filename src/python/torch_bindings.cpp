@@ -557,7 +557,7 @@ static TensorState TensorStorageState(RankTopology const& topo, std::string_view
     return state;
 }
 
-static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value)
+static TensorState TorchTensorState(RankTopology const& topo, std::string_view name, nb::handle value, bool preserveScalarShape)
 {
     auto       state = TensorStorageState(topo, name, value);
     auto const shape = nb::cast<nb::tuple>(state.owner.attr("shape"));
@@ -566,7 +566,7 @@ static TensorState TorchTensorState(RankTopology const& topo, std::string_view n
         throw std::runtime_error(fmt::format("Tensor {} has too many dimensions: {}", name, shape.size()));
     }
     uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
-    if (shape.empty())
+    if (shape.empty() && !preserveScalarShape)
     {
         state.meta.fulldim.push_back(1);
         state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
@@ -607,12 +607,7 @@ static std::optional<TensorState> TorchDTensorState(RankTopology const& topo, st
     }
     if (std::ranges::any_of(sizes, [](auto const& size) { return nb::cast<uint64_t>(size) == 0; })) { return std::nullopt; }
 
-    auto state = TensorStorageState(topo, name, value.attr("_local_tensor"));
-    if (globalShape.empty())
-    {
-        state.meta.fulldim.push_back(1);
-        state.shard.sharddim.push_back(Tensor::Range{.begin = 0, .end = 1});
-    }
+    auto     state        = TensorStorageState(topo, name, value.attr("_local_tensor"));
     uint64_t logicalBytes = Tensor::GetDTypeSize(state.meta.durableDtype);
     for (size_t axis = 0; axis < globalShape.size(); ++axis)
     {
@@ -994,12 +989,7 @@ bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node
     }
     if (IsTorchTensor(val))
     {
-        if (scan.HasCommonStateBundle() && nb::cast<int64_t>(val.attr("numel")()) == 0)
-        {
-            scan.RegisterState(node, StrView(key), TorchSaveBlob(val.attr("cpu")()));
-            return true;
-        }
-        auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val);
+        auto tensorState = TorchTensorState(scan.GetRankTopo(), StrView(key), val, scan.IsNativeState());
         RegisterTensorState(scan, node, StrView(key), tensorState.meta, tensorState.owner, std::move(tensorState.header));
         return true;
     }

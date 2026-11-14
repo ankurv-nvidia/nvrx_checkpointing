@@ -5,87 +5,106 @@ from __future__ import annotations
 
 import io
 import math
+import struct
 from typing import TYPE_CHECKING
 
 import _distcp_shim
-import pytest
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_common_archive_preserves_supported_values() -> None:
-    values = {
-        "iteration": 123456,
+def _write(path: Path, scalars: dict, objects: tuple = (), *, native: bool = True, tensors: tuple = ()) -> None:
+    entries = [(key, "float32", list(value.shape), value.numpy().tobytes()) for key, value in tensors]
+    _distcp_shim.write_rank_shard(str(path), 0, entries, list(objects), scalars=scalars, native=native)
+    layouts = [(key, "float32", list(value.shape), [(0, [(0, size) for size in value.shape])]) for key, value in tensors]
+    _distcp_shim.write_metadata(str(path), layouts, list(objects), scalars=scalars, native=native)
+
+
+def _records(path: Path) -> dict[str, bytes]:
+    metadata = dcp.FileSystemReader(path).read_metadata()
+    result = {}
+    for index, storage in metadata.storage_data.items():
+        with (path / storage.relative_path).open("rb") as stream:
+            stream.seek(storage.offset)
+            result[index.fqn] = stream.read(storage.length)
+    return result
+
+
+def test_native_scalars_preserve_exact_eight_byte_encodings(tmp_path: Path) -> None:
+    scalars = {
         "minimum": -(1 << 63),
-        "maximum": (1 << 63) - 1,
-        "negative": -1,
-        "lr": 0.00015,
+        "maximum": (1 << 64) - 1,
+        "iteration": 50,
         "negative_zero": -0.0,
+        "lr": 0.00015,
         "positive_infinity": math.inf,
         "negative_infinity": -math.inf,
-        "empty": b"",
-        "binary": bytes(range(256)) * 1024,
-        "nested.λ": b"\x00\xff",
+        "enabled": True,
     }
+    _write(tmp_path, scalars)
 
-    archive = _distcp_shim.common_state_archive(values)
-    restored = torch.load(io.BytesIO(archive), weights_only=False)
-
-    assert restored == [values]
-    assert math.copysign(1, restored[0]["negative_zero"]) == -1
-    assert isinstance(restored[0]["iteration"], int)
-    assert isinstance(restored[0]["lr"], float)
-    assert isinstance(restored[0]["binary"], bytes)
-
-
-def test_common_archive_preserves_nan() -> None:
-    archive = _distcp_shim.common_state_archive({"value": math.nan})
-
-    assert math.isnan(torch.load(io.BytesIO(archive), weights_only=False)[0]["value"])
+    records = _records(tmp_path)
+    expected = {
+        key: struct.pack("<d", value) if isinstance(value, float) else struct.pack("<q" if value < 0 else "<Q", value)
+        for key, value in scalars.items()
+    }
+    assert records == expected
+    assert (tmp_path / "__0_0.distcp").stat().st_size == 8 * len(scalars)
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    assert all(isinstance(value, BytesStorageMetadata) for value in metadata.state_dict_metadata.values())
+    assert not (tmp_path / "metadata.json").exists()
 
 
-def test_common_archive_supports_empty_state() -> None:
-    archive = _distcp_shim.common_state_archive({})
+def test_native_scalar_nan_is_preserved(tmp_path: Path) -> None:
+    _write(tmp_path, {"value": math.nan})
 
-    assert torch.load(io.BytesIO(archive), weights_only=False) == [{}]
-
-
-def test_common_archive_rejects_unsupported_values() -> None:
-    with pytest.raises(RuntimeError, match="supports integers, floats, and bytes"):
-        _distcp_shim.common_state_archive({"value": object()})
+    assert math.isnan(struct.unpack("<d", _records(tmp_path)["value"])[0])
 
 
-def test_bundled_checkpoint_tracks_current_lengths_and_format(tmp_path: Path) -> None:
-    key = "checkpoint.objects"
+def test_native_scalars_share_a_contiguous_file_with_tensors_and_blobs(tmp_path: Path) -> None:
+    weight = torch.arange(4, dtype=torch.float32)
+    _write(tmp_path, {"iteration": 7}, (("args", b"native arguments"),), tensors=(("model.weight", weight),))
+
+    records = _records(tmp_path)
+    assert records["iteration"] == struct.pack("<Q", 7)
+    assert records["args"] == b"native arguments"
+    torch.testing.assert_close(torch.load(io.BytesIO(records["model.weight"]), weights_only=False), weight)
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    intervals = sorted((record.offset, record.length) for record in metadata.storage_data.values())
+    cursor = 0
+    for offset, length in intervals:
+        assert offset == cursor
+        cursor += length
+    assert cursor == (tmp_path / "__0_0.distcp").stat().st_size
+
+
+def test_native_scalar_and_blob_records_refresh_on_every_save(tmp_path: Path) -> None:
     marker = tmp_path / "metadata.json"
     marker.write_text('{"sharded_backend": "torch_dist"}')
     lengths = []
     for iteration, payload in ((7, b"short"), (123456, bytes(range(256)) * 1024)):
-        values = {"iteration": iteration, "nested.payload": payload}
-        _distcp_shim.write_common_state(str(tmp_path), key, values)
+        _write(tmp_path, {"iteration": iteration}, (("payload", payload),))
 
+        assert _records(tmp_path) == {"iteration": struct.pack("<Q", iteration), "payload": payload}
         assert not marker.exists()
-        metadata = dcp.FileSystemReader(tmp_path).read_metadata()
-        assert set(metadata.state_dict_metadata) == {key}
-        storage = next(iter(metadata.storage_data.values()))
-        assert storage.offset == 0
-        assert storage.length == (tmp_path / storage.relative_path).stat().st_size
-        lengths.append(storage.length)
-        restored = {key: None}
-        dcp.load(restored, checkpoint_id=tmp_path)
-        assert restored[key] == [values]
-    assert lengths[1] > lengths[0]
+        lengths.append((tmp_path / "__0_0.distcp").stat().st_size)
+    assert lengths == [8 + len(b"short"), 8 + 256 * 1024]
 
 
-def test_empty_bundle_is_a_loadable_rank_zero_checkpoint(tmp_path: Path) -> None:
-    key = "checkpoint.objects"
-    _distcp_shim.write_common_state(str(tmp_path), key, {})
+def test_standard_mode_retains_its_scalar_and_format_behavior(tmp_path: Path) -> None:
+    _write(tmp_path, {"iteration": 7}, (("payload", b"opaque"),), native=False)
 
-    restored = {key: None}
-    dcp.load(restored, checkpoint_id=tmp_path)
+    assert _records(tmp_path) == {"payload": b"opaque"}
+    assert (tmp_path / "metadata.json").exists()
 
-    assert restored[key] == [{}]
-    assert (tmp_path / "__0_0.distcp").is_file()
+
+def test_empty_native_state_has_no_orphan_shard(tmp_path: Path) -> None:
+    _write(tmp_path, {})
+
+    assert _records(tmp_path) == {}
+    assert not (tmp_path / "__0_0.distcp").exists()
+    assert not (tmp_path / "metadata.json").exists()

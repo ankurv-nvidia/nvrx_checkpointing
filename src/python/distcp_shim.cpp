@@ -92,7 +92,38 @@ static std::vector<std::pair<std::string, std::vector<char>>> ParseObjects(nb::l
     return out;
 }
 
-static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb::list const& entriesPy, nb::list const& objectsPy)
+static void AddScalars(StateTree& tree, Rank rank, nb::dict const& values)
+{
+    for (auto const& [key, value] : values)
+    {
+        auto const        fqn = nb::cast<std::string>(key);
+        StateNode::Scalar scalar;
+        if (nb::isinstance<bool>(value)) { scalar = StateNode::Scalar(nb::cast<bool>(value)); }
+        else if (nb::isinstance<nb::int_>(value))
+        {
+            if (value < nb::int_(0)) { scalar = StateNode::Scalar(nb::cast<int64_t>(value)); }
+            else
+            {
+                scalar = StateNode::Scalar(nb::cast<uint64_t>(value));
+            }
+        }
+        else if (nb::isinstance<nb::float_>(value)) { scalar = StateNode::Scalar(nb::cast<double>(value)); }
+        else
+        {
+            throw std::invalid_argument("Native scalar values require integers, floats, or booleans");
+        }
+        scalar.replicas                  = {rank};
+        auto const [name, parent]        = tree.FindOrAddNodeByFQN(fqn);
+        tree.AddChild(parent, name).data = scalar;
+    }
+}
+
+static nb::list WriteRankShardImpl(std::string const& outDir,
+                                   uint32_t           rank,
+                                   nb::list const&    entriesPy,
+                                   nb::list const&    objectsPy,
+                                   nb::dict const&    scalarsPy,
+                                   bool               native)
 {
     std::vector<InputEntry> entries;
     entries.reserve(entriesPy.size());
@@ -126,6 +157,8 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
         .peers        = {"localhost"},
     };
     StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
+    tree.nativeState = native;
+    AddScalars(tree, Rank{rank}, scalarsPy);
 
     // Build the tree in the post-merge global-registry shape — DTensor
     // leaves keyed by rank — since that's what WriteRankShard's assert
@@ -215,7 +248,8 @@ static Tensor::DimRange ParseSharddim(nb::sequence const& sd)
 // then builds per-rank writeLogs from the same input and calls WriteMetadata.
 // The (file_offset, length) values are used as the verification side-channel
 // inside WriteMetadata — they're asserted against the analytical prediction.
-static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects)
+static void
+WriteMetadataImpl(std::string const& outDir, nb::list const& tensors, nb::list const& objects, nb::dict const& scalars, bool native)
 {
     RankTopology topo{
         .rank         = Rank{0},
@@ -225,6 +259,8 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
         .peers        = {"localhost"},
     };
     StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
+    tree.nativeState = native;
+    AddScalars(tree, Rank{0}, scalars);
 
     for (auto const& tensor : tensors)
     {
@@ -281,75 +317,9 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
     checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
-template <typename TCall> static auto WithCommonState(nb::dict const& values, TCall const& call)
-{
-    size_t totalBytes = 0;
-    for (auto const& [key, value] : values)
-    {
-        static_cast<void>(key);
-        if (nb::isinstance<nb::bytes>(value)) { totalBytes += nb::cast<nb::bytes>(value).size(); }
-    }
-    ByteStorage  storage(totalBytes);
-    RankTopology topo{
-        .rank         = Rank{0},
-        .worldSize    = Rank{1},
-        .ranksPerPeer = 1,
-        .peersPerNode = 1,
-        .peers        = {"localhost"},
-    };
-    StateTree tree(checkpoint::ipc::SessionId::Default, std::move(topo));
-    uint64_t  offset = 0;
-    for (auto const& [key, value] : values)
-    {
-        auto const fqn          = nb::cast<std::string>(key);
-        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
-        auto& leaf              = tree.AddChild(parent, leafName);
-        if (nb::isinstance<nb::bytes>(value))
-        {
-            auto const bytes = nb::cast<nb::bytes>(value);
-            if (bytes.size() != 0) { std::memcpy(storage[offset], bytes.c_str(), bytes.size()); }
-            leaf.data = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = offset, .storageSize = bytes.size()};
-            offset += bytes.size();
-        }
-        else
-        {
-            StateNode::Scalar scalar;
-            if (nb::isinstance<nb::int_>(value)) { scalar = StateNode::Scalar{nb::cast<int64_t>(value)}; }
-            else if (nb::isinstance<nb::float_>(value)) { scalar = StateNode::Scalar{nb::cast<double>(value)}; }
-            else
-            {
-                throw std::runtime_error("distcp_shim: common state supports integers, floats, and bytes");
-            }
-            scalar.replicas.insert(Rank{0});
-            leaf.data = std::move(scalar);
-        }
-    }
-    return call(tree, storage);
-}
-
-static nb::bytes CommonStateArchiveImpl(nb::dict const& values)
-{
-    return WithCommonState(values, [](StateTree const& tree, ByteStorage const& storage) {
-        auto const archive = checkpoint::distcp::BuildCommonStateArchive(tree, storage);
-        return nb::bytes(archive.data(), archive.size());
-    });
-}
-
-static void WriteCommonStateImpl(std::string const& outDir, std::string const& commonStateKey, nb::dict const& values)
-{
-    WithCommonState(values, [&](StateTree& tree, ByteStorage const& storage) {
-        tree.commonStateKey = commonStateKey;
-        auto const sizes    = checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{0}, tree, storage);
-        checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, sizes);
-    });
-}
-
 NB_MODULE(_distcp_shim, m)    // NOLINT
 {
     m.doc() = "Single-process shim around distcp::WriteRankShard / WriteMetadata for parity tests.";
-
-    m.def("common_state_archive", &CommonStateArchiveImpl, nb::arg("values"));
-    m.def("write_common_state", &WriteCommonStateImpl, nb::arg("out_dir"), nb::arg("common_state_key"), nb::arg("values"));
 
     m.def("write_rank_shard",
           &WriteRankShardImpl,
@@ -357,6 +327,8 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("rank"),
           nb::arg("entries"),
           nb::arg("objects") = nb::list(),
+          nb::arg("scalars") = nb::dict(),
+          nb::arg("native")  = false,
           "Write `<out_dir>/__<rank>_0.distcp` from a list of (fqn, dtype_name, "
           "shape, data_bytes) entries and optional (fqn, bytes) objects. Returns the populated writeLog as a list of "
           "(fqn, sharddim, file_offset, length) tuples.");
@@ -366,6 +338,8 @@ NB_MODULE(_distcp_shim, m)    // NOLINT
           nb::arg("out_dir"),
           nb::arg("tensors"),
           nb::arg("objects") = nb::list(),
+          nb::arg("scalars") = nb::dict(),
+          nb::arg("native")  = false,
           "Write `<out_dir>/.metadata` from a list of (fqn, dtype_name, full_shape, "
           "shards) tuples and optional (fqn, bytes) objects, where each shards entry is (rank, sharddim). The "
           "per-shard (file_offset, length) is inferred analytically from the "

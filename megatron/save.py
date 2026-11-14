@@ -34,8 +34,6 @@ from megatron.training.checkpointing import (  # type: ignore[import-not-found]
 )
 from megatron.training.global_vars import get_args  # type: ignore[import-not-found]
 from megatron.training.utils import print_rank_0  # type: ignore[import-not-found]
-from torch.distributed.checkpoint._nested_dict import flatten_state_dict
-from torch.distributed.tensor import DTensor
 
 from .. import checkpoint  # noqa: TID252
 from ..ckpt_diag import diagnose_checkpoint_server_failure  # noqa: TID252
@@ -319,32 +317,10 @@ def register_state_dict(state_dict: dict, iteration: int) -> checkpoint.model_st
     return root
 
 
-def _dtensor_write_items(state: dict) -> list[tuple[str, list[int] | None, int]]:
-    items = []
-    for key, value in state.items():
-        if isinstance(value, DTensor):
-            if value.device_mesh.get_coordinate() is None:
-                continue
-            cost = max(value.numel() * value.element_size(), 1)
-            items.extend((key, list(chunk.offsets), cost) for chunk in value.__create_chunk_list__() if all(chunk.sizes))
-        elif isinstance(value, torch.Tensor):
-            items.append((key, [0] * value.ndim, max(value.numel() * value.element_size(), 1)))
-        else:
-            items.append((key, None, 1))
-    return items
-
-
 def register_dtensor_state_dict(state_dict: dict) -> checkpoint.model_state:
-    """Register flattened DTensor state and opaque object archives."""
-    state, _ = flatten_state_dict(state_dict)
-    write_items = _dtensor_write_items(state)
-    for key, value in state.items():
-        if not isinstance(value, torch.Tensor) and type(value) not in (int, float):
-            buffer = io.BytesIO()
-            torch.save(value, buffer)
-            state[key] = buffer.getvalue()
+    """Register nested DTensor state with native object encodings."""
     root = _ensure_root()
-    root.register_state_dict(state, write_items=write_items, common_state_key=_DCP_COMMON_STATE_KEY)
+    root.register_state_dict(state_dict, native=True)
     return root
 
 

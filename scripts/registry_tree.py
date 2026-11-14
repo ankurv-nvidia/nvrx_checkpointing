@@ -37,7 +37,8 @@ page = _page_module()
 
 _INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
 _REGISTRY_MAGIC = 0x32525453
-_REGISTRY_VERSION = 4
+_ORDERED_REGISTRY_VERSION = 4
+_REGISTRY_VERSION = 5
 _METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
@@ -201,6 +202,25 @@ def _node_kind(kind: int, version: int) -> int:
     return kind + 1 if version > _METADATA_VERSION and kind >= _TENSOR else kind
 
 
+def _registry_header(reader: _Reader, path: Path) -> tuple[int, int]:
+    (count,) = reader.unpack(_U32)
+    if count != _REGISTRY_MAGIC:
+        return 1, count
+    (version,) = reader.unpack(_U32)
+    if version not in (_METADATA_VERSION, 3, _ORDERED_REGISTRY_VERSION, _REGISTRY_VERSION):
+        raise ValueError(f"{path}: unsupported registry version {version}")
+    if version == _ORDERED_REGISTRY_VERSION:
+        reader.take(reader.unpack(_U32)[0])
+        for _ in range(reader.unpack(_U32)[0]):
+            reader.take(_U32.size)
+            for _ in range(reader.unpack(_U32)[0]):
+                reader.take(1 + 8 + _DIM.size)
+                reader.take(reader.unpack(_U32)[0])
+    elif version == _REGISTRY_VERSION:
+        reader.take(1)
+    return version, reader.unpack(_U32)[0]
+
+
 def read_registry(path: Path, data: bytes | None = None) -> Registry:
     """Parse a registry file into its topology and tree entries."""
     raw = path.read_bytes() if data is None else data
@@ -210,20 +230,7 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
     peer_count = -(-world_size // ranks_per_peer) if ranks_per_peer else 0
     peers = [reader.text(reader.unpack(_U32)[0]) for _ in range(peer_count)]
     registry = Registry(path, len(raw), rank, world_size, ranks_per_peer, peers, session_id=session_id)
-    (count,) = reader.unpack(_U32)
-    version = 1
-    if count == _REGISTRY_MAGIC:
-        (version,) = reader.unpack(_U32)
-        if version not in (_METADATA_VERSION, 3, _REGISTRY_VERSION):
-            raise ValueError(f"{path}: unsupported registry version {version}")
-        if version >= 4:
-            reader.take(reader.unpack(_U32)[0])
-            for _ in range(reader.unpack(_U32)[0]):
-                reader.take(_U32.size)
-                for _ in range(reader.unpack(_U32)[0]):
-                    reader.take(1 + 8 + _DIM.size)
-                    reader.take(reader.unpack(_U32)[0])
-        (count,) = reader.unpack(_U32)
+    version, count = _registry_header(reader, path)
     for _ in range(count):
         start = reader.pos
         kind, name_length, _, handle, parent = reader.unpack(_NODE)

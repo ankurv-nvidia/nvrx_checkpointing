@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import inspect
 import io
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
@@ -20,6 +22,14 @@ from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.metadata import BytesStorageMetadata, MetadataIndex
 from torch.distributed.checkpoint.planner import LoadPlanner
 
+from .native_state import (
+    decode_native_records,
+    is_native_state,
+    native_object_key,
+    read_native_state,
+    restore_native_value,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
@@ -29,6 +39,7 @@ if TYPE_CHECKING:
 
 COMMON_STATE_KEY = "common_state/shard_0_1"
 _INSTALL_MARKER = "_nvrx_checkpointing_bundle_load_installed"
+_BOOTSTRAP_TEMPLATE: ContextVar[Any] = ContextVar("native_checkpoint_bootstrap_template", default=None)
 
 
 def is_common_state_key(key: str) -> bool:
@@ -73,13 +84,22 @@ class BundleFileSystemReader(FileSystemReader):
     """Expose bundled object keys while retaining physical tensor metadata."""
 
     objects: dict[str, Any] | None = None
+    native_objects: dict[str, Any] | None = None
 
     def reset(self, checkpoint_id: str | Path | None = None) -> None:
         self.objects = None
+        self.native_objects = None
         super().reset(checkpoint_id)
 
     def read_metadata(self, *args: Any, **kwargs: Any) -> Metadata:
         metadata = super().read_metadata(*args, **kwargs)
+        if is_native_state(metadata):
+            if self.native_objects is None:
+                self.native_objects = read_native_state(self, metadata, decode_objects=False)
+            logical_metadata = dict(metadata.state_dict_metadata)
+            for key, (kind, _) in self.native_objects.items():
+                logical_metadata.setdefault(native_object_key(key, kind), BytesStorageMetadata())
+            return replace(metadata, state_dict_metadata=logical_metadata)
         if not any(map(is_common_state_key, metadata.state_dict_metadata)) or (Path(self.path) / "metadata.json").is_file():
             return metadata
         if self.objects is None:
@@ -132,6 +152,54 @@ class _ObjectLoadPlanner(DefaultLoadPlanner):
         return create_default_local_load_plan(self.state_dict, self.metadata, not self.allow_partial_load)
 
 
+class _NativeLoadPlanner(DefaultLoadPlanner):
+    """Restore native values and retain tensor destinations for DCP reads."""
+
+    def __init__(self, records: dict[str, Any], planner: LoadPlanner) -> None:
+        super().__init__(
+            flatten_state_dict=False,
+            flatten_sharded_tensors=getattr(planner, "flatten_sharded_tensors", True),
+            allow_partial_load=getattr(planner, "allow_partial_load", False),
+        )
+        self.records = records
+
+    def set_up_planner(self, state_dict: dict[str, Any], metadata: Metadata | None = None, is_coordinator: bool = False) -> None:  # noqa: C901
+        values = decode_native_records(self.records)
+        tensors = {}
+
+        def restore(target: Any, path: str) -> Any:  # noqa: C901, PLR0911
+            if path in values:
+                if path == "args":
+                    template = target if target is not None else _BOOTSTRAP_TEMPLATE.get()
+                    if template is not None:
+                        target = deepcopy(template)
+                return restore_native_value(values[path], target, path)
+            if isinstance(target, torch.Tensor):
+                tensors[path] = target
+                return target
+            if isinstance(target, dict):
+                for key, value in tuple(target.items()):
+                    target[key] = restore(value, f"{path}.{key}" if path else str(key))
+                return target
+            if isinstance(target, list):
+                for index, value in enumerate(target):
+                    target[index] = restore(value, f"{path}.{index}")
+                return target
+            if isinstance(target, tuple):
+                restored = [restore(value, f"{path}.{index}") for index, value in enumerate(target)]
+                return type(target)(*restored) if hasattr(target, "_fields") else tuple(restored)
+            if hasattr(target, "__dict__"):
+                for key, value in tuple(vars(target).items()):
+                    setattr(target, key, restore(value, f"{path}.{key}" if path else key))
+                return target
+            if self.allow_partial_load:
+                return target
+            raise RuntimeError(f"Missing native checkpoint value: {path}")
+
+        restore(state_dict, "")
+        super().set_up_planner(tensors, metadata, is_coordinator)
+
+
 class BundleLoadPlanner(LoadPlanner):
     """Select bundled restoration after synchronized metadata loading."""
 
@@ -142,7 +210,9 @@ class BundleLoadPlanner(LoadPlanner):
 
     def set_up_planner(self, state_dict: dict[str, Any], metadata: Metadata | None = None, is_coordinator: bool = False) -> None:
         self.planner = self.base_planner
-        if self.reader.objects is not None and not any(map(is_common_state_key, state_dict)):
+        if self.reader.native_objects is not None:
+            self.planner = _NativeLoadPlanner(self.reader.native_objects, self.base_planner)
+        elif self.reader.objects is not None and not any(map(is_common_state_key, state_dict)):
             self.planner = _ObjectLoadPlanner(self.reader.objects, self.base_planner)
         self.planner.set_up_planner(state_dict, metadata, is_coordinator)
 
@@ -196,3 +266,19 @@ def install(checkpointing_module: ModuleType) -> None:
         dcp.FileSystemReader = BundleFileSystemReader
         setattr(dcp, _INSTALL_MARKER, True)
     checkpointing_module.FileSystemReader = dcp.FileSystemReader
+    original = getattr(checkpointing_module, "_load_base_checkpoint", None)
+    if original is not None and not getattr(original, _INSTALL_MARKER, False):
+        signature = inspect.signature(original)
+
+        @wraps(original)
+        def load_base_checkpoint(*args: Any, **kwargs: Any) -> Any:
+            call = signature.bind(*args, **kwargs)
+            call.apply_defaults()
+            token = _BOOTSTRAP_TEMPLATE.set(call.arguments.get("args") if call.arguments.get("rank0") else None)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                _BOOTSTRAP_TEMPLATE.reset(token)
+
+        setattr(load_base_checkpoint, _INSTALL_MARKER, True)
+        checkpointing_module._load_base_checkpoint = load_base_checkpoint  # noqa: SLF001

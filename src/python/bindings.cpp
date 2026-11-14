@@ -2,6 +2,7 @@
 #include "binding.h"
 #include "checkpoint.h"
 #include "messages.h"
+#include "native_state.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -79,7 +80,7 @@ struct PythonStateTree
 
         [[nodiscard]] RankTopology GetRankTopo() const override { return _registry->Topo(); }
         [[nodiscard]] std::string  GetNodeId(StateNode::Handle node) const override;
-        [[nodiscard]] bool         HasCommonStateBundle() const override { return !_registry->commonStateKey.empty(); }
+        [[nodiscard]] bool         IsNativeState() const override { return _registry->nativeState; }
 
         StateNode* AddDictionaryChild(StateNode::Handle parent, std::string_view name) override;
         StateNode* RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) override;
@@ -132,13 +133,10 @@ struct PythonStateTree
         });
     }
 
-    void RegisterStateDict(nb::dict stateDict, std::vector<CheckpointWriteItem> writeItems, std::string commonStateKey)
+    void RegisterStateDict(nb::dict stateDict, bool native)
     {
-        ChainAsyncCall([this,
-                        stateDict      = std::move(stateDict),
-                        writeItems     = std::move(writeItems),
-                        commonStateKey = std::move(commonStateKey)] mutable {
-            ConfigureRegistrationMetadata_(std::move(writeItems), std::move(commonStateKey));
+        ChainAsyncCall([this, stateDict = std::move(stateDict), native] mutable {
+            ConfigureRegistrationMetadata_(native);
             {
                 nb::gil_scoped_acquire acquire;
                 _dictToScan = stateDict;
@@ -184,28 +182,21 @@ struct PythonStateTree
     void SetStartedAt(int64_t startedAt) { SnapshotRegistry().startedAt = std::chrono::nanoseconds{startedAt}; }
 
     private:
-    void ConfigureRegistrationMetadata_(std::vector<CheckpointWriteItem> writeItems, std::string commonStateKey)
+    void ConfigureRegistrationMetadata_(bool native)
     {
-        auto const rank = _localRegistry.GlobalRank();
         if (_registrationMetadataConfigured)
         {
-            auto const current = _localRegistry.checkpointWriteItems.find(rank);
-            bool const matches = current == _localRegistry.checkpointWriteItems.end() ? writeItems.empty() : current->second == writeItems;
-            if (_localRegistry.commonStateKey != commonStateKey || !matches)
+            if (_localRegistry.nativeState != native)
             {
-                throw std::runtime_error("Checkpoint planning metadata changed after initial registration");
+                throw std::runtime_error("Checkpoint registration mode changed after initial registration");
             }
             return;
         }
-        if (_localRegistry.IsFinalized() && (!commonStateKey.empty() || !writeItems.empty()))
+        if (_localRegistry.IsFinalized() && native)
         {
-            throw std::runtime_error("Checkpoint planning metadata must be configured before registry synchronization");
+            throw std::runtime_error("Native checkpoint registration must be configured before registry synchronization");
         }
-        _localRegistry.commonStateKey = std::move(commonStateKey);
-        if (!_localRegistry.commonStateKey.empty() || !writeItems.empty())
-        {
-            _localRegistry.checkpointWriteItems[rank] = std::move(writeItems);
-        }
+        _localRegistry.nativeState      = native;
         _registrationMetadataConfigured = true;
     }
 
@@ -270,7 +261,6 @@ StateNode* PythonStateTree::Accessor::RegisterStateByFQN(std::string_view fqn, S
 
 StateNode* PythonStateTree::Accessor::RegisterState(StateNode::Handle parent, std::string_view stateName, StateNode::Variant data)
 {
-    if (!_registry->commonStateKey.empty() && stateName.contains('.')) { return RegisterStateByFQN(stateName, std::move(data)); }
     if (parent == StateNode::Handle::Invalid) { return nullptr; }
     if (!_registry->IsFinalized())
     {
@@ -380,6 +370,13 @@ void PythonStateTree::Scan(StateTree& registry)
     std::unordered_set<PyObject*> visited;
 
     Accessor accessor{&registry, this};
+    if (registry.nativeState)
+    {
+        nb::gil_scoped_acquire                      acquire;
+        checkpoint::python::NativeStateRegistration registration(accessor);
+        registration.Register(_dictToScan);
+        return;
+    }
     RegisterStateDictRecr(accessor, StateNode::Handle::Root, _dictToScan, true, visited);
 }
 
@@ -743,48 +740,11 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
     }
 }
 
-static uint64_t CheckpointWriteItemSize(nb::handle value, std::string_view field)
-{
-    if (!nb::isinstance<nb::int_>(value) || value < nb::int_(0))
-    {
-        throw std::invalid_argument(fmt::format("Checkpoint write item {} must be a nonnegative integer", field));
-    }
-    return nb::cast<uint64_t>(value);
-}
-
-static std::vector<CheckpointWriteItem> ReadCheckpointWriteItems(nb::iterable const& writeItems)
-{
-    std::vector<CheckpointWriteItem> items;
-    for (auto const& value : writeItems)
-    {
-        auto const descriptor = nb::cast<nb::tuple>(value);
-        if (descriptor.size() != 3) { throw std::invalid_argument("Checkpoint write items require a key, offsets, and byte size"); }
-        CheckpointWriteItem item{.fqn       = nb::cast<std::string>(descriptor[0]),
-                                 .sizeBytes = CheckpointWriteItemSize(descriptor[2], "byte size")};
-        if (item.fqn.empty()) { throw std::invalid_argument("Checkpoint write item keys must be nonempty"); }
-        item.isTensor = !descriptor[1].is_none();
-        if (item.isTensor)
-        {
-            for (auto const& offset : nb::cast<nb::iterable>(descriptor[1]))
-            {
-                if (item.offsets.size() == Tensor::MaxDims)
-                {
-                    throw std::invalid_argument("Checkpoint write item has too many offset dimensions");
-                }
-                item.offsets.push_back(CheckpointWriteItemSize(offset, "offset"));
-            }
-        }
-        items.push_back(std::move(item));
-    }
-    return items;
-}
-
-static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict, nb::iterable const& writeItems, std::string commonStateKey)
+static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict, bool native)
 {
     auto                   extraDictRef = nb::dict(stateDict);
-    auto                   items        = ReadCheckpointWriteItems(writeItems);
     nb::gil_scoped_release release;
-    self.RegisterStateDict(std::move(extraDictRef), std::move(items), std::move(commonStateKey));
+    self.RegisterStateDict(std::move(extraDictRef), native);
 }
 
 static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
@@ -866,12 +826,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
             "startedAt",
             [](PythonStateTree const& self) { return self.SnapshotRegistry().startedAt.count(); },
             [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
-        .def("register_state_dict",
-             &RegisterStateDict,
-             nb::arg("state_dict"),
-             nb::kw_only(),
-             nb::arg("write_items")      = nb::tuple(),
-             nb::arg("common_state_key") = "")
+        .def("register_state_dict", &RegisterStateDict, nb::arg("state_dict"), nb::kw_only(), nb::arg("native") = false)
         .def("finalize_registry",
              [](PythonStateTree& self) {
                  nb::gil_scoped_release release;

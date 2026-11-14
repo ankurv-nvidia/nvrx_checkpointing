@@ -1,5 +1,48 @@
 # Hand-off: the `dtensor` branch of nvrx_checkpointing
 
+## Native structured state, 2026-11-14
+
+The owner subsequently approved preserving the nested state dictionary, removing
+Python `torch.save` serialization from the FSDP save path, and restoring values
+into the state dictionary supplied at load. This section supersedes the older
+implementation descriptions below.
+
+- Python retains Megatron's FSDP preprocessing and passes the nested dictionary
+  to native registration. The native walker captures local DTensor storage and
+  supported values without constructing a Python flattened dictionary.
+  Megatron's retained uneven-shard preprocessing still uses training-rank
+  collectives, as accepted in the discussion below.
+- Numeric leaves remain scalar state nodes. The native-mode daemon writer emits
+  their eight-byte values as DCP byte entries. Other supported values use an
+  explicit native encoding; arbitrary Python objects are rejected.
+- Tensor-free dictionaries retain rank-local records so dynamic keys and
+  peer-owned expert optimizer metadata survive. The load adapter combines the
+  dictionaries and restores destination container, enum, array, and generator
+  types while preserving mutable destination objects and tensor references.
+- The daemon uses main's writer selection. Peer registry messages contain
+  metadata, scrub scalar values, and never forward snapshot payloads. The
+  ordinary `torch_dist` path retains its existing format and behavior.
+- Megatron's expert RNG tracker contains different generator states under one
+  logical key on different ranks. The native schema records ordered logical
+  item descriptions so load can reproduce PyTorch DCP's selection among the
+  retained dictionary values. This compatibility rule does not select daemon
+  writers or require training-side collectives.
+- Replicated scalar values are assumed consistent. Differing tensor replicas
+  discarded by the daemon's writer selection cannot be recovered during load.
+  Exact model checkpoint comparisons remain the acceptance test.
+
+November 14 validation passes 607 Python tests, with 82 environment-dependent
+skips, and 89 native CTest cases, with one absent-fixture skip. All 26 focused
+daemon cases pass, including scalar tensors, schema parity with the stock DCP
+planner, dynamic dictionaries, and two/four-rank peer-owned entries.
+
+The local two-GPU `fsdp_2gpu` CI run uses eight experts with EP2, TP1, and DP2.
+Both providers resume at iteration 50 and save through 125. All five checkpoints
+match exactly: 3,209 entries at iterations 25 and 50, and 3,208 at 75, 100, and
+125, with zero missing, extra, or changed entries. The ordinary CI epilog,
+argument baseline comparison, and telemetry validation pass. Four-GPU model CI
+is pending. Historical model results below describe the earlier implementation.
+
 ## Current implementation, 2026-11-13
 
 The sections below this update preserve the original hand-off and discussion. Their line numbers,

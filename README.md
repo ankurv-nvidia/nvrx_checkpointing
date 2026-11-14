@@ -119,10 +119,22 @@ native integration.
 
 Megatron-FSDP runs use `--use-megatron-fsdp --ckpt-format fsdp_dtensor` with
 the same integration entrypoint. Native saves store tensor shards and
-non-tensor state bundles in their owning ranks' checkpoint files. Load these
-checkpoints through the integration entrypoint too. Its load adapter restores
-the bundled values and delegates tensor loading to PyTorch DCP. Existing
-Megatron `fsdp_dtensor` checkpoints remain loadable through this entrypoint.
+structured non-tensor values in their owning ranks' checkpoint files. Python
+passes Megatron's preprocessed nested state dictionary to the native binding;
+the FSDP save path does not flatten it or serialize objects with `torch.save`.
+The binding captures supported values and local DTensor storage in the state
+tree. Daemons exchange metadata, select local writers, and persist snapshots.
+Scalar leaves occupy eight payload bytes each, alongside their DCP metadata.
+Megatron's existing preprocessing still gathers uneven shard geometry across
+training ranks.
+
+Load these checkpoints through the integration entrypoint too. Its load
+adapter restores native values using the supplied destination dictionary's
+types and delegates tensor reads to PyTorch DCP. Rank-local dictionaries retain
+peer-owned optimizer entries. Supported objects include namespaces, ordinary
+containers, NumPy arrays, enums, and RNG generators; arbitrary Python objects
+are rejected during capture. Existing Megatron `fsdp_dtensor` checkpoints
+remain loadable through this entrypoint.
 
 The `fsdp_2gpu` CI profile keeps eight experts with EP2 and uses TP1. Select
 it in the CI launcher with `--config fsdp_2gpu --gpus-per-node 2`.

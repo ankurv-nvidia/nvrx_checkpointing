@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import io
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -19,7 +20,14 @@ from torch.distributed.checkpoint.api import CheckpointException
 
 @pytest.fixture
 def bundle_load(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    spec = importlib.util.spec_from_file_location("native_bundle_load_test", Path(__file__).parents[1] / "megatron/load.py")
+    root = Path(__file__).parents[1] / "megatron"
+    native_spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron.native_state", root / "native_state.py")
+    assert native_spec is not None
+    assert native_spec.loader is not None
+    native_module = importlib.util.module_from_spec(native_spec)
+    monkeypatch.setitem(sys.modules, native_spec.name, native_module)
+    native_spec.loader.exec_module(native_module)
+    spec = importlib.util.spec_from_file_location("nvrx_checkpointing.megatron.native_bundle_load_test", root / "load.py")
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)

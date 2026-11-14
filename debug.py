@@ -270,6 +270,22 @@ def _is_plain_dcp(checkpoint_dir: Path, state_dict_metadata: dict) -> bool:
     return not (checkpoint_dir / "common.pt").is_file() and _DCP_COMMON_STATE_KEY not in state_dict_metadata
 
 
+def _native_common_state(reader: FileSystemReader, metadata: object) -> dict:
+    from torch.distributed.checkpoint._nested_dict import flatten_state_dict  # noqa: PLC0415
+
+    from .megatron.native_state import (  # noqa: PLC0415
+        materialize_native_value,
+        read_native_state,
+        restore_native_value,
+    )
+
+    objects = read_native_state(reader, metadata)
+    args = objects.get("args")
+    if isinstance(args, argparse.Namespace):
+        objects["args"] = restore_native_value(args, None, "args")
+    return flatten_state_dict({key: materialize_native_value(value) for key, value in objects.items()})[0]
+
+
 def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
     """Load non-sharded state from legacy or current Megatron checkpoints.
 
@@ -282,6 +298,10 @@ def load_common_state_dict(checkpoint_dir: Path | str) -> dict:
 
     reader = FileSystemReader(str(checkpoint_dir))
     metadata = reader.read_metadata()
+    from .megatron.native_state import is_native_state  # noqa: PLC0415
+
+    if is_native_state(metadata):
+        return _native_common_state(reader, metadata)
     state_dict_metadata = metadata.state_dict_metadata
     if _is_plain_dcp(checkpoint_dir, state_dict_metadata):
         objects = {fqn: io.BytesIO() for fqn, meta in state_dict_metadata.items() if isinstance(meta, BytesStorageMetadata)}

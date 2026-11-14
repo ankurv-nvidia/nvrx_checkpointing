@@ -109,8 +109,10 @@ def _metadata_prefix(version: int) -> bytes:
     if version < 2:
         return b""
     prefix = struct.pack("<II", 0x32525453, version)
-    if version >= 4:
+    if version == 4:
         prefix += struct.pack("<II", 0, 0)
+    elif version >= 5:
+        prefix += b"\x01"
     return prefix
 
 
@@ -422,7 +424,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3, 4])
+@pytest.mark.parametrize("version", [2, 3, 4, 5])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -475,8 +477,8 @@ def test_metadata_counts_local_membership_without_replica_hints(
 
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=5)
-    with pytest.raises(ValueError, match="unsupported registry version 5"):
+    _Tree(0).write(path, version=6)
+    with pytest.raises(ValueError, match="unsupported registry version 6"):
         registry_tree.read_registry(path)
 
 

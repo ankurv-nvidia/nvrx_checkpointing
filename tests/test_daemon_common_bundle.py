@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
-import io
 import os
 import random
+import struct
 from argparse import Namespace
 from pathlib import Path
+from types import ModuleType
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -16,7 +18,8 @@ import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 from nvrx_checkpointing import checkpoint
 from nvrx_checkpointing.debug import distcp_trace
-from nvrx_checkpointing.megatron.load import decode_common_state
+from nvrx_checkpointing.megatron import load as native_load
+from torch.distributed.checkpoint.metadata import MetadataIndex
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate
 
@@ -24,14 +27,7 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1", reason="requires checkpoint-server IPC support"),
 ]
-_KEY = "common_state/shard_0_1"
-_WEIGHTS = ("z.weight", "a.weight")
-
-
-def _archive(value: object) -> bytes:
-    buffer = io.BytesIO()
-    torch.save(value, buffer)
-    return buffer.getvalue()
+_WEIGHT = "decoder.layers.0.weight"
 
 
 def _save(rank: int, world_size: int, session: int, directory: str) -> None:
@@ -42,42 +38,60 @@ def _save(rank: int, world_size: int, session: int, directory: str) -> None:
         root = checkpoint.model_state.create_root(session, rank, world_size, ["localhost"], world_size)
         for iteration, length in enumerate((1, 8192), start=1):
             state = {
-                key: DTensor.from_local(torch.full((4,), float(rank * 100 + iteration + index)), mesh, [Replicate()], run_check=False)
-                for index, key in enumerate(_WEIGHTS)
+                "model": {_WEIGHT: DTensor.from_local(torch.full((4,), float(iteration)), mesh, [Replicate()], run_check=False)},
+                "iteration": iteration,
+                "objects": Namespace(message="x" * length, values=[None, (), {}, [1, 2]], rng=np.random.RandomState(17).get_state()),
+                "optimizer": {"metadata": {f"expert_{rank}": {"lr": 0.001, "step": iteration}}, "shared": True},
+                "enabled": True,
+                "empty": torch.empty(0),
             }
-            state.update(
-                {
-                    "iteration": iteration + rank,
-                    "objects.args": Namespace(rank=rank, message="x" * length),
-                    "enabled": rank % 2 == 0,
-                    "empty": torch.empty(0),
-                    f"peer.{rank}": rank + iteration * 10,
-                },
-            )
-            planner = dcp.DefaultSavePlanner()
-            planner.set_up_planner(state, is_coordinator=rank == 0)
-            descriptions = [
-                (item.index.fqn, list(item.index.offset) if item.index.offset is not None else None, item.tensor_storage_size() or 1)
-                for item in planner.create_local_plan().items
-            ]
-            captured = {
-                key: value if isinstance(value, torch.Tensor) or type(value) in (int, float) else _archive(value)
-                for key, value in state.items()
-            }
-            root.register_state_dict(captured, write_items=descriptions, common_state_key=_KEY)
-            if iteration == 1:
-                root.finalize_registry()
-            root.save_async(iteration, path / f"native-{iteration}")
-            root.wait_for_async_completion()
-            checkpoint.wait_for_ckpt_finalize(session, iteration)
+            original_save = torch.save
+
+            def forbidden_save(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError("native state capture called torch.save")
+
+            torch.save = forbidden_save
+            try:
+                root.register_state_dict(state, native=True)
+                if iteration == 1:
+                    root.finalize_registry()
+                root.save_async(iteration, path / f"native-{iteration}")
+                root.wait_for_async_completion()
+                checkpoint.wait_for_ckpt_finalize(session, iteration)
+            finally:
+                torch.save = original_save
             dist.barrier()
             dcp.save(state, checkpoint_id=path / f"reference-{iteration}")
     finally:
         dist.destroy_process_group()
 
 
+def _assert_same(actual: object, expected: object) -> None:
+    assert type(actual) is type(expected)
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, np.ndarray):
+        np.testing.assert_array_equal(actual, expected)
+    elif isinstance(expected, Namespace):
+        _assert_same(vars(actual), vars(expected))
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_same(actual[key], expected[key])
+    elif isinstance(expected, (tuple, list)):
+        assert len(actual) == len(expected)
+        for value, reference in zip(actual, expected, strict=True):
+            _assert_same(value, reference)
+    else:
+        assert actual == expected
+
+
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_daemon_source_selection_matches_dcp_for_differing_replicas(tmp_path: Path, world_size: int) -> None:
+def test_native_nested_state_matches_dcp_and_preserves_peer_entries(
+    tmp_path: Path,
+    world_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = random.randrange(1, 1 << 31)  # noqa: S311
     context = mp.get_context("spawn")
     workers = [context.Process(target=_save, args=(rank, world_size, session, str(tmp_path))) for rank in range(world_size)]
@@ -88,30 +102,40 @@ def test_daemon_source_selection_matches_dcp_for_differing_replicas(tmp_path: Pa
             worker.join(timeout=120)
         assert [worker.exitcode for worker in workers] == [0] * world_size
 
-        bundle_keys = [_KEY, *(f"{_KEY}.rank_{rank}" for rank in range(1, world_size))]
+        for name in ("load", "load_state_dict", "FileSystemReader"):
+            monkeypatch.setattr(dcp, name, getattr(dcp, name))
+        monkeypatch.setattr(dcp, native_load._INSTALL_MARKER, False, raising=False)  # noqa: SLF001
+        native_load.install(ModuleType("megatron.training.checkpointing"))
         for iteration in (1, 2):
-            directory = tmp_path / f"native-{iteration}"
-            reference = {key: torch.zeros(4) for key in _WEIGHTS}
-            reference.update({"iteration": None, "objects.args": None, "enabled": None, "empty": torch.empty(0)})
-            reference.update({f"peer.{rank}": None for rank in range(world_size)})
+
+            def destination() -> dict:
+                return {
+                    "model": {_WEIGHT: torch.zeros(4)},
+                    "iteration": 0,
+                    "objects": Namespace(message="", values=[], rng=np.random.RandomState(2).get_state()),
+                    "optimizer": {"metadata": {f"expert_{rank}": {"lr": 1.0, "step": 0} for rank in range(world_size)}, "shared": False},
+                    "enabled": False,
+                    "empty": torch.empty(0),
+                }
+
+            reference, target = destination(), destination()
             dcp.load(reference, checkpoint_id=tmp_path / f"reference-{iteration}")
-            target = {key: torch.zeros(4) for key in _WEIGHTS}
-            target.update(dict.fromkeys(bundle_keys))
+            optimizer = target["optimizer"]
+            weight = target["model"][_WEIGHT]
+            directory = tmp_path / f"native-{iteration}"
             dcp.load(target, checkpoint_id=directory)
 
-            objects = {}
-            for key in bundle_keys:
-                restored = decode_common_state(target[key][0])
-                assert not objects.keys() & restored.keys()
-                objects.update(restored)
-            assert set(objects) == set(reference) - set(_WEIGHTS)
-            for key, expected in reference.items():
-                if key in _WEIGHTS:
-                    torch.testing.assert_close(target[key], expected, rtol=0, atol=0)
-                elif isinstance(expected, torch.Tensor):
-                    torch.testing.assert_close(objects[key], expected, rtol=0, atol=0)
-                else:
-                    assert objects[key] == expected
+            _assert_same(target, reference)
+            assert target["optimizer"] is optimizer
+            assert target["model"][_WEIGHT] is weight
+            metadata = dcp.FileSystemReader(directory).read_metadata()
+            assert f"model.{_WEIGHT}" in metadata.state_dict_metadata
+            assert "common_state/shard_0_1" not in metadata.state_dict_metadata
+            scalar = metadata.storage_data[MetadataIndex("iteration")]
+            assert scalar.length == struct.calcsize("<Q")
+            with (directory / scalar.relative_path).open("rb") as stream:
+                stream.seek(scalar.offset)
+                assert int.from_bytes(stream.read(8), "little") == iteration
             assert not (directory / "metadata.json").exists()
             distcp_trace(directory, extract_tensor_data=False, verify_native_server=False)
     finally:

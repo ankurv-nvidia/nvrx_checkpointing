@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import io
 import os
 import random
 from typing import TYPE_CHECKING
@@ -94,19 +93,20 @@ def test_ignores_ranks_outside_the_tensor_mesh(single_rank_mesh: DeviceMesh) -> 
     assert root.snapshot_size == 0
 
 
-def test_registers_empty_tensors_as_objects(single_rank_mesh: DeviceMesh) -> None:
+def test_registers_empty_tensors_as_native_values(single_rank_mesh: DeviceMesh, monkeypatch: pytest.MonkeyPatch) -> None:
     del single_rank_mesh
     root = _create_root()
     empty = torch.empty(0, dtype=torch.uint8)
-    root.register_state_dict(
-        {"full": torch.ones(4), "empty": empty},
-        write_items=(("full", (0,), 16), ("empty", (0,), 0)),
-        common_state_key="common_state/shard_0_1",
-    )
+
+    def reject_archive(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("native registration called torch.save")
+
+    monkeypatch.setattr(torch, "save", reject_archive)
+    root.register_state_dict({"full": torch.ones(4), "empty": empty}, native=True)
     root.wait_for_async_completion()
-    serialized = io.BytesIO()
-    torch.save(empty, serialized)
-    assert root.snapshot_size == 4 * 4 + len(serialized.getvalue())
+
+    assert root.snapshot_size > 4 * 4
 
 
 def test_rejects_partial_placements(single_rank_mesh: DeviceMesh) -> None:
@@ -114,6 +114,33 @@ def test_rejects_partial_placements(single_rank_mesh: DeviceMesh) -> None:
     root.register_state_dict({"partial": DTensor.from_local(torch.ones(4), single_rank_mesh, [Partial()])})
     with pytest.raises(RuntimeError, match="partial placement"):
         root.wait_for_async_completion()
+
+
+@pytest.mark.integration
+@_REQUIRES_CHECKPOINT_SERVER
+def test_scalar_dtensor_preserves_its_zero_dimensional_shape(tmp_path: Path, single_rank_mesh: DeviceMesh) -> None:
+    session_id = random.randrange(1, 1 << 31)  # noqa: S311
+    root = checkpoint.model_state.create_root(session_id, 0, 1, ["localhost"], 1)
+    source = distribute_tensor(torch.tensor(7.0), single_rank_mesh, [Replicate()])
+    destination = distribute_tensor(torch.tensor(0.0), single_rank_mesh, [Replicate()])
+    plain_source = torch.tensor(11, dtype=torch.int64)
+    plain_destination = torch.tensor(0, dtype=torch.int64)
+    try:
+        root.register_state_dict({"model": {"scalar": source, "plain_scalar": plain_source}}, native=True)
+        root.finalize_registry()
+        root.save(1, tmp_path)
+        checkpoint.wait_for_ckpt_finalize(session_id, 1)
+        metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+        assert metadata.state_dict_metadata["model.scalar"].size == torch.Size([])
+        assert metadata.state_dict_metadata["model.plain_scalar"].size == torch.Size([])
+        target = {"model.scalar": destination, "model.plain_scalar": plain_destination}
+        dcp.load(target, checkpoint_id=tmp_path, planner=dcp.DefaultLoadPlanner(flatten_state_dict=False))
+        assert destination.shape == torch.Size([])
+        assert plain_destination.shape == torch.Size([])
+        torch.testing.assert_close(destination.to_local(), source.to_local())
+        torch.testing.assert_close(plain_destination, plain_source)
+    finally:
+        checkpoint.svc_spindown()
 
 
 def _save_and_load(rank: int, store: str, session_id: int, checkpoint_dir: str) -> None:

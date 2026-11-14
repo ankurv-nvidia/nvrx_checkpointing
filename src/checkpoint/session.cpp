@@ -13,7 +13,6 @@
 #include <boost/iostreams/filter/zlib.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/iostreams/stream.hpp>
-#include <tuple>
 #include <utility>
 
 namespace cipc  = checkpoint::ipc;
@@ -345,7 +344,7 @@ static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
         ostrm.push(boost::iostreams::counter());
         ostrm.push(boost::iostreams::zlib_compressor(boost::iostreams::zlib_params(RegistryCompressionLevel)));
         ostrm.push(boost::iostreams::back_inserter(out));
-        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root, !registry.commonStateKey.empty());
+        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root, registry.nativeState);
         ostrm.strict_sync();
         rawSize = static_cast<uint64_t>(ostrm.component<boost::iostreams::counter>(0)->characters());
     }
@@ -573,9 +572,9 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         {
             throw std::invalid_argument("Snapshot rank is not local to this daemon");
         }
-        if (registry->commonStateKey != sessionState.snapshotRegistryForRank.at(hdr.globalRank)->commonStateKey)
+        if (registry->nativeState != sessionState.snapshotRegistryForRank.at(hdr.globalRank)->nativeState)
         {
-            throw std::invalid_argument("Snapshot common-state entry name does not match its capture plan");
+            throw std::invalid_argument("Snapshot encoding does not match its capture plan");
         }
         auto const payloadSize = registry->GetTotalSnapshotStateSizeInBytes();
         if (hdr.snapshotSize != payloadSize) { throw std::invalid_argument("Snapshot payload size does not match its registry"); }
@@ -784,152 +783,46 @@ try
             assignments.push_back(std::move(entry));
         }
     });
-    if (globalRegistry->commonStateKey.empty())
+    std::ranges::sort(assignments, [](Assignment const& lhs, Assignment const& rhs) {
+        if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
+        if (lhs.size != rhs.size) { return lhs.size > rhs.size; }
+        if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
+        return lhs.ranges < rhs.ranges;
+    });
+    std::vector<uint64_t> assignedBytes(worldSize, 0);
+    for (auto& item : assignments)
     {
-        std::ranges::sort(assignments, [](Assignment const& lhs, Assignment const& rhs) {
-            if (lhs.candidates.size() != rhs.candidates.size()) { return lhs.candidates.size() < rhs.candidates.size(); }
-            if (lhs.size != rhs.size) { return lhs.size > rhs.size; }
-            if (lhs.fqn != rhs.fqn) { return lhs.fqn < rhs.fqn; }
-            return lhs.ranges < rhs.ranges;
-        });
-        std::vector<uint64_t> assignedBytes(worldSize, 0);
-        for (auto& item : assignments)
+        auto selected = item.candidates.front();
+        for (auto const candidate : item.candidates)
         {
-            auto selected = item.candidates.front();
-            for (auto const candidate : item.candidates)
+            auto const candidateIndex = static_cast<uint32_t>(candidate);
+            auto const selectedIndex  = static_cast<uint32_t>(selected);
+            if (assignedBytes[candidateIndex] < assignedBytes[selectedIndex]
+                || (assignedBytes[candidateIndex] == assignedBytes[selectedIndex] && candidate < selected))
             {
-                auto const candidateIndex = static_cast<uint32_t>(candidate);
-                auto const selectedIndex  = static_cast<uint32_t>(selected);
-                if (assignedBytes[candidateIndex] < assignedBytes[selectedIndex]
-                    || (assignedBytes[candidateIndex] == assignedBytes[selectedIndex] && candidate < selected))
-                {
-                    selected = candidate;
-                }
-            }
-            item.owner       = selected;
-            auto const index = static_cast<uint32_t>(selected);
-            if (item.size > std::numeric_limits<uint64_t>::max() - assignedBytes[index])
-            {
-                throw std::overflow_error("Assigned snapshot payload size overflow");
-            }
-            assignedBytes[index] += item.size;
-        }
-    }
-    else
-    {
-        using Index = std::tuple<std::string, bool, Tensor::Dim>;
-        struct Candidate
-        {
-            size_t         assignment{};
-            uint64_t       cost{};
-            std::set<Rank> holders;
-        };
-        std::map<std::pair<std::string, Tensor::Dim>, size_t> tensorAssignments;
-        std::unordered_map<std::string, size_t>               objectAssignments;
-        for (size_t index = 0; index < assignments.size(); ++index)
-        {
-            auto const& assignment = assignments[index];
-            auto const& node       = globalRegistry->GetNode(assignment.node);
-            if (node.GetType() == StateNode::Type::Scalar || node.GetType() == StateNode::Type::DynamicSizeBlob)
-            {
-                objectAssignments.emplace(assignment.fqn, index);
-            }
-            else
-            {
-                Tensor::Dim offsets;
-                for (auto const& range : assignment.ranges) { offsets.push_back(range.begin); }
-                tensorAssignments.emplace(std::pair{assignment.fqn, offsets}, index);
+                selected = candidate;
             }
         }
-        std::map<Index, size_t> indexes;
-        std::vector<Candidate>  candidates;
-        std::vector<bool>       described(assignments.size(), false);
-        for (auto const& [rank, items] : globalRegistry->checkpointWriteItems)
+        item.owner       = selected;
+        auto const index = static_cast<uint32_t>(selected);
+        if (item.size > std::numeric_limits<uint64_t>::max() - assignedBytes[index])
         {
-            for (auto const& item : items)
-            {
-                size_t assignmentIndex{};
-                if (auto const object = objectAssignments.find(item.fqn); object != objectAssignments.end())
-                {
-                    assignmentIndex  = object->second;
-                    auto const& node = globalRegistry->GetNode(assignments[assignmentIndex].node);
-                    if (item.isTensor && node.GetType() != StateNode::Type::DynamicSizeBlob)
-                    {
-                        throw std::runtime_error(fmt::format("Tensor write item '{}' has scalar capture metadata", item.fqn));
-                    }
-                }
-                else
-                {
-                    auto offsets = item.offsets;
-                    if (item.isTensor && offsets.empty()) { offsets.push_back(0); }
-                    auto const tensor = tensorAssignments.find(std::pair{item.fqn, offsets});
-                    if (tensor == tensorAssignments.end())
-                    {
-                        throw std::runtime_error(fmt::format("Write item '{}' has no matching capture shard", item.fqn));
-                    }
-                    assignmentIndex = tensor->second;
-                    auto const type = globalRegistry->GetNode(assignments[assignmentIndex].node).GetType();
-                    if (!item.isTensor && type != StateNode::Type::FixedSizeBlob)
-                    {
-                        throw std::runtime_error(fmt::format("Object write item '{}' has tensor capture metadata", item.fqn));
-                    }
-                }
-                auto const& assignment = assignments[assignmentIndex];
-                if (std::ranges::find(assignment.candidates, rank) == assignment.candidates.end())
-                {
-                    throw std::runtime_error(fmt::format("Write item '{}' is absent on its declared rank {}", item.fqn, rank));
-                }
-                auto const [found, inserted] = indexes.try_emplace(Index{item.fqn, item.isTensor, item.offsets}, candidates.size());
-                auto const cost              = item.isTensor ? std::max<uint64_t>(item.sizeBytes, 1) : 1;
-                if (inserted) { candidates.push_back({.assignment = assignmentIndex, .cost = cost, .holders = {rank}}); }
-                else
-                {
-                    auto& candidate = candidates[found->second];
-                    if (candidate.assignment != assignmentIndex) { throw std::runtime_error("Conflicting checkpoint write items"); }
-                    candidate.cost = cost;
-                    candidate.holders.insert(rank);
-                }
-                described[assignmentIndex] = true;
-            }
+            throw std::overflow_error("Assigned snapshot payload size overflow");
         }
-        if (std::ranges::find(described, false) != described.end())
-        {
-            throw std::runtime_error("Checkpoint write items do not cover the capture registry");
-        }
-        std::vector<uint64_t> assignedBytes(worldSize, 0);
-        for (auto const& candidate : candidates)
-        {
-            auto& assignment = assignments[candidate.assignment];
-            if (candidate.holders.size() != assignment.candidates.size())
-            {
-                throw std::runtime_error(fmt::format("Write item '{}' omits registered replicas", assignment.fqn));
-            }
-            auto selected = *candidate.holders.begin();
-            for (auto const rank : candidate.holders)
-            {
-                if (assignedBytes[static_cast<uint32_t>(rank)] < assignedBytes[static_cast<uint32_t>(selected)]) { selected = rank; }
-            }
-            auto& bytes = assignedBytes[static_cast<uint32_t>(selected)];
-            if (candidate.cost > std::numeric_limits<uint64_t>::max() - bytes)
-            {
-                throw std::overflow_error("Assigned checkpoint write size overflow");
-            }
-            bytes += candidate.cost;
-            assignment.owner = selected;
-        }
+        assignedBytes[index] += item.size;
     }
 
     std::unordered_map<Rank, std::shared_ptr<StateTree>> registries;
     for (uint32_t index = 0; index < rankCount; ++index)
     {
-        auto topology            = globalRegistry->Topo();
-        topology.rank            = Rank{firstRank + index};
-        auto registry            = std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology));
-        registry->commonStateKey = globalRegistry->commonStateKey;
+        auto topology         = globalRegistry->Topo();
+        topology.rank         = Rank{firstRank + index};
+        auto registry         = std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology));
+        registry->nativeState = globalRegistry->nativeState;
         registries.emplace(registry->GlobalRank(), std::move(registry));
     }
-    auto dedupedGlobalRegistry            = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
-    dedupedGlobalRegistry->commonStateKey = globalRegistry->commonStateKey;
+    auto dedupedGlobalRegistry         = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
+    dedupedGlobalRegistry->nativeState = globalRegistry->nativeState;
     std::unordered_map<StateNode::Handle, std::vector<Assignment const*>> byNode;
     for (auto const& item : assignments)
     {
@@ -1011,19 +904,10 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                 throw std::runtime_error("Cannot merge state registries from incompatible sessions or topologies");
             }
             if (global.IsFinalized()) { throw std::logic_error("Cannot merge into a finalized registry"); }
-            if (receivedFrom.empty()) { global.commonStateKey = incoming.commonStateKey; }
-            else if (global.commonStateKey != incoming.commonStateKey)
+            if (receivedFrom.empty()) { global.nativeState = incoming.nativeState; }
+            else if (global.nativeState != incoming.nativeState)
             {
-                throw std::runtime_error("State registries use different common-state entry names");
-            }
-            if (incoming.checkpointWriteItems.size() > 1
-                || (!incoming.checkpointWriteItems.empty() && !incoming.checkpointWriteItems.contains(recvRank)))
-            {
-                throw std::runtime_error("Local checkpoint write items contain another rank");
-            }
-            if (auto const items = incoming.checkpointWriteItems.find(recvRank); items != incoming.checkpointWriteItems.end())
-            {
-                global.checkpointWriteItems.emplace(recvRank, items->second);
+                throw std::runtime_error("State registries use different value encodings");
             }
             incoming.WalkNodes([&](StateNode const& supplied) {
                 auto const type = supplied.GetType();
@@ -1042,7 +926,7 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                         {
                             auto& scalar    = std::get<StateNode::Scalar>(added.data);
                             scalar.replicas = {recvRank};
-                            if (!global.commonStateKey.empty()) { Primitives64Bit::UnsignedTraits<uint64_t>::Assign(scalar, uint64_t{0}); }
+                            if (global.nativeState) { Primitives64Bit::UnsignedTraits<uint64_t>::Assign(scalar, uint64_t{0}); }
                         }
                         else if (type == StateNode::Type::DynamicSizeBlob)
                         {
@@ -1163,7 +1047,7 @@ try
     {
         // Send to coordinator
         std::ostringstream body;
-        StateSerDes::Write(body, *registry, StateNode::Handle::Root, !registry->commonStateKey.empty());
+        StateSerDes::Write(body, *registry, StateNode::Handle::Root, registry->nativeState);
         SendToPeerWithRetries(*this, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
     }
 } catch (std::exception const& error) { FailPlanning(*this, error.what()); }

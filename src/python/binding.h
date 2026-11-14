@@ -1,3 +1,4 @@
+#pragma once
 
 #include "checkpoint.h"
 #include "fmttensor.h"
@@ -54,7 +55,7 @@ class PyStateDictAccessor
 
     [[nodiscard]] virtual RankTopology GetRankTopo() const                     = 0;
     [[nodiscard]] virtual std::string  GetNodeId(StateNode::Handle node) const = 0;
-    [[nodiscard]] virtual bool         HasCommonStateBundle() const            = 0;
+    [[nodiscard]] virtual bool         IsNativeState() const                   = 0;
 
     virtual StateNode* AddDictionaryChild(StateNode::Handle parent, std::string_view name)                     = 0;
     virtual StateNode* RegisterState(StateNode::Handle parent, std::string_view name, StateNode::Variant data) = 0;

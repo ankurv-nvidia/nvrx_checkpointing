@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import io
 import shutil
 import sys
 import threading
@@ -637,80 +636,52 @@ def test_save_registers_the_state_of_its_format(
     assert events == expected
 
 
-def test_dtensor_registration_captures_local_values_without_planning(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dtensor_registration_preserves_nested_values_without_python_serialization(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     registered: list[dict] = []
-    descriptions: list[list] = []
 
-    def register(state: dict, *, write_items: list, common_state_key: str) -> None:
-        assert common_state_key == save._DCP_COMMON_STATE_KEY
+    def register(state: dict, *, native: bool) -> None:
+        assert native is True
         registered.append(state)
-        descriptions.append(write_items)
 
     root = SimpleNamespace(register_state_dict=register)
     monkeypatch.setattr(save, "_ensure_root", lambda: root)
 
-    def collective(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("registration called a distributed collective")
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("native registration called Python serialization, flattening, or a collective")
 
-    monkeypatch.setattr(save.torch.distributed, "gather_object", collective)
-    monkeypatch.setattr(save.torch.distributed, "scatter_object_list", collective)
+    monkeypatch.setattr(save.torch, "save", forbidden)
+    monkeypatch.setattr(save.torch.distributed, "gather_object", forbidden)
+    monkeypatch.setattr(save.torch.distributed, "scatter_object_list", forbidden)
+    monkeypatch.setattr(save.torch.distributed.checkpoint._nested_dict, "flatten_state_dict", forbidden)
     weight = save.torch.ones(2)
     args = SimpleNamespace(lr=0.1)
-    first_iteration, later_iteration = 7, 123456
-    later_args = SimpleNamespace(lr=0.2)
-    state = {"model": {"weight": weight}, "iteration": first_iteration, "peer": 0, "args": args, "enabled": True, "empty": None}
+    state = {"model": {"weight": weight}, "iteration": 7, "args": args, "enabled": True, "empty": None}
 
-    save.register_dtensor_state_dict(state)
-    save.register_dtensor_state_dict({**state, "iteration": later_iteration, "args": later_args})
+    assert save.register_dtensor_state_dict(state) is root
 
-    first, second = registered
-    assert set(first) == set(second) == {"model.weight", "iteration", "peer", "args", "enabled", "empty"}
-    assert first["model.weight"] is weight
-    assert first["iteration"] == first_iteration
-    assert second["iteration"] == later_iteration
-    assert first["args"] != second["args"]
-    assert save.torch.load(io.BytesIO(second["args"]), weights_only=False).lr == later_args.lr
-    assert save.torch.load(io.BytesIO(first["enabled"]), weights_only=False) is True
-    assert save.torch.load(io.BytesIO(first["empty"]), weights_only=False) is None
-    expected_items = [
-        ("model.weight", [0], weight.numel() * weight.element_size()),
-        ("iteration", None, 1),
-        ("peer", None, 1),
-        ("args", None, 1),
-        ("enabled", None, 1),
-        ("empty", None, 1),
-    ]
-    assert descriptions == [expected_items, expected_items]
-
-
-def test_write_descriptions_match_dcp_metadata_without_global_planning(save: ModuleType) -> None:
-    state = {
-        "weight": save.torch.ones(2, 3),
-        "empty": save.torch.empty(0),
-        "scalar_tensor": save.torch.tensor(5),
-        "iteration": 7,
-        "enabled": True,
-        "args": SimpleNamespace(lr=0.1),
-    }
-    planner = save.torch.distributed.checkpoint.DefaultSavePlanner()
-    planner.set_up_planner(state, is_coordinator=True)
-    expected = [
-        (item.index.fqn, list(item.index.offset) if item.index.offset is not None else None, item.tensor_storage_size() or 1)
-        for item in planner.create_local_plan().items
-    ]
-
-    assert save._dtensor_write_items(state) == expected
+    assert registered == [state]
+    assert registered[0] is state
+    assert registered[0]["model"]["weight"] is weight
+    assert registered[0]["args"] is args
+    assert registered[0]["enabled"] is True
+    assert registered[0]["empty"] is None
 
 
 def test_dtensor_registration_accepts_growing_objects(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     registered: list[dict] = []
     root = SimpleNamespace(register_state_dict=lambda state, **_kwargs: registered.append(state))
     monkeypatch.setattr(save, "_ensure_root", lambda: root)
-    save.register_dtensor_state_dict({"text": "a"})
-    save.register_dtensor_state_dict({"text": "a" * 8192})
+    first = {"objects": {"text": "a", "values": []}}
+    later = {"objects": {"text": "a" * 8192, "values": [1, None, ()]}}
 
-    assert len(registered[1]["text"]) > len(registered[0]["text"])
-    assert save.torch.load(io.BytesIO(registered[1]["text"]), weights_only=False) == "a" * 8192
+    save.register_dtensor_state_dict(first)
+    save.register_dtensor_state_dict(later)
+
+    assert registered[0] is first
+    assert registered[1] is later
 
 
 @pytest.mark.parametrize(

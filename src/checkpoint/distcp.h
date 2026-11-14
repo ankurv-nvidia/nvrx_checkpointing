@@ -6,15 +6,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <string_view>
 #include <unordered_map>
-#include <vector>
 
 namespace checkpoint::distcp
 {
-std::vector<char> BuildCommonStateArchive(StateTree const& snapshotRegistry, ByteStorage const& snapshotData);
-std::string       CommonStateKeyForRank(std::string_view key, Rank rank);
-
+// Write this rank's tensor shards and local Blobs into __<rank>_0.distcp.
+// An empty Blob map means this rank has no non-tensor state payloads.
 std::unordered_map<std::string, uint64_t>
 WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& snapshotRegistry, ByteStorage const& tensorStorage);
 

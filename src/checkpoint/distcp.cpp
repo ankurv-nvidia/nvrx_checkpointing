@@ -21,8 +21,8 @@
 #include <ios>
 #include <limits>
 #include <map>
+#include <optional>
 #include <ostream>
-#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -226,8 +226,11 @@ static ByteBuffer BuildDataPkl(Tensor::DType dtype, Tensor::Dim const& shape)
 
     Tensor::Dim stride;
     for (size_t i = 0; i < shape.size(); ++i) { stride.push_back(0); }
-    stride[shape.size() - 1] = 1;
-    for (size_t i = shape.size() - 1; i-- > 0;) { stride[i] = stride[i + 1] * shape[i + 1]; }
+    if (!shape.empty())
+    {
+        stride[shape.size() - 1] = 1;
+        for (size_t i = shape.size() - 1; i-- > 0;) { stride[i] = stride[i + 1] * shape[i + 1]; }
+    }
 
     uint64_t const storageSize = info.useV3 ? numel * Tensor::GetDTypeSize(dtype) : numel;
 
@@ -508,7 +511,6 @@ static void FinishOutputFile(std::ofstream& output, std::filesystem::path const&
 
 static uint64_t LogicalShardSizeBytes(TensorShard const& shard, Tensor::DType dtype)
 {
-    if (shard.sharddim.empty()) { return 0; }
     uint64_t size = Tensor::GetDTypeSize(dtype);
     for (auto const& range : shard.sharddim) { size *= range.end - range.begin; }
     return size;
@@ -774,132 +776,6 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     return archiveSize;
 }
 
-static void PickleScalar(ByteBuffer& out, StateNode::Scalar const& value)
-{
-    auto const type = value.GetType();
-    if (StateNode::Scalar::Type::IsFloat(type))
-    {
-        PutU8(out, 'G');
-        auto const bits = std::bit_cast<uint64_t>(value.Cast<double>());
-        for (size_t i = sizeof(bits); i > 0; --i) { PutU8(out, static_cast<uint8_t>((bits >> ((i - 1) * 8)) & ByteMask)); }
-    }
-    else if (StateNode::Scalar::Type::IsSigned(type))
-    {
-        auto const integer = value.Cast<int64_t>();
-        if (integer >= 0) { PickleInt(out, static_cast<uint64_t>(integer)); }
-        else
-        {
-            PutU8(out, PickleLong1Opcode);
-            PutU8(out, sizeof(integer));
-            auto const bits = std::bit_cast<uint64_t>(integer);
-            for (size_t i = 0; i < sizeof(bits); ++i) { PutU8(out, static_cast<uint8_t>((bits >> (i * 8)) & ByteMask)); }
-        }
-    }
-    else if (StateNode::Scalar::Type::IsUnsigned(type)) { PickleInt(out, value.Cast<uint64_t>()); }
-    else
-    {
-        throw std::runtime_error("distcp: unsupported scalar in common state");
-    }
-}
-
-static void PickleBlob(ByteBuffer& out, std::string_view value)
-{
-    std::string encoded;
-    encoded.reserve(value.size());
-    for (auto const character : value)
-    {
-        auto const byte = static_cast<uint8_t>(character);
-        if (byte < 0x80U) { encoded.push_back(character); }
-        else
-        {
-            encoded.push_back(static_cast<char>(0xc0U | (byte >> 6U)));
-            encoded.push_back(static_cast<char>(0x80U | (byte & 0x3fU)));
-        }
-    }
-    PickleGlobal(out, "_codecs", "encode");
-    PickleBinunicode(out, encoded);
-    PickleBinunicode(out, "latin1");
-    PutU8(out, PickleTuple2Opcode);
-    PutU8(out, 'R');
-}
-
-static std::string_view BlobSpan(ByteStorage const& storage, uint64_t handle, uint64_t size, std::string_view key)
-{
-    if (handle > storage.size || size > storage.size - handle)
-    {
-        throw std::out_of_range(fmt::format("Blob '{}' exceeds the snapshot payload", key));
-    }
-    return {size == 0 ? "" : static_cast<char const*>(storage.data) + handle, size};
-}
-
-static std::vector<char> BuildCommonStateArchiveForRank(StateTree const& registry, ByteStorage const& storage, Rank rank)
-{
-    ByteBuffer dataPkl;
-    PutU8(dataPkl, 0x80);
-    PutU8(dataPkl, 0x02);
-    PutU8(dataPkl, ']');
-    PutU8(dataPkl, '}');
-    PutU8(dataPkl, '(');
-    registry.WalkNodes([&](StateNode const& node) {
-        auto const fqn = registry.GetNodeId(node.handle);
-        if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data))
-        {
-            if (!scalar->replicas.contains(rank)) { return; }
-            PickleBinunicode(dataPkl, fqn);
-            PickleScalar(dataPkl, *scalar);
-        }
-        else if (auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data))
-        {
-            if (!blob->replicas.contains(rank)) { return; }
-            PickleBinunicode(dataPkl, fqn);
-            PickleBlob(dataPkl, BlobSpan(storage, blob->handle, blob->storageSize, fqn));
-        }
-    });
-    PutU8(dataPkl, 'u');
-    PutU8(dataPkl, 'a');
-    PutU8(dataPkl, '.');
-
-    mz_zip_archive zip{};
-    if (mz_zip_writer_init_heap(&zip, 0, 0) != MZ_TRUE) { throw std::runtime_error("distcp: common-state ZIP initialization failed"); }
-    void* archiveData = nullptr;
-    try
-    {
-        auto add = [&](char const* name, std::string_view data) {
-            if (mz_zip_writer_add_mem(&zip, name, data.data(), data.size(), MZ_NO_COMPRESSION) != MZ_TRUE)
-            {
-                throw std::runtime_error(fmt::format("distcp: common-state ZIP entry '{}' failed", name));
-            }
-        };
-        add("archive/data.pkl", std::string_view(dataPkl.data(), dataPkl.size()));
-        add("archive/byteorder", ByteorderBytes);
-        add("archive/version", VersionBytes);
-        size_t archiveSize = 0;
-        if (mz_zip_writer_finalize_heap_archive(&zip, &archiveData, &archiveSize) != MZ_TRUE)
-        {
-            throw std::runtime_error("distcp: common-state ZIP finalization failed");
-        }
-        auto const* bytes = static_cast<char const*>(archiveData);
-        ByteBuffer  result(bytes, bytes + archiveSize);
-        mz_free(archiveData);
-        mz_zip_writer_end(&zip);
-        return result;
-    } catch (...)
-    {
-        mz_free(archiveData);
-        mz_zip_writer_end(&zip);
-        throw;
-    }
-}
-
-std::vector<char> BuildCommonStateArchive(StateTree const& registry, ByteStorage const& storage)
-{ return BuildCommonStateArchiveForRank(registry, storage, registry.GlobalRank()); }
-
-std::string CommonStateKeyForRank(std::string_view key, Rank rank)
-{
-    if (rank == Rank{0}) { return std::string(key); }
-    return fmt::format("{}.rank_{}", key, rank);
-}
-
 constexpr std::string_view KMetadataModule   = "torch.distributed.checkpoint.metadata";
 constexpr std::string_view KFilesystemModule = "torch.distributed.checkpoint.filesystem";
 
@@ -1076,8 +952,15 @@ static BlobsByFqn CollectBlobs(StateTree const& registry, ByteStorage const& sto
 {
     BlobsByFqn blobs;
     auto       add = [&](std::string key, uint64_t handle, uint64_t size) {
-        auto const data = BlobSpan(storage, handle, size, key);
-        if (!blobs.emplace(std::move(key), data).second) { throw std::runtime_error("Snapshot contains duplicate blob keys"); }
+        if (handle > storage.size || size > storage.size - handle)
+        {
+            throw std::out_of_range(fmt::format("Blob '{}' exceeds the snapshot payload", key));
+        }
+        auto const* data = size == 0 ? "" : static_cast<char const*>(storage.data) + handle;
+        if (!blobs.emplace(std::move(key), std::string_view(data, size)).second)
+        {
+            throw std::runtime_error("Snapshot contains duplicate blob keys");
+        }
     };
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
@@ -1101,23 +984,33 @@ static BlobsByFqn CollectBlobs(StateTree const& registry, ByteStorage const& sto
     return blobs;
 }
 
+static std::array<char, sizeof(uint64_t)> EncodeScalar(StateNode::Scalar const& scalar)
+{
+    auto const type = scalar.GetType();
+    uint64_t   bits{};
+    if (Primitives64Bit::Type::IsFloat(type)) { bits = std::bit_cast<uint64_t>(scalar.Cast<double>()); }
+    else if (Primitives64Bit::Type::IsSigned(type)) { bits = std::bit_cast<uint64_t>(scalar.Cast<int64_t>()); }
+    else if (Primitives64Bit::Type::IsUnsigned(type)) { bits = scalar.Cast<uint64_t>(); }
+    else
+    {
+        throw std::runtime_error("distcp: unsupported native scalar type");
+    }
+    std::array<char, sizeof(bits)> bytes{};
+    for (size_t index = 0; index < bytes.size(); ++index) { bytes[index] = static_cast<char>((bits >> (index * 8)) & ByteMask); }
+    return bytes;
+}
+
 static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
 {
     BlobMetadataByFqn blobs;
-    std::set<Rank>    bundleOwners{Rank{0}};
     registry.WalkNodes([&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type == StateNode::Type::DynamicSizeBlob)
         {
-            auto const& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
-            if (!registry.commonStateKey.empty())
-            {
-                bundleOwners.insert(blob.replicas.begin(), blob.replicas.end());
-                return;
-            }
-            auto const fqn    = registry.GetNodeId(node.handle);
-            auto const size   = dynamicBlobSizes.find(fqn);
-            auto const length = size == dynamicBlobSizes.end() ? blob.storageSize : size->second;
+            auto const& blob   = std::get<StateNode::DynamicSizeBlob>(node.data);
+            auto const  fqn    = registry.GetNodeId(node.handle);
+            auto const  size   = dynamicBlobSizes.find(fqn);
+            auto const  length = size == dynamicBlobSizes.end() ? blob.storageSize : size->second;
             for (auto rank : blob.replicas) { blobs[fqn][rank] = {.length = length}; }
         }
         else if (type == StateNode::Type::FixedSizeBlob)
@@ -1129,26 +1022,13 @@ static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::uno
                     = {.length = shard.storageSize};
             }
         }
-        else if (type == StateNode::Type::Scalar && !registry.commonStateKey.empty())
+        else if (type == StateNode::Type::Scalar && registry.nativeState)
         {
             auto const& scalar = std::get<StateNode::Scalar>(node.data);
-            bundleOwners.insert(scalar.replicas.begin(), scalar.replicas.end());
+            auto const  fqn    = registry.GetNodeId(node.handle);
+            for (auto rank : scalar.replicas) { blobs[fqn][rank] = {.length = sizeof(uint64_t)}; }
         }
     });
-    if (!registry.commonStateKey.empty())
-    {
-        for (auto rank : bundleOwners)
-        {
-            auto const key    = CommonStateKeyForRank(registry.commonStateKey, rank);
-            auto const length = dynamicBlobSizes.find(key);
-            if (length == dynamicBlobSizes.end() || length->second == 0)
-            {
-                throw std::runtime_error(fmt::format("distcp: missing common-state archive size for rank {}", rank));
-            }
-            if (blobs.contains(key)) { throw std::runtime_error(fmt::format("distcp: common-state entry '{}' duplicates a Blob", key)); }
-            blobs[key][rank] = {.length = length->second};
-        }
-    }
     return blobs;
 }
 
@@ -1218,9 +1098,9 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     WalkTensorNodes(globalRegistry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type != StateNode::Type::DTensor) { return; }
-        auto const&      tnsr = std::get<DTensor>(node.data);
-        auto const       fqn  = globalRegistry.GetNodeId(node.handle);
-        Tensor::DimRange lastShard{};
+        auto const&                     tnsr = std::get<DTensor>(node.data);
+        auto const                      fqn  = globalRegistry.GetNodeId(node.handle);
+        std::optional<Tensor::DimRange> lastShard;
         for (auto const& shard : tnsr.shards)
         {
             auto const shardSize = LogicalShardSizeBytes(shard, tnsr.durableDtype);
@@ -1232,7 +1112,7 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
             uint64_t       curCursor  = cursor;
             cursor += archiveLen;
 
-            if (lastShard == shard.sharddim) { continue; }
+            if (lastShard && *lastShard == shard.sharddim) { continue; }
             lastShard = shard.sharddim;
 
             // Replica records advance physical offsets but share one metadata key.
@@ -1267,37 +1147,27 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
 std::unordered_map<std::string, uint64_t>
 WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
 {
-    BlobsByFqn                                blobs = CollectBlobs(registry, tensorStorage, rank);
-    std::unordered_map<std::string, uint64_t> dynamicBlobSizes;
-    std::vector<char>                         commonStateArchive;
-    bool                                      writeCommonState = rank == Rank{0};
+    BlobsByFqn                                                blobs = CollectBlobs(registry, tensorStorage, rank);
+    std::map<std::string, std::array<char, sizeof(uint64_t)>> scalarData;
+    std::unordered_map<std::string, uint64_t>                 dynamicBlobSizes;
     registry.WalkNodes([&](StateNode const& node) {
         if (auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data))
         {
-            if (!blob->replicas.contains(rank)) { return; }
-            auto const fqn = registry.GetNodeId(node.handle);
-            if (registry.commonStateKey.empty()) { dynamicBlobSizes.emplace(fqn, blob->storageSize); }
-            else
+            if (blob->replicas.contains(rank)) { dynamicBlobSizes.emplace(registry.GetNodeId(node.handle), blob->storageSize); }
+        }
+        else if (registry.nativeState)
+        {
+            if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data); scalar != nullptr && scalar->replicas.contains(rank))
             {
-                blobs.erase(fqn);
-                writeCommonState = true;
+                auto const fqn               = registry.GetNodeId(node.handle);
+                auto const [entry, inserted] = scalarData.emplace(fqn, EncodeScalar(*scalar));
+                if (!inserted || !blobs.emplace(fqn, std::string_view(entry->second.data(), entry->second.size())).second)
+                {
+                    throw std::runtime_error("Snapshot contains duplicate native scalar keys");
+                }
             }
         }
-        else if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data))
-        {
-            if (scalar->replicas.contains(rank)) { writeCommonState = true; }
-        }
     });
-    if (!registry.commonStateKey.empty() && writeCommonState)
-    {
-        commonStateArchive = BuildCommonStateArchiveForRank(registry, tensorStorage, rank);
-        auto const key     = CommonStateKeyForRank(registry.commonStateKey, rank);
-        if (!blobs.emplace(key, std::string_view(commonStateArchive.data(), commonStateArchive.size())).second)
-        {
-            throw std::runtime_error(fmt::format("distcp: common-state entry '{}' duplicates a Blob", key));
-        }
-        dynamicBlobSizes.emplace(key, commonStateArchive.size());
-    }
     auto const filename = fmt::format("__{}_0.distcp", static_cast<uint32_t>(rank));
     auto const filepath = ckptDir / filename;
 
@@ -1387,16 +1257,15 @@ void WriteMetadata(std::filesystem::path const&                     ckptDir,
     WriteBytes(output, pkl.data(), pkl.size(), filepath.string());
     FinishOutputFile(output, filepath);
 
-    auto const configPath = ckptDir / "metadata.json";
-    if (!snapshotRegistry.commonStateKey.empty())
+    // The format marker makes the directory loadable as a torch_dist checkpoint.
+    static constexpr std::string_view ConfigJson = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
+    auto const                        configPath = ckptDir / "metadata.json";
+    if (snapshotRegistry.nativeState)
     {
         std::filesystem::remove(configPath);
         return;
     }
-
-    // The format marker makes the directory loadable as a torch_dist checkpoint.
-    static constexpr std::string_view ConfigJson   = R"({"sharded_backend": "torch_dist", "sharded_backend_version": 1})";
-    auto                              configOutput = OpenOutputFile(configPath);
+    auto configOutput = OpenOutputFile(configPath);
     WriteBytes(configOutput, ConfigJson.data(), ConfigJson.size(), configPath.string());
     FinishOutputFile(configOutput, configPath);
 }
