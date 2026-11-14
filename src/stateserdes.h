@@ -83,8 +83,7 @@ struct StateSerDes
         return topo;
     }
 
-    static std::ostream&
-    Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle, bool scrubScalarValues = false)
+    static std::ostream& Write(std::ostream& ostrm LFTBND, StateTree const& tree, StateNode::Handle nodeHandle)
     {
         serdes::WriteTrivial(ostrm, tree.SessionId());
         WriteTopology(ostrm, tree._topo);
@@ -115,9 +114,7 @@ struct StateSerDes
             case Type::Scalar:
             {
                 auto const& scalar = std::get<StateNode::Scalar>(node.data);
-                auto        value  = static_cast<Primitives64Bit const&>(scalar);
-                if (scrubScalarValues) { Primitives64Bit::UnsignedTraits<uint64_t>::Assign(value, uint64_t{0}); }
-                serdes::WriteTrivial(ostrm, value);
+                serdes::WriteTrivial(ostrm, static_cast<Primitives64Bit const&>(scalar));
                 WriteRanks(ostrm, scalar.replicas);
             }
             break;

@@ -344,7 +344,7 @@ static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
         ostrm.push(boost::iostreams::counter());
         ostrm.push(boost::iostreams::zlib_compressor(boost::iostreams::zlib_params(RegistryCompressionLevel)));
         ostrm.push(boost::iostreams::back_inserter(out));
-        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root, true);
+        StateSerDes::Write(ostrm, registry, StateNode::Handle::Root);
         ostrm.strict_sync();
         rawSize = static_cast<uint64_t>(ostrm.component<boost::iostreams::counter>(0)->characters());
     }
@@ -915,7 +915,6 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                         {
                             auto& scalar    = std::get<StateNode::Scalar>(added.data);
                             scalar.replicas = {recvRank};
-                            Primitives64Bit::UnsignedTraits<uint64_t>::Assign(scalar, uint64_t{0});
                         }
                         else if (type == StateNode::Type::DynamicSizeBlob)
                         {
@@ -986,9 +985,8 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
             try
             {
                 globalRegistry->FinalizeRegistry();
-                DebugOutputToFile("registry.global.bin", [&](std::ostream& stream) {
-                    StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root, true);
-                });
+                DebugOutputToFile("registry.global.bin",
+                                  [&](std::ostream& stream) { StateSerDes::Write(stream, *globalRegistry, StateNode::Handle::Root); });
                 HandleGlobalRegistry(globalRegistry, {});
                 BroadcastGlobalRegistryToPeers_(*globalRegistry);
             } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
@@ -1037,7 +1035,7 @@ try
     {
         // Send to coordinator
         std::ostringstream body;
-        StateSerDes::Write(body, *registry, StateNode::Handle::Root, true);
+        StateSerDes::Write(body, *registry, StateNode::Handle::Root);
         SendToPeerWithRetries(*this, topo.peers[0], body.str(), fmt::format("/api/peer/localstateregistry/{}/{}", sessionId, rank), {});
     }
 } catch (std::exception const& error) { FailPlanning(*this, error.what()); }

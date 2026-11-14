@@ -1,5 +1,43 @@
 # Hand-off: the `dtensor` branch of nvrx_checkpointing
 
+## Scalar exchange and binding size audit, 2026-11-14
+
+The owner explicitly permits inline scalar values in registry exchanges.
+Serialization always retains those values. The scalar-scrubbing boolean,
+callsite arguments, and coordinator-side zeroing are removed. Registry wire
+version 8 and the checkpoint format retain their existing layouts. Planning
+uses FQNs, types, geometry, and replica holders; it does not depend on scalar
+values being zero. Snapshot capture continues to refresh local values.
+
+The binding size audit compares 2,403 lines with 830 lines on main, a net
+increase of 1,573 lines. Approximately 530 lines are the save encoder moved
+from the deleted header, 360 decode and restore native values, 325 handle
+rank-specific dictionary schemas and source merging, 185 implement request
+scanning, tensor copying, and load orchestration, and 110 support stock object
+archives and common-state inspection. Registration and public binding glue
+account for the remainder. The first load scan is 46 lines, and the load
+entrypoint is 18 lines.
+
+Shared traversal is feasible, with different operations for capture, load
+requests, and restoration. The existing save functions also encode blob bytes
+and obtain tensor storage, skip some empty values, and use container policies
+that differ between prepared and structured state. Calling them unchanged
+would not provide a metadata-only load request scan. Substantial simplification
+requires revisiting the custom object representation and rank-dictionary
+merging; sharing traversal alone removes only a small part of the total.
+The owner requests this high-level explanation before further design details.
+
+Validation passes 651 Python tests with 84 environment-dependent skips and
+all 69 public load cases. Of 95 native CTest cases, 93 pass in the isolated
+environment; the forwarding case separately passes all 17 assertions, and
+the external registry fixture is unavailable. The fresh two-GPU eight-expert
+MoE CI run resumes at 50 and saves through 125. All five checkpoints match
+exactly, with 3,209 entries at 25/50 and 3,208 at 75/100/125. Worker, epilog,
+argument, save-span, and telemetry checks pass. The earlier four-GPU issue
+remains unresolved.
+The isolated daemon suite passes 98 cases with two CUDA-only skips, including
+all 28 focused native cases.
+
 ## Native three-stage load, 2026-11-14
 
 The owner approves a native load path with three stages:

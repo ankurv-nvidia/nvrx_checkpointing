@@ -123,7 +123,8 @@ structured non-tensor values in their owning ranks' checkpoint files. Python
 passes Megatron's preprocessed nested state dictionary to the native binding;
 the FSDP save path does not flatten it or serialize objects with `torch.save`.
 The binding captures supported values and local DTensor storage in the state
-tree. Daemons exchange metadata, select local writers, and persist snapshots.
+tree. Daemons exchange registries with inline scalar values, select local
+writers, and persist snapshots.
 Scalar leaves occupy eight payload bytes each, alongside their DCP metadata.
 This applies to all scalar state nodes, including the `torch_dist` path. Each
 entry records its primitive datatype in DCP byte-storage metadata. Existing

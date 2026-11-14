@@ -1015,14 +1015,16 @@ static std::string SerializedStateRegistry(StateTree const& tree)
     return serialized.str();
 }
 
-TEST_CASE("registry metadata retains scalar types without their values", "[state][planning][tier1]")
+TEST_CASE("registry serialization retains scalar values types and replicas", "[state][planning][tier1]")
 {
     StateTree                        tree(checkpoint::ipc::SessionId{17}, SingleRankTopo(0, 2));
-    std::array<StateNode::Scalar, 5> values{StateNode::Scalar(int64_t{-57}),
-                                            StateNode::Scalar(uint64_t{99}),
+    std::array<StateNode::Scalar, 7> values{StateNode::Scalar(std::numeric_limits<int64_t>::min()),
+                                            StateNode::Scalar(std::numeric_limits<uint64_t>::max()),
                                             StateNode::Scalar(0.25),
                                             StateNode::Scalar(true),
-                                            StateNode::Scalar(uint8_t{1})};
+                                            StateNode::Scalar(uint8_t{1}),
+                                            StateNode::Scalar(-0.0),
+                                            StateNode::Scalar(false)};
     for (size_t index = 0; index < values.size(); ++index)
     {
         values[index].replicas                                                      = {Rank{0}, Rank{1}};
@@ -1030,7 +1032,7 @@ TEST_CASE("registry metadata retains scalar types without their values", "[state
     }
     tree.FinalizeRegistry();
     std::ostringstream bytes;
-    StateSerDes::Write(bytes, tree, StateNode::Handle::Root, true);
+    StateSerDes::Write(bytes, tree, StateNode::Handle::Root);
     std::istringstream input(bytes.str());
     auto               restored = StateSerDes::Read(input);
     auto const         cloned   = restored->Clone();
@@ -1039,7 +1041,7 @@ TEST_CASE("registry metadata retains scalar types without their values", "[state
         auto const  name  = fmt::format("scalar{}", index);
         auto const& value = std::get<StateNode::Scalar>(restored->GetNode(restored->FindNodeByFQN(name)).data);
         CHECK(value.GetType() == values[index].GetType());
-        CHECK(value.Cast<double>() == 0.0);
+        CHECK(value == values[index]);
         CHECK(value.replicas == (std::set<Rank>{Rank{0}, Rank{1}}));
         CHECK(std::get<StateNode::Scalar>(cloned->GetNode(cloned->FindNodeByFQN(name)).data) == value);
         CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN(name)).data) == values[index]);
@@ -1049,9 +1051,6 @@ TEST_CASE("registry metadata retains scalar types without their values", "[state
     CHECK(values[3].Cast<uint64_t>() == 1);
     CHECK(values[4].Cast<bool>());
     CHECK(input.peek() == std::char_traits<char>::eof());
-    std::istringstream captured(SerializedStateRegistry(tree));
-    auto const         capture = StateSerDes::Read(captured);
-    CHECK(std::get<StateNode::Scalar>(capture->GetNode(capture->FindNodeByFQN("scalar0")).data) == values[0]);
 }
 
 TEST_CASE("checkpoint scalars occupy eight typed bytes beside opaque blobs", "[distcp][scalar][tier1]")
@@ -1125,9 +1124,38 @@ TEST_CASE("capture planning balances scalar and replicated tensor owners", "[ser
     auto const& actual   = *session.sessionState.dedupedGlobalRegistry;
     auto const& selected = std::get<StateNode::Scalar>(actual.GetNode(actual.FindNodeByFQN("counter")).data);
     CHECK(selected.replicas == std::set<Rank>{Rank{0}});
+    CHECK(selected.Cast<int64_t>() == 99);
     auto const& shards = std::get<DTensor>(actual.GetNode(actual.FindNodeByFQN("weight")).data).shards;
     REQUIRE(shards.size() == 1);
     CHECK(shards.begin()->rank == Rank{1});
+}
+
+TEST_CASE("registry merging preserves replicated scalar values", "[server][planning][tier1]")
+{
+    auto const     topology = SingleRankTopo(0, 3);
+    Session        session(nullptr, checkpoint::ipc::SessionId::Default, std::filesystem::path{}, topology);
+    std::set<Rank> expectedRanks;
+    for (uint32_t rank = 0; rank < 2; ++rank)
+    {
+        auto localTopology       = topology;
+        localTopology.rank       = Rank{rank};
+        auto              source = std::make_shared<StateTree>(session.sessionId, std::move(localTopology));
+        StateNode::Scalar scalar(int64_t{-57});
+        scalar.replicas                                           = {Rank{rank}};
+        source->AddChild(StateNode::Handle::Root, "counter").data = scalar;
+        source->FinalizeRegistry();
+
+        session.HandleLocalStateRegistry(Rank{rank}, source);
+
+        REQUIRE(session.sessionState.planningFailure.empty());
+        auto const& global = *session.sessionState.globalRegistry;
+        auto const& merged = std::get<StateNode::Scalar>(global.GetNode(global.FindNodeByFQN("counter")).data);
+        expectedRanks.insert(Rank{rank});
+        CHECK(merged.GetType() == scalar.GetType());
+        CHECK(merged.Cast<int64_t>() == -57);
+        CHECK(merged.replicas == expectedRanks);
+        CHECK(std::get<StateNode::Scalar>(source->GetNode(source->FindNodeByFQN("counter")).data) == scalar);
+    }
 }
 
 TEST_CASE("owner selection retains distinct uneven tensor shards", "[server][planning][tier1]")
@@ -1158,7 +1186,7 @@ TEST_CASE("owner selection retains distinct uneven tensor shards", "[server][pla
     for (auto const& chunk : chunks) { CHECK(chunk.rank == (chunk.sharddim[0].begin == 0 ? Rank{0} : Rank{1})); }
 }
 
-TEST_CASE("scalar values and growing blobs remain local across daemons", "[server][scalar][blob][tier2]")
+TEST_CASE("shared scalar values and growing local blobs survive saves", "[server][scalar][blob][tier2]")
 {
     auto const output = CkptDir("native_peer_values");
     std::filesystem::remove_all(output);
@@ -1190,7 +1218,7 @@ TEST_CASE("scalar values and growing blobs remain local across daemons", "[serve
     std::array<std::shared_ptr<StateTree>, 2> selected{GetSnapshotRegistry(*trees[0]), GetSnapshotRegistry(*trees[1])};
     auto const                                shared = selected[0]->FindNodeByFQN("shared");
     REQUIRE(shared != StateNode::Handle::Invalid);
-    CHECK(std::get<StateNode::Scalar>(selected[0]->GetNode(shared).data).Cast<int64_t>() == 0);
+    CHECK(std::get<StateNode::Scalar>(selected[0]->GetNode(shared).data).Cast<int64_t>() == 100);
     REQUIRE(selected[1]->FindNodeByFQN("shared") == StateNode::Handle::Invalid);
     REQUIRE(selected[0]->FindNodeByFQN("weight") == StateNode::Handle::Invalid);
     REQUIRE(selected[1]->FindNodeByFQN("weight") != StateNode::Handle::Invalid);
@@ -1717,21 +1745,15 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         auto const  name   = fmt::format("typed_scalar{}", index);
         auto const& scalar = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
         CHECK(scalar.GetType() == values[index].GetType());
-        CHECK(scalar.Cast<double>() == 0.0);
+        CHECK(scalar == values[index]);
         CHECK(scalar.replicas == values[index].replicas);
         CHECK(std::get<StateNode::Scalar>(tree.GetNode(tree.FindNodeByFQN(name)).data) == values[index]);
     }
     for (uint32_t index = 0; index < 512; ++index)
     {
-        auto const name                       = fmt::format("scalar_{:04}_{}", index, suffix);
-        auto&      scalar                     = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
-        static_cast<Primitives64Bit&>(scalar) = Primitives64Bit(index);
-    }
-    for (size_t index = 0; index < values.size(); ++index)
-    {
-        auto const name                       = fmt::format("typed_scalar{}", index);
-        auto&      scalar                     = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
-        static_cast<Primitives64Bit&>(scalar) = static_cast<Primitives64Bit const&>(values[index]);
+        auto const  name   = fmt::format("scalar_{:04}_{}", index, suffix);
+        auto const& scalar = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
+        CHECK(scalar.Cast<uint32_t>() == index);
     }
     auto& payload = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
     CHECK(payload.handle == reinterpret_cast<uint64_t>(bytes.data()));
@@ -1833,7 +1855,7 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
                         REQUIRE(handle != StateNode::Handle::Invalid);
                         auto const& scalar = std::get<StateNode::Scalar>(registry->GetNode(handle).data);
                         CHECK(scalar.GetType() == Primitives64Bit::Type::Of<int64_t>());
-                        CHECK(scalar.Cast<int64_t>() == 0);
+                        CHECK(scalar.Cast<int64_t>() == 37);
                         if (registry == &localRegistry) { CHECK(scalar.replicas.empty()); }
                         else
                         {
