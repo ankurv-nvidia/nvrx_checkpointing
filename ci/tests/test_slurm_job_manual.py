@@ -1963,6 +1963,7 @@ def test_routine_validates_each_collected_cycle(
     )
     monkeypatch.setattr(slurm_job.otel_report, "write_analysis", lambda *_args: None)
     monkeypatch.setattr(slurm_job.otel_to_perfetto, "convert_records", lambda *values: converted.append(values))
+    monkeypatch.setattr(slurm_job.otel_to_perfetto, "convert", lambda *values: converted.append(values))
     monkeypatch.setattr(slurm_job.subprocess, "run", run)
     monkeypatch.setattr(args.flavors.policy, "stop_server", lambda *values, **_kwargs: stops.append(values))
 
@@ -2004,9 +2005,7 @@ def test_routine_validates_each_collected_cycle(
         if rank == "0"
         else []
     )
-    assert [output.name for _records, output in converted] == (
-        ["native_ckpt_perfetto.json", "native_ckpt_perfetto.json"] if rank == "0" else []
-    )
+    assert converted == []
     assert len(charts) == (2 if rank == "0" else 0)
 
 
@@ -2044,6 +2043,194 @@ def test_otel_checkpoint_timings_are_grouped_at_the_end(
         ("phase1", None, "cmp phase1"),
         ("cycle1", None, "cmp cycle1"),
     ]
+
+
+def test_otel_run_id_names_the_run_phase_and_restarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setattr(slurm_job, "RUN_NAME", "gb200-native-detr-pico-1x4")
+    env = {"SLURM_JOB_ID": "42", "SLURM_RESTART_COUNT": "1", "TORCHELASTIC_RESTART_COUNT": "2"}
+
+    assert slurm_job._otel_run_id(env, "ref", "phase1") == "42-gb200-native-detr-pico-1x4-ref-phase1-sr1-te2"
+    assert slurm_job._otel_run_id(env, "", "cycle1") == "42-gb200-native-detr-pico-1x4-cycle1-sr1-te2"
+
+
+def _otel_span_record(run_id: str, name: str, start_ns: int = 1000) -> dict:
+    return {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "nemo.run.id", "value": {"stringValue": run_id}},
+                        {"key": "host.name", "value": {"stringValue": "node-1"}},
+                        {"key": "dl.rank", "value": {"intValue": "0"}},
+                    ],
+                },
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": run_id,
+                                "spanId": name,
+                                "name": name,
+                                "startTimeUnixNano": str(start_ns),
+                                "endTimeUnixNano": str(start_ns + 1000),
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def test_job_telemetry_merges_every_run_and_phase_into_one_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "devbox")
+    args = _args(
+        tmp_path,
+        config="pico",
+        nodes=1,
+        gpus_per_node=4,
+        flavors=["detr"],
+        flavor=["detr"],
+        run=["ref:nvrx", "cmp:native"],
+    )
+    batch_log = tmp_path / "job" / "logs" / "job.log"
+    batch_log.parent.mkdir(parents=True)
+    for spec in slurm_job._run_specs(args):
+        for phase in ("cycle1", "phase1"):
+            path = slurm_job._argument_log(args, batch_log, spec).parent / "otel" / phase / "native_ckpt_otel.jsonl"
+            path.parent.mkdir(parents=True)
+            records = [_otel_span_record(f"42-job-{spec.name}-{phase}-sr0-te0", f"{spec.name}.{phase}")]
+            text = "".join(f"{json.dumps(record)}\n" for record in records)
+            if (spec.name, phase) == ("ref", "cycle1"):
+                reopened = _otel_span_record(f"42-job-{spec.name}-{phase}-sr0-te0", "ref.cycle1.reopened")
+                text += f'{{"resourceSpans": [\n{json.dumps(reopened)}\n'
+            if (spec.name, phase) == ("cmp", "cycle1"):
+                text = text.removesuffix("\n")
+            path.write_text(text)
+    sidecar = slurm_job._argument_log(args, batch_log, slurm_job._run_specs(args)[0]).parent / "otel/phase1/native_ckpt_otel.jsonl.logs"
+    sidecar.write_text(json.dumps(_otel_span_record("42-job-ref-phase1-sr0-te0", "ref.phase1.logs")) + "\n")
+
+    with caplog.at_level("INFO"):
+        slurm_job.write_job_telemetry(args, batch_log)
+
+    stem = slurm_job._identity(args)[2]
+    merged, trace = slurm_job.job_telemetry_paths(batch_log, stem)
+    names = [
+        json.loads(line)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"]
+        for line in merged.read_text().splitlines()
+    ]
+    assert names == ["ref.phase1", "ref.phase1.logs", "ref.cycle1", "ref.cycle1.reopened", "cmp.phase1", "cmp.cycle1"]
+    events = json.loads(trace.read_text())["traceEvents"]
+    processes = [event["args"]["name"] for event in events if event.get("name") == "process_name"]
+    assert processes == ["ref-phase1 · node-1", "ref-cycle1 · node-1", "cmp-phase1 · node-1", "cmp-cycle1 · node-1"]
+    assert "dropped 1 incomplete OTLP record(s)" in caplog.text
+    assert "ref/logs/otel/cycle1/native_ckpt_otel.jsonl" in caplog.text
+    assert not list(batch_log.parent.glob("*.tmp"))
+
+
+def test_job_telemetry_conversion_errors_are_logged_without_staged_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "devbox")
+    args = _args(tmp_path, config="pico", nodes=1, gpus_per_node=4, flavors=["perf"], flavor=["perf"])
+    batch_log = tmp_path / "job" / "logs" / "job.log"
+    collected = batch_log.parent / "otel" / "cycle1" / "native_ckpt_otel.jsonl"
+    collected.parent.mkdir(parents=True)
+    record = _otel_span_record("42-job-run-cycle1-sr0-te0", "untraced")
+    del record["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["traceId"]
+    collected.write_text(json.dumps(record) + "\n")
+
+    with caplog.at_level("INFO"):
+        slurm_job.write_job_telemetry(args, batch_log)
+
+    merged, trace = slurm_job.job_telemetry_paths(batch_log, slurm_job._identity(args)[2])
+    assert merged.read_text() == collected.read_text()
+    assert not trace.exists()
+    assert not list(batch_log.parent.glob("*.tmp"))
+    assert "could not write the job telemetry" in caplog.text
+    assert "missing traceId or spanId" in caplog.text
+
+
+def _job_telemetry_epilog_args(log: Path, *extra: str) -> list[str]:
+    return ["--nodes", "1", "--gpus-per-node", "4", "--config", "pico", "--flavor", "perf", "--log-file", str(log), *extra]
+
+
+def _collect_job_otlp(run_root: Path) -> None:
+    collected = run_root / "logs" / "otel" / "cycle1" / "native_ckpt_otel.jsonl"
+    collected.parent.mkdir(parents=True)
+    collected.write_text(json.dumps(_otel_span_record("42-job-run-cycle1-sr0-te0", "checkpoint")) + "\n")
+
+
+def test_epilog_writes_the_job_telemetry_beside_its_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "devbox")
+    run_root = tmp_path / "run"
+    _collect_job_otlp(run_root)
+    log = tmp_path / "artifacts" / "ci-results" / "job.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    steps = []
+    monkeypatch.setattr(slurm_job.FlavorPolicy, "epilog", lambda *_args: steps.append("report") or True)
+    monkeypatch.setattr(slurm_job, "_write_performance_baseline", lambda *_args: steps.append("baseline"))
+    monkeypatch.setattr(slurm_job, "_write_and_compare_arguments", lambda *_args: steps.append("arguments") or True)
+    monkeypatch.setattr(slurm_job, "_log_otel_checkpoint_timings", lambda *_args: steps.append("timings"))
+
+    slurm_job._epilog(_job_telemetry_epilog_args(log, "--run-root", str(run_root), "--baseline-json", "{}"))
+
+    assert steps == ["report", "baseline", "arguments", "timings"]
+    assert [path.name for path in log.parent.glob("*_otel.jsonl")] == ["devbox_perf_pico_1x4_otel.jsonl"]
+    assert [path.name for path in log.parent.glob("*_perfetto.json")] == ["devbox_perf_pico_1x4_perfetto.json"]
+
+
+@pytest.mark.parametrize("job_array", [False, True])
+def test_failed_batch_writes_the_job_telemetry_unless_its_epilog_follows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    job_array: bool,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "devbox")
+    if job_array:
+        monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "16")
+    _collect_job_otlp(tmp_path)
+    log = tmp_path / "logs" / "job.log"
+    log.write_text("")
+    monkeypatch.setattr(slurm_job, "_report_failing_rank_logs", lambda *_args: None)
+    monkeypatch.setattr(slurm_job, "_write_and_compare_arguments", lambda *_args, **_kwargs: True)
+
+    slurm_job._rank_logs_entry(_job_telemetry_epilog_args(log))
+
+    assert [path.name for path in log.parent.glob("*_otel.jsonl")] == ([] if job_array else ["devbox_perf_pico_1x4_otel.jsonl"])
+
+
+def test_job_telemetry_is_skipped_without_collected_otlp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    slurm_job = _load_slurm_job()
+    _clear_run_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM", "devbox")
+    args = _args(tmp_path, config="pico", nodes=1, gpus_per_node=4, flavors=["perf"], flavor=["perf"])
+    batch_log = tmp_path / "job" / "logs" / "job.log"
+    batch_log.parent.mkdir(parents=True)
+
+    slurm_job.write_job_telemetry(args, batch_log)
+
+    assert list(batch_log.parent.iterdir()) == []
 
 
 def test_megatron_otel_validation_requires_every_rank(tmp_path: Path) -> None:

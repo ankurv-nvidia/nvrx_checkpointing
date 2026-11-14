@@ -592,6 +592,175 @@ def test_log_checkpoint_timings_infers_the_phase_run_id(tmp_path: Path) -> None:
     otel_report.log_checkpoint_timings(Path(path), None, "phase1")
 
 
+def _finalize_timing_span(
+    name: str,
+    rank: int,
+    start_ms: float,
+    end_ms: float,
+    *,
+    iteration: int | None = None,
+    call_idx: int | list[int] | None = None,
+    span_id: str = "",
+    parent_span_id: str = "",
+) -> dict:
+    attributes = []
+    if iteration is not None:
+        attributes.append({"key": "megatron.iteration", "value": _iv(iteration)})
+    if isinstance(call_idx, list):
+        attributes.append({"key": "nvrx.call_idx", "value": {"arrayValue": {"values": [_iv(index) for index in call_idx]}}})
+    elif call_idx is not None:
+        attributes.append({"key": "nvrx.call_idx", "value": _iv(call_idx)})
+    span = {
+        "name": name,
+        "traceId": f"trace-{rank}" if span_id else "",
+        "spanId": span_id,
+        "parentSpanId": parent_span_id,
+        "attributes": attributes,
+        "startTimeUnixNano": str(round(start_ms * 1e6)),
+        "endTimeUnixNano": str(round(end_ms * 1e6)),
+    }
+    resource = {"attributes": [{"key": "nemo.run.id", "value": {"stringValue": "run-1"}}, {"key": "dl.rank", "value": _iv(rank)}]}
+    return {"resourceSpans": [{"resource": resource, "scopeSpans": [{"spans": [span]}]}]}
+
+
+def test_checkpoint_timings_report_the_finalizer_paired_by_call_index(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spans = []
+    for rank, finalize_ms in ((0, 75.0), (1, 80.0)):
+        spans += [
+            _finalize_timing_span("megatron.checkpoint.exposed_save", rank, 10, 20, iteration=250),
+            _finalize_timing_span("megatron.checkpoint.save", rank, 10, 18, iteration=250, call_idx=0),
+            _finalize_timing_span("megatron.checkpoint.save.finalize", rank, 50, 50.01),
+            _finalize_timing_span("megatron.checkpoint.save.finalize", rank, 100, 100 + finalize_ms, call_idx=[0]),
+            _finalize_timing_span("megatron.checkpoint.exposed_save", rank, 300, 310, iteration=500),
+            _finalize_timing_span("megatron.checkpoint.save", rank, 300, 308, iteration=500, call_idx=1),
+            _finalize_timing_span("megatron.checkpoint.exit_finalize", rank, 320, 3320, call_idx=[1]),
+        ]
+    path = _write_jsonl(tmp_path / "t.jsonl", spans)
+
+    with caplog.at_level("INFO"):
+        otel_report.log_checkpoint_timings(Path(path), "run-1", "cycle1")
+
+    rows = [message.strip() for message in caplog.messages if "-checkpoint iteration" in message]
+    assert [row.split(" .")[0] for row in rows] == [
+        "save-checkpoint iteration 250",
+        "finalize-checkpoint iteration 250",
+        "save-checkpoint iteration 500",
+        "finalize-checkpoint iteration 500",
+    ]
+    assert rows[1].endswith(": (75.00, 80.00, 77.50)")
+    assert rows[3].endswith(": (3000.00, 3000.00, 3000.00)")
+
+
+def test_checkpoint_timings_pair_mismatched_finalizer_indices_in_save_order(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spans = []
+    for rank in (0, 1):
+        for call_idx, (iteration, start) in enumerate(((250, 0), (500, 1000), (750, 2000))):
+            spans += [
+                _finalize_timing_span("megatron.checkpoint.exposed_save", rank, start, start + 10, iteration=iteration),
+                _finalize_timing_span("megatron.checkpoint.save", rank, start, start + 8, iteration=iteration, call_idx=call_idx),
+            ]
+        spans += [
+            _finalize_timing_span("megatron.checkpoint.save.finalize", rank, 500, 576 + rank, call_idx=[0]),
+            _finalize_timing_span("megatron.checkpoint.save.finalize", rank, 1500, 1574 + rank, call_idx=[0]),
+            _finalize_timing_span("megatron.checkpoint.exit_finalize", rank, 2020, 5520 + rank, call_idx=[0]),
+        ]
+    path = _write_jsonl(tmp_path / "t.jsonl", spans)
+
+    with caplog.at_level("INFO"):
+        otel_report.log_checkpoint_timings(Path(path), "run-1", "cycle1")
+
+    finalize = [message.strip() for message in caplog.messages if "finalize-checkpoint" in message]
+    assert [row.split(" .")[0] for row in finalize] == [f"finalize-checkpoint iteration {n}" for n in (250, 500, 750)]
+    assert [row.rsplit(": ", 1)[1] for row in finalize] == [
+        "(76.00, 77.00, 76.50)",
+        "(74.00, 75.00, 74.50)",
+        "(3500.00, 3501.00, 3500.50)",
+    ]
+    assert caplog.text.count("finalizer call indices mismatch") == 1
+
+
+def test_checkpoint_timings_report_the_finalizer_running_a_native_finalize(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spans = []
+    finalizers = (("megatron.checkpoint.save.finalize", 250, 100), ("nvrx.checkpoint.wait_previous", 500, 400))
+    finalizers += (("megatron.checkpoint.exit_finalize", 750, 700),)
+    for rank, durations in ((0, (3.0, 50.0, 4000.0)), (1, (0.1, 60.0, 4100.0))):
+        spans.append(_finalize_timing_span("megatron.checkpoint.save.finalize", rank, 50, 50.01, span_id="idle"))
+        for (name, iteration, start), duration in zip(finalizers, durations, strict=True):
+            spans += [
+                _finalize_timing_span("megatron.checkpoint.exposed_save", rank, start - 90, start - 80, iteration=iteration),
+                _finalize_timing_span("megatron.checkpoint.save", rank, start - 90, start - 82, iteration=iteration),
+                _finalize_timing_span(name, rank, start, start + duration, span_id=f"finalizer-{iteration}"),
+                _finalize_timing_span(
+                    otel_report.FINALIZE_SPAN,
+                    rank,
+                    start + 0.01,
+                    start + 0.02,
+                    iteration=iteration,
+                    span_id=f"native-{iteration}",
+                    parent_span_id=f"finalizer-{iteration}",
+                ),
+            ]
+    spans.append(
+        _finalize_timing_span(otel_report.FINALIZE_SPAN, 2, 100, 101, iteration=250, span_id="orphan", parent_span_id="missing"),
+    )
+    path = Path(_write_jsonl(tmp_path / "t.jsonl", spans))
+
+    with caplog.at_level("INFO"):
+        otel_report.log_checkpoint_timings(path, "run-1", "cycle1")
+
+    finalize = [message.strip() for message in caplog.messages if "finalize-checkpoint" in message]
+    assert [row.split(" .")[0] for row in finalize] == [f"finalize-checkpoint iteration {n}" for n in (250, 500, 750)]
+    assert [row.rsplit(": ", 1)[1] for row in finalize] == [
+        "(0.10, 3.00, 1.55)",
+        "(50.00, 60.00, 55.00)",
+        "(4000.00, 4100.00, 4050.00)",
+    ]
+    data = otel_report.OtelData([path])
+    assert otel_report.checkpoint_durability_ms(otel_report.collect_checkpoint_spans(data, "run-1")) == (
+        [8.0] * 6,
+        [0, 0, 0, 1, 1, 1],
+    )
+
+
+def test_checkpoint_timings_omit_synchronous_and_invalid_finalizers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    spans = [
+        _finalize_timing_span("megatron.checkpoint.exposed_save", 0, 10, 20, iteration=250),
+        _finalize_timing_span("megatron.checkpoint.save", 0, 10, 18, iteration=250),
+        _finalize_timing_span("megatron.checkpoint.save.finalize", 0, 30, 31),
+        _finalize_timing_span("megatron.checkpoint.exposed_save", 0, 300, 310, iteration=500),
+        _finalize_timing_span("megatron.checkpoint.save", 0, 300, 308, iteration=500),
+        _finalize_timing_span("megatron.checkpoint.save.finalize", 0, 400, 400, span_id="instant"),
+        _finalize_timing_span(
+            otel_report.FINALIZE_SPAN,
+            0,
+            400,
+            400.01,
+            iteration=500,
+            span_id="native",
+            parent_span_id="instant",
+        ),
+    ]
+    path = _write_jsonl(tmp_path / "t.jsonl", spans)
+
+    with caplog.at_level("INFO"):
+        otel_report.log_checkpoint_timings(Path(path), "run-1", "cycle1")
+
+    assert "save-checkpoint iteration 500" in caplog.text
+    assert "finalize-checkpoint" not in caplog.text
+
+
 def test_log_checkpoint_timings_requires_the_exposed_save(tmp_path: Path) -> None:
     path = _write_jsonl(
         tmp_path / "t.jsonl",

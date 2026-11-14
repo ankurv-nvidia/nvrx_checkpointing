@@ -495,6 +495,61 @@ def test_async_finalize_wait_starts_after_client_send(
     assert events == ["save_async", "client_send_complete", "submit_finalize_wait", "wait_for_finalize"]
 
 
+def test_async_finalize_publishes_inside_its_iteration_span(
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        @staticmethod
+        def finalize_registry() -> None:
+            return
+
+        @staticmethod
+        def save_async(_iteration: int, _checkpoint_dir: Path) -> None:
+            return
+
+        @staticmethod
+        def wait_for_async_completion() -> None:
+            return
+
+    class ImmediateExecutor:
+        @staticmethod
+        def submit(fn: Callable[..., None], *args: object) -> Future[None]:
+            future: Future[None] = Future()
+            future.set_result(fn(*args))
+            return future
+
+    @contextmanager
+    def managed_span(_scope: str, name: str, **attributes: object) -> Generator[None]:
+        events.append(f"enter {name} {attributes['megatron.iteration']} {attributes['nvrx.snapshot_id']}")
+        yield
+        events.append(f"exit {name}")
+
+    args = SimpleNamespace(use_distributed_optimizer=False, async_save=True, save=tmp_path)
+    save_args = save.SaveCheckpointArgs(40, object(), None, None, 0)
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "get_rng_state", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(save, "get_checkpoint_name", lambda *_args, **_kwargs: tmp_path / "iter_0000040")
+    monkeypatch.setattr(save, "register_state_dict", lambda _state, _iteration: Root())
+    monkeypatch.setattr(save, "_get_executor", ImmediateExecutor)
+    monkeypatch.setattr(save, "_write_checkpoint_tracker", lambda _args, iteration: events.append(f"publish {iteration}"))
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", lambda _session, _iteration: None)
+    save._save_checkpoint_impl(save_args, 123)
+    monkeypatch.setattr(save, "managed_span", managed_span)
+
+    save.maybe_finalize_async_save(blocking=True)
+
+    assert events == ["enter nvrx.checkpoint.finalize 40 40", "publish 40", "exit nvrx.checkpoint.finalize"]
+
+
 @pytest.mark.parametrize("async_save", [False, True])
 @pytest.mark.parametrize("failure", ["checkpoint shard write failed: Input/output error", "checkpoint finalize timed out"])
 def test_finalize_failure_preserves_tracker_and_prevents_success(

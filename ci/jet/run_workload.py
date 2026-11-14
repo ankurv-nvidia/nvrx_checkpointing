@@ -298,6 +298,23 @@ def _record_failure(log: Path, result_dir: Path, stem: str) -> None:
         traceback.print_exc()
 
 
+def _write_failed_run_telemetry(args: argparse.Namespace, log: Path) -> None:
+    """Merge and convert the telemetry that a failed run collected."""
+    try:
+        slurm_job.write_job_telemetry(args, log, slurm_job.RUN_ROOT)
+    except Exception:
+        # The run's archive is written even when its telemetry cannot be merged.
+        traceback.print_exc()
+
+
+def _drop_phase_telemetry(result_dir: Path, merged: Path) -> None:
+    """Remove the per-phase OTLP copies once the job telemetry file holds their records."""
+    if not merged.is_file():
+        return
+    for path in result_dir.glob("otel/*/native_ckpt_otel.jsonl*"):
+        path.unlink(missing_ok=True)
+
+
 def _core_artifacts(run_root: Path) -> list[Path]:
     logs = [run_root / "logs", *run_root.glob("*/logs")]
     suffixes = ("*.core", "*.core.partial", "*.core.log", "*.exe", "*.exe.partial")
@@ -482,6 +499,8 @@ def finalize(workload_argv: list[str], assets_dir: Path) -> int:
             final_rc = _run_epilog(args, log)
         if final_rc:
             _record_failure(log, artifact_root / "ci" / "ci-results", stem)
+        if worker_rc:
+            _write_failed_run_telemetry(args, log)
         _write_arguments_candidate(log, stem)
         _write_baseline_candidate(args, log, stem)
         inventories = [
@@ -491,6 +510,7 @@ def finalize(workload_argv: list[str], assets_dir: Path) -> int:
         ]
         _write_provenance(artifact_root, stem, inventories, state)
         _collect_run_artifacts(artifact_root, run_root)
+        _drop_phase_telemetry(artifact_root / "ci" / "ci-results", slurm_job.job_telemetry_paths(log, stem)[0])
         _archive(assets_dir, artifact_root, stem)
     except BaseException:
         traceback.print_exc()

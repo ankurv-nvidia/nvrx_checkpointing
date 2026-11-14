@@ -1629,12 +1629,15 @@ def _write_arguments_artifact(args: argparse.Namespace, log: Path, variants: tup
     arguments.write_text("\n".join(line.rstrip() for line in lines if not volatile.match(line)) + "\n")
     return arguments
 
+def _run_logs(run_root: Path, spec: RunSpec) -> Path:
+    """Return the directory holding a particular run's logs and collected telemetry."""
+    return (run_root / _run_dir_name(spec) if spec.name else run_root) / "logs"
+
 def _argument_log(args: argparse.Namespace, batch_log: Path, spec: RunSpec) -> Path:
     """Return the rank-0 log containing a particular run's argument blocks."""
     cfg = f"{spec.args.config}_{spec.args.nodes}x{spec.args.gpus_per_node}"
     run_root = getattr(args, "run_root", None) or batch_log.parent.parent
-    run = run_root / _run_dir_name(spec) if spec.name else run_root
-    return run / "logs" / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
+    return _run_logs(run_root, spec) / f"{cfg}_{spec.name or 'run'}-routine_rank0.log"
 
 def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, strict: bool = True) -> bool:
     """Generate, compare and retain arguments for the runs under test."""
@@ -1666,24 +1669,90 @@ def _write_and_compare_arguments(args: argparse.Namespace, batch_log: Path, *, s
     return len(results) == len(specs) and all(results)
 
 
+def _collected_otel(results_dir: Path) -> list[Path]:
+    """Return one run's collected OTLP files in the order its phases ran."""
+    return sorted(
+        results_dir.glob("otel/*/native_ckpt_otel.jsonl"),
+        key=lambda path: (
+            path.parent.name != "phase1",
+            int(path.parent.name.removeprefix("cycle"))
+            if path.parent.name.startswith("cycle") and path.parent.name.removeprefix("cycle").isdigit()
+            else 0,
+        ),
+    )
+
+
 def _log_otel_checkpoint_timings(args: argparse.Namespace, batch_log: Path) -> None:
     specs = _run_specs(args)
     for spec in specs:
         results_dir = _argument_log(args, batch_log, spec).parent
-        otel_files = sorted(
-            results_dir.glob("otel/*/native_ckpt_otel.jsonl"),
-            key=lambda path: (
-                path.parent.name != "phase1",
-                int(path.parent.name.removeprefix("cycle"))
-                if path.parent.name.startswith("cycle") and path.parent.name.removeprefix("cycle").isdigit()
-                else 0,
-            ),
-        )
+        otel_files = _collected_otel(results_dir)
         if not otel_files:
             raise RuntimeError(f"no checkpoint OTLP files found in {results_dir / 'otel'}")
         for path in otel_files:
             label = f"{spec.name} {path.parent.name}" if len(specs) > 1 else path.parent.name
             otel_report.log_checkpoint_timings(path, None, label)
+
+
+def job_telemetry_paths(batch_log: Path, stem: str) -> tuple[Path, Path]:
+    """Return the merged OTLP file and the Perfetto trace written beside a job's log."""
+    return batch_log.with_name(f"{stem}_otel.jsonl"), batch_log.with_name(f"{stem}_perfetto.json")
+
+
+def _merge_otlp(sources: list[Path], output: Path) -> list[tuple[Path, dict]]:
+    """Write every complete OTLP record of the sources to one JSONL file and return the records."""
+    records = []
+    with output.open("wb") as merged:
+        for source in sources:
+            dropped = 0
+            with source.open("rb") as stream:
+                for line in stream:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        if line.strip():
+                            dropped += 1
+                        continue
+                    merged.write(line if line.endswith(b"\n") else line + b"\n")
+                    records.append((source, record))
+            if dropped:
+                logger.warning(f"[slurm_job:otel] WARNING dropped {dropped} incomplete OTLP record(s) from {source}")
+    return records
+
+
+def write_job_telemetry(args: argparse.Namespace, batch_log: Path, run_root: Path | None = None) -> None:
+    """Merge every run's collected OTLP beside the batch log and convert the merged records for Perfetto."""
+    run_root = run_root or getattr(args, "run_root", None) or batch_log.parent.parent
+    sources = [
+        source
+        for spec in _run_specs(args)
+        for collected in _collected_otel(_run_logs(run_root, spec))
+        for source in (collected, Path(f"{collected}.logs"))
+        if source.is_file()
+    ]
+    stem = _identity(args)[2]
+    merged, trace = job_telemetry_paths(batch_log, stem)
+    staged_merged, staged_trace = merged.with_name(f"{merged.name}.tmp"), trace.with_name(f"{trace.name}.tmp")
+    try:
+        merged.unlink(missing_ok=True)
+        trace.unlink(missing_ok=True)
+        records = _merge_otlp(sources, staged_merged)
+        if not records:
+            logger.info(f"[slurm_job:otel] no collected OTLP records for {stem}")
+            return
+        staged_merged.replace(merged)
+        stats = otel_to_perfetto.convert_records(records, staged_trace)
+        staged_trace.replace(trace)
+    except (OSError, ValueError):
+        logger.exception(f"[slurm_job:otel] ERROR could not write the job telemetry for {stem}")
+        return
+    finally:
+        staged_merged.unlink(missing_ok=True)
+        staged_trace.unlink(missing_ok=True)
+    logger.info(
+        f"[slurm_job:otel] {merged.name}: {len(records)} OTLP record(s) from {len(sources)} file(s); {trace.name}: "
+        f"{stats['spans']} span(s), {stats['metrics']} metric point(s), {stats['logs']} log(s) on {stats['tracks']} track(s)",
+    )
 
 
 def _baseline_candidate_metrics(measured: dict) -> dict:
@@ -2803,6 +2872,14 @@ def _print_pretrain_env(env: dict[str, str], cycle_tag: str) -> None:
         if name in env:
             print(f"[slurm_job:env] {name}={shlex.quote(env[name])}", flush=True)  # noqa: T201
 
+def _otel_run_id(env: dict[str, str], label: str, cycle_tag: str) -> str:
+    """Identify one phase of one named run within its job and restart."""
+    job_id = env.get("SLURM_ARRAY_JOB_ID") or env.get("SLURM_JOB_ID", "local")
+    slurm_restart = "0" if _in_job_array() else env.get("SLURM_RESTART_COUNT", "0")
+    elastic_restart = env.get("TORCHELASTIC_RESTART_COUNT", "0")
+    parts = (job_id, RUN_NAME, label, cycle_tag, f"sr{slurm_restart}", f"te{elastic_restart}")
+    return "-".join(part for part in parts if part)
+
 def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str = "") -> None:
     flavors = _selected_flavors(args)
     stem = f"{platform_tag()}_{flavors.settled_tag}_{cfg}"
@@ -2854,9 +2931,7 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         otel_reporting = flavors.policy.otel_reporting and (
             bool(env.get("NATIVE_CKPT_OTEL_FILE")) or megatron_otel_enabled
         )
-        perfetto_file = otel_cycle_dir / "native_ckpt_perfetto.json"
         if collect_otel and rank == "0":
-            perfetto_file.unlink(missing_ok=True)
             otel_report.analysis_path(otel_file).unlink(missing_ok=True)
         relay_otel = provider != "native" and collect_otel
         collector_node = (
@@ -2871,10 +2946,7 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         else:
             os.environ.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
             env.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
-        job_id = env.get("SLURM_ARRAY_JOB_ID") or env.get("SLURM_JOB_ID", "local")
-        slurm_restart = "0" if _in_job_array() else env.get("SLURM_RESTART_COUNT", "0")
-        elastic_restart = env.get("TORCHELASTIC_RESTART_COUNT", "0")
-        run_id = f"{job_id}-{RUN_NAME}-{cycle_tag}-sr{slurm_restart}-te{elastic_restart}"
+        run_id = _otel_run_id(env, label, cycle_tag)
         env["MEGATRON_OTEL_RUN_ID"] = run_id
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
         server_enabled = collect_otel
@@ -2933,7 +3005,6 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                     raise RuntimeError(f"no collected OTLP file: {otel_file}")
                 otel_data = otel_report.OtelData([otel_file])
                 if otel_reporting:
-                    otel_to_perfetto.convert_records(otel_data.records, perfetto_file)
                     analysis = otel_report.validate_collected(
                         otel_data,
                         run_id,
@@ -4217,7 +4288,7 @@ def _parse_args(parser: argparse.ArgumentParser, argv: list[str] | None = None) 
     return args, extra
 
 def _rank_logs_entry(argv: list[str]) -> None:
-    """Preserve available arguments and show logs of ranks named by srun."""
+    """Preserve available arguments and telemetry, and show logs of ranks named by srun."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = _parser()
     parser.add_argument("--log-file", type=Path, required=True)
@@ -4229,6 +4300,9 @@ def _rank_logs_entry(argv: list[str]) -> None:
     # every argument block that was completed before the failure so failed jobs
     # provide the same diagnostic artifacts as successful jobs.
     _write_and_compare_arguments(args, args.log_file, strict=False)
+    # A job array runs its epilog after this entry, and the epilog merges the telemetry.
+    if not _in_job_array():
+        write_job_telemetry(args, args.log_file)
 
 
 def _failure_summary_entry(argv: list[str]) -> None:
@@ -4288,6 +4362,7 @@ def _epilog(argv: list[str]) -> None:
     args.baseline = json.loads(args.baseline_json)
     otel_reporting = _otel_reporting_enabled(args.flavors)
     log_file = args.log_file
+    write_job_telemetry(args, log_file)
     if _in_job_array():
         # The launcher's rank 0 lands on whichever array task joins the rendezvous
         # first, so the training stream the report reads lives in that task's log,
