@@ -812,6 +812,79 @@ try
         assignedBytes[index] += item.size;
     }
 
+    if (globalRegistry->nativeState && !globalRegistry->nativeWriteItems.empty())
+    {
+        using Index = std::tuple<std::string, bool, Tensor::Dim>;
+        struct LogicalItem
+        {
+            Index          index;
+            uint64_t       cost{};
+            std::set<Rank> holders;
+        };
+        if (globalRegistry->nativeWriteItems.size() != worldSize)
+        {
+            throw std::runtime_error("Logical checkpoint plans omit registered ranks");
+        }
+        std::map<Index, size_t>  indexes;
+        std::vector<LogicalItem> items;
+        for (auto const& [rank, descriptions] : globalRegistry->nativeWriteItems)
+        {
+            if (rank >= globalRegistry->GlobalWorldSize()) { throw std::runtime_error("Invalid logical checkpoint source rank"); }
+            for (auto const& description : descriptions)
+            {
+                auto const index             = Index{description.fqn, description.isTensor, description.offsets};
+                auto const [found, inserted] = indexes.try_emplace(index, items.size());
+                if (inserted) { items.push_back({.index = index, .cost = description.sizeBytes, .holders = {rank}}); }
+                else
+                {
+                    items[found->second].cost = description.sizeBytes;
+                    items[found->second].holders.insert(rank);
+                }
+            }
+        }
+        std::map<Index, Rank> sources;
+        std::vector<uint64_t> logicalBytes(worldSize, 0);
+        for (auto const& item : items)
+        {
+            auto selected = *item.holders.begin();
+            for (auto const rank : item.holders)
+            {
+                if (logicalBytes[static_cast<uint32_t>(rank)] < logicalBytes[static_cast<uint32_t>(selected)]) { selected = rank; }
+            }
+            auto& size = logicalBytes[static_cast<uint32_t>(selected)];
+            if (item.cost == 0 || item.cost > std::numeric_limits<uint64_t>::max() - size)
+            {
+                throw std::runtime_error("Invalid logical checkpoint storage cost");
+            }
+            size += item.cost;
+            sources.emplace(item.index, selected);
+        }
+        for (auto& assignment : assignments)
+        {
+            if (globalRegistry->GetNode(assignment.node).GetType() != StateNode::Type::DTensor) { continue; }
+            Tensor::Dim offsets;
+            for (auto const& range : assignment.ranges) { offsets.push_back(range.begin); }
+            auto source = sources.find(Index{assignment.fqn, true, offsets});
+            auto parent = assignment.fqn;
+            while (source == sources.end())
+            {
+                auto const dot = parent.rfind('.');
+                if (dot == std::string::npos) { break; }
+                parent.resize(dot);
+                source = sources.find(Index{parent, false, {}});
+            }
+            if (source == sources.end())
+            {
+                throw std::runtime_error(fmt::format("Logical checkpoint descriptions omit tensor '{}'", assignment.fqn));
+            }
+            if (std::ranges::find(assignment.candidates, source->second) == assignment.candidates.end())
+            {
+                throw std::runtime_error(fmt::format("Logical tensor source is absent for '{}'", assignment.fqn));
+            }
+            assignment.owner = source->second;
+        }
+    }
+
     std::unordered_map<Rank, std::shared_ptr<StateTree>> registries;
     for (uint32_t index = 0; index < rankCount; ++index)
     {
@@ -908,6 +981,15 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
             else if (global.nativeState != incoming.nativeState)
             {
                 throw std::runtime_error("State registries use different value encodings");
+            }
+            if (incoming.nativeWriteItems.size() > 1
+                || (!incoming.nativeWriteItems.empty() && !incoming.nativeWriteItems.contains(recvRank)))
+            {
+                throw std::runtime_error("Local logical checkpoint plans contain another rank");
+            }
+            if (auto const plan = incoming.nativeWriteItems.find(recvRank); plan != incoming.nativeWriteItems.end())
+            {
+                global.nativeWriteItems.emplace(recvRank, plan->second);
             }
             incoming.WalkNodes([&](StateNode const& supplied) {
                 auto const type = supplied.GetType();

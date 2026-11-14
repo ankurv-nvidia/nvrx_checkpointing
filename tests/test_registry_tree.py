@@ -113,6 +113,8 @@ def _metadata_prefix(version: int) -> bytes:
         prefix += struct.pack("<II", 0, 0)
     elif version >= 5:
         prefix += b"\x01"
+        if version >= 6:
+            prefix += struct.pack("<I", 0)
     return prefix
 
 
@@ -424,7 +426,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -449,6 +451,25 @@ def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path,
     assert {rank: value[0] for rank, value in leaves["output_path"].ranks.items()} == {0: 0, 1: 0}
     assert {rank: value[0] for rank, value in leaves["iteration"].ranks.items()} == {0: 8, 1: 8}
     assert leaves["iteration"].blob["v"] == "metadata only"
+
+
+def test_native_registry_skips_ordered_logical_planning_metadata(tmp_path: Path) -> None:
+    tree = _Tree(0)
+    tree.add("iteration", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
+    path = tmp_path / "registry.global.bin"
+    tree.write(path, version=6)
+    table = struct.pack("<III", 1, 0, 2)
+    for tensor, cost, offsets, key in ((True, 44, (7,), "weight"), (False, 1, (), "opaque")):
+        table += struct.pack("<?Q", tensor, cost) + _dim(offsets)
+        table += struct.pack("<I", len(key)) + key.encode()
+    prefix = struct.pack("<II", 0x32525453, 6) + b"\x01" + table
+    path.write_bytes(path.read_bytes().replace(_metadata_prefix(6), prefix, 1))
+
+    parsed = registry_tree.read_registry(path)
+
+    assert parsed.trailing == 0
+    report = registry_tree.analyze([path])
+    assert [(leaf.fqn, leaf.kind, leaf.unique) for leaf in report.leaves] == [("iteration", "scalar", 8)]
 
 
 @pytest.mark.parametrize(
@@ -477,8 +498,8 @@ def test_metadata_counts_local_membership_without_replica_hints(
 
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=6)
-    with pytest.raises(ValueError, match="unsupported registry version 6"):
+    _Tree(0).write(path, version=7)
+    with pytest.raises(ValueError, match="unsupported registry version 7"):
         registry_tree.read_registry(path)
 
 

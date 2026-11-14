@@ -63,6 +63,7 @@ class PyStateDictAccessor
     virtual void       AcquireTensorObjectRefForSnapshot(StateNode::Handle node, nanobind::object const& obj)  = 0;
     virtual void       RetainQuantHeader(std::unique_ptr<checkpoint::quant::Header> header)                    = 0;
     virtual uint64_t   RetainBlobData(std::vector<char> data)                                                  = 0;
+    virtual void       SetNativeWriteItems(std::vector<CheckpointWriteItem> items)                             = 0;
 
     StateNode* RegisterState(StateNode::Handle parent, std::string_view name, std::vector<char> data)
     {

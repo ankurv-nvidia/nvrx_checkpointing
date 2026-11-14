@@ -28,6 +28,7 @@ pytestmark = [
     pytest.mark.skipif(os.environ.get("MEGATRON_NATIVE_RUN_SERVER_TESTS") != "1", reason="requires checkpoint-server IPC support"),
 ]
 _WEIGHT = "decoder.layers.0.weight"
+_TENSOR_SIZES = {_WEIGHT: 4, "decoder.layers.1.weight": 17, "decoder.final_layernorm.weight": 7}
 
 
 def _save(rank: int, world_size: int, session: int, directory: str) -> None:
@@ -38,10 +39,17 @@ def _save(rank: int, world_size: int, session: int, directory: str) -> None:
         root = checkpoint.model_state.create_root(session, rank, world_size, ["localhost"], world_size)
         for iteration, length in enumerate((1, 8192), start=1):
             state = {
-                "model": {_WEIGHT: DTensor.from_local(torch.full((4,), float(iteration)), mesh, [Replicate()], run_check=False)},
+                "model": {
+                    name: DTensor.from_local(torch.full((size,), float(100 * rank + iteration)), mesh, [Replicate()], run_check=False)
+                    for name, size in _TENSOR_SIZES.items()
+                },
                 "iteration": iteration,
                 "objects": Namespace(message="x" * length, values=[None, (), {}, [1, 2]], rng=np.random.RandomState(17).get_state()),
-                "optimizer": {"metadata": {f"expert_{rank}": {"lr": 0.001, "step": iteration}}, "shared": True},
+                "optimizer": {
+                    "metadata": {f"expert_{rank}": {"lr": 0.001, "step": iteration}},
+                    "shared": True,
+                    "momentum": torch.full((11,), float(100 * rank + iteration)),
+                },
                 "enabled": True,
                 "empty": torch.empty(0),
             }
@@ -110,16 +118,22 @@ def test_native_nested_state_matches_dcp_and_preserves_peer_entries(
 
             def destination() -> dict:
                 return {
-                    "model": {_WEIGHT: torch.zeros(4)},
+                    "model": {name: torch.zeros(size) for name, size in _TENSOR_SIZES.items()},
                     "iteration": 0,
                     "objects": Namespace(message="", values=[], rng=np.random.RandomState(2).get_state()),
-                    "optimizer": {"metadata": {f"expert_{rank}": {"lr": 1.0, "step": 0} for rank in range(world_size)}, "shared": False},
+                    "optimizer": {
+                        "metadata": {f"expert_{rank}": {"lr": 1.0, "step": 0} for rank in range(world_size)},
+                        "shared": False,
+                        "momentum": torch.zeros(11),
+                    },
                     "enabled": False,
                     "empty": torch.empty(0),
                 }
 
             reference, target = destination(), destination()
             dcp.load(reference, checkpoint_id=tmp_path / f"reference-{iteration}")
+            selected_ranks = {int(value[0].item()) // 100 for value in reference["model"].values()}
+            assert len(selected_ranks) > 1
             optimizer = target["optimizer"]
             weight = target["model"][_WEIGHT]
             directory = tmp_path / f"native-{iteration}"

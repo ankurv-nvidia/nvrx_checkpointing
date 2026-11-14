@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -25,6 +26,16 @@
 
 // #define NATIVE_CKPT_TRACE_NODE "chained_0.optimizer.distributed.dp_group_idx_0"
 // #define NATIVE_CKPT_WARN_FQN
+
+struct CheckpointWriteItem
+{
+    std::string fqn;
+    Tensor::Dim offsets{};
+    uint64_t    sizeBytes{};
+    bool        isTensor{false};
+
+    bool operator==(CheckpointWriteItem const&) const = default;
+};
 
 struct StateNode
 {
@@ -473,9 +484,10 @@ struct StateTree
         clone._nodes.reserve(_nodes.size());
         clone._nodes.clear();
         for (auto const& node : _nodes) { clone._nodes.emplace_back(node.handle, node.parent, node.name, StateNode::Variant{node.data}); }
-        clone.startedAt   = startedAt;
-        clone.nativeState = nativeState;
-        clone._finalized  = false;
+        clone.startedAt        = startedAt;
+        clone.nativeState      = nativeState;
+        clone.nativeWriteItems = nativeWriteItems;
+        clone._finalized       = false;
     }
 
     [[nodiscard]] auto Clone() const
@@ -648,7 +660,8 @@ struct StateTree
     friend struct StateSerDes;
 
     public:
-    bool nativeState{false};
+    bool                                             nativeState{false};
+    std::map<Rank, std::vector<CheckpointWriteItem>> nativeWriteItems;
 
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/

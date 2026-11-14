@@ -19,29 +19,48 @@ implementation descriptions below.
   peer-owned expert optimizer metadata survive. The load adapter combines the
   dictionaries and restores destination container, enum, array, and generator
   types while preserving mutable destination objects and tensor references.
-- The daemon uses main's writer selection. Peer registry messages contain
-  metadata, scrub scalar values, and never forward snapshot payloads. The
-  ordinary `torch_dist` path retains its existing format and behavior.
+- The daemon retains main's snapshot registry and scalar/blob writer selection.
+  Native tensor owners follow DCP's ordered logical planning metadata because
+  replicated model and optimizer tensors can contain different values. Peer
+  registry messages contain metadata, scrub scalar values, and never forward
+  snapshot payloads. The ordinary `torch_dist` path retains its existing format
+  and behavior.
 - Megatron's expert RNG tracker contains different generator states under one
   logical key on different ranks. The native schema records ordered logical
   item descriptions so load can reproduce PyTorch DCP's selection among the
-  retained dictionary values. This compatibility rule does not select daemon
-  writers or require training-side collectives.
-- Replicated scalar values are assumed consistent. Differing tensor replicas
-  discarded by the daemon's writer selection cannot be recovered during load.
-  Exact model checkpoint comparisons remain the acceptance test.
+  retained dictionary values. The same logical descriptions select tensor
+  writers before capture without provider-owned training collectives.
+- Replicated scalar values are assumed consistent. A tensor copy discarded
+  during capture cannot be recovered during load, so its owner selection is
+  part of checkpoint compatibility. Exact model checkpoint comparisons remain
+  the acceptance test.
 
-November 14 validation passes 607 Python tests, with 82 environment-dependent
-skips, and 89 native CTest cases, with one absent-fixture skip. All 26 focused
+November 14 validation passes 609 Python tests, with 82 environment-dependent
+skips, and 91 native CTest cases, with one absent-fixture skip. All 26 focused
 daemon cases pass, including scalar tensors, schema parity with the stock DCP
-planner, dynamic dictionaries, and two/four-rank peer-owned entries.
+planner, dynamic dictionaries, and two/four-rank peer-owned entries. The stock
+DCP comparisons include deliberately different tensor replicas and heterogeneous
+tensor sizes; the regression fails with the preceding wheel and passes with
+DCP-compatible tensor selection.
 
 The local two-GPU `fsdp_2gpu` CI run uses eight experts with EP2, TP1, and DP2.
 Both providers resume at iteration 50 and save through 125. All five checkpoints
 match exactly: 3,209 entries at iterations 25 and 50, and 3,208 at 75, 100, and
 125, with zero missing, extra, or changed entries. The ordinary CI epilog,
-argument baseline comparison, and telemetry validation pass. Four-GPU model CI
-is pending. Historical model results below describe the earlier implementation.
+argument baseline comparison, and telemetry validation pass.
+
+Four-GPU run `43544071178` tests commit `b50613f`. Both providers resume at 50
+and save through 125, but tensor comparisons fail with 11, 11, 219, 219, and
+219 changed entries. There are no missing/extra entries and no RNG/common-state
+differences. The initial 11 keys and MD5 pairs exactly reproduce the November 7
+failure. This invalidates reusing main's tensor owner selection for this model.
+DCP-compatible tensor selection passes the local tests and the two-GPU CI flow;
+fresh four-GPU validation is pending. Historical model results below describe
+the earlier implementation.
+
+Source-selection parity is validated on two and four ranks. The native daemon
+uses ascending ranks for equal-cost ties; matching CPython set order for holder
+sets containing rank 8 or above remains deferred.
 
 ## Current implementation, 2026-11-13
 

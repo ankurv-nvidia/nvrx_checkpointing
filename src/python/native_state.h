@@ -101,6 +101,22 @@ class NativeStateRegistration
     void Register(nb::dict const& state)
     {
         CollectMappingWriteItems({}, state, 0);
+        std::vector<CheckpointWriteItem> descriptions;
+        descriptions.reserve(_writeItems.size());
+        for (auto const& item : _writeItems)
+        {
+            CheckpointWriteItem description{.fqn = item.path, .sizeBytes = item.cost, .isTensor = item.tensor};
+            for (auto const offset : item.offsets)
+            {
+                if (description.offsets.size() == Tensor::MaxDims)
+                {
+                    throw std::invalid_argument("Native tensor write description exceeds the supported dimension count");
+                }
+                description.offsets.push_back(offset);
+            }
+            descriptions.push_back(std::move(description));
+        }
+        _scan.SetNativeWriteItems(std::move(descriptions));
         Visit guard(_active, state);
         for (auto const& [key, value] : state) { RegisterValue(Path({}, key), value); }
         Buffer marker;
