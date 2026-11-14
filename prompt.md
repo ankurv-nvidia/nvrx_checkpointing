@@ -54,9 +54,21 @@ and save through 125, but tensor comparisons fail with 11, 11, 219, 219, and
 219 changed entries. There are no missing/extra entries and no RNG/common-state
 differences. The initial 11 keys and MD5 pairs exactly reproduce the November 7
 failure. This invalidates reusing main's tensor owner selection for this model.
-DCP-compatible tensor selection passes the local tests and the two-GPU CI flow;
-fresh four-GPU validation is pending. Historical model results below describe
-the earlier implementation.
+
+Four-GPU run [43549290021](https://github.com/ankurv-nvidia/nvrx_checkpointing/actions/runs/43549290021)
+passes on commit `54a8b2e` with DCP-compatible tensor selection. The eight-expert
+model uses TP2, DP2, EP2, and ETP1. Both providers resume at iteration 50 and save
+through 125. All five checkpoints match: 3,327 entries at 25/50 and 3,326 at
+75/100/125, with zero missing, extra, or changed entries. All 902 argument values
+match the baseline. Script, teardown, and workload exits are zero for ranks
+0 through 3. All 125 printed training-value sets match the reference, excluding
+timing and throughput. The final report and save-span validation pass without a
+soft-failure record.
+
+Bandwidth is 34,429 MB/s against the 115,000 MB/s baseline. That comparison is
+informational for this determinism workload; the run passes its enforced gates.
+No performance baseline or threshold changes accompany this implementation.
+Historical model results below describe the earlier implementation.
 
 Source-selection parity is validated on two and four ranks. The native daemon
 uses ascending ranks for equal-cost ties; matching CPython set order for holder
