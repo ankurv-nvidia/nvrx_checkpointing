@@ -10,6 +10,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/container/small_vector.hpp>
+#include <boost/process/v2/pid.hpp>
 
 #include <fmt/format.h>
 
@@ -343,10 +344,12 @@ struct LogTelState
         boost::container::small_vector<ActiveSpan, 16> entries;
     };
 
+    boost::process::v2::pid_type const            creator = boost::process::v2::current_pid();
     std::mutex                      mutex;
     checkpoint::telemetry::Id       lastId{};
     std::shared_ptr<spdlog::logger> logger;
-    std::shared_ptr<std::FILE>      output;
+    std::shared_ptr<spdlog::details::thread_pool> threadPool;
+    std::shared_ptr<std::FILE>                    output;
 
     std::atomic<bool>                          enabled{false};
     std::shared_ptr<trace_sdk::TracerProvider> traceProvider;
@@ -368,6 +371,7 @@ struct LogTelState
     boost::container::small_vector<PendingOtlpRequest, 8> pendingOtlp;
     size_t                                                pendingOtlpBytes{0};
 
+    std::once_flag cleanupOnce;
     std::once_flag shutdownOnce;
 
     void Collect(std::string_view const& payload)
@@ -418,13 +422,29 @@ struct LogTelState
         return {.status = HttpOk, .body = {}};
     }
 
+    static LogTelState*& Storage()
+    {
+        static auto* Instance = new LogTelState;    // NOLINT(cppcoreguidelines-owning-memory)
+        return Instance;
+    }
+
     static LogTelState& Get()
     {
-        SUPPRESS_WARNINGS_START
-        SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-        static LogTelState Instance;
-        SUPPRESS_WARNINGS_END
-        return Instance;
+        auto*& state = Storage();
+        if (state == nullptr || state->creator != boost::process::v2::current_pid())
+        {
+            state = new LogTelState;    // NOLINT(cppcoreguidelines-owning-memory)
+        }
+        std::call_once(state->cleanupOnce, [] {
+            std::atexit(+[] {
+                auto*& current = Storage();
+                if (current == nullptr || current->creator != boost::process::v2::current_pid()) { return; }
+                checkpoint::logging::Shutdown();
+                checkpoint::telemetry::Shutdown();
+                delete std::exchange(current, nullptr);    // NOLINT(cppcoreguidelines-owning-memory)
+            });
+        });
+        return *state;
     }
 };
 }    // namespace
@@ -515,13 +535,13 @@ class LoggingSink final : public spdlog::sinks::sink
 
 namespace checkpoint::logging
 {
-void Init()
+void Init(bool inproc)
 {
     LogTelState&     state = LogTelState::Get();
     std::scoped_lock lock(state.mutex);
     if (state.logger) { return; }
 
-    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
+    if (inproc)
     {
         auto const path   = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
         auto*      output = std::fopen(path.string().c_str(), "a");
@@ -535,10 +555,10 @@ void Init()
 
     static constexpr size_t QueueSize   = 8192;
     static constexpr size_t WorkerCount = 1;
-    if (!spdlog::thread_pool()) { spdlog::init_thread_pool(QueueSize, WorkerCount); }
+    state.threadPool                    = std::make_shared<spdlog::details::thread_pool>(QueueSize, WorkerCount);
 
     auto logger = std::make_shared<spdlog::async_logger>(
-        "native_ckpt", std::make_shared<LoggingSink>(state.output), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
+        "native_ckpt", std::make_shared<LoggingSink>(state.output), state.threadPool, spdlog::async_overflow_policy::overrun_oldest);
 
     std::string const         levelStr = checkpoint::config::GetConfigValue<checkpoint::config::LogLevel>();
     spdlog::level::level_enum level    = spdlog::level::from_str(levelStr);
@@ -566,13 +586,14 @@ void Flush()
 void Shutdown()
 {
     LogTelState& state = LogTelState::Get();
+    std::shared_ptr<spdlog::details::thread_pool> threadPool;
     {
         std::scoped_lock lock(state.mutex);
         if (!state.logger) { return; }
         state.logger->flush();
         state.logger.reset();
+        threadPool = std::move(state.threadPool);
     }
-    spdlog::shutdown();
 }
 
 void LogImpl(Level level, std::string_view message)
@@ -789,7 +810,12 @@ void Init()
         state.logs.logger = state.logs.provider->GetLogger("nvrx.checkpoint", "nvrx.checkpoint");
     }
 
-    std::call_once(state.shutdownOnce, [] { std::atexit(+[] { Shutdown(); }); });
+    std::call_once(state.shutdownOnce, [] {
+        std::atexit(+[] {
+            auto* current = LogTelState::Storage();
+            if (current != nullptr && current->creator == boost::process::v2::current_pid()) { Shutdown(); }
+        });
+    });
 
     state.enabled.store(true, std::memory_order_release);
     state.sampler.Start();

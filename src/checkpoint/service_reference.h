@@ -21,6 +21,7 @@ class ServiceReference
     ServiceReference() = default;
     ServiceReference(std::shared_ptr<void> lease, uint64_t generation) : _lease(std::move(lease)), _generation(generation) {}
     void                   Reset() { _lease.reset(); }
+    explicit               operator bool() const { return _lease.use_count() != 0; }
     [[nodiscard]] uint64_t Generation() const { return _generation; }
 
     private:
@@ -45,7 +46,7 @@ class ServiceReferences
     {
         return [reference = Acquire(context, session, control), call = std::forward<TCall>(operation)] mutable {
             auto lifetime = std::move(reference);
-            call();
+            if (lifetime) { call(); }
         };
     }
 
@@ -57,9 +58,13 @@ class ServiceReferences
                                      boost::beast::http::request_parser<boost::beast::http::empty_body>& parser);
     void               WaitForEmpty(std::atomic<bool> const& stopRequested);
     [[nodiscard]] bool Accepting() const;
+    void               DrainRequests();
+    void               Seal();
     void               ReleaseRemoteReferences();
 
     [[nodiscard]] static ServiceReference AcquireProcess(ipc::SessionId session, RankTopology const& topology);
+    [[nodiscard]] static ServiceReference
+    AcquireProcess(ipc::SessionId session, uint16_t index, std::string coordinator, std::string address);
 
     private:
     struct State;

@@ -23,11 +23,13 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/process.hpp>
 #include <boost/process/execute.hpp>
+#include <boost/process/v2/pid.hpp>
 #include <hwloc.h>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <future>
@@ -38,6 +40,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace std::chrono_literals;
 namespace cipc = checkpoint::ipc;
@@ -52,31 +55,58 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
-void SvcPing()
+namespace
 {
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::mutex PingMutex;
-    SUPPRESS_WARNINGS_END
+struct ClientLease;
 
-    std::scoped_lock lock(PingMutex);
+struct ClientRegistry
+{
+    boost::process::v2::pid_type const      creatorPid = boost::process::v2::current_pid();
+    std::mutex                              mutex;
+    std::mutex                              startMutex;
+    std::mutex                              pingMutex;
+    std::vector<std::weak_ptr<ClientLease>> leases;
+    std::shared_ptr<ClientLease>            controlLease;
+    std::unordered_set<uint64_t>            exitGenerations;
+
+    static ClientRegistry*& Storage()
+    {
+        static auto* registry = new ClientRegistry;
+        return registry;
+    }
+
+    static ClientRegistry& Get()
+    {
+        auto*& registry = Storage();
+        if (registry->creatorPid != boost::process::v2::current_pid()) { registry = new ClientRegistry; }
+        return *registry;
+    }
+
+    static void Close();
+    static void Add(std::shared_ptr<ClientLease> const& lease);
+};
+}    // namespace
+
+static void EnsureService(uint16_t index = 0)
+{
+    std::scoped_lock lock(ClientRegistry::Get().startMutex);
     auto             selfLoc   = boost::dll::this_line_location();
     auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
-    if (TryConnectToCheckpointService()) { return; }
+    if (TryConnectToCheckpointService(index)) { return; }
     if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
     {
         throw std::runtime_error("Externally managed checkpoint service is unavailable");
     }
-    if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>())
+    if (!checkpoint::config::GetConfigValue<checkpoint::config::ServerDisableInproc>())
     {
-        static constexpr auto StartTimeout = 900s;
-        auto const            deadline     = std::chrono::steady_clock::now() + StartTimeout;
-        while (std::chrono::steady_clock::now() < deadline)
+        try
         {
-            if (TryConnectToCheckpointService()) { return; }
-            std::this_thread::sleep_for(100ms);
+            StartOwnedInprocServer(index);
+        } catch (cipc::ErrorAlreadyRunning const&)
+        {
+            throw boost::system::system_error(boost::asio::error::try_again, "Checkpoint service election is pending");
         }
-        throw std::runtime_error("Timed out waiting for the local-rank-0 checkpoint service");
+        return;
     }
 
     bool retry = false;
@@ -93,7 +123,7 @@ void SvcPing()
     } catch (std::exception const& ex)
     {
         fmt::print(stderr,
-                   "[native_ckpt:cli][ERROR] Exception in SvcPing from {} svcbin={}: {}\n",
+                   "[native_ckpt:cli][ERROR] Exception starting service from {} svcbin={}: {}\n",
                    selfLoc.string(),
                    svcExeLoc.string(),
                    ex.what());
@@ -102,10 +132,7 @@ void SvcPing()
 
     if (retry) { throw boost::system::system_error(boost::asio::error::try_again, "Checkpoint service election is pending"); }
 
-    // Both the elected daemon and losing candidates write READY only after the
-    // elected service answers a ping. The two short attempts inside TryConnect
-    // cover a final scheduling edge without a second readiness policy here.
-    if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
+    if (!TryConnectToCheckpointService(index)) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
 }
 
 static uint32_t ServerIndex(StateTree const& registry)
@@ -244,15 +271,21 @@ struct CheckpointWriter
     // Note: a queue can be shared by multiple ranks
     struct QueueState
     {
-        std::unique_ptr<cipc::MsgQueue> queue;
-        std::shared_future<void>        ready;
-        std::shared_ptr<StateTree>      snapshotRegistry;
-        std::mutex                      snapshotMutex;
-        uint64_t                        generation{};
-        bool                            registered{false};
+        std::unique_ptr<cipc::MsgQueue>    queue;
+        std::shared_future<void>           ready;
+        std::shared_ptr<StateTree>         snapshotRegistry;
+        std::mutex                         snapshotMutex;
+        uint64_t                           generation{};
+        boost::process::v2::pid_type const creatorPid = boost::process::v2::current_pid();
+        bool                               registered{false};
 
         ~QueueState()
         {
+            if (creatorPid != boost::process::v2::current_pid())
+            {
+                static_cast<void>(queue.release());
+                return;
+            }
 #ifdef PHOENIX_HAVE_CUDA
             if (registered) try
                 {
@@ -267,6 +300,7 @@ struct CheckpointWriter
 
     struct QueueRegistry
     {
+        boost::process::v2::pid_type const                    creatorPid = boost::process::v2::current_pid();
         std::mutex                                            mu;
         std::unordered_map<Rank, std::shared_ptr<QueueState>> states;
     };
@@ -275,19 +309,25 @@ struct CheckpointWriter
     {
         SUPPRESS_WARNINGS_START
         SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-        static QueueRegistry Registry;
+        static auto registry = std::make_unique<QueueRegistry>();
         SUPPRESS_WARNINGS_END
-        return Registry;
+        if (registry->creatorPid != boost::process::v2::current_pid())
+        {
+            static_cast<void>(registry.release());
+            registry = std::make_unique<QueueRegistry>();
+        }
+        return *registry;
     }
 
-    static void ObserveGeneration(Rank rank, uint64_t generation)
+    static std::shared_ptr<QueueState> ObserveGeneration(Rank rank, uint64_t generation)
     {
         auto&            reg = Registry();
         std::scoped_lock lock(reg.mu);
         auto&            state = reg.states[rank];
-        if (state && state->generation == generation) { return; }
+        if (state && state->generation == generation && state->creatorPid == boost::process::v2::current_pid()) { return state; }
         state             = std::make_shared<QueueState>();
         state->generation = generation;
+        return state;
     }
 
     static void SendStateRegistry(StateTree const& registry)
@@ -300,6 +340,7 @@ struct CheckpointWriter
         if (entry && entry->ready.valid()) { return; }
         if (!entry) { entry = std::make_shared<QueueState>(); }
         auto               state = entry;
+        std::scoped_lock   snapshotLock(state->snapshotMutex);
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
         lock.unlock();
@@ -313,7 +354,7 @@ struct CheckpointWriter
 #endif
         try
         {
-            SvcPing();
+            EnsureService(static_cast<uint16_t>(ServerIndex(registry)));
             std::ostringstream ostr;
             serdes::WriteBlobWithSize<uint16_t>(ostr, "");
             StateSerDes::WriteTopology(ostr, topo);
@@ -680,29 +721,18 @@ struct CheckpointWriter
 };
 }    // namespace
 
-checkpoint::ServiceReference SvcAcquireReference(StateTree const& root)
+namespace
 {
-    auto const& topo = root.Topo();
-    if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+template <typename TAcquire> checkpoint::ServiceReference AcquireServiceReference(uint16_t index, TAcquire&& acquire)
+{
     static constexpr auto AcquireTimeout = 900s;
     auto const            deadline       = std::chrono::steady_clock::now() + AcquireTimeout;
     while (true)
     {
         try
         {
-            if (checkpoint::config::GetConfigValue<checkpoint::config::ServerInproc>()
-                && !checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>()
-                && static_cast<uint32_t>(topo.rank) % (topo.ranksPerPeer * topo.peersPerNode) == 0)
-            {
-                StartOwnedInprocServer();
-            }
-            else
-            {
-                SvcPing();
-            }
-            auto reference = checkpoint::ServiceReferences::AcquireProcess(root.SessionId(), topo);
-            CheckpointWriter::ObserveGeneration(topo.rank, reference.Generation());
-            return reference;
+            EnsureService(index);
+            return acquire();
         } catch (boost::system::system_error const&)
         {
             if (std::chrono::steady_clock::now() >= deadline) { throw; }
@@ -711,18 +741,96 @@ checkpoint::ServiceReference SvcAcquireReference(StateTree const& root)
     }
 }
 
-void FlushCheckpointQueue(StateTree const& root)
+struct ClientLease
 {
-    std::shared_ptr<CheckpointWriter::QueueState> state;
+    checkpoint::ServiceReference                  reference;
+    std::shared_ptr<CheckpointWriter::QueueState> queue;
+    boost::process::v2::pid_type const            creatorPid = boost::process::v2::current_pid();
+    std::mutex                                    mutex;
+    bool                                          closed{};
+
+    ClientLease(checkpoint::ServiceReference referenceIn, std::shared_ptr<CheckpointWriter::QueueState> queueIn = {}) :
+        reference(std::move(referenceIn)), queue(std::move(queueIn))
+    {}
+    CLASS_DELETE_COPY_AND_MOVE(ClientLease);
+    ~ClientLease() { Close(); }
+
+    void Close() noexcept
     {
-        auto&            reg = CheckpointWriter::Registry();
-        std::scoped_lock lock(reg.mu);
-        auto             it = reg.states.find(root.Topo().rank);
-        if (it == reg.states.end() || !it->second->ready.valid()) { return; }
-        state = it->second;
+        if (creatorPid != boost::process::v2::current_pid()) { return; }
+        std::scoped_lock lock(mutex);
+        if (closed) { return; }
+        closed = true;
+        try
+        {
+            if (queue)
+            {
+                std::scoped_lock queueLock(queue->snapshotMutex);
+                if (queue->ready.valid()) { queue->ready.wait(); }
+                if (queue->queue) { queue->queue->Flush(); }
+            }
+        } catch (std::exception const& error) { fmt::print(stderr, "[native_ckpt:cli][ERROR] Queue flush failed: {}\n", error.what()); }
+        reference.Reset();
     }
-    state->ready.get();
-    state->queue->Flush();
+};
+
+void ClientRegistry::Close()
+{
+    auto* registry = Storage();
+    if (registry->creatorPid != boost::process::v2::current_pid()) { return; }
+    std::scoped_lock lock(registry->mutex);
+    for (auto const& weak : registry->leases)
+    {
+        if (auto lease = weak.lock()) { lease->Close(); }
+    }
+}
+
+void ClientRegistry::Add(std::shared_ptr<ClientLease> const& lease)
+{
+    auto&            registry = Get();
+    std::scoped_lock lock(registry.mutex);
+    auto const       generation = lease->reference.Generation();
+    if (!registry.exitGenerations.contains(generation))
+    {
+        if (std::atexit(Close) != 0) { throw std::runtime_error("Cannot register checkpoint client shutdown"); }
+        registry.exitGenerations.insert(generation);
+    }
+    registry.leases.emplace_back(lease);
+}
+
+std::shared_ptr<ClientLease> AcquireClientLease(StateTree const& root)
+{
+    auto const& topo = root.Topo();
+    if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+    auto reference = AcquireServiceReference(static_cast<uint16_t>(ServerIndex(root)),
+                                             [&] { return checkpoint::ServiceReferences::AcquireProcess(root.SessionId(), topo); });
+    auto queue     = CheckpointWriter::ObserveGeneration(topo.rank, reference.Generation());
+    auto lease     = std::make_shared<ClientLease>(std::move(reference), std::move(queue));
+    ClientRegistry::Add(lease);
+    return lease;
+}
+}    // namespace
+
+void SvcPing()
+{
+    auto&            registry = ClientRegistry::Get();
+    std::scoped_lock lock(registry.pingMutex);
+    auto&            controlLease = registry.controlLease;
+    auto             reference    = AcquireServiceReference(0, [&] {
+        if (controlLease)
+        {
+            auto const response = LocalServiceRequest(0, "/api/reference/ping", {});
+            if (controlLease->reference.Generation() == std::stoull(response.body())) { return controlLease->reference; }
+        }
+        auto coordinator = checkpoint::config::GetConfigValue<checkpoint::config::OtelCollector>();
+        if (coordinator == "file") { coordinator.clear(); }
+        auto address = fmt::format("{}:{}", checkpoint::config::Hostname(), cipc::Message::Port);
+        return checkpoint::ServiceReferences::AcquireProcess(checkpoint::ServiceReferences::NoSession, 0, coordinator, address);
+    });
+    if (controlLease && controlLease->reference.Generation() == reference.Generation()) { return; }
+    auto lease = std::make_shared<ClientLease>(std::move(reference));
+    ClientRegistry::Add(lease);
+    controlLease = std::move(lease);
 }
 
 std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry)
@@ -750,6 +858,14 @@ void WaitForCheckpointSave(StateTree const& snapshotRegistry)
 
 void FinalizeStateRegistry(StateTree& localRegistry)
 {
+    auto lease = std::static_pointer_cast<ClientLease>(localRegistry.serviceReference);
+    if (!lease || lease->creatorPid != boost::process::v2::current_pid())
+    {
+        lease                          = AcquireClientLease(localRegistry);
+        localRegistry.serviceReference = lease;
+    }
+    std::scoped_lock lock(lease->mutex);
+    if (lease->closed) { throw std::runtime_error("Checkpoint client is shutting down"); }
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
     CheckpointWriter::SendStateRegistry(localRegistry);
 }

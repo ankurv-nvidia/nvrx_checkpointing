@@ -135,7 +135,6 @@ WORK_ROOT: Path | None = None
 RUN_NAME: str | None = None
 logger = logging.getLogger("native_ci")
 _PRETRAIN_ENTRY_CMD = "__pretrain_entry__"
-_DAEMON_CONTROL_SESSION = (1 << 32) - 2
 _EPILOG_ENTRY_CMD = "__epilog__"
 _RANK_LOGS_ENTRY_CMD = "__rank_logs__"
 _FAILURE_SUMMARY_ENTRY_CMD = "__failure_summary__"
@@ -2116,6 +2115,7 @@ class DeterministicFlavor(Flavor):
 
 _VALGRIND_NATIVE_ENV = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH": "1",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC": "1",
     "NATIVE_CKPT_SERVER_HANDLER_THREADS": "4",
     "NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS": "0",
     "NATIVE_CKPT_SERVER_TCP_ACCEPTORS": "1",
@@ -2142,8 +2142,6 @@ class ValgrindFlavor(Flavor):
         policy.reporter = None
 
     def transform(self, opts: list[str], env: dict[str, str]) -> None:
-        if "NATIVE_CKPT_SERVER_INPROC" in env:
-            raise ValueError("valgrind requires a separate-process daemon; unset NATIVE_CKPT_SERVER_INPROC")
         _drop(
             opts,
             "--cuda-graph-impl",
@@ -2210,9 +2208,9 @@ class ValgrindFlavor(Flavor):
             try:
                 from nvrx_checkpointing import checkpoint  # noqa: PLC0415
 
-                with contextlib.closing(checkpoint.model_state.create_root(_DAEMON_CONTROL_SESSION, 0, 1, ["localhost"], 1)):
-                    marker.with_suffix(".ready").touch()
-                    yield
+                checkpoint.ping()
+                marker.with_suffix(".ready").touch()
+                yield
                 CHECKPOINT_SERVER.request("spindown", 3600)
                 rc = proc.wait(timeout=3600)
                 if rc:
@@ -2319,8 +2317,6 @@ class FlavorSelection:
         scope they share, which is what a run cannot carry both of. A variant
         replacing its own option is not a contradiction.
         """
-        if {"vg", "inproc"}.issubset(flavor.name for flavor in self.items):
-            raise ValueError("inproc and vg require different daemon lifetime modes")
         for adder in self.items:
             for dropper in self.items:
                 if adder is dropper:
@@ -3489,20 +3485,12 @@ def _fill_uninitialized_memory_if_deterministic(args: argparse.Namespace, torch_
 
 
 @lru_cache(maxsize=1)
-def _training_daemon_reference() -> object | None:
+def _training_daemon_reference() -> None:
     if not os.environ.get("NATIVE_CKPT_OTEL_FILE"):
-        return None
+        return
     from nvrx_checkpointing import checkpoint  # noqa: PLC0415
-    from nvrx_checkpointing.peers import OrderedPeers, detect_environment_peers  # noqa: PLC0415
 
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
-    peers = detect_environment_peers(rank, world_size)
-    if peers is None:
-        if world_size != 1:
-            raise RuntimeError("Training daemon requires the distributed peer topology")
-        peers = OrderedPeers(("localhost",), 1)
-    return checkpoint.model_state.create_root(_DAEMON_CONTROL_SESSION, rank, world_size, **peers.checkpoint_args())
+    checkpoint.ping()
 
 
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
@@ -4096,7 +4084,7 @@ _ENV_SCOPES = {
     **dict.fromkeys(_MODEL_ENV_NAMES, "rw"),
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS": "rw",
-    "NATIVE_CKPT_SERVER_INPROC": "rw",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC": "rw",
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",

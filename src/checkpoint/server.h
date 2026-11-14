@@ -9,7 +9,7 @@
 // The standalone daemon announces readiness and waits for its references to drain.
 void RunServer();
 
-void StartOwnedInprocServer();
+void StartOwnedInprocServer(uint16_t index = 0);
 void WaitForOwnedInprocServer();
 
 void RunInprocServer(uint16_t nodes);

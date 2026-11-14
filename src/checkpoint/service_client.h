@@ -11,11 +11,12 @@
 // A short readiness probe shared by the training client and losing daemon
 // candidates. EINTR retries protect one socket operation; the two outer attempts
 // cover the narrow interval between instance election and the winner binding.
-inline bool TryConnectToCheckpointService()
+inline bool TryConnectToCheckpointService(uint16_t index = 0)
 {
     using namespace std::chrono_literals;
     namespace cipc = checkpoint::ipc;
 
+    auto const                port                  = cipc::Message::Port + index;
     static constexpr int      MaxInterruptedRetries = 5;
     static constexpr int      MaxConnectAttempts    = 2;
     static constexpr auto     RetryInterval         = 100ms;
@@ -31,7 +32,7 @@ inline bool TryConnectToCheckpointService()
             boost::beast::tcp_stream       stream(ioc);
             boost::asio::ip::tcp::resolver resolver(ioc);
 
-            auto results = resolver.resolve("localhost", std::to_string(cipc::Message::Port), ec);
+            auto results = resolver.resolve("localhost", std::to_string(port), ec);
             if (ec) { continue; }
 
             [[maybe_unused]] auto endpoint = stream.connect(results, ec);
@@ -39,7 +40,7 @@ inline bool TryConnectToCheckpointService()
 
             static constexpr int                                         HttpVersion11 = 11;
             boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
-            req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", cipc::Message::Port));
+            req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", port));
             req.body().data = nullptr;
             req.body().size = 0;
             req.body().more = false;

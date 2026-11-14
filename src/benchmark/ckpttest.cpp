@@ -215,14 +215,14 @@ TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[
     CHECK_THROWS_AS(Integer<int8_t>::Parse("-129"), std::overflow_error);
 }
 
-TEST_CASE("in-process server mode is enabled by presence", "[server][config][tier1]")
+TEST_CASE("in-process server mode is the default", "[server][config][tier1]")
 {
-    using Config           = checkpoint::config::ServerInproc;
+    using Config           = checkpoint::config::ServerDisableInproc;
     constexpr auto envName = checkpoint::config::detail::EnvName<Config>();
-    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_INPROC");
-    CHECK_FALSE(Config::Type::ParsePresence(nullptr));
-    CHECK(Config::Type::ParsePresence(""));
-    CHECK(Config::Type::ParsePresence("0"));
+    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_DISABLE_INPROC");
+    CHECK_FALSE(Config::Type::Parse(std::string(Config::Default)));
+    CHECK_FALSE(Config::Type::Parse("0"));
+    CHECK(Config::Type::Parse("1"));
 }
 
 TEST_CASE("shared-memory ring geometry supports runtime slot counts", "[shmem][config][tier1]")

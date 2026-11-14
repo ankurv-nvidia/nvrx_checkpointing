@@ -41,6 +41,7 @@
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/iostreams/stream.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/process/v2/pid.hpp>
 #include <boost/url.hpp>
 #include <hwloc.h>
 
@@ -66,7 +67,7 @@ struct Server
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
-    void Start();
+    void Start(bool inproc = false);
     bool Accepting() const { return _references.Accepting(); }
     bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
     bool AllSessionsComplete();
@@ -154,7 +155,7 @@ struct Server
     boost::asio::io_context                     _ioc;
     std::vector<boost::asio::ip::tcp::acceptor> _tcpAcceptors;
 
-    // Held across Stop()/Start() cycles so a rival daemon cannot elect itself mid-teardown.
+    // Election ownership lasts through listener and handler teardown.
     std::unique_ptr<bip::file_lock> _instanceLock;
 
     // Connection handlers run here, off the accept loop. Declared after _ioc so it is
@@ -187,20 +188,8 @@ template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
 
 using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
 
-void Server::Start()
+void Server::Start(bool inproc)
 {
-    checkpoint::logging::Init();
-    checkpoint::telemetry::Init();
-    checkpoint::config::OtelConfig const otelConfig;
-    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon() && !otelConfig.collector.empty())
-    {
-        if (otelConfig.collector == "file") { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
-        else
-        {
-            checkpoint::telemetry::InitRelayCollector(otelConfig.collector);
-        }
-    }
-
     std::scoped_lock lock(_mutex);
     _stopRequested = false;
     if (_running) { return; }
@@ -213,8 +202,21 @@ void Server::Start()
     // static_cast<void>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>());
 
     _maxActiveSnapshots = maxActiveSnapshots;
-    _handlerPool        = std::make_unique<boost::asio::thread_pool>(handlerThreads);
     StartTcpListener_(reusePort, acceptorCount);
+
+    checkpoint::logging::Init(inproc);
+    checkpoint::telemetry::Init();
+    checkpoint::config::OtelConfig const otelConfig;
+    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon() && !otelConfig.collector.empty())
+    {
+        if (otelConfig.collector == "file") { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
+        else
+        {
+            checkpoint::telemetry::InitRelayCollector(otelConfig.collector);
+        }
+    }
+
+    _handlerPool = std::make_unique<boost::asio::thread_pool>(handlerThreads);
     _running = true;
     StartTcpAcceptors_();
 }
@@ -336,7 +338,7 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
     }
     case cipc::Message::Type::Shutdown:
     {
-        Stop();
+        _stopRequested = true;
     }
     break;
     // break;
@@ -458,32 +460,30 @@ void Server::Stop()
 
     if (!wasRunning) { return; }
 
+    _references.DrainRequests();
     checkpoint::logging::Shutdown();
     checkpoint::telemetry::Shutdown();
     _references.ReleaseRemoteReferences();
+    _references.Seal();
 
     boost::system::error_code ec;
     for (auto& acceptor : _tcpAcceptors)
     {
         if (acceptor.close(ec)) { WARN("[{}][TCP] Failed to close acceptor: {}", *this, ec.message()); }
     }
-    // Drain in-flight connection handlers before tearing down the io_context their
-    // accepted sockets are bound to.
-    if (_handlerPool)
-    {
-        _handlerPool->stop();
-        _handlerPool->join();
-    }
-    // Reset the session so they wait for the async ops to finish
     _ioc.stop();
     for (auto& t : _threads)
     {
         if (t.joinable()) { t.join(); }
     }
+    if (_handlerPool) { _handlerPool->join(); }
+
     {
         std::scoped_lock<std::mutex> lock(_mutex);
         _msgQueue.clear();
         _threads.clear();
+        _activeSessions.clear();
+        _instanceLock.reset();
         _running = false;
     }
 }
@@ -1463,75 +1463,99 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
     }
 }
 
-SUPPRESS_WARNINGS_START
-SUPPRESS_CLANG_WARNING("-Wglobal-constructors")
-SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-static std::vector<std::unique_ptr<Server>> ServerSingletons;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-SUPPRESS_WARNINGS_END
-
 namespace
 {
 struct OwnedServer
 {
-    std::mutex              mutex;
     std::unique_ptr<Server> server;
     std::future<void>       shutdown;
-    std::once_flag          exitOnce;
 };
 
-OwnedServer& ProcessServer()
+struct ProcessServers
 {
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static OwnedServer Instance;
-    SUPPRESS_WARNINGS_END
+    boost::process::v2::pid_type const        creator = boost::process::v2::current_pid();
+    std::mutex                                mutex;
+    std::unordered_map<uint16_t, OwnedServer> owned;
+    std::vector<std::unique_ptr<Server>>      manual;
+    bool                                      exitRegistered{false};
+};
+
+ProcessServers*& ServerStorage()
+{
+    static auto* Instance = new ProcessServers;    // NOLINT(cppcoreguidelines-owning-memory)
     return Instance;
+}
+
+ProcessServers& Servers()
+{
+    auto*& servers = ServerStorage();
+    if (servers->creator != boost::process::v2::current_pid())
+    {
+        servers = new ProcessServers;    // NOLINT(cppcoreguidelines-owning-memory)
+    }
+    return *servers;
+}
+
+void RegisterServerExit(ProcessServers& servers)
+{
+    if (servers.exitRegistered) { return; }
+    std::atexit(+[] {
+        auto*& current = ServerStorage();
+        if (current == nullptr || current->creator != boost::process::v2::current_pid()) { return; }
+        try
+        {
+            WaitForOwnedInprocServer();
+            StopInprocServer();
+        } catch (std::exception const& ex)
+        {
+            fmt::print(checkpoint::logging::Output(), "Checkpoint daemon shutdown failed: {}\n", ex.what());
+        }
+        delete std::exchange(current, nullptr);    // NOLINT(cppcoreguidelines-owning-memory)
+    });
+    servers.exitRegistered = true;
 }
 }    // namespace
 
-void StartOwnedInprocServer()
+void StartOwnedInprocServer(uint16_t index)
 {
-    auto&            owner = ProcessServer();
-    std::scoped_lock lock(owner.mutex);
+    auto&            servers = Servers();
+    std::scoped_lock lock(servers.mutex);
+    auto&            owner = servers.owned[index];
     if (owner.shutdown.valid())
     {
         if (owner.shutdown.wait_for(0s) != std::future_status::ready && owner.server->Accepting()) { return; }
         owner.shutdown.get();
         owner.server.reset();
     }
-    auto server = std::make_unique<Server>();
-    server->Start();
+    auto server = std::make_unique<Server>(index);
+    server->Start(true);
     owner.server   = std::move(server);
     owner.shutdown = std::async(std::launch::async, [instance = owner.server.get()] { instance->WaitForShutdown(); });
-    std::call_once(owner.exitOnce, [] {
-        std::atexit(+[] {
-            try
-            {
-                WaitForOwnedInprocServer();
-            } catch (std::exception const& ex)
-            {
-                fmt::print(checkpoint::logging::Output(), "Checkpoint daemon shutdown failed: {}\n", ex.what());
-            }
-        });
-    });
+    RegisterServerExit(servers);
 }
 
 void WaitForOwnedInprocServer()
 {
-    auto&            owner = ProcessServer();
-    std::scoped_lock lock(owner.mutex);
-    if (owner.shutdown.valid()) { owner.shutdown.get(); }
-    owner.server.reset();
+    auto* servers = ServerStorage();
+    if (servers == nullptr || servers->creator != boost::process::v2::current_pid()) { return; }
+    std::scoped_lock lock(servers->mutex);
+    for (auto& [index, owner] : servers->owned)
+    {
+        if (owner.shutdown.valid()) { owner.shutdown.get(); }
+        owner.server.reset();
+    }
 }
 
 void RunInprocServer(uint16_t nodes)
 {
     checkpoint::logging::Init();
+    auto& servers = Servers();
     for (uint16_t i = 0; i < nodes; i++)
     {
         INFO("Starting inproc server instance for node={}", i);
-        ServerSingletons.push_back(std::make_unique<Server>(i));
-        ServerSingletons.back()->Start();
+        servers.manual.push_back(std::make_unique<Server>(i));
+        servers.manual.back()->Start();
+        RegisterServerExit(servers);
     }
     INFO("Inproc server started.");
     std::fflush(checkpoint::logging::Output());
@@ -1552,11 +1576,11 @@ void RunServer()    // NOLINT(misc-use-internal-linkage)
 
 void StopInprocServer()
 {
-    for (auto const& server : ServerSingletons)
+    for (auto const& server : Servers().manual)
     {
         if (server) { server->Stop(); }
     }
-    ServerSingletons.clear();
+    Servers().manual.clear();
 }
 
 void WaitForInprocServerWrites()
@@ -1567,7 +1591,7 @@ void WaitForInprocServerWrites()
     {
         bool foundServer = false;
         bool allComplete = true;
-        for (auto const& server : ServerSingletons)
+        for (auto const& server : Servers().manual)
         {
             if (!server) { continue; }
             foundServer = true;
@@ -1584,7 +1608,7 @@ void WaitForInprocServerWrites()
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData)
 {
-    for (auto& server : ServerSingletons)
+    for (auto& server : Servers().manual)
     {
         if (server) { server->QuerySessions(callback, cbData); }
     }

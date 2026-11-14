@@ -179,6 +179,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         {
             std::unordered_map<std::string, uint64_t> blobSizes;
             auto const                                otherRanks = static_cast<size_t>(topo.worldSize) - 1;
+            auto const                                deadline   = std::chrono::steady_clock::now() + ServerWaitTimeout;
             while (true)
             {
                 {
@@ -196,6 +197,10 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                          otherRanks);
                 }
                 if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to write checkpoint"); }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    throw std::runtime_error("Timed out waiting for ranks to write checkpoint");
+                }
 
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }

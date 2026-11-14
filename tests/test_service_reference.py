@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import socket
 import subprocess
 import sys
 import textwrap
@@ -32,6 +31,7 @@ pytestmark = [
 _COMMON = """
 import gc
 import os
+import sys
 import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -55,7 +55,11 @@ def wait_stopped():
 
 
 def create():
-    return checkpoint.model_state.create_root(9100, 0, 1, ['localhost'], 1)
+    root = checkpoint.model_state.create_root(9100, 0, 1, ['localhost'], 1)
+    root.register_state_dict({'value': 1})
+    root.finalize_registry()
+    root.wait_for_async_completion()
+    return root
 
 """
 
@@ -79,10 +83,15 @@ def _wait_stopped() -> None:
 @pytest.fixture(params=["inproc", "outproc"])
 def daemon_env(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[dict[str, str]]:
     env = os.environ.copy()
-    for name in ("NATIVE_CKPT_SERVER_INPROC", "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH", "NATIVE_CKPT_OTEL_FILE"):
+    for name in (
+        "NATIVE_CKPT_SERVER_DISABLE_INPROC",
+        "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH",
+        "NATIVE_CKPT_OTEL_FILE",
+        "NATIVE_CKPT_OTEL_COLLECTOR",
+    ):
         env.pop(name, None)
-    if request.param == "inproc":
-        env["NATIVE_CKPT_SERVER_INPROC"] = ""
+    if request.param == "outproc":
+        env["NATIVE_CKPT_SERVER_DISABLE_INPROC"] = "1"
     env.update(
         NATIVE_CKPT_SERVER_LOG=str(tmp_path / "daemon.%p.log"),
         NATIVE_CKPT_SHM_RING_BUFFER_SIZE="8MiB",
@@ -111,26 +120,14 @@ def _run(env: dict[str, str], script: str) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("release", ["close", "destructor"])
-def test_clean_release_has_no_shutdown_grace(daemon_env: dict[str, str], release: str) -> None:
+def test_clean_release_has_no_shutdown_grace(daemon_env: dict[str, str]) -> None:
     _run(
         daemon_env,
-        f"""
+        """
         root = create()
         started = time.monotonic()
-        if {release!r} == 'close':
-            root.close()
-            root.close()
-            try:
-                root.register_state_dict({{'value': 1}})
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError('closed client accepted work')
-        else:
-            del root
-            gc.collect()
-        checkpoint._shutdown()
+        del root
+        gc.collect()
         wait_stopped()
         assert time.monotonic() - started < 4, 'clean shutdown waited for startup grace'
         """,
@@ -142,18 +139,18 @@ def test_global_root_is_closed_at_interpreter_exit(daemon_env: dict[str, str]) -
     _wait_stopped()
 
 
-def test_close_drains_async_cpu_save(daemon_env: dict[str, str], tmp_path: Path) -> None:
+def test_destructor_drains_async_cpu_save(daemon_env: dict[str, str], tmp_path: Path) -> None:
     destination = tmp_path / "checkpoint"
     _run(
         daemon_env,
         f"""
         import torch
-        root = create()
+        root = checkpoint.model_state.create_root(9100, 0, 1, ['localhost'], 1)
         root.register_state_dict({{'weight': torch.arange(1_048_576, dtype=torch.float32)}})
         root.finalize_registry()
         root.save_async(1, {str(destination)!r})
-        root.close()
-        checkpoint._shutdown()
+        del root
+        gc.collect()
         wait_stopped()
         """,
     )
@@ -165,30 +162,20 @@ def test_close_drains_async_cpu_save(daemon_env: dict[str, str], tmp_path: Path)
     torch.testing.assert_close(loaded["weight"], torch.arange(1_048_576, dtype=torch.float32))
 
 
-def test_unavailable_telemetry_collector_preserves_daemon(daemon_env: dict[str, str], tmp_path: Path) -> None:
-    with socket.socket() as unavailable:
-        unavailable.bind(("127.0.0.1", 0))
-        daemon_env.update(
-            NATIVE_CKPT_OTEL_FILE=str(tmp_path / "telemetry.jsonl"),
-            NATIVE_CKPT_OTEL_COLLECTOR=f"127.0.0.1:{unavailable.getsockname()[1]}",
-            NATIVE_CKPT_OTEL_EXPORT="daemon",
-            NATIVE_CKPT_OTEL_LOGS="1",
-        )
-        _run(
-            daemon_env,
-            """
-            root = create()
-            try:
-                request('/api/telemetry', b'{"resourceSpans":[]}')
-            except (URLError, ConnectionError):
-                pass
-            time.sleep(1.2)
-            root.close()
-            checkpoint._shutdown()
-            wait_stopped()
-            """,
-        )
-    assert any("Telemetry export failed" in log.read_text() for log in tmp_path.glob("daemon.*.log"))
+def test_telemetry_is_flushed_before_shutdown(daemon_env: dict[str, str], tmp_path: Path) -> None:
+    destination = tmp_path / "telemetry.jsonl"
+    daemon_env.update(NATIVE_CKPT_OTEL_FILE=str(destination), NATIVE_CKPT_OTEL_EXPORT="daemon")
+    _run(
+        daemon_env,
+        """
+        root = create()
+        request('/api/telemetry', b'{"resourceSpans":[],"test":"shutdown"}')
+        del root
+        gc.collect()
+        wait_stopped()
+        """,
+    )
+    assert '"test":"shutdown"' in destination.read_text()
 
 
 def test_immediate_reacquire_saves_after_service_restart(daemon_env: dict[str, str], tmp_path: Path) -> None:
@@ -199,14 +186,15 @@ def test_immediate_reacquire_saves_after_service_restart(daemon_env: dict[str, s
         from pathlib import Path
         for index in range(3):
             first = create()
-            first.close()
-            root = create()
+            del first
+            gc.collect()
+            root = checkpoint.model_state.create_root(9100, 0, 1, ['localhost'], 1)
             root.register_state_dict({{'weight': torch.arange(16, dtype=torch.float32)}})
             root.finalize_registry()
             destination = Path({str(tmp_path)!r}) / str(index)
             root.save_async(index, destination)
-            root.close()
-            checkpoint._shutdown()
+            del root
+            gc.collect()
             wait_stopped()
             assert (destination / '.metadata').is_file()
         """,
@@ -214,14 +202,14 @@ def test_immediate_reacquire_saves_after_service_restart(daemon_env: dict[str, s
 
 
 def test_dead_training_process_releases_pid_reference(daemon_env: dict[str, str]) -> None:
-    if "NATIVE_CKPT_SERVER_INPROC" in daemon_env:
+    if daemon_env.get("NATIVE_CKPT_SERVER_DISABLE_INPROC") != "1":
         pytest.skip("the embedded daemon exits with its owner")
     _run(daemon_env, "root = create(); os._exit(0)")
     _wait_stopped()
 
 
 def test_outproc_retries_election_while_old_service_closes(daemon_env: dict[str, str]) -> None:
-    if "NATIVE_CKPT_SERVER_INPROC" in daemon_env:
+    if daemon_env.get("NATIVE_CKPT_SERVER_DISABLE_INPROC") != "1":
         pytest.skip("standalone launchers use the election handshake")
     _run(
         daemon_env,
@@ -248,8 +236,8 @@ def test_outproc_retries_election_while_old_service_closes(daemon_env: dict[str,
                 root = create()
             finally:
                 timer.join()
-        root.close()
-        checkpoint._shutdown()
+        del root
+        gc.collect()
         wait_stopped()
         """,
     )
@@ -280,7 +268,8 @@ def test_coordinator_waits_for_remote_reference(daemon_env: dict[str, str], remo
             root = create()
             request('/api/reference/remote/9100/123/remote-test',
                     f'127.0.0.1:{{peer.server_port}}'.encode())
-            root.close()
+            del root
+            gc.collect()
             time.sleep(1.5)
             assert request('/api/reference/ping'), 'coordinator exited while remote was alive'
             if {remote_exit!r} == 'release':
@@ -288,11 +277,147 @@ def test_coordinator_waits_for_remote_reference(daemon_env: dict[str, str], remo
             else:
                 peer.shutdown()
                 peer.server_close()
-            checkpoint._shutdown()
             wait_stopped()
         finally:
             peer.shutdown()
             peer.server_close()
             thread.join()
+        """,
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_fork_child_preserves_parent_reference(daemon_env: dict[str, str]) -> None:
+    _run(
+        daemon_env,
+        """
+        root = create()
+        child = os.fork()
+        if child == 0:
+            del root
+            gc.collect()
+            sys.exit(0)
+        _, status = os.waitpid(child, 0)
+        assert status == 0, status
+        assert request('/api/reference/ping'), 'child released the parent reference'
+        del root
+        gc.collect()
+        wait_stopped()
+        """,
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_fork_child_releases_only_its_own_reference(daemon_env: dict[str, str]) -> None:
+    _run(
+        daemon_env,
+        """
+        root = create()
+        ready_read, ready_write = os.pipe()
+        exit_read, exit_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(ready_read)
+            os.close(exit_write)
+            child_root = create()
+            del child_root, root
+            gc.collect()
+            os.write(ready_write, b'1')
+            os.close(ready_write)
+            os.read(exit_read, 1)
+            os._exit(0)
+        os.close(ready_write)
+        os.close(exit_read)
+        try:
+            assert os.read(ready_read, 1) == b'1'
+            assert request('/api/reference/ping'), 'child released the parent reference'
+            del root
+            gc.collect()
+            wait_stopped()
+        finally:
+            os.write(exit_write, b'1')
+            os.close(exit_write)
+            _, status = os.waitpid(child, 0)
+            assert status == 0, status
+        """,
+    )
+
+
+def test_nonzero_local_rank_can_host(daemon_env: dict[str, str]) -> None:
+    if daemon_env.get("NATIVE_CKPT_SERVER_DISABLE_INPROC") == "1":
+        pytest.skip("checks embedded ownership")
+    daemon_env["LOCAL_RANK"] = "1"
+    _run(
+        daemon_env,
+        """
+        from pathlib import Path
+        root = checkpoint.model_state.create_root(9100, 1, 2, ['localhost'], 2)
+        root.register_state_dict({'value': 1})
+        root.finalize_registry()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                request('/api/reference/ping')
+                break
+            except (URLError, ConnectionError):
+                assert time.monotonic() < deadline, 'nonzero rank did not start a daemon'
+                time.sleep(0.05)
+        assert Path(os.environ['NATIVE_CKPT_SERVER_LOG'].replace('%p', str(os.getpid()))).is_file()
+        leader = checkpoint.model_state.create_root(9100, 0, 2, ['localhost'], 2)
+        leader.register_state_dict({'value': 1})
+        leader.finalize_registry()
+        root.wait_for_async_completion()
+        leader.wait_for_async_completion()
+        del root, leader
+        gc.collect()
+        wait_stopped()
+        """,
+    )
+
+
+def test_another_process_can_own_the_replacement_daemon(daemon_env: dict[str, str]) -> None:
+    _run(
+        daemon_env,
+        """
+        import subprocess
+        checkpoint.ping()
+        checkpoint.svc_spindown()
+        result = subprocess.run(
+            [sys.executable, '-c', 'from nvrx_checkpointing import checkpoint; checkpoint.ping()'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        """,
+    )
+    _wait_stopped()
+
+
+def test_client_exit_after_becoming_an_owner(daemon_env: dict[str, str]) -> None:
+    if daemon_env.get("NATIVE_CKPT_SERVER_DISABLE_INPROC") == "1":
+        pytest.skip("checks embedded ownership")
+    _run(
+        daemon_env,
+        """
+        os.environ['NATIVE_CKPT_SERVER_DISABLE_INPROC'] = '1'
+        checkpoint.ping()
+        checkpoint.svc_spindown()
+        os.environ['NATIVE_CKPT_SERVER_DISABLE_INPROC'] = '0'
+        checkpoint.ping()
+        """,
+    )
+    _wait_stopped()
+
+
+def test_ping_reacquires_after_forced_restart(daemon_env: dict[str, str]) -> None:
+    _run(
+        daemon_env,
+        """
+        checkpoint.ping()
+        first = request('/api/reference/ping')
+        checkpoint.svc_spindown()
+        checkpoint.ping()
+        assert request('/api/reference/ping') != first
+        time.sleep(5.2)
+        assert request('/api/reference/ping'), 'replacement service has no client reference'
         """,
     )

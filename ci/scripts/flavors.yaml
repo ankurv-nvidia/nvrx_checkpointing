@@ -37,10 +37,10 @@ native:
     drop: [--ckpt-provider]
     add: [--ckpt-provider=native]
 
-inproc:
-  summary: Host the checkpoint daemon in each node's local-rank-0 trainer.
+oop:
+  summary: Run the checkpoint daemon in a separate process.
   env:
-    NATIVE_CKPT_SERVER_INPROC: "1"
+    NATIVE_CKPT_SERVER_DISABLE_INPROC: "1"
 
 async:
   summary: Save asynchronously, staging wherever the model configuration says.

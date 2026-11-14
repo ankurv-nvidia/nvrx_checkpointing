@@ -650,6 +650,7 @@ struct StateTree
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/
         = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
+    std::shared_ptr<void> serviceReference;
 };
 
 template <> struct fmt::formatter<StateNode::Variant> : fmt::formatter<std::string>

@@ -22,7 +22,7 @@ enum class Level : uint8_t
     Critical,
 };
 
-void Init();
+void Init(bool inproc = false);
 
 [[nodiscard]] std::FILE* Output();
 

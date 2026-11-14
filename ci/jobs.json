@@ -85,7 +85,7 @@
               "native",
               [
                 "perf",
-                "inproc"
+                "oop"
               ]
             ]
           ],

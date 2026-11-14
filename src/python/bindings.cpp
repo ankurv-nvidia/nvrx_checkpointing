@@ -2,8 +2,6 @@
 #include "binding.h"
 #include "checkpoint.h"
 #include "messages.h"
-#include "server.h"
-#include "service_reference.h"
 #include "state.h"
 #include "tensor.h"
 
@@ -16,7 +14,6 @@
 
 #include <future>
 #include <mutex>
-#include <set>
 
 namespace nb   = nanobind;
 namespace cipc = checkpoint::ipc;
@@ -74,17 +71,6 @@ static bool IsShardedState(StateNode::Variant const& data)
 
 namespace
 {
-struct PythonStateTree;
-
-auto& ClientRoots()
-{
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::set<PythonStateTree*> Roots;
-    SUPPRESS_WARNINGS_END
-    return Roots;
-}
-
 struct PythonStateTree
 {
     struct Accessor : PyStateDictAccessor
@@ -106,24 +92,23 @@ struct PythonStateTree
         PythonStateTree* _state{nullptr};
     };
 
-    explicit PythonStateTree(cipc::SessionId sessionId, RankTopology topology) : _localRegistry(sessionId, std::move(topology))
-    {
-        {
-            nb::gil_scoped_release release;
-            _reference = SvcAcquireReference(_localRegistry);
-        }
-        ClientRoots().insert(this);
-    }
+    explicit PythonStateTree(cipc::SessionId sessionId, RankTopology topology) : _localRegistry(sessionId, std::move(topology)) {}
 
     ~PythonStateTree()
     {
-        ClientRoots().erase(this);
         if (Py_IsInitialized() != 0)
         {
-            try
             {
-                Close();
-            } catch (std::exception const& ex) { fmt::print(stderr, "Unhandled asynchronous state registration error: {}\n", ex.what()); }
+                nb::gil_scoped_release release;
+                try
+                {
+                    WaitForAsyncCalls();
+                } catch (std::exception const& ex)
+                {
+                    fmt::print(stderr, "Unhandled asynchronous state registration error: {}\n", ex.what());
+                }
+            }
+            OnSnapshotComplete_();
         }
         else
         {
@@ -133,31 +118,6 @@ struct PythonStateTree
     }
 
     CLASS_DELETE_COPY_AND_MOVE(PythonStateTree);
-
-    void Close()
-    {
-        std::exception_ptr failure;
-        {
-            nb::gil_scoped_release release;
-            std::scoped_lock       lock(_asyncMutex);
-            if (_closed) { return; }
-            _closed = true;
-            try
-            {
-                if (_async.valid()) { _async.get(); }
-            } catch (...) { failure = std::current_exception(); }
-            try
-            {
-                FlushCheckpointQueue(_localRegistry);
-            } catch (...)
-            {
-                if (!failure) { failure = std::current_exception(); }
-            }
-            _reference.Reset();
-        }
-        OnSnapshotComplete_();
-        if (failure) { std::rethrow_exception(failure); }
-    }
 
     void FinalizeRegistry()
     {
@@ -173,15 +133,13 @@ struct PythonStateTree
 
     void RegisterStateDict(nb::dict stateDict)
     {
-        auto call = [this, stateDict = std::move(stateDict)] mutable {
+        ChainAsyncCall([this, stateDict = std::move(stateDict)] mutable {
             {
                 nb::gil_scoped_acquire acquire;
                 _dictToScan = stateDict;
             }
             Scan(SnapshotRegistry());
-        };
-        nb::gil_scoped_release release;
-        ChainAsyncCall(std::move(call));
+        });
     }
 
     void Scan(StateTree& registry);
@@ -190,7 +148,6 @@ struct PythonStateTree
     template <typename TCall> void ChainAsyncCall(TCall&& call)    // NOLINT(cppcoreguidelines-missing-std-forward)
     {
         std::scoped_lock lock(_asyncMutex);
-        if (_closed) { throw std::runtime_error("Checkpoint client is closed"); }
         _async = std::async(std::launch::async,
                             [previous = std::move(_async), next = std::function<void()>(std::forward<TCall>(call))] mutable {
                                 try
@@ -234,7 +191,6 @@ struct PythonStateTree
 
     RankTopology const                                      _topology;
     StateTree                                               _localRegistry;
-    checkpoint::ServiceReference                            _reference;
     std::shared_ptr<StateTree>                              _snapshotRegistry;
     nb::dict                                                _dictToScan;
     std::vector<nb::object>                                 _tensorRefObjects;
@@ -242,26 +198,7 @@ struct PythonStateTree
     std::vector<std::vector<char>>                          _blobStorage;
     std::mutex                                              _asyncMutex;
     std::future<void>                                       _async;
-    bool                                                    _closed{false};
 };
-
-void ShutdownClients()
-{
-    std::vector<nb::object> roots;
-    for (auto* root : ClientRoots())
-    {
-        if (auto object = nb::find(root)) { roots.push_back(std::move(object)); }
-    }
-    for (auto const& root : roots)
-    {
-        try
-        {
-            nb::cast<PythonStateTree&>(root).Close();
-        } catch (std::exception const& error) { fmt::print(stderr, "[native_ckpt:cli][ERROR] Client shutdown failed: {}\n", error.what()); }
-    }
-    nb::gil_scoped_release release;
-    WaitForOwnedInprocServer();
-}
 }    // namespace
 
 StateNode* PythonStateTree::Accessor::AddDictionaryChild(StateNode::Handle parent, std::string_view name)
@@ -774,6 +711,13 @@ void RegisterStateDictRecr(PyStateDictAccessor&           scan,
     }
 }
 
+static void RegisterStateDict(PythonStateTree& self, nb::dict const& stateDict)
+{
+    auto                   extraDictRef = nb::dict(stateDict);
+    nb::gil_scoped_release release;
+    self.RegisterStateDict(std::move(extraDictRef));
+}
+
 static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::path const& dirpath)
 {
     nb::gil_scoped_release release;
@@ -782,9 +726,9 @@ static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::pat
 
 NB_MODULE(checkpoint, m)    // NOLINT
 {
-    m.def("ping", &SvcPing, nb::call_guard<nb::gil_scoped_release>());
-    m.def("svc_stop", &SvcStop, nb::call_guard<nb::gil_scoped_release>());
-    m.def("svc_spindown", &SvcSpinDown, nb::call_guard<nb::gil_scoped_release>());
+    m.def("ping", &SvcPing);
+    m.def("svc_stop", &SvcStop);
+    m.def("svc_spindown", &SvcSpinDown);
     m.def(
         "wait_for_ckpt_finalize",
         [](uint32_t sessionId, int64_t iteration) {
@@ -793,9 +737,7 @@ NB_MODULE(checkpoint, m)    // NOLINT
         },
         nb::arg("session_id"),
         nb::arg("iteration"));
-    m.def("_shutdown", &ShutdownClients);
-    nb::module_::import_("atexit").attr("register")(m.attr("_shutdown"));
-    auto cls = nb::class_<PythonStateTree>(m, "model_state");
+    auto cls = nb::class_<PythonStateTree>(std::move(m), "model_state");
 
     cls.def_static(
            "create_root",
@@ -855,8 +797,11 @@ NB_MODULE(checkpoint, m)    // NOLINT
             "startedAt",
             [](PythonStateTree const& self) { return self.SnapshotRegistry().startedAt.count(); },
             [](PythonStateTree& self, int64_t startedAt) { self.SetStartedAt(startedAt); })
-        .def("register_state_dict", &PythonStateTree::RegisterStateDict)
-        .def("close", &PythonStateTree::Close)
+        .def("register_state_dict",
+             [](PythonStateTree& self, nb::dict stateDict) {
+                 nb::gil_scoped_release release;
+                 self.RegisterStateDict(std::move(stateDict));
+             })
         .def("finalize_registry",
              [](PythonStateTree& self) {
                  nb::gil_scoped_release release;

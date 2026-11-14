@@ -529,7 +529,7 @@ These flavors select a checkpoint variant for the comparison. They mix with
 | --- | --- |
 | `nvrx` | Write checkpoints through the NVIDIA Resiliency Extension |
 | `native` | Write checkpoints through the native provider |
-| `inproc` | Set `NATIVE_CKPT_SERVER_INPROC=1` to host each node's daemon in its local-rank-0 training process |
+| `oop` | Set `NATIVE_CKPT_SERVER_DISABLE_INPROC=1` to run each node's daemon in a separate process |
 | `async` | Save asynchronously, staging wherever the model configuration says |
 | `shm` | Save asynchronously, staging through shared memory |
 | `ipc` | Save asynchronously, staging through CUDA IPC |
@@ -539,8 +539,8 @@ These flavors select a checkpoint variant for the comparison. They mix with
 | `pg-cache` | Record a process-group distribution on phase 1 and reuse it on phase 2, with per-rank object load and no sharding-integrity validation |
 | `drop-xstate` | Omit the redundant extra-state artifacts, writing a smaller checkpoint that is equally correct |
 
-Ordinary flavors start daemons from training. Valgrind (`vg`) prestarts its
-managed daemon and cannot combine with `inproc`.
+Ordinary flavors let training start the daemon, in-process by default.
+Valgrind (`vg`) prestarts its managed daemon in a separate process.
 
 A job naming two variants where one adds what the other drops is refused
 before the allocation. That follows from the option lists, so nothing declares

@@ -5,11 +5,13 @@
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/process/v2/ext/exe.hpp>
 #include <boost/process/v2/pid.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <ranges>
 #include <stdexcept>
@@ -17,13 +19,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#ifdef __linux__
-#include <cerrno>
-#include <poll.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
 
 namespace checkpoint
 {
@@ -86,42 +81,15 @@ void Release(std::string const& peer, std::string const& token) noexcept
 
 struct Process
 {
-    explicit Process(boost::process::v2::pid_type value) : pid(value)
-    {
-#ifdef __linux__
-        descriptor = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
-        exited     = descriptor < 0 && errno == ESRCH;
-#endif
-    }
-    ~Process()
-    {
-#ifdef __linux__
-        if (descriptor >= 0) { ::close(descriptor); }
-#endif
-    }
-    Process(Process const&)            = delete;
-    Process& operator=(Process const&) = delete;
-
+    explicit Process(boost::process::v2::pid_type value) : pid(value) {}
     [[nodiscard]] bool Valid() const
     {
-#ifdef __linux__
-        if (exited) { return false; }
-        if (descriptor >= 0)
-        {
-            pollfd     observation{.fd = descriptor, .events = POLLIN, .revents = 0};
-            auto const result = ::poll(&observation, 1, 0);
-            return result == 0 || (result < 0 && errno == EINTR);
-        }
-#endif
         boost::system::error_code error;
-        auto const                processes = boost::process::v2::all_pids(error);
-        return error || std::ranges::find(processes, pid) != processes.end();
+        static_cast<void>(boost::process::v2::ext::exe(pid, error));
+        return error != boost::system::errc::no_such_file_or_directory && error != boost::system::errc::no_such_process
+               && error != boost::system::errc::invalid_argument;
     }
     boost::process::v2::pid_type pid;
-#ifdef __linux__
-    int  descriptor{-1};
-    bool exited{false};
-#endif
 };
 
 struct LocatedState
@@ -133,17 +101,16 @@ struct LocatedState
 
 struct Locator
 {
-    std::mutex                mutex;
-    std::vector<LocatedState> states;
+    boost::process::v2::pid_type const creator = boost::process::v2::current_pid();
+    std::mutex                         mutex;
+    std::vector<LocatedState>          states;
 };
 
 Locator& LocalStates()
 {
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static Locator States;
-    SUPPRESS_WARNINGS_END
-    return States;
+    static auto* States = new Locator;
+    if (States->creator != boost::process::v2::current_pid()) { States = new Locator; }
+    return *States;
 }
 }    // namespace
 
@@ -151,7 +118,6 @@ struct ServiceReferences::State
 {
     enum class Kind : uint8_t
     {
-        Self,
         Process,
         Remote
     };
@@ -165,7 +131,6 @@ struct ServiceReferences::State
 
         [[nodiscard]] bool Valid() const
         {
-            if (kind == Kind::Self) { return true; }
             if (kind == Kind::Process) { return process->Valid(); }
             try
             {
@@ -182,20 +147,23 @@ struct ServiceReferences::State
 
     std::mutex                                                   mutex;
     std::condition_variable                                      changed;
-    std::unordered_map<std::string, std::shared_ptr<Reference>>  references;
+    std::map<std::pair<ipc::SessionId, std::string>, size_t>     selfReferences;
+    std::map<std::string, std::shared_ptr<Reference>>            references;
     std::unordered_set<std::string>                              released;
     std::unordered_map<ipc::SessionId, std::shared_ptr<Session>> sessions;
     uint64_t                                                     generation{NewGeneration()};
     uint64_t                                                     revision{};
     bool                                                         owned{false};
     bool                                                         closing{false};
+    bool                                                         telemetryClosed{false};
+    bool                                                         sealed{false};
 
     void Add(std::string const& token, Reference reference)
     {
         std::scoped_lock lock(mutex);
         if (closing) { throw boost::system::system_error(boost::asio::error::try_again, "Checkpoint service is shutting down"); }
         if (released.contains(token)) { throw std::runtime_error("Reference is already released"); }
-        owned = owned || reference.kind != Kind::Self;
+        owned = true;
         references.try_emplace(token, std::make_shared<Reference>(std::move(reference)));
         ++revision;
         changed.notify_all();
@@ -215,6 +183,10 @@ struct ServiceReferences::State
         std::vector<std::pair<std::string, std::shared_ptr<Reference>>> candidates;
         {
             std::scoped_lock lock(mutex);
+            for (auto const& [context, count] : selfReferences)
+            {
+                if (count && (session == NoSession || context.first == session || context.first == NoSession)) { return true; }
+            }
             for (auto const& item : references)
             {
                 if (session == NoSession || item.second->session == session || item.second->session == NoSession)
@@ -227,14 +199,7 @@ struct ServiceReferences::State
         for (auto const& [token, reference] : candidates)
         {
             if (reference->Valid()) { return true; }
-            std::scoped_lock lock(mutex);
-            auto const       it = references.find(token);
-            if (it != references.end() && it->second == reference)
-            {
-                references.erase(it);
-                released.insert(token);
-                ++revision;
-            }
+            if (reference->kind == Kind::Process) { Remove(token, false); }
         }
         return false;
     }
@@ -310,21 +275,42 @@ ServiceReferences::~ServiceReferences()
 
 ServiceReference ServiceReferences::Acquire(std::string_view context, ipc::SessionId session, bool control)
 {
-    auto const token = NewToken();
+    auto const key     = std::make_pair(session, std::string(context));
+    auto const creator = boost::process::v2::current_pid();
     {
         std::scoped_lock lock(_state->mutex);
+        if (_state->sealed && control) { return {}; }
         if (_state->closing && !control) { throw std::runtime_error("Checkpoint service is shutting down"); }
-        _state->references.emplace(token,
-                                   std::make_shared<State::Reference>(State::Reference{
-                                       .kind = State::Kind::Self, .session = session, .context = std::string(context), .process = {}}));
+        ++_state->selfReferences[key];
         ++_state->revision;
         _state->changed.notify_all();
     }
     return {std::shared_ptr<void>(nullptr,
-                                  [state = std::weak_ptr<State>(_state), token](void*) {
-                                      if (auto owner = state.lock()) { owner->Remove(token, false); }
+                                  [state = std::weak_ptr<State>(_state), key, creator](void*) {
+                                      if (boost::process::v2::current_pid() != creator) { return; }
+                                      if (auto owner = state.lock())
+                                      {
+                                          std::scoped_lock lock(owner->mutex);
+                                          if (--owner->selfReferences.at(key) == 0) { owner->selfReferences.erase(key); }
+                                          ++owner->revision;
+                                          owner->changed.notify_all();
+                                      }
                                   }),
             _state->generation};
+}
+
+void ServiceReferences::DrainRequests()
+{
+    std::unique_lock lock(_state->mutex);
+    _state->closing         = true;
+    _state->telemetryClosed = true;
+    _state->changed.wait(lock, [&] { return _state->selfReferences.empty(); });
+}
+
+void ServiceReferences::Seal()
+{
+    std::scoped_lock lock(_state->mutex);
+    _state->sealed = true;
 }
 
 void ServiceReferences::WaitForEmpty(std::atomic<bool> const& stopRequested)
@@ -370,7 +356,10 @@ bool ServiceReferences::HandleRequest(boost::beast::tcp_stream&               st
     {
         {
             std::scoped_lock lock(_state->mutex);
-            if (!_state->closing || target.starts_with("/api/telemetry") || target.starts_with("/v1/")) { return false; }
+            if (!_state->closing || (!_state->telemetryClosed && (target.starts_with("/api/telemetry") || target.starts_with("/v1/"))))
+            {
+                return false;
+            }
         }
         Response response{http::status::service_unavailable, parser.get().version()};
         response.body() = "Checkpoint service is shutting down";
@@ -451,13 +440,19 @@ ServiceReference ServiceReferences::AcquireProcess(ipc::SessionId session, RankT
     {
         throw std::invalid_argument("Invalid checkpoint reference topology");
     }
-    auto const index  = (static_cast<uint32_t>(topology.rank) / topology.ranksPerPeer) % topology.peersPerNode;
-    auto const port   = static_cast<uint16_t>(ipc::Message::Port + index);
-    auto const peer   = fmt::format("localhost:{}", port);
-    auto const token  = NewToken();
-    auto const target = fmt::format("{}process/{}/{}/{}", Prefix, static_cast<uint32_t>(session), boost::process::v2::current_pid(), token);
-    auto const node   = static_cast<uint32_t>(topology.rank) / topology.ranksPerPeer;
-    auto const body   = node == 0 ? std::string{} : topology.peers.at(0) + '\n' + topology.peers.at(node);
+    auto const index = (static_cast<uint32_t>(topology.rank) / topology.ranksPerPeer) % topology.peersPerNode;
+    auto const node  = static_cast<uint32_t>(topology.rank) / topology.ranksPerPeer;
+    return AcquireProcess(session, static_cast<uint16_t>(index), node == 0 ? std::string{} : topology.peers.at(0), topology.peers.at(node));
+}
+
+ServiceReference ServiceReferences::AcquireProcess(ipc::SessionId session, uint16_t index, std::string coordinator, std::string address)
+{
+    auto const creator = boost::process::v2::current_pid();
+    auto const port    = static_cast<uint16_t>(ipc::Message::Port + index);
+    auto const peer    = fmt::format("localhost:{}", port);
+    auto const token   = NewToken();
+    auto const target  = fmt::format("{}process/{}/{}/{}", Prefix, static_cast<uint32_t>(session), creator, token);
+    auto const body    = coordinator.empty() ? std::string{} : coordinator + '\n' + address;
     uint64_t   generation{};
     try
     {
@@ -481,7 +476,8 @@ ServiceReference ServiceReferences::AcquireProcess(ipc::SessionId session, RankT
         }
     }
     return {std::shared_ptr<void>(nullptr,
-                                  [local, peer, token](void*) {
+                                  [local, peer, token, creator](void*) {
+                                      if (boost::process::v2::current_pid() != creator) { return; }
                                       if (auto state = local.lock()) { state->Remove(token, true); }
                                       else
                                       {
