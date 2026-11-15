@@ -177,7 +177,10 @@ def _write_baseline_candidate(args: argparse.Namespace, log: Path, stem: str) ->
             continue
         statistic = slurm_job.PerfReport._statistic(name, metric)
         value = metric[statistic]
-        candidate_metrics[name] = round(value, 2) if name.endswith("_pct") else round(value)
+        if statistic == "range":
+            candidate_metrics[name] = value
+        else:
+            candidate_metrics[name] = round(value, 2) if name.endswith("_pct") else round(value)
     if not candidate_metrics:
         return
     candidate_dir = Path(candidate_dir_value)

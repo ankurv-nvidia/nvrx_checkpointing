@@ -1241,6 +1241,16 @@ def _with_host_memory_metrics(metrics: dict, results_dir: Path, *, native: bool)
         result.update(otel_report.complete_run_process_memory_peaks(results_dir))
     return result
 
+
+def _written_bytes_bounds(name: str, recorded: object) -> tuple[int, int]:
+    """Return the inclusive bounds of a written-bytes baseline recorded as an integer or <lower>+<diff>."""
+    if isinstance(recorded, int) and not isinstance(recorded, bool):
+        return recorded, recorded
+    if isinstance(recorded, str) and (match := re.fullmatch(r"(\d+)\+(\d+)", recorded)):
+        return int(match[1]), int(match[1]) + int(match[2])
+    raise ValueError(f"baseline {name} must be an integer or <lower>+<diff>, not {recorded!r}")
+
+
 class PerfReport:
     @staticmethod
     def _platform_bandwidth_baseline(platform: str) -> int | None:
@@ -1291,6 +1301,8 @@ class PerfReport:
 
     @staticmethod
     def _statistic(name: str, measured: dict) -> str:
+        if name in otel_report.WRITTEN_BYTES_METRICS:
+            return "range"
         if name in {
             *HOST_MEMORY_METRICS,
             "gpu_hbm_peak_bytes",
@@ -1331,6 +1343,9 @@ class PerfReport:
             elif name not in expected and not diagnostic:
                 result[name] = {"status": "info" if higher is None else "no_baseline", "measured": value}
                 continue
+            elif statistic == "range":
+                low, high = _written_bytes_bounds(name, expected[name])
+                ok, target, tolerance = low <= measured["min"] and measured["max"] <= high, expected[name], 0
             else:
                 target = float(expected.get(name, 1))
                 fallback = WIDE_TOLERANCE_METRICS.get(name, 0 if higher is None else default_tolerance)
@@ -1815,11 +1830,11 @@ def _write_performance_baseline(args: argparse.Namespace, results_dir: Path) -> 
         if statistic in value:
             measured_value = value[statistic]
             preserve_decimals = name.endswith("_pct") or name.startswith("megatron.training.")
-            if name == "total_written_bytes":
+            if statistic == "range":
                 metrics[name] = measured_value
             else:
                 metrics[name] = round(measured_value, 2) if preserve_decimals else round(measured_value)
-        if {"rank_min", "rank_median", "rank_max"} <= value.keys():
+        if statistic != "range" and {"rank_min", "rank_median", "rank_max"} <= value.keys():
             rank_statistics[name] = {
                 "min": round(value["rank_min"], 2),
                 "median": round(value["rank_median"], 2),

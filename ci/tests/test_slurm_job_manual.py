@@ -4052,7 +4052,10 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         ),
     )
     (tmp_path / "checkpoint_server.cycle1.log").write_text("")
-    baseline = '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}'
+    baseline = (
+        '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes_total":100,'
+        '"total_written_bytes_rank0":100,"total_written_bytes_per_rank":"90+20"}}'
+    )
     # The epilog compares the options the run trained on as well as its
     # numbers, so record the ones this log carries.
     monkeypatch.setenv("PLATFORM", "devbox")
@@ -4103,7 +4106,9 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
         "metrics": {
             "bw_mbps": 150000,
             "wr_tnsr_us": 10,
-            "total_written_bytes": 100,
+            "total_written_bytes_total": 100,
+            "total_written_bytes_rank0": 100,
+            "total_written_bytes_per_rank": 100,
             "megatron.training.memory_allocated_gb": 60,
         },
         "rank_statistics": {
@@ -4111,11 +4116,12 @@ def test_batch_epilog_reports_from_embedded_baseline_without_yaml(monkeypatch: p
             for name, value in {
                 "bw_mbps": 150000,
                 "wr_tnsr_us": 10,
-                "total_written_bytes": 100,
                 "megatron.training.memory_allocated_gb": 60.0,
             }.items()
         },
     }
+    report = json.loads(next(tmp_path.glob("*_report.json")).read_text())
+    assert report["comparison"]["total_written_bytes_per_rank"]["status"] == "PASS"
 
 
 def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -4156,7 +4162,7 @@ def test_batch_epilog_reads_task_logs_of_an_array_run(monkeypatch: pytest.Monkey
             "--log-file",
             str(log),
             "--baseline-json",
-            '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes":100}}',
+            '{"metrics":{"bw_mbps":140000,"wr_tnsr_us":10,"total_written_bytes_total":100}}',
         ],
     )
 
@@ -4229,7 +4235,17 @@ def test_native_perf_baselines_only_stable_checkpoint_save_gpu_gates(
         "metrics": {
             "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
             "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
-            "total_written_bytes": {"mean": 100.25, "higher_is_better": None, "unit": "B"},
+            "total_written_bytes_total": {"range": "401+64", "mean": 422.33, "higher_is_better": None, "unit": "B"},
+            "total_written_bytes_rank0": {"range": "101+64", "mean": 122.33, "higher_is_better": None, "unit": "B"},
+            "total_written_bytes_per_rank": {
+                "range": "100+65",
+                "mean": 105.58,
+                "rank_min": 100,
+                "rank_median": 100,
+                "rank_max": 101,
+                "higher_is_better": None,
+                "unit": "B",
+            },
             "megatron.training.memory_allocated_gb": {"max": 20, "higher_is_better": False, "unit": "GB"},
             "checkpoint_save_gpu_allocated_during_save_bytes": {
                 "mean": 4096,
@@ -4261,7 +4277,12 @@ def test_native_perf_baselines_only_stable_checkpoint_save_gpu_gates(
         "checkpoint_save_gpu_transient_activity_within_limit",
         "checkpoint_save_gpu_invariant_satisfied",
     }
-    assert candidate["metrics"]["total_written_bytes"] == 100.25
+    assert {name: value for name, value in candidate["metrics"].items() if name.startswith("total_written_bytes")} == {
+        "total_written_bytes_total": "401+64",
+        "total_written_bytes_rank0": "101+64",
+        "total_written_bytes_per_rank": "100+65",
+    }
+    assert "rank_statistics" not in candidate
 
 
 def test_native_perf_refuses_an_incomplete_baseline_candidate(
@@ -4309,13 +4330,22 @@ def test_log_report_writes_exact_byte_baseline_candidate(monkeypatch: pytest.Mon
         flavors=slurm_job.FlavorSelection(["perf", "native"]),
     )
     _cfg, _flavor, stem = slurm_job._identity(args)
+    daemon_text = "\n".join(
+        _perf_finished(rank=rank, written_bytes=written, snapshot=snapshot)
+        for snapshot, rank, written in ((1, 0, 1000), (1, 1, 900), (2, 0, 1064), (2, 1, 900))
+    )
+    written_bytes = {
+        name: metric
+        for name, metric in slurm_job.log_report._metrics("", daemon_text, 4).items()
+        if name.startswith("total_written_bytes")
+    }
     report = {
         "telemetry_source": "logs",
         "ckpt_save_markers_valid": True,
         "metrics": {
             "bw_mbps": {"median": 150000, "higher_is_better": True, "unit": "MB/s"},
             "wr_tnsr_us": {"median": 10, "higher_is_better": False, "unit": "us"},
-            "total_written_bytes": {"mean": 100.25, "higher_is_better": None, "unit": "B"},
+            **written_bytes,
             "checkpoint_daemon_peak_rss_bytes": {"max": 200, "higher_is_better": False, "unit": "B"},
             "training_process_peak_rss_bytes": {"max": 300, "higher_is_better": False, "unit": "B"},
         },
@@ -4329,7 +4359,9 @@ def test_log_report_writes_exact_byte_baseline_candidate(monkeypatch: pytest.Mon
     assert candidate["metrics"] == {
         "bw_mbps": 150000,
         "wr_tnsr_us": 10,
-        "total_written_bytes": 100.25,
+        "total_written_bytes_total": "1900+64",
+        "total_written_bytes_rank0": "1000+64",
+        "total_written_bytes_per_rank": "900+164",
         "checkpoint_daemon_peak_rss_bytes": 200,
         "training_process_peak_rss_bytes": 300,
     }
@@ -4783,7 +4815,15 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
             "pico_1x1",
             "perf",
             log,
-            {"metrics": {"bw_mbps": 150000, "wr_tnsr_us": 10, "total_written_bytes": 100}},
+            {
+                "metrics": {
+                    "bw_mbps": 150000,
+                    "wr_tnsr_us": 10,
+                    "total_written_bytes_total": 100,
+                    "total_written_bytes_rank0": 100,
+                    "total_written_bytes_per_rank": "100+0",
+                },
+            },
             report_path,
             1,
         )
@@ -4798,6 +4838,9 @@ def test_perf_report_uses_logs_only_when_otel_is_disabled(
     assert "[no_baseline] training_process_peak_rss_bytes: max=10 B" in caplog.text
     assert "[no_baseline] checkpoint_daemon_peak_rss_bytes: max=20 B" in caplog.text
     assert ("[PASS] wr_tnsr_us: median=10 us (min=8 us, median=10 us, max=12 us); baseline=10.0 us; tolerance=5.0%") in caplog.messages
+    assert (
+        "[PASS] total_written_bytes_per_rank: range=100 B (min=100 B, median=100 B, max=100 B); baseline=100+0 B; tolerance=0%"
+    ) in caplog.messages
 
 
 def test_perf_report_explicit_log_reporting_overrides_otel_environment(
@@ -4973,7 +5016,7 @@ def test_native_perf_report_cannot_pass_on_memory_metrics_alone(
             "pico_1x1",
             "perf-native",
             log,
-            {"metrics": {"bw_mbps": 100, "wr_tnsr_us": 10, "total_written_bytes": 100, "gpu_peak_bytes": 100}},
+            {"metrics": {"bw_mbps": 100, "wr_tnsr_us": 10, "total_written_bytes_total": 100, "gpu_peak_bytes": 100}},
             report_path,
             1,
         )

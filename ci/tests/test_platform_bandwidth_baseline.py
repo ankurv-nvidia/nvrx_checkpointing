@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ci" / "scripts"))
 
 from slurm_job import PERF_TOLERANCE, PerfReport, otel_report
@@ -12,7 +14,7 @@ from slurm_job import PERF_TOLERANCE, PerfReport, otel_report
 def _otel_data(rows: list[tuple[float, int]]) -> dict[str, list]:
     return {
         "native_saves": [
-            {"rank": rank, "bw_mbps": bandwidth, "wr_tnsr_us": write_us, "total_written_bytes": 100}
+            {"rank": rank, "snapshot_id": 1, "bw_mbps": bandwidth, "wr_tnsr_us": write_us, "total_written_bytes": 100}
             for rank, (bandwidth, write_us) in enumerate(rows)
         ],
         "daemon_durable_spans": [],
@@ -86,3 +88,39 @@ def test_timing_baselines_use_steady_state_median() -> None:
     assert comparison["bw_mbps"]["statistic"] == "median"
     assert comparison["wr_tnsr_us"]["measured"] == 20500
     assert comparison["wr_tnsr_us"]["statistic"] == "median"
+
+
+def test_written_bytes_pass_only_inside_the_recorded_value_or_range() -> None:
+    metrics = otel_report.written_bytes_metrics(
+        [(0, 1, 1000), (1, 1, 900), (0, 2, 1000), (1, 2, 900), (0, 3, 1064), (1, 3, 900)],
+    )
+    recorded = {
+        "total_written_bytes_total": "1900+64",
+        "total_written_bytes_rank0": "1000+64",
+        "total_written_bytes_per_rank": "890+200",
+    }
+
+    comparison, passed = PerfReport._compare_to_baseline(metrics, {"metrics": recorded}, PERF_TOLERANCE)
+    exact = {**recorded, "total_written_bytes_total": 1900, "total_written_bytes_rank0": "1000+63"}
+    exact_comparison, exact_passed = PerfReport._compare_to_baseline(metrics, {"metrics": exact}, PERF_TOLERANCE)
+
+    assert passed
+    assert {name: entry["measured"] for name, entry in comparison.items()} == {
+        "total_written_bytes_total": "1900+64",
+        "total_written_bytes_rank0": "1000+64",
+        "total_written_bytes_per_rank": "900+164",
+    }
+    assert not exact_passed
+    assert {name: entry["status"] for name, entry in exact_comparison.items()} == {
+        "total_written_bytes_total": "FAIL",
+        "total_written_bytes_rank0": "FAIL",
+        "total_written_bytes_per_rank": "PASS",
+    }
+
+
+@pytest.mark.parametrize("recorded", [1900.5, "1900-1964", "1900+", True])
+def test_written_bytes_baselines_must_be_integers_or_ranges(recorded: object) -> None:
+    metrics = otel_report.written_bytes_metrics([(0, 1, 1000), (1, 1, 900)])
+
+    with pytest.raises(ValueError, match="must be an integer or <lower>"):
+        PerfReport._compare_to_baseline(metrics, {"metrics": {"total_written_bytes_total": recorded}}, PERF_TOLERANCE)

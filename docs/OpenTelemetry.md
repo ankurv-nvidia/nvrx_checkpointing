@@ -157,6 +157,13 @@ ranks in the JSON report and generated baseline candidate. Checkpoint durability
 paired and summarized independently for every Megatron exporter rank. Coordinator-only
 durability has no rank aggregation.
 
+Native saves report written bytes as `total_written_bytes_total` (each checkpoint's
+sum over ranks), `total_written_bytes_rank0` (rank 0's bytes per checkpoint), and
+`total_written_bytes_per_rank` (every rank's bytes per checkpoint). Each baseline holds
+one integer or `<lower>+<diff>`, the inclusive range from `lower` to `lower + diff`, and
+a run passes only when every sample falls inside it. Candidates record the integer when
+every sample agrees and the range otherwise, without rank statistics.
+
 After the reports, the epilog logs each phase's checkpoint timings as min, max, and
 median milliseconds across ranks: every load, every exposed save, and, for each
 asynchronous save, the finalize call that completed it

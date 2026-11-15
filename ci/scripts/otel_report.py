@@ -22,8 +22,11 @@ _ATTR_PREFIX = "nvrx."
 MEGATRON_PERF_METRICS = {
     "megatron.training.memory_allocated_gb": ("GB", False),
 }
+WRITTEN_BYTES_METRICS = frozenset(
+    {"total_written_bytes_total", "total_written_bytes_rank0", "total_written_bytes_per_rank"},
+)
 REQUIRED_PERF_METRICS = frozenset(
-    {"bw_mbps", "wr_tnsr_us", "total_written_bytes", *MEGATRON_PERF_METRICS},
+    {"bw_mbps", "wr_tnsr_us", *WRITTEN_BYTES_METRICS, *MEGATRON_PERF_METRICS},
 )
 logger = logging.getLogger("native_ci")
 _MIN_SOCKET_RANKS = 4
@@ -499,6 +502,28 @@ def metric(
     return result
 
 
+def _byte_metric(samples: list[int], ranks: list[int] | None = None) -> dict:
+    low, high = min(samples), max(samples)
+    return {**metric(samples, "B", higher_is_better=None, ranks=ranks), "range": low if low == high else f"{low}+{high - low}"}
+
+
+def written_bytes_metrics(saves: list[tuple[int, int, int]]) -> dict:
+    """Summarize (rank, snapshot, bytes) saves as checkpoint totals, rank 0's bytes, and every rank's bytes."""
+    totals: dict[int, int] = {}
+    for _rank, snapshot, written in saves:
+        totals[snapshot] = totals.get(snapshot, 0) + written
+    metrics = {
+        "total_written_bytes_total": _byte_metric([totals[snapshot] for snapshot in sorted(totals)]),
+        "total_written_bytes_per_rank": _byte_metric(
+            [written for _rank, _snapshot, written in saves],
+            [rank for rank, _snapshot, _written in saves],
+        ),
+    }
+    if rank0 := [written for rank, _snapshot, written in saves if rank == 0]:
+        metrics["total_written_bytes_rank0"] = _byte_metric(rank0)
+    return metrics
+
+
 def _checkpoint_timing_run_id(spans: list[dict], path: Path, run_id: str | None) -> str:
     if run_id is not None:
         return run_id
@@ -781,17 +806,22 @@ def completed_finalize_calls(spans: list[dict]) -> list[tuple[int, int, dict]]:
 
 
 def _native_metrics(samples: list[dict], gpus_per_node: int | None) -> dict:
-    rows = [sample for sample in samples if {"rank", "bw_mbps", "wr_tnsr_us", "total_written_bytes"} <= sample.keys()]
+    rows = [
+        sample
+        for sample in samples
+        if {"rank", "snapshot_id", "bw_mbps", "wr_tnsr_us", "total_written_bytes"} <= sample.keys()
+    ]
     ranks = [int(sample["rank"]) for sample in rows]
     bandwidth = [round(float(sample["bw_mbps"])) for sample in rows]
     write = [int(sample["wr_tnsr_us"]) for sample in rows]
-    written = [int(sample["total_written_bytes"]) for sample in rows]
     if not ranks:
         return {}
     metrics = {
         "bw_mbps": metric(bandwidth, "MB/s", higher_is_better=True, ranks=ranks),
         "wr_tnsr_us": metric(write, "us", higher_is_better=False, ranks=ranks),
-        "total_written_bytes": metric(written, "B", higher_is_better=None, ranks=ranks),
+        **written_bytes_metrics(
+            [(rank, int(sample["snapshot_id"]), int(sample["total_written_bytes"])) for rank, sample in zip(ranks, rows)],
+        ),
     }
     unique = sorted(set(ranks))
     per_rank = [statistics.mean(value for rank_value, value in zip(ranks, bandwidth) if rank_value == rank) for rank in unique]

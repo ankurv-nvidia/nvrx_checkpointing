@@ -253,6 +253,38 @@ def test_iter_samples_extracts_per_rank(tmp_path):
     assert by_rank[1]["total_written_bytes"] == 4096
 
 
+@pytest.mark.parametrize(
+    ("rank0_bytes", "expected"),
+    [
+        ((1000, 1000, 1000), {"total": 2850, "rank0": 1000, "per_rank": "900+100"}),
+        ((1000, 1000, 1064), {"total": "2850+64", "rank0": "1000+64", "per_rank": "900+164"}),
+    ],
+)
+def test_written_bytes_cover_each_checkpoint_rank_zero_and_every_rank(
+    tmp_path: Path,
+    rank0_bytes: tuple[int, ...],
+    expected: dict,
+) -> None:
+    spans = [
+        _save_span(rank, 100.0, 200, written, snapshot_id=snapshot)
+        for snapshot, rank0 in zip((125, 250, 375), rank0_bytes)
+        for rank, written in ((0, rank0), (1, 900), (2, 950))
+    ]
+    data = {
+        "native_saves": otel_report.collect_samples([_write_jsonl(tmp_path / "t.jsonl", spans)]),
+        "daemon_durable_spans": [],
+        "megatron_spans": [],
+        "megatron_metrics": [],
+        "resource_metrics": [],
+    }
+
+    metrics = otel_report.metrics_from_data(data)
+
+    assert "total_written_bytes" not in metrics
+    assert metrics["total_written_bytes_total"]["samples"] == [2850, 2850, 2850 + rank0_bytes[2] - 1000]
+    assert {name: metrics[f"total_written_bytes_{name}"]["range"] for name in expected} == expected
+
+
 def test_save_gpu_memory_events_are_reported_as_metrics(tmp_path: Path) -> None:
     path = _write_jsonl(tmp_path / "telemetry.jsonl", [_gpu_memory_span(0), _gpu_memory_span(1)])
     events = otel_report.collect_save_gpu_memory_events([path], "run-1")

@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import yaml
 
 JET_DIR = Path(__file__).resolve().parents[2] / "ci" / "jet"
 
@@ -234,3 +235,40 @@ def test_failed_run_telemetry_does_not_stop_the_archive(
 
     assert calls == [(args, log, tmp_path / "run")]
     assert "no timestamped OTLP records found" in capsys.readouterr().err
+
+
+def test_baseline_candidate_records_written_byte_ranges_verbatim(
+    workload: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scripts = JET_DIR.parent / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("jet_candidate_slurm_job", scripts / "slurm_job.py")
+    assert spec is not None
+    assert spec.loader is not None
+    slurm_job = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, slurm_job)
+    spec.loader.exec_module(slurm_job)
+    monkeypatch.setattr(slurm_job, "_performance_baseline_stem", lambda _args: "gb200_native-perf_pico_1x4")
+    monkeypatch.setattr(slurm_job, "_selected_flavors", lambda _args: slurm_job.FlavorSelection(["perf", "native"]))
+    monkeypatch.setattr(slurm_job.PerfReport, "baseline", staticmethod(lambda _stem: {"metrics": {}}))
+    monkeypatch.setattr(workload, "slurm_job", slurm_job)
+    monkeypatch.setenv("CI_BASELINE_CANDIDATE_DIR", str(tmp_path / "candidates"))
+    monkeypatch.delenv("JET_BASELINE_BOOTSTRAP", raising=False)
+    log = tmp_path / "pico.log"
+    metrics = {
+        "wr_tnsr_us": {"median": 10.4, "mean": 11.6, "higher_is_better": False},
+        "total_written_bytes_total": {"range": "1900+64", "mean": 1921.33, "higher_is_better": None},
+        "total_written_bytes_rank0": {"range": 1000, "mean": 1000, "higher_is_better": None},
+    }
+    log.with_name("pico_report.json").write_text(json.dumps({"metrics": metrics}))
+
+    workload._write_baseline_candidate(SimpleNamespace(), log, "pico")
+
+    candidate = yaml.safe_load((tmp_path / "candidates" / "gb200_native-perf_pico_1x4.yaml").read_text())
+    assert candidate["metrics"] == {
+        "wr_tnsr_us": 10,
+        "total_written_bytes_total": "1900+64",
+        "total_written_bytes_rank0": 1000,
+    }
