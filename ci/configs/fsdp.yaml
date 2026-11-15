@@ -8,6 +8,7 @@ ci:
 use-megatron-fsdp: true
 data-parallel-sharding-strategy: optim_grads_params
 ckpt-format: fsdp_dtensor
+megatron-fsdp-main-grads-dtype: fp32
 
 # Experts use unquantized parameters and unfused gradient accumulation.
 expert-tensor-parallel-size: 1
