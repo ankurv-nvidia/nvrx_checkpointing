@@ -1011,9 +1011,7 @@ static std::array<char, sizeof(uint64_t)> EncodeScalar(StateNode::Scalar const& 
     {
         throw std::runtime_error("distcp: unsupported scalar type");
     }
-    std::array<char, sizeof(bits)> bytes{};
-    for (size_t index = 0; index < bytes.size(); ++index) { bytes[index] = static_cast<char>((bits >> (index * 8)) & ByteMask); }
-    return bytes;
+    return std::bit_cast<std::array<char, sizeof(bits)>>(bits);
 }
 
 static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
@@ -1163,18 +1161,12 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     return b;
 }
 
-std::unordered_map<std::string, uint64_t>
-WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
+void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
 {
     BlobsByFqn                                                blobs = CollectBlobs(registry, tensorStorage, rank);
     std::map<std::string, std::array<char, sizeof(uint64_t)>> scalarData;
-    std::unordered_map<std::string, uint64_t>                 dynamicBlobSizes;
     registry.WalkNodes([&](StateNode const& node) {
-        if (auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data))
-        {
-            if (blob->replicas.contains(rank)) { dynamicBlobSizes.emplace(registry.GetNodeId(node.handle), blob->storageSize); }
-        }
-        else if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data); scalar != nullptr && scalar->replicas.contains(rank))
+        if (auto const* scalar = std::get_if<StateNode::Scalar>(&node.data); scalar != nullptr && scalar->replicas.contains(rank))
         {
             auto const fqn               = registry.GetNodeId(node.handle);
             auto const [entry, inserted] = scalarData.emplace(fqn, EncodeScalar(*scalar));
@@ -1202,7 +1194,7 @@ WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const&
         std::error_code ec;
         std::filesystem::remove(filepath, ec);
         if (ec) { throw std::system_error(ec, fmt::format("distcp: remove({}) failed", filepath.string())); }
-        return dynamicBlobSizes;
+        return;
     }
 
     std::filesystem::create_directories(ckptDir);
@@ -1253,7 +1245,6 @@ WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const&
         cursor += bytes.size();
     }
     FinishOutputFile(output, filepath);
-    return dynamicBlobSizes;
 }
 
 void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry)
@@ -1682,12 +1673,9 @@ static uint64_t CheckedMultiply(uint64_t left, uint64_t right)
     return left * right;
 }
 
-static uint64_t ElementSize(Tensor::DType dtype)
-{ return dtype == Tensor::DType::Bool ? uint64_t{1} : Tensor::GetDTypeSize(dtype); }
-
 static uint64_t DenseSize(Tensor::DimRange const& ranges, Tensor::DType dtype)
 {
-    uint64_t result = ElementSize(dtype);
+    uint64_t result = Tensor::GetDTypeSize(dtype);
     for (auto const range : ranges)
     {
         if (range.end < range.begin) { throw std::runtime_error("distcp: inverted tensor range"); }
@@ -1708,20 +1696,9 @@ static Tensor::DType MetadataDtype(PickleRef const& properties)
         throw std::runtime_error("distcp: invalid tensor datatype");
     }
     auto const name = std::string_view(value->text).substr(6);
-    for (auto dtype : {Tensor::DType::Float16,
-                       Tensor::DType::BFloat16,
-                       Tensor::DType::Float32,
-                       Tensor::DType::Float64,
-                       Tensor::DType::UInt8,
-                       Tensor::DType::UInt16,
-                       Tensor::DType::UInt32,
-                       Tensor::DType::UInt64,
-                       Tensor::DType::Int8,
-                       Tensor::DType::Int16,
-                       Tensor::DType::Int32,
-                       Tensor::DType::Int64,
-                       Tensor::DType::Bool})
+    for (auto type = static_cast<uint8_t>(Tensor::DType::Float16); type <= static_cast<uint8_t>(Tensor::DType::Bool); ++type)
     {
+        auto const dtype = static_cast<Tensor::DType>(type);
         if (DTypeName(dtype) == name) { return dtype; }
     }
     throw std::runtime_error(fmt::format("distcp: unsupported tensor datatype '{}'", name));
@@ -1830,7 +1807,7 @@ static ByteStorage ReadTensorArchive(ByteStorage const& bytes, Tensor::DimRange 
         {
             throw std::runtime_error("distcp: tensor archive dimensions disagree with checkpoint metadata");
         }
-        auto size = ElementSize(dtype);
+        auto size = Tensor::GetDTypeSize(dtype);
         for (size_t axis = 0; axis < ranges.size(); ++axis)
         {
             if (shape[axis] != ranges[axis].end - ranges[axis].begin)
@@ -1864,7 +1841,7 @@ static ByteStorage ReadTensorArchive(ByteStorage const& bytes, Tensor::DimRange 
             auto const storageKey    = MetadataText(persistent->items[0]->items[2]);
             auto const raw           = ZipEntry(archive, prefix + "data/" + storageKey);
             auto const storageOffset = MetadataNumber(tensor->items[1]);
-            auto const elementSize   = ElementSize(dtype);
+            auto const elementSize   = Tensor::GetDTypeSize(dtype);
             auto const elements      = size / elementSize;
             uint64_t   blockElements{1};
             for (size_t axis = shape.size(); axis != 0; --axis)
@@ -1940,7 +1917,7 @@ static uint64_t CopyIntersection(ByteStorage const&      source,
         if (end <= begin) { return 0; }
         intersection.push_back({.begin = begin, .end = end});
     }
-    auto const elementSize = ElementSize(dtype);
+    auto const elementSize = Tensor::GetDTypeSize(dtype);
     auto const size        = DenseSize(intersection, dtype);
     uint64_t   blockElements{1};
     size_t     blockAxis = intersection.size();

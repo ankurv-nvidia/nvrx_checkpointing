@@ -13,6 +13,7 @@ from argparse import Namespace
 from typing import TYPE_CHECKING
 
 import _distcp_shim
+import numpy as np
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -245,6 +246,49 @@ def test_independent_scalar_conflicts_with_archived_leaf(tmp_path: Path) -> None
         debug.load_common_state_dict(tmp_path)
     with pytest.raises(ValueError, match=r"Conflicting archived and independent scalar value: optimizer\.group\.lr"):
         distcp_trace(tmp_path, extract_tensor_data=False, verify_native_server=False)
+
+
+@pytest.mark.parametrize("value_type", [float, np.float32, np.float64])
+def test_independent_scalar_detects_archived_signed_zero(tmp_path: Path, value_type: type) -> None:
+    _write_scalar_checkpoint(tmp_path, {"value": 0.0}, {"value": value_type(-0.0)})
+
+    with pytest.raises(ValueError, match="Conflicting archived and independent scalar value: value"):
+        debug.load_common_state_dict(tmp_path)
+    with pytest.raises(ValueError, match="Conflicting archived and independent scalar value: value"):
+        distcp_trace(tmp_path, extract_tensor_data=False, verify_native_server=False)
+
+
+@pytest.mark.parametrize("payload", [b"abcdefgh", b"different"])
+def test_common_state_preserves_fields_named_like_separate_blobs(tmp_path: Path, payload: bytes) -> None:
+    common = {"payload": b"abcdefgh", "iteration": 7}
+    objects = [(_COMMON_KEY, _archive(common).getvalue()), ("payload", payload)]
+    scalars = {"iteration": 7}
+    _distcp_shim.write_rank_shard(str(tmp_path), 0, [], objects, scalars=scalars)
+    _distcp_shim.write_metadata(str(tmp_path), [], objects, scalars=scalars)
+
+    assert debug.load_common_state_dict(tmp_path) == common
+
+
+def test_rank_bundles_preserve_independent_scalars(tmp_path: Path) -> None:
+    dcp.save(
+        {
+            _COMMON_KEY: _archive({"iteration": 7}),
+            f"{_COMMON_KEY}.rank_1": _archive({"optimizer.group.lr": 0.125}),
+            "iteration": 7,
+        },
+        checkpoint_id=tmp_path,
+    )
+    metadata = dcp.FileSystemReader(tmp_path).read_metadata()
+    index = next(index for index in metadata.storage_data if index.fqn == "iteration")
+    storage = metadata.storage_data[index]
+    with (tmp_path / storage.relative_path).open("r+b") as stream:
+        stream.seek(storage.offset)
+        stream.write(struct.pack("<Q", 7))
+    metadata.storage_data[index] = dataclasses.replace(storage, length=8)
+    metadata.state_dict_metadata["iteration"].nvrx_scalar_type = "uint64"
+    (tmp_path / ".metadata").write_bytes(pickle.dumps(metadata))
+
+    assert debug.load_common_state_dict(tmp_path) == {"iteration": 7, "optimizer.group.lr": 0.125}
 
 
 def test_native_server_scalar_claim_uses_the_eight_payload_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

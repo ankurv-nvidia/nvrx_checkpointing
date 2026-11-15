@@ -105,19 +105,6 @@ def _blob_payload(payload: object, version: int) -> bytes:
     return struct.pack(f"<I{len(replicas)}IQQ", len(replicas), *replicas, 0, storage_size)
 
 
-def _metadata_prefix(version: int) -> bytes:
-    if version < 2:
-        return b""
-    prefix = struct.pack("<II", 0x32525453, version)
-    if version == 4:
-        prefix += struct.pack("<II", 0, 0)
-    elif 5 <= version <= 7:
-        prefix += b"\x01"
-        if version == 6:
-            prefix += struct.pack("<I", 0)
-    return prefix
-
-
 class _Tree:
     """Serializes a hand-built state tree the way the checkpoint daemon does."""
 
@@ -154,7 +141,8 @@ class _Tree:
     def write(self, path: Path, version: int = 1) -> None:
         out = bytearray(struct.pack("<IIIII", self.session_id, self.rank, self.world, 2, 1))
         out += struct.pack("<I", len(_PEER)) + _PEER.encode()
-        out += _metadata_prefix(version)
+        if version >= 2:
+            out += struct.pack("<II", 0x32525453, version)
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
             if version >= 3 and kind == _TENSOR:
@@ -426,7 +414,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("version", [2, 3, 8])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -453,25 +441,6 @@ def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path,
     assert leaves["iteration"].blob["v"] == "metadata only"
 
 
-def test_legacy_native_registry_skips_ordered_logical_planning_metadata(tmp_path: Path) -> None:
-    tree = _Tree(0)
-    tree.add("iteration", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
-    path = tmp_path / "registry.global.bin"
-    tree.write(path, version=6)
-    table = struct.pack("<III", 1, 0, 2)
-    for tensor, cost, offsets, key in ((True, 44, (7,), "weight"), (False, 1, (), "opaque")):
-        table += struct.pack("<?Q", tensor, cost) + _dim(offsets)
-        table += struct.pack("<I", len(key)) + key.encode()
-    prefix = struct.pack("<II", 0x32525453, 6) + b"\x01" + table
-    path.write_bytes(path.read_bytes().replace(_metadata_prefix(6), prefix, 1))
-
-    parsed = registry_tree.read_registry(path)
-
-    assert parsed.trailing == 0
-    report = registry_tree.analyze([path])
-    assert [(leaf.fqn, leaf.kind, leaf.unique) for leaf in report.leaves] == [("iteration", "scalar", 8)]
-
-
 @pytest.mark.parametrize(
     ("filename", "replicas", "expected_ranks"),
     [
@@ -496,14 +465,15 @@ def test_metadata_counts_local_membership_without_replica_hints(
     assert {rank: value[0] for rank, value in leaves["payload"].ranks.items()} == dict.fromkeys(expected_ranks, 17)
 
 
-def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [4, 5, 6, 7, 9])
+def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path, version: int) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=9)
-    with pytest.raises(ValueError, match="unsupported registry version 9"):
+    _Tree(0).write(path, version=version)
+    with pytest.raises(ValueError, match=f"unsupported registry version {version}"):
         registry_tree.read_registry(path)
 
 
-@pytest.mark.parametrize("version", [5, 6, 7, 8])
+@pytest.mark.parametrize("version", [3, 8])
 def test_boolean_scalar_type_uses_current_wire_category(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     tree.add("enabled", _SCALAR, (((4 << 3) | 1, 1), (0,)))
@@ -516,24 +486,3 @@ def test_boolean_scalar_type_uses_current_wire_category(tmp_path: Path, version:
     assert leaves["enabled"].blob["t"] == ("bool" if version == 8 else "unknown")
     assert leaves["byte"].blob["t"] == "uint8"
     assert leaves["enabled"].unique == 1
-
-
-def test_capture_descriptions_do_not_change_registry_values(tmp_path: Path) -> None:
-    path = tmp_path / "registry.global.bin"
-    tree = _Tree(0)
-    tree.add("step", _SCALAR, ((_INT64_BITS, 0), (0, 1)))
-    tree.write(path, version=4)
-    original = registry_tree.read_registry(path)
-    data = path.read_bytes()
-    prefix_size = 20 + 4 + len(_PEER) + 8
-    key = b"checkpoint.objects"
-    metadata = struct.pack("<I", len(key)) + key + struct.pack("<III", 1, 0, 2)
-    for name, offsets in ((b"weight", (0,)), (b"step", None)):
-        metadata += struct.pack("<?Q", offsets is not None, 8 if offsets else 1)
-        metadata += _dim(offsets or ()) + struct.pack("<I", len(name)) + name
-    path.write_bytes(data[:prefix_size] + metadata + data[prefix_size + 8 :])
-
-    parsed = registry_tree.read_registry(path)
-
-    assert parsed.entries == original.entries
-    assert parsed.trailing == 0

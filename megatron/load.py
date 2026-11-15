@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import inspect
 from contextvars import ContextVar
-from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,7 +48,7 @@ def _wrap_load(function: Callable[..., Any]) -> Callable[..., Any]:
             return function(*args, **kwargs)
         state = call.arguments["state_dict"]
         if "args" in state and state["args"] is None and (template := _BOOTSTRAP_TEMPLATE.get()) is not None:
-            state["args"] = deepcopy(template)
+            state["args"] = template
         initialized = dist.is_available() and dist.is_initialized()
         checkpoint.load_checkpoint(
             directory,

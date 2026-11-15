@@ -1,610 +1,127 @@
-# Hand-off: the `dtensor` branch of nvrx_checkpointing
+# dtensor branch hand-off
 
-## Scalar exchange and binding size audit, 2026-11-14
+## Current contract
 
-The owner explicitly permits inline scalar values in registry exchanges.
-Serialization always retains those values. The scalar-scrubbing boolean,
-callsite arguments, and coordinator-side zeroing are removed. Registry wire
-version 8 and the checkpoint format retain their existing layouts. Planning
-uses FQNs, types, geometry, and replica holders; it does not depend on scalar
-values being zero. Snapshot capture continues to refresh local values.
+- Provide Megatron-LM `fsdp_dtensor` save/load parity through the native provider.
+- Preserve the existing `torch_dist` path and its common-state archive.
+- Pass Megatron's preprocessed nested dictionary directly to native capture;
+  do not flatten it in the provider or generate Python `torch.save` blobs.
+- Keep planning and snapshot persistence in the daemon. Add no provider-owned
+  training collectives. Megatron's existing preprocessing remains in use.
+- Use main's FQN/global-range ownership policy. Replicas of the same tensor
+  chunk and replicated scalar values are assumed identical; distinct global
+  ranges are distinct chunks. Do not add tensor writer/source hints.
+- Preserve peer-owned expert optimizer keys and rank-dependent RNG dictionaries.
+- Scalar values may travel inline in registry exchanges. There is no scalar
+  scrubbing flag or coordinator zeroing. Every persisted scalar is an eight-byte
+  little-endian byte entry with its primitive datatype in DCP metadata.
+- Load into the supplied destination dictionary and retain tensor storage,
+  aliases, mutable containers, and runtime object types.
+- Use existing C++ sources and minimal Python integration; no Python load
+  planner/reader classes, extra native-state header, or global format boolean.
 
-The binding size audit compares 2,403 lines with 830 lines on main, a net
-increase of 1,573 lines. Approximately 530 lines are the save encoder moved
-from the deleted header, 360 decode and restore native values, 325 handle
-rank-specific dictionary schemas and source merging, 185 implement request
-scanning, tensor copying, and load orchestration, and 110 support stock object
-archives and common-state inspection. Registration and public binding glue
-account for the remainder. The first load scan is 46 lines, and the load
-entrypoint is 18 lines.
+## Code structure
 
-Shared traversal is feasible, with different operations for capture, load
-requests, and restoration. The existing save functions also encode blob bytes
-and obtain tensor storage, skip some empty values, and use container policies
-that differ between prepared and structured state. Calling them unchanged
-would not provide a metadata-only load request scan. Substantial simplification
-requires revisiting the custom object representation and rank-dictionary
-merging; sharing traversal alone removes only a small part of the total.
-The owner requests this high-level explanation before further design details.
+`megatron/save.py` retains Megatron state-dict generation and FSDP preprocessing.
+The native binding registers supported Python values and local DTensor storage.
+Prepared `torch_dist` registration retains its existing encoding and addresses.
 
-Validation passes 651 Python tests with 84 environment-dependent skips and
-all 69 public load cases. Of 95 native CTest cases, 93 pass in the isolated
-environment; the forwarding case separately passes all 17 assertions, and
-the external registry fixture is unavailable. The fresh two-GPU eight-expert
-MoE CI run resumes at 50 and saves through 125. All five checkpoints match
-exactly, with 3,209 entries at 25/50 and 3,208 at 75/100/125. Worker, epilog,
-argument, save-span, and telemetry checks pass. The earlier four-GPU issue
-remains unresolved.
-The isolated daemon suite passes 98 cases with two CUDA-only skips, including
-all 28 focused native cases.
+Structured save and load use a common visitor in `src/python/bindings.cpp` for
+paths, containers, namespace handling, depth/cycle checks, and tuple identity.
+Leaf actions capture values, build load requests, or restore loaded values.
+`src/python/torch_bindings.cpp` shares tensor geometry extraction; only capture
+obtains payload storage. Load requests accept empty and strided destinations.
 
-## Native three-stage load, 2026-11-14
+Loading has three stages:
 
-The owner approves a native load path with three stages:
+1. Scan the destination dictionary into a local request `StateTree`.
+2. `distcp::ReadCheckpoint` reads global `.metadata`, locates entries across
+   writer files, and fills that tree and owned buffers. Writer rank is independent
+   of the destination rank. Tensor views and overlapping shard ranges are handled
+   in C++, and pickle globals are parsed as inert data.
+3. Traverse the destination again, assign values, and copy tensors into their
+   existing local storage. Runtime argument templates support bootstrap loads.
 
-1. The binding scans the supplied dictionary into a local request registry.
-   Tensor requests contain destination global shape, datatype, and local chunk
-   ranges. The scan reads metadata without copying destination tensor data.
-2. The reader in `distcp.cpp` parses global `.metadata`, locates the requested
-   chunks across writer files, and fills the registry and owned byte buffers.
-   It decodes tensor ZIP archives and assembles overlapping saved ranges.
-   Writer rank is independent of the destination rank.
-3. The binding traverses the destination dictionary again and restores values.
-   Tensor copies target existing local storage. Containers, arrays, enums, and
-   generators use the supplied destinations; missing members are restored from
-   saved structure. Runtime argument templates support bootstrap loads.
-
-The public bindings are `checkpoint.load_checkpoint(path, state_dict, rank=0,
+Public APIs are `checkpoint.load_checkpoint(path, state_dict, rank=0,
 world_size=1, allow_partial_load=False)` and `checkpoint.read_common_state(path)`.
-The existing I/O header declares `distcp::ReadCheckpoint`, which returns owned
-backing storage for the populated state tree. The metadata parser treats pickle
-globals as inert data. It supports the metadata and tensor archive structures
-covered by native checkpoints and stock PyTorch metadata protocols 2, 4, and 5.
-
-`megatron/load.py` contains only function hooks. The Python reader/planner
-classes and Python native codec are removed. The separate `native_state.h` is
-removed; save conversion and load restoration live in the existing binding
-sources. The structured save format, scalar metadata, and daemon owner policy
-retain their existing behavior. Ordinary `torch_dist` loads that use Megatron's
-custom planner continue through that planner.
-
-Unmarked generic DCP byte entries use standard object-archive interpretation.
-A complete Torch archive stored as an unmarked opaque blob is ambiguous with
-a standard DCP object archive. Structured native byte values have an explicit
-storage kind and retain exact bytes, including embedded Torch archives. Debug
-tools retain inspection of the earlier branch's common-state bundles.
-
-Validation passes 651 Python tests with 84 environment-dependent skips. The
-focused load/debug suite passes all 80 cases, including native loads with
-Python checkpoint readers disabled. The CPU public-load suite passes all 69
-cases. Of 94 native CTest cases, 92 pass in the isolated environment; the
-forwarding case separately passes all 17 assertions, and the external registry
-fixture is unavailable. The three new native reader cases pass 21 assertions.
-Another 21 stock-checkpoint variants cover metadata protocols, tensor views,
-booleans, scalar tensors, and empty tensors.
-The isolated daemon suite passes 98 cases with two CUDA-only skips, including
-all 28 focused native cases.
-
-The fresh two-GPU eight-expert MoE CI run resumes both ranks at iteration 50
-and saves through 125. All five checkpoints match the reference exactly:
-3,209 entries at 25/50 and 3,208 at 75/100/125, with no missing, extra, or
-changed entries. Worker, epilog, argument, save-span, and telemetry checks pass.
-
-The earlier four-GPU tensor comparison issue remains open. Globally empty
-DTensor capture remains the separate coverage boundary described below.
-
-## Independent scalar storage, 2026-11-14
-
-The owner requires independent scalar persistence for every state node,
-including `torch_dist`, without a native-format boolean. Existing common-state
-archive generation is retained for a separate cleanup.
-
-- State registries, planning, and the daemon contain no format mode. Registry
-  wire version 8 contains the node tree without a format byte. Debug tools
-  retain support for earlier registry versions.
-- Every scalar is an eight-byte little-endian DCP byte entry. Its byte-storage
-  metadata records `int64`, `uint64`, `float64`, or `bool`; unmarked blobs remain
-  distinct. Booleans have an intrinsic primitive category. Full signed and
-  unsigned 64-bit integer ranges are supported.
-- The prepared registration API retains its existing input conversion. The
-  structured registration API accepts the nested FSDP state dictionary. The
-  binding retains the scanner locally so later captures use the same traversal;
-  that choice does not enter state registries or daemon planning.
-- Planning and peer messages scrub scalar values. Captures contain current
-  local values. The load adapter restores raw scalars into destination objects
-  while retaining tensor and container references. Debug comparisons merge
-  independent scalars with existing archives and reject conflicting values.
-- Structured state records identify `fsdp_dtensor` output. Ordinary output
-  retains the `torch_dist` format marker and common-state archive.
-
-The class layout in the load adapter and the separate native encoder/decoder
-files are implementation choices. They are not requirements of DTensor or DCP.
-The adapter retains compatibility with the branch's earlier object bundles.
-The structured codec supports container keys, arrays, enums, namespaces, and
-RNG generators without generating Python `torch.save` object archives.
-
-The fresh two-GPU eight-expert MoE CI run uses EP2, TP1, and DP2. Both ranks
-resume at iteration 50 and save through 125. All five checkpoints match the
-reference exactly: 3,209 entries at 25/50 and 3,208 at 75/100/125. Its worker,
-epilog, argument, save-span, and telemetry checks pass. There is no new
-four-GPU result; the discrepancy described below remains unresolved.
-
-Validation passes 639 Python tests with 84 environment-dependent skips and
-98 isolated daemon cases with two CUDA-only skips. All 28 focused native
-cases pass. Of 91 native CTest cases, 89 pass in the isolated environment;
-the forwarding case separately passes all 17 assertions, and the external
-registry fixture is unavailable. All 18 Python-backed CTests also pass against
-the final wheel.
-
-Globally empty DTensors remain a coverage boundary: capture omits their keys,
-so strict loading lacks their metadata. Empty ordinary tensors are supported.
-The exercised MoE models do not contain globally empty DTensors.
-
-## Replica consistency cleanup, 2026-11-14
-
-The owner requires identical data for replicas of the same logical tensor
-chunk. Distinct global shard ranges represent distinct data and remain separate
-in the checkpoint. Under this invariant, DCP's choice between replica holders
-does not affect checkpoint contents.
-
-The cleanup removes the daemon's `CheckpointWriteItem` and `nativeWriteItems`
-representations, binding export, wire table, and DCP-specific tensor owner
-override. Native tensor capture uses main's existing FQN/range owner selection.
-Registry wire version 7 contains the native-format flag and node tree; the debug
-reader retains support for historical registry formats. Scalar persistence,
-metadata-only peer exchange, native value encoding, and load-into behavior stay
-in place. The persisted native schema retains its descriptions for restoring
-rank-specific non-tensor objects; those descriptions are not daemon hints.
-
-Tests use identical tensor replicas across ranks, retain distinct-shard and
-uneven-shard coverage, and compare saved values with stock DCP. Fixtures no
-longer require a particular DCP writer for inconsistent replica values.
-
-The earlier four-GPU comparison failure remains unexplained. Matching DCP's
-writer choice made the comparison pass, but the archived artifacts do not
-contain per-rank input or captured payload hashes. They do not establish that
-valid replicas contained different values. Aggregate emitted shapes and chunk
-ranges match reference metadata. Diagnosing the difference requires per-rank
-FQN, mesh, placements, global shape, chunk ranges, and payload hashes before
-registration and capture. The successful run below applies to the earlier
-implementation with the DCP owner override enabled.
-
-Fresh cleanup validation passes 610 Python tests with 82 environment-dependent
-skips, 90 native CTest cases with one absent-registry fixture skip, and all 26
-focused native cases. The two/four-rank CPU comparisons match stock DCP with
-consistent replicas and peer-owned entries. The local two-GPU eight-expert MoE
-CI flow resumes at iteration 50 and saves through 125; all five checkpoints
-match exactly, with 3,209 entries at 25/50 and 3,208 at 75/100/125. Its worker,
-epilog, argument-baseline, save-span, and telemetry checks pass. The cleanup has
-no fresh four-GPU model result; the unexplained comparison issue remains open.
-
-## Earlier native structured state, 2026-11-14
-
-The owner subsequently approved preserving the nested state dictionary, removing
-Python `torch.save` serialization from the FSDP save path, and restoring values
-into the state dictionary supplied at load. This section supersedes the older
-implementation descriptions below.
-
-- Python retains Megatron's FSDP preprocessing and passes the nested dictionary
-  to native registration. The native walker captures local DTensor storage and
-  supported values without constructing a Python flattened dictionary.
-  Megatron's retained uneven-shard preprocessing still uses training-rank
-  collectives, as accepted in the discussion below.
-- Numeric leaves remain scalar state nodes. The native-mode daemon writer emits
-  their eight-byte values as DCP byte entries. Other supported values use an
-  explicit native encoding; arbitrary Python objects are rejected.
-- Tensor-free dictionaries retain rank-local records so dynamic keys and
-  peer-owned expert optimizer metadata survive. The load adapter combines the
-  dictionaries and restores destination container, enum, array, and generator
-  types while preserving mutable destination objects and tensor references.
-- The daemon retains main's snapshot registry and scalar/blob writer selection.
-  Native tensor owners follow DCP's ordered logical planning metadata because
-  replicated model and optimizer tensors can contain different values. Peer
-  registry messages contain metadata, scrub scalar values, and never forward
-  snapshot payloads. The ordinary `torch_dist` path retains its existing format
-  and behavior.
-- Megatron's expert RNG tracker contains different generator states under one
-  logical key on different ranks. The native schema records ordered logical
-  item descriptions so load can reproduce PyTorch DCP's selection among the
-  retained dictionary values. The same logical descriptions select tensor
-  writers before capture without provider-owned training collectives.
-- Replicated scalar values are assumed consistent. A tensor copy discarded
-  during capture cannot be recovered during load, so its owner selection is
-  part of checkpoint compatibility. Exact model checkpoint comparisons remain
-  the acceptance test.
-
-November 14 validation passes 609 Python tests, with 82 environment-dependent
-skips, and 91 native CTest cases, with one absent-fixture skip. All 26 focused
-daemon cases pass, including scalar tensors, schema parity with the stock DCP
-planner, dynamic dictionaries, and two/four-rank peer-owned entries. The stock
-DCP comparisons include deliberately different tensor replicas and heterogeneous
-tensor sizes; the regression fails with the preceding wheel and passes with
-DCP-compatible tensor selection.
-
-The local two-GPU `fsdp_2gpu` CI run uses eight experts with EP2, TP1, and DP2.
-Both providers resume at iteration 50 and save through 125. All five checkpoints
-match exactly: 3,209 entries at iterations 25 and 50, and 3,208 at 75, 100, and
-125, with zero missing, extra, or changed entries. The ordinary CI epilog,
-argument baseline comparison, and telemetry validation pass.
-
-Four-GPU run `43544071178` tests commit `b50613f`. Both providers resume at 50
-and save through 125, but tensor comparisons fail with 11, 11, 219, 219, and
-219 changed entries. There are no missing/extra entries and no RNG/common-state
-differences. The initial 11 keys and MD5 pairs exactly reproduce the November 7
-failure. This invalidates reusing main's tensor owner selection for this model.
-
-Four-GPU run [43549290021](https://github.com/ankurv-nvidia/nvrx_checkpointing/actions/runs/43549290021)
-passes on commit `54a8b2e` with DCP-compatible tensor selection. The eight-expert
-model uses TP2, DP2, EP2, and ETP1. Both providers resume at iteration 50 and save
-through 125. All five checkpoints match: 3,327 entries at 25/50 and 3,326 at
-75/100/125, with zero missing, extra, or changed entries. All 902 argument values
-match the baseline. Script, teardown, and workload exits are zero for ranks
-0 through 3. All 125 printed training-value sets match the reference, excluding
-timing and throughput. The final report and save-span validation pass without a
-soft-failure record.
-
-Bandwidth is 34,429 MB/s against the 115,000 MB/s baseline. That comparison is
-informational for this determinism workload; the run passes its enforced gates.
-No performance baseline or threshold changes accompany this implementation.
-Historical model results below describe the earlier implementation.
-
-Source-selection parity is validated on two and four ranks. The native daemon
-uses ascending ranks for equal-cost ties; matching CPython set order for holder
-sets containing rank 8 or above remains deferred.
-
-## Current implementation, 2026-11-13
-
-The sections below this update preserve the original hand-off and discussion. Their line numbers,
-branch status, implementation descriptions, and validation commands describe the earlier branch.
-The owner subsequently authorized implementation, preserving peer-owned objects, and a one-time
-rebase + squash onto the latest main. Those instructions supersede the historical process rules.
-
-The implementation uses main's unified peer registry and daemon-generated capture plans:
-
-- Python calls Megatron's flattening and FSDP preprocessing, serializes object leaves in memory,
-  and registers all participating replicas with their original ordered checkpoint descriptions.
-- Registration supplies immutable `write_items` and `common_state_key` metadata. The normal
-  two-argument `save_async` interface remains unchanged.
-- Daemons select tensor and object sources using DCP's ordered load-balancing policy, then return
-  local capture registries. Only selected local values enter each snapshot. Peer exchanges contain
-  registry metadata, with scalar values scrubbed, and never object or tensor payloads.
-- Each owner writes its scalar/object dictionary as a Torch-readable bundle in its local distcp
-  file. Dynamic object sizes are refreshed on every save. Peer-only optimizer entries survive.
-- The guarded Megatron load adapter restores those bundles into the flattened target state before
-  tensor loading. Ordinary torch_dist capture, fixed-size blobs, and format markers retain main's
-  behavior.
-
-The provider imports no PyTorch save planner and performs no provider-owned collectives. Tests use
-the stock planner as an independent reference. Source selection is covered for two and four ranks
-with differing tensor and object replicas, including growing objects. Python set iteration can
-change equal-cost DCP tie choices at larger rank counts; parity for those ties remains deferred.
-
-The November 7 four-GPU run `42407791025` failed tensor comparisons: 11 differences at each of
-iterations 25 and 50, and 219 at each of 75, 100, and 125 after resume. Objects, keys, shapes, and
-layouts matched. Earlier two-GPU results do not establish four-GPU parity. The current implementation
-registers all replicas and applies the daemon source policy to tensors as well as objects.
-
-The November 13 four-GPU run `43403781753` matches all checkpoint entries at iterations 25, 50,
-75, 100, and 125: 3,327 entries before resume and 3,326 after resume, with no missing, extra, or
-changed entries. Both providers resume from iteration 50 and save through 125. Its argument
-baseline is recorded from the native run. The final report flags bandwidth of 37,924 MB/s against
-the 115,000 MB/s baseline; this metric is informational for the determinism workload. The missing
-argument baseline causes the initial workflow failure, and the adopted record passes CI's argument
-comparison. There is no controlled comparison against main for this workload's bandwidth.
-
-Fresh validation and model-run results are recorded in the commit accompanying this update.
-
-## Original hand-off
-
-You are taking over the `dtensor` branch of this repository (remote `github`,
-`git@github.com:ankurv-nvidia/nvrx_checkpointing.git`). Read this whole file before changing anything.
-It gives you the goal, the history, an unfinished review, and code pointers. It deliberately avoids
-telling you how the code works: read the pointers and form your own conclusions.
-
-## What the branch is for
-
-In the owner's words, from earlier work:
-
-> Lets fork the dtensor work out into a dtensor branch that can go in earlier and adds a fsdp_dtensor
-> path + e2e test
-
-> Can you add a fsdp.yaml file next to nvrx_checkpointing/ci/configs/ultra3fp8.yaml that triggers the
-> fsdp_dtensor path and then add that config to the jet-ci so that it runs e2e . That is what i meant
-> by an e2e test, not an e2e_fsdp_dtensor.sh script.
-
-The fsdp_dtensor path is Megatron-LM's `--ckpt-format fsdp_dtensor` (Megatron-FSDP), saved through
-this repository's native provider instead of Megatron's own DCP save. CI pins Megatron-LM to
-`DEFAULT_MEGATRON_COMMIT` (`ci/scripts/slurm_job.py:95`, `16251ac1221f…`).
-
-## Branch state
-
-The base is `67d996b2` (Jet CI integration (#1)). The commits since then, oldest first, are listed
-below. Read them with `git log -p 67d996b2..dtensor`; each message states its intent.
-
-| Commit | Subject |
-| --- | --- |
-| `73f4ae71` | Save fsdp_dtensor checkpoints of DTensor state dictionaries |
-| `13c5f67d` | remove comments (the owner's commit) |
-| `d61f2d31` | Write each fsdp_dtensor value from the rank DCP writes it from |
-| `81b3ec4e` | Trace fsdp_dtensor checkpoints |
-| `c1fd66a7` | Run Megatron-FSDP checkpoints end to end in JET CI |
-| `879b1c01` | Set CUDA_DEVICE_MAX_CONNECTIONS on Hopper only |
-
-Validation so far:
-
-- Unit tests: the full `tests/` suite passed at `879b1c01` (one test deselected, see Validation tools).
-- A local two-GPU emulation of the JET determinism job (see Validation tools) passed at `c1fd66a7`:
-  the native and nvrx checkpoints matched on all 3,210 traced entries at iterations 5, 10, 15 and 20.
-- The JET workload `gb200-native-detr-fsdp-1x4` has never run in CI. There is no PR, and the owner
-  does not want one (see Process rules).
-
-## The review in progress
-
-After `879b1c01` the owner reviewed `megatron/save.py` with the previous agent. Both sides are
-reproduced verbatim. The previous agent's answers are its own reading of the code. Treat every claim
-in them as a hypothesis and check it against the code pointers before relying on it.
-
-### Owner, message 1
-
-> save.py
-> I would like to take a dependence on megatron processing functions as much as possible
-> what does preprocess_fsdp_dtensor_state_dict do ? Can we inline it in save.py if its not too much change ?
-> same with flatten_state_dict ? seems like we're importing it from an internal namespace / class
->
-> Why do we need to import DefaultSavePlanner ?
->
-> i would like to avoid anything that needs a collective in save.py
-> looks like _dcp_writes needs a collective. Can you explain why is that ?
-> There's also a bunch of synchronous saves going on in that file that i find objectionable.
->
-> Walk me through the justifications in small sentences so i can ask questions as you're explaining me
-
-### Previous agent, answer 1
-
-Answers in order, numbered so you can point at a line.
-
-**1. `preprocess_fsdp_dtensor_state_dict`**
-- It's Megatron's function, not ours (`megatron/training/checkpointing.py:1862` in 16251ac).
-- Megatron's own fsdp_dtensor save calls it right before its DCP save (`:965`). We call it at the same point.
-- It turns the live Megatron-FSDP state into the on-disk layout:
-  - drops FP8 `_extra_state`;
-  - splits fused SwiGLU and MLA weights;
-  - renumbers local experts to global expert numbers;
-  - renames MTP layers;
-  - marks unevenly sharded DTensors so DCP writes them correctly.
-- Its helpers come to about 1,100 lines (`megatron/core/transformer/fsdp_dtensor_checkpoint.py`).
-- Inlining would mean copying Megatron's layout rules. Calling it is exactly the dependence on Megatron you want, so I'd keep it.
-
-**2. `flatten_state_dict`**
-- DCP flattens the nested state into dotted keys like `optimizer.state.<param>.exp_avg` before writing.
-- We need the same keys, or DCP can't load what we write.
-- Right now we import torch's private copy from `torch.distributed.checkpoint._nested_dict`.
-- Megatron has its own copy: `megatron.core.dist_checkpointing.strategies.torch.flatten_state_dict`. It only adds Megatron's sharded types as leaves, so DTensor states flatten the same way.
-- Switching is a one-line change.
-
-**3. `DefaultSavePlanner`**
-- Only `_dcp_writes` uses it.
-- It's the planner Megatron's own fsdp_dtensor save hands to DCP.
-- I used it to ask: "which rank would DCP pick to write this key?" If `_dcp_writes` goes, this import goes too.
-
-**4. Why `_dcp_writes` needs a collective**
-- Many non-tensor values exist on several ranks: `args`, `iteration`, per-parameter optimizer settings, `rng_state`.
-- DCP writes each key once. Before `_dcp_writes`, every rank wrote its own copy and the metadata kept one. The extra copies were orphan bytes, which your gap check rejects.
-- To write a key once, the ranks holding it must agree on one writer.
-- No rank can see what the others hold (expert keys exist only on some ranks), so agreeing needs communication.
-- DCP does this on every save: it gathers every rank's plan to rank 0, removes duplicates, and sends each rank its share. I do it once, at the first save.
-- I copied DCP's choice because copies can differ. Megatron's fsdp_dtensor `rng_state` key leaves out the data-parallel rank (a TODO in Megatron), so ranks can store different values under one key.
-- The code before it also had a collective: an `all_gather_object` to agree on slot sizes.
-- The Megatron functions save.py calls may still communicate internally, just as in Megatron's own save. `_dcp_writes` is save.py's only direct collective.
-
-**5. A way to drop the collective**
-- The engine already deduplicates tensors on the server side. `DeduplicateTensorReplicas` (`src/checkpoint/server.cpp:312`) picks one owner for each replicated shard, from the registry merged across all ranks.
-- Objects skip that step, which is why every rank writes them.
-- Extending it to objects removes `_dcp_writes`, `DefaultSavePlanner` and the slot-size agreement from save.py.
-- It's a C++ change, so it needs your OK under harness rule 8.
-- Caveat: the engine would pick its own owner, not DCP's. That `rng_state` key could then differ from the reference in layouts where a rank's EP rank ≠ its TP rank. The CI layout isn't one of them.
-
-**6. Blocking work in save.py**
-- File writes on the training thread:
-  - **Dataloader state:** Megatron's `maybe_save_dataloader_state` writes it before the snapshot is submitted, so the tracker never names an iteration without it. It could move into finalize, ahead of the tracker write.
-  - **`metadata.json` (torch_dist only):** rank 0 writes it before submission. Megatron's own save writes it at finalize (`dist_checkpointing/serialization.py:436`), so ours should move there.
-  - **Tracker file:** a few bytes, written by rank 0 once the checkpoint is durable.
-- Waits:
-  - **Without `--async-save`:** the save blocks until the checkpoint is durable. That's Megatron's contract for synchronous saves, and the DETR jobs use it.
-  - **With `--async-save`:** it still waits until the snapshot is off the GPU, so the next step can't change tensors mid-copy.
-  - **Previous save:** each save first waits for the previous one; Megatron allows one outstanding async save.
-  - **After a load:** registration blocks until it completes.
-- Serialization: objects go through `torch.save` into memory on the training thread. It's CPU time, not disk.
-
-My suggestion: do 2 and the `metadata.json` move now, since both are small, and do 5 if you're OK with the C++ change.
-
-### Owner, message 2
-
-> 1. ok for now but we'll revisit after others have been clarified
-> 2. But why do we need it at all if registering the state-dict will construct an fqn for it in the C++ StateTree
-> 3. I would like to avoid any use of the torch planner. Lets discuss if thats feasible and if not i need a good understanding of why
-> 4., 5. 6. I would like it to go through the regular StateTree registration and daemon-planning and writes . What is missing ?
-
-### Previous agent, answer 2
-
-**2. Why flatten at all**
-- The C++ walker does build FQNs, but not the ones DCP uses.
-- It splits `args` (a Namespace) into one node per field. DCP stores `args` as one object.
-- It names list elements `key.[list]#0`. DCP names them `key.0`.
-- It stores ints, strings and tuples as its own typed nodes. A string, for example, becomes raw wide-char bytes (`bindings.cpp:440`).
-- DCP stores every leaf as a `torch.save` archive, and Megatron's fsdp_dtensor loader `torch.load`s each one. The engine never writes the int nodes at all, and Megatron's loader can't `torch.load` the typed blobs.
-- So Python flattens to DCP's keys and `torch.save`s each leaf before registering.
-- Dropping that needs a "DCP mode" in the walker: DCP's flattening rules plus `torch.save` for each leaf. The `torch.save` part already exists as `TorchSaveBlob`.
-
-**3. Avoiding the torch planner**
-- It's feasible.
-- The planner's only job is to copy DCP's choice of which rank writes a shared key.
-- Once the daemons pick an owner for each object (below), save.py needs neither the planner nor a collective.
-- What we give up: Megatron's ambiguous `rng_state` key. When its copies differ, the daemon may keep a different rank's copy than DCP. That only happens when a rank's EP rank ≠ its TP rank, which the CI layout never has.
-
-**4–6. Registration → daemon planning → daemon writes**
-
-For objects, what's missing is all in the engine:
-- **a.** The merged registry doesn't know which ranks hold an object. A Blob node is just bytes (`state.h:32`), whereas DTensor shards carry their rank.
-- **b.** Daemon planning picks owners for tensor shards only. `DeduplicateTensorReplicas` (`server.cpp:312`) skips Blob nodes.
-- **c.** So each daemon writes every object its rank registered (`server.cpp:1001`). That's where the orphans come from.
-- **d.** The metadata step then requires every copy of an object to have the same length (`distcp.cpp:950`). That's the only reason Python agrees on slot sizes with a collective.
-- Fixing a–c means tracking holders, picking one owner, and writing only owned objects. Then d goes away, and save.py just registers padded bytes, with no planner and no collective.
-
-For the synchronous file writes:
-- **e.** `metadata.json` and the tracker: the daemons have no way to write small extra files at finalize. A generic hook in the save call (file name → bytes, written by the coordinator after `.metadata`) would cover both, without the FQN hardcode you rejected. The tracker sits outside the iteration directory, so the hook must allow that.
-- **f.** Dataloader state: Megatron's `maybe_save_dataloader_state` writes its own files. Routing it through the daemons means capturing its bytes instead, i.e. not calling that Megatron function as-is.
-- **g.** The waits stay. With `--async-save` off, the save must be durable when it returns; that's Megatron's contract. Async saves still have to wait until the snapshot is off the GPU.
-
-I'd start with a–d: that one engine change removes `_dcp_writes`, `DefaultSavePlanner` and the collective together. It's a C++ change under harness rule 8. Should I prototype it?
-
-### Where it stands
-
-The owner did not answer that last question and handed the branch to you instead. No code has changed
-in response to this review.
-
-## The owner's guidance
-
-From this review:
-
-- "I would like to take a dependence on megatron processing functions as much as possible"
-- On `preprocess_fsdp_dtensor_state_dict`: "ok for now but we'll revisit after others have been clarified"
-- On `flatten_state_dict`: "seems like we're importing it from an internal namespace / class" and
-  "why do we need it at all if registering the state-dict will construct an fqn for it in the C++ StateTree"
-- "I would like to avoid any use of the torch planner. Lets discuss if thats feasible and if not i need
-  a good understanding of why"
-- "i would like to avoid anything that needs a collective in save.py"
-- "There's also a bunch of synchronous saves going on in that file that i find objectionable."
-- "I would like it to go through the regular StateTree registration and daemon-planning and writes .
-  What is missing ?"
-
-From earlier work on this branch:
-
-- On hardcoding in the engine: "I dont like the changes in distcp.cpp . We shouldnt need to hardcode
-  based on whether that specific fqn exist. Convince me that its needed if it really is." Commit
-  `73f4ae71` removed the FQN-keyed `metadata.json` write from `src/checkpoint/distcp.cpp`.
-- On a flavor added only to unset one environment variable: "Creating a flavor for that seems a little
-  overkill". Commit `879b1c01` replaced it.
-- "no dont open a draft PR . Just push to the branch"
-- The owner made the `distcp_trace` gap check in `debug.py` a hard error in commit `182ed095`. Keep it strict.
-
-## Process rules
-
-- Follow the "LLM/agent maintenance constraints" at the top of `ci/scripts/slurm_job.py`. Rule 8
-  matters most here: explain and obtain approval before changing Python or C++ checkpointing
-  implementation.
-- Add new commits only. Never amend, rebase or force-push `dtensor`. Push to `github dtensor` and do
-  not open PRs.
-- Commit with `git commit -s` and an imperative subject line. This devbox has no signing key, so `-S`
-  is not possible.
-- Write comments only when the code cannot say it, in at most two lines. Rationale belongs in the
-  commit message.
-- `pyproject.toml` sets ruff `fix = true` and `unsafe-fixes = true`, so a plain `ruff check` rewrites
-  files. The ruff on `PATH` (0.9.10) also strips `# noqa` codes it does not know. Lint with
-  `/home/coder/workspace/nvrx_checkpointing/build/python_venv/bin/ruff check --no-fix` and compare
-  the findings against `HEAD`.
-
-## Code pointers
-
-Line numbers are at `879b1c01`; function names are stable if they drift.
-
-### This repository
-
-Save path (Python):
-
-- `megatron/save.py:429` `_save_checkpoint_impl`: the per-save flow for both formats.
-- `megatron/save.py:359` `register_dtensor_state_dict`, `:343` `_dcp_writes`, `:194` `_snapshot_blob_capacity`,
-  and the module caches at `:61-62`.
-- `megatron/save.py:231` `_prepare_registration_state_dict`: how torch_dist state is prepared, for contrast.
-- `megatron/save.py:390` `_write_checkpoint_tracker`, `:397` `_save_dataloader_state`,
-  `:303` `maybe_finalize_async_save`.
-- `megatron/save.py:108` `_wrap_load_checkpoint`: registration after a load.
-- `megatron/save.py:182` `detect_peers`, `:324` `_ensure_root`.
-
-Registration (C++ binding):
-
-- `src/python/bindings.cpp:587` `RegisterStateDictRecrContainerItem`: the generic walker. Namespaces
-  are handled at `:698`, list element naming at `:657` and `:673`, strings by `StringBlob` at `:440`.
-- `src/python/torch_bindings.cpp:978` `TryRegisterTorchStateDict`, `:583` `IsMainTorchDTensorReplica`,
-  `:598` `TorchDTensorState`, `:821` `TorchSaveBlob`.
-- `src/state.h`: `StateNode` (the `Blob` type at `:32`) and `FinalizeRegistry` at `:420`.
-
-Daemon planning and writes (C++):
-
-- `src/checkpoint/server.cpp:890` `Session::OnFinalizeSnapshotAsync_`: merge, broadcast, plan, write.
-- `src/checkpoint/server.cpp:312` `DeduplicateTensorReplicas`, called at `:973`. Local blobs are
-  collected at `:1001`, and `WriteRankShard` is called at `:1013`.
-- `src/checkpoint/distcp.cpp:916` `BuildMetadataPkl` (the replicated-blob length check is at `:950`),
-  `:1016` `WriteRankShard` (blob payloads at `:1085`), `:1094` `WriteMetadata`.
-
-Verification:
-
-- `debug.py:319` `distcp_trace` (the gap check is at `:385`), `:268` `_is_plain_dcp`,
-  `:273` `load_common_state_dict`. `metadata_compare.py` is the CLI the CI runs.
-
-CI wiring:
-
-- `ci/configs/fsdp.yaml`, which inherits `ci/configs/gpt_moe.yaml`.
-- The `fsdp` entry under the gb200 `multinode` list in `ci/jobs.json`. `ci/github/generate_jet_workflows.py`
-  regenerates `.github/workflows/jet-*.yml` from that file, and `.github/workflows/ci.yml` lists the
-  workloads pull requests run.
-- `ci/jet/generate_workloads.py:152` `resolved_workloads`: how a `detr` job becomes
-  `--run ref:nvrx --run cmp:native`.
-- `ci/scripts/slurm_job.py:2562` `_train_options` (the profile's `ckpt-format` at `:2596`),
-  `:2711` `_phase_command` (the Hopper block at `:2734`), `:2014` `DeterministicFlavor`,
-  `:1439` `_compare_arguments` (a new workload adopts its argument baselines from its first run).
-
-Tests:
-
-- `tests/test_megatron_save.py:307` and `:349`; the latter is a two-rank test driven by `_plan_and_save`.
-- `tests/test_dtensor_registration.py`
-- `tests/test_debug_semantic_objects.py:123`
-- `tests/test_slurm_job_manual.py:1820` and `:2348`
-
-### Megatron-LM at 16251ac
-
-On this devbox it is checked out at `/home/coder/workspace/scratch/mlm_16251ac`.
-
-- `megatron/training/checkpointing.py:959-1013`: Megatron's own fsdp_dtensor save, with the planner
-  at `:975` and the synchronous save at `:1010`.
-- `megatron/training/checkpointing.py:1862` `preprocess_fsdp_dtensor_state_dict`. Its handlers are in
-  `megatron/core/transformer/fsdp_dtensor_checkpoint.py` and
-  `megatron/core/distributed/fsdp/src/megatron_fsdp/uneven_dtensor.py:238`.
-- `megatron/training/checkpointing.py:556`: the fsdp_dtensor `rng_state` key. Read its TODO.
-- `megatron/training/checkpointing.py:1576` `maybe_save_dataloader_state`.
-- `megatron/training/checkpointing.py:2270` onward: the fsdp_dtensor load.
-- `megatron/core/dist_checkpointing/strategies/torch.py:107` `flatten_state_dict`.
-- `megatron/core/dist_checkpointing/serialization.py:436` `metadata_finalize_fn`.
-- `megatron/training/arguments.py:1192` and `:1489-1515`: the `CUDA_DEVICE_MAX_CONNECTIONS` rules.
-
-### torch
-
-In the installed version:
-
-- `torch/distributed/checkpoint/default_planner.py`: `DefaultSavePlanner` and `create_default_local_save_plan`.
-- `torch/distributed/checkpoint/_dedup_save_plans.py`: `dedup_save_plans`.
-- `torch/distributed/checkpoint/_nested_dict.py` and `_traverse.py`: `flatten_state_dict` and its traversal rules.
-
-## Validation tools
-
-These paths are on this devbox.
-
-- **Python:** use the Megatron virtualenv, `/home/coder/workspace/megatron-lm/.venv/bin/python`.
-- **Build:** `/home/coder/workspace/scratch/nvrx_ci_build/build_worktree.sh <src> <build dir> [tests]`
-  builds an importable site for a worktree.
-  - The site used so far is `/home/coder/workspace/build/nvrx-dtensor/site`.
-  - Its Python files were copied in by hand after edits, so rebuild or re-copy after changing Python.
-- **Unit tests:** `PYTHONPATH=<site>:<dir with hypothesis> python -m pytest -q -p no:cacheprovider tests
-  --deselect tests/test_quantized_binding.py::test_quantized_registration_rejects_components_on_different_devices`.
-  - The deselected test also fails on main here.
-  - `hypothesis` is not in the virtualenv; `pip install --target <dir> hypothesis` provides it.
-- **Local determinism job:** `NVRX_SITE=<site> python /home/coder/workspace/scratch/nvrx_fsdp_ci/drive.py
-  <nvrx worktree> <work dir> [--compare-only]`.
-  - It emulates the JET determinism job on two GPUs against Megatron 16251ac, comparing an nvrx
-    reference run with a native run.
-  - It shrinks the parallelism to fit two GPUs, so read it before trusting its results.
-
-## Related work
-
-`.worktrees/native_ckpt-v2` was never pushed. It is based on `73f4ae71` and will need rebasing onto
-this branch. Leave it alone unless the owner asks.
+`megatron/load.py` supplies function hooks and runtime templates. The C++ binding
+protects live runtime arguments with one copy during restoration.
+
+Tensor-free containers retain the structured object encoding and per-rank
+schema/source descriptions. These describe dictionary reconstruction and RNG
+source selection during load; they are not daemon tensor-writer hints. Removing
+this representation requires preserving expert/RNG behavior under stock DCP.
+
+`debug.py` uses the C++ reader for native structured state. Its small Python
+scalar inspector also supports historical rank bundles with overlapping physical
+addresses. Common-archive and separate object manifests remain distinct. Scalar
+tests exercise both the Python inspector and the public C++ reader. The
+experimental registry debug formats 4–7 are
+removed; main's formats 1–3 and the current format 8 remain readable.
+
+## CI and validation
+
+CI pins public Megatron-LM commit `16251ac1221f4814cd39350def05cefa3c36734a`.
+`ci/configs/fsdp.yaml` adds the four-GPU eight-expert MoE workload. Its environment
+metadata unsets `CUDA_DEVICE_MAX_CONNECTIONS`; other profiles retain main's
+existing defaults. `fsdp_2gpu` inherits it with TP1, EP2, and DP2.
+
+Both argument baselines are required: local `devbox_detr-native_fsdp_2gpu_1x2`
+and `gb200_detr-native_fsdp_1x4`. Keep generated JET workflows synchronized with
+`ci/jobs.json`. Do not weaken comparisons, thresholds, checkpoint counts, or
+performance baselines to pass validation.
+
+Validation passes 659 Python tests, 101 focused CPU load/inspection tests,
+98 isolated server cases, and 94 of 95 CTest cases. The external-registry fixture
+is absent; forwarding passes separately in its network-only namespace. Two CUDA-only cases
+are skipped by CPU runtime checks. Native checkpoints load with Python checkpoint
+readers disabled. Stock metadata protocols 2, 4, and 5 have interoperability
+coverage, including strided tensors, booleans, scalar tensors, and empty tensors.
+
+The two-GPU MoE comparison resumes at iteration 50 and trains through 125.
+All five checkpoints match exactly: 3,209 entries at 25/50 and 3,208 at
+75/100/125. Worker, epilog, argument, save-span, and telemetry checks pass.
+Current validation artifacts are recorded in the accompanying change.
+
+Runtime tests require private user/network/mount/IPC/PID namespaces. The host
+checkpoint daemon on port 4100 belongs to another worktree and must not be
+stopped. Run each server lifecycle test in a fresh process because the client
+queue cache is process-global. CPU imports use the explicit CPU site/build;
+source artifact links are restored to the CUDA build afterward.
+
+## Known boundaries
+
+- The four-GPU tensor comparison discrepancy remains unresolved. Failed run
+  `43544071178` has 11 changed entries at 25/50 and 219 at 75/100/125, with no
+  missing/extra entries or RNG/common differences. The first keys and hashes
+  reproduce November 7 run `42407791025`.
+- Run `43549290021` passes with a tensor-source override that has since been
+  removed. It is not validation of the current ownership policy. Archived
+  artifacts do not prove that valid replicas differed. Diagnosis needs per-rank
+  FQN, mesh, placements, shape, ranges, and hashes before registration/capture.
+- Globally empty DTensor capture omits its key, so strict loading lacks metadata.
+  Empty ordinary tensors are supported. The exercised MoE model has no globally
+  empty DTensors.
+- A complete Torch archive stored as an unmarked generic opaque blob is
+  ambiguous with a standard DCP object archive. Structured native byte values
+  have explicit kinds and retain exact embedded archive bytes.
+
+## Brief history
+
+- The original work adds an FSDP YAML profile and JET end-to-end checkpoint test.
+- November 13: the branch adopts main's daemon-generated snapshot plans;
+  peer-owned entries replace the rank-0-only prototype.
+- November 14: nested structured capture replaces provider flattening and
+  `torch.save` object generation. Tensor source hints are subsequently removed
+  under the identical-replica contract.
+- November 14: `53bb5ed` persists all scalar nodes independently; `7350231`
+  implements native three-stage loading and removes Python planner/codec files.
+- November 14: `1fffa556` removes scalar scrubbing and records the binding audit.
+  The user then requests shared traversal and broader diff reduction.
+- November 15: shared traversal and tensor geometry remove duplicated binding
+  code. The writer/session APIs match main; unused test-reader and experimental
+  registry formats are removed. Historical scalar inspection stays in Python.
+
+The complete earlier hand-off, discussion, and validation history is preserved
+in [commit 1fffa556](https://github.com/ankurv-nvidia/nvrx_checkpointing/blob/1fffa556aa36e3ab52078a0bf22891fd50347641/prompt.md).
+Read it locally with `git show 1fffa556:prompt.md` when historical detail is needed.

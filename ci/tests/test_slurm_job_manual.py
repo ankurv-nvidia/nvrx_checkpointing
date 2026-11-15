@@ -1816,12 +1816,11 @@ def test_periodic_memory_sampling_is_a_manual_override(
     assert "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS" in slurm_job._RUN_ENV_NAMES
 
 
-@pytest.mark.parametrize(("capability", "expected"), [("9.0", "1"), ("10.0", None), ("", None)])
-def test_only_hopper_training_uses_one_cuda_device_connection(
+@pytest.mark.parametrize("capability", ["9.0", "10.0", "8.0", ""])
+def test_standard_profiles_keep_one_cuda_device_connection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capability: str,
-    expected: str | None,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
@@ -1833,7 +1832,7 @@ def test_only_hopper_training_uses_one_cuda_device_connection(
 
     _cmd, env = slurm_job._phase_command("nano3_8x4", args, "native", 1)
 
-    assert env.get("CUDA_DEVICE_MAX_CONNECTIONS") == expected
+    assert env["CUDA_DEVICE_MAX_CONNECTIONS"] == "1"
 
 
 @pytest.mark.parametrize(
@@ -2350,15 +2349,17 @@ def test_a_variant_reaches_both_phases_and_the_structure_cache_holds(
         assert _CONSTANT_STRUCTURE in command, phase
 
 
+@pytest.mark.parametrize("capability", ["9.0", "10.0", "8.0", ""])
 def test_the_fsdp_profile_saves_megatron_fsdp_state_in_its_own_format(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capability: str,
 ) -> None:
     slurm_job = _load_slurm_job()
     _clear_run_env(monkeypatch)
     monkeypatch.setenv("SLURM_JOB_NODELIST", "n0")
     monkeypatch.setenv("MASTER_ADDR", "n0")
-    monkeypatch.setattr(slurm_job, "_gpu_compute_capability", lambda: "10.0")
+    monkeypatch.setattr(slurm_job, "_gpu_compute_capability", lambda: capability)
     args = _args(tmp_path, config="fsdp", nodes=1, flavors=["detr"])
     slurm_job._configure_run(args)
 
@@ -2366,7 +2367,6 @@ def test_the_fsdp_profile_saves_megatron_fsdp_state_in_its_own_format(
         command, env = slurm_job._phase_command("fsdp_1x4", args, "native", phase)
         assert "--use-megatron-fsdp" in command, phase
         assert command[command.index("--ckpt-format") + 1] == "fsdp_dtensor", phase
-        # Megatron-FSDP refuses CUDA_DEVICE_MAX_CONNECTIONS=1.
         assert "CUDA_DEVICE_MAX_CONNECTIONS" not in env, phase
 
 

@@ -74,6 +74,7 @@ class PyStateDictAccessor
     }
 };
 
+nanobind::object TorchDtypeObject(Tensor::DType dtype);
 bool TryRegisterTorchStateDict(PyStateDictAccessor& scan, StateNode::Handle node, nanobind::str const& key, nanobind::handle val);
 bool TryRegisterTorchLoadStateDict(PyStateDictAccessor& scan, nanobind::str const& key, nanobind::handle value);
 

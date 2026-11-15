@@ -250,7 +250,7 @@ def test_hook_passes_rank_and_partial_load_to_native_binding(
     assert target == {"iteration": 7}
 
 
-def test_bootstrap_supplies_runtime_template_without_mutating_it(
+def test_bootstrap_forwards_runtime_template(
     dictionary_load: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -264,10 +264,8 @@ def test_bootstrap_supplies_runtime_template_without_mutating_it(
     runtime = argparse.Namespace(mode=Mode.SLOW, layers=4)
 
     def native_load(_path: Path, state: dict, **_kwargs: object) -> None:
-        assert state["args"] is not runtime
-        assert state["args"].mode is Mode.SLOW
-        state["args"].mode = Mode.FAST
-        state["args"].layers = 12
+        assert state["args"] is runtime
+        state["args"] = argparse.Namespace(mode=Mode.FAST, layers=12)
 
     def load_base_checkpoint(_directory: Path, args: argparse.Namespace, rank0: bool = False) -> dict:
         assert args is runtime

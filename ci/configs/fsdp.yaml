@@ -1,6 +1,10 @@
 # A one-node GPT-MoE regression covers Megatron-FSDP checkpointing.
 inherits: gpt_moe
 
+ci:
+  environment:
+    CUDA_DEVICE_MAX_CONNECTIONS: null
+
 use-megatron-fsdp: true
 data-parallel-sharding-strategy: optim_grads_params
 ckpt-format: fsdp_dtensor

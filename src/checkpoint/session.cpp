@@ -147,8 +147,15 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                                   fmt::format("/api/peer/snapshotcomplete/{}/{}/{}", sessionId, hdr.globalRank, hdr.snapshotId),
                                   {});
         }
-        auto const dynamicBlobSizes = checkpoint::distcp::WriteRankShard(
+        checkpoint::distcp::WriteRankShard(
             snapshot.path.parent_path(), hdr.globalRank, *snapshotState.snapshotRegistry, snapshotState.snapshotData);
+        std::unordered_map<std::string, uint64_t> dynamicBlobSizes;
+        std::as_const(*snapshotState.snapshotRegistry).WalkNodes([&](StateNode const& node) {
+            if (auto const* blob = std::get_if<StateNode::DynamicSizeBlob>(&node.data))
+            {
+                dynamicBlobSizes.emplace(snapshotState.snapshotRegistry->GetNodeId(node.handle), blob->storageSize);
+            }
+        });
         if (notifyCoordinator)
         {
             SendToPeerWithRetries(*this,
@@ -813,8 +820,7 @@ try
     {
         auto topology = globalRegistry->Topo();
         topology.rank = Rank{firstRank + index};
-        auto registry = std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology));
-        registries.emplace(registry->GlobalRank(), std::move(registry));
+        registries.emplace(topology.rank, std::make_shared<StateTree>(globalRegistry->SessionId(), std::move(topology)));
     }
     auto dedupedGlobalRegistry = std::make_shared<StateTree>(globalRegistry->SessionId(), topo);
     std::unordered_map<StateNode::Handle, std::vector<Assignment const*>> byNode;
@@ -911,11 +917,7 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                     {
                         auto& added = global.AddChild(parent, name);
                         added.data  = supplied.data;
-                        if (type == StateNode::Type::Scalar)
-                        {
-                            auto& scalar    = std::get<StateNode::Scalar>(added.data);
-                            scalar.replicas = {recvRank};
-                        }
+                        if (type == StateNode::Type::Scalar) { std::get<StateNode::Scalar>(added.data).replicas = {recvRank}; }
                         else if (type == StateNode::Type::DynamicSizeBlob)
                         {
                             std::get<StateNode::DynamicSizeBlob>(added.data).replicas = {recvRank};

@@ -264,6 +264,47 @@ def test_native_load_keeps_tensor_and_optimizer_aliases(tmp_path: Path) -> None:
     torch.testing.assert_close(average, torch.full((2, 3), 2.0))
 
 
+def test_shared_walk_preserves_mixed_container_and_tensor_aliases(tmp_path: Path) -> None:
+    _write_native(
+        tmp_path,
+        [("items.0.step", 1, struct.pack("<q", 17))],
+        {"items.0.weight": torch.arange(3.0), "items.1.options.weight": torch.ones(2)},
+    )
+    weight = torch.zeros(3)
+    options = SimpleNamespace(weight=torch.zeros(2))
+    group = {"step": 0, "weight": weight}
+    pair = (group, SimpleNamespace(options=options))
+    target = {"items": pair}
+
+    checkpoint.load_checkpoint(tmp_path, target)
+
+    assert target["items"] is pair
+    assert pair[0] is group
+    assert pair[0]["weight"] is weight
+    assert pair[0]["step"] == 17
+    assert pair[1].options is options
+    torch.testing.assert_close(weight, torch.arange(3.0))
+    torch.testing.assert_close(options.weight, torch.ones(2))
+
+
+def test_load_request_scan_does_not_acquire_tensor_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_native(tmp_path, [], {"weight": torch.arange(3.0)})
+    destination = torch.zeros(3)
+    address = destination.data_ptr()
+
+    def reject_payload(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("load request scan acquired destination tensor storage")
+
+    monkeypatch.setattr(torch.Tensor, "__dlpack__", reject_payload)
+    target = {"weight": destination}
+
+    checkpoint.load_checkpoint(tmp_path, target)
+
+    assert target["weight"] is destination
+    assert destination.data_ptr() == address
+    torch.testing.assert_close(destination, torch.arange(3.0))
+
+
 def test_full_load_keeps_live_runtime_arguments_unchanged(tmp_path: Path) -> None:
     nested = _dictionary(
         [("options", b"\x07" + struct.pack("<I", 2) + _integer(2) + _integer(3)), ("groups", _dictionary([("lr", _floating(0.002))]))],

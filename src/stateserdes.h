@@ -90,6 +90,7 @@ struct StateSerDes
 
         serdes::WriteTrivial(ostrm, WireMagic);
         serdes::WriteTrivial(ostrm, WireVersion);
+
         serdes::WriteTrivial(ostrm, static_cast<uint32_t>(tree._nodes.size()));
         for (auto const& node : tree._nodes)
         {

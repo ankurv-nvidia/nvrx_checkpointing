@@ -182,6 +182,7 @@ _TRAIN_ENV_DEFAULTS = {
     "TORCHINDUCTOR_WORKER_START": "fork",
     "TORCHINDUCTOR_COMPILE_THREADS": "1",
     "QUANTIZATION_TYPE_DEBUG": "1",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "MASTER_PORT": "29500",
     "NATIVE_CKPT_OTEL_EXPORT": "daemon",
 }
@@ -197,7 +198,6 @@ _MEGATRON_OTEL_ENV_DEFAULTS = {
 _PRETRAIN_ENV_NAMES = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH",
     "CUBLAS_WORKSPACE_CONFIG",
-    "CUDA_DEVICE_MAX_CONNECTIONS",
     "ENROOT_IMAGE",
     "GPUS_PER_NODE",
     "GROUP_RANK",
@@ -419,7 +419,7 @@ def _gpu_compute_capability() -> str:
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as error:
         if _rank_env("SLURM_PROCID", "RANK", "0") == "0":
-            logger.warning(f"[slurm_job:env] GPU compute capability unavailable ({error}); Hopper defaults unchanged")
+            logger.warning(f"[slurm_job:env] GPU compute capability unavailable ({error}); attention backend defaults unchanged")
         return ""
 
 def cluster_tag() -> str:
@@ -2765,11 +2765,9 @@ def _phase_command(
             env[name] = str(value)
     for name, value in _MEGATRON_OTEL_ENV_DEFAULTS.items():
         env.setdefault(name, value)
-    if _gpu_compute_capability() == "9.0":
+    if "NVTE_FLASH_ATTN_V4" not in env and _gpu_compute_capability() == "9.0":
         # FlashAttention 4's Hopper backward pass stalls, so Hopper trains with FlashAttention 2.
-        env.setdefault("NVTE_FLASH_ATTN_V4", "0")
-        # Before Blackwell, Megatron's tensor and context parallelism require a single device connection.
-        env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+        env["NVTE_FLASH_ATTN_V4"] = "0"
     include_nvrx = not (provider == "native" and flavors.policy.requires_nvrx_absent)
     _toolchain(cfg, args).apply(env, include_nvrx=include_nvrx)
     flavors.transform(opts, env)

@@ -1072,10 +1072,8 @@ TEST_CASE("checkpoint scalars occupy eight typed bytes beside opaque blobs", "[d
     tree.AddChild(StateNode::Handle::Root, "c_payload").data
         = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = 8};
     tree.FinalizeRegistry();
-    auto const lengths = checkpoint::distcp::WriteRankShard(output, Rank{0}, tree, storage);
-    checkpoint::distcp::WriteMetadata(output, tree, lengths);
-    std::unordered_map<std::string, uint64_t> const expectedLengths{{"c_payload", 8}};
-    CHECK(lengths == expectedLengths);
+    checkpoint::distcp::WriteRankShard(output, Rank{0}, tree, storage);
+    checkpoint::distcp::WriteMetadata(output, tree);
     auto const bytes = ReadWholeFile(output / "__0_0.distcp");
     REQUIRE(bytes.size() == 48);
     std::array<char, 48> expected{};
