@@ -206,6 +206,8 @@ function ubuntu2404 {
         clang-${CLANG_VERSION}
         clang-format-${CLANG_VERSION}
         clangd-${CLANG_VERSION}
+        libc++-${CLANG_VERSION}-dev
+        libc++abi-${CLANG_VERSION}-dev
         llvm-${CLANG_VERSION}
         gdb
         strace
@@ -461,6 +463,28 @@ function cross_arm64 {
     echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/cross-linux-sbsa/ /" \
         > /etc/apt/sources.list.d/cuda-ubuntu2404-cross-linux-sbsa.list
     apt update && apt-get install --yes --no-install-recommends crossbuild-essential-arm64 "cuda-cross-sbsa-${CUDA_VERSION/./-}"
+    libcxx_arm64
+    $*
+}
+
+# Installs apt.llvm.org's arm64 libc++ archives where clang's aarch64-linux-gnu target finds them.
+function libcxx_arm64 {
+    . /etc/os-release
+    local pool=https://apt.llvm.org/${UBUNTU_CODENAME}
+    local work
+    work=$(mktemp -d)
+    curl -fsSL "${pool}/dists/llvm-toolchain-${UBUNTU_CODENAME}-${CLANG_VERSION}/main/binary-arm64/Packages.gz" | gzip -dc > "${work}/Packages"
+    for package in libc++-${CLANG_VERSION}-dev libc++abi-${CLANG_VERSION}-dev; do
+        local filename
+        filename=$(awk -v package="${package}" '$1 == "Package:" { name = $2 } $1 == "Filename:" && name == package { print $2 }' "${work}/Packages")
+        curl -fsSL "${pool}/${filename}" -o "${work}/${package}.deb"
+        dpkg-deb -x "${work}/${package}.deb" "${work}/root"
+    done
+    install -m 644 -t /usr/aarch64-linux-gnu/lib \
+        "${work}/root/usr/lib/aarch64-linux-gnu/libc++.a" \
+        "${work}/root/usr/lib/aarch64-linux-gnu/libc++abi.a" \
+        "${work}/root/usr/lib/aarch64-linux-gnu/libc++.modules.json"
+    rm -rf "${work}"
     $*
 }
 

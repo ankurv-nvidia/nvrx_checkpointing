@@ -69,6 +69,7 @@ set(PYTHON_VENV_USE_SYSTEM_PACKAGES ON)
 
 set(CMAKE_CXX_STANDARD 26)
 EnableStrictCompilation()
+include(StdModules)
 InitClangDIntellisense()
 
 include_directories(include)
@@ -119,6 +120,7 @@ target_link_libraries(phoenix_checkpoint PUBLIC
     opentelemetry-cpp::otlp_file_metric_exporter
     opentelemetry-cpp::otlp_file_log_record_exporter
     opentelemetry-cpp::proto
+    phoenix_std
     spdlog::spdlog_header_only
     ZLIB::ZLIB
 )
@@ -202,7 +204,7 @@ if (PHOENIX_BUILD_BENCHMARK)
 
     add_executable(shm_ipc_benchmark src/benchmark/shm_ipc_benchmark.cpp)
     target_include_directories(shm_ipc_benchmark PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${CMAKE_CURRENT_LIST_DIR}/src/checkpoint)
-    target_link_libraries(shm_ipc_benchmark PRIVATE fmt::fmt-header-only Boost::interprocess Boost::process Boost::program_options)
+    target_link_libraries(shm_ipc_benchmark PRIVATE fmt::fmt-header-only Boost::interprocess Boost::process Boost::program_options phoenix_std)
 
     # Connection-layer scale test for the checkpoint web service. Reuses the real
     # in-process server (via the fixture -> server object files) and drives it with
@@ -237,6 +239,12 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     SupressWarningForTarget(nanobind-static-abi3)
     SupressLintingForTarget(nanobind-static)
     SupressLintingForTarget(nanobind-static-abi3)
+    foreach (nanobind_library nanobind-static nanobind-static-abi3)
+        if (TARGET ${nanobind_library})
+            # nanobind 3.1.0 headers use stderr without including <cstdio>.
+            target_compile_options(${nanobind_library} PUBLIC -include cstdio)
+        endif()
+    endforeach()
     target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
     if (PHOENIX_BUILD_TESTS)

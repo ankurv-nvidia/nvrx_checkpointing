@@ -118,6 +118,8 @@ def build_native_extensions() -> None:
         native_build_dir.as_posix(),
         "-S",
         SCRIPT_DIR.as_posix(),
+        "-G",
+        "Ninja",
         "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
         "--debug-trycompile",
         *get_vcpkg_cmake_args(),

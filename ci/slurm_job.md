@@ -55,12 +55,13 @@ Authentication tokens are intentionally not written to the reproducer. When a
 direct re-run finds no wheel, native wheel setup falls back to a source
 build. Its preparation step uses a writable container overlay and runs
 `scripts/prepare.sh ubuntu2404` when the custom image does not contain
-`clang-23`; the supplied `.sqsh` itself is not overwritten. Native checkpoint
-setup and an exact NVIDIA Resiliency Extension install share one preparation
-`srun`. nvrx_checkpointing is installed with `pip --target` under
-`<run>/deps/python`, so the final `pip list` in `<run>_prep.log` includes its
-version. The log also records its selected source commit, installed module
-path, shared library, and server path explicitly.
+`clang-23` with libc++; the supplied `.sqsh` itself is not overwritten.
+Native checkpoint setup and an exact NVIDIA Resiliency Extension install
+share one preparation `srun`. nvrx_checkpointing is installed with
+`pip --target` under `<run>/deps/python`, so the final `pip list` in
+`<run>_prep.log` includes its version. The log also records its selected
+source commit, installed module path, shared library, and server path
+explicitly.
 
 ## Ultra4 on GB300
 

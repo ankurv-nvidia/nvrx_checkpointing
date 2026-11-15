@@ -22,6 +22,7 @@
 #include <limits>
 #include <map>
 #include <ostream>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -412,8 +413,26 @@ static constexpr uint32_t HashCombineLeftShift = 6U;
 static uint64_t HashCombine(uint64_t seed, uint64_t value)
 { return seed ^ (value + HashCombineConstant + (seed << HashCombineLeftShift) + (seed >> 2U)); }
 
-static uint64_t StdHashString(std::string const& s)
-{ return std::hash<std::string>{}(s); }
+// Matches the libstdc++ string hash that PyTorch's serialization id is built from.
+static uint64_t LibstdcxxStringHash(std::string_view s)
+{
+    constexpr uint64_t seed             = 0xc70f6907ULL;
+    constexpr uint64_t multiplier       = 0xc6a4a7935bd1e995ULL;
+    constexpr auto     shiftMix         = [](uint64_t value) { return value ^ (value >> 47U); };
+    auto const         loadLittleEndian = [s](size_t offset, size_t count) {
+        uint64_t word = 0;
+        for (size_t i = count; i-- > 0;) { word = (word << 8U) | static_cast<uint64_t>(static_cast<uint8_t>(s[offset + i])); }
+        return word;
+    };
+    size_t const alignedSize = s.size() & ~size_t{7};
+    uint64_t     hash        = seed ^ (s.size() * multiplier);
+    for (size_t offset = 0; offset < alignedSize; offset += sizeof(uint64_t))
+    {
+        hash = (hash ^ (shiftMix(loadLittleEndian(offset, sizeof(uint64_t)) * multiplier) * multiplier)) * multiplier;
+    }
+    if (alignedSize != s.size()) { hash = (hash ^ loadLittleEndian(alignedSize, s.size() - alignedSize)) * multiplier; }
+    return shiftMix(shiftMix(hash) * multiplier);
+}
 
 static std::ofstream OpenOutputFile(std::filesystem::path const& path)
 {
@@ -652,7 +671,7 @@ static uint64_t WriteShardArchive(std::ostream&         output,
     }
 
     uint64_t                        combinedCrc = 0;
-    std::unordered_set<std::string> bareNamesWritten;
+    std::vector<std::string_view>   bareNamesWritten;
     CBData                          cbData{
         .snapshotBytes = storageBytes,
         .shard         = shard,
@@ -718,7 +737,7 @@ static uint64_t WriteShardArchive(std::ostream&         output,
             throw std::runtime_error(fmt::format("distcp: data descriptor CRC mismatch for '{}'", plan.fullName));
         }
         combinedCrc = HashCombine(combinedCrc, entryCrc);
-        bareNamesWritten.insert(std::string{bareName});
+        bareNamesWritten.push_back(bareName);
     };
 
     try
@@ -726,7 +745,11 @@ static uint64_t WriteShardArchive(std::ostream&         output,
         for (size_t i = 0; i < entries.size(); ++i) { addEntry(entries.at(i), checkpoint::distcp::EntryBareNames.at(i)); }
 
         uint64_t combinedRecordNameHash = 0;
-        for (auto const& name : bareNamesWritten) { combinedRecordNameHash = HashCombine(combinedRecordNameHash, StdHashString(name)); }
+        // PyTorch folds record names in libstdc++ hash-set order, which is the reverse of insertion for these names.
+        for (auto const name : std::views::reverse(bareNamesWritten))
+        {
+            combinedRecordNameHash = HashCombine(combinedRecordNameHash, LibstdcxxStringHash(name));
+        }
 
         std::string const serializationId = fmt::format("{:020d}{:020d}", combinedRecordNameHash, combinedCrc);
 

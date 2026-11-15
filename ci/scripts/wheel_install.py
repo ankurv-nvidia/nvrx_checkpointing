@@ -275,15 +275,21 @@ def _clang() -> tuple[str, str]:
     return f"clang-{version}", f"clang++-{version}"
 
 
+def _has_libcxx_modules(cxx: str) -> bool:
+    """Return whether the compiler finds libc++'s standard library module manifest."""
+    probe = subprocess.run([cxx, "-stdlib=libc++", "-print-file-name=libc++.modules.json"], capture_output=True, text=True, check=False)
+    return Path(probe.stdout.strip()).is_absolute()
+
+
 def _ensure_source_toolchain() -> None:
     cc, cxx = _clang()
-    if shutil.which(cc) and shutil.which(cxx):
+    if shutil.which(cc) and shutil.which(cxx) and _has_libcxx_modules(cxx):
         return
     prepare = REPO_ROOT / "scripts" / "prepare.sh"
-    logger.warning(f"[wheel] {cc} is unavailable — preparing the Ubuntu build environment")
+    logger.warning(f"[wheel] {cc} with libc++ is unavailable — preparing the Ubuntu build environment")
     subprocess.run(["/bin/bash", str(prepare), "ubuntu2404"], check=True)
-    if not shutil.which(cc) or not shutil.which(cxx):
-        raise RuntimeError(f"scripts/prepare.sh ubuntu2404 did not install {cc}")
+    if not shutil.which(cc) or not shutil.which(cxx) or not _has_libcxx_modules(cxx):
+        raise RuntimeError(f"scripts/prepare.sh ubuntu2404 did not install {cc} with libc++")
 
 
 def build_and_install_from_source() -> None:
@@ -307,6 +313,8 @@ def build_and_install_from_source() -> None:
             str(build_dir),
             "-S",
             str(REPO_ROOT),
+            "-G",
+            "Ninja",
             "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
             "-DPHOENIX_BUILD_WHEEL=ON",
             "-DPHOENIX_BUILD_BENCHMARK=OFF",

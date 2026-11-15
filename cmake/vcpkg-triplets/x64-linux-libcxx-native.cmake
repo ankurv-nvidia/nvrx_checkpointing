@@ -5,7 +5,8 @@ set(VCPKG_LIBRARY_LINKAGE static)
 set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 
 set(VCPKG_C_FLAGS "-march=native -mtune=native")
-set(VCPKG_CXX_FLAGS "-march=native -mtune=native")
+set(VCPKG_CXX_FLAGS "-march=native -mtune=native -stdlib=libc++")
+set(VCPKG_LINKER_FLAGS "-stdlib=libc++")
 set(VCPKG_CMAKE_CONFIGURE_OPTIONS
     "-DCMAKE_C_COMPILER=$ENV{VCPKG_C_COMPILER}"
     "-DCMAKE_CXX_COMPILER=$ENV{VCPKG_CXX_COMPILER}"

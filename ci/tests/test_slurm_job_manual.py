@@ -5239,6 +5239,7 @@ def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
         "clang++-23": "/usr/bin/clang++-23",
     }
     monkeypatch.setattr(wheel_install.shutil, "which", tools.get)
+    monkeypatch.setattr(wheel_install, "_has_libcxx_modules", lambda _cxx: True)
     monkeypatch.setattr(
         wheel_install.subprocess,
         "run",
@@ -5249,6 +5250,7 @@ def test_source_wheel_build_skips_vcpkg_bootstrap_dependency_probe(
 
     wheel_install.build_and_install_from_source()
 
+    assert commands[0][commands[0].index("-G") + 1] == "Ninja"
     assert "-DVCPKG_BOOTSTRAP_OPTIONS=-skipDependencyChecks" in commands[0]
     assert f"-DVCPKG_ROOT={tmp_path / 'vcpkg'}" in commands[0]
     assert "-DCMAKE_C_COMPILER=/usr/bin/clang-23" in commands[0]
@@ -5355,11 +5357,54 @@ def test_source_wheel_build_prepares_ubuntu_when_clang_is_missing(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(wheel_install.shutil, "which", which)
+    monkeypatch.setattr(wheel_install, "_has_libcxx_modules", lambda _cxx: prepared)
     monkeypatch.setattr(wheel_install.subprocess, "run", run)
 
     wheel_install._ensure_source_toolchain()
 
     assert prepared
+
+
+def test_source_wheel_build_prepares_ubuntu_when_libcxx_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel_install = _load_slurm_job().wheel_install
+    prepared = False
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal prepared
+        prepared = True
+        assert command == ["/bin/bash", str(REPO_ROOT / "scripts" / "prepare.sh"), "ubuntu2404"]
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(wheel_install.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(wheel_install, "_has_libcxx_modules", lambda _cxx: prepared)
+    monkeypatch.setattr(wheel_install.subprocess, "run", run)
+
+    wheel_install._ensure_source_toolchain()
+
+    assert prepared
+
+
+@pytest.mark.parametrize(
+    ("printed", "found"),
+    [("/usr/lib/x86_64-linux-gnu/libc++.modules.json\n", True), ("libc++.modules.json\n", False)],
+)
+def test_libcxx_modules_probe_requires_a_resolved_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    printed: str,
+    found: bool,
+) -> None:
+    wheel_install = _load_slurm_job().wheel_install
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        wheel_install.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(returncode=0, stdout=printed),
+    )
+
+    assert wheel_install._has_libcxx_modules("clang++-23") is found
+    assert commands == [["clang++-23", "-stdlib=libc++", "-print-file-name=libc++.modules.json"]]
 
 
 def test_vcpkg_bootstrap_invalidates_cached_executable() -> None:
