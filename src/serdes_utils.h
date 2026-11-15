@@ -47,4 +47,50 @@ template <typename TSize> auto WriteBlobWithSize(std::ostream& os LFTBND, std::s
     return os;
 }
 
+// Counts the bytes streamed through it without storing them.
+class ByteCounter final : public std::streambuf
+{
+    public:
+    [[nodiscard]] size_t Count() const { return _count; }
+
+    protected:
+    std::streamsize xsputn(char const* /*data*/, std::streamsize size) override
+    {
+        _count += static_cast<size_t>(size);
+        return size;
+    }
+
+    int_type overflow(int_type ch) override
+    {
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) { ++_count; }
+        return traits_type::not_eof(ch);
+    }
+
+    private:
+    size_t _count = 0;
+};
+
+// Appends the bytes streamed through it to a caller-owned string.
+class StringSink final : public std::streambuf
+{
+    public:
+    explicit StringSink(std::string& out LFTBND) : _out(&out) {}
+
+    protected:
+    std::streamsize xsputn(char const* data, std::streamsize size) override
+    {
+        _out->append(data, static_cast<size_t>(size));
+        return size;
+    }
+
+    int_type overflow(int_type ch) override
+    {
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) { _out->push_back(traits_type::to_char_type(ch)); }
+        return traits_type::not_eof(ch);
+    }
+
+    private:
+    std::string* _out;
+};
+
 }    // namespace serdes

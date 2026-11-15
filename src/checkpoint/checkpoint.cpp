@@ -565,25 +565,33 @@ struct CheckpointWriter
         auto stop1                       = Clock::now();
 
         {
-            std::stringstream sstrm;
-            serdes::WriteBlobWithSize<uint16_t>(sstrm, std::filesystem::path(ckptPath).string());
-            StateSerDes::Write(sstrm, root, StateNode::Handle::Root);
-            auto msg = sstrm.str();
-            if (msg.size() > std::numeric_limits<uint32_t>::max()) { throw std::length_error("Snapshot metadata exceeds wire limit"); }
+            auto const pathString    = std::filesystem::path(ckptPath).string();
+            auto const writeMetadata = [&](std::ostream& out) {
+                serdes::WriteBlobWithSize<uint16_t>(out, pathString);
+                StateSerDes::Write(out, root, StateNode::Handle::Root);
+            };
+            // Sizing the metadata first lets the activation message be allocated once.
+            serdes::ByteCounter counter;
+            std::ostream        counting(&counter);
+            writeMetadata(counting);
+            if (counter.Count() > std::numeric_limits<uint32_t>::max()) { throw std::length_error("Snapshot metadata exceeds wire limit"); }
             cipc::Message::ActivateSnapshot header{
                 .sessionId    = root.SessionId(),
                 .snapshotId   = snapshotId,
                 .globalRank   = root.GlobalRank(),
                 .snapshotSize = totalTensorStateSizeInBytes,
-                .messageSize  = static_cast<uint32_t>(msg.size()),
+                .messageSize  = static_cast<uint32_t>(counter.Count()),
                 .startedAt    = root.startedAt,
             };
-            std::ostringstream activation;
-            serdes::WriteTrivial(activation, header);
-            activation.write(msg.data(), static_cast<std::streamsize>(msg.size()));
+            std::string activation;
+            activation.reserve(sizeof(header) + counter.Count());
+            serdes::StringSink sink(activation);
+            std::ostream       message(&sink);
+            serdes::WriteTrivial(message, header);
+            writeMetadata(message);
             LocalServiceRequest(ServerIndex(root),
                                 fmt::format("/api/activate-snapshot/{}/{}/{}", root.SessionId(), root.GlobalRank(), snapshotId),
-                                activation.str());
+                                activation);
         }
         WriteTensors(snapshotId);
         auto const stop2       = Clock::now();
