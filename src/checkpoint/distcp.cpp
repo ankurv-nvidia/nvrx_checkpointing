@@ -9,27 +9,7 @@
 
 #include <fmt/format.h>
 
-#include <algorithm>
-#include <array>
-#include <bit>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <exception>
-#include <fstream>
-#include <functional>
-#include <ios>
-#include <limits>
-#include <map>
-#include <ostream>
-#include <ranges>
-#include <span>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <unordered_set>
-#include <vector>
+import std.compat;
 
 static_assert(std::endian::native == std::endian::little,
               "distcp writer assumes a little-endian host: archive/byteorder is hardcoded "

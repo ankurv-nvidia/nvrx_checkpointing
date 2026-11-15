@@ -5,10 +5,7 @@
 
 #include <fmt/format.h>
 
-#include <array>
-#include <string>
-#include <utility>
-#include <vector>
+import std.compat;
 
 // Process-lifetime hwloc topology, loaded once. hwloc_topology_load scans /sys,
 // so it must not run per-operation (e.g. on the checkpoint server's per-snapshot

@@ -26,13 +26,7 @@ SUPPRESS_MSVC_WARNING(4388)    // signed / unsigned mismatch (Catch2)
 #include <fmt/ranges.h>
 SUPPRESS_WARNINGS_END
 
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <vector>
+import std.compat;
 
 #ifdef HAVE_EMBEDRESOURCE
 DECLARE_RESOURCE_COLLECTION(testdata);

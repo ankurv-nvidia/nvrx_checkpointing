@@ -4,12 +4,7 @@
 
 #include <cuda_runtime.h>
 
-#include <array>
-#include <cctype>
-#include <fstream>
-#include <mutex>
-#include <stdexcept>
-#include <string>
+import std.compat;
 
 // CUDA error checking macros
 #define CUDA_CHECK(call, ...)                                                                                                         \

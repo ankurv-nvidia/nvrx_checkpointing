@@ -14,18 +14,9 @@
 #include <fmt/chrono.h>
 #include <fmt/std.h>
 
-#include <algorithm>
-#include <bit>
 #include <cerrno>
-#include <chrono>
-#include <cstddef>
-#include <limits>
-#include <memory>
-#include <span>
-#include <stdexcept>
-#include <string>
-#include <thread>
-#include <utility>
+
+import std.compat;
 
 namespace checkpoint::ipc
 {

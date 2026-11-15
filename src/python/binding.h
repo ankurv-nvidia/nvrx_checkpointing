@@ -12,9 +12,7 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
-#include <memory>
-#include <utility>
-#include <vector>
+import std.compat;
 
 template <typename T, typename TPy> static bool IsTuple(TPy const& tupleObj)
 {

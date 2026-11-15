@@ -36,14 +36,10 @@
 #include <opentelemetry/sdk/trace/tracer_provider_factory.h>
 #include <opentelemetry/trace/provider.h>
 
-#include <expected>
-#include <mutex>
-#include <sstream>
-#include <utility>
-#include <variant>
-
 #include <unistd.h>
 #include <zlib.h>
+
+import std.compat;
 
 namespace trace_api     = opentelemetry::trace;
 namespace trace_sdk     = opentelemetry::sdk::trace;

@@ -5,8 +5,7 @@
 #include <boost/beast.hpp>
 #include <fmt/format.h>
 
-#include <string>
-#include <thread>
+import std.compat;
 
 // A short readiness probe shared by the training client and losing daemon
 // candidates. EINTR retries protect one socket operation; the two outer attempts

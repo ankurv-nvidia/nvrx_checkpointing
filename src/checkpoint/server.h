@@ -3,8 +3,7 @@
 #include "messages.h"
 #include "state.h"
 
-#include <filesystem>
-#include <string_view>
+import std.compat;
 
 // Starts the checkpoint server, prints "READY\n" to stdout when the port is bound,
 // then blocks until a shutdown is triggered (either by message or inactivity timeout).

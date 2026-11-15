@@ -11,11 +11,7 @@
 
 #include <fmt/std.h>
 
-#include <chrono>
-#include <cstddef>
-#include <cstring>
-#include <iostream>
-#include <string_view>
+import std.compat;
 
 namespace bpo = boost::program_options;
 using namespace checkpoint::ipc;

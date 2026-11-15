@@ -3,10 +3,7 @@
 #include <fmt/core.h>
 #include <fmt/format.h>
 
-#include <cstdint>
-#include <iterator>
-#include <string_view>
-#include <utility>
+import std.compat;
 
 namespace checkpoint::logging
 {

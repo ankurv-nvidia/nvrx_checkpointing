@@ -5,18 +5,7 @@
 #include <fmt/ranges.h>
 #include <fmt/std.h>
 
-#include <array>
-#include <cstdint>
-#include <cstdio>
-#include <functional>
-#include <limits>
-#include <numeric>
-#include <ranges>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <type_traits>
-#include <vector>
+import std.compat;
 
 #ifndef NDEBUG
 #define TENSOR_SHARD_ASSERTION_ENABLED

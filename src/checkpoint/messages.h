@@ -4,9 +4,7 @@
 
 #include <fmt/format.h>
 
-#include <chrono>
-#include <cstdint>
-#include <variant>
+import std.compat;
 
 namespace checkpoint::ipc
 {

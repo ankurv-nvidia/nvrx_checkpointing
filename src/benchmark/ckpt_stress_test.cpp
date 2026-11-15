@@ -26,7 +26,6 @@
 #include "messages.h"
 #include "server.h"
 
-#include <algorithm>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/io_context.hpp>
@@ -43,21 +42,7 @@
 
 #include <sys/resource.h>
 
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <cmath>
-#include <condition_variable>
-#include <cstdint>
-#include <cstdlib>
-#include <exception>
-#include <fstream>
-#include <iostream>
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <vector>
+import std.compat;
 
 // NOLINTBEGIN(readability-magic-numbers, cppcoreguidelines-avoid-reference-coroutine-parameters)
 namespace bpo   = boost::program_options;

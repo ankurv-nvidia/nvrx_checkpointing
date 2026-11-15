@@ -2,7 +2,7 @@
 
 #include "tensor.h"
 
-#include <cstdint>
+import std.compat;
 namespace checkpoint::distcp
 {
 uint64_t ComputeShardArchiveSize(Tensor::DType dtype, Tensor::Dim const& shape, uint64_t shardDataSize);

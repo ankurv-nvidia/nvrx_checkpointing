@@ -5,19 +5,7 @@
 #include "state.h"
 #include "tensor.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <filesystem>
-#include <future>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <span>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+import std.compat;
 
 // Server is defined in server.cpp at file scope; Session only holds a pointer to it.
 struct Server;

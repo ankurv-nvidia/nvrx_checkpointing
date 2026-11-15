@@ -12,8 +12,7 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
-#include <future>
-#include <mutex>
+import std.compat;
 
 namespace nb   = nanobind;
 namespace cipc = checkpoint::ipc;

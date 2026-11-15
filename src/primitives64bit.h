@@ -1,17 +1,7 @@
 #pragma once
 #include "CommonMacros.h"
 
-SUPPRESS_WARNINGS_START
-SUPPRESS_STL_WARNINGS
-SUPPRESS_MSVC_WARNING(4866)    // left to right evaluation not guaranteed
-#include <array>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <stdexcept>
-#include <type_traits>
-
-SUPPRESS_WARNINGS_END
+import std.compat;
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access,bugprone-branch-clone,readability-magic-numbers)
 

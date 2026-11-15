@@ -38,33 +38,7 @@
 #include <opentelemetry/proto/collector/metrics/v1/metrics_service.pb.h>
 #include <opentelemetry/proto/collector/trace/v1/trace_service.pb.h>
 
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <bit>
-#include <chrono>
-#include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <future>
-#include <limits>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <new>
-#include <regex>
-#include <set>
-#include <span>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <unordered_set>
-#include <utility>
-#include <vector>
 
 #include <csignal>
 #include <fcntl.h>
@@ -72,6 +46,8 @@
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+import std.compat;
 
 // NOLINTBEGIN(readability-magic-numbers)
 

@@ -1,21 +1,7 @@
 #include "CommonMacros.h"
 #include "SetThreadName.h"
 
-#include "byte_storage.h"
-#include "config.h"
-#include "logging.h"
-#include "messages.h"
-#include "net_utils.h"
-#include "numa_utils.h"
-#include "serdes_utils.h"
-#include "server.h"
-#include "session.h"
-#include "shm_ring_buffer.h"
-#include "state.h"
-#include "stateserdes.h"
-#include "telemetry.h"
-#include "tensor.h"
-
+// Third-party headers come first so their standard headers precede the std module import.
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read_until.hpp>
@@ -43,7 +29,22 @@
 #include <boost/url.hpp>
 #include <hwloc.h>
 
-#include <latch>
+#include "byte_storage.h"
+#include "config.h"
+#include "logging.h"
+#include "messages.h"
+#include "net_utils.h"
+#include "numa_utils.h"
+#include "serdes_utils.h"
+#include "server.h"
+#include "session.h"
+#include "shm_ring_buffer.h"
+#include "state.h"
+#include "stateserdes.h"
+#include "telemetry.h"
+#include "tensor.h"
+
+import std.compat;
 
 using namespace std::chrono_literals;
 namespace bip  = boost::interprocess;

@@ -13,12 +13,7 @@
 #include <boost/beast/version.hpp>
 #include <boost/url.hpp>
 
-#include <mutex>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <utility>
+import std.compat;
 
 static constexpr int HttpVersion11 = 11;
 

@@ -3,15 +3,7 @@
 
 #include <fmt/format.h>
 
-#include <array>
-#include <bit>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <stdexcept>
-#include <string_view>
+import std.compat;
 
 // NOLINTBEGIN(readability-magic-numbers)
 namespace checkpoint::host_dequant

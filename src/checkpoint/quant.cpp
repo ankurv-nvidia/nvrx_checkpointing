@@ -1,9 +1,6 @@
 #include "quant.h"
 
-#include <algorithm>
-#include <iterator>
-#include <stdexcept>
-#include <utility>
+import std.compat;
 
 namespace checkpoint::quant
 {

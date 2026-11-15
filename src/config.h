@@ -1,17 +1,8 @@
 #pragma once
 
-#include <array>
-#include <concepts>
-#include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <type_traits>
-
 #include <unistd.h>    // for gethostname
+
+import std.compat;
 
 namespace checkpoint::config
 {

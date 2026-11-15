@@ -1,10 +1,7 @@
 #pragma once
 #include "CommonMacros.h"
 
-#include <istream>
-#include <ostream>
-#include <span>
-#include <string>
+import std.compat;
 
 namespace serdes
 {

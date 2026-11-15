@@ -2,10 +2,7 @@
 #include "CommonMacros.h"
 #include <fmt/format.h>
 
-#include <cstddef>
-#include <cstdlib>
-#include <new>
-#include <span>
+import std.compat;
 
 struct ByteStorage
 {

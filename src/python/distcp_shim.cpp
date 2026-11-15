@@ -17,15 +17,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <filesystem>
-#include <map>
-#include <stdexcept>
-#include <string>
-#include <utility>
-#include <vector>
+import std.compat;
 
 namespace nb = nanobind;
 

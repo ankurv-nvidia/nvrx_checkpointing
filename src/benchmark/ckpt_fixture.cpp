@@ -10,17 +10,7 @@
 #include <fmt/format.h>
 #include <fmt/std.h>
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <numeric>
-#include <queue>
-#include <ranges>
-#include <stdexcept>
-#include <string_view>
-#include <unordered_map>
-#include <utility>
+import std.compat;
 
 namespace cipc = checkpoint::ipc;
 

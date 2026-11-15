@@ -5,16 +5,7 @@
 #include "state.h"
 #include "tensor.h"
 
-#include <atomic>
-#include <condition_variable>
-#include <cstdint>
-#include <exception>
-#include <filesystem>
-#include <memory>
-#include <mutex>
-#include <thread>
-#include <unordered_set>
-#include <vector>
+import std.compat;
 
 using FixtureFunc = void (*)(StateTree& tree, std::filesystem::path const& ckptDir);
 

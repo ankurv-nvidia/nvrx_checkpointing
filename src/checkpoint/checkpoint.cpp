@@ -23,19 +23,7 @@
 #include <boost/process/execute.hpp>
 #include <hwloc.h>
 
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <ctime>
-#include <fstream>
-#include <future>
-#include <limits>
-#include <mutex>
-#include <sstream>
-#include <stdexcept>
-#include <string_view>
-#include <thread>
-#include <unordered_map>
+import std.compat;
 
 using namespace std::chrono_literals;
 namespace cipc = checkpoint::ipc;

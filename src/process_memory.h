@@ -1,14 +1,6 @@
 #pragma once
 
-#include <charconv>
-#include <cstddef>
-#include <cstdint>
-#include <fstream>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
+import std.compat;
 
 struct ProcessMemUsageInfo
 {

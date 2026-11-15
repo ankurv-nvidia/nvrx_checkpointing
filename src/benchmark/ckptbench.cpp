@@ -9,11 +9,7 @@
 #include <fmt/format.h>
 #include <fmt/std.h>
 
-#include <cstdint>
-#include <filesystem>
-#include <iostream>
-#include <string>
-#include <vector>
+import std.compat;
 
 namespace bpo = boost::program_options;
 

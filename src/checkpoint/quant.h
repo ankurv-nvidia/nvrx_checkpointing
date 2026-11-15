@@ -2,13 +2,7 @@
 
 #include "tensor.h"
 
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <span>
-#include <type_traits>
-#include <vector>
+import std.compat;
 
 namespace checkpoint::quant
 {

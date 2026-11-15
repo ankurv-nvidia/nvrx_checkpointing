@@ -9,16 +9,11 @@
 
 #include <cerrno>
 #include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <exception>
-#include <iostream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
 
 // TODO: avoid backtrace()
 #include <execinfo.h>
+
+import std.compat;
 
 extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);

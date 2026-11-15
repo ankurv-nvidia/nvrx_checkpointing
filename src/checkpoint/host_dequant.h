@@ -2,8 +2,7 @@
 
 #include "quant.h"
 
-#include <cstdint>
-#include <span>
+import std.compat;
 
 namespace checkpoint::host_dequant
 {

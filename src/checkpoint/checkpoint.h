@@ -5,9 +5,7 @@
 #include "state.h"
 #include "tensor.h"
 
-#include <cstdint>
-#include <filesystem>
-#include <memory>
+import std.compat;
 
 void SvcIncrRef();
 void SvcDecrRef();

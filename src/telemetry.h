@@ -3,15 +3,7 @@
 #include "messages.h"
 #include "process_memory.h"
 
-#include <chrono>
-#include <condition_variable>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <mutex>
-#include <string>
-#include <string_view>
-#include <thread>
+import std.compat;
 namespace checkpoint::telemetry
 {
 struct Id

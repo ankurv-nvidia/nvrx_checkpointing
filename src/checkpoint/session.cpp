@@ -13,7 +13,8 @@
 #include <boost/iostreams/filter/zlib.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/iostreams/stream.hpp>
-#include <utility>
+
+import std.compat;
 
 namespace cipc  = checkpoint::ipc;
 namespace tel   = checkpoint::telemetry;

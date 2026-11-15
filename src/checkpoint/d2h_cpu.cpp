@@ -1,6 +1,6 @@
 #include "checkpoint.h"
-#include <cstdint>
-#include <cstring>
+
+import std.compat;
 namespace
 {
 struct CPUContext : public DeviceContext
