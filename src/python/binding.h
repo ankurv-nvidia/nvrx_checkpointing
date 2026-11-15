@@ -4,6 +4,8 @@
 #include "quant.h"
 #include "tensor.h"
 
+// nanobind 3.1.0 headers use stderr without including <cstdio>.
+#include <cstdio>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/filesystem.h>

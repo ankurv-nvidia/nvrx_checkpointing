@@ -1,4 +1,8 @@
-cmake_minimum_required(VERSION 3.31)
+cmake_minimum_required(VERSION 4.5)
+# The cross build runs the build host's Python interpreter for packaging.
+cmake_policy(SET CMP0190 OLD)
+# Compiler detection must see libc++ to locate its standard library modules.
+set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
 project(phoenix)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -69,7 +73,8 @@ set(PYTHON_VENV_USE_SYSTEM_PACKAGES ON)
 
 set(CMAKE_CXX_STANDARD 26)
 EnableStrictCompilation()
-include(StdModules)
+# Static libc++ keeps the binaries free of a libc++ runtime dependency; CUDA-linked targets keep libstdc++.
+add_link_options("$<$<LINK_LANGUAGE:CXX>:-stdlib=libc++;-static-libstdc++>")
 InitClangDIntellisense()
 
 include_directories(include)
@@ -120,7 +125,6 @@ target_link_libraries(phoenix_checkpoint PUBLIC
     opentelemetry-cpp::otlp_file_metric_exporter
     opentelemetry-cpp::otlp_file_log_record_exporter
     opentelemetry-cpp::proto
-    phoenix_std
     spdlog::spdlog_header_only
     ZLIB::ZLIB
 )
@@ -204,7 +208,7 @@ if (PHOENIX_BUILD_BENCHMARK)
 
     add_executable(shm_ipc_benchmark src/benchmark/shm_ipc_benchmark.cpp)
     target_include_directories(shm_ipc_benchmark PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${CMAKE_CURRENT_LIST_DIR}/src/checkpoint)
-    target_link_libraries(shm_ipc_benchmark PRIVATE fmt::fmt-header-only Boost::interprocess Boost::process Boost::program_options phoenix_std)
+    target_link_libraries(shm_ipc_benchmark PRIVATE fmt::fmt-header-only Boost::interprocess Boost::process Boost::program_options)
 
     # Connection-layer scale test for the checkpoint web service. Reuses the real
     # in-process server (via the fixture -> server object files) and drives it with
@@ -242,7 +246,7 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     foreach (nanobind_library nanobind-static nanobind-static-abi3)
         if (TARGET ${nanobind_library})
             # nanobind 3.1.0 headers use stderr without including <cstdio>.
-            target_compile_options(${nanobind_library} PUBLIC -include cstdio)
+            target_compile_options(${nanobind_library} PRIVATE -include cstdio)
         endif()
     endforeach()
     target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
