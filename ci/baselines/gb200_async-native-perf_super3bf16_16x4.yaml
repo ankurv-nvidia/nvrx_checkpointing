@@ -3,7 +3,7 @@ source: otlp
 metrics:
   bw_mbps: 154500
   wr_tnsr_us: 147600
-  total_written_bytes: 24127272288
+  total_written_bytes: 24127295429.140625
   ckpt_durable_ms: 259
   ckpt_daemon_durable_ms: 17640
   megatron.training.memory_allocated_gb: 87.81
@@ -24,9 +24,9 @@ rank_statistics:
     median: 150331.5
     max: 186719
   total_written_bytes:
-    min: 23837641728
-    median: 23840022528.0
-    max: 29099675136
+    min: 24090554484
+    median: 24094599284.0
+    max: 24364367969
   ckpt_durable_ms:
     min: 244.15
     median: 262.3
