@@ -477,10 +477,11 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
         else:
 
             def finalize_fn() -> None:
-                _write_checkpoint_tracker(args, iteration)
-                print_rank_0(
-                    f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
-                )
+                with _checkpoint_span("nvrx.checkpoint.finalize", iteration):
+                    _write_checkpoint_tracker(args, iteration)
+                    print_rank_0(
+                        f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
+                    )
 
             with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
                 root.wait_for_async_completion()

@@ -87,7 +87,9 @@ OTLP/HTTP protobuf ─────────────── terminal decode
 - Python checkpoint boundary spans use the application's process-global OpenTelemetry
   provider. They are no-ops when `MEGATRON_OTEL_ENABLED` is not `1` or the
   OpenTelemetry Python API is unavailable; otherwise the training job's provider owns
-  sampling, OTLP export, resource attributes, and shutdown.
+  sampling, OTLP export, resource attributes, and shutdown. The native provider
+  publishes each asynchronous save inside an `nvrx.checkpoint.finalize` span that
+  carries `megatron.iteration` and `nvrx.snapshot_id`.
 
 ## Notes
 
