@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 4.5)
 cmake_policy(SET CMP0190 OLD)
 # Compiler detection must see libc++ to locate its standard library modules.
 set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
+if (NOT CMAKE_GENERATOR MATCHES "^Ninja")
+    message(FATAL_ERROR "The ${CMAKE_GENERATOR} generator cannot build the standard library module import; configure with -G Ninja or set CMAKE_GENERATOR=Ninja.")
+endif()
 project(phoenix)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
