@@ -607,6 +607,52 @@ def test_stock_dcp_checkpoint_restores_values_and_tensor_aliases(tmp_path: Path,
     assert vars(target["args"]) == vars(arguments)
 
 
+@pytest.mark.parametrize("allow_partial_load", [False, True])
+@pytest.mark.parametrize("namespace", [False, True], ids=["tuple", "namespace"])
+@pytest.mark.parametrize("destination_dtype", [torch.float32, torch.float64])
+def test_stock_dcp_object_archive_restores_tensor_destinations(
+    tmp_path: Path,
+    allow_partial_load: bool,
+    namespace: bool,
+    destination_dtype: torch.dtype,
+) -> None:
+    expected = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    destination = torch.zeros_like(expected, dtype=destination_dtype, requires_grad=True)
+    if namespace:
+        source = argparse.Namespace(weight=expected, metadata={"step": 7}, label="saved")
+        template = argparse.Namespace(weight=destination, metadata={"step": 0}, label="current")
+    else:
+        source = (expected, {"step": 7}, "saved")
+        template = (destination, {"step": 0}, "current")
+    dcp.save({"outer": {"payload": source}, "weight": expected + 1}, checkpoint_id=tmp_path)
+    ordinary = torch.zeros_like(expected)
+    target = {"outer": {"payload": template}, "weight": ordinary}
+
+    checkpoint.load_checkpoint(tmp_path, target, allow_partial_load=allow_partial_load)
+
+    restored = target["outer"]["payload"]
+    if namespace:
+        assert restored is template
+        assert restored.weight is destination
+        assert restored.metadata == {"step": 7}
+        assert restored.label == "saved"
+    else:
+        assert restored[0] is destination
+        assert restored[1:] == ({"step": 7}, "saved")
+    assert destination.requires_grad
+    torch.testing.assert_close(destination, expected.to(destination_dtype))
+    assert target["weight"] is ordinary
+    torch.testing.assert_close(ordinary, expected + 1)
+
+
+def test_stock_dcp_object_archive_rejects_tensor_shape_mismatch(tmp_path: Path) -> None:
+    dcp.save({"payload": (torch.ones(1, 3),)}, checkpoint_id=tmp_path)
+    target = {"payload": (torch.zeros(2, 3),)}
+
+    with pytest.raises((RuntimeError, ValueError), match=r"does not match the destination at: payload\.0"):
+        checkpoint.load_checkpoint(tmp_path, target)
+
+
 @pytest.mark.parametrize("shape", [(), (0, 3)])
 def test_stock_dcp_scalar_and_empty_tensors_preserve_destination_identity(tmp_path: Path, shape: tuple[int, ...]) -> None:
     expected = torch.full(shape, 3.5)

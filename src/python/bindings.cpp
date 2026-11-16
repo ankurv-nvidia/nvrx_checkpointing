@@ -1967,7 +1967,7 @@ RestoreLoadedValue(nb::handle value, nb::handle target, std::string const& path,
     {
         if (nb::isinstance(target, types["tensor"]))
         {
-            if (!target.attr("shape").equal(value.attr("shape")) || !target.attr("dtype").equal(value.attr("dtype")))
+            if (!target.attr("shape").equal(value.attr("shape")))
             {
                 throw std::invalid_argument(fmt::format("Native tensor does not match the destination at: {}", path));
             }

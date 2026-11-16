@@ -144,8 +144,12 @@ storage. DTensors retain their local storage and aliases. Runtime templates
 supply Python types for bootstrap arguments and dynamic containers.
 Rank-local dictionaries retain peer-owned optimizer entries. Supported objects
 include namespaces, ordinary containers, NumPy arrays, enums, and RNG
-generators; arbitrary Python objects are rejected during capture. Existing
-Megatron `fsdp_dtensor` checkpoints remain loadable through this entrypoint.
+generators; arbitrary Python objects are rejected during capture. The native
+reader accepts stock DCP tensor entries and `torch.save` object archives.
+Compatibility targets `fsdp_dtensor` checkpoints from the pinned Megatron
+revision with matching model configuration and parameter names. The reader
+does not translate architecture-dependent parameter names. Stock PyTorch DCP
+does not decode native scalar and object payloads.
 
 The `fsdp_2gpu` CI profile keeps eight experts with EP2 and uses TP1. Select
 it in the CI launcher with `--config fsdp_2gpu --gpus-per-node 2`.

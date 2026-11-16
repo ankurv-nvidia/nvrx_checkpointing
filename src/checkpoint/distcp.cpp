@@ -2035,6 +2035,18 @@ std::vector<ByteStorage> ReadCheckpoint(std::filesystem::path const& ckptDir, St
         auto const entry = entries.find(fqn);
         if (entry == entries.end())
         {
+            bool objectAncestor = false;
+            for (auto separator = fqn.rfind('.'); separator != std::string::npos;
+                 separator      = separator == 0 ? std::string::npos : fqn.rfind('.', separator - 1))
+            {
+                auto const ancestor = entries.find(fqn.substr(0, separator));
+                if (ancestor != entries.end() && ancestor->second->text == std::string(KMetadataModule) + ".BytesStorageMetadata")
+                {
+                    objectAncestor = true;
+                    break;
+                }
+            }
+            if (objectAncestor) { continue; }
             if (!allowPartialLoad) { throw std::runtime_error(fmt::format("distcp: missing checkpoint tensor '{}'", fqn)); }
             LoadedNode(localRegistry, fqn).data = std::monostate{};
             continue;
