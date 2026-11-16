@@ -40,6 +40,24 @@ def _read_metadata_uncached(strategy: Any) -> None:
         strategy = getattr(strategy, "base_strategy", None)
 
 
+def _install_run_config_load(checkpointing_module: Any) -> None:
+    original = getattr(checkpointing_module, "_read_checkpoint_run_config", None)
+    if original is None or getattr(original, _NATIVE_LOAD_MARKER, False):
+        return
+
+    @wraps(original)
+    def read_run_config(state_dict: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        saved = getattr(state_dict.get("args"), "_nvrx_run_config", None)
+        if saved is None:
+            return original(state_dict, *args, **kwargs)
+        from megatron.training.utils.checkpoint_utils import _prepare_run_config  # type: ignore[import-not-found]
+
+        return _prepare_run_config(saved)
+
+    setattr(read_run_config, _NATIVE_LOAD_MARKER, True)
+    checkpointing_module._read_checkpoint_run_config = read_run_config  # noqa: SLF001
+
+
 def _install_load_registration() -> None:
     """Coordinate native registration around Megatron's checkpoint load."""
     from megatron.core import dist_checkpointing  # type: ignore[import-not-found]
@@ -65,6 +83,7 @@ def _install_load_registration() -> None:
         from .load import install as install_dictionary_load
 
         install_dictionary_load(checkpointing_module)
+        _install_run_config_load(checkpointing_module)
 
 
 def _install_async_queue_bindings() -> None:
@@ -137,6 +156,7 @@ def _install_save_wrapper() -> None:
                 dp_gtp_remat_group=values.get("dp_gtp_remat_group"),
                 cp_group=values.get("cp_group"),
                 rng_state_key_prefix=values.get("rng_state_key_prefix", ""),
+                **{name: values[name] for name in ("save", "ckpt_format", "verify_integrity", "release", "on_saved") if name in values},
             ),
         )
 

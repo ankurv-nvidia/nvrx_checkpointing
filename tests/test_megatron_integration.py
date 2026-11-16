@@ -393,6 +393,82 @@ def test_train_does_not_register_state_without_a_load(monkeypatch: pytest.Monkey
     assert calls.native_loads == []
 
 
+def test_training_save_forwards_checkpoint_policy_and_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    integration, calls = _load_integration(monkeypatch)
+
+    def save(
+        iteration: int,
+        model: object,
+        optimizer: object,
+        opt_param_scheduler: object,
+        num_floating_point_operations_so_far: int,
+        release: bool = False,
+        on_saved: object = None,
+        *,
+        save: str | None = None,
+        ckpt_format: str | None = None,
+        verify_integrity: bool | None = None,
+    ) -> None:
+        raise AssertionError("Stock checkpoint writer called")
+
+    def callback() -> None:
+        pass
+
+    monkeypatch.setattr(calls.training_module, "save_checkpoint", save)
+    monkeypatch.delattr(calls.training_module, integration._NATIVE_SAVE_MARKER)  # noqa: SLF001
+    integration._install_save_wrapper()  # noqa: SLF001
+
+    calls.training_module.save_checkpoint(
+        10,
+        "model",
+        "optimizer",
+        "scheduler",
+        123,
+        release=True,
+        on_saved=callback,
+        save="/converted",
+        ckpt_format="fsdp_dtensor",
+        verify_integrity=False,
+    )
+
+    (save_args,), kwargs = calls.native_saves[0]
+    assert kwargs == {}
+    assert save_args.save == "/converted"
+    assert save_args.ckpt_format == "fsdp_dtensor"
+    assert save_args.verify_integrity is False
+    assert save_args.release is True
+    assert save_args.on_saved is callback
+
+
+def test_run_config_load_validates_embedded_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    integration, _ = _load_integration(monkeypatch)
+    reads = []
+    validated = []
+    checkpointing = ModuleType("megatron.training.checkpointing")
+
+    def read_config(state: dict, path: str, kind: str) -> str:
+        reads.append((state, path, kind))
+        return "sidecar"
+
+    def prepare_config(value: dict) -> dict:
+        validated.append(value)
+        return {"model": value["model"], "prepared": True}
+
+    utilities = ModuleType("megatron.training.utils.checkpoint_utils")
+    utilities._prepare_run_config = prepare_config  # noqa: SLF001
+    monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
+    checkpointing._read_checkpoint_run_config = read_config  # noqa: SLF001
+    integration._install_run_config_load(checkpointing)  # noqa: SLF001
+    saved = {"model": {"transformer": {"moe_grouped_gemm": False}}}
+    state = {"args": argparse.Namespace(_nvrx_run_config=saved)}
+
+    assert checkpointing._read_checkpoint_run_config(state, "/native", "fsdp") == {"model": saved["model"], "prepared": True}  # noqa: SLF001
+    assert reads == []
+    assert validated == [saved]
+    assert checkpointing._read_checkpoint_run_config({}, "/stock", "fsdp") == "sidecar"  # noqa: SLF001
+    assert reads == [({}, "/stock", "fsdp")]
+
+
 def test_native_load_defers_registration_until_the_outer_load_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
     _, calls = _load_integration(monkeypatch)
     state = {"model": "tensor"}

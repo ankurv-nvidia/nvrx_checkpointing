@@ -2048,7 +2048,12 @@ RankTopology LoadTopology(uint32_t rank, uint32_t worldSize)
     return {.rank = Rank{rank}, .worldSize = Rank{worldSize}, .ranksPerPeer = worldSize, .peersPerNode = 1, .peers = {"localhost"}};
 }
 
-void LoadPythonCheckpoint(std::filesystem::path const& path, nb::dict const& state, uint32_t rank, uint32_t worldSize, bool allowPartial)
+void LoadPythonCheckpoint(std::filesystem::path const& path,
+                          nb::dict const&              state,
+                          uint32_t                     rank,
+                          uint32_t                     worldSize,
+                          bool                         allowPartial,
+                          nb::dict const&              missingDefaults)
 {
     auto                          types    = StatePythonTypes();
     auto                          topology = LoadTopology(rank, worldSize);
@@ -2076,6 +2081,15 @@ void LoadPythonCheckpoint(std::filesystem::path const& path, nb::dict const& sta
         storage = checkpoint::distcp::ReadCheckpoint(path, registry, allowPartial);
     }
     auto objects = DecodeLoadedObjects(registry, targets, types, false);
+    for (auto const& [key, value] : missingDefaults)
+    {
+        auto const address = nb::cast<std::string>(key);
+        auto const target  = targets.find(address);
+        if (target != targets.end() && !nb::isinstance(target->second, types["tensor"]) && !StateIsContainer(target->second, types))
+        {
+            objects.try_emplace(address, nb::borrow<nb::object>(value));
+        }
+    }
     static_cast<void>(FillLoadDestinations(registry, objects, state, {}, types, allowPartial));
 }
 
@@ -2169,11 +2183,13 @@ NB_MODULE(checkpoint, m)    // NOLINT
         nb::arg("iteration"));
     m.def("load_checkpoint",
           &LoadPythonCheckpoint,
+          "Fill destinations with defaults for missing independently stored non-tensor leaves.",
           nb::arg("path"),
           nb::arg("state_dict"),
           nb::arg("rank")               = 0,
           nb::arg("world_size")         = 1,
-          nb::arg("allow_partial_load") = false);
+          nb::arg("allow_partial_load") = false,
+          nb::arg("missing_defaults")   = nb::dict());
     m.def("read_common_state", &ReadPythonCommonState, nb::arg("path"));
     auto cls = nb::class_<PythonStateTree>(std::move(m), "model_state");
 

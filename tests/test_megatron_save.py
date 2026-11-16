@@ -9,12 +9,14 @@ import sys
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 
 import nvrx_checkpointing.megatron as nvrx_megatron
 import pytest
+import torch.distributed.checkpoint as dcp
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -66,6 +68,7 @@ def _megatron_stubs() -> dict[str, ModuleType | None]:
         "megatron.core.utils": core_utils,
         "megatron.training": training,
         "megatron.training.checkpointing": checkpointing,
+        "megatron.training.config.yaml_utils": _module("megatron.training.config.yaml_utils", safe_yaml_representers=nullcontext),
         "megatron.training.global_vars": global_vars,
         "megatron.training.utils": training_utils,
         "nemo": None,
@@ -636,6 +639,169 @@ def test_save_registers_the_state_of_its_format(
     assert events == expected
 
 
+@pytest.mark.parametrize("async_save", [False, True])
+@pytest.mark.parametrize("release", [False, True])
+def test_configured_save_snapshots_training_state_without_archives(  # noqa: C901, PLR0915
+    save: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    async_save: bool,
+    release: bool,
+) -> None:
+    iteration, initial_iteration = 10, 3
+    samples, flops = 128, 1.5e20
+
+    @dataclass
+    class CheckpointPolicy:
+        save: Path
+        async_save: bool
+        ckpt_format: str = "fsdp_dtensor"
+        verify_integrity: bool = False
+        save_retain_interval: int | None = None
+
+    events = []
+    captured = []
+    train_state = SimpleNamespace(
+        iteration=initial_iteration,
+        consumed_train_samples=samples,
+        skipped_train_samples=64,
+        consumed_valid_samples=32,
+    )
+    transformer = object()
+    policy = CheckpointPolicy(tmp_path / "configured", async_save)
+
+    def config_dict(*, checkpoint: dict) -> dict:
+        return {"checkpoint": {**checkpoint, "save": str(checkpoint["save"])}, "model": {"hidden_size": 8}}
+
+    config = SimpleNamespace(
+        checkpoint=policy,
+        optimizer=SimpleNamespace(use_distributed_optimizer=False),
+        model=SimpleNamespace(transformer=transformer),
+        logger=SimpleNamespace(log_progress=True),
+        to_dict=config_dict,
+    )
+    args = SimpleNamespace(
+        save="stale",
+        async_save=not async_save,
+        ckpt_format="torch_dist",
+        use_distributed_optimizer=True,
+        dataloader_save="loader",
+    )
+
+    def metadata(dp_cp_group: object = None, *, ckpt_format: str | None = None) -> dict:
+        assert dp_cp_group == "data"
+        assert ckpt_format == "fsdp_dtensor"
+        return {"dp_cp_group": dp_cp_group}
+
+    def generate(arguments: object, *_state: object, ckpt_format: str, **kwargs: object) -> dict:
+        assert arguments is args
+        assert ckpt_format == "fsdp_dtensor"
+        assert kwargs["save"] == tmp_path / "export"
+        assert kwargs["verify_integrity"] is True
+        return {"args": arguments, "model": {}, "iteration": iteration}
+
+    def preprocess(model_config: object, state: dict, _model: object) -> dict:
+        assert model_config is transformer
+        return state
+
+    class Root:
+        startedAt = 0  # noqa: N815
+
+        def finalize_registry(self) -> None:
+            pass
+
+        def save_async(self, snapshot: int, directory: Path) -> None:
+            assert snapshot == iteration
+            assert directory.name == ("release" if release else "iter_0000010")
+            directory.mkdir(parents=True, exist_ok=True)
+
+        def wait_for_async_completion(self) -> None:
+            pass
+
+    def durable(_session: int, _iteration: int) -> None:
+        assert (export / "latest_train_state.pt").is_file()
+        assert (checkpoint_dir / "train_state.pt").is_file()
+        events.append("durable")
+
+    def on_saved() -> None:
+        assert events[-1] == "durable"
+        export = tmp_path / "export"
+        assert (export / "latest_checkpointed_iteration.txt").read_text() == ("release" if release else "10")
+        assert not (export / "latest_train_state.pt").exists()
+        assert not (checkpoint_dir / "train_state.pt").exists()
+        state = captured[0]
+        saved_args = state["args"]
+        assert state["iteration"] == iteration
+        assert state["num_floating_point_operations_so_far"] == flops
+        assert saved_args.consumed_train_samples == samples
+        assert saved_args.skipped_train_samples == train_state.skipped_train_samples
+        assert saved_args.consumed_valid_samples == train_state.consumed_valid_samples
+        assert saved_args._nvrx_run_config == config_dict(
+            checkpoint={"save": export, "ckpt_format": "fsdp_dtensor", "verify_integrity": True},
+        )
+        events.append("callback")
+
+    def checkpoint_name(directory: Path, iteration: int, *, release: bool, **_kwargs: object) -> Path:
+        return directory / ("release" if release else f"iter_{iteration:07d}")
+
+    def reject_archive(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("native save serialized a Python archive")
+
+    export = tmp_path / "export"
+    export.mkdir()
+    checkpoint_dir = export / ("release" if release else "iter_0000010")
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "train_state.pt").write_bytes(b"stale counters")
+    (export / "latest_train_state.pt").write_bytes(b"stale tracker")
+    (export / "latest_checkpointed_iteration.txt").write_text(str(initial_iteration))
+    monkeypatch.setattr(save, "get_args", lambda: args)
+    monkeypatch.setattr(save, "_build_sharded_state_dict_metadata", metadata)
+    monkeypatch.setattr(save.checkpointing_module, "get_run_config", lambda: config, raising=False)
+    monkeypatch.setattr(save.checkpointing_module, "get_train_state", lambda: train_state, raising=False)
+    monkeypatch.setattr(save, "get_rerun_state_machine", lambda: SimpleNamespace(state_dict=lambda **_kwargs: {}))
+    monkeypatch.setattr(save, "generate_state_dict", generate)
+    monkeypatch.setattr(save, "preprocess_fsdp_dtensor_state_dict", preprocess)
+    monkeypatch.setattr(
+        save,
+        "maybe_save_dataloader_state",
+        lambda _iterator, _iteration, path, **_groups: events.append(("loader", path)),
+    )
+    monkeypatch.setattr(save, "register_dtensor_state_dict", lambda state: captured.append(state) or Root())
+    monkeypatch.setattr(save, "get_checkpoint_name", checkpoint_name)
+    monkeypatch.setattr(save, "get_checkpoint_tracker_filename", lambda directory: Path(directory) / "latest_checkpointed_iteration.txt")
+    monkeypatch.setattr(save.torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(save.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(save.checkpoint, "wait_for_ckpt_finalize", durable)
+    monkeypatch.setattr(save.torch, "save", reject_archive)
+    call = save.SaveCheckpointArgs(
+        iteration=iteration,
+        model=[object()],
+        optimizer=None,
+        opt_param_scheduler=None,
+        num_floating_point_operations_so_far=flops,
+        dp_cp_group="data",
+        save=tmp_path / "export",
+        ckpt_format="fsdp_dtensor",
+        verify_integrity=True,
+        release=release,
+        on_saved=on_saved,
+    )
+
+    save._save_checkpoint_impl(call, 123)
+    if async_save:
+        assert "callback" not in events
+        train_state.consumed_train_samples = 999
+        save.maybe_finalize_async_save(blocking=True)
+
+    assert events[-1] == "callback"
+    assert events[0] == ("loader", args.dataloader_save)
+    assert policy.save == tmp_path / "configured"
+    assert policy.verify_integrity is False
+    assert args.save == "stale"
+    assert train_state.iteration == initial_iteration
+    assert not hasattr(args, "_nvrx_run_config")
+
+
 def test_dtensor_registration_preserves_nested_values_without_python_serialization(
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -654,7 +820,7 @@ def test_dtensor_registration_preserves_nested_values_without_python_serializati
     monkeypatch.setattr(save.torch, "save", forbidden)
     monkeypatch.setattr(save.torch.distributed, "gather_object", forbidden)
     monkeypatch.setattr(save.torch.distributed, "scatter_object_list", forbidden)
-    monkeypatch.setattr(save.torch.distributed.checkpoint._nested_dict, "flatten_state_dict", forbidden)
+    monkeypatch.setattr(dcp._nested_dict, "flatten_state_dict", forbidden)
     weight = save.torch.ones(2)
     args = SimpleNamespace(lr=0.1)
     state = {"model": {"weight": weight}, "iteration": 7, "args": args, "enabled": True, "empty": None}
@@ -667,6 +833,41 @@ def test_dtensor_registration_preserves_nested_values_without_python_serializati
     assert registered[0]["args"] is args
     assert registered[0]["enabled"] is True
     assert registered[0]["empty"] is None
+
+
+def test_run_config_uses_upstream_representers_without_emitting_yaml(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    import yaml
+
+    class RuntimeValue:
+        pass
+
+    represented = {"_target_": "example.RuntimeValue", "_call_": True}
+    raw = {"optimizer": {"timers": RuntimeValue()}}
+
+    @contextmanager
+    def representers() -> Generator[None]:
+        yaml.SafeDumper.add_representer(RuntimeValue, lambda dumper, _value: dumper.represent_data(represented))
+        try:
+            yield
+        finally:
+            del yaml.SafeDumper.yaml_representers[RuntimeValue]
+
+    def reject_archive(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("configuration normalization emitted serialized data")
+
+    monkeypatch.setattr(save, "safe_yaml_representers", representers)
+    monkeypatch.setattr(save.checkpointing_module, "get_train_state", lambda: None, raising=False)
+    monkeypatch.setattr(save.torch, "save", reject_archive)
+    monkeypatch.setattr(yaml, "safe_dump", reject_archive)
+    monkeypatch.setattr(yaml, "safe_load", reject_archive)
+    arguments = SimpleNamespace()
+    state = {"args": arguments}
+
+    save._capture_run_state(state, SimpleNamespace(to_dict=lambda **_policy: raw), {})
+
+    assert state["args"]._nvrx_run_config == {"optimizer": {"timers": represented}}
+    assert isinstance(raw["optimizer"]["timers"], RuntimeValue)
+    assert not hasattr(arguments, "_nvrx_run_config")
 
 
 def test_dtensor_registration_accepts_growing_objects(save: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -689,7 +890,7 @@ def test_dtensor_registration_accepts_growing_objects(save: ModuleType, monkeypa
 )
 @pytest.mark.parametrize("supports_cp_group", [True, False])
 @pytest.mark.parametrize("initialized", [False, True])
-def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913, PLR0917
+def test_dataloader_state_is_saved_before_snapshot_submission(  # noqa: PLR0913
     save: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -943,7 +1144,7 @@ def test_load_registers_live_state_after_loading(
     )
     save.checkpointing_module.generate_state_dict = generate_load_state
 
-    def load_checkpoint(
+    def load_checkpoint(  # noqa: PLR0913
         ddp_model: object,
         optimizer: object,
         opt_param_scheduler: object,

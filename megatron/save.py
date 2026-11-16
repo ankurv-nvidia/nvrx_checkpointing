@@ -4,19 +4,22 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import io
 import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+import yaml
+
 from megatron.core import mpu  # type: ignore[import-not-found]
 from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess  # type: ignore[import-not-found]
 from megatron.core.msc_utils import maybe_msc  # type: ignore[import-not-found]
@@ -32,6 +35,7 @@ from megatron.training.checkpointing import (  # type: ignore[import-not-found]
     maybe_save_dataloader_state,
     preprocess_fsdp_dtensor_state_dict,
 )
+from megatron.training.config.yaml_utils import safe_yaml_representers  # type: ignore[import-not-found]
 from megatron.training.global_vars import get_args  # type: ignore[import-not-found]
 from megatron.training.utils import print_rank_0  # type: ignore[import-not-found]
 
@@ -73,6 +77,11 @@ class SaveCheckpointArgs:
     dp_gtp_remat_group: object | None = None
     cp_group: object | None = None
     rng_state_key_prefix: str = ""
+    save: str | None = None
+    ckpt_format: str | None = None
+    verify_integrity: bool | None = None
+    release: bool = False
+    on_saved: Callable[[], None] | None = None
 
 
 @dataclass
@@ -99,6 +108,41 @@ class _SingletonProcessGroup:
 _SINGLETON_PROCESS_GROUP = _SingletonProcessGroup()
 
 
+def _run_config() -> object | None:
+    if "ckpt_format" in inspect.signature(_build_sharded_state_dict_metadata).parameters:
+        return checkpointing_module.get_run_config()
+    return None
+
+
+def _sharded_metadata(args: object, dp_cp_group: object | None, ckpt_format: str) -> dict:
+    if _run_config() is not None:
+        return _build_sharded_state_dict_metadata(dp_cp_group=dp_cp_group, ckpt_format=ckpt_format)
+    return _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
+
+
+def _capture_run_state(state_dict: dict, run_config: object | None, policy: dict) -> None:
+    if run_config is None:
+        return
+    with safe_yaml_representers():
+        dumper = yaml.SafeDumper(None)
+        try:
+            node = dumper.represent_data(run_config.to_dict(checkpoint=policy))
+        finally:
+            dumper.dispose()
+    loader = yaml.SafeLoader("")
+    try:
+        config = loader.construct_object(node, deep=True)
+    finally:
+        loader.dispose()
+    arguments = copy.copy(state_dict["args"])
+    arguments._nvrx_run_config = config  # noqa: SLF001
+    train_state = checkpointing_module.get_train_state()
+    if train_state is not None:
+        for name in ("consumed_train_samples", "skipped_train_samples", "consumed_valid_samples"):
+            setattr(arguments, name, getattr(train_state, name))
+    state_dict["args"] = arguments
+
+
 def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
     """Expose Megatron's role-specific groups while its DCP load is running."""
 
@@ -113,6 +157,8 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
         values = call.arguments
         _LOAD_CONTEXT = {name: values.get(name) for name in ("tp_group", "pp_group", "dp_cp_group", "dp_group", "rng_state_key_prefix")}
         training_args = get_args()
+        run_config = _run_config()
+        policy = training_args if run_config is None else run_config.checkpoint
         original_generate_state_dict = checkpointing_module.generate_state_dict
         checkpoint_loaded = False
 
@@ -131,11 +177,12 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
                 checkpointing_module.generate_state_dict = original_generate_state_dict
 
             # The first save registers unloaded optimizer state and FSDP state.
-            if not checkpoint_loaded or getattr(training_args, "ckpt_format", None) == "fsdp_dtensor":
+            if not checkpoint_loaded or getattr(policy, "ckpt_format", None) == "fsdp_dtensor":
                 return result
 
             iteration, num_floating_point_operations_so_far = result
-            metadata = _build_sharded_state_dict_metadata(training_args, dp_cp_group=values.get("dp_cp_group"))
+            metadata = _sharded_metadata(training_args, values.get("dp_cp_group"), "torch_dist")
+            generation_policy = {} if run_config is None else {"ckpt_format": "torch_dist"}
             with preserve_quantized_tensors():
                 state_dict = generate_state_dict(
                     training_args,
@@ -147,8 +194,10 @@ def _wrap_load_checkpoint(load_checkpoint: Callable) -> Callable:
                     optim_sd_kwargs={"metadata": metadata},
                     model_sd_kwargs={"metadata": metadata},
                     rerun_state=None,
+                    **generation_policy,
                 )
             state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
+            _capture_run_state(state_dict, run_config, generation_policy)
             if torch.distributed.get_rank() == 0:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
@@ -333,7 +382,14 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
-def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
+def _write_checkpoint_tracker(
+    args: object,
+    iteration: int,
+    *,
+    release: bool = False,
+    log_progress: bool | None = None,
+    checkpoint_dir: Path | None = None,
+) -> None:
     """Publish the completed checkpoint and schedule eligible previous-checkpoint deletion."""
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return
@@ -343,11 +399,16 @@ def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
     if retain_interval is not None:
         try:
             with maybe_msc.open(tracker, "r") as tracker_file:
-                previous_iteration = int(tracker_file.read().strip())
+                previous = tracker_file.read().strip()
+                previous_iteration = 0 if previous == "release" else int(previous)
         except FileNotFoundError:
             pass
+    if checkpoint_dir is not None:
+        (checkpoint_dir / "train_state.pt").unlink(missing_ok=True)
     with maybe_msc.open(tracker, "w") as tracker_file:
-        tracker_file.write(str(iteration))
+        tracker_file.write("release" if release else str(iteration))
+    if _run_config() is not None:
+        (Path(args.save) / "latest_train_state.pt").unlink(missing_ok=True)
     if retain_interval is None or not 0 < previous_iteration < iteration or previous_iteration % retain_interval == 0:
         return
     previous_checkpoint = Path(get_checkpoint_name(args.save, iteration=previous_iteration, return_base_dir=True))
@@ -358,7 +419,7 @@ def _write_checkpoint_tracker(args, iteration: int) -> None:  # noqa: ANN001
         return
     threading.Thread(
         target=checkpointing_module._async_delete_checkpoint_impl,  # noqa: SLF001
-        args=(args.save, previous_iteration, getattr(args, "log_progress", False)),
+        args=(args.save, previous_iteration, getattr(args, "log_progress", False) if log_progress is None else log_progress),
         name="native-ckpt-retention",
         daemon=False,
     ).start()
@@ -426,9 +487,14 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
         with _checkpoint_span("megatron.checkpoint.save.state_dict", iteration):
             args = get_args()
-            ckpt_format = "fsdp_dtensor" if getattr(args, "ckpt_format", None) == "fsdp_dtensor" else "torch_dist"
-            metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=save_args.dp_cp_group)
-            if args.use_distributed_optimizer:
+            run_config = _run_config()
+            policy = args if run_config is None else run_config.checkpoint
+            save_dir = policy.save if save_args.save is None else save_args.save
+            requested_format = getattr(policy, "ckpt_format", None) if save_args.ckpt_format is None else save_args.ckpt_format
+            ckpt_format = "fsdp_dtensor" if requested_format == "fsdp_dtensor" else "torch_dist"
+            metadata = _sharded_metadata(args, save_args.dp_cp_group, ckpt_format)
+            optimizer_config = args if run_config is None else run_config.optimizer
+            if optimizer_config.use_distributed_optimizer:
                 print_rank_0(
                     f"Storing distributed optimizer sharded state of type {metadata['distrib_optim_sharding_type']}",
                 )
@@ -445,6 +511,14 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                 ckpt_format=ckpt_format,
             )
             model = unwrap_model(save_args.model)
+            generation_policy = {}
+            if run_config is not None:
+                generation_policy = {
+                    "save": save_dir,
+                    "ckpt_format": ckpt_format,
+                    "verify_integrity": policy.verify_integrity if save_args.verify_integrity is None else save_args.verify_integrity,
+                }
+                policy = replace(policy, **generation_policy)
             with preserve_quantized_tensors():
                 state_dict = generate_state_dict(
                     args,
@@ -456,17 +530,20 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
                     optim_sd_kwargs={"metadata": metadata},
                     model_sd_kwargs={"metadata": metadata},
                     rerun_state=rerun_state,
+                    **generation_policy,
                 )
             state_dict["num_floating_point_operations_so_far"] = save_args.num_floating_point_operations_so_far
+            _capture_run_state(state_dict, run_config, generation_policy)
             if ckpt_format == "fsdp_dtensor":
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                model_config = args if run_config is None else run_config.model.transformer
+                state_dict = preprocess_fsdp_dtensor_state_dict(model_config, state_dict, model[0])
             elif torch.distributed.get_rank() == 0:
                 state_dict[_CONTENT_METADATA_KEY] = {key: value for key, value in metadata.items() if key != "dp_cp_group"}
 
             print_rank_0(
-                f"[{_timestamp()}] saving checkpoint at iteration {iteration:7d} to {args.save} in {ckpt_format} format",
+                f"[{_timestamp()}] saving checkpoint at iteration {iteration:7d} to {save_dir} in {ckpt_format} format",
             )
-            checkpoint_dir = Path(get_checkpoint_name(args.save, iteration, return_base_dir=True))
+            checkpoint_dir = Path(get_checkpoint_name(save_dir, iteration, release=save_args.release, return_base_dir=True))
 
     with _checkpoint_span("megatron.checkpoint.save.io_write", iteration):
         # Loader state lands before snapshot submission, so the tracker never names an iteration without it.
@@ -484,31 +561,39 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
             root.startedAt = started_at_ns
             root.save_async(iteration, checkpoint_dir)
 
-        if not getattr(args, "async_save", False):
+        def finalize_fn() -> None:
+            tracker_options = (
+                {}
+                if run_config is None
+                else {
+                    "log_progress": run_config.logger.log_progress,
+                    "checkpoint_dir": checkpoint_dir,
+                }
+            )
+            if save_args.release:
+                tracker_options["release"] = True
+            _write_checkpoint_tracker(policy, iteration, **tracker_options)
+            if save_args.on_saved is not None:
+                save_args.on_saved()
+            print_rank_0(
+                f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {save_dir}",
+            )
+
+        if not getattr(policy, "async_save", False):
             # A deferred client send must run before the blocking server wait.
             with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
                 root.wait_for_async_completion()
             with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
                 checkpoint.wait_for_ckpt_finalize(_SESSION_ID, iteration)
-                _write_checkpoint_tracker(args, iteration)
-                print_rank_0(
-                    f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
-                )
+                finalize_fn()
         else:
-
-            def finalize_fn() -> None:
-                _write_checkpoint_tracker(args, iteration)
-                print_rank_0(
-                    f"  [{_timestamp()}] successfully saved checkpoint from iteration {iteration:7d} to {args.save}",
-                )
-
             with _checkpoint_span("nvrx.checkpoint.cpp.wait_for_async_completion", iteration):
                 root.wait_for_async_completion()
             with _checkpoint_span("nvrx.checkpoint.enqueue_finalize", iteration):
                 future = _get_executor().submit(checkpoint.wait_for_ckpt_finalize, _SESSION_ID, iteration)
                 _pending = _PendingSave(future, finalize_fn)
                 print_rank_0(
-                    f"  [{_timestamp()}] scheduled an async checkpoint save at iteration {iteration:7d} to {args.save}",
+                    f"  [{_timestamp()}] scheduled an async checkpoint save at iteration {iteration:7d} to {save_dir}",
                 )
 
 

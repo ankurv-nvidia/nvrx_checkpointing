@@ -8,6 +8,7 @@ import enum
 import importlib.util
 import io
 import math
+import struct
 from pathlib import Path
 from types import ModuleType
 
@@ -46,6 +47,103 @@ def _save_independent_scalars(path: Path, scalars: dict, objects: tuple = ()) ->
 
 def _mark_torch_dist(path: Path) -> None:
     (path / "metadata.json").write_text('{"sharded_backend": "torch_dist", "sharded_backend_version": 1}')
+
+
+def _save_optimizer_metadata(path: Path, groups: dict, *, native: bool) -> None:
+    if not native:
+        dcp.save({"optimizer": {"param_to_group_meta": groups}}, checkpoint_id=path)
+        return
+
+    def text(value: str) -> bytes:
+        encoded = value.encode()
+        return struct.pack("<I", len(encoded)) + encoded
+
+    def encode(value: object) -> bytes:
+        if isinstance(value, dict):
+            return b"\x09" + struct.pack("<I", len(value)) + b"".join(encode(key) + encode(child) for key, child in value.items())
+        if isinstance(value, str):
+            return b"\x05" + text(value)
+        if isinstance(value, bool):
+            return b"\x04" + bytes([value])
+        if isinstance(value, float):
+            return b"\x03" + struct.pack("<d", value)
+        raise TypeError(type(value))
+
+    key = "__nvrx_native_dict_rank_0__.optimizer.param_to_group_meta"
+    objects = [
+        (key, b"NVRXOBJ1" + encode(groups)),
+        ("__nvrx_native_state_rank_0__", b"NVRXNST1" + struct.pack("<I", 1) + text(key) + b"\x14"),
+    ]
+    _distcp_shim.write_rank_shard(str(path), 0, [], objects)
+    _distcp_shim.write_metadata(str(path), [], objects)
+
+
+@pytest.mark.parametrize("saved", [None, False, True])
+def test_missing_defaults_preserve_saved_values(dictionary_load: ModuleType, tmp_path: Path, saved: bool | None) -> None:
+    source = {"step": 7}
+    if saved is not None:
+        source["optional"] = saved
+    dcp.save(source, checkpoint_id=tmp_path)
+    target = {"step": 0, "optional": True, "container": {}}
+
+    dictionary_load.checkpoint.load_checkpoint(
+        tmp_path,
+        target,
+        missing_defaults={"step": 99, "optional": False, "container": False, "unrequested": False},
+    )
+
+    assert target == {"step": 7, "optional": saved if saved is not None else False, "container": {}}
+
+
+@pytest.mark.parametrize("allow_partial_load", [False, True])
+def test_missing_defaults_preserve_tensor_requirements(dictionary_load: ModuleType, tmp_path: Path, allow_partial_load: bool) -> None:
+    dcp.save({"iteration": 7}, checkpoint_id=tmp_path)
+    tensor = torch.zeros(2)
+    target = {"iteration": 0, "weight": tensor, "optional": None}
+    defaults = {"weight": False, "optional": False}
+
+    if allow_partial_load:
+        dictionary_load.checkpoint.load_checkpoint(tmp_path, target, allow_partial_load=True, missing_defaults=defaults)
+        assert target["weight"] is tensor
+        torch.testing.assert_close(tensor, torch.zeros(2))
+        assert target["optional"] is False
+    else:
+        with pytest.raises((RuntimeError, ValueError), match=r"missing checkpoint tensor 'weight'"):
+            dictionary_load.checkpoint.load_checkpoint(tmp_path, target, missing_defaults=defaults)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["stock-leaves", "native-parent"])
+@pytest.mark.parametrize("saved", [None, False, True])
+@pytest.mark.parametrize("runtime", [False, True])
+def test_optimizer_indexer_metadata_uses_checkpoint_or_legacy_default(
+    dictionary_load: ModuleType,
+    tmp_path: Path,
+    native: bool,
+    saved: bool | None,
+    runtime: bool,
+) -> None:
+    del dictionary_load
+    group = {"lr": 0.002}
+    if saved is not None:
+        group["is_dsa_indexer"] = saved
+    _save_optimizer_metadata(tmp_path, {"weight": group}, native=native)
+    destination = {"lr": 1.0, "is_dsa_indexer": runtime}
+    target = {"optimizer": {"param_to_group_meta": {"weight": destination}}}
+
+    dcp.load(target, checkpoint_id=tmp_path)
+
+    assert target["optimizer"]["param_to_group_meta"]["weight"] is destination
+    assert destination == {"lr": 0.002, "is_dsa_indexer": saved if saved is not None else runtime}
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["stock-leaves", "native-parent"])
+def test_optimizer_indexer_default_preserves_other_required_metadata(dictionary_load: ModuleType, tmp_path: Path, native: bool) -> None:
+    del dictionary_load
+    _save_optimizer_metadata(tmp_path, {"weight": {"lr": 0.002}}, native=native)
+    target = {"optimizer": {"param_to_group_meta": {"weight": {"lr": 1.0, "is_dsa_indexer": True, "required": 0}}}}
+
+    with pytest.raises((RuntimeError, ValueError), match=r"(?i)missing.*optimizer.param_to_group_meta.weight.required"):
+        dcp.load(target, checkpoint_id=tmp_path)
 
 
 @pytest.mark.parametrize("flatten", [True, False])
@@ -235,7 +333,8 @@ def test_hook_passes_rank_and_partial_load_to_native_binding(
     target = {"iteration": 0}
     calls = []
 
-    def native_load(path: Path, state: dict, *, rank: int, world_size: int, allow_partial_load: bool) -> None:
+    def native_load(path: Path, state: dict, *, rank: int, world_size: int, allow_partial_load: bool, **kwargs: object) -> None:
+        assert kwargs == {"missing_defaults": {}}
         calls.append((path, state is target, rank, world_size, allow_partial_load))
         state["iteration"] = 7
 
@@ -250,10 +349,12 @@ def test_hook_passes_rank_and_partial_load_to_native_binding(
     assert target == {"iteration": 7}
 
 
+@pytest.mark.parametrize("implicit_args", [False, True])
 def test_bootstrap_forwards_runtime_template(
     dictionary_load: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    implicit_args: bool,
 ) -> None:
     class Mode(enum.Enum):
         SLOW = "slow"
@@ -267,24 +368,86 @@ def test_bootstrap_forwards_runtime_template(
         assert state["args"] is runtime
         state["args"] = argparse.Namespace(mode=Mode.FAST, layers=12)
 
-    def load_base_checkpoint(_directory: Path, args: argparse.Namespace, rank0: bool = False) -> dict:
-        assert args is runtime
+    def load_base_checkpoint(_directory: Path, args: argparse.Namespace | None = None, rank0: bool = False) -> dict:
+        assert args is (None if implicit_args else runtime)
         assert rank0
         target = {"args": None}
         dcp.load(target, checkpoint_id=tmp_path)
         return target
 
     monkeypatch.setattr(dictionary_load.checkpoint, "load_checkpoint", native_load)
+    checkpointing.get_args = lambda: runtime
     checkpointing._load_base_checkpoint = load_base_checkpoint
     dictionary_load.install(checkpointing)
 
-    target = checkpointing._load_base_checkpoint(tmp_path, runtime, rank0=True)
+    target = (
+        checkpointing._load_base_checkpoint(tmp_path, rank0=True)
+        if implicit_args
+        else checkpointing._load_base_checkpoint(tmp_path, runtime, rank0=True)
+    )
 
     assert target["args"].mode is Mode.FAST
     assert target["args"].layers == 12
     assert runtime.mode is Mode.SLOW
     assert runtime.layers == 4
     assert dictionary_load._BOOTSTRAP_TEMPLATE.get() is None
+
+
+@pytest.mark.parametrize("saved_flops", [None, 3_180_960_153_600])
+def test_full_megatron_load_requests_optional_flops_counter(dictionary_load: ModuleType, tmp_path: Path, saved_flops: int | None) -> None:
+    source = {"model": {"weight": torch.ones(2)}, "iteration": 50}
+    if saved_flops is not None:
+        source["num_floating_point_operations_so_far"] = saved_flops
+    dcp.save(source, checkpoint_id=tmp_path)
+    checkpointing = ModuleType("native_checkpoint_full_load_test")
+
+    def load_base_checkpoint(_directory: Path, rank0: bool = False, sharded_state_dict: dict | None = None) -> dict:
+        assert not rank0
+        assert sharded_state_dict is not None
+        state = sharded_state_dict.copy()
+        state.pop("_model")
+        dcp.load(state, checkpoint_id=tmp_path)
+        return state
+
+    checkpointing._load_base_checkpoint = load_base_checkpoint
+    dictionary_load.install(checkpointing)
+    weight = torch.zeros(2)
+    template = {"model": {"weight": weight}, "iteration": 0, "_model": [object()]}
+
+    restored = checkpointing._load_base_checkpoint(tmp_path, sharded_state_dict=template)
+
+    assert restored["num_floating_point_operations_so_far"] == (saved_flops or 0)
+    assert restored["iteration"] == 50
+    assert restored["model"]["weight"] is weight
+    torch.testing.assert_close(weight, torch.ones(2))
+    assert dictionary_load._LOAD_DEFAULTS.get() is None
+    if saved_flops is None:
+        with pytest.raises((RuntimeError, ValueError), match=r"Missing checkpoint value: num_floating_point_operations_so_far"):
+            dcp.load({"num_floating_point_operations_so_far": 0}, checkpoint_id=tmp_path)
+
+
+def test_full_non_fsdp_load_preserves_requested_state(dictionary_load: ModuleType, tmp_path: Path) -> None:
+    dcp.save({"iteration": 50, "num_floating_point_operations_so_far": 1000}, checkpoint_id=tmp_path)
+    checkpointing = ModuleType("native_checkpoint_non_fsdp_load_test")
+
+    def load_base_checkpoint(_directory: Path, rank0: bool = False, sharded_state_dict: dict | None = None) -> dict:
+        assert not rank0
+        assert sharded_state_dict is not None
+        assert "num_floating_point_operations_so_far" not in sharded_state_dict
+        assert dictionary_load._LOAD_DEFAULTS.get() == {}
+        state = sharded_state_dict.copy()
+        dcp.load(state, checkpoint_id=tmp_path)
+        return state
+
+    checkpointing._load_base_checkpoint = load_base_checkpoint
+    dictionary_load.install(checkpointing)
+    template = {"iteration": 0}
+
+    restored = checkpointing._load_base_checkpoint(tmp_path, sharded_state_dict=template)
+
+    assert restored == {"iteration": 50}
+    assert template == {"iteration": 0}
+    assert dictionary_load._LOAD_DEFAULTS.get() is None
 
 
 def test_install_preserves_filesystem_reader_and_is_idempotent(dictionary_load: ModuleType) -> None:

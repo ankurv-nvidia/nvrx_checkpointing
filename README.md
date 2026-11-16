@@ -28,10 +28,10 @@ python3 -m pip install \
   "nvrx-checkpointing==VERSION"
 ```
 
-Use the public Megatron-LM checkout pinned by this repository
-(`16251ac1221f4814cd39350def05cefa3c36734a`) and make sure the
-`nvrx_checkpointing` package is installed in the training container on every
-node.
+CI defaults to public Megatron-LM revision
+`16251ac1221f4814cd39350def05cefa3c36734a`. The integration is also tested against
+upstream main at `7c0fac795b76180c26e363fa292c1ce2c025c4df`. Install the
+`nvrx_checkpointing` package in the training container on every node.
 
 The only required sbatch change is to run the Megatron entrypoint through the
 integration module. For example, change:
@@ -146,10 +146,22 @@ Rank-local dictionaries retain peer-owned optimizer entries. Supported objects
 include namespaces, ordinary containers, NumPy arrays, enums, and RNG
 generators; arbitrary Python objects are rejected during capture. The native
 reader accepts stock DCP tensor entries and `torch.save` object archives.
-Compatibility targets `fsdp_dtensor` checkpoints from the pinned Megatron
-revision with matching model configuration and parameter names. The reader
-does not translate architecture-dependent parameter names. Stock PyTorch DCP
-does not decode native scalar and object payloads.
+On the upstream main revision above, two-GPU grouped MoE tests cover loading
+stock and native `fsdp_dtensor` checkpoints from both revisions. A sequential
+expert test also covers preserving the older expert choice and parameter
+names across the changed default. Use `--use-checkpoint-args` to preserve
+saved model choices when defaults change between versions. The load hook supplies
+the runtime default for missing optimizer indexer metadata and retains strict
+checks for other required values. The reader does not translate
+architecture-dependent parameter names. Stock PyTorch DCP does not decode
+native scalar and object payloads.
+
+On the newer Megatron revision, native capture includes the run configuration
+and current training counters in the state tree. Loading restores counters
+through Megatron's saved-argument fallback and validates the embedded
+configuration with Megatron's configuration reader. Native checkpoint
+publication uses the text tracker and removes obsolete training-state
+sidecars when reusing a stock checkpoint directory.
 
 The `fsdp_2gpu` CI profile keeps eight experts with EP2 and uses TP1. Select
 it in the CI launcher with `--config fsdp_2gpu --gpus-per-node 2`.
