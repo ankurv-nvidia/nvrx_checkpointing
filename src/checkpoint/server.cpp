@@ -13,6 +13,7 @@
 #include "shm_ring_buffer.h"
 #include "state.h"
 #include "stateserdes.h"
+#include "svcref.h"
 #include "telemetry.h"
 #include "tensor.h"
 
@@ -1018,6 +1019,34 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }
+    else if (matches({"api", "peer", "acquireref"}) && getOrPost && (it == segs.end()))
+    {
+        // Get who the request is from from the headers
+        std::string peer;
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected URL segments"); }
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        auto const token = SvcRef::SvrAcquireRemoteProcRef(std::move(peer));
+        res.body()       = fmt::format("{}", token);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+
+        Ping();
+    }
+    else if (matches({"api", "peer", "releaseref"}) && getOrPost && (it == segs.end()))
+    {
+        // Get who the request is from from the headers
+        std::string peer;
+        auto const  token = boost::lexical_cast<uint64_t>(*(it++));
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected URL segments"); }
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        SvcRef::SvrReleaseRemoteProcRef(peer, token);
+        res.body() = fmt::format("{}", token);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        Ping();
+    }
     else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
         auto const sessionId = cipc::SessionId{boost::lexical_cast<uint32_t>(*(it++))};
@@ -1254,6 +1283,32 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
         res.keep_alive(headers.keep_alive());
         res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        Ping();
+    }
+    else if (matches({"api", "acquirelocalref"}) && getOrPost && (it == segs.end()))
+    {
+        auto const pid = boost::lexical_cast<uint64_t>(*(it++));
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        auto const token = SvcRef::SvrAcquireLocalProcRef(pid);
+        res.body()       = fmt::format("{}", token);
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+
+        Ping();
+    }
+    else if (matches({"api", "releaselocalref"}) && getOrPost && (it == segs.end()))
+    {
+        auto const pid   = boost::lexical_cast<uint64_t>(*(it++));
+        auto const token = boost::lexical_cast<uint64_t>(*(it++));
+        if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        SvcRef::SvrReleaseLocalProcRef(pid, token);
+        res.body() = fmt::format("{}", token);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
         Ping();
