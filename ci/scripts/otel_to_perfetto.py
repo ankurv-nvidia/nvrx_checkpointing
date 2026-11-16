@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 _SIGNALS = ("resourceSpans", "resourceMetrics", "resourceLogs")
 _PHASE_RE = re.compile(r"(?:^|-)((?:phase|cycle)\d+)(?:-|$)")
+_PHASE_TOKEN_RE = re.compile(r"(?:phase|cycle)\d+")
 
 
 def _value(value: dict) -> object:
@@ -83,6 +84,30 @@ def _timestamps(record: dict) -> Iterator[int]:
     yield from _log_timestamps(record)
 
 
+def _common_length(sequences: list[list[str]]) -> int:
+    return next(
+        (index for index, values in enumerate(zip(*sequences)) if len(set(values)) > 1),
+        min(len(sequence) for sequence in sequences),
+    )
+
+
+def _run_titles(records: Sequence[tuple[Path, dict]]) -> dict[str, str]:
+    """Title each run ID by the non-phase tokens that distinguish it from the trace's other run IDs."""
+    run_ids = {
+        str(run_id)
+        for _, record in records
+        for signal in _SIGNALS
+        for resource in record.get(signal, [])
+        if (run_id := _attributes(resource.get("resource", {})).get("nemo.run.id"))
+    }
+    tokens = {run_id: [token for token in run_id.split("-") if not _PHASE_TOKEN_RE.fullmatch(token)] for run_id in run_ids}
+    if len({tuple(parts) for parts in tokens.values()}) < 2:  # noqa: PLR2004
+        return {}
+    prefix = _common_length(list(tokens.values()))
+    suffix = _common_length([parts[::-1] for parts in tokens.values()])
+    return {run_id: "-".join(parts[prefix : len(parts) - suffix]) for run_id, parts in tokens.items()}
+
+
 def _origin(records: Sequence[tuple[Path, dict]]) -> int:
     origin_ns: int | None = None
     for _, record in records:
@@ -117,8 +142,9 @@ class _Writer:
 
 
 class _Tracks:
-    def __init__(self, writer: _Writer) -> None:
+    def __init__(self, writer: _Writer, run_titles: dict[str, str]) -> None:
         self._writer = writer
+        self._run_titles = run_titles
         self._processes: dict[tuple[str, str, str], int] = {}
         self._tracks: dict[tuple[tuple[str, str, str], str, str, str], tuple[int, int]] = {}
         self._next_tid: dict[int, int] = {}
@@ -128,14 +154,15 @@ class _Tracks:
         run_id = str(resource.get("nemo.run.id") or "")
         phase_match = _PHASE_RE.search(run_id)
         phase = phase_match.group(1) if phase_match else path.parent.name
+        title = "-".join(part for part in (self._run_titles.get(run_id), phase) if part)
         host = str(resource.get("host.name") or service)
-        process_key = phase, run_id, host
+        process_key = title, run_id, host
         pid = self._processes.get(process_key)
         if pid is None:
             pid = len(self._processes) + 1
             self._processes[process_key] = pid
             self._next_tid[pid] = 1
-            self._writer.event({"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": f"{phase} · {host}"}})
+            self._writer.event({"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": f"{title} · {host}"}})
             self._writer.event({"ph": "M", "name": "process_sort_index", "pid": pid, "tid": 0, "args": {"sort_index": pid}})
 
         rank = event_rank if event_rank is not None else resource.get("dl.rank", resource.get("nvrx.rank"))
@@ -335,7 +362,7 @@ def convert_records(records: Sequence[tuple[Path, dict]], output: Path) -> dict[
     seen: set[tuple[str, str]] = set()
     with output.open("w", encoding="utf-8") as handle:
         writer = _Writer(handle, origin_ns)
-        tracks = _Tracks(writer)
+        tracks = _Tracks(writer, _run_titles(records))
         for path, record in records:
             stats["spans"] += _emit_spans(writer, tracks, path, record, seen)
             stats["metrics"] += _emit_metrics(writer, tracks, path, record)

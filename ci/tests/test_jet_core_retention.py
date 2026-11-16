@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import yaml
 
 JET_DIR = Path(__file__).resolve().parents[2] / "ci" / "jet"
 
@@ -125,3 +126,149 @@ def test_archive_contains_manifest_and_diagnostics_without_large_cores(
     assert not any(name.endswith((".core", ".core.partial", ".exe", ".exe.partial")) for name in names)
     assert archive.stat().st_size < core.stat().st_size
     assert core.is_file()
+
+
+@pytest.mark.parametrize("merged_written", [True, False])
+def test_phase_otlp_copies_leave_only_once_the_job_file_holds_them(
+    workload: ModuleType,
+    tmp_path: Path,
+    merged_written: bool,
+) -> None:
+    result_dir = tmp_path / "ci" / "ci-results"
+    phase = result_dir / "otel" / "cycle1"
+    phase.mkdir(parents=True)
+    names = ["native_ckpt_otel.jsonl", "native_ckpt_otel.jsonl.logs", "native_ckpt_otel.report.json", "process_memory_all.svg"]
+    for name in names:
+        (phase / name).write_text("{}\n")
+    merged = result_dir / "ultra4_otel.jsonl"
+    if merged_written:
+        merged.write_text("{}\n")
+
+    workload._drop_phase_telemetry(result_dir, merged)
+
+    kept = ["native_ckpt_otel.report.json", "process_memory_all.svg"] if merged_written else sorted(names)
+    assert sorted(path.name for path in phase.iterdir()) == kept
+
+
+@pytest.mark.parametrize("worker_rc", [0, 1])
+def test_finalize_merges_failed_run_telemetry_after_diagnostics_and_before_the_archive(
+    workload: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    worker_rc: int,
+) -> None:
+    run = tmp_path / "run"
+    coordination = run / ".jet-coordination" / "7"
+    coordination.mkdir(parents=True)
+    (coordination / "worker-0.rc").write_text("0\n")
+    (coordination / "worker-1.rc").write_text(f"{worker_rc}\n")
+    (coordination / "workers.rc").write_text("0\n")
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    monkeypatch.delenv("CI_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setattr(workload.runtime, "parse_args", lambda _argv: SimpleNamespace(nodes=1, gpus_per_node=2))
+    monkeypatch.setattr(workload.runtime, "configure", lambda _args: None, raising=False)
+    monkeypatch.setattr(workload.runtime, "require_prepared", dict, raising=False)
+    monkeypatch.setattr(workload.slurm_job, "RUN_ROOT", run, raising=False)
+    monkeypatch.setattr(workload.slurm_job, "RESULTS_DIR", run / "logs", raising=False)
+    monkeypatch.setattr(
+        workload.slurm_job,
+        "job_telemetry_paths",
+        lambda log, stem: (log.with_name(f"{stem}_otel.jsonl"), None),
+        raising=False,
+    )
+    log = tmp_path / "assets" / "nvrx-ci-artifacts" / "ci" / "ci-results" / "ultra4.log"
+    calls = []
+
+    def record(name: str, result: object = None):  # noqa: ANN202
+        def step(*_args: object) -> object:
+            calls.append(name)
+            return result
+
+        return step
+
+    monkeypatch.setattr(workload, "_combined_log", record("combined_log", (log, "ultra4")))
+    monkeypatch.setattr(workload, "_run_epilog", record("epilog", 0))
+    for name in (
+        "_record_failure",
+        "_write_failed_run_telemetry",
+        "_write_arguments_candidate",
+        "_write_baseline_candidate",
+        "_write_provenance",
+        "_collect_run_artifacts",
+        "_drop_phase_telemetry",
+        "_archive",
+    ):
+        monkeypatch.setattr(workload, name, record(name.removeprefix("_")))
+
+    assert workload.finalize([], tmp_path / "assets") == worker_rc
+
+    outcome = ["epilog"] if worker_rc == 0 else ["record_failure", "write_failed_run_telemetry"]
+    assert calls == [
+        "combined_log",
+        *outcome,
+        "write_arguments_candidate",
+        "write_baseline_candidate",
+        "write_provenance",
+        "collect_run_artifacts",
+        "drop_phase_telemetry",
+        "archive",
+    ]
+
+
+def test_failed_run_telemetry_does_not_stop_the_archive(
+    workload: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = []
+
+    def fail(*values: object) -> None:
+        calls.append(values)
+        raise ValueError("no timestamped OTLP records found")
+
+    monkeypatch.setattr(workload.slurm_job, "write_job_telemetry", fail, raising=False)
+    monkeypatch.setattr(workload.slurm_job, "RUN_ROOT", tmp_path / "run", raising=False)
+    args, log = SimpleNamespace(), tmp_path / "ultra4.log"
+
+    workload._write_failed_run_telemetry(args, log)
+
+    assert calls == [(args, log, tmp_path / "run")]
+    assert "no timestamped OTLP records found" in capsys.readouterr().err
+
+
+def test_baseline_candidate_records_written_byte_ranges_verbatim(
+    workload: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scripts = JET_DIR.parent / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("jet_candidate_slurm_job", scripts / "slurm_job.py")
+    assert spec is not None
+    assert spec.loader is not None
+    slurm_job = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, slurm_job)
+    spec.loader.exec_module(slurm_job)
+    monkeypatch.setattr(slurm_job, "_performance_baseline_stem", lambda _args: "gb200_native-perf_pico_1x4")
+    monkeypatch.setattr(slurm_job, "_selected_flavors", lambda _args: slurm_job.FlavorSelection(["perf", "native"]))
+    monkeypatch.setattr(slurm_job.PerfReport, "baseline", staticmethod(lambda _stem: {"metrics": {}}))
+    monkeypatch.setattr(workload, "slurm_job", slurm_job)
+    monkeypatch.setenv("CI_BASELINE_CANDIDATE_DIR", str(tmp_path / "candidates"))
+    monkeypatch.delenv("JET_BASELINE_BOOTSTRAP", raising=False)
+    log = tmp_path / "pico.log"
+    metrics = {
+        "wr_tnsr_us": {"median": 10.4, "mean": 11.6, "higher_is_better": False},
+        "total_written_bytes_total": {"range": "1900+64", "mean": 1921.33, "higher_is_better": None},
+        "total_written_bytes_rank0": {"range": 1000, "mean": 1000, "higher_is_better": None},
+    }
+    log.with_name("pico_report.json").write_text(json.dumps({"metrics": metrics}))
+
+    workload._write_baseline_candidate(SimpleNamespace(), log, "pico")
+
+    candidate = yaml.safe_load((tmp_path / "candidates" / "gb200_native-perf_pico_1x4.yaml").read_text())
+    assert candidate["metrics"] == {
+        "wr_tnsr_us": 10,
+        "total_written_bytes_total": "1900+64",
+        "total_written_bytes_rank0": 1000,
+    }

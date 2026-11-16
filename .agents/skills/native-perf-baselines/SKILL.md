@@ -53,7 +53,10 @@ NUMA analysis."_ (URL optional; default to the latest pull-request CI run.)
   `[native_ckpt:svr][...][PERF] Rank=<n> Finished bw_mbps=...` line per rank and save.
 - Baseline file = `ci/baselines/<platform>_<job>[_<flavor>]_<config>.yaml`.
   Metrics: `bw_mbps` (higher better), `wr_tnsr_us` (lower better; anti-correlated
-  with bw), plus exact-match info metrics (`total_written_bytes`, `gpu_peak_bytes`).
+  with bw), plus exact-match info metrics (`gpu_peak_bytes`) and written bytes
+  (`total_written_bytes_total`, `total_written_bytes_rank0`,
+  `total_written_bytes_per_rank`), each an integer or a `<lower>+<diff>` range
+  that every checkpoint must fall within.
   Adopting a candidate is copying it over the baseline; editing the YAML by hand
   is equivalent.
 
