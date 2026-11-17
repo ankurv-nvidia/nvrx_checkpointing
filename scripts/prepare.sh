@@ -381,8 +381,10 @@ function megatron {
     pushd DeepEP
         git fetch origin "${DEEPEP_COMMIT}"
         git checkout FETCH_HEAD
+        patch -p1 < "${SCRIPT_DIR}/deepep.patch"
+        # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
+        patch -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"
     popd
-    deepep_patch DeepEP
 
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
     ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
@@ -425,16 +427,6 @@ function deepep_prereqs {
     nvml_dir=$(mktemp -d)
     (cd "${nvml_dir}" && apt-get update && apt-get download libnvidia-ml-dev && dpkg-deb -x libnvidia-ml-dev_*.deb /)
     rm -rf "${nvml_dir}"
-    $*
-}
-
-# Applies this repository's DeepEP patches to the given DeepEP checkout.
-function deepep_patch {
-    local deepep_root=$1
-    shift
-    patch -d "${deepep_root}" -p1 < "${SCRIPT_DIR}/deepep.patch"
-    # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
-    patch -d "${deepep_root}" -p1 < "${SCRIPT_DIR}/deepep-nvshmem.patch"
     $*
 }
 
