@@ -120,16 +120,10 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 - Async Load-Checkpoint
   - Allow construction of data-loaders, cuda-graphs etc in parallel
 
-## TODO :
+## TODO : Cleanups
 
-- namespace
-
-## TODO : Error Cases GO over resiliency
-
-- Sessions
-- Error scenarios
-  - During planning
-  - During snapshotting
+- namespaces
+-
 
 ## TODO : Assumptions
 
@@ -173,20 +167,61 @@ There are several other (fatal) corner cases that will cause a fail-fast of the 
 
 In each of these cases the daemon does its best to transmit and broadcast errors to all clients as needed but sometimes the errors will only be limited to the rank it originates from.
 
-# Lifecycle Management
+## TODO : Error scenario examples
 
-There are two modes the daemon operates in:
+### Example 1
 
-1. In-Proc mode
-2. Out-of-proc mode
+# Lifecycle Management (Daemon)
+
+The section covers mainly the daemon-module where the main processing of state-dictionary, planning and checkpointing tasks are happening.
+
+The daemon can operate in 2 life-cycle modes
+
+1. Self-managed
+2. Externally launched and managed
+
+The module itself can be instantiated in 2 ways.
+
+1. In-Proc mode (always self-managed)
+2. Out-of-proc mode: Both Self-managed and external managed.
+
+## Self-Managed
+
+The primary mechanism to assist the self-managed lifecyle is via <mark>(TODO: better name)references</mark>. which come in 3 flavors
+
+1. Self-References / In-Proc references
+2. Local-Process Reference
+3. Remote Process Reference.
+
+These references keep the daemon process alive and assist with the startup sequence.
+The daemon is auto-launched when the first-reference is acquired and gracefully spins down when the last-reference is released (after a configurable inactivity timeout)
+
+### Startup Sequence
+
+- The first reference in a process pings the server.
+- A boot is requested if its unable to ping the server
+- Potentially multiple requests can be made to bootup the server from multiple threads
+- Each startup request tries to listen to the port which acts as a gate.
+- The first one wins. The rest gracefully cede.
+- A reference is acquired on the newly started server / already-existing server which keeps it alive until its released
+
+### Spin-Down
+
+- The daemon keeps a list of all references.
+- As long as atleast one in-proc reference is alive it does nothing.
+- When all in-proc references are released it checks the local-proc references
+- Local-proc references
+
+### Keep-Alive
 
 ## In-proc mode (No ft-launcher integration needed)
 
-The in-proc mode implies that the daemon will be instantiated inside one of the N-local ranks in the training process and its lifetime is bound by the training process.
+The in-proc mode implies that the daemon will be instantiated inside one of the N-local ranks in the training process and its lifetime is bound by the training process and hence the lifecycle is always self-managed.
 
 This is meant to simplify the lifecycle management for scenarios that dont require fault-tolerance or quick recovery (mainly dev scenarios) and hence it requires no additional management.
 
-The daemon holds the rank-process its instantiated in especially if its a coordinator daemon for the job and keeps the process alive unless its ready to wind-down in case of a regular spin-down.
+The daemon holds the rank-process its instantiated in, from exiting, especially if its a coordinator daemon for the job and keeps the process alive unless its ready to wind-down in case of a regular spin-down.
+This is part of the regular
 
 ## Out-of-proc mode : FT-Launcher Integration (Fault-Tolerance)
 
