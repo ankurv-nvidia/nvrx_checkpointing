@@ -14,6 +14,9 @@ set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_C_FLAGS_INIT "-mcpu=neoverse-v2")
 set(CMAKE_CXX_FLAGS_INIT "-mcpu=neoverse-v2")
+# vcpkg's make-based ports prefer an exported compiler over the triplet's cross compiler.
+unset(ENV{CC})
+unset(ENV{CXX})
 
 set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu /usr/local/cuda-${_nvrx_CUDA}/targets/sbsa-linux)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
