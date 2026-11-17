@@ -249,13 +249,6 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
             pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
         endif()
     endif()
-    add_custom_command(TARGET checkpoint POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint>>
-        COMMAND ${CMAKE_COMMAND} -E create_symlink
-            $<TARGET_FILE:checkpoint>
-            $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint>>
-        COMMENT "Creating symbolic link..."
-    )
 endif()
 
 if (COMMAND vcpkg_install)
@@ -299,14 +292,6 @@ add_executable(checkpoint_server src/checkpoint/server_main.cpp)
 # missing from the executable even though server.cpp references it.
 target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint daemon distcpio cpptrace::cpptrace)
 
-add_custom_command(TARGET checkpoint_server POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        $<TARGET_FILE:checkpoint_server>
-        $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>
-    COMMENT "Creating symbolic link..."
-)
-
 if (BUILD_TESTING)
     include(Catch2)
     enable_testing()
@@ -338,14 +323,6 @@ if (BUILD_TESTING)
             distcpio fmt::fmt-header-only)
         target_is_python_extension(_distcp_shim)
 
-        add_custom_command(TARGET _distcp_shim POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:_distcp_shim>>
-            COMMAND ${CMAKE_COMMAND} -E create_symlink
-                $<TARGET_FILE:_distcp_shim>
-                $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:_distcp_shim>>
-            COMMENT "Creating symbolic link for _distcp_shim..."
-        )
-
         # Wire Python tests into ctest via pytest-cmake.
         pip_install(-r "${CMAKE_CURRENT_SOURCE_DIR}/tests/requirements.txt")
         set(Pytest_ROOT      "${PYTHON_VIRTUAL_ENV_PATH}/share/Pytest")
@@ -359,28 +336,22 @@ if (BUILD_TESTING)
         # then reads it back through `torch.distributed.checkpoint.load`.
         pytest_discover_tests(dcp_load
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dcp_load.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS _distcp_shim
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
         # Per-tensor `torch.load` round-trip via the shim — independent check
         # that each per-tensor ZIP slice decodes correctly.
         pytest_discover_tests(distcp_roundtrip
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_distcp_roundtrip.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS _distcp_shim
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
         pytest_discover_tests(quantized_snapshot
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quantized_snapshot.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS checkpoint checkpoint_server
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
         # Smoke checks of the installed package, which skip where no package is installed.
@@ -436,4 +407,13 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
     # the configuring interpreter. Depending on the wheel file itself avoids
     # both.
     add_custom_target(nvrx_checkpointing_whl DEPENDS "${PHOENIX_WHEEL_FILE}")
+endif()
+
+if (BUILD_TESTING AND TARGET nvrx_checkpointing_dev_whl)
+    # Test discovery imports the package through its editable install.
+    foreach(_test_group dcp_load distcp_roundtrip quantized_snapshot)
+        if (TARGET ${_test_group})
+            add_dependencies(${_test_group} nvrx_checkpointing_dev_whl)
+        endif()
+    endforeach()
 endif()

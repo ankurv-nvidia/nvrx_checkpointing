@@ -23,7 +23,7 @@ import torch
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-# sys.path + MEGATRON_NATIVE_BUILD_DIR opt-out are wired by `pytest_discover_tests`.
+# The CTest registration puts the build directory, which holds the shim, on the import path.
 import _distcp_shim
 
 
