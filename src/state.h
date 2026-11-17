@@ -4,6 +4,7 @@
 #include "fmttensor.h"    // IWYU pragma: keep
 #include "messages.h"
 #include "primitives64bit.h"
+#include "svcref.h"
 #include "tensor.h"
 
 #include <fmt/std.h>
@@ -647,6 +648,7 @@ struct StateTree
     friend struct StateSerDes;
 
     public:
+    std::shared_ptr<SvcRef::LocalProcCli> svcref;    // NOLINT
     // TODO: Better time tracking.
     std::chrono::nanoseconds startedAt /*NOLINT*/
         = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());

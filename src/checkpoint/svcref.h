@@ -35,36 +35,9 @@ struct SvcRef
     };
 
     private:
-    auto AcquireInProc_()
-    {
-        auto inProc = std::make_shared<InProc>();
-        {
-            std::scoped_lock lock(_mutex);
-            _inProc.push_back(inProc);
-        }
-        return inProc;
-    }
-
-    auto CliAcquireLocalProc_(uint64_t pid)
-    {
-        auto localProc = std::make_shared<LocalProcCli>();
-        localProc->pid = pid;
-        {
-            std::scoped_lock lock(_mutex);
-            _localProc.push_back(localProc);
-        }
-        return localProc;
-    }
-
-    auto CliAcquireRemoteProc_()
-    {
-        auto remoteProc = std::make_shared<RemoteProcCli>();
-        {
-            std::scoped_lock lock(_mutex);
-            _remoteProc.push_back(remoteProc);
-        }
-        return remoteProc;
-    }
+    std::shared_ptr<InProc>        AcquireInProc_();
+    std::shared_ptr<LocalProcCli>  CliAcquireLocalProc_();
+    std::shared_ptr<RemoteProcCli> CliAcquireRemoteProc_();
 
     uint64_t SvrAcquireLocalProcRef_(uint64_t pid);
     void     SvrReleaseLocalProcRef_(uint64_t pid, uint64_t token);
@@ -73,8 +46,9 @@ struct SvcRef
 
     public:
     static auto AcquireInProc() { return Instance_().AcquireInProc_(); }
-    static auto CliAcquireLocalProc(uint64_t pid) { return Instance_().CliAcquireLocalProc_(pid); }
+    static auto CliAcquireLocalProc() { return Instance_().CliAcquireLocalProc_(); }
     static auto CliAcquireRemoteProc() { return Instance_().CliAcquireRemoteProc_(); }
+
     static auto SvrAcquireLocalProcRef(uint64_t pid) { return Instance_().SvrAcquireLocalProcRef_(pid); }
     static void SvrReleaseLocalProcRef(uint64_t pid, uint64_t token) { Instance_().SvrReleaseLocalProcRef_(pid, token); }
     static auto SvrAcquireRemoteProcRef(std::string peer) { return Instance_().SvrAcquireRemoteProcRef_(std::move(peer)); }
@@ -83,9 +57,13 @@ struct SvcRef
     private:
     static SvcRef& Instance_();
 
+    // A daemon can acquire both cli and srv references
+    // Both must be empty to safely exit or release resources.
     uint32_t                                _token;
     std::mutex                              _mutex;
     std::list<std::weak_ptr<InProc>>        _inProc;
-    std::list<std::weak_ptr<LocalProcCli>>  _localProc;
-    std::list<std::weak_ptr<RemoteProcCli>> _remoteProc;
+    std::list<std::weak_ptr<LocalProcCli>>  _localProcCli;
+    std::list<std::weak_ptr<RemoteProcCli>> _remoteProcCli;
+    std::list<std::weak_ptr<LocalProcSrv>>  _localProcSrv;
+    std::list<std::weak_ptr<RemoteProcSrv>> _remoteProcSrv;
 };

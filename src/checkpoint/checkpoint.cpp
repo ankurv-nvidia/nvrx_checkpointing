@@ -662,6 +662,7 @@ void WaitForCheckpointSave(StateTree const& snapshotRegistry)
 void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
+    localRegistry.svcref = SvcRef::CliAcquireLocalProc();
     CheckpointWriter::SendStateRegistry(localRegistry);
 }
 
