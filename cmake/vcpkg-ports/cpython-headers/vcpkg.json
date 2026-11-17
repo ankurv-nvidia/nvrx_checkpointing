@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cpython-headers",
+  "version": "3.12.16",
+  "description": "CPython headers from a python-build-standalone release, for compiling extension modules for another architecture.",
+  "homepage": "https://github.com/astral-sh/python-build-standalone",
+  "license": "PSF-2.0",
+  "supports": "linux & arm64"
+}

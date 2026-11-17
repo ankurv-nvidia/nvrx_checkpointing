@@ -217,6 +217,10 @@ endif()
 if (PHOENIX_BUILD_PYTHON_BINDINGS)
     include(DLPack)
 
+    # A cross build compiles the extensions against the target CPython's headers.
+    if (CMAKE_CROSSCOMPILING AND COMMAND vcpkg_install)
+        vcpkg_install(cpython-headers)
+    endif()
     find_package(Python3 COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
     include(PythonEnv)
     pip_install(nanobind)
