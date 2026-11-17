@@ -39,7 +39,30 @@ endif()
 
 option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"      ON)
 option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         ON)
-set(PHOENIX_WHEEL_VERSION "0.0.1" CACHE STRING "Python wheel version")
+# A wheel built from a Git checkout counts the commits in its history and names its commit.
+set(PHOENIX_WHEEL_VERSION "0.0.1")
+find_package(Git QUIET)
+if (GIT_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-list --count HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _wheel_count_failed
+        OUTPUT_VARIABLE _wheel_commit_count
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=8 HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _wheel_commit_failed
+        OUTPUT_VARIABLE _wheel_commit
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if (NOT _wheel_count_failed AND NOT _wheel_commit_failed)
+        string(APPEND PHOENIX_WHEEL_VERSION ".dev${_wheel_commit_count}+g${_wheel_commit}")
+    endif()
+endif()
 
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
 option(BUILD_TESTING                    "Build the tests"                   OFF)

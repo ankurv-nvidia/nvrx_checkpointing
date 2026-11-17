@@ -15,7 +15,8 @@ python3 -m pip install --upgrade --pre \
 The aarch64 wheel targets Grace (Neoverse V2) CPUs, as in GB200 and GB300
 systems.
 
-Published versions have the form `0.0.1.dev<RUN_NUMBER>+g<COMMIT_SHORT_SHA>`,
+Published versions have the form `0.0.1.dev<COMMIT_COUNT>+g<COMMIT_SHORT_SHA>`,
+where `COMMIT_COUNT` is the number of commits in the built commit's history,
 and the index keeps the newest 50 builds. To reproduce a particular build,
 replace `VERSION` below with its published version:
 
