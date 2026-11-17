@@ -123,7 +123,10 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 ## TODO : Cleanups
 
 - namespaces
--
+- packaging
+- daemon vs session : note on why sessions are needed
+
+- Bugfix : for session overlap
 
 ## TODO : Assumptions
 
@@ -169,7 +172,11 @@ In each of these cases the daemon does its best to transmit and broadcast errors
 
 ## TODO : Error scenario examples
 
-### Example 1
+### Example 1 : Transient Node Failure
+
+### Example 2 : Permanent Node Failure
+
+### Example 3 : Session overlap
 
 # Lifecycle Management (Daemon)
 
