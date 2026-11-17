@@ -125,7 +125,6 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 - namespaces
 - packaging
 - daemon vs session : note on why sessions are needed
-
 - Bugfix : for session overlap
 
 ## TODO : Assumptions
@@ -138,45 +137,46 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
    1.1 . shm file is already exists. it'll reinitialize it
    1.2 - Any producer thats still writing to the old file will error
 
-# Resiliency and Error Handling
+# Daemon
 
-There are 2 main high level design philosophies that important to remember when thinking about resiliency and error propagation.
+The daemon operates as primarily a manager of:
 
-1. The daemon never intentionally crashes or raise exceptions
-2. Almost all of the client exposed api surface is async.
+1. Session : Captures all state that corresponds to a training-job
+2. Lifetime Management : Managing lifetimes of the module and the individual sessions
+3. Messaging Infra: (Shared-Memory, Web-Service etc) : Relays requests/data to session(s) or processes lifetime management requests
 
-A training job will usually go through these high level steps
-(Happens once per training cycle)
+## Session
 
-1. Daemon boot (async)
-2. State-Dict registration (async)
-3. Save-planning globally across all ranks (background)
-   (Repeated multiple times)
-4. Snapshot activation
-   1. Sync wait for save-planning
-   2. Sync wait for last-snapshot completion
-5. Snapshot transfer to daemon
-6. Snapshot durability to disk
-7. Snapshot disk finalization
-8. Client notification and finalization callbacks
-   1. GIL lock for client routine callbacks
+The session manages state that corresponds to a specific training-job. There are two main components of the state
 
-There are several other (fatal) corner cases that will cause a fail-fast of the training process or the daemon but the primary outlets for most errors will have two main outlets for error propagation.
+1. Session-State : Computed once and applies to the entire session
+2. Snapshot-State : Applies to each individual snapshot within a session
 
-- Step-4.1 : Snapshot activation
-  - Sync wait for save-planing covers all errors from Step-1-2-3 and bubbles any errors
-- Step-8.1 : Finalization Callbacks
-  - GIL Lock for client routine callbacks used for bubbling up errors between Step-4-8
+### Session-State
 
-In each of these cases the daemon does its best to transmit and broadcast errors to all clients as needed but sometimes the errors will only be limited to the rank it originates from.
+The following are the most important session state
 
-## TODO : Error scenario examples
+1. The local registry (per-local-rank)
+2. Global Registry. A full detailed plan that knows the locations of each state-dictionary item as well as their replication or shard locations.
+3. Deduped Local Registries (per-local-rank): This is also used as the snapshot plan and consists of rank-assignment to avoid duplicate snapshoting and disk-persistence for checkpoint state
+4. Snapshots : Each snapshot further has its own state but the session maintains all the snapshots available within a session.
+   1. Snapshots can be evicted to conserve memory
+   2. Snapshots can be loaded (or preloaded) from disk as needed
 
-### Example 1 : Transient Node Failure
+A Session is considered initialized and valid once it has recieved the global registry from the coordinator (or merged all local registries on the coordinator) and computed the local-registries for its local-ranks
+Any error during the session initialization will prevent a async-save from the training job and will be bubbled up during the first save request.
 
-### Example 2 : Permanent Node Failure
+### Snapshot-State
 
-### Example 3 : Session overlap
+A snapshot can be under-construction or finalized. Once finalize the snapshot state is considered frozen and not modified.
+Snapshots can be evicted by the Session if the server starts running out of memory or based on user preference on how many active snapshots to maintain
+Partial snapshots arent considered reusable. The following state is maintained in the snapshot
+
+Once fine
+
+1. Snapshot Registry
+2. Byte-Storage
+3.
 
 # Lifecycle Management (Daemon)
 
@@ -257,6 +257,50 @@ Here's a consolidated list of behaviors when it comes to ft-launcher and daemon 
     - <mark>TODO</mark> : Should we terminate all daemons ??. This will handicap fast-recovery
   - Diagnostics include daemon coredump (if applicable) and logs.
   - Also includes daemon being unresponsive or hanged (stack trace if hanged)
+
+# Resiliency and Error Handling
+
+There are 2 main high level design philosophies that important to remember when thinking about resiliency and error propagation.
+
+1. The daemon never intentionally crashes or raise exceptions
+2. Almost all of the client exposed api surface is async.
+
+A training job will usually go through these high level steps
+(Happens once per training cycle)
+
+1. Daemon boot (async)
+2. State-Dict registration (async)
+3. Save-planning globally across all ranks (background)
+   (Repeated multiple times)
+4. Snapshot activation
+   1. Sync wait for save-planning
+   2. Sync wait for last-snapshot completion
+5. Snapshot transfer to daemon
+6. Snapshot durability to disk
+7. Snapshot disk finalization
+8. Client notification and finalization callbacks
+   1. GIL lock for client routine callbacks
+
+Each training-job has a corresponding session in the daemon-set that it interacts with.
+A snapshot is considered active if its still unfinalized.
+Active snapshots across all sessions that output to the same location are waited to become quiescent before a session can make its snapshot active.
+
+There are several other (fatal) corner cases that will cause a fail-fast of the training process or the daemon but the primary outlets for most errors will have two main outlets for error propagation.
+
+- Step-4.1 : Snapshot activation
+  - Sync wait for save-planing covers all errors from Step-1-2-3 and bubbles any errors
+- Step-8.1 : Finalization Callbacks
+  - GIL Lock for client routine callbacks used for bubbling up errors between Step-4-8
+
+In each of these cases the daemon does its best to transmit and broadcast errors to all clients as needed but sometimes the errors will only be limited to the rank it originates from.
+
+## TODO : Error scenario examples
+
+### Example 1 : Transient Node Failure
+
+### Example 2 : Permanent Node Failure
+
+### Example 3 : Session overlap
 
 # Key Components and Code Walkthrough
 
