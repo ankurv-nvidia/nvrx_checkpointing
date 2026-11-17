@@ -38,8 +38,8 @@ inline bool TryConnectToCheckpointService(uint16_t index)
             [[maybe_unused]] auto endpoint = stream.connect(results, ec);
             if (ec) { continue; }
 
-            static constexpr int                                         HttpVersion11 = 11;
-            boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
+            static constexpr int                                         HttpVersion = 11;
+            boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion};
             req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", port));
             req.body().data = nullptr;
             req.body().size = 0;

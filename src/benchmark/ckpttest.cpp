@@ -105,7 +105,6 @@ class TestServerProcess
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
         if (TryConnectToCheckpointService(0))
         {
-            // TODO_NOMERGESvcStop();
             static constexpr size_t MaxStopAttempts = 50;
             using namespace std::chrono_literals;
             for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
@@ -143,17 +142,26 @@ class TestServerProcess
         using namespace std::chrono_literals;
         for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
         {
-            if (TryConnectToCheckpointService(0)) { return; }
+            if (TryConnectToCheckpointService(0))
+            {
+                _reference = SvcRef::CliAcquireLocalProc(0);
+                return;
+            }
             std::this_thread::sleep_for(100ms);
         }
         Stop();
         throw std::runtime_error("checkpoint test server did not become ready");
     }
 
-    bool Stop() { return WaitForExit(); }
+    bool Stop()
+    {
+        SvcRef::CloseLocalProcClients();
+        return WaitForExit();
+    }
 
     bool WaitForExit()
     {
+        _reference.reset();
         static constexpr size_t MaxAttempts = 50;
         using namespace std::chrono_literals;
         int status = 0;
@@ -180,7 +188,8 @@ class TestServerProcess
     }
 
     private:
-    pid_t _pid = -1;
+    std::shared_ptr<SvcRef::LocalProcCli> _reference;
+    pid_t                                 _pid = -1;
 };
 }    // namespace
 
@@ -1284,7 +1293,6 @@ TEST_CASE("finalize uses the completed HTTP status and error body", "[server][fi
     namespace http = boost::beast::http;
     if (TryConnectToCheckpointService(0))
     {
-        // TODO_NOMERGE SvcStop();
         for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(0); ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -1412,11 +1420,7 @@ TEST_CASE("a shard write failure reaches the finalize caller", "[server][finaliz
     CHECK(failure.contains("__0_0.distcp"));
     CHECK_FALSE(std::filesystem::exists(badDir / ".metadata"));
     CHECK(std::filesystem::exists(goodDir / ".metadata"));
-    // TODO_NOMERGE auto       spinDown   = std::async(std::launch::async, &SvcSpinDown);
-    // TODO_NOMERGE auto const stopStatus = spinDown.wait_for(std::chrono::seconds{10});
-    // TODO_NOMERGE if (stopStatus != std::future_status::ready) { CHECK(server.Stop()); }
-    // TODO_NOMERGE REQUIRE(stopStatus == std::future_status::ready);
-    // TODO_NOMERGE CHECK_NOTHROW(spinDown.get());
+    tree.svcref.reset();
     CHECK(server.WaitForExit());
     std::filesystem::remove_all(logDir);
 }
@@ -1560,6 +1564,7 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
         {
             static_cast<Primitives64Bit&>(captured) = Primitives64Bit(int64_t{iteration});
             SaveCheckpoint(*selected, checkpoint::ipc::SnapshotId{iteration}, logDir / std::to_string(iteration));
+            WaitForCkptFinalize(TestSessionId, iteration);
             struct Expected
             {
                 checkpoint::ipc::SnapshotId snapshot;
@@ -3010,6 +3015,7 @@ TEST_CASE("registries are not dumped without a server log directory", "[server][
 
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
 {
+    checkpoint::logging::Init();
     auto const outDir     = CkptDir("telemetry_schema");
     auto const stderrPath = outDir / "stderr.log";
     std::filesystem::remove_all(outDir);

@@ -180,6 +180,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         {
             std::unordered_map<std::string, uint64_t> blobSizes;
             auto const                                otherRanks = static_cast<size_t>(topo.worldSize) - 1;
+            auto const                                deadline   = std::chrono::steady_clock::now() + ServerWaitTimeout;
             while (true)
             {
                 {
@@ -197,6 +198,10 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                          otherRanks);
                 }
                 if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to write checkpoint"); }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    throw std::runtime_error("Timed out waiting for ranks to write checkpoint");
+                }
 
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -220,7 +225,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
             // Rank 0 joins last, so the set is now world-size: every shard and the metadata
             // are on disk and the checkpoint is loadable.
             // This raw marker has a strict schema consumed by CI.
-            INFO("[PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
+            INFO("[{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
                  *this,
                  hdr.snapshotId,
                  static_cast<size_t>(topo.worldSize),
@@ -339,6 +344,24 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                  numActiveSnapshots);
         }
     } catch (std::exception const& ex) { ERR("[{}] Exception occurred while releasing snapshot buffers: {}", *this, ex.what()); }
+
+    if (!onCoordinatorPeer)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + ServerWaitTimeout;
+        while (!stopRequested)
+        {
+            {
+                std::scoped_lock lock(mutex);
+                if (snapshot.complete) { break; }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    snapshot.failures.emplace_back("Timed out waiting for global checkpoint completion");
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
 }
 
 static std::string DeflateRegistry(StateTree const& registry, uint64_t& rawSize)
@@ -415,8 +438,12 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
     RelayGlobalRegistryToPeers(registry, startPeerIndex, delegateStart);
 }
 
-Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
-    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn)), selfSvcRef(SvcRef::AcquireInProc())
+Session::Session(Server* serverIn      LFTBND,
+                 cipc::SessionId       sessionIdIn,
+                 std::filesystem::path workDirIn,
+                 RankTopology          topoIn,
+                 uint16_t              serverIndexIn) :
+    serverIndex(serverIndexIn), server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
 {}
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
@@ -471,8 +498,11 @@ void Session::Handle(cipc::Message::LocalStateRegistry const& hdr, std::span<cha
         {
             registeredRegistry = std::move(localRegistry);
             registryAccepted   = true;
-            asyncTasks.emplace_back(
-                std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkReceiveLocalStateRegistry_, this, rank));
+            asyncTasks.emplace_back(SvcRef::Async(
+                "receive registry",
+                [this, rank] { AsyncWorkReceiveLocalStateRegistry_(rank); },
+                static_cast<uint32_t>(sessionId),
+                serverIndex));
         }
     }
 
@@ -664,7 +694,8 @@ void Session::Handle(cipc::Message::FinalizeSnapshot const& hdr, std::span<char 
     }
     {
         std::scoped_lock lock(mutex);    // local registry uploads can arrive on concurrent HTTP handlers
-        asyncTasks.emplace_back(std::async(std::launch::async | std::launch::deferred, &Session::AsyncWorkFinalizeSnapshot_, this, hdr));
+        asyncTasks.emplace_back(SvcRef::Async(
+            "finalize snapshot", [this, hdr] { AsyncWorkFinalizeSnapshot_(hdr); }, static_cast<uint32_t>(sessionId), serverIndex));
     }
 }
 
@@ -676,7 +707,7 @@ static void FailPlanning(Session& session, std::string failure)
     if (session.stopRequested) { return; }
     ERR("[{}] Snapshot planning failed: {}", session, session.sessionState.planningFailure);
     auto const message = session.sessionState.planningFailure;
-    session.asyncTasks.emplace_back(std::async(std::launch::async, [&session, message] {
+    auto       propagate = [&session, message] {
         std::ostringstream result;
         serdes::WriteBlobWithSize<uint32_t>(result, message);
         auto const body      = result.str();
@@ -690,7 +721,9 @@ static void FailPlanning(Session& session, std::string failure)
                     session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
             } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
         }
-    }));
+    };
+    session.asyncTasks.emplace_back(
+        SvcRef::Async("propagate planning failure", std::move(propagate), static_cast<uint32_t>(session.sessionId), session.serverIndex));
 }
 
 void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
@@ -983,7 +1016,7 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
         }
         sessionState.planningStarted = true;
         auto globalRegistry          = sessionState.globalRegistry;
-        asyncTasks.emplace_back(std::async(std::launch::async, [this, globalRegistry] {
+        auto plan                    = [this, globalRegistry] {
             try
             {
                 globalRegistry->FinalizeRegistry();
@@ -992,7 +1025,8 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
                 HandleGlobalRegistry(globalRegistry, {});
                 BroadcastGlobalRegistryToPeers_(*globalRegistry);
             } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
-        }));
+        };
+        asyncTasks.emplace_back(SvcRef::Async("plan snapshot registry", std::move(plan), static_cast<uint32_t>(sessionId), serverIndex));
     } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
 }
 
@@ -1035,7 +1069,6 @@ try
     if (IsCoordinatorPeer()) { HandleLocalStateRegistry(rank, std::move(registry)); }
     else
     {
-        if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
         // Send to coordinator
         std::ostringstream body;
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);

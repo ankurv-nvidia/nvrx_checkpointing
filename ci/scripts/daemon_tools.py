@@ -81,6 +81,20 @@ class LocalDaemon:
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
             pass
 
+    def hold(self, timeout: float = 30, *, coordinator: str = "") -> str:
+        pid = os.getpid()
+        token = str(time.time_ns() ^ (pid << 32))
+        body = f"4294967295\n{coordinator}\n{socket.gethostname()}:{urlsplit(self.base_url).port or 80}".encode()
+        request = urllib.request.Request(
+            f"{self.base_url}/acquirelocalref/{pid}", data=body, headers={"X-Checkpoint-Token": token}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return str(int(response.read()))
+        except BaseException:
+            self.request(f"releaselocalref/{pid}/{token}", min(timeout, 5))
+            raise
+
     def reachable(self, timeout: float = 0.25) -> bool:
         url = urlsplit(self.base_url)
         try:

@@ -132,7 +132,7 @@ ctest_gate() {
         export MEGATRON_NATIVE_RUN_SERVER_TESTS=1
         export PYTHONPATH="${cpu_pythonpath}:${repo_root}/build-test"
         "${python}" -m pytest --collect-only -q tests/test_native_common_state.py tests/test_snapshot_planning.py \
-            tests/test_sharded_tensor_registration.py tests/test_quantized_binding.py > "${scratch}/native-python-cases.txt"
+            tests/test_sharded_tensor_registration.py tests/test_quantized_binding.py tests/test_svcref.py > "${scratch}/native-python-cases.txt"
         local native_test_index=0
         while IFS= read -r test_case; do
             [[ ${test_case} == tests/*::* ]] || continue

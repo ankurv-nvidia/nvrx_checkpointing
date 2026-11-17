@@ -9,6 +9,7 @@
 # Keys per entry:
 #   summary   one line naming the axis under test
 #   priority  configure order, low first; equal priorities order by name
+#   env       training environment variables applied to both phases
 #   <scope>   `add` and `drop` lists of Megatron options
 #
 # A scope is `all`, `phase1` or `phase2`. Phase 1 trains from scratch and phase
@@ -35,6 +36,11 @@ native:
   all:
     drop: [--ckpt-provider]
     add: [--ckpt-provider=native]
+
+oop:
+  summary: Run the checkpoint daemon in a separate process.
+  env:
+    NATIVE_CKPT_SERVER_DISABLE_INPROC: "1"
 
 async:
   summary: Save asynchronously, staging wherever the model configuration says.

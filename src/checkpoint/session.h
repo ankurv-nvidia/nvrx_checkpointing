@@ -63,6 +63,7 @@ struct Session
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
     };
 
+    uint16_t const                        serverIndex;
     Server* const                         server;
     checkpoint::ipc::SessionId const      sessionId{checkpoint::ipc::SessionId::Invalid};
     RankTopology const                    topo;
@@ -80,7 +81,11 @@ struct Session
 
     std::vector<std::future<void>> asyncTasks;
 
-    Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
+    Session(Server* serverIn           LFTBND,
+            checkpoint::ipc::SessionId sessionIdIn,
+            std::filesystem::path      workDirIn,
+            RankTopology               topoIn,
+            uint16_t                   serverIndexIn = 0);
     std::atomic<bool> stopRequested{false};
 
     void Activate();
@@ -114,9 +119,6 @@ struct Session
 
     // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
-
-    std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-    std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
 
     private:
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;

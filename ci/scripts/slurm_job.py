@@ -26,8 +26,10 @@ LLM/agent maintenance constraints:
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import fcntl
+import glob
 import hashlib
 import importlib
 import importlib.metadata
@@ -2014,13 +2016,10 @@ class FlavorPolicy:
     def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server:
             def stop() -> None:
-                pids = CHECKPOINT_SERVER.pids()
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
-                    pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]
-                    _reject_server_errors(
-                        Path(pattern.replace("%h", socket.gethostname()).replace("%p", pid)) for pid in pids
-                    )
+                    pattern = Path(os.environ["NATIVE_CKPT_SERVER_LOG"].replace("%h", socket.gethostname()))
+                    _reject_server_errors(pattern.parent.glob(glob.escape(pattern.name).replace("%p", "*")))
 
             _node_once(tag, stop)
 
@@ -2201,7 +2200,7 @@ class DeterministicFlavor(Flavor):
 
 _VALGRIND_NATIVE_ENV = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH": "1",
-    "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS": "0",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC": "1",
     "NATIVE_CKPT_SERVER_HANDLER_THREADS": "4",
     "NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS": "0",
     "NATIVE_CKPT_SERVER_TCP_ACCEPTORS": "1",
@@ -2291,8 +2290,9 @@ class ValgrindFlavor(Flavor):
                 time.sleep(1)
             else:
                 raise RuntimeError(f"checkpoint_server failed to start under valgrind; see {server_log}")
-            marker.with_suffix(".ready").touch()
             try:
+                CHECKPOINT_SERVER.hold()
+                marker.with_suffix(".ready").touch()
                 yield
                 CHECKPOINT_SERVER.request("spindown", 3600)
                 rc = proc.wait(timeout=3600)
@@ -2305,15 +2305,11 @@ class ValgrindFlavor(Flavor):
                 marker.with_suffix(".done").touch()
 
 
-_FLAVOR_KEYS = ("summary", "priority", *_SCOPES)
+_FLAVOR_KEYS = ("summary", "priority", "env", *_SCOPES)
 
 
 class DeclaredFlavor(Flavor):
-    """A checkpoint variant declared in ``ci/flavors.yaml``.
-
-    A variant that only adds or drops options, or settles a run option, needs no
-    code: it names the axis it puts under test and the options that express it.
-    """
+    """A checkpoint variant declared through options and training environment."""
 
     def __init__(self, name: str, spec: dict):
         if unknown := sorted(set(spec) - set(_FLAVOR_KEYS)):
@@ -2321,6 +2317,7 @@ class DeclaredFlavor(Flavor):
         self.name = name
         self.summary = str(spec.get("summary", ""))
         self.priority = int(spec.get("priority", 0))
+        self.environment = {str(name): str(value) for name, value in (spec.get("env") or {}).items()}
         self.edits = tuple(
             OptionEdit(scope, tuple(spec[scope].get("add") or ()), tuple(spec[scope].get("drop") or ()))
             for scope in _SCOPES
@@ -2329,6 +2326,9 @@ class DeclaredFlavor(Flavor):
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.option_edits += self.edits
+
+    def transform(self, _opts: list[str], env: dict[str, str]) -> None:
+        env.update(self.environment)
 
 
 def _flavor_index(flavors: Iterable[Flavor]) -> dict[str, Flavor]:
@@ -2786,25 +2786,6 @@ def _reject_server_errors(logs: Iterable[Path]) -> None:
     if failed:
         raise RuntimeError(f"checkpoint server reported errors; see {', '.join(map(str, failed))}")
 
-def _heartbeat_server(stopped: threading.Event) -> None:
-    while not stopped.wait(60):
-        CHECKPOINT_SERVER.request("ping", 1)
-
-
-@contextlib.contextmanager
-def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
-    if not enabled or _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") != "0":
-        yield
-        return
-    stopped = threading.Event()
-    thread = threading.Thread(target=_heartbeat_server, args=(stopped,), daemon=True)
-    thread.start()
-    try:
-        yield
-    finally:
-        stopped.set()
-        thread.join()
-
 def _extra_options(cfg: str, selected: list[str]) -> list[str]:
     """Split option text, resolving the run-scoped cache directory in it."""
     if not any(selected):
@@ -2916,8 +2897,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         if checkpoints_override is not None:
             expected_checkpoints = checkpoints_override
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
-        # The trainer environment consumes the cycle-specific daemon log path.
-        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
+        slurm_restart = "0" if _in_job_array() else os.environ.get("SLURM_RESTART_COUNT", "0")
+        attempt = f"sr{slurm_restart}-te{os.environ.get('TORCHELASTIC_RESTART_COUNT', '0')}"
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.{attempt}.%h.%p.log")
         cmd, env = _phase_command(
             cfg,
             args,
@@ -2938,6 +2920,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
             provider == "native" or megatron_otel_enabled or "detr" in flavors.names
         )
         if collect_otel:
+            from nvrx_checkpointing import SERVER_PATH, ckpt_diag  # noqa: PLC0415
+
+            ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
             os.environ["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
             env["NATIVE_CKPT_OTEL_FILE"] = str(otel_file)
         else:
@@ -2964,27 +2949,9 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         run_id = _otel_run_id(env, label, cycle_tag)
         env["MEGATRON_OTEL_RUN_ID"] = run_id
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
-        server_enabled = collect_otel
-        if server_enabled:
-            from nvrx_checkpointing import SERVER_PATH, checkpoint, ckpt_diag  # noqa: PLC0415
-
-            ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
-
-            if relay_otel:
-                if collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-collector".strip("-"), checkpoint.ping)
-                _sync_ranks(f"{label}-{cycle_tag}-otel-collector-ready".strip("-"))
-                if not collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-relay".strip("-"), checkpoint.ping)
-            else:
-                _node_once(f"{label}-{cycle_tag}-otel-listener".strip("-"), checkpoint.ping)
-            _sync_ranks(f"{label}-{cycle_tag}-otel-listeners-ready".strip("-"))
         if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
-        with (
-            flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
-            _server_heartbeat(server_enabled),
-        ):
+        with flavors.policy.server_context(f"{stem}-{cycle_tag}", phase):
             _print_pretrain_env(env, cycle_tag)
             rc = (
                 _tee_rc(
@@ -3007,10 +2974,10 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                 _run_dir(cfg) / f"phase1-checkpoints/iter_{flavors.policy.phase1_train_iters:07d}/.metadata",
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
-        if server_enabled and not collector_node:
+        if collect_otel and not collector_node:
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop")
         _sync_ranks(f"{label}-{cycle_tag}-relays-stopped".strip("-"))
-        if server_enabled and collector_node:
+        if collect_otel and collector_node:
             flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
         if rank == "0":
@@ -3603,6 +3570,23 @@ def _fill_uninitialized_memory_if_deterministic(args: argparse.Namespace, torch_
         torch_module.utils.deterministic.fill_uninitialized_memory = True
 
 
+def _setup_training_collector() -> None:
+    if not os.environ.get("NATIVE_CKPT_OTEL_FILE"):
+        return
+    from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+
+    owner_pid = os.getpid()
+    checkpoint.ping()
+    coordinator = os.environ.get("NATIVE_CKPT_OTEL_COLLECTOR", "")
+    token = CHECKPOINT_SERVER.hold(timeout=900, coordinator="" if coordinator == "file" else coordinator)
+
+    def release() -> None:
+        if os.getpid() == owner_pid:
+            CHECKPOINT_SERVER.request(f"releaselocalref/{owner_pid}/{token}", 5)
+
+    atexit.register(release)
+
+
 def _pretrain_entry(phase: int, entrypoint: str) -> None:
     sys_path_insert(megatron_root())
     _prepare_otel_randomness()
@@ -3708,14 +3692,9 @@ def _worker(args: argparse.Namespace) -> None:
         # uninstall would pull its modules from under the launcher agents.
         uninstall_nvrx_for_native()
     cfg = f"{args.config}_{args.nodes}x{args.gpus_per_node}"
-    if _in_job_array():
-        # A launcher restart re-runs this worker on nodes whose previous attempt
-        # auto-launched the checkpoint daemon; the leftover belongs to this run,
-        # so terminate it instead of refusing to start.
-        CHECKPOINT_SERVER.terminate()
-    # JET preflights the node before starting worker ranks.
-    elif os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
-        CHECKPOINT_SERVER.require_stopped()
+    if _in_job_array() or os.environ.get("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE") != "1":
+        action = CHECKPOINT_SERVER.terminate if _in_job_array() else CHECKPOINT_SERVER.require_stopped
+        _node_once("server-preflight", action)
     try:
         _perform_runs(cfg, args)
     except BaseException:
@@ -4198,6 +4177,7 @@ _ENV_SCOPES = {
     **dict.fromkeys(_MODEL_ENV_NAMES, "rw"),
     **dict.fromkeys(_TRAIN_ENV_DEFAULTS, "rw"),
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS": "rw",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC": "rw",
     "VCPKG_ROOT": "rspw", "MEGATRON_NATIVE_BUILD_DIR": "rspw", "NVRX_REPO_ROOT": "rspw",
     "SLURMJOB_OPT_PYTHON_INSTALL_DIR": "rspw", "ENROOT_IMAGE_DIR": "rs", "HOME": "rs", "MEGATRON_ROOT": "rspw",
     "SLURMJOB_OPT_LAUNCHER_ROOT": "rs", "SLURMJOB_OPT_RUN_DIR": "rsw", "SLURMJOB_OPT_WORK_ROOT": "rspw",
@@ -4620,6 +4600,7 @@ if __name__ == "__main__":
         phase = int(sys.argv[2])
         entrypoint = sys.argv[3]
         sys.argv = [f"pretrain_{entrypoint}.py", *sys.argv[4:]]
+        _setup_training_collector()
         _pretrain_entry(phase, entrypoint)
     elif len(sys.argv) > 1 and sys.argv[1] == _EPILOG_ENTRY_CMD:
         _epilog(sys.argv[2:])

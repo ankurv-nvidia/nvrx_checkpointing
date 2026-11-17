@@ -113,6 +113,7 @@ namespace checkpoint::telemetry
 {
 
 void Init();
+bool Flush();
 void Shutdown();
 
 [[nodiscard]] bool IsEnabled() noexcept;

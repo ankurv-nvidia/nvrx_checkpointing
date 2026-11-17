@@ -361,6 +361,22 @@ template <typename THdr> struct ShmRingBuffer
 
     void Heartbeat() { _ctrl->rtimestamp = Control::Clock::now(); }
 
+    [[nodiscard]] bool HasPendingMessages()
+    {
+        bip::scoped_lock<bip::interprocess_mutex> lock(_ctrl->mutex);
+        return _ctrl->rend + _slotCount != _ctrl->wend;
+    }
+
+    template <typename TPredicate> [[nodiscard]] bool HasPendingMessages(TPredicate&& matches)
+    {
+        bip::scoped_lock<bip::interprocess_mutex> lock(_ctrl->mutex);
+        for (auto offset = _ctrl->wend - _slotCount; offset != _ctrl->rend; ++offset)
+        {
+            if (matches(_hdrs[offset % _slotCount])) { return true; }
+        }
+        return false;
+    }
+
     // The extent the ring actually uses (control + headers + slots), for callers that
     // NUMA-bind or cudaHostRegister the buffer — it must never exceed the published
     // geometry, which bounds what a client may touch and pin.

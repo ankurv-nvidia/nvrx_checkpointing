@@ -2,7 +2,9 @@
 # ruff: noqa: ANN001, ANN202, INP001, PLR2004, S101, SLF001
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import signal
 import sys
 from pathlib import Path
@@ -27,6 +29,50 @@ def test_checkpoint_server_uses_fixed_native_service_port() -> None:
     daemon_tools = _load_daemon_tools()
 
     assert daemon_tools.CHECKPOINT_SERVER.base_url == "http://127.0.0.1:4100/api"
+
+
+@pytest.mark.parametrize(
+    ("coordinator", "body"),
+    [("", b"4294967295\n\npeer:4100"), ("collector:4100", b"4294967295\ncollector:4100\npeer:4100")],
+)
+def test_hold_acquires_a_reference_for_the_current_process(monkeypatch, coordinator: str, body: bytes) -> None:
+    daemon_tools = _load_daemon_tools()
+    requests = []
+    monkeypatch.setattr(daemon_tools.os, "getpid", lambda: 42)
+    monkeypatch.setattr(daemon_tools.time, "time_ns", lambda: 100)
+    monkeypatch.setattr(daemon_tools.socket, "gethostname", lambda: "peer")
+
+    def urlopen(request, *, timeout):
+        requests.append((request.full_url, request.get_method(), request.data, request.get_header("X-checkpoint-token"), timeout))
+        return io.BytesIO(b"123")
+
+    monkeypatch.setattr(daemon_tools.urllib.request, "urlopen", urlopen)
+
+    lease = daemon_tools.CHECKPOINT_SERVER.hold(timeout=7, coordinator=coordinator)
+
+    assert lease == "123"
+    assert requests == [("http://127.0.0.1:4100/api/acquirelocalref/42", "POST", body, str(100 ^ (42 << 32)), 7)]
+
+
+def test_hold_cancels_a_reference_when_the_acquisition_reply_is_lost(monkeypatch) -> None:
+    daemon_tools = _load_daemon_tools()
+    requests = []
+    monkeypatch.setattr(daemon_tools.os, "getpid", lambda: 42)
+    monkeypatch.setattr(daemon_tools.time, "time_ns", lambda: 100)
+
+    def lost_reply():
+        raise TimeoutError("acquisition reply lost")
+
+    monkeypatch.setattr(
+        daemon_tools.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: contextlib.nullcontext(SimpleNamespace(read=lost_reply)),
+    )
+    monkeypatch.setattr(daemon_tools.LocalDaemon, "request", lambda _self, endpoint, timeout: requests.append((endpoint, timeout)))
+
+    with pytest.raises(TimeoutError, match="acquisition reply lost"):
+        daemon_tools.CHECKPOINT_SERVER.hold(timeout=7)
+
+    assert requests == [(f"releaselocalref/42/{100 ^ (42 << 32)}", 5)]
 
 
 def test_require_stopped_removes_configured_stale_files(monkeypatch, tmp_path: Path) -> None:

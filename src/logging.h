@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <string_view>
 #include <utility>
@@ -21,9 +22,11 @@ enum class Level : uint8_t
     Critical,
 };
 
-void Init();
+void Init(bool inproc = false);
 
-void Flush();
+[[nodiscard]] std::FILE* Output();
+
+bool Flush();
 
 void Shutdown();
 

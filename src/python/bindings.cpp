@@ -726,9 +726,9 @@ static void SaveAsync(PythonStateTree& self, int iteration, std::filesystem::pat
 
 NB_MODULE(checkpoint, m)    // NOLINT
 {
-    // TODO_NOMERGE m.def("ping", &SvcPing);
-    // TODO_NOMERGE m.def("svc_stop", &SvcStop);
-    // TODO_NOMERGE m.def("svc_spindown", &SvcSpinDown);
+    m.def("ping", &SvcPing);
+    m.def("svc_stop", &SvcStop);
+    m.def("svc_spindown", &SvcSpinDown);
     m.def(
         "wait_for_ckpt_finalize",
         [](uint32_t sessionId, int64_t iteration) {

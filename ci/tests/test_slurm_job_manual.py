@@ -14,9 +14,13 @@ import sys
 import tempfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "ci" / "scripts"
@@ -45,6 +49,7 @@ _MUTATED_ENV = (
     "MEGATRON_ROOT",
     "MASTER_PORT",
     "NATIVE_CKPT_SERVER_LOG",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC",
     "NATIVE_CKPT_OTEL_EXPORT",
     "NATIVE_CKPT_OTEL_FILE",
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
@@ -463,44 +468,80 @@ def test_stopping_server_does_not_write_custom_memory_files(monkeypatch: pytest.
     assert recorded == [("stop", False), ("stop", False)]
 
 
-def test_server_heartbeat_pings_only_from_node_leader(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("current_error", [False, True])
+def test_stopping_server_checks_logs_after_the_daemon_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, current_error: bool,
+) -> None:
     slurm_job = _load_slurm_job()
-    requests = []
+    host = slurm_job.socket.gethostname()
+    previous = tmp_path / f"checkpoint_server.phase1.sr0-te0.{host}.41.log"
+    previous.write_text("[native_ckpt:svr][ERROR] an earlier attempt\n")
+    log = tmp_path / f"checkpoint_server.phase1.sr0-te1.{host}.42.log"
+    log.write_text("[native_ckpt:svr][ERROR] unfinished work\n" if current_error else "[native_ckpt:svr][INFO] work completed\n")
+    monkeypatch.setenv("NATIVE_CKPT_SERVER_LOG", str(tmp_path / "checkpoint_server.phase1.sr0-te1.%h.%p.log"))
+    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(stop=lambda _graceful: None))
+    monkeypatch.setattr(slurm_job, "_node_once", lambda _tag, action: action())
+    if current_error:
+        with pytest.raises(RuntimeError, match="checkpoint server reported errors"):
+            slurm_job.FlavorPolicy().stop_server("native", "stopped")
+    else:
+        slurm_job.FlavorPolicy().stop_server("native", "stopped")
 
-    class Stop:
-        waits = 0
 
-        def wait(self, timeout: int) -> bool:
-            assert timeout == 60  # noqa: PLR2004
-            self.waits += 1
-            return self.waits == 2  # noqa: PLR2004
+@pytest.mark.parametrize(("collector", "coordinator"), [(None, ""), ("file", ""), ("collector:4100", "collector:4100")])
+def test_training_collector_explicitly_holds_and_releases_its_daemon(
+    monkeypatch: pytest.MonkeyPatch, collector: str | None, coordinator: str,
+) -> None:
+    slurm_job = _load_slurm_job()
+    events = []
+    exits = []
+    pid = [42]
+    monkeypatch.setattr(slurm_job.os, "getpid", lambda: pid[0])
+    monkeypatch.setenv("NATIVE_CKPT_OTEL_FILE", "/run/otel.jsonl")
+    if collector is None:
+        monkeypatch.delenv("NATIVE_CKPT_OTEL_COLLECTOR", raising=False)
+    else:
+        monkeypatch.setenv("NATIVE_CKPT_OTEL_COLLECTOR", collector)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(
+        checkpoint=SimpleNamespace(ping=lambda: events.append("ready")),
+    ))
 
-        def set(self) -> None:
-            pass
+    def hold(**kwargs: object) -> str:
+        events.append(("hold", kwargs))
+        return "123"
 
-    class Thread:
-        def __init__(self, *, target: object, args: tuple[object, ...], daemon: bool) -> None:
-            assert daemon
-            self.target, self.args = target, args
+    def register(callback: Callable[..., None], *args: object) -> None:
+        events.append("register-release")
+        exits.append((callback, args))
 
-        def start(self) -> None:
-            self.target(*self.args)
+    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(
+        hold=hold, request=lambda *args: events.append(("release", *args)),
+    ))
+    monkeypatch.setattr(slurm_job.atexit, "register", register)
 
-        def join(self) -> None:
-            pass
+    slurm_job._setup_training_collector()
 
-    monkeypatch.setenv("SLURM_LOCALID", "0")
-    monkeypatch.setattr(slurm_job.threading, "Event", Stop)
-    monkeypatch.setattr(slurm_job.threading, "Thread", Thread)
-    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(request=lambda *args: requests.append(args)))
+    assert events == ["ready", ("hold", {"timeout": 900, "coordinator": coordinator}), "register-release"]
+    assert len(exits) == 1
+    callback, args = exits[0]
+    pid[0] = 43
+    callback(*args)
+    assert events[-1] == "register-release"
+    pid[0] = 42
+    callback(*args)
+    assert events[-1] == ("release", "releaselocalref/42/123", 5)
 
-    with slurm_job._server_heartbeat(enabled=True):
-        pass
-    monkeypatch.setenv("SLURM_LOCALID", "1")
-    with slurm_job._server_heartbeat(enabled=True):
-        pass
 
-    assert requests == [("ping", 1)]
+def test_training_without_collector_does_not_start_a_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    slurm_job = _load_slurm_job()
+    monkeypatch.delenv("NATIVE_CKPT_OTEL_FILE", raising=False)
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(
+        checkpoint=SimpleNamespace(ping=lambda: pytest.fail("no collector is needed")),
+    ))
+    monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", SimpleNamespace(
+        hold=lambda **_kwargs: pytest.fail("no collector is needed"),
+    ))
+    slurm_job._setup_training_collector()
 
 
 def test_valgrind_server_uses_phase_in_log_names(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -532,8 +573,9 @@ def test_valgrind_server_waits_for_listener_before_releasing_peers(
     monkeypatch.setattr(slurm_job.socket, "gethostname", lambda: "node")
     monkeypatch.setenv("SLURM_LOCALID", "0")
     monkeypatch.setenv("SLURM_JOB_ID", "123")
-    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
     calls: list[object] = []
+
+    monkeypatch.setitem(sys.modules, "nvrx_checkpointing", SimpleNamespace(SERVER_PATH=tmp_path / "server"))
 
     class Process:
         finished = False
@@ -559,6 +601,7 @@ def test_valgrind_server_waits_for_listener_before_releasing_peers(
     checkpoint_server = SimpleNamespace(
         require_stopped=lambda: calls.append("stopped"),
         reachable=lambda: calls.append("reachable") or next(reachable),
+        hold=lambda: calls.append("reference"),
         request=lambda *args: calls.append(("request", *args)),
     )
     monkeypatch.setattr(slurm_job, "CHECKPOINT_SERVER", checkpoint_server)
@@ -573,6 +616,7 @@ def test_valgrind_server_waits_for_listener_before_releasing_peers(
         ("stdio", subprocess.DEVNULL, str(tmp_path / "test_server_phase2.node.log")),
         "reachable",
         "reachable",
+        "reference",
         ("request", "spindown", 3600),
         ("wait", 3600),
     ]
@@ -1353,15 +1397,25 @@ def test_checkpoint_cycle_extends_sample_horizon_for_large_allocations(tmp_path:
         (3, [(1, 0), (2, 0), (2, 1), (2, 2)]),
     ],
 )
+@pytest.mark.parametrize(("slurm_restart", "elastic_restart"), [(None, None), ("2", "3")])
 def test_repeat_runs_phase1_once_then_cycles_phase2(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     repeat: int,
     expected: list[tuple[int, int]],
+    slurm_restart: str | None,
+    elastic_restart: str | None,
 ) -> None:
     slurm_job = _load_slurm_job()
     args = _args(tmp_path, repeat=repeat)
     args.flavors = slurm_job.FlavorSelection(["perf", "native"])
+    monkeypatch.delenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", raising=False)
+    for name, value in (("SLURM_RESTART_COUNT", slurm_restart), ("TORCHELASTIC_RESTART_COUNT", elastic_restart)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    attempt = f"sr{slurm_restart or 0}-te{elastic_restart or 0}"
     calls = []
     daemon_logs = []
 
@@ -1390,8 +1444,8 @@ def test_repeat_runs_phase1_once_then_cycles_phase2(
     assert calls == expected
     phase2 = 2
     assert daemon_logs == [
-        "checkpoint_server.phase1.%h.%p.log",
-        *(f"checkpoint_server.cycle{cycle + 1}.%h.%p.log" for phase, cycle in expected if phase == phase2),
+        f"checkpoint_server.phase1.{attempt}.%h.%p.log",
+        *(f"checkpoint_server.cycle{cycle + 1}.{attempt}.%h.%p.log" for phase, cycle in expected if phase == phase2),
     ]
 
 
@@ -1472,6 +1526,7 @@ def test_worker_uses_coordinated_jet_server_preflight(
     monkeypatch.setenv("SLURMJOB_OPT_JOB_ARRAY_SEGMENT", "0")
     checks: list[str] = []
     monkeypatch.setattr(slurm_job, "_perform_runs", lambda *_args: None)
+    monkeypatch.setattr(slurm_job, "_node_once", lambda tag, action: (checks.append(tag), action()))
     monkeypatch.setattr(
         slurm_job,
         "CHECKPOINT_SERVER",
@@ -1484,7 +1539,7 @@ def test_worker_uses_coordinated_jet_server_preflight(
 
     monkeypatch.delenv("SLURMJOB_OPT_SERVER_PREFLIGHT_DONE")
     slurm_job._worker(args)
-    assert checks == ["checked"]
+    assert checks == ["server-preflight", "checked"]
 
 
 def test_worker_failure_requests_nonblocking_local_server_stop(
@@ -1974,23 +2029,8 @@ def test_routine_validates_each_collected_cycle(
         "42-otel-run-cycle1-sr0-te0",
     ]
     assert all("NATIVE_CKPT_TRAINING_MEMORY_FILE" not in env for env in child_envs)
-    assert sum(event == ("ping", "") for event in lifecycle) == 2  # noqa: PLR2004
-    if provider == "native":
-        expected_startup = [("ping", ""), ("sync", "phase1-otel-listeners-ready")]
-    elif server_role == "collector":
-        expected_startup = [
-            ("ping", ""),
-            ("sync", "phase1-otel-collector-ready"),
-            ("sync", "phase1-otel-listeners-ready"),
-        ]
-    else:
-        expected_startup = [
-            ("sync", "phase1-otel-collector-ready"),
-            ("ping", ""),
-            ("sync", "phase1-otel-listeners-ready"),
-        ]
-    expected_startup.insert(0, ("cores", ""))
-    assert lifecycle[: len(expected_startup)] == expected_startup
+    assert all(event != "ping" for event, _tag in lifecycle)
+    assert sum(event == "cores" for event, _tag in lifecycle) == len(child_envs)
     assert [env.get("NATIVE_CKPT_OTEL_COLLECTOR") for env in child_envs] == [collector, collector]
     assert [label.rsplit("-", 2)[-2] for _provider, label in stops] == [server_role, server_role]
     validation_calls = [
@@ -2492,6 +2532,14 @@ def test_declared_flavors_carry_their_yaml_definition() -> None:
     # An unknown key is a typo, not a variant nobody implemented.
     with pytest.raises(ValueError, match="unknown keys: phase3"):
         slurm_job.DeclaredFlavor("typo", {"phase3": {"add": ["--nope"]}})
+
+    environment: dict[str, str] = {}
+    slurm_job.FlavorSelection(["perf", "native"]).transform([], environment)
+    assert "NATIVE_CKPT_SERVER_DISABLE_INPROC" not in environment
+    slurm_job.FlavorSelection(["perf", "oop", "native"]).transform([], environment)
+    assert environment["NATIVE_CKPT_SERVER_DISABLE_INPROC"] == "1"
+    slurm_job.FlavorSelection(["vg", "oop"]).transform([], environment)
+    assert environment["NATIVE_CKPT_SERVER_DISABLE_INPROC"] == "1"
 
 
 def test_a_variant_reaches_both_phases_and_the_structure_cache_holds(
@@ -5793,14 +5841,14 @@ def test_valgrind_keeps_training_nan_aborts_enabled() -> None:
         "moe",
     ]
 
-    env = {"NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl"}
+    env = {"NATIVE_CKPT_OTEL_FILE": "/tmp/otel.jsonl", "NATIVE_CKPT_SERVER_DISABLE_INPROC": "0"}
     slurm_job.FlavorSelection(["vg"]).transform(opts, env)
 
     assert "--check-for-nan-in-loss-and-grad" in opts
     assert "--no-check-for-nan-in-loss-and-grad" not in opts
     assert opts[-2:] == ["--rerun-mode", "disabled"]
+    assert env["NATIVE_CKPT_SERVER_DISABLE_INPROC"] == "1"
     assert {name: env[name] for name in slurm_job._VALGRIND_NATIVE_ENV} == slurm_job._VALGRIND_NATIVE_ENV
-    assert env["NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS"] == "0"
     assert "NATIVE_CKPT_OTEL_FILE" not in env
     assert env["MEGATRON_OTEL_ENABLED"] == "0"
 
