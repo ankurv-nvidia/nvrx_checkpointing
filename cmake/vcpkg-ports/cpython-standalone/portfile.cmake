@@ -1,4 +1,4 @@
-set(VCPKG_BUILD_TYPE release)
+set(VCPKG_POLICY_MISMATCHED_NUMBER_OF_BINARIES enabled)
 
 set(release 20261110)
 set(archive_name "cpython-${VERSION}+${release}-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz")
