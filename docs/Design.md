@@ -133,55 +133,88 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
 ## TODO : Assumptions
 
-- Daemon is always restarted
 - Daemon relies on megatron to validate the checkpoint file
--
 - Shared - memory - Daemon
   - Add a Time sequence diagram for daemon and shared-memory
 
 1. Daemon opens the shm file (listener)
    1.1 . shm file is already exists. it'll reinitialize it
    1.2 - Any producer thats still writing to the old file will error
-2.
+
+# Resiliency and Error Handling
+
+There are 2 main high level design philosophies that important to remember when thinking about resiliency and error propagation.
+
+1. The daemon never intentionally crashes or raise exceptions
+2. Almost all of the client exposed api surface is async.
+
+A training job will usually go through these high level steps
+(Happens once per training cycle)
+
+1. Daemon boot (async)
+2. State-Dict registration (async)
+3. Save-planning globally across all ranks (background)
+   (Repeated multiple times)
+4. Snapshot activation
+   1. Sync wait for save-planning
+   2. Sync wait for last-snapshot completion
+5. Snapshot transfer to daemon
+6. Snapshot durability to disk
+7. Snapshot disk finalization
+8. Client notification and finalization callbacks
+   1. GIL lock for client routine callbacks
+
+There are several other (fatal) corner cases that will cause a fail-fast of the training process or the daemon but the primary outlets for most errors will have two main outlets for error propagation.
+
+- Step-4.1 : Snapshot activation
+  - Sync wait for save-planing covers all errors from Step-1-2-3 and bubbles any errors
+- Step-8.1 : Finalization Callbacks
+  - GIL Lock for client routine callbacks used for bubbling up errors between Step-4-8
+
+In each of these cases the daemon does its best to transmit and broadcast errors to all clients as needed but sometimes the errors will only be limited to the rank it originates from.
 
 # Lifecycle Management
-
-## FT-Launcher Integration (Fault-Tolerance)
-
-The ft-launcher is component responsible for tracking the individual rank processes and restarting in case of errors or exceptions happening on any of the ranks.
 
 There are two modes the daemon operates in:
 
 1. In-Proc mode
 2. Out-of-proc mode
 
-### Out-of-proc mode
-
-The description below applies mainly for out-of-proc mode where we rely on ft-launcher to launch and track the out-of-proc daemon (node singleton) and extend the fault-tolerance umbrella to include the daemon as well.
-
-In an ideal world we dont expect the daemon to ever crash or exit during a training run so all failures are considered fatal and invoke the fault-diagnostics as well as fault-recovery thereby cause the training to restart.
-
-Here's a consolidated list of behaviors when it comes to ft-launcher and daemon interaction
-
-1. Daemon to be launched by ft-launcher before training-jobs-processes
-2. ft-launcher launches daemon with cli-args (<mark>TODO</mark>)to capture its logging
-
-- One consolidated log per cycle
-
-3. Restarting training jobs dont require restarting the daemon if its still alive and operational from the last run.
-
-- The cycle id is used as a session-id for the daemon which insulate the workflow of this cycle from any partial workflow state from last cycle
-
-4. A crash or illegal termination of the daemon invokes the ft-launcher diagnostics which will collect the coredump from the daemon, including other diagnostic logs, and restart the training jobs
-5.
-
-### In-proc mode (No ft-launcher integration needed)
+## In-proc mode (No ft-launcher integration needed)
 
 The in-proc mode implies that the daemon will be instantiated inside one of the N-local ranks in the training process and its lifetime is bound by the training process.
 
 This is meant to simplify the lifecycle management for scenarios that dont require fault-tolerance or quick recovery (mainly dev scenarios) and hence it requires no additional management.
 
 The daemon holds the rank-process its instantiated in especially if its a coordinator daemon for the job and keeps the process alive unless its ready to wind-down in case of a regular spin-down.
+
+## Out-of-proc mode : FT-Launcher Integration (Fault-Tolerance)
+
+The ft-launcher is component responsible for tracking the individual rank processes and restarting in case of errors or exceptions happening on any of the ranks.
+The section describes extension of the ft-launcher's umbrella to include tracking and crash-diagnostics on the daemon.
+While the daemon does provide auto-start/spin-down behavior to avoid requiring a separate pre-launch mechanism the ft-launcher integration forces manual lifetime management by launching it manually (epilogue to training jobs) as well as spinning down manually (prologue)
+
+In an ideal world we dont expect the daemon to ever crash or exit during a training run so all unexpected process terminations are considered fatal and invoke the fault-diagnostics as well as fault-recovery routines, causing the training to restart.
+
+Here's a consolidated list of behaviors when it comes to ft-launcher and daemon interaction
+
+- Cold start: Daemon to be launched by ft-launcher before training-jobs-processes
+- Recovery start : Daemon is launched if not already present
+  - The previous daemon process from earlier is continued to be used across all nodes.
+  - The cycle id is used as a session-id for the daemon which insulate the workflow of this cycle from any partial workflow state from last cycle
+  - This mechanism in future will be used to provide quick-load-checkpoint by using the in-memory snapshot from previous session.
+
+- Logging: Redirect to itself.
+  - ft-launcher launches daemon with cli-args (<mark>TODO</mark>)to capture its logging
+  - One consolidated log per cycle
+  - On a restart if the daemon is reused ft-launcher handles redirecting the logs to a new cycle without the need to change daemon log outputs
+
+- Daemon Critical Fault Handling : Collect diagnostic logs and restart
+  - All Daemon crashes are considered unexpected bugs that need fixing or handling.
+  - Non-crashed daemons are reused. (New session-id insulates the session from last-session state)
+    - <mark>TODO</mark> : Should we terminate all daemons ??. This will handicap fast-recovery
+  - Diagnostics include daemon coredump (if applicable) and logs.
+  - Also includes daemon being unresponsive or hanged (stack trace if hanged)
 
 # Key Components and Code Walkthrough
 
