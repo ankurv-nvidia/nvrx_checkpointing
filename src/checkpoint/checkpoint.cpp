@@ -50,11 +50,11 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
-static uint32_t ServerIndex(StateTree const& registry)
+static uint16_t ServerIndex(StateTree const& registry)
 {
     auto const& topo        = registry.Topo();
     auto const  serverIndex = (static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer) % topo.peersPerNode;
-    return serverIndex;
+    return static_cast<uint16_t>(serverIndex);
 }
 
 static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target, std::string const& body)

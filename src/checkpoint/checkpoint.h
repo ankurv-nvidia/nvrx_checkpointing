@@ -20,13 +20,6 @@ void SaveCheckpoint(StateTree const&                   snapshotRegistry,
                     std::filesystem::path const&       ckptPath);
 void WaitForCheckpointSave(StateTree const& snapshotRegistry);
 
-void SvcPing();
-void SvcStop();
-
-// Graceful shutdown: ask the server to stop once every session is idle, blocking until the
-// spin-down completes.
-void SvcSpinDown();
-
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration);
 
 struct DeviceContext

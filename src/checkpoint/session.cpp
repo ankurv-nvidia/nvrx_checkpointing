@@ -416,7 +416,7 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
 }
 
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
-    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn)), svcref(SvcRef::AcquireInProc())
+    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn)), selfSvcRef(SvcRef::AcquireInProc())
 {}
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
@@ -1035,6 +1035,7 @@ try
     if (IsCoordinatorPeer()) { HandleLocalStateRegistry(rank, std::move(registry)); }
     else
     {
+        if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
         // Send to coordinator
         std::ostringstream body;
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);

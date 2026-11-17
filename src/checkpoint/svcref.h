@@ -36,8 +36,8 @@ struct SvcRef
 
     private:
     std::shared_ptr<InProc>        AcquireInProc_();
-    std::shared_ptr<LocalProcCli>  CliAcquireLocalProc_(uint32_t serverIndex);
-    std::shared_ptr<RemoteProcCli> CliAcquireRemoteProc_();
+    std::shared_ptr<LocalProcCli>  CliAcquireLocalProc_(uint16_t serverIndex);
+    std::shared_ptr<RemoteProcCli> CliAcquireRemoteProc_(std::string peer);
 
     uint64_t SvrAcquireLocalProcRef_(uint64_t pid);
     void     SvrReleaseLocalProcRef_(uint64_t pid, uint64_t token);
@@ -46,8 +46,8 @@ struct SvcRef
 
     public:
     static auto AcquireInProc() { return Instance_().AcquireInProc_(); }
-    static auto CliAcquireLocalProc(uint32_t serverIndex) { return Instance_().CliAcquireLocalProc_(serverIndex); }
-    static auto CliAcquireRemoteProc() { return Instance_().CliAcquireRemoteProc_(); }
+    static auto CliAcquireLocalProc(uint16_t serverIndex) { return Instance_().CliAcquireLocalProc_(serverIndex); }
+    static auto CliAcquireRemoteProc(std::string peer) { return Instance_().CliAcquireRemoteProc_(std::move(peer)); }
 
     static auto SvrAcquireLocalProcRef(uint64_t pid) { return Instance_().SvrAcquireLocalProcRef_(pid); }
     static void SvrReleaseLocalProcRef(uint64_t pid, uint64_t token) { Instance_().SvrReleaseLocalProcRef_(pid, token); }
@@ -59,7 +59,6 @@ struct SvcRef
 
     // A daemon can acquire both cli and srv references
     // Both must be empty to safely exit or release resources.
-    uint32_t                                _token;
     std::mutex                              _mutex;
     std::list<std::weak_ptr<InProc>>        _inProc;
     std::list<std::weak_ptr<LocalProcCli>>  _localProcCli;
