@@ -15,6 +15,8 @@
 #include "shm_ring_buffer.h"
 #include "state.h"
 #include "stateserdes.h"
+#include "svcref.h"
+#include "svcref_test.h"
 #include "telemetry.h"
 #include "tensor.h"
 
@@ -54,6 +56,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <regex>
 #include <set>
 #include <span>
@@ -68,6 +71,7 @@
 
 #include <csignal>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
@@ -105,7 +109,7 @@ class TestServerProcess
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
         if (TryConnectToCheckpointService(0))
         {
-            // TODO_NOMERGESvcStop();
+            SvcStop();
             static constexpr size_t MaxStopAttempts = 50;
             using namespace std::chrono_literals;
             for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
@@ -143,14 +147,25 @@ class TestServerProcess
         using namespace std::chrono_literals;
         for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
         {
-            if (TryConnectToCheckpointService(0)) { return; }
+            if (TryConnectToCheckpointService(0))
+            {
+                // The test holds the daemon past its startup grace until it stops it.
+                _reference = SvcRef::CliAcquireLocalProc(0);
+                return;
+            }
             std::this_thread::sleep_for(100ms);
         }
         Stop();
         throw std::runtime_error("checkpoint test server did not become ready");
     }
 
-    bool Stop() { return WaitForExit(); }
+    bool Stop()
+    {
+        SvcStop();
+        auto const exited = WaitForExit();
+        _reference.reset();
+        return exited;
+    }
 
     bool WaitForExit()
     {
@@ -180,7 +195,8 @@ class TestServerProcess
     }
 
     private:
-    pid_t _pid = -1;
+    pid_t                                 _pid = -1;
+    std::shared_ptr<SvcRef::LocalProcCli> _reference;
 };
 }    // namespace
 
@@ -211,13 +227,14 @@ TEST_CASE("shared-memory configuration parses sizes and automatic sentinels", "[
     CHECK_THROWS_AS(Integer<int8_t>::Parse("-129"), std::overflow_error);
 }
 
-TEST_CASE("server auto-shutdown configuration accepts a disabled sentinel", "[server][config][tier1]")
+TEST_CASE("in-process hosting is the default and a setting opts out", "[server][config][tier1]")
 {
-    using Config           = checkpoint::config::ServerAutoShutdownTimeoutSeconds;
+    using Config           = checkpoint::config::ServerDisableInproc;
     constexpr auto envName = checkpoint::config::detail::EnvName<Config>();
-    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS");
-    CHECK(Config::Default == "900");
-    CHECK(Config::Type::Parse("0") == 0);
+    CHECK(std::string_view{envName.data()} == "NATIVE_CKPT_SERVER_DISABLE_INPROC");
+    CHECK_FALSE(Config::Type::Parse(Config::Default));
+    CHECK(Config::Type::Parse("1"));
+    CHECK_FALSE(Config::Type::Parse("0"));
 }
 
 TEST_CASE("shared-memory ring geometry supports runtime slot counts", "[shmem][config][tier1]")
@@ -1284,7 +1301,7 @@ TEST_CASE("finalize uses the completed HTTP status and error body", "[server][fi
     namespace http = boost::beast::http;
     if (TryConnectToCheckpointService(0))
     {
-        // TODO_NOMERGE SvcStop();
+        SvcStop();
         for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(0); ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -1311,6 +1328,57 @@ TEST_CASE("finalize uses the completed HTTP status and error body", "[server][fi
     CHECK_FALSE(FinalizeResultForResponse(http::status::not_found, "unknown endpoint").empty());
     CHECK_FALSE(FinalizeResultForResponse(http::status::ok, "checkpoint is durable", false).empty());
     CHECK_FALSE(FinalizeResultForResponse(http::status::ok, {}, false).empty());
+}
+
+TEST_CASE("a finalize wait resumes after a signal interrupts it", "[server][finalize][tier1]")
+{
+    using boost::asio::ip::tcp;
+    if (TryConnectToCheckpointService(0)) { SKIP("a checkpoint service already listens on the test port"); }
+    // Python installs its signal handlers without restarting interrupted system calls.
+    struct sigaction interrupting{};
+    interrupting.sa_handler = +[](int /* signal */) {};
+    sigemptyset(&interrupting.sa_mask);
+    struct sigaction previous{};
+    REQUIRE(::sigaction(SIGUSR1, &interrupting, &previous) == 0);
+
+    boost::asio::io_context ioc;
+    tcp::acceptor           acceptor(ioc);
+    acceptor.open(tcp::v4());
+    acceptor.set_option(tcp::acceptor::reuse_address(true));
+    acceptor.bind({tcp::v4(), checkpoint::ipc::Message::Port});
+    acceptor.listen();
+    std::atomic<bool> received{false};
+    std::atomic<bool> finished{false};
+    auto              server      = std::async(std::launch::async, [&] {
+        boost::beast::tcp_stream                                    stream(acceptor.accept());
+        boost::beast::flat_buffer                                   buffer;
+        boost::beast::http::request<boost::beast::http::empty_body> request;
+        boost::beast::http::read(stream, buffer, request);
+        received = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        boost::beast::http::response<boost::beast::http::empty_body> response{boost::beast::http::status::ok, 11};
+        response.content_length(0);
+        boost::beast::http::write(stream, response);
+    });
+    auto const        waiter      = ::pthread_self();
+    auto              interrupter = std::async(std::launch::async, [&] {
+        while (!finished)
+        {
+            if (received) { ::pthread_kill(waiter, SIGUSR1); }
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+    });
+
+    std::string failure;
+    try
+    {
+        WaitForCkptFinalize(0, 40);
+    } catch (std::exception const& error) { failure = error.what(); }
+    finished = true;
+    interrupter.get();
+    server.get();
+    ::sigaction(SIGUSR1, &previous, nullptr);
+    CHECK(failure.empty());
 }
 
 TEST_CASE("a shard write failure reaches the finalize caller", "[server][finalize][tier2]")
@@ -1412,11 +1480,11 @@ TEST_CASE("a shard write failure reaches the finalize caller", "[server][finaliz
     CHECK(failure.contains("__0_0.distcp"));
     CHECK_FALSE(std::filesystem::exists(badDir / ".metadata"));
     CHECK(std::filesystem::exists(goodDir / ".metadata"));
-    // TODO_NOMERGE auto       spinDown   = std::async(std::launch::async, &SvcSpinDown);
-    // TODO_NOMERGE auto const stopStatus = spinDown.wait_for(std::chrono::seconds{10});
-    // TODO_NOMERGE if (stopStatus != std::future_status::ready) { CHECK(server.Stop()); }
-    // TODO_NOMERGE REQUIRE(stopStatus == std::future_status::ready);
-    // TODO_NOMERGE CHECK_NOTHROW(spinDown.get());
+    auto       spinDown   = std::async(std::launch::async, &SvcSpinDown);
+    auto const stopStatus = spinDown.wait_for(std::chrono::seconds{10});
+    if (stopStatus != std::future_status::ready) { CHECK(server.Stop()); }
+    REQUIRE(stopStatus == std::future_status::ready);
+    CHECK_NOTHROW(spinDown.get());
     CHECK(server.WaitForExit());
     std::filesystem::remove_all(logDir);
 }
@@ -1787,6 +1855,36 @@ static std::string SerializedSliceFragment(uint32_t rank, RankTopology topology)
 static std::string SerializedSliceFragment(uint32_t rank, uint32_t worldSize)
 { return SerializedSliceFragment(rank, SingleRankTopo(rank, worldSize)); }
 
+// Answers the reference request a peer sends before forwarding, like a coordinator that does not track references.
+static void DeclineReferenceRequest(boost::asio::io_context& ioc, boost::asio::ip::tcp::acceptor& acceptor)
+{
+    using namespace std::chrono_literals;
+    namespace http = boost::beast::http;
+    boost::beast::tcp_stream  stream{ioc};
+    boost::system::error_code error;
+    boost::asio::steady_timer deadline{ioc, 30s};
+    deadline.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { acceptor.cancel(); }
+    });
+    acceptor.async_accept(stream.socket(), [&](boost::system::error_code ec) {
+        deadline.cancel();
+        error = ec;
+    });
+    ioc.run();
+    ioc.restart();
+    if (error) { throw boost::system::system_error(error); }
+    boost::beast::flat_buffer        buffer;
+    http::request<http::string_body> request;
+    http::read(stream, buffer, request);
+    if (request.target() != "/api/peer/acquireref")
+    {
+        throw std::runtime_error(fmt::format("expected a service reference request, received {}", std::string_view{request.target()}));
+    }
+    http::response<http::string_body> response{http::status::not_found, request.version()};
+    response.prepare_payload();
+    http::write(stream, response);
+}
+
 TEST_CASE("duplicate registries preserve the first upload during forwarding", "[server][registry][tier2]")
 {
     using namespace std::chrono_literals;
@@ -1895,6 +1993,7 @@ TEST_CASE("duplicate registries preserve the first upload during forwarding", "[
         bool started = false;
         try
         {
+            DeclineReferenceRequest(ioc, acceptor);
             boost::beast::tcp_stream  stream{ioc};
             boost::asio::steady_timer deadline{ioc, 30s};
             deadline.async_wait([&](boost::system::error_code ec) {
@@ -2102,6 +2201,15 @@ static std::future<void> ServePeerRequests(boost::asio::io_context& ioc, boost::
             http::request<http::string_body> request;
             stream.expires_after(10s);
             run([&](auto done) { http::async_read(stream, buffer, request, done); });
+            if (request.target() == "/api/peer/acquireref")
+            {
+                // The mock peer answers like a daemon that does not track service references.
+                http::response<http::string_body> untracked{http::status::not_found, request.version()};
+                untracked.prepare_payload();
+                stream.expires_after(10s);
+                run([&](auto done) { http::async_write(stream, untracked, done); });
+                continue;
+            }
             auto const [body, finished] = requestHandler(request);
             http::response<http::string_body> response{http::status::ok, request.version()};
             response.set(http::field::content_type, "text/plain");
@@ -3403,6 +3511,46 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     std::filesystem::remove_all(outDir);
 }
 
+TEST_CASE("a forked child of a process with live logging and telemetry exits normally", "[telemetry][tier1]")
+{
+    auto const outDir = CkptDir("otel_fork_exit");
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);                                // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_FILE", (outDir / "telemetry.jsonl").c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_METRICS", "1", 1);                                  // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                                     // NOLINT(concurrency-mt-unsafe)
+    checkpoint::logging::Init();
+    checkpoint::telemetry::Init();
+
+    pid_t const child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) { std::exit(0); }    // NOLINT(concurrency-mt-unsafe)
+    int  status = 0;
+    bool exited = false;
+    for (int attempt = 0; attempt < 200 && !exited; ++attempt)
+    {
+        exited = ::waitpid(child, &status, WNOHANG) == child;
+        if (!exited) { std::this_thread::sleep_for(std::chrono::milliseconds{50}); }
+    }
+    if (!exited)
+    {
+        ::kill(child, SIGKILL);
+        ::waitpid(child, &status, 0);
+    }
+
+    checkpoint::telemetry::Shutdown();
+    checkpoint::logging::Shutdown();
+    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");       // NOLINT(concurrency-mt-unsafe)
+    std::filesystem::remove_all(outDir);
+    REQUIRE(exited);
+    CHECK(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+}
+
 TEST_CASE("Process memory samples export through OpenTelemetry", "[telemetry][memory][tier1]")
 {
     auto const outDir   = CkptDir("otel_process_memory");
@@ -4245,6 +4393,7 @@ int main(int argc, char* argv[])
         RunServer(0);
         return EXIT_SUCCESS;
     }
+    if (argc >= 2 && std::string_view{argv[1]} == SvcRefChildArg) { return RunSvcRefChild(argc, argv); }
 
     Catch::Session session;
     std::string    registry;

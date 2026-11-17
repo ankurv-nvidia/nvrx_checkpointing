@@ -50,6 +50,9 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
+void SvcPing()
+{ SvcRef::CliEnsureLocalProc(0); }
+
 static uint16_t ServerIndex(StateTree const& registry)
 {
     auto const& topo        = registry.Topo();
@@ -79,13 +82,15 @@ static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target,
         req.set(boost::beast::http::field::content_type, "application/octet-stream");
         req.body() = body;
         req.prepare_payload();
-        boost::beast::http::write(stream, req, ec);
+        // Python's signal handlers do not restart system calls, so an interrupted write or read resumes where it stopped.
+        boost::beast::http::request_serializer<boost::beast::http::string_body> serializer{req};
+        do { boost::beast::http::write(stream, serializer, ec); } while (ec == boost::asio::error::interrupted);
         if (ec) { throw boost::system::system_error(ec); }
 
         boost::beast::flat_buffer                                            buffer;
         boost::beast::http::response_parser<boost::beast::http::string_body> parser;
         parser.body_limit(std::numeric_limits<uint64_t>::max());
-        boost::beast::http::read(stream, buffer, parser, ec);
+        do { boost::beast::http::read(stream, buffer, parser, ec); } while (ec == boost::asio::error::interrupted);
         if (ec) { throw boost::system::system_error(ec); }
         auto response = parser.release();
         if (response.result() != boost::beast::http::status::ok)
@@ -107,6 +112,38 @@ static uint8_t ResolveClientQueueCount(RankTopology const& topo)
         configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount;
     }
     return cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+}
+
+void SvcStop()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::mutex PingMutex;
+    SUPPRESS_WARNINGS_END
+
+    std::scoped_lock lock(PingMutex);
+    if (!TryConnectToCheckpointService(0)) { return; }
+    LocalServiceRequest(0, "/api/stop", {});
+}
+
+void SvcSpinDown()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static std::mutex SpinDownMutex;
+    SUPPRESS_WARNINGS_END
+
+    std::scoped_lock lock(SpinDownMutex);
+
+    if (!TryConnectToCheckpointService(0)) { return; }
+
+    LocalServiceRequest(0, "/api/spindown", {});
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    while (TryConnectToCheckpointService(0))
+    {
+        if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("Checkpoint service shutdown timed out"); }
+        std::this_thread::sleep_for(20ms);
+    }
 }
 
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
@@ -158,6 +195,8 @@ struct CheckpointWriter
         std::shared_future<void>        ready;
         std::shared_ptr<StateTree>      snapshotRegistry;
         std::mutex                      snapshotMutex;
+        uint64_t                        generation{};
+        bool                            pinned{false};
     };
 
     struct QueueRegistry
@@ -175,17 +214,42 @@ struct CheckpointWriter
         return Registry;
     }
 
+    // A queue registered with an earlier service is dropped so the rank registers with the current one.
+    static void ObserveGeneration(Rank rank, uint64_t generation)
+    {
+        std::shared_ptr<QueueState> stale;
+        {
+            auto&            reg = Registry();
+            std::scoped_lock lock(reg.mu);
+            auto&            entry = reg.states[rank];
+            if (entry && entry->generation == generation) { return; }
+            stale             = std::exchange(entry, std::make_shared<QueueState>());
+            entry->generation = generation;
+        }
+#ifdef PHOENIX_HAVE_CUDA
+        if (!stale || !stale->pinned) { return; }
+        try
+        {
+            DeviceContext::CudaUnregisterHostBuffer(stale->queue->GetShmDataRegion().data());
+        } catch (std::exception const& error)
+        {
+            fmt::print(stderr, "[native_ckpt:cli][WARN] Unpinning a stale checkpoint queue failed: {}\n", error.what());
+        }
+#endif
+    }
+
     static void SendStateRegistry(StateTree const& registry)
     {
         auto const& topo = registry.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
-        auto               state = std::make_shared<QueueState>();
+        auto&            entry = reg.states[topo.rank];
+        if (entry && entry->ready.valid()) { return; }
+        if (!entry) { entry = std::make_shared<QueueState>(); }
+        auto               state = entry;
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -224,6 +288,7 @@ struct CheckpointWriter
 #ifdef PHOENIX_HAVE_CUDA
             auto region = state->queue->GetShmDataRegion();
             DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            state->pinned = true;
 #endif
             state->snapshotRegistry = std::move(snapshotRegistry);
         } catch (...)
@@ -589,6 +654,7 @@ void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
     localRegistry.svcref = SvcRef::CliAcquireLocalProc(ServerIndex(localRegistry));
+    CheckpointWriter::ObserveGeneration(localRegistry.Topo().rank, localRegistry.svcref->generation);
     CheckpointWriter::SendStateRegistry(localRegistry);
 }
 

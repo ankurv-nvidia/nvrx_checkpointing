@@ -24,6 +24,10 @@ on:
         description: gb200-native-perf-nano3-8x4 (main-branch-runs)
         type: boolean
         default: false
+      gb200-native-perf-oop-nano3-8x4:
+        description: gb200-native-perf-oop-nano3-8x4 (main-branch-runs)
+        type: boolean
+        default: false
       gb200-native-detr-super3bf16-16x4:
         description: gb200-native-detr-super3bf16-16x4 (large-scale)
         type: boolean
@@ -42,6 +46,10 @@ on:
         default: false
       gb200-native-perf-ultra3bf16-64x4:
         description: gb200-native-perf-ultra3bf16-64x4 (large-scale)
+        type: boolean
+        default: false
+      gb200-native-perf-oop-ultra3bf16-64x4:
+        description: gb200-native-perf-oop-ultra3bf16-64x4 (large-scale)
         type: boolean
         default: false
       gb200-native-detr-ultra3fp8-64x4:

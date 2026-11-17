@@ -81,6 +81,12 @@ class LocalDaemon:
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
             pass
 
+    def hold(self, timeout: float = 30) -> int:
+        """Hold a reference on the daemon that lasts as long as this process and return its token."""
+        request = urllib.request.Request(f"{self.base_url}/acquirelocalref/{os.getpid()}", method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.read().split()[0])
+
     def reachable(self, timeout: float = 0.25) -> bool:
         url = urlsplit(self.base_url)
         try:

@@ -115,7 +115,7 @@ struct Session
     // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
 
-    std::shared_ptr<SvcRef::InProc>        selfSvcRef;
+    std::mutex                             coordinatorMutex;
     std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
 
     private:

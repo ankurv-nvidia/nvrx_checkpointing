@@ -4,6 +4,8 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <iterator>
 #include <string_view>
 #include <utility>
@@ -21,7 +23,10 @@ enum class Level : uint8_t
     Critical,
 };
 
-void Init();
+// Writes to the file when one is given, otherwise to stderr.
+void Init(std::filesystem::path const& file = {});
+
+[[nodiscard]] std::FILE* Output();
 
 void Flush();
 

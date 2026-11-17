@@ -62,16 +62,26 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    explicit Server(uint16_t index) : _index(index) {}
+    // Test fixtures neither link to a coordinator nor own a log file; a hosting training process logs to its own file.
+    enum class Role : uint8_t
+    {
+        Fixture,
+        Standalone,
+        Inproc,
+    };
+
+    explicit Server(uint16_t index, Role role = Role::Fixture) : _index(index), _role(role) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
+
+    [[nodiscard]] uint16_t Index() const { return _index; }
+    void                   RequestStop();
 
     void Start();
     bool AllSessionsComplete(std::scoped_lock<std::mutex> const& /* lock */);
     bool AllSessionsComplete();
     bool HasSessionsAndAllSessionsComplete();
     void WaitForShutdown();
-    void Ping();
     void HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf);
     void Stop();
     void QuerySessions(ServerSessionCallback callback, void* cbData);
@@ -138,9 +148,9 @@ struct Server
 
     private:
     uint16_t   _index{};
+    Role       _role{Role::Fixture};
     std::mutex _mutex;
 
-    PerfClock::time_point        _lastPingTime{PerfClock::now()};
     std::atomic<bool>            _stopRequested{false};
     std::vector<cipc::MsgQueue*> _msgQueue;
     bool                         _running{false};
@@ -175,6 +185,11 @@ struct Server
     friend struct Session;
 };
 
+namespace
+{
+void ScheduleInprocJoin();
+}    // namespace
+
 // Formatter for Server*
 template <> struct fmt::formatter<Server> : fmt::formatter<std::string_view>
 {
@@ -189,7 +204,18 @@ using BufStream = boost::iostreams::stream<boost::iostreams::array_source>;
 
 void Server::Start()
 {
-    checkpoint::logging::Init();
+    {
+        std::scoped_lock lock(_mutex);
+        _stopRequested = false;
+        if (_running) { return; }
+        _ioc.restart();
+        // An election loser throws here, before logging, telemetry or threads start.
+        StartTcpListener_(checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpReusePort>(),
+                          checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpAcceptors>());
+    }
+
+    checkpoint::logging::Init(_role == Role::Inproc ? checkpoint::config::GetConfigValue<checkpoint::config::LogFile>()
+                                                    : std::filesystem::path{});
     checkpoint::telemetry::Init();
     checkpoint::config::OtelConfig const otelConfig;
     if (otelConfig.enabled && otelConfig.RoutesThroughDaemon() && !otelConfig.collector.empty())
@@ -201,20 +227,11 @@ void Server::Start()
         }
     }
 
+    if (_role != Role::Fixture) { SvcRef::BeginService(); }
     std::scoped_lock lock(_mutex);
-    _stopRequested = false;
-    if (_running) { return; }
-    _ioc.restart();
-
-    auto const handlerThreads     = checkpoint::config::GetConfigValue<checkpoint::config::ServerHandlerThreads>();
-    auto const reusePort          = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpReusePort>();
-    auto const acceptorCount      = checkpoint::config::GetConfigValue<checkpoint::config::ServerTcpAcceptors>();
-    auto const maxActiveSnapshots = checkpoint::config::GetConfigValue<checkpoint::config::ServerMaxActiveSnapshots>();
-    // static_cast<void>(checkpoint::config::GetConfigValue<checkpoint::config::ShmRingBufferWriteTimeoutSeconds>());
-
-    _maxActiveSnapshots = maxActiveSnapshots;
-    _handlerPool        = std::make_unique<boost::asio::thread_pool>(handlerThreads);
-    StartTcpListener_(reusePort, acceptorCount);
+    _maxActiveSnapshots = checkpoint::config::GetConfigValue<checkpoint::config::ServerMaxActiveSnapshots>();
+    _handlerPool
+        = std::make_unique<boost::asio::thread_pool>(checkpoint::config::GetConfigValue<checkpoint::config::ServerHandlerThreads>());
     _running = true;
     StartTcpAcceptors_();
 }
@@ -268,7 +285,7 @@ void Server::InitializeShm_(RankTopology const& topo, Rank rank, uint64_t snapsh
                 std::fill(region.begin() + static_cast<std::ptrdiff_t>(msgQueue.HeaderSize()), region.end(), char{});
             }
             INFO("[{}] Checkpoint server started QueueSize={} Waiting for messages...", *this, queueSize);
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::Output());
             _msgQueue[queueIndex] = &msgQueue;
             queueReady.count_down();
             [&]() noexcept {
@@ -321,31 +338,31 @@ bool Server::HasSessionsAndAllSessionsComplete()
 
 void Server::WaitForShutdown()
 {
-    auto const autoShutdownTimeout
-        = std::chrono::seconds{checkpoint::config::GetConfigValue<checkpoint::config::ServerAutoShutdownTimeoutSeconds>()};
-    while (true)
-    {
-        auto const autoShutdown
-            = autoShutdownTimeout != 0s && (_lastPingTime + autoShutdownTimeout) < PerfClock::now() && HasSessionsAndAllSessionsComplete();
-        if (_stopRequested || autoShutdown) { break; }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    SvcRef::WaitUntilIdle(_stopRequested);
     Stop();
 }
 
-void Server::Ping()
+void Server::RequestStop()
 {
-    std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
+    {
+        std::scoped_lock lock(_mutex);
+        _stopRequested = true;
+        for (auto& session : _activeSessions)
+        {
+            std::scoped_lock slock(session.second->mutex);
+            session.second->stopRequested = true;
+        }
+    }
+    SvcRef::Wake();
 }
 
 void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char const> buf)
 {
+    auto const reference = SvcRef::AcquireInProc();
     switch (static_cast<cipc::Message::Type>(hdr.index()))
     {
     case cipc::Message::Type::Ping:
     {
-        Ping();
         return;
     }
     case cipc::Message::Type::Shutdown:
@@ -399,8 +416,6 @@ void Server::HandleMessage(cipc::Message::Header const& hdr, std::span<char cons
 
 void Server::Stop()
 {
-    checkpoint::logging::Shutdown();
-    checkpoint::telemetry::Shutdown();
     bool wasRunning = false;
     {
         std::scoped_lock lock(_mutex);
@@ -433,7 +448,7 @@ void Server::Stop()
                     }
                 }
             }
-            std::fflush(stderr);
+            std::fflush(checkpoint::logging::Output());
         }
         for (auto const& msgQueue : _msgQueue)
         {
@@ -473,6 +488,10 @@ void Server::Stop()
     }
 
     if (!wasRunning) { return; }
+
+    // The last telemetry reaches the coordinator before the sessions, which hold its references, are destroyed.
+    checkpoint::telemetry::Shutdown();
+    checkpoint::logging::Shutdown();
 
     boost::system::error_code ec;
     for (auto& acceptor : _tcpAcceptors)
@@ -528,8 +547,7 @@ void Server::QuerySessions(ServerSessionCallback callback, void* cbData)
 Session& Server::SessionById_(cipc::SessionId sessionId) LFTBND
 {
     std::scoped_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
-    auto it       = _activeSessions.find(sessionId);
+    auto             it = _activeSessions.find(sessionId);
     if (it == _activeSessions.end())
     {
         throw std::runtime_error(fmt::format("[native_ckpt:svr][{}][ERROR] Session id={} not found", *this, sessionId));
@@ -652,7 +670,6 @@ void Server::NotifyWriteCkptComplete_(cipc::SessionId                           
 void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnapshots, std::string_view const& buf)
 {
     std::unique_lock lock(_mutex);
-    _lastPingTime = PerfClock::now();
 
     BufStream bufStream{buf.data(), buf.size()};
     auto      workDirStr    = serdes::ReadBlobWithSize<uint16_t>(bufStream);
@@ -765,6 +782,7 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
 {
     SetThreadName("ncs:spindown");
     static constexpr auto HeartbeatInterval = 2s;
+    static constexpr auto PollInterval      = 50ms;
     // The bounded wait prevents a wedged server from hanging a caller forever.
 
     auto const deadline = PerfClock::now() + std::chrono::duration_cast<PerfClock::duration>(ServerWaitTimeout);
@@ -781,22 +799,29 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
     boost::beast::http::response_serializer<boost::beast::http::empty_body> sr{res};
     boost::beast::http::write_header(stream, sr, ec);
 
-    bool hardStop = false;
+    bool hardStop      = false;
+    auto nextHeartbeat = PerfClock::now();
     while (!ec)
     {
-        if (AllSessionsComplete()) { break; }
+        if (!SvcRef::HasInProc()) { break; }
         if (_stopRequested) { break; }    // another path already began shutdown
-        if (PerfClock::now() >= deadline)
+        auto const now = PerfClock::now();
+        if (now >= deadline)
         {
             hardStop = true;
             break;
         }
-        // A non-empty chunk keeps the client read alive while we wait for idle. The body
-        // is opaque to the caller, which only inspects the status line.
-        static constexpr std::string_view Heartbeat = " ";
-        boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Heartbeat)), ec);
-        if (ec) { break; }    // client hung up — stop heartbeating, still spin down below
-        std::this_thread::sleep_for(HeartbeatInterval);
+        if (now >= nextHeartbeat)
+        {
+            // A non-empty chunk keeps the client read alive while we wait for idle. The body
+            // is opaque to the caller, which only inspects the status line.
+            static constexpr std::string_view Heartbeat = " ";
+            boost::asio::write(stream.socket(), boost::beast::http::make_chunk(boost::asio::buffer(Heartbeat)), ec);
+            if (ec) { break; }    // client hung up — stop heartbeating, still spin down below
+            nextHeartbeat = now + HeartbeatInterval;
+        }
+        // The request that started this wait releases its reference as soon as its handler returns.
+        std::this_thread::sleep_for(PollInterval);
     }
 
     if (hardStop)
@@ -821,6 +846,7 @@ void Server::SpinDownWaitLoop_(tcp_stream stream)
     TryCleanShutdown(stream);
 
     _stopRequested = true;    // WaitForShutdown observes this and calls Stop()
+    SvcRef::Wake();
 }
 
 // A dedicated waiter keeps peer completion requests progressing during the global durability wait.
@@ -899,6 +925,19 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
     auto const& headers = headerParser.get();
     auto        target  = headers.target();
     SetThreadName(fmt::format("ncs:w:{}", target).c_str());
+
+    // A closing service still answers peer pings and takes releases and telemetry, and refuses everything else.
+    if (SvcRef::Closing() && target != "/api/peer/ping" && !target.starts_with("/api/releaselocalref/")
+        && !target.starts_with("/api/peer/releaseref/") && !target.starts_with("/api/telemetry") && !target.starts_with("/v1/"))
+    {
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::service_unavailable,
+                                                                          headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.body() = "Checkpoint service is shutting down";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+        return;
+    }
 
     auto const getOrPost = headers.method() == boost::beast::http::verb::get || headers.method() == boost::beast::http::verb::post;
 
@@ -1019,24 +1058,31 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }
+    else if (matches({"api", "peer", "ping"}) && getOrPost && (it == segs.end()))
+    {
+        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
+        res.body() = "{}";
+        res.prepare_payload();
+        boost::beast::http::write(stream, res);
+    }
     else if (matches({"api", "peer", "acquireref"}) && getOrPost && (it == segs.end()))
     {
         // Get who the request is from from the headers
-        std::string peer;
+        std::string peer{headers[SvcRef::PeerHeader]};
         if (it != segs.end()) { throw std::invalid_argument("Unexpected URL segments"); }
-        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        auto const                                                    token = SvcRef::SvrAcquireRemoteProcRef(std::move(peer));
+        boost::beast::http::response<boost::beast::http::string_body> res{
+            token == 0 ? boost::beast::http::status::service_unavailable : boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-        auto const token = SvcRef::SvrAcquireRemoteProcRef(std::move(peer));
-        res.body()       = fmt::format("{}", token);
+        res.body() = fmt::format("{}", token);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-
-        Ping();
     }
-    else if (matches({"api", "peer", "releaseref"}) && getOrPost && (it == segs.end()))
+    else if (matches({"api", "peer", "releaseref"}) && getOrPost && (it != segs.end()))
     {
         // Get who the request is from from the headers
-        std::string peer;
+        std::string peer{headers[SvcRef::PeerHeader]};
         auto const  token = boost::lexical_cast<uint64_t>(*(it++));
         if (it != segs.end()) { throw std::invalid_argument("Unexpected URL segments"); }
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
@@ -1045,7 +1091,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.body() = fmt::format("{}", token);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
+        if (_role == Role::Inproc) { ScheduleInprocJoin(); }
     }
     else if (matches({"api", "activatesession"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
@@ -1074,7 +1120,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "activate-snapshot"}) && headers.method() == boost::beast::http::verb::post)
     {
@@ -1121,7 +1166,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         response.keep_alive(keepAlive);
         response.prepare_payload();
         boost::beast::http::write(stream, response);
-        Ping();
     }
     else if (matches({"api", "localstateregistry"}) && headers.method() == boost::beast::http::verb::post && (it != segs.end()))
     {
@@ -1152,7 +1196,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.keep_alive(keepAlive);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
     else if (matches({"api", "shmqueue"}) && headers.method() == boost::beast::http::verb::post)
     {
@@ -1185,7 +1228,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         response.keep_alive(keepAlive);
         response.prepare_payload();
         boost::beast::http::write(stream, response);
-        Ping();
     }
     else if (matches({"api", "snapshot-plan"}) && getOrPost && it != segs.end())
     {
@@ -1196,7 +1238,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock waitersLock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& task) { return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, socket = std::move(stream), sessionId, rank] mutable {
+        _finalizeWaits.emplace_back(SvcRef::Async([this, socket = std::move(stream), sessionId, rank] mutable {
             auto connection = std::move(socket);
             SetThreadName("ncs:planwait");
             connection.expires_never();
@@ -1285,24 +1327,23 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
     }
-    else if (matches({"api", "acquirelocalref"}) && getOrPost && (it == segs.end()))
+    else if (matches({"api", "acquirelocalref"}) && getOrPost && (it != segs.end()))
     {
         auto const pid = boost::lexical_cast<uint64_t>(*(it++));
         if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
-        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
+        auto const                                                    token = SvcRef::SvrAcquireLocalProcRef(pid);
+        boost::beast::http::response<boost::beast::http::string_body> res{
+            token == 0 ? boost::beast::http::status::service_unavailable : boost::beast::http::status::ok, headers.version()};
         res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-        auto const token = SvcRef::SvrAcquireLocalProcRef(pid);
-        res.body()       = fmt::format("{}", token);
+        res.body() = fmt::format("{} {}", token, SvcRef::Generation());
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-
-        Ping();
     }
-    else if (matches({"api", "releaselocalref"}) && getOrPost && (it == segs.end()))
+    else if (matches({"api", "releaselocalref"}) && getOrPost && (it != segs.end()))
     {
-        auto const pid   = boost::lexical_cast<uint64_t>(*(it++));
+        auto const pid = boost::lexical_cast<uint64_t>(*(it++));
+        if (it == segs.end()) { throw std::invalid_argument("Releasing a local reference requires a token"); }
         auto const token = boost::lexical_cast<uint64_t>(*(it++));
         if (it != segs.end()) { throw std::invalid_argument("Unexpected snapshot plan URL segments"); }
         boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
@@ -1311,7 +1352,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.body() = fmt::format("{}", token);
         res.prepare_payload();
         boost::beast::http::write(stream, res);
-        Ping();
+        // Releases come late in a client's life, so an exit wait registered now precedes the teardown of what training created.
+        if (_role == Role::Inproc) { ScheduleInprocJoin(); }
     }
     else if (matches({"api", "stop"}) && getOrPost && (it == segs.end()))
     {
@@ -1331,6 +1373,7 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
                 session.second->stopRequested = true;
             }
         }
+        SvcRef::Wake();
     }
     else if (matches({"api", "spindown"}) && getOrPost)
     {
@@ -1355,9 +1398,8 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         std::scoped_lock lock(_mutex);
         std::erase_if(_finalizeWaits,
                       [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
-        _finalizeWaits.emplace_back(std::async(std::launch::async, [this, s = std::move(stream), sessionId, iteration] mutable {
-            FinalizeWaitLoop_(std::move(s), sessionId, iteration);
-        }));
+        _finalizeWaits.emplace_back(SvcRef::Async(
+            [this, s = std::move(stream), sessionId, iteration] mutable { FinalizeWaitLoop_(std::move(s), sessionId, iteration); }));
     }
     else if ((url.path() == "/v1/traces" || url.path() == "/v1/metrics" || url.path() == "/v1/logs")
              && headers.method() == boost::beast::http::verb::post)
@@ -1511,7 +1553,7 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
             ERR("accept error: {}", ec.message());
             co_return;
         }
-        boost::asio::post(*_handlerPool, [this, sock = std::move(socket)] mutable {
+        boost::asio::post(*_handlerPool, SvcRef::Bind([this, sock = std::move(socket)] mutable {
             static constexpr auto Timeout = std::chrono::seconds{30};
             tcp_stream            stream(std::move(sock));
             stream.expires_after(Timeout);
@@ -1527,7 +1569,7 @@ Server::DoListen_(boost::asio::ip::tcp::acceptor& acceptor)    // NOLINT(cppcore
                 TryCleanShutdown(stream);
                 ERR("Error: {}", e.what());
             }
-        });
+        }));
     }
 }
 
@@ -1550,10 +1592,141 @@ void RunInprocServer(uint16_t nodes)
     std::fflush(stderr);
 }
 
+namespace
+{
+struct HostedServer
+{
+    std::weak_ptr<Server> server;
+    std::thread           waiter;
+};
+
+struct Hosting
+{
+    uint64_t const            pid{SvcRef::CurrentPid()};
+    std::mutex                mutex;
+    std::vector<HostedServer> servers;
+};
+
+Hosting& Hosted()
+{
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static Hosting Instance;
+    SUPPRESS_WARNINGS_END
+    return Instance;
+}
+
+// Waits for every hosted server to drain without this exiting process's references, and stops any still running at the deadline.
+void JoinHostedServers()
+{
+    auto& hosting = Hosted();
+    if (hosting.pid != SvcRef::CurrentPid())
+    {
+        // A forked child inherits these entries without their threads, so it leaks them rather than join.
+        static_cast<void>(new std::vector<HostedServer>(std::move(hosting.servers)));    // NOLINT(cppcoreguidelines-owning-memory)
+        return;
+    }
+    std::vector<HostedServer> servers;
+    {
+        std::scoped_lock lock(hosting.mutex);
+        servers.swap(hosting.servers);
+    }
+    if (!servers.empty()) { SvcRef::SvrReleaseLocalProcRefs(hosting.pid); }
+    auto const deadline = SvcRef::Clock::now() + ServerWaitTimeout;
+    for (auto& hosted : servers)
+    {
+        while (!hosted.server.expired() && SvcRef::Clock::now() < deadline) { std::this_thread::sleep_for(50ms); }
+        if (auto const server = hosted.server.lock())
+        {
+            ERR("[{}] service references outlived the wind-down deadline; aborting in-flight work", *server);
+            server->RequestStop();
+        }
+        if (hosted.waiter.joinable()) { hosted.waiter.join(); }
+    }
+}
+
+struct InprocHost
+{
+    InprocHost() = default;
+    ~InprocHost() { JoinHostedServers(); }
+    CLASS_DELETE_COPY_AND_MOVE(InprocHost);
+};
+
+// Runs a hosted server until it drains, then destroys it.
+void ServeHosted(std::shared_ptr<Server> server)
+{
+    SetThreadName("ncs:host");
+    try
+    {
+        server->WaitForShutdown();
+    } catch (std::exception const& error)
+    {
+        fmt::print(stderr, "[native_ckpt:svr][ERROR] Hosted checkpoint server failed: {}\n", error.what());
+    }
+    server.reset();
+}
+
+// True when this process serves the index, already or by winning its election now.
+bool TryHostInprocServer(uint16_t index)
+{
+    if (std::ranges::any_of(ServerSingletons, [index](auto const& server) { return server->Index() == index; })) { return true; }
+    auto&            hosting = Hosted();
+    std::scoped_lock lock(hosting.mutex);
+    for (auto it = hosting.servers.begin(); it != hosting.servers.end();)
+    {
+        auto const server = it->server.lock();
+        if (server && server->Index() == index) { return !SvcRef::Closing(); }
+        if (server)
+        {
+            ++it;
+            continue;
+        }
+        it->waiter.join();
+        it = hosting.servers.erase(it);
+    }
+    auto server = std::make_shared<Server>(index, Server::Role::Inproc);
+    try
+    {
+        server->Start();
+    } catch (cipc::ErrorAlreadyRunning const&) { return false; }
+    INFO("Hosting the checkpoint server for peer index={} in process {}", index, SvcRef::CurrentPid());
+    hosting.servers.push_back({.server = server, .waiter = std::thread(&ServeHosted, server)});
+
+    // Joins at static destruction when no released client reference scheduled an earlier join.
+    SUPPRESS_WARNINGS_START
+    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
+    static InprocHost const Host;
+    SUPPRESS_WARNINGS_END
+    return true;
+}
+
+void ScheduleInprocJoin()
+{
+    auto&            hosting = Hosted();
+    std::scoped_lock lock(hosting.mutex);
+    if (hosting.servers.empty()) { return; }
+    // Exit handlers run in reverse order of registration, so the join from the last release precedes the teardown of earlier statics.
+    static_cast<void>(std::atexit(+[] { JoinHostedServers(); }));
+}
+}    // namespace
+
+void EnsureInprocServer(uint16_t index)
+{
+    auto const deadline = SvcRef::Clock::now() + ServerWaitTimeout;
+    while (!TryHostInprocServer(index) && !SvcRef::Answers(static_cast<uint16_t>(Server::Port + index)))
+    {
+        if (SvcRef::Clock::now() >= deadline)
+        {
+            throw std::runtime_error(fmt::format("No checkpoint service for peer index {} became available", index));
+        }
+        std::this_thread::sleep_for(200ms);
+    }
+}
+
 void RunServer(uint16_t index)    // NOLINT(misc-use-internal-linkage)
 {
     SetThreadName("ncs:main");
-    Server server(index);
+    Server server(index, Server::Role::Standalone);
     server.Start();
 
     // Signal to the launching process (SvcPing) that we are ready to accept connections.

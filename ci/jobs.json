@@ -57,6 +57,13 @@
               "perf"
             ],
             [
+              "native",
+              [
+                "perf",
+                "oop"
+              ]
+            ],
+            [
               "nvrx",
               "detr"
             ],
@@ -120,6 +127,13 @@
             [
               "native",
               "perf"
+            ],
+            [
+              "native",
+              [
+                "perf",
+                "oop"
+              ]
             ],
             [
               "nvrx",

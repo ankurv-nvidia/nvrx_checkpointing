@@ -188,15 +188,17 @@ The wiring:
   Megatron sends traces and metrics from every rank to the node-local daemon so
   checkpoint timing summaries retain rank minima, maxima, and medians. The default
   span groups plus `load_checkpoint` cover both checkpoint directions.
-- CI starts one daemon per node before the trainer so startup exports reach the
-  pre-topology buffer rather than waiting for checkpoint warmup to launch it.
+- Each native training process starts its node's daemon on entry and holds a
+  reference on it until it exits, so startup exports reach the pre-topology buffer
+  rather than waiting for the first checkpoint registration to start the daemon.
 - Image preparation installs the pinned Megatron checkout's `otel` extra, whose
   nemo-lens instrumentation exports Megatron's spans and metrics; the underlying
   PyTorch base-image tag is unchanged.
 - `_run_routine` gives each phase or cycle one `native_ckpt_otel.jsonl` beneath
-  `ci-results/otel/{cycle_tag}`. Every node-local daemon relays to the rank-zero
-  daemon, which writes that single file. Native checkpoint topology selects the route;
-  NVRx runs configure the collector-only daemons explicitly. `MEGATRON_OTEL_RUN_ID`
+  `ci-results/otel/{cycle_tag}`. In native runs every node-local daemon relays to the
+  rank-zero daemon, which writes that single file. NVRx runs start no daemon: their
+  ranks export to an OTLP/HTTP receiver the harness runs on port 4318 of the first
+  node, which appends the same JSON lines to that file. `MEGATRON_OTEL_RUN_ID`
   (`nemo.run.id`) names the job, the run (`ref`, `cmp`, or `run`), the phase, and the
   Slurm and elastic restart counts.
 - Each cycle requires checkpoint save spans, all four Megatron performance metrics,
@@ -212,8 +214,9 @@ The functional ckptbench gate (`ci/scripts/ckpt_stress.py`) does not gate on per
 
 - **In-process runs** (`ckpttest` with `RunInprocServer`) put many ranks and daemons
   in one process, which shares one process-global OTel provider. Each save's
-  `nvrx.rank` span attribute remains correct. Production daemons run in separate processes.
-- The multi-node relay (`/api/telemetry/remote`) is exercised by multi-node native and
-  NVRx CI runs; single-node and file-mode runs collect directly.
+  `nvrx.rank` span attribute remains correct. Production runs host one daemon per peer,
+  inside a training process unless `NATIVE_CKPT_SERVER_DISABLE_INPROC=1`.
+- The multi-node relay (`/api/telemetry/remote`) is exercised by multi-node native CI
+  runs; single-node and file-mode runs collect directly.
 - Grafana dashboards over this OTLP output are a planned follow-on; point an
   OpenTelemetry Collector / Tempo / Prometheus at the JSONL or enable `otlp-http`.

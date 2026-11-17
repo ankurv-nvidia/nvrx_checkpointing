@@ -116,3 +116,22 @@ log line.
 Comparison harnesses that need a `native`/`nvrx` selector can opt in to
 `nvrx_checkpointing.megatron.provider`; reference runs should not install the
 native integration.
+
+### Where the checkpoint daemon runs
+
+By default each node's checkpoint daemon runs inside a training process. Every
+rank that registers checkpoint state tries to host its peer's daemon; the first
+to claim the daemon's port wins and the other ranks connect to it. A daemon
+stops as soon as nothing references it: no training process using it, no peer
+daemon waiting on it, and no checkpoint still being written. A process that
+hosts a daemon therefore waits at exit until the other ranks on its node, and
+the peers that depend on it, are done.
+
+Set `NATIVE_CKPT_SERVER_DISABLE_INPROC=1` on every rank to run the daemon as a
+separate `checkpoint_server` process instead. It follows the same lifetime
+rules. With `CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH=1`, ranks only connect to a
+daemon started outside training and never start one themselves.
+
+Either way, the daemon writes its log to `NATIVE_CKPT_SERVER_LOG` (default
+`/tmp/native_ckpt_server.%h_%p.log`), where `%h` is the host name and `%p` is
+the ID of the process running the daemon.

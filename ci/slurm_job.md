@@ -529,6 +529,7 @@ These flavors select a checkpoint variant for the comparison. They mix with
 | --- | --- |
 | `nvrx` | Write checkpoints through the NVIDIA Resiliency Extension |
 | `native` | Write checkpoints through the native provider |
+| `oop` | Run the native checkpoint daemon as its own process instead of inside training |
 | `async` | Save asynchronously, staging wherever the model configuration says |
 | `shm` | Save asynchronously, staging through shared memory |
 | `ipc` | Save asynchronously, staging through CUDA IPC |
@@ -578,6 +579,19 @@ A scope is `all`, `phase1` or `phase2`. An option carries its value as the next
 token or joined by `=`; a flavor replaces one by naming it in both `drop` and
 `add`. Each phase logs what its variants changed as
 `[slurm_job:flavor] <tag> phase<N> drop <option> add <option>`.
+
+A variant can also set environment variables for training under `env`, as
+`oop` does:
+
+```yaml
+oop:
+  summary: Run the native checkpoint daemon as its own process instead of inside training.
+  env:
+    NATIVE_CKPT_SERVER_DISABLE_INPROC: "1"
+```
+
+The `[slurm_job:env]` snapshot printed before each phase includes
+`NATIVE_CKPT_SERVER_DISABLE_INPROC`, so a log shows where its daemons ran.
 
 The three execution modes — `perf`, `detr` and `vg` — stay in
 `slurm_job.py`, because each owns behaviour rather than a list of options:

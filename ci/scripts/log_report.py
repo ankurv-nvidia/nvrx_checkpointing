@@ -38,9 +38,6 @@ _MEM_RE = re.compile(
     r"\[native_ckpt:mem\](?: rank=(\d+))? gpu_peak_bytes=(\d+)"
     r"(?: gpu_hbm_peak_bytes=(\d+) gpu_total_bytes=(\d+))? cpu_rss_bytes=(\d+)",
 )
-_DAEMON_DURABLE_RE = re.compile(
-    r"\[native_ckpt:svr\]\[[^\]]*\]\[PERF\] Snapshot=(\d+) Durable[^\n]*?activate_to_durable_us=(\d+)",
-)
 _CKPT_EVENT_RE = re.compile(
     r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\] "
     r"(saving checkpoint at iteration|successfully saved (?:\S+ )?checkpoint from iteration)"
@@ -209,9 +206,6 @@ def _metrics(text: str, daemon_text: str, gpus_per_node: int | None) -> dict:
     durable = _durability_ms(text)
     if durable:
         metrics["ckpt_durable_ms"] = _metric(durable, "ms", higher_is_better=False)
-    daemon_durable = [int(match[2]) / 1e3 for match in _DAEMON_DURABLE_RE.finditer(daemon_text)]
-    if daemon_durable:
-        metrics["ckpt_daemon_durable_ms"] = _metric(daemon_durable, "ms", higher_is_better=False)
     memory = list(_MEM_RE.finditer(text))
     if memory:
         ranks = [int(match[1]) for match in memory if match[1] is not None]

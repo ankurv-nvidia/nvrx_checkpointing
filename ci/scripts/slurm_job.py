@@ -26,6 +26,7 @@ LLM/agent maintenance constraints:
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import fcntl
 import hashlib
@@ -210,6 +211,7 @@ _PRETRAIN_ENV_NAMES = {
     "NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS",
     "NATIVE_CKPT_SERVER_CORE_DUMP",
     "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC",
     "NATIVE_CKPT_SERVER_LOG",
     "NCCL_ALGO",
     "NCCL_NET",
@@ -2014,13 +2016,11 @@ class FlavorPolicy:
     def stop_server(self, _provider: str, tag: str, graceful: bool = True) -> None:
         if self.manages_native_server:
             def stop() -> None:
-                pids = CHECKPOINT_SERVER.pids()
                 CHECKPOINT_SERVER.stop(graceful)
                 if graceful:
-                    pattern = os.environ["NATIVE_CKPT_SERVER_LOG"]
-                    _reject_server_errors(
-                        Path(pattern.replace("%h", socket.gethostname()).replace("%p", pid)) for pid in pids
-                    )
+                    # Each log carries the pid of whichever process hosted its daemon.
+                    pattern = Path(os.environ["NATIVE_CKPT_SERVER_LOG"].replace("%h", socket.gethostname()))
+                    _reject_server_errors(pattern.parent.glob(pattern.name.replace("%p", "*")))
 
             _node_once(tag, stop)
 
@@ -2201,7 +2201,6 @@ class DeterministicFlavor(Flavor):
 
 _VALGRIND_NATIVE_ENV = {
     "CHECKPOINT_SVC_DISABLE_AUTO_LAUNCH": "1",
-    "NATIVE_CKPT_SERVER_AUTO_SHUTDOWN_TIMEOUT_SECONDS": "0",
     "NATIVE_CKPT_SERVER_HANDLER_THREADS": "4",
     "NATIVE_CKPT_SERVER_MAX_ACTIVE_SNAPSHOTS": "0",
     "NATIVE_CKPT_SERVER_TCP_ACCEPTORS": "1",
@@ -2291,6 +2290,8 @@ class ValgrindFlavor(Flavor):
                 time.sleep(1)
             else:
                 raise RuntimeError(f"checkpoint_server failed to start under valgrind; see {server_log}")
+            # The worker's reference keeps the daemon up until training registers its own.
+            CHECKPOINT_SERVER.hold(timeout=600)
             marker.with_suffix(".ready").touch()
             try:
                 yield
@@ -2305,14 +2306,15 @@ class ValgrindFlavor(Flavor):
                 marker.with_suffix(".done").touch()
 
 
-_FLAVOR_KEYS = ("summary", "priority", *_SCOPES)
+_FLAVOR_KEYS = ("summary", "priority", "env", *_SCOPES)
 
 
 class DeclaredFlavor(Flavor):
     """A checkpoint variant declared in ``ci/flavors.yaml``.
 
-    A variant that only adds or drops options, or settles a run option, needs no
-    code: it names the axis it puts under test and the options that express it.
+    A variant that only adds or drops options, sets training environment
+    variables, or settles a run option, needs no code: it names the axis it puts
+    under test and the options that express it.
     """
 
     def __init__(self, name: str, spec: dict):
@@ -2326,9 +2328,13 @@ class DeclaredFlavor(Flavor):
             for scope in _SCOPES
             if scope in spec
         )
+        self.env = {str(key): str(value) for key, value in (spec.get("env") or {}).items()}
 
     def configure(self, policy: FlavorPolicy) -> None:
         policy.option_edits += self.edits
+
+    def transform(self, _opts: list[str], env: dict[str, str]) -> None:
+        env.update(self.env)
 
 
 def _flavor_index(flavors: Iterable[Flavor]) -> dict[str, Flavor]:
@@ -2786,23 +2792,70 @@ def _reject_server_errors(logs: Iterable[Path]) -> None:
     if failed:
         raise RuntimeError(f"checkpoint server reported errors; see {', '.join(map(str, failed))}")
 
-def _heartbeat_server(stopped: threading.Event) -> None:
-    while not stopped.wait(60):
-        CHECKPOINT_SERVER.request("ping", 1)
+_OTLP_RECEIVER_PORT = 4318
 
 
 @contextlib.contextmanager
-def _server_heartbeat(enabled: bool) -> Generator[None, None, None]:
-    if not enabled or _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") != "0":
+def _otlp_receiver(path: Path | None) -> Generator[None, None, None]:
+    """Append every OTLP/HTTP export posted to this node as one JSON line in ``path``.
+
+    Lines carry the export requests in their protobuf JSON mapping, the form
+    the checkpoint daemon writes, so the reports read either source.
+    """
+    if path is None:
         yield
         return
-    stopped = threading.Event()
-    thread = threading.Thread(target=_heartbeat_server, args=(stopped,), daemon=True)
+    import gzip  # noqa: PLC0415
+    import http.server  # noqa: PLC0415
+
+    from google.protobuf.json_format import MessageToDict  # noqa: PLC0415
+    from opentelemetry.proto.collector.logs.v1 import logs_service_pb2  # noqa: PLC0415
+    from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2  # noqa: PLC0415
+    from opentelemetry.proto.collector.trace.v1 import trace_service_pb2  # noqa: PLC0415
+
+    messages = {
+        "/v1/traces": (trace_service_pb2.ExportTraceServiceRequest, trace_service_pb2.ExportTraceServiceResponse),
+        "/v1/metrics": (metrics_service_pb2.ExportMetricsServiceRequest, metrics_service_pb2.ExportMetricsServiceResponse),
+        "/v1/logs": (logs_service_pb2.ExportLogsServiceRequest, logs_service_pb2.ExportLogsServiceResponse),
+    }
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            kind = messages.get(self.path.partition("?")[0])
+            if kind is None:
+                self.send_error(404)
+                return
+            if self.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            request = kind[0]()
+            try:
+                request.ParseFromString(body)
+            except Exception:  # noqa: BLE001
+                self.send_error(400)
+                return
+            line = json.dumps(MessageToDict(request), separators=(",", ":"))
+            with lock, path.open("a") as output:
+                output.write(f"{line}\n")
+            reply = kind[1]().SerializeToString()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-protobuf")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("", _OTLP_RECEIVER_PORT), Handler)
+    thread = threading.Thread(target=server.serve_forever, name="otlp-receiver", daemon=True)
     thread.start()
     try:
         yield
     finally:
-        stopped.set()
+        server.shutdown()
+        server.server_close()
         thread.join()
 
 def _extra_options(cfg: str, selected: list[str]) -> list[str]:
@@ -2916,8 +2969,10 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         if checkpoints_override is not None:
             expected_checkpoints = checkpoints_override
         cycle_tag = "phase1" if phase == 1 else f"cycle{cycle + 1}"
-        # The trainer environment consumes the cycle-specific daemon log path.
-        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.%h.%p.log")
+        slurm_restart = "0" if _in_job_array() else os.environ.get("SLURM_RESTART_COUNT", "0")
+        attempt = f"sr{slurm_restart}-te{os.environ.get('TORCHELASTIC_RESTART_COUNT', '0')}"
+        # A restart reuses the run's log directory, so naming the attempt keeps its error gate off earlier attempts' logs.
+        os.environ["NATIVE_CKPT_SERVER_LOG"] = str(RESULTS_DIR / f"checkpoint_server.{cycle_tag}.{attempt}.%h.%p.log")
         cmd, env = _phase_command(
             cfg,
             args,
@@ -2948,43 +3003,31 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
         )
         if collect_otel and rank == "0":
             otel_report.analysis_path(otel_file).unlink(missing_ok=True)
-        relay_otel = provider != "native" and collect_otel
-        collector_node = (
-            socket.gethostname().split(".", 1)[0] == env["MASTER_ADDR"].split(".", 1)[0]
-            if relay_otel
-            else int(rank) < args.gpus_per_node
+        # Other providers export to a receiver on the first node instead of a checkpoint daemon.
+        receive_otel = provider != "native" and collect_otel
+        if receive_otel:
+            env["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"http://{env['MASTER_ADDR']}:{_OTLP_RECEIVER_PORT}"
+        receiver = (
+            receive_otel
+            and socket.gethostname().split(".", 1)[0] == env["MASTER_ADDR"].split(".", 1)[0]
+            and _rank_env("SLURM_LOCALID", "LOCAL_RANK", "0") == "0"
         )
-        collector = "" if not relay_otel else ("file" if collector_node else f"{env['MASTER_ADDR']}:4100")
-        if collector:
-            os.environ["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
-            env["NATIVE_CKPT_OTEL_COLLECTOR"] = collector
-        else:
-            os.environ.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
-            env.pop("NATIVE_CKPT_OTEL_COLLECTOR", None)
         run_id = _otel_run_id(env, label, cycle_tag)
         env["MEGATRON_OTEL_RUN_ID"] = run_id
         os.environ["MEGATRON_OTEL_RUN_ID"] = run_id
-        server_enabled = collect_otel
+        server_enabled = provider == "native" and collect_otel
         if server_enabled:
-            from nvrx_checkpointing import SERVER_PATH, checkpoint, ckpt_diag  # noqa: PLC0415
+            from nvrx_checkpointing import SERVER_PATH, ckpt_diag  # noqa: PLC0415
 
             ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH, RESULTS_DIR)
-
-            if relay_otel:
-                if collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-collector".strip("-"), checkpoint.ping)
-                _sync_ranks(f"{label}-{cycle_tag}-otel-collector-ready".strip("-"))
-                if not collector_node:
-                    _node_once(f"{label}-{cycle_tag}-otel-relay".strip("-"), checkpoint.ping)
-            else:
-                _node_once(f"{label}-{cycle_tag}-otel-listener".strip("-"), checkpoint.ping)
-            _sync_ranks(f"{label}-{cycle_tag}-otel-listeners-ready".strip("-"))
         if rank == "0":
             print(f"[native_ckpt:run] {cycle_tag}", flush=True)  # noqa: T201
         with (
             flavors.policy.server_context(f"{stem}-{cycle_tag}", phase),
-            _server_heartbeat(server_enabled),
+            _otlp_receiver(otel_file if receiver else None),
         ):
+            if receive_otel:
+                _sync_ranks(f"{label}-{cycle_tag}-otel-receiver-ready".strip("-"))
             _print_pretrain_env(env, cycle_tag)
             rc = (
                 _tee_rc(
@@ -3007,11 +3050,13 @@ def _run_routine(cfg: str, args: argparse.Namespace, provider: str, label: str =
                 _run_dir(cfg) / f"phase1-checkpoints/iter_{flavors.policy.phase1_train_iters:07d}/.metadata",
                 _time_budget(args.config, flavors, "phase1-flush", 30) * 60,
             )
-        if server_enabled and not collector_node:
-            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-relay-stop")
-        _sync_ranks(f"{label}-{cycle_tag}-relays-stopped".strip("-"))
-        if server_enabled and collector_node:
-            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-collector-stop")
+        # Peer daemons stop before the first node's, which hosts the coordinator they reference.
+        coordinator_node = int(rank) < args.gpus_per_node
+        if server_enabled and not coordinator_node:
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-peer-stop")
+        _sync_ranks(f"{label}-{cycle_tag}-peers-stopped".strip("-"))
+        if server_enabled and coordinator_node:
+            flavors.policy.stop_server(provider, f"{label}-{cycle_tag}-coordinator-stop")
         _sync_ranks(f"{label}-{cycle_tag}-stopped".strip("-"))
         if rank == "0":
             otel_data = otel_report.OtelData([])
@@ -3565,6 +3610,31 @@ def _emit_checkpoint_resource_metrics(
         instrument.set(value)
     meter_provider.shutdown()
 
+def _hold_checkpoint_daemon(megatron_provider: ModuleType) -> None:
+    """Start this node's checkpoint daemon at boot and hold it until this process exits.
+
+    In native runs the daemon collects the run's telemetry, so it is up before
+    Megatron's exporters send anything, and the hold ends only after they flush
+    at exit.
+    """
+    native = megatron_provider.selected_provider() == megatron_provider.NATIVE_PROVIDER
+    if not native or not os.environ.get("NATIVE_CKPT_OTEL_FILE"):
+        return
+    from nvrx_checkpointing import checkpoint  # noqa: PLC0415
+
+    checkpoint.ping()
+    token = CHECKPOINT_SERVER.hold(timeout=900)
+    owner = os.getpid()
+
+    def release() -> None:
+        # A forked child inherits this handler but not the hold.
+        if os.getpid() == owner:
+            CHECKPOINT_SERVER.request(f"releaselocalref/{owner}/{token}", 5)
+
+    # Exit handlers run newest first, so the exporters' later-registered flushes precede this release.
+    atexit.register(release)
+
+
 def _install_selected_checkpoint_provider() -> ModuleType:
     """Install packed-tensor compatibility and the selected provider's hooks."""
     from nvrx_checkpointing.megatron import provider as megatron_provider  # noqa: PLC0415
@@ -3611,6 +3681,7 @@ def _pretrain_entry(phase: int, entrypoint: str) -> None:
 
     # Reference runs execute without native integration patches.
     megatron_provider = _install_selected_checkpoint_provider()
+    _hold_checkpoint_daemon(megatron_provider)
     from megatron.core.enums import ModelType  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
     from megatron.training import (  # noqa: PLC0415 # pyright: ignore[reportMissingImports]
         inprocess_restart,
@@ -4210,6 +4281,7 @@ _ENV_SCOPES = {
     "SLURM_SEGMENT": "r", "TRITON_CACHE_DIR": "rw", "TRITON_CACHE_PATH": "rw",
     "TORCHINDUCTOR_CACHE_DIR": "rw", "TORCH_EXTENSIONS_DIR": "rw", "NATIVE_CKPT_SERVER_LOG": "rw",
     "NATIVE_CKPT_SERVER_CORE_DUMP": "rw", "NATIVE_CKPT_SERVER_CORE_DUMP_TIMEOUT_SECONDS": "rw",
+    "NATIVE_CKPT_SERVER_DISABLE_INPROC": "rw",
     "NATIVE_CKPT_OTEL_COLLECTOR": "rw", "NATIVE_CKPT_OTEL_FILE": "rw",
     "MEGATRON_OTEL_RUN_ID": "rw",
     **dict.fromkeys(_MEGATRON_OTEL_ENV_DEFAULTS, "rw"),

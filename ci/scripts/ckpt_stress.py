@@ -99,6 +99,8 @@ def check_daemon_election(server: Path) -> None:
     try:
         if not ready.wait(timeout=SERVER_READY_TIMEOUT_S):
             raise RuntimeError(f"checkpoint_server did not print '{READY_MARKER}' within {SERVER_READY_TIMEOUT_S}s")
+        # Without a client reference the winner would wind down after its startup grace.
+        CHECKPOINT_SERVER.hold()
         logger.info("[ckpt_stress] daemon up (pid %d); starting a second candidate", winner.pid)
 
         loser, _ = _spawn_daemon(server, RESULTS_DIR / f"{stem}_loser.%p.log")
