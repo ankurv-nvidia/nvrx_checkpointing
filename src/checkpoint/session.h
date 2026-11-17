@@ -61,6 +61,9 @@ struct Session
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
         bool                                      complete{false};
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
+
+        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
+        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
     };
 
     Server* const                         server;
@@ -114,9 +117,6 @@ struct Session
 
     // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
-
-    std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-    std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
 
     private:
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;

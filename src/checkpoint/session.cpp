@@ -1029,13 +1029,16 @@ try
     std::shared_ptr<StateTree> registry;
     {
         std::scoped_lock lock(mutex);
-        if (!IsCoordinatorPeer()) { receivedFrom.insert(rank); }    // Otherwise HandleLocalStateRegistry will do it
+        if (!IsCoordinatorPeer())
+        {
+            receivedFrom.insert(rank);
+            if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
+        }    // Otherwise HandleLocalStateRegistry will do it
         registry = sessionState.localRegistryForRank.at(rank);
     }
     if (IsCoordinatorPeer()) { HandleLocalStateRegistry(rank, std::move(registry)); }
     else
     {
-        if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
         // Send to coordinator
         std::ostringstream body;
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);
