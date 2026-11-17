@@ -45,7 +45,7 @@ struct SvcRef
         return inProc;
     }
 
-    auto CliAcquireLocalProc_(int64_t pid)
+    auto CliAcquireLocalProc_(uint64_t pid)
     {
         auto localProc = std::make_shared<LocalProcCli>();
         localProc->pid = pid;
@@ -73,7 +73,7 @@ struct SvcRef
 
     public:
     static auto AcquireInProc() { return Instance_().AcquireInProc_(); }
-    static auto CliAcquireLocalProc(int64_t pid) { return Instance_().CliAcquireLocalProc_(pid); }
+    static auto CliAcquireLocalProc(uint64_t pid) { return Instance_().CliAcquireLocalProc_(pid); }
     static auto CliAcquireRemoteProc() { return Instance_().CliAcquireRemoteProc_(); }
     static auto SvrAcquireLocalProcRef(uint64_t pid) { return Instance_().SvrAcquireLocalProcRef_(pid); }
     static void SvrReleaseLocalProcRef(uint64_t pid, uint64_t token) { Instance_().SvrReleaseLocalProcRef_(pid, token); }
