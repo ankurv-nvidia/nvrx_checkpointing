@@ -144,26 +144,44 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
    1.2 - Any producer thats still writing to the old file will error
 2.
 
-# TODO : Logging and FT-Launcher integration
+# Lifecycle Management
 
-1. Daemon to launched by ft-launcher
+## FT-Launcher Integration (Fault-Tolerance)
 
-- One consolidate log per cycle
-  - All logs go into ft-launcher logs
-  - How do training-workers redirect their logs ?
-    - stdout/stderr of workers is redirect the training pipe
+The ft-launcher is component responsible for tracking the individual rank processes and restarting in case of errors or exceptions happening on any of the ranks.
 
-- Should the daemon cause training process to die
-  - Tentatively yes. (Need confirmation from ADLR/Mcore/others if thsis is a no and a redesign)
+There are two modes the daemon operates in:
 
-- ## Core-dump traces
+1. In-Proc mode
+2. Out-of-proc mode
 
-1. Handling of restarts without Daemon kills (Multiple sessions)
+### Out-of-proc mode
 
-2. Logs redirects
+The description below applies mainly for out-of-proc mode where we rely on ft-launcher to launch and track the out-of-proc daemon (node singleton) and extend the fault-tolerance umbrella to include the daemon as well.
 
-- OTel logging ?
--
+In an ideal world we dont expect the daemon to ever crash or exit during a training run so all failures are considered fatal and invoke the fault-diagnostics as well as fault-recovery thereby cause the training to restart.
+
+Here's a consolidated list of behaviors when it comes to ft-launcher and daemon interaction
+
+1. Daemon to be launched by ft-launcher before training-jobs-processes
+2. ft-launcher launches daemon with cli-args (<mark>TODO</mark>)to capture its logging
+
+- One consolidated log per cycle
+
+3. Restarting training jobs dont require restarting the daemon if its still alive and operational from the last run.
+
+- The cycle id is used as a session-id for the daemon which insulate the workflow of this cycle from any partial workflow state from last cycle
+
+4. A crash or illegal termination of the daemon invokes the ft-launcher diagnostics which will collect the coredump from the daemon, including other diagnostic logs, and restart the training jobs
+5.
+
+### In-proc mode (No ft-launcher integration needed)
+
+The in-proc mode implies that the daemon will be instantiated inside one of the N-local ranks in the training process and its lifetime is bound by the training process.
+
+This is meant to simplify the lifecycle management for scenarios that dont require fault-tolerance or quick recovery (mainly dev scenarios) and hence it requires no additional management.
+
+The daemon holds the rank-process its instantiated in especially if its a coordinator daemon for the job and keeps the process alive unless its ready to wind-down in case of a regular spin-down.
 
 # Key Components and Code Walkthrough
 
