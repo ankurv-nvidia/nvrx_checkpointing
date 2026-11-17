@@ -354,6 +354,29 @@ if (BUILD_TESTING)
             DEPENDS checkpoint checkpoint_server
         )
 
+        # The tests marked integration need a checkpoint server, and each runs in a process of its own.
+        set(_integration_environment MEGATRON_NATIVE_RUN_SERVER_TESTS=1)
+        if (NOT PHOENIX_BUILD_CUDA)
+            # A CPU-only extension cannot take device tensors.
+            list(APPEND _integration_environment CUDA_VISIBLE_DEVICES=)
+        endif()
+        pytest_discover_tests(integration
+            TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
+            DISCOVERY_EXTRA_ARGS -m integration
+            DEPENDS checkpoint checkpoint_server _distcp_shim
+            ENVIRONMENT ${_integration_environment}
+        )
+
+        if (TARGET ckpt_stress_test)
+            # Daemon election and a loopback connect storm against the checkpoint web service.
+            add_test(NAME ckpt_stress
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ckpt_stress.py"
+                    --stress $<TARGET_FILE:ckpt_stress_test>
+                    --server $<TARGET_FILE:checkpoint_server>
+                    --results-dir "${CMAKE_CURRENT_BINARY_DIR}/ckpt_stress")
+        endif()
+
         # Smoke checks of the installed package, which skip where no package is installed.
         set(_package_installed "import importlib.util, sys; importlib.util.find_spec('nvrx_checkpointing') or sys.exit(77)")
         add_test(NAME package_import
@@ -411,7 +434,7 @@ endif()
 
 if (BUILD_TESTING AND TARGET nvrx_checkpointing_dev_whl)
     # Test discovery imports the package through its editable install.
-    foreach(_test_group dcp_load distcp_roundtrip quantized_snapshot)
+    foreach(_test_group dcp_load distcp_roundtrip quantized_snapshot integration)
         if (TARGET ${_test_group})
             add_dependencies(${_test_group} nvrx_checkpointing_dev_whl)
         endif()
