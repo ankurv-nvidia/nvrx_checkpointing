@@ -351,7 +351,7 @@ function megatron {
         git -C "${name}" checkout --quiet "${ref}"
         sed -i 's/-std=c++17/-std=c++20/g' "${name}/setup.py"
         grep -q -- '-std=c++20' "${name}/setup.py"
-        uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" "./${name}"
+        wheel_install "${name}" --override "${UV_OVERRIDES}"
         rm -rf "${name}"
     done
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
@@ -387,7 +387,7 @@ function megatron {
     popd
 
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
-    ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
+    ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" wheel_install DeepEP
     rm -rf /var/lib/apt/lists/*
     rm -rf DeepEP
 
@@ -408,6 +408,38 @@ function nvte_cuda_archs {
         12.*) echo 120 ;;
         *) echo "${1/./}" ;;
     esac
+}
+
+# Installs a source tree's wheel with the given uv pip arguments, reusing a cached wheel of the same tree, toolchain and script.
+function wheel_install {
+    local source=$1 wheels="" key build
+    shift
+    if [[ -n "${PREPARE_WHEEL_CACHE:-}" ]]; then
+        mkdir -p "${PREPARE_WHEEL_CACHE}"
+        git -C "${source}" add --all
+        key=$({
+            sha256sum < "${SCRIPT_DIR}/prepare.sh"
+            git -C "${source}" rev-parse HEAD
+            git -C "${source}" diff --cached --binary HEAD
+            uname -m
+            nvcc --version
+            python -c 'import sys, torch; print(sys.version, torch.__version__)'
+            echo "${TORCH_CUDA_ARCH_LIST:-}"
+        } | sha256sum | cut -c1-16)
+        wheels="${PREPARE_WHEEL_CACHE}/$(basename "$(realpath "${source}")")-${key}"
+    fi
+    if [[ -z "${wheels}" ]] || ! compgen -G "${wheels}/*.whl" > /dev/null; then
+        build=$(mktemp -d "${PREPARE_WHEEL_CACHE:-${TMPDIR:-/tmp}}/.wheel-build.XXXXXX")
+        uv build --wheel --no-build-isolation --python "$(command -v python)" --out-dir "${build}" "${source}"
+        if [[ -z "${wheels}" ]]; then
+            wheels=${build}
+        else
+            # A concurrent run that stored the same wheels first keeps its copy.
+            mv -T "${build}" "${wheels}" || rm -rf "${build}"
+        fi
+    fi
+    uv pip install --system --no-cache --break-system-packages "$@" "${wheels}"/*.whl
+    [[ -n "${PREPARE_WHEEL_CACHE:-}" ]] || rm -rf "${wheels}"
 }
 
 # DeepEP compiles against these RDMA and NVML development files.
