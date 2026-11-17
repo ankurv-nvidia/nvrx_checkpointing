@@ -705,6 +705,3 @@ std::unique_ptr<DeviceContext> DeviceContext::CreateDeviceContext(DeviceId devic
                                          "is this build missing PHOENIX_BUILD_CUDA / PHOENIX_BUILD_METAL?",
                                          device));
 }
-
-void SvcDecrRef()
-{}

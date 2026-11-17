@@ -89,6 +89,7 @@ add_library(phoenix_checkpoint OBJECT
     src/checkpoint/checkpoint.cpp
     src/checkpoint/logtel.cpp
     src/checkpoint/quant.cpp
+    src/checkpoint/svcref.cpp
 )
 
 target_include_directories(phoenix_checkpoint PUBLIC
@@ -237,7 +238,7 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     SupressWarningForTarget(nanobind-static-abi3)
     SupressLintingForTarget(nanobind-static)
     SupressLintingForTarget(nanobind-static-abi3)
-    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
+    target_link_libraries(checkpoint PRIVATE phoenix_checkpoint daemon distcpio fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
     if (PHOENIX_BUILD_TESTS)
         if (PHOENIX_BUILD_CUDA)
