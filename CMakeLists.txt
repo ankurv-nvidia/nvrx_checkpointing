@@ -217,9 +217,12 @@ endif()
 if (PHOENIX_BUILD_PYTHON_BINDINGS)
     include(DLPack)
 
-    # A cross build compiles the extensions against the target CPython's headers.
+    # A cross build compiles and links the extensions against the target CPython.
     if (CMAKE_CROSSCOMPILING AND COMMAND vcpkg_install)
-        vcpkg_install(cpython-headers)
+        vcpkg_install(cpython-standalone)
+        find_path(Python3_INCLUDE_DIR Python.h PATH_SUFFIXES python3.12 REQUIRED)
+        find_library(Python3_LIBRARY python3.12 REQUIRED)
+        set(Python_INCLUDE_DIR "${Python3_INCLUDE_DIR}")
     endif()
     find_package(Python3 COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
     include(PythonEnv)
