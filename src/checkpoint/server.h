@@ -8,15 +8,10 @@
 
 // Starts the checkpoint server, prints "READY\n" to stdout when the port is bound,
 // then blocks until a shutdown is triggered (either by message or inactivity timeout).
-void RunServer();
+void RunServer(uint16_t index);
 
 void RunInprocServer(uint16_t nodes);
-
-// Waits until every in-process daemon has made its active snapshots durable.
-// This is intended for test and benchmark teardown, not the measured save path.
-void WaitForInprocServerWrites();
-
-void StopInprocServer();
+void SpinDownAllInprocServers();
 
 using ServerSessionCallback = void (*)(void*                        cbData,
                                        checkpoint::ipc::SessionId   sessionId,

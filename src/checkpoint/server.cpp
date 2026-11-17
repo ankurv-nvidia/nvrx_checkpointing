@@ -62,7 +62,7 @@ struct Server
     static constexpr uint16_t Port = cipc::Message::Port;
 
     public:
-    explicit Server(uint16_t index = 0) : _index(index) {}
+    explicit Server(uint16_t index) : _index(index) {}
     ~Server() { Stop(); }
     CLASS_DELETE_COPY_AND_MOVE(Server);
 
@@ -1550,10 +1550,10 @@ void RunInprocServer(uint16_t nodes)
     std::fflush(stderr);
 }
 
-void RunServer()    // NOLINT(misc-use-internal-linkage)
+void RunServer(uint16_t index)    // NOLINT(misc-use-internal-linkage)
 {
     SetThreadName("ncs:main");
-    Server server;
+    Server server(index);
     server.Start();
 
     // Signal to the launching process (SvcPing) that we are ready to accept connections.
@@ -1563,36 +1563,13 @@ void RunServer()    // NOLINT(misc-use-internal-linkage)
     server.WaitForShutdown();
 }
 
-void StopInprocServer()
+void SpinDownAllInprocServers()
 {
     for (auto const& server : ServerSingletons)
     {
         if (server) { server->Stop(); }
     }
     ServerSingletons.clear();
-}
-
-void WaitForInprocServerWrites()
-{
-    static constexpr auto WaitDuration = 50ms;
-    auto const            deadline     = PerfClock::now() + ServerWaitTimeout;
-    while (true)
-    {
-        bool foundServer = false;
-        bool allComplete = true;
-        for (auto const& server : ServerSingletons)
-        {
-            if (!server) { continue; }
-            foundServer = true;
-            if (!server->HasSessionsAndAllSessionsComplete()) { allComplete = false; }
-        }
-        if (foundServer && allComplete) { return; }
-        if (PerfClock::now() >= deadline)
-        {
-            throw std::runtime_error("Timed out waiting for in-process checkpoint server writes to become durable");
-        }
-        std::this_thread::sleep_for(WaitDuration);
-    }
 }
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData)

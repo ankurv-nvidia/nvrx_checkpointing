@@ -36,7 +36,7 @@ struct SvcRef
 
     private:
     std::shared_ptr<InProc>        AcquireInProc_();
-    std::shared_ptr<LocalProcCli>  CliAcquireLocalProc_();
+    std::shared_ptr<LocalProcCli>  CliAcquireLocalProc_(uint32_t serverIndex);
     std::shared_ptr<RemoteProcCli> CliAcquireRemoteProc_();
 
     uint64_t SvrAcquireLocalProcRef_(uint64_t pid);
@@ -46,7 +46,7 @@ struct SvcRef
 
     public:
     static auto AcquireInProc() { return Instance_().AcquireInProc_(); }
-    static auto CliAcquireLocalProc() { return Instance_().CliAcquireLocalProc_(); }
+    static auto CliAcquireLocalProc(uint32_t serverIndex) { return Instance_().CliAcquireLocalProc_(serverIndex); }
     static auto CliAcquireRemoteProc() { return Instance_().CliAcquireRemoteProc_(); }
 
     static auto SvrAcquireLocalProcRef(uint64_t pid) { return Instance_().SvrAcquireLocalProcRef_(pid); }

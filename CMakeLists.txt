@@ -263,22 +263,8 @@ if (COMMAND vcpkg_install)
     vcpkg_install(cpptrace)
 endif()
 
-# cpptrace symbolizes the checkpoint_server crash backtrace (demangled, file:line).
 find_package(cpptrace CONFIG REQUIRED)
 
-# Writer library — pure-C++ ZIP+pickle emitter (no Python, no nanobind, no
-# libtorch). Both the production server and the parity-test shim link against
-# this. Format spec lives in the header comment at the top of
-# `src/checkpoint/distcp.cpp`.
-#
-# NOTE: OBJECT library so the same .o files feed both `checkpoint_server` and
-# `_distcp_shim`. CMake propagates OBJECT-lib object files one consumer hop
-# deep, so STATIC/EXECUTABLE consumers more than one level removed must list
-# this target directly in their `target_link_libraries` (see
-# `phoenix_checkpoint_fixture` and `checkpoint_server` below). Promoting to
-# STATIC + POSITION_INDEPENDENT_CODE=ON would let transitive PUBLIC
-# propagation handle this naturally; defer that until a third consumer hits
-# the same wall.
 add_library(distcpio OBJECT
     src/checkpoint/distcp.cpp
     src/checkpoint/host_dequant.cpp)
@@ -298,7 +284,9 @@ add_executable(checkpoint_server src/checkpoint/server_main.cpp)
 # distcpio is listed directly because CMake only propagates
 # OBJECT-lib object files one consumer hop — without this, distcp.cpp.o is
 # missing from the executable even though server.cpp references it.
-target_link_libraries(checkpoint_server PUBLIC phoenix_checkpoint daemon distcpio cpptrace::cpptrace)
+target_link_libraries(checkpoint_server PUBLIC 
+    phoenix_checkpoint daemon distcpio
+    Boost::program_options cpptrace::cpptrace)
 
 add_custom_command(TARGET checkpoint_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>

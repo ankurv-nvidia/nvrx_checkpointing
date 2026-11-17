@@ -98,18 +98,12 @@ try
             WaitForCkptFinalize(static_cast<uint32_t>(Ctx.globalRegistry->SessionId()), snapshot);
         }
     }
-    if (!Ctx.outofproc)
-    {
-        // Keep disk I/O outside BM_SaveCheckpoint while ensuring the in-process
-        // daemon is not torn down with background DCP writes still in flight.
-        WaitForInprocServerWrites();
-        StopInprocServer();
-    }
+    if (!Ctx.outofproc) { SpinDownAllInprocServers(); }
 
     return 0;
 } catch (std::exception const& e)
 {
-    if (!Ctx.outofproc) { StopInprocServer(); }
+    if (!Ctx.outofproc) { SpinDownAllInprocServers(); }
     fmt::print(stderr, "Exception: {}\n", e.what());
     return 1;
 }

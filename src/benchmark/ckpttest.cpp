@@ -103,14 +103,14 @@ class TestServerProcess
     void Start(std::filesystem::path const& stderrLog = {})
     {
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
-        if (TryConnectToCheckpointService())
+        if (TryConnectToCheckpointService(0))
         {
             SvcStop();
             static constexpr size_t MaxStopAttempts = 50;
             using namespace std::chrono_literals;
             for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
             {
-                if (!TryConnectToCheckpointService()) { break; }
+                if (!TryConnectToCheckpointService(0)) { break; }
                 if (attempt + 1 == MaxStopAttempts) { throw std::runtime_error("existing checkpoint test server did not stop"); }
                 std::this_thread::sleep_for(100ms);
             }
@@ -143,7 +143,7 @@ class TestServerProcess
         using namespace std::chrono_literals;
         for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
         {
-            if (TryConnectToCheckpointService()) { return; }
+            if (TryConnectToCheckpointService(0)) { return; }
             std::this_thread::sleep_for(100ms);
         }
         Stop();
@@ -1286,14 +1286,14 @@ FinalizeResultForResponse(boost::beast::http::status status, std::string const& 
 TEST_CASE("finalize uses the completed HTTP status and error body", "[server][finalize][tier1]")
 {
     namespace http = boost::beast::http;
-    if (TryConnectToCheckpointService())
+    if (TryConnectToCheckpointService(0))
     {
         SvcStop();
-        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(); ++attempt)
+        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(0); ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
         }
-        REQUIRE_FALSE(TryConnectToCheckpointService());
+        REQUIRE_FALSE(TryConnectToCheckpointService(0));
     }
     CHECK(FinalizeResultForResponse(http::status::ok).empty());
     CHECK(FinalizeResultForResponse(http::status::ok, "checkpoint is durable").empty());
@@ -1511,7 +1511,7 @@ TEST_CASE("snapshot descriptors larger than a shared-memory slot save successful
         auto&      scalar                     = std::get<StateNode::Scalar>(selected->GetNode(selected->FindNodeByFQN(name)).data);
         static_cast<Primitives64Bit&>(scalar) = static_cast<Primitives64Bit const&>(values[index]);
     }
-    auto& payload       = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
+    auto& payload = std::get<StateNode::DynamicSizeBlob>(selected->GetNode(selected->FindNodeByFQN("payload")).data);
     CHECK(payload.handle == reinterpret_cast<uint64_t>(bytes.data()));
     CHECK(payload.storageSize == bytes.size());
     payload.handle      = reinterpret_cast<uint64_t>(bytes.data());
@@ -1564,7 +1564,6 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
         {
             static_cast<Primitives64Bit&>(captured) = Primitives64Bit(int64_t{iteration});
             SaveCheckpoint(*selected, checkpoint::ipc::SnapshotId{iteration}, logDir / std::to_string(iteration));
-            WaitForInprocServerWrites();
             struct Expected
             {
                 checkpoint::ipc::SnapshotId snapshot;
@@ -1611,10 +1610,10 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
         }
     } catch (...)
     {
-        StopInprocServer();
+        SpinDownAllInprocServers();
         throw;
     }
-    StopInprocServer();
+    SpinDownAllInprocServers();
     std::filesystem::remove_all(logDir);
 }
 
@@ -4229,18 +4228,17 @@ TEST_CASE("save_then_round_trip_validate", "[round-trip]")
         LoadStateRegistryFromPath(ctx, registryPath);
         tasks = StartClientThreads(ctx);
         REQUIRE_NOTHROW(RunOnAllRanks(ctx, &SaveCheckpointAndValidate, CkptDir("save_then_round_trip_validate")));
-        REQUIRE_NOTHROW(WaitForInprocServerWrites());
     } catch (...)
     {
         // Real failures (stale shm files, IPC bugs, etc.) propagate — the
         // pre-checks above already SKIP the known "this sandbox can't run
         // it" cases. Anything past that point is a regression worth seeing.
         if (!tasks.empty()) { JoinClientThreads(ctx, tasks); }
-        if (serverRunning) { StopInprocServer(); }
+        if (serverRunning) { SpinDownAllInprocServers(); }
         throw;
     }
     if (!tasks.empty()) { JoinClientThreads(ctx, tasks); }
-    if (serverRunning) { StopInprocServer(); }
+    if (serverRunning) { SpinDownAllInprocServers(); }
 }
 
 // Custom main registers the optional --registry argument.
@@ -4248,7 +4246,7 @@ int main(int argc, char* argv[])
 {
     if (argc == 2 && std::string_view{argv[1]} == ShmTestServerArg)
     {
-        RunServer();
+        RunServer(0);
         return EXIT_SUCCESS;
     }
 

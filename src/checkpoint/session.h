@@ -1,6 +1,5 @@
 #pragma once
 #include "byte_storage.h"
-#include "distcp.h"
 #include "messages.h"
 #include "state.h"
 #include "tensor.h"
@@ -115,6 +114,8 @@ struct Session
 
     // Negative iterations count backward through retained checkpoint IDs.
     bool ResolveSnapshotId(int64_t iteration, checkpoint::ipc::SnapshotId& out) const;
+
+    std::shared_ptr<SvcRef::InProc> svcref;
 
     private:
     Snapshot& GetSnapshot_(checkpoint::ipc::SnapshotId snapshotId) LFTBND;

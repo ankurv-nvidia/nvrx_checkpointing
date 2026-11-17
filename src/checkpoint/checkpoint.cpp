@@ -50,47 +50,6 @@ template <typename TStream> static void TryCleanShutdown(TStream& stream)
     }
 }
 
-void SvcPing()
-{
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::mutex PingMutex;
-    SUPPRESS_WARNINGS_END
-
-    std::scoped_lock lock(PingMutex);
-    auto             selfLoc   = boost::dll::this_line_location();
-    auto             svcExeLoc = selfLoc.parent_path() / "checkpoint_server";
-    if (TryConnectToCheckpointService()) { return; }
-    if (checkpoint::config::GetConfigValue<checkpoint::config::SvcDisableAutoLaunch>())
-    {
-        throw std::runtime_error("Externally managed checkpoint service is unavailable");
-    }
-
-    try
-    {
-        boost::asio::io_context    ctx;
-        boost::asio::readable_pipe output(ctx);
-        boost::process::process    proc(ctx, svcExeLoc, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
-        std::string                line;
-        boost::system::error_code  ec;
-        boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
-        proc.detach();
-    } catch (std::exception const& ex)
-    {
-        fmt::print(stderr,
-                   "[native_ckpt:cli][ERROR] Exception in SvcPing from {} svcbin={}: {}\n",
-                   selfLoc.string(),
-                   svcExeLoc.string(),
-                   ex.what());
-        throw;
-    }
-
-    // Both the elected daemon and losing candidates write READY only after the
-    // elected service answers a ping. The two short attempts inside TryConnect
-    // cover a final scheduling edge without a second readiness policy here.
-    if (!TryConnectToCheckpointService()) { throw std::runtime_error("Failed to start or connect to checkpoint service"); }
-}
-
 static uint32_t ServerIndex(StateTree const& registry)
 {
     auto const& topo        = registry.Topo();
@@ -148,38 +107,6 @@ static uint8_t ResolveClientQueueCount(RankTopology const& topo)
         configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount;
     }
     return cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
-}
-
-void SvcStop()
-{
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::mutex PingMutex;
-    SUPPRESS_WARNINGS_END
-
-    std::scoped_lock lock(PingMutex);
-    if (!TryConnectToCheckpointService()) { return; }
-    LocalServiceRequest(0, "/api/stop", {});
-}
-
-void SvcSpinDown()
-{
-    SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-    static std::mutex SpinDownMutex;
-    SUPPRESS_WARNINGS_END
-
-    std::scoped_lock lock(SpinDownMutex);
-
-    if (!TryConnectToCheckpointService()) { return; }
-
-    LocalServiceRequest(0, "/api/spindown", {});
-    auto const deadline = std::chrono::steady_clock::now() + 30s;
-    while (TryConnectToCheckpointService())
-    {
-        if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("Checkpoint service shutdown timed out"); }
-        std::this_thread::sleep_for(20ms);
-    }
 }
 
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
@@ -270,7 +197,6 @@ struct CheckpointWriter
 #endif
         try
         {
-            SvcPing();
             std::ostringstream ostr;
             serdes::WriteBlobWithSize<uint16_t>(ostr, "");
             StateSerDes::WriteTopology(ostr, topo);
@@ -662,7 +588,7 @@ void WaitForCheckpointSave(StateTree const& snapshotRegistry)
 void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
-    localRegistry.svcref = SvcRef::CliAcquireLocalProc();
+    localRegistry.svcref = SvcRef::CliAcquireLocalProc(ServerIndex(localRegistry));
     CheckpointWriter::SendStateRegistry(localRegistry);
 }
 

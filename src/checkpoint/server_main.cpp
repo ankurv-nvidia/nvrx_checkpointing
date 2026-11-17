@@ -4,6 +4,7 @@
 #include "server.h"
 #include "service_client.h"
 
+#include <boost/program_options.hpp>
 #include <cpptrace/cpptrace.hpp>
 #include <fmt/core.h>
 
@@ -20,6 +21,8 @@
 // TODO: avoid backtrace()
 #include <execinfo.h>
 
+namespace bpo = boost::program_options;
+
 extern "C" void LogAndExitHandler(int sig);
 extern "C" void FatalSignalHandler(int sig);
 
@@ -29,9 +32,10 @@ static std::string GetLogPath()
 // Detach stdin/stderr so the daemon never blocks on a pipe owned by the departed client.
 // Stdout stays on the launcher pipe for RunServer's "READY\n" handshake (single-write, SIGPIPE ignored).
 // Stderr goes to the log file; if it can't be opened the daemon refuses to start.
-static void RedirectStdio()
+static void RedirectStdio(std::string const& stdoutPath, std::string const& /* stderrPath */)
 {
-    auto                    logPath     = GetLogPath();
+    // TODO : handle stderrPath separately if needed
+    auto                    logPath     = stdoutPath.empty() ? GetLogPath() : stdoutPath;
     static constexpr mode_t LogFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
     int                     logFd
         = ::open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, LogFileMode);    // NOLINT(cppcoreguidelines-pro-type-vararg)
@@ -216,44 +220,70 @@ static void InstallSignalHandlers()
     std::set_terminate(&TerminateHandler);
 }
 
-int main(int /* argc */, char const* const /* argv */[])
+int main(int argc, char const* const argv[])
 try
 {
-    ::setsid();
-    RedirectStdio();
-    // Prime cpptrace before installing the handlers: absorb_trace_exceptions keeps trace
-    // generation from ever throwing out of a handler, and resolving one trace now warms the
-    // unwinder + libdwarf reader so the first crash backtrace is cheap.
-    cpptrace::absorb_trace_exceptions(true);
-    (void)cpptrace::generate_trace();
-    // Warm glibc's unwinder too: backtrace()'s first call may lazily dlopen libgcc_s (which
-    // allocates), so prime it now — the fatal handler's DumpSafeBacktrace must not allocate.
+    bpo::options_description desc("options");
+    uint16_t                 index{0};
+    std::string              stdoutPath{};
+    std::string              stderrPath{};
+
+    desc.add_options()("help", "produce help message")                          //
+        ("index", bpo::value<uint16_t>(&index), "server index")                 //
+        ("stdout", bpo::value<std::string>(&stdoutPath), "stdout file path")    //
+        ("stderr", bpo::value<std::string>(&stderrPath), "stderr file path")    //
+        ;
+
+    bpo::variables_map vm;
+    auto               parsed = bpo::command_line_parser(argc, argv).options(desc).allow_unregistered().run();
+    bpo::store(parsed, vm);
+    bpo::notify(vm);
+
+    if (vm.contains("help"))
     {
-        std::array<void*, 1> warm{};
-        (void)::backtrace(warm.data(), 1);
-    }
-    InstallSignalHandlers();
-    fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon started pid={} sid={} ppid={}\n", ::getpid(), ::getsid(0), ::getppid());
-    RunServer();
-    fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon exiting normally pid={}\n", ::getpid());
-    checkpoint::logging::Shutdown();
-    return 0;
-} catch (checkpoint::ipc::ErrorAlreadyRunning const& e)
-{
-    // Losing candidates wait for the elected daemon's listener before releasing their launchers.
-    fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
-    if (!TryConnectToCheckpointService())
-    {
-        fmt::print(stderr, "[native_ckpt:svr][INFO] Elected checkpoint server is unavailable; retrying election\n");
-        fmt::print(stdout, "RETRY\n");
+        desc.print(std::cerr);
+        std::cerr << '\n';
         return 1;
     }
-    fmt::print(stdout, "READY\n");
-    std::error_code ec;
-    std::filesystem::remove(GetLogPath(), ec);
-    checkpoint::logging::Shutdown();
 
-    return 0;
+    try
+    {
+        ::setsid();
+        RedirectStdio(stdoutPath, stderrPath);
+        // Prime cpptrace before installing the handlers: absorb_trace_exceptions keeps trace
+        // generation from ever throwing out of a handler, and resolving one trace now warms the
+        // unwinder + libdwarf reader so the first crash backtrace is cheap.
+        cpptrace::absorb_trace_exceptions(true);
+        (void)cpptrace::generate_trace();
+        // Warm glibc's unwinder too: backtrace()'s first call may lazily dlopen libgcc_s (which
+        // allocates), so prime it now — the fatal handler's DumpSafeBacktrace must not allocate.
+        {
+            std::array<void*, 1> warm{};
+            (void)::backtrace(warm.data(), 1);
+        }
+        InstallSignalHandlers();
+        fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon started pid={} sid={} ppid={}\n", ::getpid(), ::getsid(0), ::getppid());
+        RunServer(index);
+        fmt::print(stderr, "[native_ckpt:svr][INFO] Daemon exiting normally pid={}\n", ::getpid());
+        checkpoint::logging::Shutdown();
+        return 0;
+    } catch (checkpoint::ipc::ErrorAlreadyRunning const& e)
+    {
+        // Losing candidates wait for the elected daemon's listener before releasing their launchers.
+        fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
+        if (!TryConnectToCheckpointService(index))
+        {
+            fmt::print(stderr, "[native_ckpt:svr][INFO] Elected checkpoint server is unavailable; retrying election\n");
+            fmt::print(stdout, "RETRY\n");
+            return 1;
+        }
+        fmt::print(stdout, "READY\n");
+        std::error_code ec;
+        std::filesystem::remove(GetLogPath(), ec);
+        checkpoint::logging::Shutdown();
+
+        return 0;
+    }
 } catch (std::exception const& e)
 {
     fmt::print(stderr, "[native_ckpt:svr][ERROR] Fatal error: {}\n", e.what());

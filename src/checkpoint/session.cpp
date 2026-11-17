@@ -1,4 +1,5 @@
 #include "session.h"
+#include "distcp.h"
 #include "logging.h"
 #include "net_utils.h"
 #include "server.h"
@@ -219,12 +220,11 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
             // Rank 0 joins last, so the set is now world-size: every shard and the metadata
             // are on disk and the checkpoint is loadable.
             // This raw marker has a strict schema consumed by CI.
-            fmt::print(stderr,
-                       "[native_ckpt:svr][{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
-                       *this,
-                       hdr.snapshotId,
-                       static_cast<size_t>(topo.worldSize),
-                       durableUs.count());
+            INFO("[PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
+                 *this,
+                 hdr.snapshotId,
+                 static_cast<size_t>(topo.worldSize),
+                 durableUs.count());
             PERF() << tel::span::SvrDurable::End{.id = {.sessionId = sessionId, .rank = Rank{0}, .snapshotId = hdr.snapshotId}};
             BroadcastWriteCkptCompleteToPeers_(snapshot);
             {
@@ -416,7 +416,7 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
 }
 
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
-    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
+    server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn)), svcref(SvcRef::AcquireInProc())
 {}
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND

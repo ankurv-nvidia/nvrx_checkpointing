@@ -644,7 +644,7 @@ try
         // if it does not finish promptly, drop the stale shm and force-exit.
         std::atomic<bool> stopped{false};
         std::thread       stopper([&] {
-            StopInprocServer();
+            SpinDownAllInprocServers();
             stopped.store(true);
         });
         for (int i = 0; i < 50 && !stopped.load(); ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
