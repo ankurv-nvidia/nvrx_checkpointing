@@ -42,7 +42,7 @@ option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         ON)
 set(PHOENIX_WHEEL_VERSION "0.0.1" CACHE STRING "Python wheel version")
 
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
-option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"      OFF)
+option(BUILD_TESTING                    "Build the tests"                   OFF)
 option(PHOENIX_REQUIRE_CUDA             "Fail if CUDA is unavailable"       OFF)
 
 if (PHOENIX_BUILD_WHEEL AND NOT PHOENIX_BUILD_PYTHON_BINDINGS)
@@ -176,7 +176,7 @@ if (PHOENIX_BUILD_CUDA)
     endif()
 endif()
 
-if (PHOENIX_BUILD_BENCHMARK OR PHOENIX_BUILD_TESTS)
+if (PHOENIX_BUILD_BENCHMARK OR BUILD_TESTING)
     add_library(phoenix_checkpoint_fixture STATIC src/benchmark/ckpt_fixture.cpp)
     # distcpio is listed alongside daemon because
     # CMake only propagates OBJECT-library object files one consumer hop deep — the
@@ -239,7 +239,7 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     SupressLintingForTarget(nanobind-static-abi3)
     target_link_libraries(checkpoint PRIVATE phoenix_checkpoint fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
-    if (PHOENIX_BUILD_TESTS)
+    if (BUILD_TESTING)
         if (PHOENIX_BUILD_CUDA)
             set(pytorch_index_url "https://download.pytorch.org/whl/cu${CUDAToolkit_VERSION_MAJOR}${CUDAToolkit_VERSION_MINOR}")
             message(STATUS "Installing CUDA-enabled PyTorch from ${pytorch_index_url} into venv for Python bindings...")
@@ -307,7 +307,7 @@ add_custom_command(TARGET checkpoint_server POST_BUILD
     COMMENT "Creating symbolic link..."
 )
 
-if (PHOENIX_BUILD_TESTS)
+if (BUILD_TESTING)
     include(Catch2)
     enable_testing()
     include(Catch)
@@ -347,7 +347,7 @@ if (PHOENIX_BUILD_TESTS)
         )
 
         # Wire Python tests into ctest via pytest-cmake.
-        pip_install(pytest-cmake hypothesis)
+        pip_install(-r "${CMAKE_CURRENT_SOURCE_DIR}/tests/requirements.txt")
         set(Pytest_ROOT      "${PYTHON_VIRTUAL_ENV_PATH}/share/Pytest")
         # FORCE because find_program may have cached NOTFOUND on an earlier
         # configure run before the venv had pytest installed.
