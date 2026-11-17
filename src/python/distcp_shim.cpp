@@ -17,9 +17,11 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -100,6 +102,8 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
         entries.push_back(ConvertEntry(nb::cast<nb::tuple>(i)));
         totalBytes += entries.back().bytes.size();
     }
+    auto const blobBytes = ParseObjects(objectsPy);
+    for (auto const& [fqn, bytes] : blobBytes) { totalBytes += bytes.size(); }
 
     // `ByteStorage`'s aligned_alloc is POSIX-conformant: `size` must be a multiple of
     // `alignof(std::max_align_t)` (typically 16). Hypothesis-drawn tensors
@@ -152,24 +156,38 @@ static nb::list WriteRankShardImpl(std::string const& outDir, uint32_t rank, nb:
 
         offset += e.bytes.size();
     }
-    auto const                     blobBytes = ParseObjects(objectsPy);
-    checkpoint::distcp::BlobsByFqn blobView;
-    for (auto const& [fqn, bytes] : blobBytes) { blobView[fqn] = std::string_view(bytes.data(), bytes.size()); }
+    for (auto const& [fqn, bytes] : blobBytes)
+    {
+        if (!bytes.empty()) { std::memcpy(tensorStorage[offset], bytes.data(), bytes.size()); }
+        auto [leafName, parent] = tree.FindOrAddNodeByFQN(fqn);
+        tree.AddChild(parent, leafName).data
+            = StateNode::DynamicSizeBlob{.replicas = {Rank{rank}}, .handle = offset, .storageSize = bytes.size()};
+        offset += bytes.size();
+    }
+    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage);
 
-    checkpoint::distcp::WriteRankShard(std::filesystem::path(outDir), Rank{rank}, tree, tensorStorage, blobView);
+    std::vector<InputEntry const*> archiveEntries;
+    archiveEntries.reserve(entries.size());
+    for (auto const& entry : entries) { archiveEntries.push_back(&entry); }
+    std::ranges::sort(archiveEntries, {}, [](InputEntry const* entry) { return entry->fqn; });
+    std::map<std::string, std::pair<uint64_t, uint64_t>> locations;
 
-    nb::list out;
     uint64_t cursor = 0;
-    for (auto const& e : entries)
+    for (auto const* entry : archiveEntries)
     {
         Tensor::Dim shape;
-        for (auto d : e.shape) { shape.push_back(d); }
-        uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(e.dtype, shape, e.bytes.size());
-
+        for (auto d : entry->shape) { shape.push_back(d); }
+        uint64_t const archiveLen = checkpoint::distcp::ComputeShardArchiveSize(entry->dtype, shape, entry->bytes.size());
+        locations.emplace(entry->fqn, std::pair{cursor, archiveLen});
+        cursor += archiveLen;
+    }
+    nb::list out;
+    for (auto const& e : entries)
+    {
         nb::list sharddim;
         for (auto d : e.shape) { sharddim.append(nb::make_tuple(0ULL, static_cast<uint64_t>(d))); }
-        out.append(nb::make_tuple(e.fqn, sharddim, cursor, archiveLen));
-        cursor += archiveLen;
+        auto const& [offset, archiveLen] = locations.at(e.fqn);
+        out.append(nb::make_tuple(e.fqn, sharddim, offset, archiveLen));
     }
     return out;
 }
@@ -254,10 +272,13 @@ static void WriteMetadataImpl(std::string const& outDir, nb::list const& tensors
 
         leaf.data = std::move(st);
     }
-    auto const                            blobBytes = ParseObjects(objects);
-    checkpoint::distcp::BlobMetadataByFqn blobView;
-    for (auto const& [fqn, bytes] : blobBytes) { blobView[fqn][Rank{0}] = {.length = bytes.size()}; }
-    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree, blobView);
+    auto const blobBytes = ParseObjects(objects);
+    for (auto const& [fqn, bytes] : blobBytes)
+    {
+        auto [leafName, parent]              = tree.FindOrAddNodeByFQN(fqn);
+        tree.AddChild(parent, leafName).data = StateNode::DynamicSizeBlob{.replicas = {Rank{0}}, .handle = 0, .storageSize = bytes.size()};
+    }
+    checkpoint::distcp::WriteMetadata(std::filesystem::path(outDir), tree);
 }
 
 NB_MODULE(_distcp_shim, m)    // NOLINT

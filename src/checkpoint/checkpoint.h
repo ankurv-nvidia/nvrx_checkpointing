@@ -7,16 +7,21 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 
 void SvcIncrRef();
 void SvcDecrRef();
 
-void FinalizeStateRegistry(StateTree& root);
+void FinalizeStateRegistry(StateTree& localRegistry);
 
-[[noreturn]] void LoadCheckpoint(StateTree& root, std::filesystem::path const& ckptPath);
+std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry);
 
-void SaveCheckpoint(StateTree const& root, checkpoint::ipc::SnapshotId const& snapshotId, std::filesystem::path const& ckptPath);
-void WaitForCheckpointSave(StateTree const& root);
+[[noreturn]] void LoadCheckpoint(StateTree& localRegistry, std::filesystem::path const& ckptPath);
+
+void SaveCheckpoint(StateTree const&                   snapshotRegistry,
+                    checkpoint::ipc::SnapshotId const& snapshotId,
+                    std::filesystem::path const&       ckptPath);
+void WaitForCheckpointSave(StateTree const& snapshotRegistry);
 
 void SvcPing();
 void SvcStop();
@@ -56,8 +61,8 @@ struct DeviceContext
     static void CudaRegisterHostBuffer(void* ptr, size_t size);
     static void CudaUnregisterHostBuffer(void* ptr);
 
-    // NUMA node of the current CUDA device (from its PCI bus), or -1 if unknown.
-    static int CudaGetCurrentDeviceNumaNode();
+    // NUMA node of a CUDA device (from its PCI bus), or -1 if unknown.
+    static int CudaGetDeviceNumaNode(int deviceIndex);
 #endif
 
 #ifdef PHOENIX_HAVE_METAL

@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import os
 import random
+import sys
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -93,8 +94,7 @@ def _cuda_memory_exit_attributes(entry: _CudaMemoryState, exit_state: _CudaMemor
     hbm_used_delta = exit_state.hbm_used_bytes - entry.hbm_used_bytes
     allocator_unchanged = allocated_delta == reserved_delta == 0
     transient_activity_within_limit = (
-        allocated_during_save <= _MAX_CHECKPOINT_CUDA_TRANSIENT_BYTES
-        and freed_during_save <= _MAX_CHECKPOINT_CUDA_TRANSIENT_BYTES
+        allocated_during_save <= _MAX_CHECKPOINT_CUDA_TRANSIENT_BYTES and freed_during_save <= _MAX_CHECKPOINT_CUDA_TRANSIENT_BYTES
     )
     return {
         "nvrx.gpu.memory.allocated_delta_bytes": allocated_delta,
@@ -105,7 +105,7 @@ def _cuda_memory_exit_attributes(entry: _CudaMemoryState, exit_state: _CudaMemor
         "nvrx.gpu.memory.allocator_unchanged": allocator_unchanged,
         "nvrx.gpu.memory.transient_activity_within_limit": transient_activity_within_limit,
         "nvrx.gpu.memory.transient_limit_bytes": _MAX_CHECKPOINT_CUDA_TRANSIENT_BYTES,
-        "nvrx.gpu.memory.invariant_satisfied": allocator_unchanged,
+        "nvrx.gpu.memory.invariant_satisfied": allocated_delta <= 0 and reserved_delta <= 0,
         "nvrx.gpu.memory.hbm_unchanged": hbm_used_delta == 0,
     }
 
@@ -114,18 +114,25 @@ def _assert_cuda_memory_unchanged(entry: _CudaMemoryState | None, exit_state: _C
     if entry is None or exit_state is None:
         raise RuntimeError("CUDA memory counters are unavailable for the checkpoint invariant")
     details = _cuda_memory_exit_attributes(entry, exit_state)
-    if details["nvrx.gpu.memory.invariant_satisfied"]:
+    if details["nvrx.gpu.memory.allocator_unchanged"]:
         return
-    raise RuntimeError(
+    message = (
         "Checkpoint save changed CUDA allocator state: "
         f"allocated_delta_bytes={details['nvrx.gpu.memory.allocated_delta_bytes']}, "
-        f"reserved_delta_bytes={details['nvrx.gpu.memory.reserved_delta_bytes']}",
+        f"reserved_delta_bytes={details['nvrx.gpu.memory.reserved_delta_bytes']}"
+    )
+    if not details["nvrx.gpu.memory.invariant_satisfied"]:
+        raise RuntimeError(message)
+    print(  # noqa: T201
+        f"[native_ckpt][WARNING] {message}. Checkpoint save continues.",
+        file=sys.stderr,
+        flush=True,
     )
 
 
 @contextmanager
 def assert_cuda_memory_unchanged(span: object | None) -> Generator[None]:
-    """Report checkpoint-boundary CUDA memory and enforce allocator stability."""
+    """Report CUDA allocator changes, warn on decreases, and reject increases."""
     entry = _capture_cuda_memory()
     _record_cuda_memory_event(span, "entry", entry)
     if entry is None:

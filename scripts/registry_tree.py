@@ -1,31 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-"""Render checkpoint daemon state registries as the interactive page of distcp_tree.py.
-
-Reads the daemon's binary state registries: per-rank registries named
-``registry.<rank>.bin`` or ``registry.rank<rank>.bin``, or the merged global
-registry ``registry.bin`` that the daemon writes beside each checkpoint. Both
-hold a session ID, rank topology and flattened state tree, whose leaves are
-tensors, distributed tensor shards, blobs and scalars.
-
-Tensor sizes are physical storage bytes as registered. Their dtype, full shape
-and shard ranges describe the logical tensor and can imply a different size for
-packed or quantized storage. Blob sizes are their inline length and scalar sizes
-are their value width. A rank's size includes replicas. "All ranks" sums every
-rank and "Unique" counts each distinct shard range, blob and scalar once.
-
-Per-rank registries hold every entry. The global registry holds every rank's
-tensor shards, but its blob and scalar nodes come from the first rank that
-registered, carry no rank, and its blobs hold no bytes.
-
-``--expand-blobs`` decodes the blob bytes held in per-rank registries with the
-restricted unpickler of distcp_tree.py, which must sit next to this script.
-Only the Python standard library is required.
-
-Usage::
-
-    python scripts/registry_tree.py <dir-or-registry-file> [...] [-o tree.html] [--expand-blobs]
-"""
+"""Render metadata-only and legacy checkpoint registries as an interactive page."""
 
 from __future__ import annotations
 
@@ -60,7 +35,10 @@ def _page_module() -> ModuleType:
 
 page = _page_module()
 
-_INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR = range(6)
+_INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
+_REGISTRY_MAGIC = 0x32525453
+_REGISTRY_VERSION = 3
+_METADATA_VERSION = 2
 _DTYPES = {
     1: "float16",
     2: "bfloat16",
@@ -83,6 +61,7 @@ _UNSIGNED, _SIGNED, _FLOAT = 1, 2, 3
 _SCALAR_WIDTHS = {1: 1, 2: 2, 3: 4, 4: 8}
 _TOPOLOGY = struct.Struct("<IIII")
 _U32 = struct.Struct("<I")
+_BLOB_STORAGE = struct.Struct("<QQ")
 _NODE = struct.Struct("<BBHII")
 _SCALAR_VALUE = struct.Struct("<B7xQ")
 _TENSOR_PREFIX = struct.Struct("<B7xQQ")
@@ -97,9 +76,11 @@ _GLOBAL_NAMES = frozenset({"registry.bin", "registry.global.bin"})
 _PREFETCH = 16
 _SIZES_NOTE = (
     "Tensor sizes are explicit physical storage bytes registered with the checkpoint daemon. Dtype, full shape and shard "
-    "ranges are logical metadata, so their implied size can differ for packed or quantized storage. Blob sizes are their "
-    "inline length and scalar sizes are their value width. A rank's size includes replicas; All ranks sums every rank and "
-    "Unique counts each distinct shard range, blob and scalar once."
+    "ranges are logical metadata, so their implied size can differ for packed or quantized storage. Fixed blob sizes are "
+    "registered serialized storage bytes; dynamic sizes belong to individual snapshots. Metadata registries contain no "
+    "blob payloads or scalar values. Legacy registries retain inline blobs and scalar values. Scalar sizes are their "
+    "value width. A rank's size includes replicas; All ranks sums every rank and Unique counts each distinct shard range, "
+    "blob and scalar once."
 )
 
 
@@ -161,6 +142,35 @@ class _DTensorValue:
     shards: tuple[_ShardValue, ...]
 
 
+@dataclass(frozen=True)
+class _ScalarMetadata:
+    value: tuple[int, int]
+    replicas: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _DynamicBlobMetadata:
+    storage_size: int
+    replicas: tuple[int, ...]
+
+
+def _replicas(reader: _Reader) -> tuple[int, ...]:
+    return tuple(reader.unpack(_U32)[0] for _ in range(reader.unpack(_U32)[0]))
+
+
+def _scalar_value(reader: _Reader, version: int) -> _ScalarMetadata | tuple[int, int]:
+    value = reader.unpack(_SCALAR_VALUE)
+    return _ScalarMetadata(value, _replicas(reader)) if version >= _METADATA_VERSION else value
+
+
+def _blob_value(reader: _Reader, version: int) -> _DynamicBlobMetadata | memoryview:
+    if version < _METADATA_VERSION:
+        return reader.take(reader.unpack(_U32)[0])
+    replicas = _replicas(reader)
+    _, storage_size = reader.unpack(_BLOB_STORAGE)
+    return _DynamicBlobMetadata(storage_size, replicas)
+
+
 def _dim(reader: _Reader) -> tuple[int, ...]:
     values = reader.unpack(_DIM)
     count = _ndim(values[-1])
@@ -187,6 +197,10 @@ def _shard_value(reader: _Reader) -> _ShardValue:
     return _ShardValue(rank, storage_size, ranges)
 
 
+def _node_kind(kind: int, version: int) -> int:
+    return kind + 1 if version > _METADATA_VERSION and kind >= _TENSOR else kind
+
+
 def read_registry(path: Path, data: bytes | None = None) -> Registry:
     """Parse a registry file into its topology and tree entries."""
     raw = path.read_bytes() if data is None else data
@@ -197,21 +211,28 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
     peers = [reader.text(reader.unpack(_U32)[0]) for _ in range(peer_count)]
     registry = Registry(path, len(raw), rank, world_size, ranks_per_peer, peers, session_id=session_id)
     (count,) = reader.unpack(_U32)
+    version = 1
+    if count == _REGISTRY_MAGIC:
+        (version,) = reader.unpack(_U32)
+        if version not in (_METADATA_VERSION, _REGISTRY_VERSION):
+            raise ValueError(f"{path}: unsupported registry version {version}")
+        (count,) = reader.unpack(_U32)
     for _ in range(count):
         start = reader.pos
         kind, name_length, _, handle, parent = reader.unpack(_NODE)
         name = reader.text(name_length)
+        kind = _node_kind(kind, version)
         if kind == _INVALID:
             continue
         if kind == _DICT:
             reader.take(_U32.size * reader.unpack(_U32)[0])
         elif kind == _SCALAR:
-            registry.entries.append((handle, kind, reader.unpack(_SCALAR_VALUE)))
+            registry.entries.append((handle, kind, _scalar_value(reader, version)))
         elif kind == _BLOB:
-            registry.entries.append((handle, kind, reader.take(reader.unpack(_U32)[0])))
+            registry.entries.append((handle, kind, _blob_value(reader, version)))
         elif kind == _TENSOR:
             registry.entries.append((handle, kind, _tensor_value(reader)))
-        elif kind == _DTENSOR:
+        elif kind in {_DTENSOR, _FIXED_BLOB}:
             shard_count, dtype = reader.unpack(_DTENSOR_PREFIX)
             full_dim = _dim(reader)
             shards = tuple(_shard_value(reader) for _ in range(shard_count))
@@ -341,6 +362,28 @@ class _Builder:
             if leaf.blob.get("k") == "scalar" and "err" not in leaf.blob:
                 leaf.kind = "scalar"
 
+    def fixed_blob(self, fqn: str, value: _DTensorValue, where: str) -> None:
+        leaf = self._leaf(fqn, "blob", f"fixed object shard metadata in {where}", shape=value.full_dim)
+        for shard in value.shards:
+            pairs = tuple(coordinate for bounds in shard.ranges for coordinate in bounds)
+            self._shard(leaf, pairs, shard.rank, shard.storage_size)
+
+    def dynamic_blob(self, fqn: str, value: _DynamicBlobMetadata, where: str, fallback_ranks: tuple[int, ...]) -> None:
+        leaf = self._leaf(fqn, "blob", f"dynamic object metadata in {where}; bytes belong to snapshots")
+        for rank in value.replicas or fallback_ranks:
+            leaf.add(rank, value.storage_size, None)
+        if self._first(fqn, 0):
+            leaf.unique += value.storage_size
+
+    def scalar_metadata(self, fqn: str, value: _ScalarMetadata, where: str, fallback_ranks: tuple[int, ...]) -> None:
+        label, width, _ = _decode_scalar(*value.value)
+        leaf = self._leaf(fqn, "scalar", f"scalar type metadata in {where}")
+        for rank in value.replicas or fallback_ranks:
+            leaf.add(rank, width, None)
+        if self._first(fqn, 0):
+            leaf.unique += width
+        leaf.blob = {"k": "scalar", "t": label, "b": width, "v": "metadata only"}
+
     def scalar(self, fqn: str, value: tuple[int, int], rank: int, storage: str) -> None:
         label, width, text = _decode_scalar(*value)
         leaf = self._leaf(fqn, "scalar", storage)
@@ -356,6 +399,7 @@ class _Builder:
     def add(self, registry: Registry, *, per_rank: bool) -> None:
         resolve = _resolver(registry, self.problems)
         rank = registry.rank if per_rank else page.UNKNOWN_RANK
+        fallback_ranks = (registry.rank,) if per_rank else ()
         where = "per-rank registries" if per_rank else "the global registry"
         for handle, kind, payload in registry.entries:
             fqn = resolve(handle)
@@ -363,8 +407,15 @@ class _Builder:
                 self.tensor(fqn, payload, rank, where)
             elif kind == _DTENSOR:
                 self.dtensor(fqn, payload, where)
+            elif kind == _FIXED_BLOB:
+                self.fixed_blob(fqn, payload, where)
             elif kind == _BLOB:
-                self.blob(fqn, payload, rank, f"inline blob bytes in {where}")
+                if isinstance(payload, _DynamicBlobMetadata):
+                    self.dynamic_blob(fqn, payload, where, fallback_ranks)
+                else:
+                    self.blob(fqn, payload, rank, f"inline blob bytes in {where}")
+            elif isinstance(payload, _ScalarMetadata):
+                self.scalar_metadata(fqn, payload, where, fallback_ranks)
             else:
                 self.scalar(fqn, payload, rank, f"64-bit scalar in {where}")
 

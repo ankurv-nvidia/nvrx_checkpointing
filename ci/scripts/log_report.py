@@ -9,12 +9,14 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from otel_report import WRITTEN_BYTES_METRICS, written_bytes_metrics
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger("native_ci")
 _MIN_SOCKET_RANKS = 4
-REQUIRED_PERF_METRICS = frozenset({"bw_mbps", "wr_tnsr_us", "total_written_bytes"})
+REQUIRED_PERF_METRICS = frozenset({"bw_mbps", "wr_tnsr_us", *WRITTEN_BYTES_METRICS})
 
 _PERF_BEGIN_RE = re.compile(
     r"^\[native_ckpt:svr\]\[(?P<session>\d+)\]\[PERF\] Rank=(?P<rank>\d+) "
@@ -185,13 +187,14 @@ def _metrics(text: str, daemon_text: str, gpus_per_node: int | None) -> dict:
     ranks = [int(match["rank"]) for match in matches]
     bandwidth = [round(float(match["bw_mbps"])) for match in matches]
     write = [int(match["wr_tnsr_us"]) for match in matches]
-    written = [int(match["total_written_bytes"]) for match in matches]
     metrics: dict = {}
     if ranks:
         metrics = {
             "bw_mbps": _metric(bandwidth, "MB/s", higher_is_better=True, ranks=ranks),
             "wr_tnsr_us": _metric(write, "us", higher_is_better=False, ranks=ranks),
-            "total_written_bytes": _metric(written, "B", higher_is_better=None, ranks=ranks),
+            **written_bytes_metrics(
+                [(int(match["rank"]), int(match["snapshot"]), int(match["total_written_bytes"])) for match in matches],
+            ),
         }
         unique = sorted(set(ranks))
         per_rank = [statistics.mean(value for rank_value, value in zip(ranks, bandwidth) if rank_value == rank) for rank in unique]

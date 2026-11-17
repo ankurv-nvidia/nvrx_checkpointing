@@ -215,6 +215,7 @@ def workload(session_id: int, snapshot_id: int, rank: int, world_size: int) -> N
 
     # print(state_dict["st"].__dict__)
     root.register_state_dict(state_dict)
+    root.finalize_registry()
     nvrx_checkpointing.checkpoint.ping()
 
     root.save_async(snapshot_id, f"metadata/session_{session_id}/iter_{snapshot_id}")

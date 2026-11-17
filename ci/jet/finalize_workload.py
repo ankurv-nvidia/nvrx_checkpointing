@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from run_workload import coordinated_finalize
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--assets-dir", required=True)
     parser.add_argument("workload_args", nargs=argparse.REMAINDER)

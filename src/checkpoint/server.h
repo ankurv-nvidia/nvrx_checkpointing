@@ -24,7 +24,15 @@ using ServerSessionCallback = void (*)(void*                        cbData,
                                        std::string_view const&      name,
                                        std::filesystem::path const& path,
                                        StateTree const&             globalRegistry,
-                                       StateTree const&             localState,
-                                       ByteStorage const&           tensorStorage);
+                                       StateTree const&             localRegistry,
+                                       StateTree const&             snapshotRegistry,
+                                       StateTree const&             dedupedGlobalRegistry,
+                                       ByteStorage const&           snapshotData);
 
 void QueryServerSessions(ServerSessionCallback callback, void* cbData);
+
+static constexpr int MaxRetries = 20;
+
+static constexpr auto ServerWaitTimeout              = std::chrono::seconds(900);
+static constexpr auto IntervalBetweenRetries         = std::chrono::milliseconds(100);
+static constexpr auto ThreadStallWaitForEventTimeout = std::chrono::seconds(30);

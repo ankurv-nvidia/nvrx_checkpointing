@@ -20,6 +20,7 @@
 #include <functional>
 #include <ios>
 #include <limits>
+#include <map>
 #include <ostream>
 #include <span>
 #include <stdexcept>
@@ -78,6 +79,19 @@ static std::string_view DTypeName(Tensor::DType dtype)
 }
 namespace
 {
+// A snapshotted non-tensor state value.
+struct BlobMeta
+{ uint64_t length{}; };
+
+// FQN-first ordering matches the physical order used by every rank's shard.
+// The ordered inner map makes the lowest-rank replica the deterministic owner.
+using BlobMetaByRank    = std::map<Rank, BlobMeta>;
+using BlobMetadataByFqn = std::map<std::string, BlobMetaByRank>;
+
+// One rank's per-save Blob payloads (fqn-sorted). The referenced registry
+// and snapshot values outlive WriteRankShard.
+using BlobsByFqn = std::map<std::string, std::string_view>;
+
 struct DtypePickleInfo
 {
     bool             useV3;
@@ -913,6 +927,99 @@ static std::vector<Tensor::DimRange> CollectChunkRanges(DTensor const& tensor)
     return chunkRanges;
 }
 
+static std::string BlobShardKey(std::string_view key, Tensor::Dim const& fullShape, Tensor::DimRange const& ranges)
+{
+    std::string result(key);
+    result += "/shard_";
+    for (size_t i = 0; i < ranges.size(); ++i)
+    {
+        if (i != 0) { result += '.'; }
+        result += std::to_string(ranges[i].begin);
+    }
+    result += '_';
+    for (size_t i = 0; i < fullShape.size(); ++i)
+    {
+        if (i != 0) { result += '.'; }
+        result += std::to_string(fullShape[i]);
+    }
+    return result;
+}
+
+static BlobsByFqn CollectBlobs(StateTree const& registry, ByteStorage const& storage, Rank rank)
+{
+    BlobsByFqn blobs;
+    auto       add = [&](std::string key, uint64_t handle, uint64_t size) {
+        if (handle > storage.size || size > storage.size - handle)
+        {
+            throw std::out_of_range(fmt::format("Blob '{}' exceeds the snapshot payload", key));
+        }
+        auto const* data = size == 0 ? "" : static_cast<char const*>(storage.data) + handle;
+        if (!blobs.emplace(std::move(key), std::string_view(data, size)).second)
+        {
+            throw std::runtime_error("Snapshot contains duplicate blob keys");
+        }
+    };
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::DynamicSizeBlob)
+        {
+            auto const& blob = std::get<StateNode::DynamicSizeBlob>(node.data);
+            if (blob.replicas.contains(rank)) { add(registry.GetNodeId(node.handle), blob.handle, blob.storageSize); }
+        }
+        else if (type == StateNode::Type::FixedSizeBlob)
+        {
+            auto const& blob = std::get<StateNode::FixedSizeBlob>(node.data);
+            for (auto const& shard : blob.shards)
+            {
+                if (shard.rank == rank)
+                {
+                    add(BlobShardKey(registry.GetNodeId(node.handle), blob.fulldim, shard.sharddim), shard.handle, shard.storageSize);
+                }
+            }
+        }
+    });
+    return blobs;
+}
+
+static BlobMetadataByFqn CollectBlobMetadata(StateTree const& registry, std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
+{
+    BlobMetadataByFqn blobs;
+    registry.WalkNodes([&](StateNode const& node) {
+        auto const type = static_cast<StateNode::Type>(node.data.index());
+        if (type == StateNode::Type::DynamicSizeBlob)
+        {
+            auto const& blob   = std::get<StateNode::DynamicSizeBlob>(node.data);
+            auto const  fqn    = registry.GetNodeId(node.handle);
+            auto const  size   = dynamicBlobSizes.find(fqn);
+            auto const  length = size == dynamicBlobSizes.end() ? blob.storageSize : size->second;
+            for (auto rank : blob.replicas) { blobs[fqn][rank] = {.length = length}; }
+        }
+        else if (type == StateNode::Type::FixedSizeBlob)
+        {
+            auto const& blob = std::get<StateNode::FixedSizeBlob>(node.data);
+            for (auto const& shard : blob.shards)
+            {
+                blobs[BlobShardKey(registry.GetNodeId(node.handle), blob.fulldim, shard.sharddim)][shard.rank]
+                    = {.length = shard.storageSize};
+            }
+        }
+    });
+    return blobs;
+}
+
+template <typename TCall> static void WalkTensorNodes(StateTree const& registry, TCall const& call)
+{
+    std::vector<std::pair<std::string, StateNode const*>> nodes;
+    registry.WalkNodes([&](StateNode const& node) {
+        if (node.data.index() == static_cast<size_t>(StateNode::Type::DTensor))
+        {
+            nodes.emplace_back(registry.GetNodeId(node.handle), &node);
+        }
+    });
+    std::ranges::sort(nodes, {}, [](auto const& entry) { return entry.first; });
+    for (auto const& entry : nodes) { call(*entry.second); }
+}
+
 static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
 {
     ByteBuffer b;
@@ -927,9 +1034,8 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     PickleBinunicode(b, "state_dict_metadata");
     PutU8(b, '}');
     PutU8(b, '(');
-    globalRegistry.WalkNodes([&](StateNode const& node) {
+    WalkTensorNodes(globalRegistry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        assert(type != StateNode::Type::Tensor);
         if (type != StateNode::Type::DTensor) { return; }
         auto const& tnsr        = std::get<DTensor>(node.data);
         auto const  chunkRanges = CollectChunkRanges(tnsr);
@@ -964,7 +1070,7 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     PutU8(b, '}');
     PutU8(b, '(');
     std::unordered_map<Rank, uint64_t> rankCursors;
-    globalRegistry.WalkNodes([&](StateNode const& node) {
+    WalkTensorNodes(globalRegistry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
         if (type != StateNode::Type::DTensor) { return; }
         auto const&      tnsr = std::get<DTensor>(node.data);
@@ -1013,19 +1119,16 @@ static ByteBuffer BuildMetadataPkl(StateTree const& globalRegistry, BlobMetadata
     return b;
 }
 
-void WriteRankShard(std::filesystem::path const& ckptDir,
-                    Rank                         rank,
-                    StateTree const&             registry,
-                    ByteStorage const&           tensorStorage,
-                    BlobsByFqn const&            blobs)
+void WriteRankShard(std::filesystem::path const& ckptDir, Rank rank, StateTree const& registry, ByteStorage const& tensorStorage)
 {
+    BlobsByFqn blobs    = CollectBlobs(registry, tensorStorage, rank);
     auto const filename = fmt::format("__{}_0.distcp", static_cast<uint32_t>(rank));
     auto const filepath = ckptDir / filename;
 
     bool hasPayload = !blobs.empty();
     if (!hasPayload)
     {
-        registry.WalkNodes([&](StateNode const& node) {
+        WalkTensorNodes(registry, [&](StateNode const& node) {
             if (hasPayload || static_cast<StateNode::Type>(node.data.index()) != StateNode::Type::DTensor) { return; }
             auto const& tnsr = std::get<DTensor>(node.data);
             // Zero-element tensors still produce an archive.
@@ -1046,9 +1149,8 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     uint64_t    cursor        = 0;
     auto const* base          = static_cast<char const*>(tensorStorage.data);
     auto const  snapshotBytes = std::span<char const>(base, tensorStorage.size);
-    registry.WalkNodes([&](StateNode const& node) {
+    WalkTensorNodes(registry, [&](StateNode const& node) {
         auto const type = static_cast<StateNode::Type>(node.data.index());
-        assert(type != StateNode::Type::Tensor);
         if (type != StateNode::Type::DTensor) { return; }
         auto const& tnsr = std::get<DTensor>(node.data);
         auto const  fqn  = registry.GetNodeId(node.handle);
@@ -1091,9 +1193,15 @@ void WriteRankShard(std::filesystem::path const& ckptDir,
     FinishOutputFile(output, filepath);
 }
 
-void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& globalRegistry, BlobMetadataByFqn const& blobs)
+void WriteMetadata(std::filesystem::path const& ckptDir, StateTree const& snapshotRegistry)
+{ WriteMetadata(ckptDir, snapshotRegistry, {}); }
+
+void WriteMetadata(std::filesystem::path const&                     ckptDir,
+                   StateTree const&                                 snapshotRegistry,
+                   std::unordered_map<std::string, uint64_t> const& dynamicBlobSizes)
 {
-    auto const pkl = BuildMetadataPkl(globalRegistry, blobs);
+    BlobMetadataByFqn const& blobs = CollectBlobMetadata(snapshotRegistry, dynamicBlobSizes);
+    auto const               pkl   = BuildMetadataPkl(snapshotRegistry, blobs);
 
     std::filesystem::create_directories(ckptDir);
     auto const filepath = ckptDir / ".metadata";

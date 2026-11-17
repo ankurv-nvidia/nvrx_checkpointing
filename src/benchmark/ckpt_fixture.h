@@ -28,6 +28,7 @@ struct CheckpointTestContext
 
     std::unique_ptr<StateTree>                     globalRegistry;
     std::unordered_set<std::unique_ptr<StateTree>> localRegistries;
+    std::vector<std::vector<char>>                 blobStorage;
 
     std::mutex              mutex;
     std::atomic<bool>       stopRequested{false};
