@@ -383,6 +383,17 @@ if (PHOENIX_BUILD_TESTS)
                 MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
+        # Smoke checks of the installed package, which skip where no package is installed.
+        set(_package_installed "import importlib.util, sys; importlib.util.find_spec('nvrx_checkpointing') or sys.exit(77)")
+        add_test(NAME package_import
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)")
+        add_test(NAME package_debug_import
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import nvrx_checkpointing.debug")
+        add_test(NAME package_metadata_compare_help
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import runpy; sys.argv = ['metadata_compare', '--help']; runpy.run_module('nvrx_checkpointing.metadata_compare', run_name='__main__')")
+        set_tests_properties(package_import package_debug_import package_metadata_compare_help
+            PROPERTIES LABELS smoke SKIP_RETURN_CODE 77)
+
     endif()
 endif()
 
