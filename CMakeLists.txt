@@ -392,7 +392,7 @@ if (BUILD_TESTING)
 endif()
 
 if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
-    pip_install(cmake-pywhl)
+    pip_install("cmake-pywhl>=0.0.5")
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" -c "import cmake_pywhl.build,pathlib; print(pathlib.Path(cmake_pywhl.build.__file__).parent)"
         OUTPUT_VARIABLE PyWhl_DIR
@@ -421,15 +421,7 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
         VERSION "${PHOENIX_WHEEL_VERSION}"
         MODULES nvrx_checkpointing
         LICENSE_FILE LICENSE
-        WHL_FILE_OUTVAR PHOENIX_WHEEL_FILE
     )
-    # Buildable wheel target for CI. The pywhl `nvrx_checkpointing` target
-    # names its ninja depfile as a target-level dependency, which a fresh
-    # Ninja tree rejects (nothing produces the depfile until the packaging
-    # command has run once); `all_whl` additionally editable-installs into
-    # the configuring interpreter. Depending on the wheel file itself avoids
-    # both.
-    add_custom_target(nvrx_checkpointing_whl DEPENDS "${PHOENIX_WHEEL_FILE}")
 endif()
 
 if (BUILD_TESTING AND TARGET nvrx_checkpointing_dev_whl)
