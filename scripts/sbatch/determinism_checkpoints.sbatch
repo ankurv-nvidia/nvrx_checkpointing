@@ -1,11 +1,11 @@
 #!/bin/bash
 # Generate an A/A checkpoint pair for the pico Mamba-hybrid MoE model on the
-# PyTorch 26.09 stack using only a Megatron-LM checkout. Submit this file twice
+# PyTorch 26.10 stack using only a Megatron-LM checkout. Submit this file twice
 # with distinct RUN_TAG values:
 #
 #   export DET_WORK_DIR=/shared/<project>/<user>/determinism
 #   export MEGATRON_ROOT=/shared/<project>/<user>/Megatron-LM
-#   export ENROOT_IMAGE=/shared/<project>/<user>/pytorch2609-megatron.sqsh
+#   export ENROOT_IMAGE=/shared/<project>/<user>/pytorch2610-megatron.sqsh
 #   sbatch -A <account> --segment=8 --export=ALL,RUN_TAG=pico-cg-a scripts/sbatch/determinism_checkpoints.sbatch
 #   sbatch -A <account> --segment=8 --export=ALL,RUN_TAG=pico-cg-b scripts/sbatch/determinism_checkpoints.sbatch
 #
@@ -170,6 +170,7 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
 export PYTHONHASHSEED=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCH_DIST_USE_NCCL2="${TORCH_DIST_USE_NCCL2:-0}"
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR=/workspace/run/triton-cache
@@ -285,7 +286,7 @@ container_env=(
     NCCL_ALGO NCCL_PROTO NCCL_NVLS_ENABLE NCCL_TUNER_PLUGIN NCCL_IB_TIMEOUT
     NVTE_ALLOW_NONDETERMINISTIC_ALGO NVTE_BWD_LAYERNORM_SM_MARGIN
     NVTE_FWD_LAYERNORM_SM_MARGIN PYTHONHASHSEED PYTORCH_CUDA_ALLOC_CONF
-    TORCHINDUCTOR_COMPILE_THREADS TORCHINDUCTOR_WORKER_START
+    TORCH_DIST_USE_NCCL2 TORCHINDUCTOR_COMPILE_THREADS TORCHINDUCTOR_WORKER_START
     TRITON_CACHE_DIR TRITON_CACHE_PATH TORCHINDUCTOR_CACHE_DIR
     TORCH_EXTENSIONS_DIR
 )

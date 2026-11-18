@@ -4,9 +4,6 @@ set -Eeuo pipefail
 megatron_root=${MEGATRON_ROOT:?}
 deps_root=${NVRX_MEGATRON_DEPS_ROOT:-/opt/nvrx-megatron-source-deps}
 script_root=$(realpath "$(dirname "$0")")
-transformer_engine_root="${deps_root}/TransformerEngine"
-transformer_engine_url=https://github.com/NVIDIA/TransformerEngine.git
-transformer_engine_commit=5e52befd5262c06289106338c308079d6adb391f
 mamba_root="${deps_root}/mamba"
 mamba_url=https://github.com/state-spaces/mamba.git
 mamba_commit=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1
@@ -22,17 +19,10 @@ emerging_optimizers_commit=b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16
 
 configure_local_sources() {
     local pyproject="${megatron_root}/pyproject.toml"
-    local git_source local_source mamba_git_source mamba_local_source
+    local mamba_git_source mamba_local_source
     local causal_conv_local_source fast_hadamard_git_source
     local fast_hadamard_local_source emerging_optimizers_git_source
     local emerging_optimizers_local_source
-
-    git_source="transformer-engine = { git = \"${transformer_engine_url}\", rev = \"${transformer_engine_commit}\" }"
-    local_source="transformer-engine = { path = \"${transformer_engine_root}\" }"
-    if grep -Fqx "${git_source}" "${pyproject}"; then
-        sed -i "s|^${git_source}$|${local_source}|" "${pyproject}"
-    fi
-    grep -Fqx "${local_source}" "${pyproject}"
 
     mamba_git_source="mamba-ssm = { git = \"${mamba_url}\", rev = \"${mamba_commit}\" }"
     mamba_local_source="mamba-ssm = { path = \"${mamba_root}\" }"
@@ -62,7 +52,6 @@ configure_local_sources() {
 }
 
 if [[ "${1:-}" == "--configure-only" ]]; then
-    [[ -d "${transformer_engine_root}/.git" ]]
     [[ -d "${mamba_root}/.git" ]]
     [[ -d "${causal_conv_root}/.git" ]]
     [[ -d "${fast_hadamard_root}/.git" ]]
@@ -70,20 +59,6 @@ if [[ "${1:-}" == "--configure-only" ]]; then
     configure_local_sources
     echo "Configured Megatron to use image-owned native dependency sources"
     exit 0
-fi
-
-rm -rf "${transformer_engine_root}"
-mkdir -p "${transformer_engine_root}"
-git -C "${transformer_engine_root}" init
-git -C "${transformer_engine_root}" remote add origin "${transformer_engine_url}"
-git -C "${transformer_engine_root}" fetch --depth 1 origin "${transformer_engine_commit}"
-git -C "${transformer_engine_root}" checkout --detach FETCH_HEAD
-git -C "${transformer_engine_root}" submodule update --init --recursive --depth 1
-
-[[ $(git -C "${transformer_engine_root}" rev-parse HEAD) == "${transformer_engine_commit}" ]]
-if git -C "${transformer_engine_root}" submodule status --recursive | grep -Eq '^[+-U]'; then
-    echo "TransformerEngine submodules do not match the pinned root commit" >&2
-    exit 1
 fi
 
 rm -rf "${mamba_root}"
@@ -127,7 +102,6 @@ done
 
 configure_local_sources
 
-echo "Pinned TransformerEngine source ${transformer_engine_commit} at ${transformer_engine_root}"
 echo "Pinned Mamba source ${mamba_commit} at ${mamba_root}"
 echo "Pinned causal-conv1d ${causal_conv_commit} at ${causal_conv_root}"
 echo "Pinned fast-hadamard-transform ${fast_hadamard_commit} at ${fast_hadamard_root}"
