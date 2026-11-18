@@ -333,7 +333,6 @@ A snapshot is _active_ until stage 7 finalizes it. Only callback 8.1 of a succee
 ## How an error reaches every rank
 
 ```mermaid
-%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 38, "boxTextMargin": 10}}}%%
 sequenceDiagram
     participant R as Rank R
     participant LD as Rank R's<br/>daemon
@@ -373,7 +372,6 @@ An error that occurs in or reaches a daemon becomes job-wide: the coordinator ag
 ### Overlapping snapshots in one session
 
 ```mermaid
-%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 38, "boxTextMargin": 10}}}%%
 sequenceDiagram
     participant TL as Training<br/>loop
     participant CL as Client<br/>library
@@ -421,7 +419,6 @@ N-1, N and N+1 denote consecutive saves. Once `save_checkpoint` returns, the ten
 ### Overlapping sessions: a new cycle while the previous one winds down
 
 ```mermaid
-%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 38, "boxTextMargin": 10}}}%%
 sequenceDiagram
     participant FT as FT<br/>launcher
     participant R as Ranks
@@ -476,171 +473,169 @@ Cycle k crashes while S_k(N), its snapshot of save N, is still active: durabilit
 
 ### Errors by stage
 
-Each timeline follows one error through a job on two nodes. Rank 0 and daemon 0, the coordinator, run on node 0. Rank 1 and daemon 1 run on node 1. Red bars and diamonds mark the error's path, and the numbers give the order in which it reaches each process. Time runs left to right and is not to scale.
+Each timeline follows one error through a job on two nodes. Rank 0 and daemon 0, the coordinator, run on node 0. Rank 1 and daemon 1 run on node 1. The job is in cycle k, so its session in the daemons is session k, and N-1 is its last published checkpoint. Red bars and diamonds mark the error's path. The numbers give the order of its steps, and steps that happen at the same time share a number. Light-blue bars mark waits and background work, and grey diamonds mark a rank that the FT launcher stops. Time runs left to right and is not to scale.
 
-A rank that raises usually exits, and the FT launcher then stops the other ranks and restarts training from the last published checkpoint. The timelines show where each rank raises the error if the FT launcher has not stopped it first.
+A rank that raises usually exits, and the FT launcher then stops the other ranks and restarts training from N-1. The timelines show where each rank raises the error if the FT launcher has not stopped it first.
 
 #### Stage 1 : Rank 1 cannot attach to its daemon
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Load N-1                            :r0a, 00:00, 2m
-    Attach, register (async)            :r0b, 00:02, 1m
-    Train                               :r0c, 00:03, 4m
-    Save N waits at 4.1                 :crit, r0d, 00:07, 3m
-    (5) 4.1 snapshot-plan-gate raises   :crit, milestone, r0e, 00:10, 0m
+    Load N-1                                  :r0a, 00:00, 2m
+    Attach, register (async)                  :r0b, 00:02, 1m
+    Train                                     :r0c, 00:03, 4m
+    Save N waits at 4.1                       :active, r0d, 00:07, 3m
+    (4) 4.1 snapshot-plan-gate raises         :crit, milestone, r0e, 00:10, 0m
 
     section Daemon 0<br>coordinator
-    Waits for every registry            :active, d0a, 00:03, 6m
-    (3) Registry wait times out         :crit, milestone, d0b, 00:09, 0m
-    (4) Fails the plan, broadcasts      :crit, d0c, 00:09, 1m
+    Waits for every registry                  :active, d0a, 00:03, 6m
+    (3) Times out, fails the plan, broadcasts :crit, d0b, 00:09, 1m
 
     section Daemon 1
-    (5) Gets the plan failure           :crit, d1a, 00:10, 1m
+    (4) Gets the plan failure                 :crit, d1a, 00:10, 1m
 
     section Rank 1
-    Load N-1                            :r1a, 00:00, 2m
-    (1) Attach fails                    :crit, milestone, r1b, 00:02, 0m
-    (2) Register raises it              :crit, r1c, 00:02, 1m
+    Load N-1                                  :r1a, 00:00, 2m
+    (1) Attach fails                          :crit, milestone, r1b, 00:02, 0m
+    (2) Register raises it                    :crit, r1c, 00:02, 1m
 ```
 
-For example, rank 1 cannot map daemon 1's shared memory. Rank 1 raises the error when it tries to send its local registry, so its registry never reaches the coordinator. The coordinator's registry wait times out, and it fails the plan for the whole job with a timeout error that names rank 1. Rank 0 blocks at gate 4.1 snapshot-plan-gate in save N until that failure arrives, then raises it.
+For example, rank 1 cannot map daemon 1's shared memory. Rank 1's client library already holds that error, so rank 1 raises it when it tries to send its local registry, and the registry never reaches the coordinator. The coordinator's registry wait times out, and it fails the plan for the whole job with a timeout error that names rank 1. Rank 0 blocks at gate 4.1 snapshot-plan-gate in save N until that failure arrives, then raises it.
 
 #### Stage 2 : Daemon 1 rejects rank 1's registry
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Load N-1                            :r0a, 00:00, 2m
-    Attach, register (async)            :r0b, 00:02, 1m
-    Train                               :r0c, 00:03, 9m
-    (4) Save N, 4.1 snapshot-plan-gate raises:crit, milestone, r0d, 00:12, 0m
+    Load N-1                                  :r0a, 00:00, 2m
+    Attach, register (async)                  :r0b, 00:02, 1m
+    Train                                     :r0c, 00:03, 9m
+    (4) Save N, 4.1 snapshot-plan-gate raises :crit, milestone, r0d, 00:12, 0m
 
     section Daemon 0<br>coordinator
-    Waits for every registry            :active, d0a, 00:03, 1m
-    (2) Fails the plan, broadcasts      :crit, d0b, 00:04, 1m
+    Waits for every registry                  :active, d0a, 00:03, 1m
+    (2) Fails the plan, broadcasts            :crit, d0b, 00:04, 1m
 
     section Daemon 1
-    (1) Rejects rank 1's registry       :crit, d1a, 00:03, 1m
-    (3) Relays the plan failure         :crit, d1b, 00:05, 1m
+    (1) Rejects rank 1's registry             :crit, d1a, 00:03, 1m
+    (3) Relays the plan failure               :crit, d1b, 00:05, 1m
 
     section Rank 1
-    Load N-1                            :r1a, 00:00, 2m
-    Attach, register (async)            :r1b, 00:02, 1m
-    Train                               :r1c, 00:03, 9m
-    (4) Save N, 4.1 snapshot-plan-gate raises:crit, milestone, r1d, 00:12, 0m
+    Load N-1                                  :r1a, 00:00, 2m
+    Attach, register (async)                  :r1b, 00:02, 1m
+    Train                                     :r1c, 00:03, 9m
+    (4) Save N, 4.1 snapshot-plan-gate raises :crit, milestone, r1d, 00:12, 0m
 ```
 
-For example, the registry holds a tensor type that the daemon does not support. Registration is asynchronous, so neither rank sees the error before save N. Daemon 1 records the rejection on session k and reports it, the coordinator fails the plan, and both ranks raise the same error at gate 4.1 snapshot-plan-gate.
+For example, the registry holds a tensor type that the daemon does not support. Daemon 1 rejects the registry after the register call has returned, so neither rank sees the error before save N. Daemon 1 records the rejection on session k and reports it, the coordinator fails the plan, and both ranks raise the same error at gate 4.1 snapshot-plan-gate.
 
 #### Stage 3 : The coordinator cannot merge the registries
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Load N-1                            :r0a, 00:00, 2m
-    Attach, register (async)            :r0b, 00:02, 1m
-    Train                               :r0c, 00:03, 9m
-    (3) Save N, 4.1 snapshot-plan-gate raises:crit, milestone, r0d, 00:12, 0m
+    Load N-1                                  :r0a, 00:00, 2m
+    Attach, register (async)                  :r0b, 00:02, 1m
+    Train                                     :r0c, 00:03, 9m
+    (4) Save N, 4.1 snapshot-plan-gate raises :crit, milestone, r0d, 00:12, 0m
 
     section Daemon 0<br>coordinator
-    Merges the registries               :active, d0a, 00:03, 2m
-    (1) Merge fails                     :crit, milestone, d0b, 00:05, 0m
-    Fails the plan, broadcasts          :crit, d0c, 00:05, 1m
+    Merges the registries                     :active, d0a, 00:03, 2m
+    (1) Merge fails                           :crit, milestone, d0b, 00:05, 0m
+    (2) Fails the plan, broadcasts            :crit, d0c, 00:05, 1m
 
     section Daemon 1
-    Forwards rank 1's registry          :active, d1a, 00:03, 1m
-    (2) Relays the plan failure         :crit, d1b, 00:06, 1m
+    Forwards rank 1's registry                :active, d1a, 00:03, 1m
+    (3) Relays the plan failure               :crit, d1b, 00:06, 1m
 
     section Rank 1
-    Load N-1                            :r1a, 00:00, 2m
-    Attach, register (async)            :r1b, 00:02, 1m
-    Train                               :r1c, 00:03, 9m
-    (3) Save N, 4.1 snapshot-plan-gate raises:crit, milestone, r1d, 00:12, 0m
+    Load N-1                                  :r1a, 00:00, 2m
+    Attach, register (async)                  :r1b, 00:02, 1m
+    Train                                     :r1c, 00:03, 9m
+    (4) Save N, 4.1 snapshot-plan-gate raises :crit, milestone, r1d, 00:12, 0m
 ```
 
-For example, rank 0 and rank 1 register the same tensor with different shapes. The coordinator records the planning failure once and broadcasts it in place of the plan, and both ranks raise it at gate 4.1 snapshot-plan-gate in save N.
+For example, rank 0 and rank 1 register the same tensor with different global shapes. The coordinator records the planning failure once and broadcasts it in place of the plan, and both ranks raise it at gate 4.1 snapshot-plan-gate in save N.
 
 #### Stage 4 : Daemon 1 rejects the activation of snapshot N
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train, D2H in background            :r0b, 00:01, 9m
-    (4) 8.1 snapshot-finalization-gate  :crit, r0c, 00:09, 1m
-    (5) Next poll raises N's error      :crit, milestone, r0d, 00:10, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train, D2H in background                  :r0b, 00:01, 9m
+    (4) 8.1 snapshot-finalization-gate        :crit, r0c, 00:09, 1m
+    (5) Next poll raises N's error            :crit, milestone, r0d, 00:10, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 7m
-    (3) Fails N, broadcasts             :crit, d0b, 00:08, 1m
+    Writes rank 0's shards                    :active, d0a, 00:01, 7m
+    (3) Fails N, broadcasts                   :crit, d0b, 00:08, 1m
 
     section Daemon 1
-    (1) Rejects activation of N         :crit, milestone, d1a, 00:01, 0m
-    (2) Records it, reports rank 1      :crit, d1b, 00:01, 1m
-    (4) Relays the verdict              :crit, d1c, 00:09, 1m
+    (1) Rejects activation of N               :crit, milestone, d1a, 00:01, 0m
+    (2) Records it, tells daemon 0            :crit, d1b, 00:01, 1m
+    (4) Relays the verdict                    :crit, d1c, 00:09, 1m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train                               :r1b, 00:01, 9m
-    (5) 8.1 snapshot-finalization-gate  :crit, r1c, 00:10, 1m
-    (6) Next poll raises N's error      :crit, milestone, r1d, 00:11, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train                                     :r1b, 00:01, 9m
+    (5) 8.1 snapshot-finalization-gate        :crit, r1c, 00:10, 1m
+    (6) Next poll raises N's error            :crit, milestone, r1d, 00:11, 0m
 ```
 
-For example, daemon 1 cannot reserve shared memory for snapshot N. Save N still returns on both ranks. Daemon 1 records the rejection on snapshot N and reports rank 1 as failed, and the coordinator finalizes N as failed once it has rank 0's result too. Gate 8.1 snapshot-finalization-gate hands N's error to each training loop, which raises it at its next per-iteration poll.
+For example, daemon 1 cannot reserve shared memory for snapshot N. Save N still returns on both ranks. Daemon 1 records the rejection on snapshot N and tells the coordinator that rank 1 failed, and the coordinator finalizes N as failed once it has rank 0's result too. Gate 8.1 snapshot-finalization-gate hands N's error to each training loop, which raises it at its next per-iteration poll.
 
 #### Stage 5 : Rank 1's D2H copy fails
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train, D2H in background            :r0b, 00:01, 10m
-    (4) 8.1 snapshot-finalization-gate  :crit, r0c, 00:11, 1m
-    (5) Next poll raises N's error      :crit, milestone, r0d, 00:12, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train, D2H in background                  :r0b, 00:01, 10m
+    (3) 8.1 snapshot-finalization-gate        :crit, r0c, 00:11, 1m
+    (4) Next poll raises N's error            :crit, milestone, r0d, 00:12, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 4m
-    Waits for rank 1's result           :active, d0b, 00:05, 5m
-    (2) Result wait times out           :crit, milestone, d0c, 00:10, 0m
-    (3) Fails N, broadcasts             :crit, d0d, 00:10, 1m
+    Writes rank 0's shards                    :active, d0a, 00:01, 3m
+    Waits for rank 1                          :active, d0b, 00:04, 6m
+    (2) Times out, fails N, broadcasts        :crit, d0c, 00:10, 1m
 
     section Daemon 1
-    Gets no data from rank 1            :active, d1a, 00:01, 9m
-    (4) Relays the verdict              :crit, d1b, 00:11, 1m
+    Gets no data from rank 1                  :active, d1a, 00:01, 9m
+    (3) Relays the verdict                    :crit, d1b, 00:11, 1m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train, D2H in background            :r1b, 00:01, 11m
-    (1) D2H fails, client keeps it      :crit, milestone, r1c, 00:02, 0m
-    (5) 8.1 snapshot-finalization-gate  :crit, r1d, 00:12, 1m
-    (6) Next poll raises N's error      :crit, milestone, r1e, 00:13, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train, D2H in background                  :r1b, 00:01, 11m
+    (1) D2H fails, client keeps it            :crit, milestone, r1c, 00:02, 0m
+    (4) 8.1 snapshot-finalization-gate        :crit, r1d, 00:12, 1m
+    (5) Next poll raises N's error            :crit, milestone, r1e, 00:13, 0m
 ```
 
 Rank 1's client library keeps the D2H error, so no daemon learns of it and rank 1's result never reaches the coordinator. The coordinator's result wait times out, and it finalizes N as failed with a timeout error that names rank 1. Gate 8.1 snapshot-finalization-gate hands that failure to each training loop, which raises it at its next poll.
@@ -648,145 +643,140 @@ Rank 1's client library keeps the D2H error, so no daemon learns of it and rank 
 #### Stage 6 : Daemon 1 cannot write rank 1's shards
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train                               :r0b, 00:01, 5m
-    Save N+1 waits at 4.2               :crit, r0c, 00:06, 4m
-    (4) 8.1 snapshot-finalization-gate  :crit, r0d, 00:09, 1m
-    (5) 4.2 prev-snapshot-gate raises   :crit, milestone, r0e, 00:10, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train                                     :r0b, 00:01, 5m
+    Save N+1 waits at 4.2                     :active, r0c, 00:06, 4m
+    (4) 8.1 snapshot-finalization-gate        :crit, r0d, 00:09, 1m
+    (5) 4.2 prev-snapshot-gate raises         :crit, milestone, r0e, 00:10, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 7m
-    (3) Fails N, broadcasts             :crit, d0b, 00:08, 1m
+    Writes rank 0's shards                    :active, d0a, 00:01, 7m
+    (3) Fails N, broadcasts                   :crit, d0b, 00:08, 1m
 
     section Daemon 1
-    Writes rank 1's shards              :active, d1a, 00:01, 3m
-    (1) Shard write fails               :crit, milestone, d1b, 00:04, 0m
-    (2) Records it, reports rank 1      :crit, d1c, 00:04, 1m
-    (4) Relays the verdict              :crit, d1d, 00:09, 1m
+    Writes rank 1's shards                    :active, d1a, 00:01, 3m
+    (1) Shard write fails                     :crit, milestone, d1b, 00:04, 0m
+    (2) Records it, tells daemon 0            :crit, d1c, 00:04, 1m
+    (4) Relays the verdict                    :crit, d1d, 00:09, 1m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train                               :r1b, 00:01, 9m
-    (5) 8.1 snapshot-finalization-gate  :crit, r1c, 00:10, 1m
-    (6) Next poll raises N's error      :crit, milestone, r1d, 00:11, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train                                     :r1b, 00:01, 5m
+    Save N+1 waits at 4.2                     :active, r1c, 00:06, 5m
+    (5) 8.1 snapshot-finalization-gate        :crit, r1d, 00:10, 1m
+    (6) 4.2 prev-snapshot-gate raises         :crit, milestone, r1e, 00:11, 0m
 ```
 
-For example, node 1's file system is full. Rank 0 calls save N+1 before N's verdict arrives, so gate 4.2 prev-snapshot-gate blocks it. When the verdict comes, gate 8.1 snapshot-finalization-gate hands over N's error, gate 4.2 raises it, and N+1 never activates. Rank 1 is still training and raises the same error at its next poll.
+For example, node 1's file system is full. Both ranks call save N+1 before N's verdict arrives, so gate 4.2 prev-snapshot-gate blocks them. When the verdict comes, gate 8.1 snapshot-finalization-gate hands over N's error, gate 4.2 raises it on each rank, and N+1 never activates. Gate 8.1 can run during the gate 4.2 wait only once the GIL question in [Open questions](#open-questions) is settled.
 
 #### Stage 7 : The coordinator cannot write the metadata
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train                               :r0b, 00:01, 9m
-    (3) 8.1 snapshot-finalization-gate  :crit, r0c, 00:09, 1m
-    (4) Next poll raises N's error      :crit, milestone, r0d, 00:10, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train                                     :r0b, 00:01, 9m
+    (3) 8.1 snapshot-finalization-gate        :crit, r0c, 00:09, 1m
+    (4) Next poll raises N's error            :crit, milestone, r0d, 00:10, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 5m
-    Writes the metadata                 :active, d0b, 00:06, 2m
-    (1) Metadata write fails            :crit, milestone, d0c, 00:08, 0m
-    (2) Fails N, broadcasts             :crit, d0d, 00:08, 1m
+    Writes rank 0's shards                    :active, d0a, 00:01, 5m
+    Writes the metadata                       :active, d0b, 00:06, 2m
+    (1) Write fails                           :crit, milestone, d0c, 00:08, 0m
+    (2) Fails N, broadcasts                   :crit, d0d, 00:08, 1m
 
     section Daemon 1
-    Writes rank 1's shards              :active, d1a, 00:01, 5m
-    (3) Relays the verdict              :crit, d1b, 00:09, 1m
+    Writes rank 1's shards                    :active, d1a, 00:01, 5m
+    (3) Relays the verdict                    :crit, d1b, 00:09, 1m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train                               :r1b, 00:01, 9m
-    (4) 8.1 snapshot-finalization-gate  :crit, r1c, 00:10, 1m
-    (5) Next poll raises N's error      :crit, milestone, r1d, 00:11, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train                                     :r1b, 00:01, 9m
+    (4) 8.1 snapshot-finalization-gate        :crit, r1c, 00:10, 1m
+    (5) Next poll raises N's error            :crit, milestone, r1d, 00:11, 0m
 ```
 
-Every shard is on disk, but N is unusable without its metadata. The coordinator finalizes N as failed with its own error, and both ranks raise it at their next poll.
+The coordinator's metadata write fails after every shard is on disk, and N is unusable without its metadata. The coordinator finalizes N as failed with its own error, and both ranks raise it at their next poll.
 
 #### Stage 8 : Rank 0's finalization routine fails
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train                               :r0b, 00:01, 8m
-    (1) 8.1 snapshot-finalization-gate  :crit, r0c, 00:09, 1m
-    (2) Next poll raises it             :crit, milestone, r0d, 00:10, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train                                     :r0b, 00:01, 8m
+    (1) 8.1 snapshot-finalization-gate fails  :crit, r0c, 00:09, 1m
+    (2) Next poll raises the error            :crit, milestone, r0d, 00:10, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 5m
-    Writes the metadata                 :active, d0b, 00:06, 2m
-    N succeeded, broadcasts             :d0c, 00:08, 1m
+    Writes rank 0's shards                    :active, d0a, 00:01, 5m
+    Writes the metadata                       :active, d0b, 00:06, 2m
+    N succeeded, broadcasts                   :d0c, 00:08, 1m
 
     section Daemon 1
-    Writes rank 1's shards              :active, d1a, 00:01, 5m
-    Relays the verdict                  :d1b, 00:09, 1m
+    Writes rank 1's shards                    :active, d1a, 00:01, 5m
+    Relays the verdict                        :d1b, 00:09, 1m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train                               :r1b, 00:01, 11m
-    8.1 snapshot-finalization-gate      :r1c, 00:10, 1m
-    (3) Stopped by the FT launcher      :done, milestone, r1d, 00:12, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train                                     :r1b, 00:01, 11m
+    8.1 snapshot-finalization-gate            :r1c, 00:10, 1m
+    (3) FT launcher stops it                  :done, milestone, r1d, 00:12, 0m
 ```
 
-N succeeds, but gate 8.1 snapshot-finalization-gate fails on rank 0, for example because rank 0 cannot write the tracker file. N is on disk but never published. Only rank 0 raises the error. When rank 0 exits, the FT launcher stops rank 1 and restarts training from N-1.
+N succeeds, but gate 8.1 snapshot-finalization-gate fails on rank 0, for example because rank 0 cannot write the latest-checkpoint tracker file. N is on disk but never published. Only rank 0 raises the error. When rank 0 exits, the FT launcher stops rank 1 and restarts training from N-1.
 
 #### Fatal : Daemon 1 crashes
 
 ```mermaid
-%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 40}}}%%
+%%{init: {"gantt": {"fontSize": 16, "sectionFontSize": 16, "barHeight": 26, "barGap": 6, "leftPadding": 110, "topPadding": 50}}}%%
 gantt
     dateFormat HH:mm
     axisFormat t+%M
     todayMarker off
 
     section Rank 0
-    Save N, 4.1 and 4.2 pass            :r0a, 00:00, 1m
-    Train                               :r0b, 00:01, 6m
-    (3) Stopped by the FT launcher      :done, milestone, r0c, 00:07, 0m
+    Save N, 4.1 and 4.2 pass                  :r0a, 00:00, 1m
+    Train                                     :r0b, 00:01, 6m
+    (3) FT launcher stops it                  :done, milestone, r0c, 00:07, 0m
 
     section Daemon 0<br>coordinator
-    Writes rank 0's shards              :active, d0a, 00:01, 5m
-    Waits for rank 1's result           :active, d0b, 00:06, 5m
-    (5) Times out, N failed, logged     :crit, milestone, d0c, 00:11, 0m
+    Writes rank 0's shards                    :active, d0a, 00:01, 5m
+    Waits for rank 1                          :active, d0b, 00:06, 5m
+    (5) Times out, fails N, logs it           :crit, d0c, 00:11, 1m
 
     section Daemon 1
-    Writes rank 1's shards              :active, d1a, 00:01, 3m
-    (1) Crashes                         :crit, milestone, d1b, 00:04, 0m
+    Writes rank 1's shards                    :active, d1a, 00:01, 3m
+    (1) Crashes                               :crit, milestone, d1b, 00:04, 0m
 
     section Rank 1
-    Save N, 4.1 and 4.2 pass            :r1a, 00:00, 1m
-    Train                               :r1b, 00:01, 6m
-    (3) Stopped by the FT launcher      :done, milestone, r1c, 00:07, 0m
+    Save N, 4.1 and 4.2 pass                  :r1a, 00:00, 1m
+    Train                                     :r1b, 00:01, 6m
+    (3) FT launcher stops it                  :done, milestone, r1c, 00:07, 0m
 
     section FT launcher
-    (2) Collects diagnostics            :crit, ft1, 00:04, 3m
-    (4) Restarts from N-1               :ft2, 00:07, 5m
+    (2) Collects diagnostics                  :crit, ft1, 00:04, 3m
+    (4) Restarts from N-1                     :ft2, 00:07, 5m
 ```
 
 No outlet carries a crash. The FT launcher collects diagnostics, stops both ranks and restarts training as cycle k+1 from N-1. In session k, the coordinator's wait for rank 1's result later times out and finalizes N as failed, which is only logged because session k has no client left.
-
-### Example 1 : Transient Node Failure
-
-### Example 2 : Permanent Node Failure
-
-### Example 3 : Session overlap
 
 See [Overlapping sessions](#overlapping-sessions-a-new-cycle-while-the-previous-one-winds-down).
 
