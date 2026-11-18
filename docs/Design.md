@@ -280,6 +280,8 @@ Stages 4-8 run for every save:
    - Gate 4.1 snapshot-plan-gate: waits for the rank's snapshot plan and raises any session error.
    - Gate 4.2 prev-snapshot-gate: waits until the a previous active snapshot is finalized and its callback has run, and raises that snapshot's error, if any.
      - <mark>TODO_CROSS_SESSION_GATE</mark> This also includes the "cross-session-gate" from the daemon that makes sure lingering active snapshots from zombied sessions on the same output location are \_quiescent\*: (finalized, with no write in flight).
+       - <mark>OPEN-QUESTION</mark> Should we limit this to sessions with **Same output location.** Is it the checkpoint root or the per-iteration directory?
+
 5. **Transfer.** Scalars and blobs are captured synchronously, before `save_checkpoint` returns. Tensors are copied device-to-host (D2H) in the background into the daemon's shared memory, and the next optimizer step waits on an event until the copy is done.
 6. **Durability.** In the background, each daemon writes its ranks' shards and reports each rank's result to the coordinator.
 7. **Disk finalization.** In the background, the coordinator waits for every rank's result, writes the metadata, and finalizes the snapshot with one _verdict_: succeeded, or failed with the collected errors.
@@ -461,15 +463,7 @@ Cycle k crashes while S_k(N), its snapshot of save N, is still active: durabilit
 
 ### Open questions
 
-- <mark>TODO</mark> **Snapshots that can never finalize.** A snapshot that waits for data that never arrives, from a rank that died or whose D2H copy failed, has no defined end, so it can hold gate 4.2 or the cross-session gate forever. Proposal: when no rank result arrives within a timeout, the coordinator finalizes the snapshot as failed with a timeout verdict that names the missing ranks, and the daemons abort a superseded session's active snapshots when the next cycle's session registers. A timeout on the cross-session gate alone, raised in `save_checkpoint`, turns this into a restart loop.
 - <mark>TODO</mark> **Client-side failures.** Proposal: the client library reports a client-side failure (a registration or D2H error, for example) to its daemon whenever the daemon is reachable, so the coordinator fails the plan or the snapshot for every rank at once instead of waiting for input that never arrives.
-- <mark>TODO</mark> **Same output location.** Is it the checkpoint root or the per-iteration directory? With the per-iteration directory, only a re-save of the same iteration waits.
-- <mark>TODO</mark> **Superseded sessions.** A cycle id alone does not tell a daemon that session k+1 supersedes session k when one daemon serves several jobs. Candidates: a job id plus the cycle id, or a notice from the FT launcher.
-- <mark>TODO</mark> **Late logs.** Proposal: every daemon log line carries its session id, so a late verdict of session k in cycle k+1's log is not read as a cycle k+1 error.
-- <mark>TODO</mark> **Last save of a run.** No later poll or save exists to raise its error. Proposal: the blocking finalize at the end of training is a third sync point for Outlet 2.
-- <mark>TODO</mark> **GIL at gate 4.2.** Callback 8.1 needs the GIL while the training loop waits at gate 4.2. Candidates: the wait releases the GIL, or the gate runs the callback on the waiting thread.
-
-## TODO : Error scenario examples
 
 ### Errors by stage
 
