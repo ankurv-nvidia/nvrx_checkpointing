@@ -373,6 +373,8 @@ function megatron {
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
 
     uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
+    python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
     uv pip install --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
