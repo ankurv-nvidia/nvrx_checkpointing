@@ -416,6 +416,7 @@ function megatron {
 
     unset CC
     unset CXX
+    python -c 'import megatron.core, transformer_engine.pytorch, causal_conv1d, mamba_ssm, flash_attn, deep_ep'
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true
     uv pip list
     #pip install  --no-build-isolation --break-system-packages
