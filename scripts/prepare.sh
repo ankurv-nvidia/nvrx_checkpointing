@@ -356,6 +356,8 @@ function megatron {
     UV_OVERRIDES=$(mktemp)
     python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
         "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}"
+    # A base image's quack-kernels stays in use; its FlashAttention-4 needs that release.
+    python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
 
     # The image's torch requires C++20, so Mamba and causal-conv1d are built from source with it.
