@@ -383,7 +383,7 @@ function megatron {
     # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
     python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
     # An importable flash-attn, such as the NGC image's, serves; building one takes hours.
-    python -c 'import flash_attn' 2>/dev/null || uv pip install --no-build-isolation flash-attn
+    python -c 'import flash_attn' 2>/dev/null || FLASH_ATTN_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" uv pip install --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
