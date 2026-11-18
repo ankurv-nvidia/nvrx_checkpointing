@@ -13,6 +13,8 @@ fi
 
 # The CI build scripts, the JET image and the Slurm runner read these versions from here.
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
+# The image's PyTorch series, which bases without PyTorch install so that Megatron-LM's pins hold.
+PYTORCH_SERIES=2.14
 CUDA_VERSION=13.4
 CLANG_VERSION=23
 
@@ -335,8 +337,8 @@ function megatron {
     if [ -f "$HOME/.local/bin/env" ]; then
         source $HOME/.local/bin/env
     fi
-    # A base without PyTorch, such as plain Ubuntu, gets the release built for the driver's CUDA.
-    python -c 'import torch' 2>/dev/null || uv pip install torch --torch-backend=auto
+    # A base without PyTorch, such as plain Ubuntu, gets the image's series built for the driver's CUDA.
+    python -c 'import torch' 2>/dev/null || uv pip install "torch==${PYTORCH_SERIES}.*" --torch-backend=auto
     if [[ -n "${PREPARE_WHEEL_CACHE:-}" ]]; then
         # Every revision of this script, toolchain and GPU architecture keeps caches of its own.
         PREPARE_WHEEL_CACHE="${PREPARE_WHEEL_CACHE}/$({
