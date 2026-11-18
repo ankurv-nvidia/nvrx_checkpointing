@@ -124,8 +124,6 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 
 - namespaces
 - packaging
-- daemon vs session : note on why sessions are needed
-- Bugfix : for session overlap
 
 ## TODO : Assumptions
 
@@ -142,15 +140,17 @@ def _save_checkpoint_impl(save_args: SaveCheckpointArgs, started_at_ns: int) -> 
 The daemon operates as primarily a manager of:
 
 1. Session : Captures all state that corresponds to a training-job
-2. Lifetime Management : Managing lifetimes of the module and the individual sessions
-3. Messaging Infra: (Shared-Memory, Web-Service etc) : Relays requests/data to session(s) or processes lifetime management requests
+2. Lifetime Management : Process or In-Proc threads and the sessions
+3. Messaging Infra: (Shared-Memory, Web-Service etc) : Relays requests/data to session(s) or processes lifetime management requests.
 
 ## Session
 
 The session manages state that corresponds to a specific training-job. There are two main components of the state
 
 1. Session-State : Computed once and applies to the entire session
-2. Snapshot-State : Applies to each individual snapshot within a session
+2. Snapshot-State : Applies to each individual snapshot within a session as they are requested.
+
+A session-state must be available and finalized before it begins to accept snapshots
 
 ### Session-State
 
@@ -176,7 +176,6 @@ Once fine
 
 1. Snapshot Registry
 2. Byte-Storage
-3.
 
 # Lifecycle Management (Daemon)
 
@@ -280,7 +279,7 @@ Stages 4-8 run for every save:
 4. **Snapshot activation.** The training loop blocks at three gates:
    - Gate 4.1 snapshot-plan-gate: waits for the rank's snapshot plan and raises any session error.
    - Gate 4.2 prev-snapshot-gate: waits until the a previous active snapshot is finalized and its callback has run, and raises that snapshot's error, if any.
-     - This also includes the "cross-session-gate" from the daemon that makes sure lingering active snapshots from zombied sessions on the same output location are _quiescent_: (finalized, with no write in flight).
+     - <mark>TODO_CROSS_SESSION_GATE</mark> This also includes the "cross-session-gate" from the daemon that makes sure lingering active snapshots from zombied sessions on the same output location are \_quiescent\*: (finalized, with no write in flight).
 5. **Transfer.** Scalars and blobs are captured synchronously, before `save_checkpoint` returns. Tensors are copied device-to-host (D2H) in the background into the daemon's shared memory, and the next optimizer step waits on an event until the copy is done.
 6. **Durability.** In the background, each daemon writes its ranks' shards and reports each rank's result to the coordinator.
 7. **Disk finalization.** In the background, the coordinator waits for every rank's result, writes the metadata, and finalizes the snapshot with one _verdict_: succeeded, or failed with the collected errors.
@@ -334,7 +333,7 @@ A snapshot is _active_ until stage 7 finalizes it. Only callback 8.1 of a succee
 ## How an error reaches every rank
 
 ```mermaid
-%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
+%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 34}}}%%
 sequenceDiagram
     participant R as Rank R
     participant LD as Rank R's<br/>daemon
@@ -346,10 +345,10 @@ sequenceDiagram
     R->>LD: [5] tensors D2H<br/>in the background
     LD->>CO: [6] rank R's result
     PD->>CO: [6] other results
-    alt all shards and metadata written
-        CO->>CO: [7] N succeeded
-    else any write failed
-        CO->>CO: [7] N failed,<br/>errors collected
+    alt success
+        CO->>CO: [7] every result OK,<br/>metadata written,<br/>N succeeded
+    else failure
+        CO->>CO: [7] a daemon recorded<br/>an error, N failed
     end
     CO->>PD: [8] one verdict,<br/>tree relay
     CO->>LD: [8] same verdict
@@ -364,7 +363,7 @@ sequenceDiagram
             Note right of R: next poll or gate 4.2<br/>raises it (Outlet 2)
         end
     end
-    Note over R,PD: Every rank receives the same verdict.<br/>A D2H failure on rank R never reaches<br/>a daemon. Only rank R raises it, and N<br/>cannot finalize without rank R's result<br/>(see Open questions).
+    Note over R,PD: Every rank receives the same verdict.<br/>A D2H failure on rank R never reaches<br/>a daemon, so only rank R learns of it,<br/>and N cannot finalize without rank R's<br/>result (see Open questions).
 ```
 
 An error that occurs in or reaches a daemon becomes job-wide: the coordinator aggregates it into the snapshot's verdict, and every rank receives the same error. A planning failure reaches every rank's gate 4.1 the same way. An error that never leaves the client library, such as a D2H failure on rank R, reaches rank R only. The snapshot cannot finalize without rank R's result, and nothing bounds that wait (see [Open questions](#open-questions)).
@@ -374,7 +373,7 @@ An error that occurs in or reaches a daemon becomes job-wide: the coordinator ag
 ### Overlapping snapshots in one session
 
 ```mermaid
-%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
+%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 34}}}%%
 sequenceDiagram
     participant TL as Training<br/>loop
     participant CL as Client<br/>library
@@ -391,10 +390,10 @@ sequenceDiagram
         CL->>D: [5] tensors D2H
         D->>D: [6] write shards
     end
-    break N fails before save N+1, the rank exits
+    break N fails before save N+1
         D->>CL: [7, 8] N failed
         CL->>CL: [8.1] callback takes<br/>N's error
-        CL-->>TL: next poll raises it
+        CL-->>TL: next poll raises it,<br/>the rank exits
     end
     TL->>CL: save N+1
     rect rgba(255,165,0,0.12)
@@ -422,7 +421,7 @@ N-1, N and N+1 denote consecutive saves. Once `save_checkpoint` returns, the ten
 ### Overlapping sessions: a new cycle while the previous one winds down
 
 ```mermaid
-%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
+%%{init: {"fontSize": 24, "sequence": {"labelBoxWidth": 80, "labelBoxHeight": 34}}}%%
 sequenceDiagram
     participant FT as FT<br/>launcher
     participant R as Ranks
@@ -437,9 +436,10 @@ sequenceDiagram
     FT->>R: stop cycle k,<br/>start cycle k+1
     Note over R: no callback 8.1 ran,<br/>N is not published
     par cycle k+1 sets up
+        R->>R: load N-1
         R->>SK1: [1, 2] attach,<br/>register
         SK1-->>R: [3] snapshot plan
-        R->>R: load N-1,<br/>train to N
+        R->>R: train to N
     and session k winds down
         SK->>SK: S_k(N) stages<br/>6 and 7 continue
     end
@@ -450,8 +450,8 @@ sequenceDiagram
         SK-->>SK1: S_k(N) quiescent
     end
     SK1-->>R: S_k+1(N) activates
-    Note over SK,SK1: no client is left in session k,<br/>so its verdict is only logged
-    Note over SK,SK1: if a rank died before its data<br/>reached a daemon, S_k(N) never<br/>finalizes (see Open questions)
+    Note over SK,SK1: no client is left in<br/>session k, so its verdict<br/>is only logged
+    Note over R,SK1: if a rank died before its data reached<br/>a daemon, S_k(N) never finalizes and<br/>save N blocks forever (see Open questions)
 ```
 
 Cycle k crashes while S_k(N), its snapshot of save N, is still active: durability is still running, or the coordinator is still waiting for results from ranks that died. The FT launcher collects cycle k's diagnostics and restarts the ranks as cycle k+1, reusing the daemons that did not crash.
