@@ -296,7 +296,7 @@ function container {
         -d -it ${BASE_IMAGE} \
         bash
 
-    podman exec -it ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
+    podman exec -it ${MAX_JOBS:+--env MAX_JOBS=${MAX_JOBS}} ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
 
     podman commit ${CONTAINER_NAME}-build ${CONTAINER_NAME}-image
     podman run \
@@ -320,7 +320,7 @@ function megatron {
         echo "Unable to determine the CUDA major version from nvcc" >&2
         return 1
     fi
-    export MAX_JOBS=4
+    export MAX_JOBS=${MAX_JOBS:-4}
     export CC=gcc
     export CXX=g++
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
