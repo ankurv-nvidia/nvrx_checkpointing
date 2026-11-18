@@ -409,7 +409,7 @@ function megatron {
     popd
 
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
-    ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" wheel_install DeepEP
+    ONLY_FUNCS="SendRecv" wheel_install DeepEP
     rm -rf DeepEP
 
     unset CC
