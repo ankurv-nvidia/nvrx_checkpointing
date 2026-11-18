@@ -265,20 +265,29 @@ Two principles shape how failures are handled:
 1. **The daemon never intentionally crashes or raises.** It records each failure on the session or snapshot that the failure belongs to and reports it to the clients. A daemon crash is always a bug and is handled as a fatal fault (see [FT-launcher integration](#out-of-proc-mode--ft-launcher-integration-fault-tolerance)).
 2. **The client API is almost entirely asynchronous.** Background work never raises into the training loop directly. Its errors travel through two _outlets_ and are raised only at synchronous points of the training loop.
 
-## Stages and error outlets
+## Stages
 
-A _cycle_ is one launch of the training ranks, and every FT-launcher restart starts the next cycle. Each cycle has its own session in the daemon set (one daemon per node), and the session id is the cycle id. One daemon, the _coordinator_ (peer 0), builds the global plan and aggregates snapshot results for the whole job. A cycle goes through these stages:
+A _cycle_ is one launch of the training ranks, and every FT-launcher restart starts the next cycle. Each cycle has its own session in the daemon set (one daemon per node), and the session id is the cycle id. One daemon, the _coordinator_ (peer 0), builds the global plan and aggregates snapshot results for the whole job.
 
-| Stage                      | What happens                                                                                                                                                                                                                                                                                                                                                                           | When           | Training loop                | Errors surface at |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ---------------------------- | ----------------- |
-| 1. Daemon boot or attach   | The client library attaches to the node's daemon. The FT launcher starts the daemon, or the client starts it in self-managed mode.                                                                                                                                                                                                                                                     | Once per cycle | Async                        | Outlet 1          |
-| 2. State-dict registration | Each rank sends its local registry to its daemon, which forwards it to the coordinator.                                                                                                                                                                                                                                                                                                | Once per cycle | Async                        | Outlet 1          |
-| 3. Global save-planning    | The coordinator merges every registry into the global plan and broadcasts it, and each daemon derives the deduplicated snapshot plans of its ranks.                                                                                                                                                                                                                                    | Once per cycle | Background                   | Outlet 1          |
-| 4. Snapshot activation     | Gate 4.1 waits for the rank's snapshot plan and raises any session error (Outlet 1). Gate 4.2 waits until the previous snapshot is finalized and its callback has run, and raises that snapshot's error, if any (Outlet 2). The cross-session gate waits until the active snapshots of other sessions on the same output location are _quiescent_: finalized, with no write in flight. | Every save     | Blocks                       | Outlet 2          |
-| 5. Transfer                | Scalars and blobs are captured synchronously. Tensors are copied device-to-host (D2H) in the background into the daemon's shared memory, and the next optimizer step waits on an event until the copy is done.                                                                                                                                                                         | Every save     | Blocks for scalars and blobs | Outlet 2          |
-| 6. Durability              | Each daemon writes its ranks' shards and reports each rank's result to the coordinator.                                                                                                                                                                                                                                                                                                | Every save     | Async                        | Outlet 2          |
-| 7. Disk finalization       | The coordinator waits for every rank's result, writes the metadata, and finalizes the snapshot with one _verdict_: succeeded, or failed with the collected errors.                                                                                                                                                                                                                     | Every save     | Async                        | Outlet 2          |
-| 8. Notification            | The coordinator broadcasts the verdict and each daemon notifies its clients. Callback 8.1 takes the GIL and runs the client's finalization routine.                                                                                                                                                                                                                                    | Every save     | Pauses for callback 8.1      | Outlet 2          |
+Stages 1-3 run once per cycle, without blocking the training loop:
+
+1. **Daemon boot or attach.** The client library attaches to the node's daemon. The FT launcher starts the daemon, or the client starts it in self-managed mode.
+2. **State-dict registration.** Each rank sends its local registry to its daemon, which forwards it to the coordinator.
+3. **Global save-planning.** The coordinator merges every registry into the global plan and broadcasts it, and each daemon derives the deduplicated snapshot plans of its ranks.
+
+Stages 4-8 run for every save:
+
+4. **Snapshot activation.** The training loop blocks at three gates:
+   - Gate 4.1 snapshot-plan-gate: waits for the rank's snapshot plan and raises any session error.
+   - Gate 4.2 prev-snapshot-gate: waits until the a previous active snapshot is finalized and its callback has run, and raises that snapshot's error, if any.
+     - This also includes the "cross-session-gate" from the daemon that makes sure lingering active snapshots from zombied sessions on the same output location are _quiescent_: (finalized, with no write in flight).
+5. **Transfer.** Scalars and blobs are captured synchronously, before `save_checkpoint` returns. Tensors are copied device-to-host (D2H) in the background into the daemon's shared memory, and the next optimizer step waits on an event until the copy is done.
+6. **Durability.** In the background, each daemon writes its ranks' shards and reports each rank's result to the coordinator.
+7. **Disk finalization.** In the background, the coordinator waits for every rank's result, writes the metadata, and finalizes the snapshot with one _verdict_: succeeded, or failed with the collected errors.
+8. **Notification.** The coordinator broadcasts the verdict and each daemon notifies its clients.
+   - Gate 8.1 snapshot-finalization-gate: takes the GIL to run the client's finalization routine on the main python thread. Errors during Steps 4-8 are also propagated here.
+
+## Error outlets
 
 ```mermaid
 flowchart TB
@@ -325,50 +334,37 @@ A snapshot is _active_ until stage 7 finalizes it. Only callback 8.1 of a succee
 ## How an error reaches every rank
 
 ```mermaid
+%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
 sequenceDiagram
-    box Rank R process
-        participant TL as Training loop
-        participant CL as Client library
-    end
-    box Daemons, one per node
-        participant LD as Local daemon (node of rank R)
-        participant CO as Coordinator daemon (peer 0)
-        participant PD as Peer daemons
-    end
+    participant R as Rank R
+    participant LD as Rank R's<br/>daemon
+    participant CO as Coordinator<br/>(peer 0)
+    participant PD as Peer<br/>daemons
 
-    TL->>CL: save_checkpoint(N) passes gates 4.1 and 4.2
-    CL->>LD: [4] activate snapshot N<br/>[5] scalars and blobs, captured synchronously
-    CL-->>TL: save_checkpoint returns, training continues
-    CL->>LD: [5] tensors D2H in the background<br/>through bounce buffers into shared memory
-    alt every shard is written
-        LD->>CO: [6] rank R shards written<br/>write-ckpt-complete(rank R, OK)
-        PD->>CO: [6] write-ckpt-complete(OK) for the other ranks
-        CO->>CO: [7] every rank OK, write metadata and index<br/>finalize N as succeeded
-    else disk write fails on a peer node
-        LD->>CO: [6] write-ckpt-complete(rank R, OK)
-        PD->>PD: [6] shard write fails<br/>recorded in snapshot N failures
-        PD->>CO: [6] write-ckpt-complete(rank P, error)
-        CO->>CO: [7] every rank reported, aggregate failures<br/>into one verdict, finalize N as failed
-        Note over CO,PD: A rejected activation is reported the same way.<br/>A metadata failure is recorded on the coordinator
-    else transfer fails on rank R, client side
-        CL->>CL: [5] D2H copy fails, never reaches a daemon<br/>the client library keeps it for rank R
-        PD->>CO: [6] write-ckpt-complete for every rank except R
-        CO->>CO: [7] PROPOSAL bounded wait for rank R expires<br/>finalize N as failed with a timeout
+    R->>LD: [4] activate N<br/>[5] scalars, blobs
+    Note right of R: save returns,<br/>training continues
+    R->>LD: [5] tensors D2H<br/>in the background
+    LD->>CO: [6] rank R's result
+    PD->>CO: [6] other results
+    alt all shards and metadata written
+        CO->>CO: [7] N succeeded
+    else any write failed
+        CO->>CO: [7] N failed,<br/>errors collected
     end
-    CO->>PD: [8] one verdict for N, tree relay<br/>(write-ckpt-complete)
-    PD->>LD: [8] verdict relayed
-    LD->>CL: [8] notify local clients
-    alt verdict succeeded
+    CO->>PD: [8] one verdict,<br/>tree relay
+    CO->>LD: [8] same verdict
+    LD->>R: [8] notify clients
+    alt N succeeded
         rect rgba(22,163,74,0.12)
-            CL->>CL: callback 8.1 under the GIL<br/>rank 0 writes the tracker file, N is published
+            R->>R: [8.1] publish N
         end
-    else verdict failed or timed out
+    else N failed
         rect rgba(220,38,38,0.12)
-            CL--xTL: Outlet 2, callback 8.1 hands over the error
-            TL->>TL: maybe_finalize_async_save raises it at the<br/>per-iteration poll or at gate 4.2 of save N+1
+            R->>R: [8.1] hand the error<br/>to the training loop
+            Note right of R: next poll or gate 4.2<br/>raises it (Outlet 2)
         end
-        Note over TL,PD: Every rank gets the same verdict.<br/>On a transfer failure rank R keeps its D2H error<br/>and, under the proposal, every other rank gets the timeout
     end
+    Note over R,PD: Every rank receives the same verdict.<br/>A D2H failure on rank R never reaches<br/>a daemon. Only rank R raises it, and N<br/>cannot finalize without rank R's result<br/>(see Open questions).
 ```
 
 An error that occurs in or reaches a daemon becomes job-wide: the coordinator aggregates it into the snapshot's verdict, and every rank receives the same error. A planning failure reaches every rank's gate 4.1 the same way. An error that never leaves the client library, such as a D2H failure on rank R, reaches rank R only. The snapshot cannot finalize without rank R's result, and nothing bounds that wait (see [Open questions](#open-questions)).
@@ -378,47 +374,41 @@ An error that occurs in or reaches a daemon becomes job-wide: the coordinator ag
 ### Overlapping snapshots in one session
 
 ```mermaid
+%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
 sequenceDiagram
-    box transparent Rank process
-        participant TL as Training loop
-        participant CL as Client library
-    end
-    participant D as Daemons (session)
+    participant TL as Training<br/>loop
+    participant CL as Client<br/>library
+    participant D as Daemons
 
-    Note over TL,D: N-1 is finalized and published, it is the recovery point
-    TL->>CL: save_checkpoint(N)
-    CL->>D: 4 activate N, gates 4.1 and 4.2 pass at once
-    CL->>D: 5 scalars and blobs, captured synchronously
+    Note over TL,D: N-1 is published, the recovery point
+    TL->>CL: save N
+    CL->>D: [4] activate N<br/>[5] scalars, blobs
     CL-->>TL: save N returns
-    par Training continues
-        loop every iteration until save N+1
-            TL->>CL: per-iteration poll (maybe_finalize_async_save)
-            CL-->>TL: nothing to raise, N still active
-        end
-    and Snapshot N stays active
-        CL->>D: 5 tensors copied D2H in the background<br/>(next optimizer step waits for the copy)
-        D->>D: 6 each daemon writes its shards,<br/>reports per-rank results
+    par training continues
+        TL->>CL: per-iteration poll
+        CL-->>TL: nothing to raise
+    and snapshot N stays active
+        CL->>D: [5] tensors D2H
+        D->>D: [6] write shards
     end
-    break N failed, verdict lands before save N+1
-        D->>CL: 7 N finalized as failed, 8 verdict broadcast
-        CL->>CL: 8.1 under the GIL, callback hands<br/>N's error to the training loop
-        CL-->>TL: next poll raises N's error (Outlet 2)
-        Note over TL,CL: the rank exits here, not at gate 4.2
+    break N fails before save N+1, the rank exits
+        D->>CL: [7, 8] N failed
+        CL->>CL: [8.1] callback takes<br/>N's error
+        CL-->>TL: next poll raises it
     end
-    TL->>CL: save_checkpoint(N+1)
+    TL->>CL: save N+1
     rect rgba(255,165,0,0.12)
-        Note over TL,CL: gate 4.1 passes, plan ready<br/>gate 4.2 blocks until N is finalized<br/>and its callback has run
-        D->>D: 7 coordinator has every rank result,<br/>writes metadata, finalizes N
-        D->>CL: 8 one job-wide verdict for N, to every rank
+        Note over TL,CL: gate 4.2 blocks until N<br/>is finalized and its<br/>callback has run
+        D->>CL: [7, 8] N's verdict
     end
     alt N succeeded
-        CL->>CL: 8.1 under the GIL, callback publishes N<br/>(rank 0 writes the tracker file)
-        CL->>D: gate 4.2 opens, 4 activate N+1
+        CL->>CL: [8.1] publish N
+        CL->>D: [4] activate N+1
         CL-->>TL: save N+1 returns
     else N failed
-        CL->>CL: 8.1 under the GIL, callback hands<br/>N's error to the training loop
-        CL-->>TL: gate 4.2 opens, save N+1 raises N's error (Outlet 2)
-        Note over TL,D: gate 4.2 needs N finalized, not successful.<br/>Megatron's policy is to raise, so N+1 never activates,<br/>the rank exits and the FT launcher restarts from N-1
+        CL->>CL: [8.1] callback takes<br/>N's error
+        CL-->>TL: save N+1 raises it
+        Note over TL,D: N+1 never activates. Megatron exits,<br/>and the FT launcher restarts from N-1
     end
 ```
 
@@ -432,57 +422,36 @@ N-1, N and N+1 denote consecutive saves. Once `save_checkpoint` returns, the ten
 ### Overlapping sessions: a new cycle while the previous one winds down
 
 ```mermaid
+%%{init: {"sequence": {"actorFontSize": 28, "messageFontSize": 28, "noteFontSize": 28, "labelBoxWidth": 100, "labelBoxHeight": 40}}}%%
 sequenceDiagram
-    participant FT as FT launcher
-    participant RK as Cycle k ranks
-    participant RK1 as Cycle k+1 ranks
+    participant FT as FT<br/>launcher
+    participant R as Ranks
     box Daemons, reused across cycles
         participant SK as Session k
         participant SK1 as Session k+1
     end
 
-    RK->>SK: save N activates S_k(N),<br/>stage 5 transfer starts
-    Note over SK: S_k(N) stays active<br/>until stage 7 finalizes it
-    rect rgba(255,0,0,0.12)
-        RK-xFT: rank crash while S_k(N) is active, fatal
-        FT->>FT: collect cycle k diagnostics<br/>(logs, core dump, stacks)
-        FT-xRK: stop all cycle k ranks
+    R->>SK: in cycle k, save N<br/>activates S_k(N)
+    R-xFT: rank crash
+    FT->>FT: collect cycle k<br/>diagnostics
+    FT->>R: stop cycle k,<br/>start cycle k+1
+    Note over R: no callback 8.1 ran,<br/>N is not published
+    par cycle k+1 sets up
+        R->>SK1: [1, 2] attach,<br/>register
+        SK1-->>R: [3] snapshot plan
+        R->>R: load N-1,<br/>train to N
+    and session k winds down
+        SK->>SK: S_k(N) stages<br/>6 and 7 continue
     end
-    Note over RK: no callback 8.1 for S_k(N),<br/>so N is never published
-    FT->>RK1: restart as cycle k+1 (session id k+1),<br/>reuse the daemons that did not crash
-    par Cycle k+1 runs stages 1-3 in session k+1
-        RK1->>RK1: load last published checkpoint N-1
-        RK1->>SK1: stage 1 attach, stage 2 registration
-        SK1->>SK1: stage 3 plan, fresh snapshots<br/>and error state
-        SK1-->>RK1: snapshot plan
-    and Session k winds down in the same daemons
-        SK->>SK: S_k(N) stages 6 and 7 continue
-    end
-    RK1->>SK1: after training N-1 to N, save N,<br/>gates 4.1 and 4.2 pass
+    R->>SK1: save N, gates<br/>4.1 and 4.2 pass
     rect rgba(255,165,0,0.12)
-        SK1->>SK: cross-session gate, same output location,<br/>wait until S_k(N) is quiescent
-        Note over RK1: training loop blocked<br/>in save_checkpoint
+        SK1->>SK: cross-session gate,<br/>same output location
+        Note over R: save N blocks
+        SK-->>SK1: S_k(N) quiescent
     end
-    alt every cycle k rank's data reached a daemon
-        SK->>SK: stage 7 finalizes S_k(N) as failed,<br/>or as succeeded but never published
-        SK-->>FT: no client for Outlet 2, verdict and<br/>errors only logged, never raised
-        SK-->>SK1: S_k(N) quiescent, gate opens
-        SK1-->>RK1: S_k+1(N) activated, stages 5-8 as usual
-    else a cycle k rank died before its data reached a daemon
-        rect rgba(106,90,205,0.12)
-            Note over RK1,SK1: PROPOSAL, not in the design yet. The design defines<br/>no end for S_k(N) while it waits for the dead rank
-            alt PROPOSAL A, abort superseded snapshots at registration
-                Note over SK,SK1: at stage 2 of session k+1, the daemon<br/>already aborted S_k(N) as failed
-                SK-->>FT: S_k(N) aborted, only logged
-                SK-->>SK1: S_k(N) quiescent, partial data dropped
-                SK1-->>RK1: S_k+1(N) activated
-            else PROPOSAL B, bounded cross-session wait
-                SK1-->>RK1: gate times out,<br/>save_checkpoint raises the timeout
-                RK1-xFT: rank exits, restart as cycle k+2
-                Note over RK1,SK1: B alone repeats in cycle k+2<br/>while S_k(N) stays active
-            end
-        end
-    end
+    SK1-->>R: S_k+1(N) activates
+    Note over SK,SK1: no client is left in session k,<br/>so its verdict is only logged
+    Note over SK,SK1: if a rank died before its data<br/>reached a daemon, S_k(N) never<br/>finalizes (see Open questions)
 ```
 
 Cycle k crashes while S_k(N), its snapshot of save N, is still active: durability is still running, or the coordinator is still waiting for results from ranks that died. The FT launcher collects cycle k's diagnostics and restarts the ranks as cycle k+1, reusing the daemons that did not crash.
