@@ -350,6 +350,9 @@ function megatron {
         # uv cache to avoid collision.
         export UV_CACHE_DIR="$(mktemp -d)" UV_NO_CACHE=1
     fi
+    # Installs keep a base image's NumPy, which packages such as its Numba cap.
+    export UV_CONSTRAINT=$(mktemp)
+    python -c 'import importlib.metadata as m; print("numpy==" + m.version("numpy"))' 2>/dev/null > "${UV_CONSTRAINT}" || true
     # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
     uv pip install "nvidia-cudnn-frontend[cutedsl]==1.28.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
