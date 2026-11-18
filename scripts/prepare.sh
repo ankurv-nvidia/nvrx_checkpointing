@@ -365,16 +365,18 @@ function megatron {
     python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
 
-    # The image's torch requires C++20, so Mamba and causal-conv1d are built from source with it.
+    # The base's torch requires C++20, so Mamba, causal-conv1d and a missing flash-attn are built from source with it.
     read -r MAMBA_GIT MAMBA_REV <<< "$(python -c 'import sys, tomllib; s = tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"]["sources"]["mamba-ssm"]; print(s["git"], s["rev"])' "${MEGATRON_ROOT}/pyproject.toml")"
     export MAMBA_FORCE_BUILD=TRUE
-    for spec in "causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git v1.7.0" "mamba ${MAMBA_GIT} ${MAMBA_REV}"; do
+    specs=("causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git v1.7.0" "mamba ${MAMBA_GIT} ${MAMBA_REV}")
+    python -c 'import flash_attn' 2>/dev/null || specs+=("flash-attention https://github.com/Dao-AILab/flash-attention.git v2.8.3.post2")
+    for spec in "${specs[@]}"; do
         read -r name url ref <<< "${spec}"
         git clone --quiet "${url}" "${name}"
         git -C "${name}" checkout --quiet "${ref}"
         sed -i 's/-std=c++17/-std=c++20/g' "${name}/setup.py"
         grep -q -- '-std=c++20' "${name}/setup.py"
-        wheel_install "${name}" --override "${UV_OVERRIDES}"
+        FLASH_ATTN_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" wheel_install "${name}" --override "${UV_OVERRIDES}"
         rm -rf "${name}"
     done
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
@@ -384,8 +386,6 @@ function megatron {
     uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
     # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
     python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
-    # An importable flash-attn, such as the NGC image's, serves; building one takes hours.
-    python -c 'import flash_attn' 2>/dev/null || FLASH_ATTN_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" uv pip install --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
