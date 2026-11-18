@@ -4,6 +4,12 @@ set -Eeoux pipefail
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 ARCH=$(uname -m)
+# Python packages go into the active virtual environment, or else into the system Python.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+else
+    export UV_SYSTEM_PYTHON=1 UV_BREAK_SYSTEM_PACKAGES=1
+fi
 
 # The CI build scripts, the JET image and the Slurm runner read these versions from here.
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
@@ -305,9 +311,7 @@ function container {
 }
 
 function megatron {
-    git config --system protocol.version 1
     resolve_megatron_root
-    nvcc --version || cuda13
     _NVCC_VERSION=$(nvcc --version)
     printf '%s\n' "${_NVCC_VERSION}"
     if [[ "${_NVCC_VERSION}" =~ release[[:space:]]+([0-9]+)\. ]]; then
@@ -347,7 +351,7 @@ function megatron {
         export UV_CACHE_DIR="$(mktemp -d)" UV_NO_CACHE=1
     fi
     # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
-    uv pip install --system --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.28.0"
+    uv pip install "nvidia-cudnn-frontend[cutedsl]==1.28.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
     UV_OVERRIDES=$(mktemp)
     python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
@@ -368,8 +372,8 @@ function megatron {
     done
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
 
-    uv pip install --system --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
-    uv pip install --system --break-system-packages --no-build-isolation flash-attn
+    uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    uv pip install --no-build-isolation flash-attn
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
@@ -379,11 +383,9 @@ function megatron {
     export RDMA_CORE_HOME=/opt/rdma-core/build
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
 
-    deepep_prereqs
-
     # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
     # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
-    uv pip install --system --break-system-packages nvidia-nvshmem-cu13==3.7.2
+    uv pip install nvidia-nvshmem-cu13==3.7.2
     NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
     pushd "${NVSHMEM_LIB_DIR}"
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
@@ -400,13 +402,12 @@ function megatron {
 
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
     ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" wheel_install DeepEP
-    rm -rf /var/lib/apt/lists/*
     rm -rf DeepEP
 
     unset CC
     unset CXX
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true
-    pip list
+    uv pip list
     #pip install  --no-build-isolation --break-system-packages
     # if nvidia gpus found then run run.sh
     nvidia-smi || echo "No nvidia gpus found"
@@ -446,12 +447,12 @@ function wheel_install {
             mv -T "${build}" "${wheels}" || rm -rf "${build}"
         fi
     fi
-    uv pip install --system --break-system-packages "$@" "${wheels}"/*.whl
+    uv pip install "$@" "${wheels}"/*.whl
     [[ -n "${PREPARE_WHEEL_CACHE:-}" ]] || rm -rf "${wheels}"
 }
 
-# DeepEP compiles against these RDMA and NVML development files.
-function deepep_prereqs {
+# Installs the RDMA, InfiniBand verbs, mlx5 and NVML development files that GPU networking packages compile against.
+function gpu_networking {
     apt-get update
     apt-get install --yes --allow-change-held-packages rdma-core libibverbs-dev
     apt-get clean
@@ -466,7 +467,7 @@ function deepep_prereqs {
     # Only the payload is unpacked because installing the package pulls in driver packages that overrun container overlays.
     nvml_dir=$(mktemp -d)
     (cd "${nvml_dir}" && apt-get update && apt-get download libnvidia-ml-dev && dpkg-deb -x libnvidia-ml-dev_*.deb /)
-    rm -rf "${nvml_dir}"
+    rm -rf "${nvml_dir}" /var/lib/apt/lists/*
     $*
 }
 
@@ -493,6 +494,7 @@ function cuda13 {
     export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-${CUDA_VERSION}}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
+    $*
 }
 
 # Cross-compiles aarch64 (Grace) wheels on an x86_64 host that has run cuda13.
@@ -505,7 +507,7 @@ function cross_arm64 {
 }
 
 if [ "$#" -eq 0 ]; then
-    container ubuntu2404 megatron test
+    container ubuntu2404 cuda13 gpu_networking megatron test
 else
     $*
 fi
