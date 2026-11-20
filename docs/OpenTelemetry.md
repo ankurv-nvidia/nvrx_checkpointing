@@ -1,9 +1,10 @@
 # OpenTelemetry performance telemetry
 
 The checkpoint daemon emits OpenTelemetry **spans** (and, opt-in, **metrics**) for
-every checkpoint save, and forwards its operational **logs** as OTLP log records.
-It also accepts OTLP/HTTP protobuf traces, metrics, and logs. All terminal telemetry
-is written as **OTLP-JSONL** (one OTLP JSON object per line).
+every checkpoint save, forwards its operational **logs** as OTLP log records, and
+exports all of them over **OTLP/HTTP**. It also accepts OTLP/HTTP protobuf traces,
+metrics, and logs and can route them into one **OTLP-JSONL** file (one OTLP JSON
+object per line).
 
 Telemetry is **off by default**.
 
@@ -13,9 +14,9 @@ Set on every rank (the daemon inherits its own env):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NATIVE_CKPT_OTEL_EXPORT` | `daemon` | `daemon` — route through the node-local daemon collector, which collects to a single file on rank 0. `file` — each process writes its own OTLP-JSONL. `both` — use both routes. |
-| `NATIVE_CKPT_OTEL_FILE` | — | A nonempty value enables native telemetry and selects the collector-local output file. In `file` or `both` mode it also selects each process's output path. `%h` and `%p` expand to the host and process ID, as for `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath the server-log directory. |
-| `NATIVE_CKPT_OTEL_COLLECTOR` | — | In `daemon` or `both` export mode, initialize a collector before checkpoint topology exists: `file` writes `NATIVE_CKPT_OTEL_FILE`; any other value relays to that host or `host:port`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | A nonempty value enables native telemetry and exports it to `<endpoint>/v1/{traces,metrics,logs}`. The standard `OTEL_EXPORTER_OTLP_*` variables (protocol, per-signal endpoints, headers, timeout, compression) configure the exporter. Endpoints are plain HTTP. |
+| `NATIVE_CKPT_OTEL_FILE` | — | With an endpoint, the daemons route the OTLP they receive: the coordinator writes this file and the others relay to it. Without an endpoint, a nonempty value enables native telemetry and each process writes its own telemetry to this path, with metrics and logs in `.metrics` and `.logs` siblings. `%h` and `%p` expand to the host and process ID, as for `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath the server-log directory. |
+| `NATIVE_CKPT_OTEL_COLLECTOR` | — | With both an endpoint and a file, select the route before checkpoint topology exists: `file` writes `NATIVE_CKPT_OTEL_FILE`; any other value relays to that host or `host:port`. |
 | `NATIVE_CKPT_OTEL_SERVICE` | — | Override `service.name`. |
 | `NATIVE_CKPT_OTEL_METRICS` | `0` | `1` also emits `bw_mbps`, `wr_tnsr_us`, and `total_written_bytes` OTLP histograms. Off by default because the spans already carry every figure; enable for Grafana. |
 | `NATIVE_CKPT_OTEL_LOGS` | `1` | `0` suppresses just the log-record signal (spans/metrics unaffected). |
@@ -26,19 +27,27 @@ Set on every rank (the daemon inherits its own env):
 ## Architecture
 
 ```text
-training native OTel SDK ── serialized JSON ──► node-local daemon ──┐
-daemon OTel SDK ─────────── serialized JSON ───────────────────────┼─ FileCollector ── JSONL
-OTLP/HTTP protobuf ─────────────── terminal decode ────────────────┘
-                              └─ RelayCollector ── unchanged OTLP request ──► another daemon
+external collector:  daemon SDK, Megatron SDK ── OTLP/HTTP ──► collector ──► JSONL or backend
+
+daemon routing:      daemon SDK, Megatron SDK ── OTLP/HTTP ──► node-local daemon ─┬─ coordinator: FileCollector ── JSONL
+                                                                                  └─ others: RelayCollector ── unchanged request ──► coordinator
 ```
 
 - A single TU (`src/checkpoint/logtel.cpp`) contains the OpenTelemetry SDK, spdlog,
   and daemon telemetry collection behind the lightweight `src/telemetry.h` and
   `src/logging.h` facades.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` selects the topology. An external
+  OpenTelemetry Collector aggregates every process's telemetry and leaves the daemons'
+  routing idle. The node-local daemon's address (`http://127.0.0.1:4100`) together with
+  `NATIVE_CKPT_OTEL_FILE` makes the daemons the collector; each daemon's own export
+  reaches its own receiver over loopback.
+- Daemon routing accepts only protobuf, so it requires
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
 - The daemon holds one active `FileCollector` or `RelayCollector` directly. Checkpoint
-  session topology normally selects the route. `NATIVE_CKPT_OTEL_COLLECTOR` selects it
-  at startup when the daemon is used only as a collector. OTLP requests received before
-  a route exists are buffered up to 64 MiB and drained when one becomes available.
+  session topology normally selects the route: the coordinator writes the file, and the
+  other daemons relay to it. `NATIVE_CKPT_OTEL_COLLECTOR` selects the route at startup
+  when the daemon is used only as a collector. OTLP requests received before a route
+  exists are buffered up to 64 MiB and drained when one becomes available.
 - The OTLP/HTTP receiver accepts binary protobuf on `/v1/traces`, `/v1/metrics`, and
   `/v1/logs`, including gzip request bodies. Requests and decompressed payloads are
   limited to 64 MiB. Success and failure responses use the corresponding OTLP protobuf
@@ -48,16 +57,7 @@ OTLP/HTTP protobuf ─────────────── terminal decode
   originating OTLP exporter owns retry policy. Multi-hop relay remains valid.
 - A terminal collector decodes protobuf and uses OpenTelemetry's OTLP file serializer
   to produce canonical JSON. The file collector alone appends and flushes the JSONL
-  newline. Daemon-generated telemetry already reaches it as canonical JSON.
-- The existing JSON relay used by daemon-generated telemetry retains its three bounded
-  attempts. Its at-least-once delivery can duplicate a batch if a response is lost.
-- The daemon maps its own topology policy onto that neutral collector configuration.
-  In `daemon` mode rank 0 writes locally, while the other daemons relay to rank 0's
-  `/api/telemetry/remote` listener. Every daemon can accept both local and remote input.
-- Each training process sends its native telemetry to its node-local daemon in
-  `daemon` mode. In `file` mode each native process writes to
-  `NATIVE_CKPT_OTEL_FILE`; use `%h` and `%p` in that path to give every process
-  a distinct file.
+  newline.
 
 ### Spans, logs and attributes
 
@@ -96,7 +96,5 @@ OTLP/HTTP protobuf ─────────────── terminal decode
 - **In-process runs** (`ckpttest` with `RunInprocServer`) put many ranks and daemons
   in one process, which shares one process-global OTel provider. Each save's
   `nvrx.rank` span attribute remains correct. Production daemons run in separate processes.
-- The multi-node relay (`/api/telemetry/remote`) carries the telemetry of multi-node
-  runs; single-node and file-mode runs collect directly.
-- Grafana dashboards over this OTLP output are a planned follow-on; point an
-  OpenTelemetry Collector / Tempo / Prometheus at the JSONL or enable `otlp-http`.
+- Grafana dashboards over this OTLP output are a planned follow-on; an OpenTelemetry
+  Collector at the endpoint can forward it to Tempo or Prometheus.

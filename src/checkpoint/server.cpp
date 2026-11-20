@@ -191,7 +191,7 @@ void Server::Start()
     checkpoint::logging::Init();
     checkpoint::telemetry::Init();
     checkpoint::config::OtelConfig const otelConfig;
-    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon() && !otelConfig.collector.empty())
+    if (otelConfig.RoutesReceivedOtlp() && !otelConfig.collector.empty())
     {
         if (otelConfig.collector == "file") { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
         else
@@ -668,7 +668,7 @@ void Server::ActivateSession_(cipc::SessionId sessionId, uint32_t numActiveSnaps
     auto it = _activeSessions.find(sessionId);
     it      = it != _activeSessions.end() ? it : _activeSessions.insert({sessionId, createSession()}).first;
     checkpoint::config::OtelConfig const otelConfig;
-    if (otelConfig.enabled && otelConfig.RoutesThroughDaemon())
+    if (otelConfig.RoutesReceivedOtlp())
     {
         if (it->second->IsCoordinatorPeer()) { checkpoint::telemetry::InitLocalCollector(otelConfig.CollectorFile()); }
         else if (!it->second->topo.peers.empty()) { checkpoint::telemetry::InitRelayCollector(it->second->topo.peers[0]); }
@@ -1322,20 +1322,6 @@ void Server::HandleRequest_(tcp_stream& stream)    // NOLINT(readability-functio
         res.set(boost::beast::http::field::content_type, "application/x-protobuf");
         res.keep_alive(false);
         res.body() = std::move(result.body);
-        res.prepare_payload();
-        boost::beast::http::write(stream, res);
-    }
-    else if ((url.path() == "/api/telemetry" || url.path() == "/api/telemetry/remote")
-             && headers.method() == boost::beast::http::verb::post)
-    {
-        boost::beast::http::request_parser<boost::beast::http::string_body> bodyParser{std::move(headerParser)};
-        bodyParser.body_limit(checkpoint::telemetry::MaxOtlpRequestBytes);
-        boost::beast::http::read(stream, buffer, bodyParser);
-        checkpoint::telemetry::Collect(bodyParser.get().body());
-        boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::ok, headers.version()};
-        res.set(boost::beast::http::field::server, "NativeCheckpointServer");
-        res.keep_alive(headers.keep_alive());
-        res.body() = "{}";
         res.prepare_payload();
         boost::beast::http::write(stream, res);
     }

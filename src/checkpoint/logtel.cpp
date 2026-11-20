@@ -23,6 +23,9 @@
 #include <opentelemetry/exporters/otlp/otlp_file_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_file_log_record_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_file_metric_exporter_factory.h>
+#include <opentelemetry/exporters/otlp/otlp_http_exporter_factory.h>
+#include <opentelemetry/exporters/otlp/otlp_http_log_record_exporter_factory.h>
+#include <opentelemetry/exporters/otlp/otlp_http_metric_exporter_factory.h>
 #include <opentelemetry/logs/provider.h>
 #include <opentelemetry/metrics/provider.h>
 #include <opentelemetry/proto/collector/logs/v1/logs_service.pb.h>
@@ -162,13 +165,6 @@ class FileCollector
         _file.exceptions(std::ios::badbit | std::ios::failbit);
     }
 
-    void Collect(std::string_view const& payload)
-    {
-        _file.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-        _file.put('\n');
-        _file.flush();
-    }
-
     checkpoint::telemetry::OtlpResponse
     ReceiveOtlp(std::string_view const& path, std::string_view const& contentEncoding, std::string_view const& payload)
     {
@@ -200,8 +196,15 @@ class FileCollector
         {
             return OtlpError(HttpBadRequest, "invalid binary protobuf OTLP request");
         }
-        if (request.ByteSizeLong() != 0) { Collect(_converter.Convert(request)); }
+        if (request.ByteSizeLong() != 0) { Append_(_converter.Convert(request)); }
         return {.status = HttpOk, .body = {}};
+    }
+
+    void Append_(std::string_view const& payload)
+    {
+        _file.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        _file.put('\n');
+        _file.flush();
     }
 
     std::ofstream     _file;
@@ -210,31 +213,9 @@ class FileCollector
 
 class RelayCollector
 {
-    static constexpr size_t MaxRelayAttempts = 3;
-
     public:
     explicit RelayCollector(std::string_view const& remote) : _remote(remote)
     { std::tie(_remoteAddr, _results) = ResolveEndpoint(_ioc, _remote); }
-
-    void Collect(std::string_view const& payload)
-    {
-        for (size_t attempt = 0; attempt < MaxRelayAttempts; ++attempt)
-        {
-            try
-            {
-                auto const response = Request_("/api/telemetry/remote", "application/json", {}, payload);
-                if (response.result() == boost::beast::http::status::ok) { return; }
-                if (attempt + 1 == MaxRelayAttempts)
-                {
-                    throw std::runtime_error(
-                        fmt::format("Failed to relay telemetry to remote={} status={}", _remote, response.result_int()));
-                }
-            } catch (boost::system::system_error const&)
-            {
-                if (attempt + 1 == MaxRelayAttempts) { throw; }
-            }
-        }
-    }
 
     checkpoint::telemetry::OtlpResponse
     ReceiveOtlp(std::string_view const& path, std::string_view const& contentEncoding, std::string_view const& payload)
@@ -369,14 +350,6 @@ struct LogTelState
     size_t                                                pendingOtlpBytes{0};
 
     std::once_flag shutdownOnce;
-
-    void Collect(std::string_view const& payload)
-    {
-        if (payload.empty()) { return; }
-        std::scoped_lock lock(collectorMutex);
-        if (auto* file = std::get_if<FileCollector>(&collector)) { file->Collect(payload); }
-        else if (auto* relay = std::get_if<RelayCollector>(&collector)) { relay->Collect(payload); }
-    }
 
     template <typename TCollector, typename... Args> void InitCollector(Args&&... args)
     {
@@ -636,32 +609,22 @@ static std::string_view ToText(uint32_t value, UInt32Text& text)
 namespace
 {
 
-class RoutingAppender : public otlp::OtlpFileAppender
+class FileAppender : public otlp::OtlpFileAppender
 {
     public:
-    RoutingAppender(std::string const& filePath, LogTelState& state LFTBND) : _state(state)
+    explicit FileAppender(std::string const& filePath) : _file(filePath, std::ios::out | std::ios::app)
     {
-        if (!filePath.empty())
-        {
-            _file.open(filePath, std::ios::out | std::ios::app);
-            if (!_file.is_open()) { throw std::runtime_error("Failed to open file: " + filePath); }
-            _file.exceptions(std::ios::badbit | std::ios::failbit);
-        }
+        if (!_file.is_open()) { throw std::runtime_error("Failed to open file: " + filePath); }
+        _file.exceptions(std::ios::badbit | std::ios::failbit);
     }
 
     void Export(std::string_view data, std::size_t /*record_count*/) override
     {
         std::scoped_lock lock(_mutex);
-        if (_file.is_open())
-        {
-            _file.write(data.data(), static_cast<std::streamsize>(data.size()));
-            if (data.empty() || data[data.size() - 1] != '\n') { _file.put('\n'); }
-            _file.flush();
-        }
-        std::string_view line{data.data(), data.size()};
-        if (!line.empty() && line.back() == '\n') { line.remove_suffix(1); }
-        if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
-        _state.Collect(line);
+        if (!_file.is_open()) { return; }
+        _file.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (data.empty() || data[data.size() - 1] != '\n') { _file.put('\n'); }
+        _file.flush();
     }
 
     bool ForceFlush(std::chrono::microseconds /*timeout*/) noexcept override
@@ -681,18 +644,39 @@ class RoutingAppender : public otlp::OtlpFileAppender
     private:
     std::mutex    _mutex;
     std::ofstream _file;
-    LogTelState&  _state;
 };
 
 }    // namespace
 
-static std::shared_ptr<otlp::OtlpFileAppender>
-MakeAppender(checkpoint::config::OtelConfig const& cfg, LogTelState& state, std::string_view suffix = {})
+static std::shared_ptr<otlp::OtlpFileAppender> MakeAppender(checkpoint::config::OtelConfig const& cfg, std::string_view suffix)
 {
-    bool const  writeFile = cfg.WritesProcessFile();
-    std::string file      = writeFile ? cfg.ExportFile().string() : std::string{};
-    if (writeFile) { file.append(suffix); }
-    return std::make_shared<RoutingAppender>(file, state);
+    std::string file = cfg.ExportFile().string();
+    file.append(suffix);
+    return std::make_shared<FileAppender>(file);
+}
+
+static std::unique_ptr<trace_sdk::SpanExporter> MakeSpanExporter(checkpoint::config::OtelConfig const& cfg)
+{
+    if (cfg.ExportsOtlp()) { return otlp::OtlpHttpExporterFactory::Create(); }
+    otlp::OtlpFileExporterOptions options;
+    options.backend_options = MakeAppender(cfg, {});
+    return otlp::OtlpFileExporterFactory::Create(options);
+}
+
+static std::unique_ptr<metrics_sdk::PushMetricExporter> MakeMetricExporter(checkpoint::config::OtelConfig const& cfg)
+{
+    if (cfg.ExportsOtlp()) { return otlp::OtlpHttpMetricExporterFactory::Create(); }
+    otlp::OtlpFileMetricExporterOptions options;
+    options.backend_options = MakeAppender(cfg, ".metrics");
+    return otlp::OtlpFileMetricExporterFactory::Create(options);
+}
+
+static std::unique_ptr<logs_sdk::LogRecordExporter> MakeLogExporter(checkpoint::config::OtelConfig const& cfg)
+{
+    if (cfg.ExportsOtlp()) { return otlp::OtlpHttpLogRecordExporterFactory::Create(); }
+    otlp::OtlpFileLogRecordExporterOptions options;
+    options.backend_options = MakeAppender(cfg, ".logs");
+    return otlp::OtlpFileLogRecordExporterFactory::Create(options);
 }
 
 void Init()
@@ -714,9 +698,7 @@ void Init()
     if (!cfg.runId.empty()) { attrs.SetAttribute("nemo.run.id", cfg.runId); }
     otel_res::Resource resource = otel_res::Resource::Create(attrs);
 
-    otlp::OtlpFileExporterOptions spanOpts;
-    spanOpts.backend_options                          = MakeAppender(cfg, state);
-    auto                                 spanExporter = otlp::OtlpFileExporterFactory::Create(spanOpts);
+    auto                                 spanExporter = MakeSpanExporter(cfg);
     trace_sdk::BatchSpanProcessorOptions bspOpts;
     static constexpr auto                ExportInterval = std::chrono::milliseconds{1000};
     static constexpr auto                ExportTimeout  = std::chrono::milliseconds{500};
@@ -728,9 +710,7 @@ void Init()
 
     if (cfg.metrics)
     {
-        otlp::OtlpFileMetricExporterOptions exporterOpts;
-        exporterOpts.backend_options                                     = MakeAppender(cfg, state, ".metrics");
-        auto                                              metricExporter = otlp::OtlpFileMetricExporterFactory::Create(exporterOpts);
+        auto                                              metricExporter = MakeMetricExporter(cfg);
         metrics_sdk::PeriodicExportingMetricReaderOptions readerOpts;
         readerOpts.export_interval_millis = ExportInterval;
         readerOpts.export_timeout_millis  = ExportTimeout;
@@ -745,9 +725,7 @@ void Init()
 
     if (cfg.logs)
     {
-        otlp::OtlpFileLogRecordExporterOptions exporterOpts;
-        exporterOpts.backend_options                         = MakeAppender(cfg, state, ".logs");
-        auto                                     logExporter = otlp::OtlpFileLogRecordExporterFactory::Create(exporterOpts);
+        auto                                     logExporter = MakeLogExporter(cfg);
         logs_sdk::BatchLogRecordProcessorOptions blpOpts;
         blpOpts.schedule_delay_millis = ExportInterval;
         auto logProcessor             = logs_sdk::BatchLogRecordProcessorFactory::Create(std::move(logExporter), blpOpts);
@@ -832,9 +810,6 @@ void InitRelayCollector(std::string_view const& relayToRemote)
     std::scoped_lock lock(state.collectorMutex);
     state.InitCollector<RelayCollector>(relayToRemote);
 }
-
-void Collect(std::string_view const& payload)
-{ LogTelState::Get().Collect(payload); }
 
 OtlpResponse ReceiveOtlp(std::string_view const& path,
                          std::string_view const& contentType,

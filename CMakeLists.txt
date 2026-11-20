@@ -141,6 +141,9 @@ target_link_libraries(phoenix_checkpoint PUBLIC
     opentelemetry-cpp::otlp_file_exporter
     opentelemetry-cpp::otlp_file_metric_exporter
     opentelemetry-cpp::otlp_file_log_record_exporter
+    opentelemetry-cpp::otlp_http_exporter
+    opentelemetry-cpp::otlp_http_metric_exporter
+    opentelemetry-cpp::otlp_http_log_record_exporter
     opentelemetry-cpp::proto
     spdlog::spdlog_header_only
     ZLIB::ZLIB
