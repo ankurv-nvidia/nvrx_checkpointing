@@ -3333,6 +3333,50 @@ TEST_CASE("distcp shard walk skips tensors without shards", "[distcp][tier1]")
     REQUIRE(entries[0].fqn == "non_empty");
 }
 
+TEST_CASE("Service requests resume socket calls that a signal handler interrupts", "[service][tier1]")
+{
+    using namespace std::chrono_literals;
+
+    struct sigaction interrupting{};
+    interrupting.sa_handler = +[](int) {};
+    ::sigemptyset(&interrupting.sa_mask);
+    struct sigaction previous{};
+    REQUIRE(::sigaction(SIGUSR2, &interrupting, &previous) == 0);
+
+    boost::asio::io_context        ioc;
+    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), checkpoint::ipc::Message::Port}};
+    std::atomic<bool>              requested{false};
+    std::jthread                   server([&] {
+        boost::system::error_code    ec;
+        boost::asio::ip::tcp::socket socket{ioc};
+        acceptor.accept(socket, ec);
+        boost::beast::flat_buffer                                    buffer;
+        boost::beast::http::request<boost::beast::http::string_body> request;
+        if (!ec) { boost::beast::http::read(socket, buffer, request, ec); }
+        requested = true;
+        std::this_thread::sleep_for(300ms);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, request.version()};
+        response.keep_alive(false);
+        response.prepare_payload();
+        if (!ec) { boost::beast::http::write(socket, response, ec); }
+    });
+
+    pthread_t const client = ::pthread_self();
+    std::jthread    interrupter([&] {
+        while (!requested) { std::this_thread::sleep_for(1ms); }
+        for (int signal = 0; signal < 20; ++signal)
+        {
+            static_cast<void>(::pthread_kill(client, SIGUSR2));
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+
+    REQUIRE_NOTHROW(WaitForCkptFinalize(0, 1));
+    interrupter.join();
+    server.join();
+    REQUIRE(::sigaction(SIGUSR2, &previous, nullptr) == 0);
+}
+
 static constexpr char KZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};    // NOLINT
 
 static std::vector<char> ReadFile(std::filesystem::path const& path)
