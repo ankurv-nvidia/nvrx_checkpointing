@@ -1,15 +1,12 @@
 # OpenTelemetry performance telemetry
 
 The checkpoint daemon emits OpenTelemetry **spans** (and, opt-in, **metrics**) for
-every checkpoint save, and forwards its operational **logs** as OTLP log records.
-It also accepts OTLP/HTTP protobuf traces, metrics, and logs. All terminal telemetry
-is written as **OTLP-JSONL** (one OTLP JSON object per line) and analyzed offline by
-`ci/scripts/otel_report.py`.
+every checkpoint save, forwards its operational **logs** as OTLP log records, and
+exports all of them over **OTLP/HTTP**. It also accepts OTLP/HTTP protobuf traces,
+metrics, and logs and can route them into one **OTLP-JSONL** file (one OTLP JSON
+object per line).
 
-Telemetry is **off by default**. Native CI jobs driven by `ci/scripts/slurm_job.py`
-enable it for both checkpoint providers. When enabled, performance reports consume
-the post-run OTLP data and daemon and trainer logs remain diagnostic artifacts. When
-both OTel flags are disabled, CI uses the legacy log report instead.
+Telemetry is **off by default**.
 
 ## Enabling
 
@@ -17,9 +14,9 @@ Set on every rank (the daemon inherits its own env):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NATIVE_CKPT_OTEL_EXPORT` | `daemon` | `daemon` — route through the node-local daemon collector, which collects to a single file on rank 0. `file` — each process writes its own OTLP-JSONL. `both` — use both routes. |
-| `NATIVE_CKPT_OTEL_FILE` | — | A nonempty value enables native telemetry and selects the collector-local output file. In `file` or `both` mode it also selects each process's output path. `%h` and `%p` expand to the host and process ID, as for `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath the server-log directory. |
-| `NATIVE_CKPT_OTEL_COLLECTOR` | — | In `daemon` or `both` export mode, initialize a collector before checkpoint topology exists: `file` writes `NATIVE_CKPT_OTEL_FILE`; any other value relays to that host or `host:port`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | A nonempty value enables native telemetry and exports it to `<endpoint>/v1/{traces,metrics,logs}`. The standard `OTEL_EXPORTER_OTLP_*` variables (protocol, per-signal endpoints, headers, timeout, compression) configure the exporter. Endpoints are plain HTTP. |
+| `NATIVE_CKPT_OTEL_FILE` | — | With an endpoint, the daemons route the OTLP they receive: the coordinator writes this file and the others relay to it. Without an endpoint, a nonempty value enables native telemetry and each process writes its own telemetry to this path, with metrics and logs in `.metrics` and `.logs` siblings. `%h` and `%p` expand to the host and process ID, as for `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath the server-log directory. |
+| `NATIVE_CKPT_OTEL_COLLECTOR` | — | With both an endpoint and a file, select the route before checkpoint topology exists: `file` writes `NATIVE_CKPT_OTEL_FILE`; any other value relays to that host or `host:port`. |
 | `NATIVE_CKPT_OTEL_SERVICE` | — | Override `service.name`. |
 | `NATIVE_CKPT_OTEL_METRICS` | `0` | `1` also emits `bw_mbps`, `wr_tnsr_us`, and `total_written_bytes` OTLP histograms. Off by default because the spans already carry every figure; enable for Grafana. |
 | `NATIVE_CKPT_OTEL_LOGS` | `1` | `0` suppresses just the log-record signal (spans/metrics unaffected). |
@@ -30,19 +27,27 @@ Set on every rank (the daemon inherits its own env):
 ## Architecture
 
 ```text
-training native OTel SDK ── serialized JSON ──► node-local daemon ──┐
-daemon OTel SDK ─────────── serialized JSON ───────────────────────┼─ FileCollector ── JSONL
-OTLP/HTTP protobuf ─────────────── terminal decode ────────────────┘
-                              └─ RelayCollector ── unchanged OTLP request ──► another daemon
+external collector:  daemon SDK, Megatron SDK ── OTLP/HTTP ──► collector ──► JSONL or backend
+
+daemon routing:      daemon SDK, Megatron SDK ── OTLP/HTTP ──► node-local daemon ─┬─ coordinator: FileCollector ── JSONL
+                                                                                  └─ others: RelayCollector ── unchanged request ──► coordinator
 ```
 
 - A single TU (`src/checkpoint/logtel.cpp`) contains the OpenTelemetry SDK, spdlog,
   and daemon telemetry collection behind the lightweight `src/telemetry.h` and
   `src/logging.h` facades.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` selects the topology. An external
+  OpenTelemetry Collector aggregates every process's telemetry and leaves the daemons'
+  routing idle. The node-local daemon's address (`http://127.0.0.1:4100`) together with
+  `NATIVE_CKPT_OTEL_FILE` makes the daemons the collector; each daemon's own export
+  reaches its own receiver over loopback.
+- Daemon routing accepts only protobuf, so it requires
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
 - The daemon holds one active `FileCollector` or `RelayCollector` directly. Checkpoint
-  session topology normally selects the route. `NATIVE_CKPT_OTEL_COLLECTOR` selects it
-  at startup when the daemon is used only as a collector. OTLP requests received before
-  a route exists are buffered up to 64 MiB and drained when one becomes available.
+  session topology normally selects the route: the coordinator writes the file, and the
+  other daemons relay to it. `NATIVE_CKPT_OTEL_COLLECTOR` selects the route at startup
+  when the daemon is used only as a collector. OTLP requests received before a route
+  exists are buffered up to 64 MiB and drained when one becomes available.
 - The OTLP/HTTP receiver accepts binary protobuf on `/v1/traces`, `/v1/metrics`, and
   `/v1/logs`, including gzip request bodies. Requests and decompressed payloads are
   limited to 64 MiB. Success and failure responses use the corresponding OTLP protobuf
@@ -52,16 +57,7 @@ OTLP/HTTP protobuf ─────────────── terminal decode
   originating OTLP exporter owns retry policy. Multi-hop relay remains valid.
 - A terminal collector decodes protobuf and uses OpenTelemetry's OTLP file serializer
   to produce canonical JSON. The file collector alone appends and flushes the JSONL
-  newline. Daemon-generated telemetry already reaches it as canonical JSON.
-- The existing JSON relay used by daemon-generated telemetry retains its three bounded
-  attempts. Its at-least-once delivery can duplicate a batch if a response is lost.
-- The daemon maps its own topology policy onto that neutral collector configuration.
-  In `daemon` mode rank 0 writes locally, while the other daemons relay to rank 0's
-  `/api/telemetry/remote` listener. Every daemon can accept both local and remote input.
-- Each training process sends its native telemetry to its node-local daemon in
-  `daemon` mode. In `file` mode each native process writes to
-  `NATIVE_CKPT_OTEL_FILE`; use `%h` and `%p` in that path to give every process
-  a distinct file.
+  newline.
 
 ### Spans, logs and attributes
 
@@ -85,9 +81,9 @@ OTLP/HTTP protobuf ─────────────── terminal decode
   custom sink forwards each as an OTLP **log record** with its severity and
   current `nvrx.memory.*` attributes.
 - The daemon's `[native_ckpt:svr][{session}][PERF] …` Begin/Finished stderr markers
-  remain human-readable diagnostics. CI parses them only when OTel is disabled.
+  remain human-readable diagnostics.
 - Resource attributes: `service.name`, `host.name`, `process.pid`,
-  `nvrx.process.role`, `nvrx.ci_phase`, and, when supplied by CI, `nemo.run.id`.
+  `nvrx.process.role`, `nvrx.ci_phase`, and, when the launcher supplies one, `nemo.run.id`.
 - Python checkpoint boundary spans use the application's process-global OpenTelemetry
   provider. They are no-ops when `MEGATRON_OTEL_ENABLED` is not `1` or the
   OpenTelemetry Python API is unavailable; otherwise the training job's provider owns
@@ -95,125 +91,10 @@ OTLP/HTTP protobuf ─────────────── terminal decode
   publishes each asynchronous save inside an `nvrx.checkpoint.finalize` span that
   carries `megatron.iteration` and `nvrx.snapshot_id`.
 
-## Analysis
-
-```bash
-# Human summary of the ckpt.save spans:
-python3 ci/scripts/otel_report.py "$NATIVE_CKPT_OTEL_FILE"
-```
-
-`otel_report.py` extracts one sample per `ckpt.save` span (keyed on the span's
-`nvrx.rank`) and reads OTLP gauges, sums, and histograms. It does not recreate
-performance log lines. `ci/tests/test_otel_report.py` covers the extraction and summary
-with synthetic OTLP fixtures.
-
-## CI perf gating
-
-`PerfReport` (`ci/scripts/slurm_job.py`) derives every checkpoint-provider metric from
-the collected OTLP data after a run:
-
-- Native writer bandwidth, write time, and bytes come from `ckpt.save` spans.
-- Save-to-durable time comes from Megatron checkpoint spans for both providers.
-  Asynchronous saves use `nvrx.call_idx`, with a cardinality-checked FIFO match when
-  the dispatch span does not carry the request index.
-- Native coordinator activation-to-durable time comes from `ckpt.svr.durable`.
-- Megatron step duration, TFLOP/s/GPU, tokens/s, and allocated GPU memory come from
-  `megatron.training.*` metrics. The final cumulative histogram point supplies step
-  duration; the final gauge point supplies each other value.
-- CUDA allocation, HBM, GPU capacity, and CPU RSS gauges are exported once per rank
-  after training and aggregated by rank. `gpu_peak_bytes` is PyTorch's peak live
-  allocation; `gpu_hbm_peak_bytes` is the sampled whole-device HBM use and therefore
-  also includes reserved allocator memory, CUDA/NCCL state, and other device users.
-- Native save spans contain `nvrx.checkpoint.save.gpu_memory.entry` and
-  `nvrx.checkpoint.save.gpu_memory.exit` events. They record live and reserved
-  allocator bytes, cumulative allocator activity, and whole-device HBM. Packed
-  NVFP4/MXFP8 saves fail if live or reserved allocator bytes change, or if
-  cumulative transient allocator activity exceeds 1 MiB. The bounded allowance
-  covers Megatron's small checkpoint bookkeeping tensors while still rejecting
-  material parameter dequantization.
-- The Slurm harness also persists each training rank's process high-water mark and
-  reads each native checkpoint daemon's Linux `VmHWM` immediately before shutdown.
-  The final report prints `training_process_peak_rss_bytes` across ranks and
-  `checkpoint_daemon_peak_rss_bytes` across nodes, taking each process's maximum
-  over every phase and cycle in the run. GPU and host peak-memory metrics are
-  compared with provider-specific workload baselines.
-- The existing one-second GPU sampler also records each training rank's current
-  RSS as OTLP `process.memory` events. Each rank sends them through its node-local
-  daemon into the single collected OTel JSONL. After each phase, CI combines those
-  samples with the native daemon's
-  `process.memory` events in one `process_memory_all.svg`: daemon processes use
-  blue shades and training processes use red shades. The graph contains host RSS
-  only and is generated solely from that OTel JSONL.
-- At the end of every job, CI concatenates each run's collected OTLP records, in run
-  and phase order, into one `<stem>_otel.jsonl` beside the job log and converts it to
-  `<stem>_perfetto.json`, a Chrome trace with one process per run phase and host.
-  Failed jobs merge whatever their phases collected, and incomplete records are
-  dropped with a warning. A merge or conversion error is logged without changing the
-  job's result. JET archives both files with the job's other results in place of the
-  per-phase OTLP copies.
-
-Metrics carrying `dl.rank` retain per-rank medians plus min, median, and max across
-ranks in the JSON report and generated baseline candidate. Checkpoint durability is
-paired and summarized independently for every Megatron exporter rank. Coordinator-only
-durability has no rank aggregation.
-
-Native saves report written bytes as `total_written_bytes_total` (each checkpoint's
-sum over ranks), `total_written_bytes_rank0` (rank 0's bytes per checkpoint), and
-`total_written_bytes_per_rank` (every rank's bytes per checkpoint). Each baseline holds
-one integer or `<lower>+<diff>`, the inclusive range from `lower` to `lower + diff`, and
-a run passes only when every sample falls inside it. Candidates record the integer when
-every sample agrees and the range otherwise, without rank statistics.
-
-After the reports, the epilog logs each phase's checkpoint timings as min, max, and
-median milliseconds across ranks: every load, every exposed save, and, for each
-asynchronous save, the finalize call that completed it
-(`finalize-checkpoint iteration N`). That finalizer is the Megatron
-`megatron.checkpoint.save.finalize` or `megatron.checkpoint.exit_finalize` span, or
-the native provider's `nvrx.checkpoint.wait_previous`. Megatron's asynchronous saves
-pair with it through `nvrx.call_idx`, in save order when the indices disagree; native
-saves identify it as the parent of their `nvrx.checkpoint.finalize` span. Synchronous
-saves finalize inside the save span.
-
-OTel takes precedence whenever `NATIVE_CKPT_OTEL_FILE` is nonempty or
-`MEGATRON_OTEL_ENABLED` is enabled. Missing, malformed, mismatched, or incomplete
-OTLP data then fails validation instead of silently falling back to logs. If both
-are disabled, `log_report.py` extracts the legacy performance markers and validates
-that every native `ckpt.save` Begin has a schema-valid matching Finished marker.
-The wiring:
-
-- `_TRAIN_ENV_DEFAULTS` sets `NATIVE_CKPT_OTEL_EXPORT=daemon`, and each
-  telemetry-enabled cycle assigns `NATIVE_CKPT_OTEL_FILE`. Periodic process-memory
-  sampling remains opt-in through `NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS`;
-  native span begin/end emissions generate standalone memory events without it.
-  Megatron sends traces and metrics from every rank to the node-local daemon so
-  checkpoint timing summaries retain rank minima, maxima, and medians. The default
-  span groups plus `load_checkpoint` cover both checkpoint directions.
-- CI starts one daemon per node before the trainer so startup exports reach the
-  pre-topology buffer rather than waiting for checkpoint warmup to launch it.
-- Image preparation installs the pinned Megatron checkout's `otel` extra, whose
-  nemo-lens instrumentation exports Megatron's spans and metrics; the underlying
-  PyTorch base-image tag is unchanged.
-- `_run_routine` gives each phase or cycle one `native_ckpt_otel.jsonl` beneath
-  `ci-results/otel/{cycle_tag}`. Every node-local daemon relays to the rank-zero
-  daemon, which writes that single file. Native checkpoint topology selects the route;
-  NVRx runs configure the collector-only daemons explicitly. `MEGATRON_OTEL_RUN_ID`
-  (`nemo.run.id`) names the job, the run (`ref`, `cmp`, or `run`), the phase, and the
-  Slurm and elastic restart counts.
-- Each cycle requires checkpoint save spans, all four Megatron performance metrics,
-  and all four resource gauges from every world rank. Native cycles additionally require
-  complete `ckpt.save` rank sets for every session and snapshot.
-- `otel_report.py` owns OTLP loading, validation, and metric derivation;
-  `log_report.py` owns regex-based log extraction. `slurm_job.py` selects one source
-  and applies the shared baseline comparison.
-
-The functional ckptbench gate (`ci/scripts/ckpt_stress.py`) does not gate on perf.
-
 ## Notes
 
 - **In-process runs** (`ckpttest` with `RunInprocServer`) put many ranks and daemons
   in one process, which shares one process-global OTel provider. Each save's
   `nvrx.rank` span attribute remains correct. Production daemons run in separate processes.
-- The multi-node relay (`/api/telemetry/remote`) is exercised by multi-node native and
-  NVRx CI runs; single-node and file-mode runs collect directly.
-- Grafana dashboards over this OTLP output are a planned follow-on; point an
-  OpenTelemetry Collector / Tempo / Prometheus at the JSONL or enable `otlp-http`.
+- Grafana dashboards over this OTLP output are a planned follow-on; an OpenTelemetry
+  Collector at the endpoint can forward it to Tempo or Prometheus.

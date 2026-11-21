@@ -4,9 +4,17 @@ set -Eeoux pipefail
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 REPO_ROOT=$(realpath ${SCRIPT_DIR}/..)
 ARCH=$(uname -m)
+# Python packages go into the active virtual environment, or else into the system Python.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+else
+    export UV_SYSTEM_PYTHON=1 UV_BREAK_SYSTEM_PACKAGES=1
+fi
 
 # The CI build scripts, the JET image and the Slurm runner read these versions from here.
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
+# The image's PyTorch series, which bases without PyTorch install so that Megatron-LM's pins hold.
+PYTORCH_SERIES=2.14
 CUDA_VERSION=13.4
 CLANG_VERSION=23
 
@@ -290,7 +298,7 @@ function container {
         -d -it ${BASE_IMAGE} \
         bash
 
-    podman exec -it ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
+    podman exec -it ${MAX_JOBS:+--env MAX_JOBS=${MAX_JOBS}} ${CONTAINER_NAME}-build bash /root/nvrx_checkpointing/scripts/prepare.sh $*
 
     podman commit ${CONTAINER_NAME}-build ${CONTAINER_NAME}-image
     podman run \
@@ -305,9 +313,7 @@ function container {
 }
 
 function megatron {
-    git config --system protocol.version 1
     resolve_megatron_root
-    nvcc --version || cuda13
     _NVCC_VERSION=$(nvcc --version)
     printf '%s\n' "${_NVCC_VERSION}"
     if [[ "${_NVCC_VERSION}" =~ release[[:space:]]+([0-9]+)\. ]]; then
@@ -316,7 +322,7 @@ function megatron {
         echo "Unable to determine the CUDA major version from nvcc" >&2
         return 1
     fi
-    export MAX_JOBS=4
+    export MAX_JOBS=${MAX_JOBS:-4}
     export CC=gcc
     export CXX=g++
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
@@ -331,33 +337,57 @@ function megatron {
     if [ -f "$HOME/.local/bin/env" ]; then
         source $HOME/.local/bin/env
     fi
-    # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
-    # uv cache to avoid collision.
-    export UV_CACHE_DIR="$(mktemp -d)"
+    # A base without PyTorch, such as plain Ubuntu, gets the image's series built for the driver's CUDA.
+    python -c 'import torch' 2>/dev/null || uv pip install "torch==${PYTORCH_SERIES}.*" --torch-backend=auto
+    if [[ -n "${PREPARE_WHEEL_CACHE:-}" ]]; then
+        # Every revision of this script, toolchain and GPU architecture keeps caches of its own.
+        PREPARE_WHEEL_CACHE="${PREPARE_WHEEL_CACHE}/$({
+            sha256sum < "${SCRIPT_DIR}/prepare.sh"
+            uname -m
+            nvcc --version
+            python -c 'import sys, torch; print(sys.version, torch.__version__)'
+            echo "${TORCH_CUDA_ARCH_LIST}"
+        } | sha256sum | cut -c1-16)"
+        export UV_CACHE_DIR="${PREPARE_WHEEL_CACHE}/uv"
+    else
+        # By default ${HOME} is mounted at root in enroot; use a temporary directory for the
+        # uv cache to avoid collision.
+        export UV_CACHE_DIR="$(mktemp -d)" UV_NO_CACHE=1
+    fi
+    # Installs keep a base image's NumPy, which packages such as its Numba cap.
+    export UV_CONSTRAINT=$(mktemp)
+    python -c 'import importlib.metadata as m; print("numpy==" + m.version("numpy"))' 2>/dev/null > "${UV_CONSTRAINT}" || true
     # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
-    uv pip install --system --no-cache --break-system-packages "nvidia-cudnn-frontend[cutedsl]==1.28.0"
+    uv pip install "nvidia-cudnn-frontend[cutedsl]==1.28.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
-    UV_OVERRIDES="${UV_CACHE_DIR}/megatron-overrides.txt"
+    UV_OVERRIDES=$(mktemp)
     python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
         "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}"
+    # A base image's quack-kernels stays in use; its FlashAttention-4 needs that release.
+    python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
 
-    # The image's torch requires C++20, so Mamba and causal-conv1d are built from source with it.
+    # The base's torch requires C++20, so Mamba, causal-conv1d and a missing flash-attn are built from source with it.
     read -r MAMBA_GIT MAMBA_REV <<< "$(python -c 'import sys, tomllib; s = tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"]["sources"]["mamba-ssm"]; print(s["git"], s["rev"])' "${MEGATRON_ROOT}/pyproject.toml")"
     export MAMBA_FORCE_BUILD=TRUE
-    for spec in "causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git v1.7.0" "mamba ${MAMBA_GIT} ${MAMBA_REV}"; do
+    specs=("causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git v1.7.0" "mamba ${MAMBA_GIT} ${MAMBA_REV}")
+    python -c 'import flash_attn' 2>/dev/null || specs+=("flash-attention https://github.com/Dao-AILab/flash-attention.git v2.8.3.post2")
+    for spec in "${specs[@]}"; do
         read -r name url ref <<< "${spec}"
         git clone --quiet "${url}" "${name}"
         git -C "${name}" checkout --quiet "${ref}"
         sed -i 's/-std=c++17/-std=c++20/g' "${name}/setup.py"
         grep -q -- '-std=c++20' "${name}/setup.py"
-        uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" "./${name}"
+        FLASH_ATTN_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" wheel_install "${name}" --override "${UV_OVERRIDES}"
         rm -rf "${name}"
     done
     printf '%s\n' "causal-conv1d; sys_platform == 'never'" "mamba-ssm; sys_platform == 'never'" >> "${UV_OVERRIDES}"
 
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
-    uv pip install --system --no-cache --break-system-packages --no-build-isolation flash-attn
+    # Megatron-LM builds without isolation, so a base without pybind11 first gets its declared build requirements.
+    python -c 'import pybind11' 2>/dev/null || uv pip install -r <(python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["build-system"]["requires"]))' "${MEGATRON_ROOT}/pyproject.toml")
+    uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
+    python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
@@ -367,11 +397,9 @@ function megatron {
     export RDMA_CORE_HOME=/opt/rdma-core/build
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
 
-    deepep_prereqs
-
     # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
     # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
-    uv pip install --system --no-cache --break-system-packages nvidia-nvshmem-cu13==3.7.2
+    uv pip install nvidia-nvshmem-cu13==3.7.2
     NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
     pushd "${NVSHMEM_LIB_DIR}"
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
@@ -387,14 +415,14 @@ function megatron {
     popd
 
     # DeepEP links only NCCL's GPUNetIO objects, so only the SendRecv kernels are generated.
-    ONLY_FUNCS="SendRecv" TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --system --no-cache --break-system-packages --no-build-isolation -v DeepEP/.
-    rm -rf /var/lib/apt/lists/*
+    ONLY_FUNCS="SendRecv" wheel_install DeepEP
     rm -rf DeepEP
 
     unset CC
     unset CXX
+    python -c 'import megatron.core, transformer_engine.pytorch, causal_conv1d, mamba_ssm, flash_attn, deep_ep'
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true
-    pip list
+    uv pip list
     #pip install  --no-build-isolation --break-system-packages
     # if nvidia gpus found then run run.sh
     nvidia-smi || echo "No nvidia gpus found"
@@ -410,8 +438,36 @@ function nvte_cuda_archs {
     esac
 }
 
-# DeepEP compiles against these RDMA and NVML development files.
-function deepep_prereqs {
+# Installs a source tree's wheel with the given uv pip arguments, reusing a cached wheel of the same tree and GPU architectures.
+function wheel_install {
+    local source=$1 wheels="" key build
+    shift
+    if [[ -n "${PREPARE_WHEEL_CACHE:-}" ]]; then
+        mkdir -p "${PREPARE_WHEEL_CACHE}"
+        git -C "${source}" add --all
+        key=$({
+            git -C "${source}" rev-parse HEAD
+            git -C "${source}" diff --cached --binary HEAD
+            echo "${TORCH_CUDA_ARCH_LIST:-}"
+        } | sha256sum | cut -c1-16)
+        wheels="${PREPARE_WHEEL_CACHE}/$(basename "$(realpath "${source}")")-${key}"
+    fi
+    if [[ -z "${wheels}" ]] || ! compgen -G "${wheels}/*.whl" > /dev/null; then
+        build=$(mktemp -d "${PREPARE_WHEEL_CACHE:-${TMPDIR:-/tmp}}/.wheel-build.XXXXXX")
+        uv build --wheel --no-build-isolation --python "$(command -v python)" --out-dir "${build}" "${source}"
+        if [[ -z "${wheels}" ]]; then
+            wheels=${build}
+        else
+            # A concurrent run that stored the same wheels first keeps its copy.
+            mv -T "${build}" "${wheels}" || rm -rf "${build}"
+        fi
+    fi
+    uv pip install "$@" "${wheels}"/*.whl
+    [[ -n "${PREPARE_WHEEL_CACHE:-}" ]] || rm -rf "${wheels}"
+}
+
+# Installs the RDMA, InfiniBand verbs, mlx5 and NVML development files that GPU networking packages compile against.
+function gpu_networking {
     apt-get update
     apt-get install --yes --allow-change-held-packages rdma-core libibverbs-dev
     apt-get clean
@@ -426,7 +482,7 @@ function deepep_prereqs {
     # Only the payload is unpacked because installing the package pulls in driver packages that overrun container overlays.
     nvml_dir=$(mktemp -d)
     (cd "${nvml_dir}" && apt-get update && apt-get download libnvidia-ml-dev && dpkg-deb -x libnvidia-ml-dev_*.deb /)
-    rm -rf "${nvml_dir}"
+    rm -rf "${nvml_dir}" /var/lib/apt/lists/*
     $*
 }
 
@@ -453,6 +509,7 @@ function cuda13 {
     export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-${CUDA_VERSION}}
     export PATH=${CUDA_HOME}/bin:${PATH}
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}
+    $*
 }
 
 # Cross-compiles aarch64 (Grace) wheels on an x86_64 host that has run cuda13.
@@ -465,7 +522,7 @@ function cross_arm64 {
 }
 
 if [ "$#" -eq 0 ]; then
-    container ubuntu2404 megatron test
+    container ubuntu2404 cuda13 gpu_networking megatron test
 else
     $*
 fi

@@ -73,7 +73,7 @@ void SvcPing()
         boost::process::process    proc(ctx, svcExeLoc, {}, boost::process::process_stdio{.in = {}, .out = output, .err = stderr});
         std::string                line;
         boost::system::error_code  ec;
-        boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec);
+        do { boost::asio::read_until(output, boost::asio::dynamic_buffer(line), '\n', ec); } while (ec == boost::asio::error::interrupted);
         proc.detach();
     } catch (std::exception const& ex)
     {
@@ -120,13 +120,15 @@ static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target,
         req.set(boost::beast::http::field::content_type, "application/octet-stream");
         req.body() = body;
         req.prepare_payload();
-        boost::beast::http::write(stream, req, ec);
+        // A handled signal, such as a daemon candidate's exit, interrupts these calls without losing their progress.
+        boost::beast::http::request_serializer<boost::beast::http::string_body> serializer{req};
+        do { boost::beast::http::write(stream, serializer, ec); } while (ec == boost::asio::error::interrupted);
         if (ec) { throw boost::system::system_error(ec); }
 
         boost::beast::flat_buffer                                            buffer;
         boost::beast::http::response_parser<boost::beast::http::string_body> parser;
         parser.body_limit(std::numeric_limits<uint64_t>::max());
-        boost::beast::http::read(stream, buffer, parser, ec);
+        do { boost::beast::http::read(stream, buffer, parser, ec); } while (ec == boost::asio::error::interrupted);
         if (ec) { throw boost::system::system_error(ec); }
         auto response = parser.release();
         if (response.result() != boost::beast::http::status::ok)

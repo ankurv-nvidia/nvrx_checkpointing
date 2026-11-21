@@ -175,8 +175,8 @@ function(target_is_python_extension target)
         find_package(Python3 COMPONENTS Development.Embed Development.SABIModule REQUIRED QUIET)
         target_link_libraries(${target} PRIVATE Python3::Python Python3::SABIModule)
         add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${PATCHELF} --remove-needed libpython${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}.so.1.0 $<TARGET_FILE:${target}>
-            COMMENT "Removing libpython dependency with patchelf..."
+            COMMAND ${PATCHELF} --remove-rpath --remove-needed libpython${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}.so.1.0 $<TARGET_FILE:${target}>
+            COMMENT "Removing libpython dependency and run path with patchelf..."
         )
     else()
         message(FATAL_ERROR "Unsupported platform ${CMAKE_SYSTEM_NAME} for target_is_python_extension")
