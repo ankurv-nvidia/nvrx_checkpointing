@@ -39,10 +39,33 @@ endif()
 
 option(PHOENIX_BUILD_PYTHON_BINDINGS    "Build Python Bindings"      ON)
 option(PHOENIX_BUILD_WHEEL              "Build Python Wheel"         ON)
-set(PHOENIX_WHEEL_VERSION "0.0.1" CACHE STRING "Python wheel version")
+# A wheel built from a Git checkout counts the commits in its history and names its commit.
+set(PHOENIX_WHEEL_VERSION "0.0.1")
+find_package(Git QUIET)
+if (GIT_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-list --count HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _wheel_count_failed
+        OUTPUT_VARIABLE _wheel_commit_count
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=8 HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _wheel_commit_failed
+        OUTPUT_VARIABLE _wheel_commit
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if (NOT _wheel_count_failed AND NOT _wheel_commit_failed)
+        string(APPEND PHOENIX_WHEEL_VERSION ".dev${_wheel_commit_count}+g${_wheel_commit}")
+    endif()
+endif()
 
 option(PHOENIX_BUILD_BENCHMARK          "Build benchmark tools"             ON)
-option(PHOENIX_BUILD_TESTS              "Build Catch2 test executable"      OFF)
+option(BUILD_TESTING                    "Build the tests"                   OFF)
 option(PHOENIX_REQUIRE_CUDA             "Fail if CUDA is unavailable"       OFF)
 
 if (PHOENIX_BUILD_WHEEL AND NOT PHOENIX_BUILD_PYTHON_BINDINGS)
@@ -119,6 +142,9 @@ target_link_libraries(phoenix_checkpoint PUBLIC
     opentelemetry-cpp::otlp_file_exporter
     opentelemetry-cpp::otlp_file_metric_exporter
     opentelemetry-cpp::otlp_file_log_record_exporter
+    opentelemetry-cpp::otlp_http_exporter
+    opentelemetry-cpp::otlp_http_metric_exporter
+    opentelemetry-cpp::otlp_http_log_record_exporter
     opentelemetry-cpp::proto
     spdlog::spdlog_header_only
     ZLIB::ZLIB
@@ -177,7 +203,7 @@ if (PHOENIX_BUILD_CUDA)
     endif()
 endif()
 
-if (PHOENIX_BUILD_BENCHMARK OR PHOENIX_BUILD_TESTS)
+if (PHOENIX_BUILD_BENCHMARK OR BUILD_TESTING)
     add_library(phoenix_checkpoint_fixture STATIC src/benchmark/ckpt_fixture.cpp)
     # distcpio is listed alongside daemon because
     # CMake only propagates OBJECT-library object files one consumer hop deep — the
@@ -218,6 +244,12 @@ endif()
 if (PHOENIX_BUILD_PYTHON_BINDINGS)
     include(DLPack)
 
+    # A cross build compiles and links the extensions against the target CPython.
+    if (CMAKE_CROSSCOMPILING AND COMMAND vcpkg_install)
+        vcpkg_install(cpython-standalone)
+        find_path(Python3_INCLUDE_DIR Python.h PATH_SUFFIXES python3.12 REQUIRED)
+        set(Python_INCLUDE_DIR "${Python3_INCLUDE_DIR}")
+    endif()
     find_package(Python3 COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
     include(PythonEnv)
     pip_install(nanobind)
@@ -240,7 +272,7 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
     SupressLintingForTarget(nanobind-static-abi3)
     target_link_libraries(checkpoint PRIVATE phoenix_checkpoint daemon distcpio fmt::fmt-header-only dlpack::dlpack )
     target_is_python_extension(checkpoint)
-    if (PHOENIX_BUILD_TESTS)
+    if (BUILD_TESTING)
         if (PHOENIX_BUILD_CUDA)
             set(pytorch_index_url "https://download.pytorch.org/whl/cu${CUDAToolkit_VERSION_MAJOR}${CUDAToolkit_VERSION_MINOR}")
             message(STATUS "Installing CUDA-enabled PyTorch from ${pytorch_index_url} into venv for Python bindings...")
@@ -250,13 +282,6 @@ if (PHOENIX_BUILD_PYTHON_BINDINGS)
             pip_install(torch --index-url https://download.pytorch.org/whl/cpu)
         endif()
     endif()
-    add_custom_command(TARGET checkpoint POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint>>
-        COMMAND ${CMAKE_COMMAND} -E create_symlink
-            $<TARGET_FILE:checkpoint>
-            $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint>>
-        COMMENT "Creating symbolic link..."
-    )
 endif()
 
 if (COMMAND vcpkg_install)
@@ -288,15 +313,7 @@ target_link_libraries(checkpoint_server PUBLIC
     phoenix_checkpoint daemon distcpio
     Boost::program_options cpptrace::cpptrace)
 
-add_custom_command(TARGET checkpoint_server POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-        $<TARGET_FILE:checkpoint_server>
-        $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:checkpoint_server>>
-    COMMENT "Creating symbolic link..."
-)
-
-if (PHOENIX_BUILD_TESTS)
+if (BUILD_TESTING)
     include(Catch2)
     enable_testing()
     include(Catch)
@@ -327,16 +344,8 @@ if (PHOENIX_BUILD_TESTS)
             distcpio fmt::fmt-header-only)
         target_is_python_extension(_distcp_shim)
 
-        add_custom_command(TARGET _distcp_shim POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E remove $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:_distcp_shim>>
-            COMMAND ${CMAKE_COMMAND} -E create_symlink
-                $<TARGET_FILE:_distcp_shim>
-                $<PATH:APPEND,${CMAKE_CURRENT_LIST_DIR},$<TARGET_FILE_NAME:_distcp_shim>>
-            COMMENT "Creating symbolic link for _distcp_shim..."
-        )
-
         # Wire Python tests into ctest via pytest-cmake.
-        pip_install(pytest-cmake hypothesis)
+        pip_install(-r "${CMAKE_CURRENT_SOURCE_DIR}/tests/requirements.txt")
         set(Pytest_ROOT      "${PYTHON_VIRTUAL_ENV_PATH}/share/Pytest")
         # FORCE because find_program may have cached NOTFOUND on an earlier
         # configure run before the venv had pytest installed.
@@ -348,35 +357,63 @@ if (PHOENIX_BUILD_TESTS)
         # then reads it back through `torch.distributed.checkpoint.load`.
         pytest_discover_tests(dcp_load
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dcp_load.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS _distcp_shim
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
         # Per-tensor `torch.load` round-trip via the shim — independent check
         # that each per-tensor ZIP slice decodes correctly.
         pytest_discover_tests(distcp_roundtrip
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_distcp_roundtrip.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS _distcp_shim
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
 
         pytest_discover_tests(quantized_snapshot
             TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quantized_snapshot.py
-            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_SOURCE_DIR}
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS checkpoint checkpoint_server
-            ENVIRONMENT
-                MEGATRON_NATIVE_BUILD_DIR=/tmp/megatron-native-autobuild-disabled
         )
+
+        # The tests marked integration need a checkpoint server, and each runs in a process of its own.
+        set(_integration_environment MEGATRON_NATIVE_RUN_SERVER_TESTS=1)
+        if (NOT PHOENIX_BUILD_CUDA)
+            # A CPU-only extension cannot take device tensors.
+            list(APPEND _integration_environment CUDA_VISIBLE_DEVICES=)
+        endif()
+        pytest_discover_tests(integration
+            TEST_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            PYTHON_PATH_PREPEND ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}
+            DISCOVERY_EXTRA_ARGS -m integration
+            DEPENDS checkpoint checkpoint_server _distcp_shim
+            ENVIRONMENT ${_integration_environment}
+        )
+
+        if (TARGET ckpt_stress_test)
+            # Daemon election and a loopback connect storm against the checkpoint web service.
+            add_test(NAME ckpt_stress
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ckpt_stress.py"
+                    --stress $<TARGET_FILE:ckpt_stress_test>
+                    --server $<TARGET_FILE:checkpoint_server>
+                    --results-dir "${CMAKE_CURRENT_BINARY_DIR}/ckpt_stress")
+        endif()
+
+        # Smoke checks of the installed package, which skip where no package is installed.
+        set(_package_installed "import importlib.util, sys; importlib.util.find_spec('nvrx_checkpointing') or sys.exit(77)")
+        add_test(NAME package_import
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import nvrx_checkpointing as m; print(m.SHLIB_PATH, m.SERVER_PATH)")
+        add_test(NAME package_debug_import
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import nvrx_checkpointing.debug")
+        add_test(NAME package_metadata_compare_help
+            COMMAND "${Python3_EXECUTABLE}" -c "${_package_installed}; import runpy; sys.argv = ['metadata_compare', '--help']; runpy.run_module('nvrx_checkpointing.metadata_compare', run_name='__main__')")
+        set_tests_properties(package_import package_debug_import package_metadata_compare_help
+            PROPERTIES LABELS smoke SKIP_RETURN_CODE 77)
 
     endif()
 endif()
 
 if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
-    pip_install(cmake-pywhl)
+    pip_install("cmake-pywhl>=0.0.5")
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" -c "import cmake_pywhl.build,pathlib; print(pathlib.Path(cmake_pywhl.build.__file__).parent)"
         OUTPUT_VARIABLE PyWhl_DIR
@@ -405,13 +442,14 @@ if (PHOENIX_BUILD_WHEEL AND PHOENIX_BUILD_PYTHON_BINDINGS)
         VERSION "${PHOENIX_WHEEL_VERSION}"
         MODULES nvrx_checkpointing
         LICENSE_FILE LICENSE
-        WHL_FILE_OUTVAR PHOENIX_WHEEL_FILE
     )
-    # Buildable wheel target for CI. The pywhl `nvrx_checkpointing` target
-    # names its ninja depfile as a target-level dependency, which a fresh
-    # Ninja tree rejects (nothing produces the depfile until the packaging
-    # command has run once); `all_whl` additionally editable-installs into
-    # the configuring interpreter. Depending on the wheel file itself avoids
-    # both.
-    add_custom_target(nvrx_checkpointing_whl DEPENDS "${PHOENIX_WHEEL_FILE}")
+endif()
+
+if (BUILD_TESTING AND TARGET nvrx_checkpointing_dev_whl)
+    # Test discovery imports the package through its editable install.
+    foreach(_test_group dcp_load distcp_roundtrip quantized_snapshot integration)
+        if (TARGET ${_test_group})
+            add_dependencies(${_test_group} nvrx_checkpointing_dev_whl)
+        endif()
+    endforeach()
 endif()

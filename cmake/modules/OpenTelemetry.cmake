@@ -14,7 +14,8 @@ if (COMMAND vcpkg_install)
         )
         _vcpkg_refresh_available_ports()
     endif()
-    vcpkg_install("opentelemetry-cpp23[otlp-file]")
+    # OTLP/HTTP collectors are plain-HTTP endpoints, so curl builds without TLS.
+    vcpkg_install(--recurse "curl[core]" "opentelemetry-cpp23[otlp-file,otlp-http]")
 endif()
 
 find_package(opentelemetry-cpp CONFIG REQUIRED)

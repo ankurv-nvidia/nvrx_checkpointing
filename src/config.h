@@ -156,23 +156,6 @@ struct WFile
 
     static ValueType Parse(std::string_view value) { return ValueType{Substitute(value)}; }
 };
-
-struct OtelExportMode
-{
-    enum class ValueType : uint8_t
-    {
-        File,
-        Daemon,
-        Both,
-    };
-
-    static ValueType Parse(std::string_view value)
-    {
-        if (value == "file") { return ValueType::File; }
-        if (value == "both") { return ValueType::Both; }
-        return ValueType::Daemon;
-    }
-};
 }    // namespace checkpoint::config::types
 
 namespace checkpoint::config
@@ -198,11 +181,11 @@ struct SvcDisableAutoLaunch
     using Type                                = types::EnabledByOne;
 };
 
-struct OtelExport
+struct OtelEndpoint
 {
-    static constexpr std::string_view Name    = "otel.export";
-    static constexpr std::string_view Default = "daemon";
-    using Type                                = types::OtelExportMode;
+    static constexpr std::string_view Env     = "OTEL_EXPORTER_OTLP_ENDPOINT";
+    static constexpr std::string_view Default = {};
+    using Type                                = types::Text;
 };
 
 struct OtelFile
@@ -369,13 +352,11 @@ template <typename TConfig> [[nodiscard]] auto GetConfigValue()
     return TConfig::Type::Parse(value);
 }
 
-using OtelExportMode = types::OtelExportMode::ValueType;
-
 struct OtelConfig
 {
-    OtelExportMode        mode      = GetConfigValue<OtelExport>();
+    std::string           endpoint  = GetConfigValue<OtelEndpoint>();
     std::filesystem::path file      = GetConfigValue<OtelFile>();
-    bool                  enabled   = !file.empty();
+    bool                  enabled   = !endpoint.empty() || !file.empty();
     std::string           service   = GetConfigValue<OtelService>();
     std::string           collector = GetConfigValue<OtelCollector>();
     std::string           runId     = GetConfigValue<OtelRunId>();
@@ -383,9 +364,9 @@ struct OtelConfig
     bool                  metrics   = GetConfigValue<OtelMetrics>();
     bool                  logs      = GetConfigValue<OtelLogs>();
 
-    [[nodiscard]] constexpr bool WritesProcessFile() const noexcept { return mode != OtelExportMode::Daemon; }
+    [[nodiscard]] bool ExportsOtlp() const noexcept { return !endpoint.empty(); }
 
-    [[nodiscard]] constexpr bool RoutesThroughDaemon() const noexcept { return mode != OtelExportMode::File; }
+    [[nodiscard]] bool RoutesReceivedOtlp() const noexcept { return !endpoint.empty() && !file.empty(); }
 
     [[nodiscard]] std::filesystem::path ExportFile() const
     { return file.is_absolute() ? file : GetConfigValue<LogFile>().parent_path() / file; }

@@ -202,7 +202,6 @@ struct Stream
 
 void InitLocalCollector(std::filesystem::path const& filePath);
 void InitRelayCollector(std::string_view const& relayToRemote);
-void Collect(std::string_view const& payload);
 
 struct OtlpResponse
 {

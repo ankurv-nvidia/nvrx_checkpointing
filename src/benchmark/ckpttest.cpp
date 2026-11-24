@@ -3328,6 +3328,50 @@ TEST_CASE("distcp shard walk skips tensors without shards", "[distcp][tier1]")
     REQUIRE(entries[0].fqn == "non_empty");
 }
 
+TEST_CASE("Service requests resume socket calls that a signal handler interrupts", "[service][tier1]")
+{
+    using namespace std::chrono_literals;
+
+    struct sigaction interrupting{};
+    interrupting.sa_handler = +[](int) {};
+    ::sigemptyset(&interrupting.sa_mask);
+    struct sigaction previous{};
+    REQUIRE(::sigaction(SIGUSR2, &interrupting, &previous) == 0);
+
+    boost::asio::io_context        ioc;
+    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), checkpoint::ipc::Message::Port}};
+    std::atomic<bool>              requested{false};
+    std::jthread                   server([&] {
+        boost::system::error_code    ec;
+        boost::asio::ip::tcp::socket socket{ioc};
+        acceptor.accept(socket, ec);
+        boost::beast::flat_buffer                                    buffer;
+        boost::beast::http::request<boost::beast::http::string_body> request;
+        if (!ec) { boost::beast::http::read(socket, buffer, request, ec); }
+        requested = true;
+        std::this_thread::sleep_for(300ms);
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, request.version()};
+        response.keep_alive(false);
+        response.prepare_payload();
+        if (!ec) { boost::beast::http::write(socket, response, ec); }
+    });
+
+    pthread_t const client = ::pthread_self();
+    std::jthread    interrupter([&] {
+        while (!requested) { std::this_thread::sleep_for(1ms); }
+        for (int signal = 0; signal < 20; ++signal)
+        {
+            static_cast<void>(::pthread_kill(client, SIGUSR2));
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+
+    REQUIRE_NOTHROW(WaitForCkptFinalize(0, 1));
+    interrupter.join();
+    server.join();
+    REQUIRE(::sigaction(SIGUSR2, &previous, nullptr) == 0);
+}
+
 static constexpr char KZipLocalFileMagic[4] = {'P', 'K', '\x03', '\x04'};    // NOLINT
 
 static std::vector<char> ReadFile(std::filesystem::path const& path)
@@ -3346,7 +3390,7 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);             // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");                  // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", spansPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_METRICS", "1", 1);               // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                  // NOLINT(concurrency-mt-unsafe)
@@ -3378,7 +3422,6 @@ TEST_CASE("OpenTelemetry exports checkpoint spans and opt-in metrics", "[telemet
     PERF() << checkpoint::telemetry::span::SvrDurable::Begin{.id = durableId, .startedAt = durableStartedAt};
     PERF() << checkpoint::telemetry::span::SvrDurable::End{.id = durableId};
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_LOGS");       // NOLINT(concurrency-mt-unsafe)
@@ -3411,7 +3454,7 @@ TEST_CASE("Process memory samples export through OpenTelemetry", "[telemetry][me
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);           // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");                // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                // NOLINT(concurrency-mt-unsafe)
     checkpoint::telemetry::Init();
@@ -3424,9 +3467,8 @@ TEST_CASE("Process memory samples export through OpenTelemetry", "[telemetry][me
     PERF() << checkpoint::telemetry::span::SvrFinalize::Begin{.id = id};
     PERF() << checkpoint::telemetry::span::SvrFinalize::End{.id = id};
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");    // NOLINT(concurrency-mt-unsafe)
-    ::unsetenv("NATIVE_CKPT_OTEL_FILE");      // NOLINT(concurrency-mt-unsafe)
-    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");      // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");    // NOLINT(concurrency-mt-unsafe)
 
     REQUIRE(std::filesystem::exists(logsPath));
     auto const bytes = ReadFile(logsPath);
@@ -3453,7 +3495,7 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "file", 1);           // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");                // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_METRICS", "0", 1);             // NOLINT(concurrency-mt-unsafe)
     ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                // NOLINT(concurrency-mt-unsafe)
@@ -3477,7 +3519,6 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     ::close(savedStderr);
 
     checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");     // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_FILE");       // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_METRICS");    // NOLINT(concurrency-mt-unsafe)
     ::unsetenv("NATIVE_CKPT_OTEL_LOGS");       // NOLINT(concurrency-mt-unsafe)
@@ -3499,27 +3540,40 @@ TEST_CASE("Logging writes stderr records to OpenTelemetry", "[telemetry][tier1]"
     std::filesystem::remove_all(outDir);
 }
 
-TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telemetry][tier1]")
+TEST_CASE("OpenTelemetry exports OTLP protobuf to the configured endpoint", "[telemetry][tier1]")
 {
-    auto const outDir  = CkptDir("otel_daemon_export");
+    auto const outDir  = CkptDir("otel_endpoint_export");
     auto const outPath = outDir / "telemetry.jsonl";
     std::filesystem::remove_all(outDir);
     std::filesystem::create_directories(outDir);
 
-    ::setenv("NATIVE_CKPT_OTEL_EXPORT", "daemon", 1);         // NOLINT(concurrency-mt-unsafe)
-    ::setenv("NATIVE_CKPT_OTEL_FILE", outPath.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
-    ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                // NOLINT(concurrency-mt-unsafe)
-    checkpoint::telemetry::Init();
-    checkpoint::telemetry::Collect(R"({"discarded":true})");
-    checkpoint::telemetry::Shutdown();
+    boost::asio::io_context        ioc;
+    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    std::string                    target;
+    std::string                    contentType;
+    std::string                    body;
+    std::jthread                   receiver([&] {
+        boost::asio::ip::tcp::socket socket{ioc};
+        acceptor.accept(socket);
+        boost::beast::flat_buffer                                    buffer;
+        boost::beast::http::request<boost::beast::http::string_body> request;
+        boost::beast::http::read(socket, buffer, request);
+        target      = request.target();
+        contentType = request[boost::beast::http::field::content_type];
+        body        = request.body();
 
+        boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::ok, request.version()};
+        response.set(boost::beast::http::field::content_type, "application/x-protobuf");
+        response.keep_alive(false);
+        response.prepare_payload();
+        boost::beast::http::write(socket, response);
+    });
+
+    auto const endpoint = fmt::format("http://127.0.0.1:{}", acceptor.local_endpoint().port());
+    ::setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf", 1);     // NOLINT(concurrency-mt-unsafe)
+    ::setenv("NATIVE_CKPT_OTEL_LOGS", "0", 1);                       // NOLINT(concurrency-mt-unsafe)
     checkpoint::telemetry::Init();
-    checkpoint::telemetry::InitLocalCollector(outPath);
-    checkpoint::telemetry::InitLocalCollector(outPath);
-    checkpoint::telemetry::Collect(R"({"written_once":true})");
-    checkpoint::telemetry::Collect(R"({"second_local_line":true})");
-    checkpoint::telemetry::Collect(R"({"received_remotely":true})");
-    checkpoint::telemetry::Collect(R"({"second_remote_line":true})");
     auto const spanId = checkpoint::telemetry::Id{
         .sessionId  = checkpoint::ipc::SessionId::Default,
         .rank       = Rank{0},
@@ -3528,46 +3582,55 @@ TEST_CASE("OpenTelemetry daemon mode routes through its file collector", "[telem
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::Begin{.id = spanId};
     PERF() << checkpoint::telemetry::span::SvrWriteMetadata::End{.id = spanId};
     checkpoint::telemetry::Shutdown();
-    checkpoint::telemetry::Shutdown();
-    ::unsetenv("NATIVE_CKPT_OTEL_EXPORT");    // NOLINT(concurrency-mt-unsafe)
-    ::unsetenv("NATIVE_CKPT_OTEL_FILE");      // NOLINT(concurrency-mt-unsafe)
-    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");      // NOLINT(concurrency-mt-unsafe)
+    receiver.join();
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("OTEL_EXPORTER_OTLP_PROTOCOL");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_LOGS");          // NOLINT(concurrency-mt-unsafe)
 
-    REQUIRE(std::filesystem::exists(outPath));
+    REQUIRE(target == "/v1/traces");
+    REQUIRE(contentType == "application/x-protobuf");
+    opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest request;
+    REQUIRE(request.ParseFromString(body));
+    REQUIRE(request.resource_spans_size() == 1);
+    REQUIRE(request.resource_spans(0).scope_spans_size() == 1);
+    REQUIRE(request.resource_spans(0).scope_spans(0).spans_size() == 1);
+    REQUIRE(request.resource_spans(0).scope_spans(0).spans(0).name() == checkpoint::telemetry::span::SvrWriteMetadata::Name);
+
+    checkpoint::telemetry::InitLocalCollector(outPath);
+    auto const collected = checkpoint::telemetry::ReceiveOtlp(target, contentType, {}, body);
+    checkpoint::telemetry::Shutdown();
+    REQUIRE(collected.status == 200);
     auto const bytes = ReadFile(outPath);
-    auto const json  = std::string(bytes.begin(), bytes.end());
-    REQUIRE(json.contains(checkpoint::telemetry::span::SvrWriteMetadata::Name));
-    REQUIRE(json.contains("{\"received_remotely\":true}\n{\"second_remote_line\":true}\n"));
-    REQUIRE(json.contains("{\"written_once\":true}\n{\"second_local_line\":true}\n"));
-    REQUIRE_FALSE(json.contains(R"({"discarded":true})"));
-    auto const writtenOnce = json.find(R"({"written_once":true})");
-    REQUIRE(writtenOnce != std::string::npos);
-    REQUIRE(writtenOnce == json.rfind(R"({"written_once":true})"));
+    REQUIRE(std::string(bytes.begin(), bytes.end()).contains(checkpoint::telemetry::span::SvrWriteMetadata::Name));
     std::filesystem::remove_all(outDir);
 }
 
-TEST_CASE("OpenTelemetry both mode selects file and daemon routes", "[telemetry][tier1]")
+TEST_CASE("OpenTelemetry endpoint and file select export and routing", "[telemetry][tier1]")
 {
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");                                    // NOLINT(concurrency-mt-unsafe)
+    ::setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318", 1);    // NOLINT(concurrency-mt-unsafe)
     checkpoint::config::OtelConfig config;
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");    // NOLINT(concurrency-mt-unsafe)
 
-    config.mode = checkpoint::config::OtelExportMode::File;
-    REQUIRE(config.WritesProcessFile());
-    REQUIRE_FALSE(config.RoutesThroughDaemon());
+    REQUIRE(config.enabled);
+    REQUIRE(config.ExportsOtlp());
+    REQUIRE_FALSE(config.RoutesReceivedOtlp());
 
-    config.mode = checkpoint::config::OtelExportMode::Daemon;
-    REQUIRE_FALSE(config.WritesProcessFile());
-    REQUIRE(config.RoutesThroughDaemon());
+    config.file = "telemetry.jsonl";
+    REQUIRE(config.ExportsOtlp());
+    REQUIRE(config.RoutesReceivedOtlp());
 
-    config.mode = checkpoint::config::OtelExportMode::Both;
-    REQUIRE(config.WritesProcessFile());
-    REQUIRE(config.RoutesThroughDaemon());
+    config.endpoint.clear();
+    REQUIRE_FALSE(config.ExportsOtlp());
+    REQUIRE_FALSE(config.RoutesReceivedOtlp());
 }
 
 TEST_CASE("OpenTelemetry file presence enables telemetry relative to the server log", "[telemetry][tier1]")
 {
     auto const outDir    = CkptDir("otel_relative_file");
     auto const serverLog = outDir / "server.%h.%p.log";
-    ::unsetenv("NATIVE_CKPT_OTEL_FILE");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");    // NOLINT(concurrency-mt-unsafe)
+    ::unsetenv("NATIVE_CKPT_OTEL_FILE");          // NOLINT(concurrency-mt-unsafe)
     REQUIRE_FALSE(checkpoint::config::OtelConfig{}.enabled);
 
     ::setenv("NATIVE_CKPT_SERVER_LOG", serverLog.c_str(), 1);         // NOLINT(concurrency-mt-unsafe)
@@ -3713,44 +3776,6 @@ TEST_CASE("OTLP relay forwards the encoded request unchanged", "[telemetry][tier
     REQUIRE(body == opaqueBody);
     REQUIRE(response.status == 200);
     REQUIRE(response.body == downstreamBody);
-}
-
-TEST_CASE("Telemetry relay retries one opaque export batch", "[telemetry][tier1]")
-{
-    boost::asio::io_context        ioc;
-    boost::asio::ip::tcp::acceptor acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
-    std::vector<std::string>       bodies;
-    std::vector<bool>              chunked;
-    std::vector<std::string>       contentTypes;
-    std::jthread                   receiver([&] {
-        for (size_t remaining = 3; remaining != 0; --remaining)
-        {
-            boost::asio::ip::tcp::socket socket{ioc};
-            acceptor.accept(socket);
-            boost::beast::flat_buffer                                    buffer;
-            boost::beast::http::request<boost::beast::http::string_body> request;
-            boost::beast::http::read(socket, buffer, request);
-            bodies.push_back(request.body());
-            chunked.push_back(request.chunked());
-            contentTypes.emplace_back(request[boost::beast::http::field::content_type]);
-
-            boost::beast::http::response<boost::beast::http::string_body> response{boost::beast::http::status::service_unavailable,
-                                                                                   request.version()};
-            response.keep_alive(false);
-            response.body() = "{}";
-            response.prepare_payload();
-            boost::beast::http::write(socket, response);
-        }
-    });
-
-    checkpoint::telemetry::InitRelayCollector(fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port()));
-    REQUIRE_THROWS(checkpoint::telemetry::Collect(R"({"resourceSpans":[]})"));
-    receiver.join();
-
-    REQUIRE(bodies == std::vector<std::string>{R"({"resourceSpans":[]})", R"({"resourceSpans":[]})", R"({"resourceSpans":[]})"});
-    REQUIRE(chunked == std::vector<bool>{false, false, false});
-    REQUIRE(contentTypes == std::vector<std::string>{"application/json", "application/json", "application/json"});
-    REQUIRE_NOTHROW(checkpoint::telemetry::Shutdown());
 }
 
 namespace
