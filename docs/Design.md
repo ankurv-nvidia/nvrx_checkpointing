@@ -31,6 +31,203 @@
   - Redundancy by using multiple storage policies ()
   - Multiple network backends for data interchange (NVLink/Infiniband/TCP)
 
+# Design Overview
+
+The two figures follow one async save on rank 0, showing where each step runs and which network carries it: first in nvrx-python, as Megatron-LM runs it with `--async-save --use-persistent-ckpt-worker --ckpt-assume-constant-structure`, then in this design.
+
+```mermaid
+block-beta
+  columns 1
+  block:time
+    columns 8
+    tl["nvrx-python"] t_o["once per<br/>session"] t_o2[" "] t_s["save N"] t_s2[" "] t_t["training<br/>continues"] t_f["finalize"] t_f2["time →"]
+  end
+  block:ranks
+    columns 8
+    l_r["Other<br/>ranks"] space md["metadata<br/>×N"] space space space rs["write<br/>results ×N"] space
+  end
+  block:nccl
+    columns 8
+    l_n["NCCL"] n_o["all-gather,<br/>gather"] space space space n_t["all-reduce"] space n_f["gather,<br/>barrier"]
+  end
+  block:main
+    columns 8
+    l_m["Main thread<br/>rank 0"] sd0["state dict"] gp["global plan"] sd1["state dict"] sb["scalars,<br/>blobs"] space mf[("metadata file")] tr[("tracker")]
+  end
+  block:busyband
+    columns 8
+    l_b["Main thread<br/>busy"] b_o1[" "] b_o2[" "] b_s1[" "] b_s2["sync, wait<br/>for D2H"] b_t["per iteration"] b_f1[" "] b_f2[" "]
+  end
+  block:bg
+    columns 8
+    l_w["Background<br/>worker"] space space tb["tensor bytes"] space sf[("shard files")] wr["write<br/>results"] space
+  end
+  block:ipc
+    columns 8
+    l_s["Local<br/>IPC"] space space space space space space space
+  end
+  block:dm
+    columns 8
+    l_d["Daemon"] space space nd["no daemon"] space space space space
+  end
+  block:tcp
+    columns 8
+    l_h["Host<br/>TCP"] space space nt["not used"] space space space space
+  end
+  block:peers
+    columns 8
+    l_o["Other<br/>daemons"] space space space space space space space
+  end
+  sd0 --> gp
+  md --> gp
+  sd1 --> sb
+  sd1 -- "CUDA IPC, blobs" --> tb
+  tb --> sf
+  sf --> wr
+  wr --> mf
+  rs --> mf
+  class tl,l_r,l_n,l_m,l_b,l_w,l_s,l_d,l_h,l_o lbl
+  class t_o,t_o2,t_t phA
+  class t_s,t_s2,t_f,t_f2 phB
+  class n_o,n_t,n_f,nd,nt note
+  class sd0,sd1,sb py
+  class md,gp,rs,wr meta
+  class tb data
+  class mf,tr,sf file
+  class b_o1,b_o2,b_s1,b_s2,b_f1,b_f2 busy
+  class b_t tick
+  classDef lbl fill:none,stroke:none,font-weight:bold
+  classDef note fill:none,stroke:none,color:#777777,font-style:italic
+  classDef phA fill:#e8e8e8,stroke:none,color:#333333
+  classDef phB fill:#f5f5f5,stroke:none,color:#333333
+  classDef py fill:#e1d5e7,stroke:#9673a6,color:#000000
+  classDef native fill:#d5e8d4,stroke:#82b366,color:#000000
+  classDef meta fill:#dae8fc,stroke:#6c8ebf,color:#000000
+  classDef data fill:#fff2cc,stroke:#d6b656,color:#000000
+  classDef file fill:#f5f5f5,stroke:#666666,color:#000000
+  classDef busy fill:#f39c3399,stroke:#b45f06,color:#3d1f00
+  classDef tick fill:none,stroke:#b45f06,stroke-dasharray:3 3,color:#b45f06
+  style time fill:none,stroke:none
+  style ranks fill:#8080801a,stroke:none
+  style nccl fill:none,stroke:#999999,stroke-dasharray:5 4
+  style main fill:#ffa5001f,stroke:none
+  style busyband fill:#ffa5001f,stroke:none
+  style bg fill:#4a90e21f,stroke:none
+  style ipc fill:none,stroke:#999999,stroke-dasharray:5 4
+  style dm fill:#5cb85c1f,stroke:none
+  style tcp fill:none,stroke:#999999,stroke-dasharray:5 4
+  style peers fill:#8080801a,stroke:none
+```
+
+```mermaid
+block-beta
+  columns 1
+  block:time
+    columns 8
+    tl["This design"] t_o["once per<br/>session"] t_o2[" "] t_s["save N"] t_s2[" "] t_t["training<br/>continues"] t_f["finalize"] t_f2["time →"]
+  end
+  block:ranks
+    columns 8
+    l_r["Other<br/>ranks"] space space space space space space space
+  end
+  block:nccl
+    columns 8
+    l_n["NCCL"] space space nn["unused by<br/>checkpoints"] space space space space
+  end
+  block:main
+    columns 8
+    l_m["Main thread<br/>rank 0"] sd0["state dict"] space sd1["state dict"] space space space tr[("tracker")]
+  end
+  block:busyband
+    columns 8
+    l_b["Main thread<br/>busy"] space space space space space b_f1[" "] space
+  end
+  block:bg
+    columns 8
+    l_l["Background<br/>library"] nc0["native clone"] space nc1["native clone"] space tb["tensor bytes"] space space
+  end
+  block:ipc
+    columns 8
+    l_s["Local<br/>IPC"] space space space space space space space
+  end
+  block:dm
+    columns 8
+    l_d["Coordinator<br/>daemon"] rg["registries"] gp["global plan"] space space sf[("shard files")] mf[("metadata file")] vd["verdict"]
+  end
+  block:tcp
+    columns 8
+    l_h["Host<br/>TCP"] space space mo["metadata<br/>only"] space space space space
+  end
+  block:peers
+    columns 8
+    l_o["Other<br/>daemons"] rgn["registries ×N"] pln["plans ×N"] space space space bsn["blob sizes<br/>×N"] vdn["verdict ×N"]
+  end
+  block:keyrow
+    columns 8
+    k0["Key"] k1["Python<br/>objects"] k2["native<br/>memory"] k3["metadata"] k4["tensor<br/>bytes"] k5[("file")] k6["main thread<br/>busy"] k7["×N: one per<br/>rank or node"]
+  end
+  sd0 -- "clone" --> nc0
+  nc0 -- "registry" --> rg
+  rgn --> rg
+  rg --> gp
+  gp --> pln
+  sd1 -- "sync" --> nc1
+  nc1 -- "D2H" --> tb
+  tb -- "shared memory" --> sf
+  sf --> mf
+  bsn --> mf
+  mf --> vd
+  vd --> vdn
+  vd -- "notify" --> tr
+  class tl,l_r,l_n,l_m,l_b,l_l,l_s,l_d,l_h,l_o,k0 lbl
+  class t_o,t_o2,t_t phA
+  class t_s,t_s2,t_f,t_f2 phB
+  class nn,mo,k7 note
+  class sd0,sd1,k1 py
+  class nc0,nc1,k2 native
+  class rg,gp,rgn,pln,bsn,vd,vdn,k3 meta
+  class tb,k4 data
+  class sf,mf,tr,k5 file
+  class b_f1,k6 busy
+  classDef lbl fill:none,stroke:none,font-weight:bold
+  classDef note fill:none,stroke:none,color:#777777,font-style:italic
+  classDef phA fill:#e8e8e8,stroke:none,color:#333333
+  classDef phB fill:#f5f5f5,stroke:none,color:#333333
+  classDef py fill:#e1d5e7,stroke:#9673a6,color:#000000
+  classDef native fill:#d5e8d4,stroke:#82b366,color:#000000
+  classDef meta fill:#dae8fc,stroke:#6c8ebf,color:#000000
+  classDef data fill:#fff2cc,stroke:#d6b656,color:#000000
+  classDef file fill:#f5f5f5,stroke:#666666,color:#000000
+  classDef busy fill:#f39c3399,stroke:#b45f06,color:#3d1f00
+  classDef tick fill:none,stroke:#b45f06,stroke-dasharray:3 3,color:#b45f06
+  style time fill:none,stroke:none
+  style ranks fill:#8080801a,stroke:none
+  style nccl fill:none,stroke:#999999,stroke-dasharray:5 4
+  style main fill:#ffa5001f,stroke:none
+  style busyband fill:#ffa5001f,stroke:none
+  style bg fill:#4a90e21f,stroke:none
+  style ipc fill:none,stroke:#999999,stroke-dasharray:5 4
+  style dm fill:#5cb85c1f,stroke:none
+  style tcp fill:none,stroke:#999999,stroke-dasharray:5 4
+  style peers fill:#8080801a,stroke:none
+  style keyrow fill:none,stroke:none
+```
+
+<details>
+<summary>The same comparison as one draw.io figure</summary>
+
+![nvrx-python and this design: where each step of an async save runs, and which network carries it](./Design-overview.drawio.svg)
+
+</details>
+
+**A native clone on library threads, the rest in the background.** The client library keeps a native clone of the state dict on its own threads. The first registration copies the scalars and blobs into native memory and records each tensor by device pointer, creating no Python objects, and each async save syncs the clone with the state dict in the background. Apart from passing the snapshot gates, which normally open at once, and a short callback at [gate 8.1](#stages), the main thread does no checkpoint work. Library threads also copy the tensors device-to-host (D2H) into the daemon's shared memory, the daemons plan once per session and make the shards durable, and the coordinator daemon writes the checkpoint metadata file.
+
+PyTorch DCP also writes the metadata file in the background, but by default copies the state dict to host memory on the calling thread. nvrx-python overlaps only the shard writes with training: its main thread builds the global plan over NCCL and, on every save, syncs the scalars and blobs, waits for the D2H copy, and on rank 0 gathers every rank's results and writes the metadata file while the other ranks wait.
+
+**The daemons' own network plane.** The daemons communicate asynchronously over TCP on the host. No checkpoint step uses the training process group, so ranks never enter a checkpoint collective, although the daemons share the host's CPU, memory bandwidth, PCIe and storage with training. On the save path only metadata crosses this network: registries and the global plan once per session, then each rank's status and blob sizes, from which the coordinator computes the metadata file's offsets and one verdict.
+
+**Future work the design enables.** Fully asynchronous tensor capture removes the next optimizer step's wait for the D2H copy. Continuous in-memory checkpoints persist only some of the snapshots that finalize in daemon memory, so a rollback loses less work. Because out-of-proc daemons outlive the training processes, a restarted job can load from daemon memory instead of disk.
+
 # API Surface
 
 The sequencing of checkpointing and the API surface is divided into 3 main areas
