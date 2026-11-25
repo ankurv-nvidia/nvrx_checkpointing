@@ -125,7 +125,6 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         auto*            snapshotPtr1      = snapshots.at(hdr.snapshotId).get();
         auto*            snapshotStatePtr1 = snapshotPtr1->snapshotStateForRank.at(hdr.globalRank).get();
         assert(snapshotStatePtr1->selfSvcRef);
-        assert(snapshotStatePtr1->coordinatorSvcRef);
         auto svcRef1    = std::move(snapshotStatePtr1->selfSvcRef);
         auto crdSvcRef1 = std::move(snapshotStatePtr1->coordinatorSvcRef);
         return std::tuple{snapshotPtr1, snapshotStatePtr1, std::move(svcRef1), std::move(crdSvcRef1)};
@@ -229,8 +228,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
             }
             // Rank 0 joins last, so the set is now world-size: every shard and the metadata
             // are on disk and the checkpoint is loadable.
-            // This raw marker has a strict schema consumed by CI.
-            INFO("[PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
+            INFO("[{}][PERF] Snapshot={} Durable ranks={} | Time(us): activate_to_durable_us={}\n",
                  *this,
                  hdr.snapshotId,
                  static_cast<size_t>(topo.worldSize),
@@ -427,7 +425,10 @@ void Session::RelayGlobalRegistryToPeers(std::string_view const& registry, size_
 
 Session::Session(Server* serverIn LFTBND, cipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn) :
     server(serverIn), sessionId(sessionIdIn), topo(std::move(topoIn)), workDir(std::move(workDirIn))
-{ sessionState.selfSvcRef = SvcRef::AcquireInProc(); }
+{
+    sessionState.selfSvcRef = SvcRef::AcquireInProc();
+    if (PeerIndex() < topo.peers.size()) { SvcRef::RecordSelfAddress(topo.peers[PeerIndex()]); }
+}
 
 Session::Snapshot& Session::GetSnapshot_(cipc::SnapshotId snapshotId) LFTBND
 {
@@ -690,6 +691,8 @@ static void FailPlanning(Session& session, std::string failure)
     auto const message = session.sessionState.planningFailure;
     session.asyncTasks.emplace_back(
         std::async(std::launch::async, [&session, message, selfSvcRef = std::move(session.sessionState.selfSvcRef)] mutable {
+            // The reference ends with the task, not with the future that keeps the task's captures.
+            auto const         held = std::move(selfSvcRef);
             std::ostringstream result;
             serdes::WriteBlobWithSize<uint32_t>(result, message);
             auto const body      = result.str();
@@ -999,7 +1002,9 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
         }
         sessionState.planningStarted = true;
         auto globalRegistry          = sessionState.globalRegistry;
-        asyncTasks.emplace_back(std::async(std::launch::async, [this, globalRegistry] {
+        asyncTasks.emplace_back(std::async(std::launch::async, [this, globalRegistry, planning = sessionState.selfSvcRef] mutable {
+            // Planning ends inside this task, so its reference also covers the broadcast that follows.
+            auto const held = std::move(planning);
             try
             {
                 globalRegistry->FinalizeRegistry();

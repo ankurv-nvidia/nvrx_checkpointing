@@ -223,39 +223,6 @@ def flatten_to_entries(  # noqa: C901, PLR0911, PLR0912
         visited.discard(obj_id)
 
 
-def try_ping() -> None:
-    try:
-        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
-
-        nvrx_checkpointing.checkpoint.ping()
-    except ImportError:
-        pass
-
-
-def svc_stop() -> None:
-    try:
-        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
-
-        nvrx_checkpointing.checkpoint.svc_stop()
-    except ImportError:
-        pass
-
-
-def svc_spindown() -> None:
-    """Gracefully spin the checkpoint server down, blocking until it is idle.
-
-    Unlike svc_stop this does not abort in-flight saves on other ranks; the server stops
-    only once every session is idle. `timeout` bounds the wait before falling back to a
-    hard stop; None lets the server apply its own default bound.
-    """
-    try:
-        import nvrx_checkpointing.checkpoint  # noqa: PLC0415
-
-        nvrx_checkpointing.checkpoint.svc_spindown()
-    except ImportError:
-        pass
-
-
 # A .distcp file lives on lustre (a network filesystem) where read latency, not
 # bandwidth, dominates: many small seek-then-read calls thrash the file. A large
 # read buffer lets the client coalesce and read ahead once the reads are issued
@@ -306,12 +273,6 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
     *,
     verify_native_server: bool = True,
 ) -> None:
-    # distcp_trace only reads on-disk files (the .distcp chunks for md5s, and the server's
-    # 0.metadata.info for the claim check below) — it never talks to a live server. So only
-    # ensure one is up when we actually verify against it; the md5 / cross-provider path
-    # (verify_native_server=False) must not launch a server it would then strand on the node.
-    if verify_native_server:
-        try_ping()
     if isinstance(checkpoint_dir, str):
         checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
@@ -444,9 +405,6 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             continue
         reads_by_file.setdefault(si.relative_path, []).append(("bytes", si.offset, si.length, fqn, 0, None))
 
-    if verify_native_server:
-        try_ping()
-
     # Each .distcp file is independent — its chunks read, ZIP-extract, and md5 with no
     # cross-file state — so process the files concurrently. hashlib and file reads drop
     # the GIL, so worker threads overlap the lustre reads and the md5 hashing that
@@ -561,7 +519,6 @@ def distcp_trace(  # noqa: C901, PLR0912, PLR0915
             sys.stdout.writelines("\n".join(diff))
         if len(diff) > 0:
             raise ValueError(f"[native_ckpt:cli] FAIL: {len(diff)} Differences found between {ref_info_file} and {native_info_file}")
-        try_ping()
 
 
 _CHUNK_KEY_RE = re.compile(r"^(?P<fqn>.+)\.chunks\.(?P<idx>\d+)\.(?P<field>\w+)$")

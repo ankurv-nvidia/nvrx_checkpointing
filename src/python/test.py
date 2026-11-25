@@ -72,7 +72,6 @@ roots = {}
 
 
 def workload(session_id: int, snapshot_id: int, rank: int, world_size: int) -> None:
-    nvrx_checkpointing.checkpoint.ping()
     state_dict = {}
     state_dict["int"] = 42
     state_dict["double"] = 3.14
@@ -216,7 +215,6 @@ def workload(session_id: int, snapshot_id: int, rank: int, world_size: int) -> N
     # print(state_dict["st"].__dict__)
     root.register_state_dict(state_dict)
     root.finalize_registry()
-    nvrx_checkpointing.checkpoint.ping()
 
     root.save_async(snapshot_id, f"metadata/session_{session_id}/iter_{snapshot_id}")
     root.wait_for_async_completion()
@@ -230,13 +228,10 @@ def run_world(session_id: int, snapshot_id: int, world_size: int) -> None:
     nvrx_checkpointing.checkpoint.wait_for_ckpt_finalize(session_id, snapshot_id)
 
 
-try:
-    run_world(1, 0, 1)
-    run_world(1, 1, 1)
-    run_world(2, 0, 4)
-    run_world(2, 1, 4)
-finally:
-    nvrx_checkpointing.checkpoint.svc_spindown()
+run_world(1, 0, 1)
+run_world(1, 1, 1)
+run_world(2, 0, 4)
+run_world(2, 1, 4)
 
 # root.register_torch_tensor("tensor", state_dict["tensor"])
 # root.register_sharded_torch_tensor(

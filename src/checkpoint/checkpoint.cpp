@@ -148,6 +148,8 @@ struct CheckpointWriter
         std::shared_future<void>        ready;
         std::shared_ptr<StateTree>      snapshotRegistry;
         std::mutex                      snapshotMutex;
+        uint64_t                        generation{};
+        bool                            pinned{false};
     };
 
     struct QueueRegistry
@@ -165,17 +167,42 @@ struct CheckpointWriter
         return Registry;
     }
 
+    // A queue registered with an earlier service is dropped so the rank registers with the current one.
+    static void ObserveGeneration(Rank rank, uint64_t generation)
+    {
+        std::shared_ptr<QueueState> stale;
+        {
+            auto&            reg = Registry();
+            std::scoped_lock lock(reg.mu);
+            auto&            entry = reg.states[rank];
+            if (entry && entry->generation == generation) { return; }
+            stale             = std::exchange(entry, std::make_shared<QueueState>());
+            entry->generation = generation;
+        }
+#ifdef PHOENIX_HAVE_CUDA
+        if (!stale || !stale->pinned) { return; }
+        try
+        {
+            DeviceContext::CudaUnregisterHostBuffer(stale->queue->GetShmDataRegion().data());
+        } catch (std::exception const& error)
+        {
+            fmt::print(stderr, "[native_ckpt:cli][WARN] Unpinning a stale checkpoint queue failed: {}\n", error.what());
+        }
+#endif
+    }
+
     static void SendStateRegistry(StateTree const& registry)
     {
         auto const& topo = registry.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
         auto&            reg = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
-        auto               state = std::make_shared<QueueState>();
+        auto&            entry = reg.states[topo.rank];
+        if (entry && entry->ready.valid()) { return; }
+        if (!entry) { entry = std::make_shared<QueueState>(); }
+        auto               state = entry;
         std::promise<void> readyPromise;
         state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -214,6 +241,7 @@ struct CheckpointWriter
 #ifdef PHOENIX_HAVE_CUDA
             auto region = state->queue->GetShmDataRegion();
             DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            state->pinned = true;
 #endif
             state->snapshotRegistry = std::move(snapshotRegistry);
         } catch (...)
@@ -579,6 +607,7 @@ void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
     localRegistry.svcref = SvcRef::CliAcquireLocalProc(ServerIndex(localRegistry));
+    CheckpointWriter::ObserveGeneration(localRegistry.Topo().rank, localRegistry.svcref->generation);
     CheckpointWriter::SendStateRegistry(localRegistry);
 }
 

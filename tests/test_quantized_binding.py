@@ -12,15 +12,11 @@ import types
 import weakref
 from itertools import count
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from typing_extensions import Self
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
 
 try:
     from nvrx_checkpointing import checkpoint
@@ -48,15 +44,6 @@ _REQUIRES_CHECKPOINT_SERVER = pytest.mark.skipif(
     reason="requires checkpoint-server IPC support",
 )
 pytestmark = [pytest.mark.integration, _REQUIRES_CHECKPOINT_SERVER]
-
-
-@pytest.fixture(autouse=True)
-def _isolated_checkpoint_service() -> Iterator[None]:
-    checkpoint.svc_spindown()
-    try:
-        yield
-    finally:
-        checkpoint.svc_spindown()
 
 
 def _create_root():
@@ -262,19 +249,16 @@ def test_cpu_quantized_snapshot_dequantizes_during_dcp_write(tmp_path: Path, sto
     root.register_state_dict({"weight": tensor})
     root.finalize_registry()
     checkpoint_dir = tmp_path / storage_type
-    try:
-        root.save(1, checkpoint_dir)
-        deadline = time.monotonic() + 30
-        while not (checkpoint_dir / ".metadata").is_file():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
-            time.sleep(0.05)
+    root.save(1, checkpoint_dir)
+    deadline = time.monotonic() + 30
+    while not (checkpoint_dir / ".metadata").is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+        time.sleep(0.05)
 
-        loaded = {"weight": torch.zeros(tensor.shape, dtype=torch.bfloat16)}
-        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
-        torch.testing.assert_close(loaded["weight"], torch.ones_like(loaded["weight"]))
-    finally:
-        checkpoint.svc_spindown()
+    loaded = {"weight": torch.zeros(tensor.shape, dtype=torch.bfloat16)}
+    dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+    torch.testing.assert_close(loaded["weight"], torch.ones_like(loaded["weight"]))
 
 
 @pytest.mark.integration
@@ -325,21 +309,18 @@ def test_nvfp4_factory_shards_keep_distinct_storage(tmp_path: Path) -> None:
     root.wait_for_async_completion()
     registered_build_calls = build_calls
     checkpoint_dir = tmp_path / "nvfp4-shards"
-    try:
-        root.save(1, checkpoint_dir)
-        assert build_calls == registered_build_calls
-        deadline = time.monotonic() + 30
-        while not (checkpoint_dir / ".metadata").is_file():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
-            time.sleep(0.05)
+    root.save(1, checkpoint_dir)
+    assert build_calls == registered_build_calls
+    deadline = time.monotonic() + 30
+    while not (checkpoint_dir / ".metadata").is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+        time.sleep(0.05)
 
-        loaded = {"weight": torch.zeros((2, 128, 512), dtype=torch.bfloat16)}
-        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
-        torch.testing.assert_close(loaded["weight"][0], torch.ones((128, 512), dtype=torch.bfloat16))
-        torch.testing.assert_close(loaded["weight"][1], torch.full((128, 512), 2.0, dtype=torch.bfloat16))
-    finally:
-        checkpoint.svc_spindown()
+    loaded = {"weight": torch.zeros((2, 128, 512), dtype=torch.bfloat16)}
+    dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+    torch.testing.assert_close(loaded["weight"][0], torch.ones((128, 512), dtype=torch.bfloat16))
+    torch.testing.assert_close(loaded["weight"][1], torch.full((128, 512), 2.0, dtype=torch.bfloat16))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

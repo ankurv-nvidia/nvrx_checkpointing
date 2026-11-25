@@ -98,7 +98,7 @@ def test_semantic_object_compare_detects_dynamic_state_changes(tmp_path: Path) -
     assert compare_reference_metadata(changed, reference) > 0
 
 
-def test_native_server_blob_claim_uses_exact_archive_bytes(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+def test_native_server_blob_claim_uses_exact_archive_bytes(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     _write_checkpoint(checkpoint, step=7, legacy_archives=False)
 
@@ -115,5 +115,4 @@ def test_native_server_blob_claim_uses_exact_archive_bytes(tmp_path: Path, monke
         claims.append(f"{index.fqn}.bytes.md5sum={hashlib.md5(raw).hexdigest()}")  # noqa: S324
     (checkpoint / "0.metadata.info").write_text("\n".join(sorted(claims)))
 
-    monkeypatch.setattr(debug, "try_ping", lambda: None)
     debug.distcp_trace(checkpoint, extract_tensor_data=False)

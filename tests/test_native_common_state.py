@@ -92,40 +92,37 @@ def test_daemon_embeds_fresh_common_state(tmp_path: Path) -> None:
     root.register_state_dict(state_dict)
     root.finalize_registry()
 
-    try:
-        for iteration in (1, 2):
-            checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
-            assert not checkpoint_dir.exists()
-            common_bytes = _serialize_common_state(iteration).ljust(common_capacity, b"\0")
-            root.register_state_dict(
-                {
-                    "weight": state_dict["weight"],
-                    _DCP_COMMON_STATE_KEY: common_bytes,
-                    "rng_state": ShardedObject("rng_state", {"iteration": iteration}, (1,), (0,)),
-                },
-            )
-            root.save_async(iteration, checkpoint_dir)
-            root.wait_for_async_completion()
+    for iteration in (1, 2):
+        checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
+        assert not checkpoint_dir.exists()
+        common_bytes = _serialize_common_state(iteration).ljust(common_capacity, b"\0")
+        root.register_state_dict(
+            {
+                "weight": state_dict["weight"],
+                _DCP_COMMON_STATE_KEY: common_bytes,
+                "rng_state": ShardedObject("rng_state", {"iteration": iteration}, (1,), (0,)),
+            },
+        )
+        root.save_async(iteration, checkpoint_dir)
+        root.wait_for_async_completion()
 
-            deadline = time.monotonic() + 30
-            while not (checkpoint_dir / ".metadata").is_file() or not (checkpoint_dir / "metadata.json").is_file():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
-                time.sleep(0.05)
+        deadline = time.monotonic() + 30
+        while not (checkpoint_dir / ".metadata").is_file() or not (checkpoint_dir / "metadata.json").is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+            time.sleep(0.05)
 
-            assert _load_common_state(checkpoint_dir) == {
-                "iteration": iteration,
-                "scheduler": {"num_steps": iteration * 10},
-            }
-            assert _load_sharded_object(checkpoint_dir) == {"iteration": iteration}
-            _assert_common_state_layout(checkpoint_dir, common_capacity)
-            assert not (checkpoint_dir / "common.pt").exists()
-            assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
-                "sharded_backend": "torch_dist",
-                "sharded_backend_version": 1,
-            }
-    finally:
-        checkpoint.svc_spindown()
+        assert _load_common_state(checkpoint_dir) == {
+            "iteration": iteration,
+            "scheduler": {"num_steps": iteration * 10},
+        }
+        assert _load_sharded_object(checkpoint_dir) == {"iteration": iteration}
+        _assert_common_state_layout(checkpoint_dir, common_capacity)
+        assert not (checkpoint_dir / "common.pt").exists()
+        assert json.loads((checkpoint_dir / "metadata.json").read_text()) == {
+            "sharded_backend": "torch_dist",
+            "sharded_backend_version": 1,
+        }
 
 
 def test_daemon_embeds_changing_common_state_lengths(tmp_path: Path) -> None:
@@ -134,24 +131,21 @@ def test_daemon_embeds_changing_common_state_lengths(tmp_path: Path) -> None:
     root.register_state_dict({_DCP_COMMON_STATE_KEY: b""})
     root.finalize_registry()
 
-    try:
-        for iteration, length in enumerate((10, 4096, 0), 1):
-            value = {"payload": "x" * length, "iteration": iteration}
-            buffer = io.BytesIO()
-            torch.save([value], buffer)
-            serialized = buffer.getvalue()
-            checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
+    for iteration, length in enumerate((10, 4096, 0), 1):
+        value = {"payload": "x" * length, "iteration": iteration}
+        buffer = io.BytesIO()
+        torch.save([value], buffer)
+        serialized = buffer.getvalue()
+        checkpoint_dir = tmp_path / f"iter_{iteration:07d}"
 
-            root.register_state_dict({_DCP_COMMON_STATE_KEY: serialized})
-            root.save(iteration, checkpoint_dir)
-            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+        root.register_state_dict({_DCP_COMMON_STATE_KEY: serialized})
+        root.save(iteration, checkpoint_dir)
+        checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 
-            assert _load_common_state(checkpoint_dir) == value
-            metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
-            entry = next(info for index, info in metadata.storage_data.items() if index.fqn == _DCP_COMMON_STATE_KEY)
-            assert entry.length == len(serialized)
-    finally:
-        checkpoint.svc_spindown()
+        assert _load_common_state(checkpoint_dir) == value
+        metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata()
+        entry = next(info for index, info in metadata.storage_data.items() if index.fqn == _DCP_COMMON_STATE_KEY)
+        assert entry.length == len(serialized)
 
 
 def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
@@ -167,24 +161,20 @@ def test_daemon_cold_save_preserves_mixed_state(tmp_path: Path) -> None:
             _DCP_COMMON_STATE_KEY: _serialize_common_state(iteration),
         }
 
-    try:
-        for iteration in (1, 2):
-            directory = tmp_path / f"iter_{iteration:07d}"
-            root.register_state_dict(state(iteration))
-            if iteration == 1:
-                root.finalize_registry()
-            root.save(iteration, directory)
-            checkpoint.wait_for_ckpt_finalize(session_id, iteration)
+    for iteration in (1, 2):
+        directory = tmp_path / f"iter_{iteration:07d}"
+        root.register_state_dict(state(iteration))
+        if iteration == 1:
+            root.finalize_registry()
+        root.save(iteration, directory)
+        checkpoint.wait_for_ckpt_finalize(session_id, iteration)
 
-            loaded = {"weight": torch.zeros(8, dtype=torch.float32)}
-            dcp.load(loaded, checkpoint_id=str(directory))
-            torch.testing.assert_close(loaded["weight"], torch.arange(8, dtype=torch.float32) + iteration)
-            assert _load_common_state(directory)["iteration"] == iteration
-            assert _load_sharded_object(directory) == {"iteration": iteration}
-            metadata = dcp.FileSystemReader(directory).read_metadata()
-            entries = [info for index, info in metadata.storage_data.items() if index.fqn == "empty_blob"]
-            assert len(entries) == 1
-            assert entries[0].length == 0
-
-    finally:
-        checkpoint.svc_spindown()
+        loaded = {"weight": torch.zeros(8, dtype=torch.float32)}
+        dcp.load(loaded, checkpoint_id=str(directory))
+        torch.testing.assert_close(loaded["weight"], torch.arange(8, dtype=torch.float32) + iteration)
+        assert _load_common_state(directory)["iteration"] == iteration
+        assert _load_sharded_object(directory) == {"iteration": iteration}
+        metadata = dcp.FileSystemReader(directory).read_metadata()
+        entries = [info for index, info in metadata.storage_data.items() if index.fqn == "empty_blob"]
+        assert len(entries) == 1
+        assert entries[0].length == 0

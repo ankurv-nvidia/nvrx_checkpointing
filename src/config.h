@@ -307,6 +307,13 @@ struct ServerDisableInproc
     using Type                                = types::OptIn;
 };
 
+struct ServerReferenceScanIntervalSeconds
+{
+    static constexpr std::string_view Name    = "server.reference.scan.interval.seconds";
+    static constexpr std::string_view Default = "5";
+    using Type                                = types::Integer<uint32_t, 1>;
+};
+
 struct MemorySampleIntervalSeconds
 {
     static constexpr std::string_view Name    = "memory.sample.interval.seconds";

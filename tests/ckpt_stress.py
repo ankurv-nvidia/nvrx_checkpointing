@@ -41,6 +41,19 @@ def _http(path: str, timeout: float = 5.0) -> int:
         return response.status
 
 
+def _hold() -> str:
+    """Hold a reference on the daemon until its returned token is released."""
+    request = urllib.request.Request(f"{BASE_URL}/api/acquirelocalref/{os.getpid()}", method="POST")
+    with urllib.request.urlopen(request, timeout=5.0) as response:
+        return response.read().decode().split()[0]
+
+
+def _release(token: str) -> None:
+    request = urllib.request.Request(f"{BASE_URL}/api/releaselocalref/{os.getpid()}/{token}", method="POST")
+    with urllib.request.urlopen(request, timeout=5.0) as response:
+        response.read()
+
+
 def _require_free_port() -> None:
     """Both phases need the port to themselves."""
     try:
@@ -70,9 +83,12 @@ def _spawn_daemon(server: Path, log_file: Path) -> tuple[subprocess.Popen[str], 
 def check_daemon_election(server: Path, results_dir: Path) -> None:
     """The second candidate loses the election and the first keeps serving."""
     winner, ready = _spawn_daemon(server, results_dir / "election_winner.%p.log")
+    token = None
     try:
         if not ready.wait(timeout=SERVER_READY_TIMEOUT_S):
             raise SystemExit(f"the checkpoint server did not print '{READY_MARKER}' within {SERVER_READY_TIMEOUT_S}s")
+        # Without a client reference the winner would wind down after its startup grace.
+        token = _hold()
         logger.info("daemon up (pid %d); starting a second candidate", winner.pid)
         loser, _ = _spawn_daemon(server, results_dir / "election_loser.%p.log")
         try:
@@ -90,15 +106,16 @@ def check_daemon_election(server: Path, results_dir: Path) -> None:
             raise SystemExit(f"the daemon stopped serving after the election: /api/ping -> {status}")
         logger.info("election passed: the loser exited 0 and the winner still serves")
     finally:
-        with contextlib.suppress(OSError):
-            _http("/api/stop")
+        if token is not None:
+            with contextlib.suppress(OSError):
+                _release(token)
         try:
             winner_rc = winner.wait(timeout=SERVER_EXIT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             winner.kill()
-            raise SystemExit(f"the checkpoint server did not exit within {SERVER_EXIT_TIMEOUT_S}s of /api/stop") from None
+            raise SystemExit(f"the checkpoint server did not wind down within {SERVER_EXIT_TIMEOUT_S}s of its last release") from None
         if winner_rc != 0:
-            raise SystemExit(f"the checkpoint server exited {winner_rc} after /api/stop, expected a clean 0")
+            raise SystemExit(f"the checkpoint server exited {winner_rc} after winding down, expected a clean 0")
 
 
 def run_connect_burst(stress: Path, args: argparse.Namespace) -> None:

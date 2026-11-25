@@ -7,11 +7,14 @@
 #include <string_view>
 
 // Starts the checkpoint server, prints "READY\n" to stdout when the port is bound,
-// then blocks until a shutdown is triggered (either by message or inactivity timeout).
+// then blocks until a stop request or until its references drain.
 void RunServer(uint16_t index);
 
 void RunInprocServer(uint16_t nodes);
 void SpinDownAllInprocServers();
+
+// Returns once this process hosts the server for the peer index or another process serves it.
+void EnsureInprocServer(uint16_t index);
 
 using ServerSessionCallback = void (*)(void*                        cbData,
                                        checkpoint::ipc::SessionId   sessionId,

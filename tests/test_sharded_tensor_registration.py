@@ -22,7 +22,6 @@ from nvrx_checkpointing import checkpoint
 from nvrx_checkpointing.megatron.mapping import ShardedObject, ShardedTensor, ShardedTensorFactory
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
 
@@ -32,15 +31,6 @@ _REQUIRES_CHECKPOINT_SERVER = pytest.mark.skipif(
     reason="requires checkpoint-server IPC support",
 )
 pytestmark = [pytest.mark.integration, _REQUIRES_CHECKPOINT_SERVER]
-
-
-@pytest.fixture(autouse=True)
-def _isolated_checkpoint_service() -> Iterator[None]:
-    checkpoint.svc_spindown()
-    try:
-        yield
-    finally:
-        checkpoint.svc_spindown()
 
 
 def _create_root(
@@ -124,7 +114,6 @@ class SecondState(dict):
         return super().keys()
 
 
-checkpoint.svc_spindown()
 try:
     roots = [checkpoint.model_state.create_root(97201, rank, 2, ["localhost"], 2) for rank in range(2)]
     importlib.util.find_spec = paused_find_spec
@@ -146,7 +135,6 @@ try:
     print("cold and warm registrations completed", flush=True)
 finally:
     importlib.util.find_spec = find_spec
-    checkpoint.svc_spindown()
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -212,19 +200,16 @@ def test_register_state_dict_repoints_plain_tensor_data(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "iter_0000001"
 
     assert root.snapshot_size == fresh.numel() * fresh.element_size()
-    try:
-        root.save(1, checkpoint_dir)
-        deadline = time.monotonic() + 30
-        while not (checkpoint_dir / ".metadata").is_file():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
-            time.sleep(0.05)
+    root.save(1, checkpoint_dir)
+    deadline = time.monotonic() + 30
+    while not (checkpoint_dir / ".metadata").is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"checkpoint daemon did not publish {checkpoint_dir}")
+        time.sleep(0.05)
 
-        loaded = {"weight": torch.zeros_like(fresh)}
-        dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
-        torch.testing.assert_close(loaded["weight"], fresh)
-    finally:
-        checkpoint.svc_spindown()
+    loaded = {"weight": torch.zeros_like(fresh)}
+    dcp.load(loaded, checkpoint_id=str(checkpoint_dir))
+    torch.testing.assert_close(loaded["weight"], fresh)
 
 
 @pytest.mark.integration
@@ -410,10 +395,7 @@ def test_save_materializes_storage_less_cuda_tensor(tmp_path: Path) -> None:
     assert materialized is not None
     assert materialized.is_cuda
 
-    try:
-        root.save(1, tmp_path / "iter_0000001")
-    finally:
-        checkpoint.svc_spindown()
+    root.save(1, tmp_path / "iter_0000001")
 
     torch.testing.assert_close(materialized, source)
     del materialized
