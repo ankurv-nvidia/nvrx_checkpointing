@@ -61,9 +61,6 @@ struct Session
         std::unordered_set<checkpoint::ipc::Rank> writeCkptCompletedRanks;
         bool                                      complete{false};
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
-
-        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
     };
 
     Server* const                         server;
@@ -82,6 +79,9 @@ struct Session
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
     std::vector<std::future<void>> asyncTasks;
+    // Acquired during snapshotting and initial planning
+    std::shared_ptr<SvcRef::InProc>        selfSvcRef;
+    std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
 
     Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
     std::atomic<bool> stopRequested{false};

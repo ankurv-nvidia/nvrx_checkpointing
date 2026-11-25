@@ -14,6 +14,7 @@
 #include <boost/iostreams/filter/zlib.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/iostreams/stream.hpp>
+#include <mutex>
 #include <utility>
 
 namespace cipc  = checkpoint::ipc;
@@ -114,6 +115,8 @@ static std::string WriteCkptCompleteBody(std::string_view failure, std::unordere
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& hdr) noexcept
 {
+    decltype(selfSvcRef)        svcRef;
+    decltype(coordinatorSvcRef) crdSvcRef;
     // Ranks on the coordinator peer (peers[0]) record their finalize/write-complete
     // locally; only ranks on other peers forward those notifications to the coordinator.
     bool const onCoordinatorPeer = static_cast<uint32_t>(hdr.globalRank) / topo.ranksPerPeer == 0;
@@ -123,6 +126,10 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
     SnapshotState* snapshotStatePtr = nullptr;
     {
         std::scoped_lock lock(mutex);
+        assert(selfSvcRef);
+        assert(crdSvcRef);
+        svcRef           = std::move(selfSvcRef);
+        crdSvcRef        = std::move(coordinatorSvcRef);
         snapshotPtr      = snapshots.at(hdr.snapshotId).get();
         snapshotStatePtr = snapshotPtr->snapshotStateForRank.at(hdr.globalRank).get();
     }
@@ -573,6 +580,8 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
     std::chrono::system_clock::time_point durableStartedAt;
     {
         std::scoped_lock lock(mutex);
+        selfSvcRef = SvcRef::AcquireInProc();
+        if (!IsCoordinatorPeer() && !coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
         if (!sessionState.planningReady) { throw std::runtime_error("Snapshot plan is not ready"); }
         if (!sessionState.planningFailure.empty()) { throw std::runtime_error(sessionState.planningFailure); }
         if (!sessionState.snapshotRegistryForRank.contains(hdr.globalRank))
@@ -996,8 +1005,17 @@ void Session::HandleLocalStateRegistry(Rank recvRank, std::shared_ptr<StateTree>
     } catch (std::exception const& error) { FailPlanning(*this, error.what()); }
 }
 
+// No one calls this right now but maybe we should use this to release the svc-reference
 void Session::Handle(cipc::Message::FinalizeSession const& /* hdr */, std::span<char const> /* buf */)
 {}
+/* {
+    // Release the self-ref no longer need the session alive
+    std::scoped_lock lock(mutex);
+    asyncTasks.emplace_back(std::async(std::launch::async, [this, asyncTasksActive = std::move(asyncTasks)] mutable {
+        auto svcRef = std::move(selfSvcRef);    // This is the last thing a session needs to be active for
+        asyncTasksActive.clear();
+    }));
+} */
 
 bool Session::ResolveSnapshotId(int64_t iteration, cipc::SnapshotId& out) const
 {
@@ -1029,16 +1047,16 @@ try
     std::shared_ptr<StateTree> registry;
     {
         std::scoped_lock lock(mutex);
-        if (!IsCoordinatorPeer())
-        {
-            receivedFrom.insert(rank);
-            if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
-        }    // Otherwise HandleLocalStateRegistry will do it
+        if (!IsCoordinatorPeer()) { receivedFrom.insert(rank); }    // Otherwise HandleLocalStateRegistry will do it
         registry = sessionState.localRegistryForRank.at(rank);
     }
     if (IsCoordinatorPeer()) { HandleLocalStateRegistry(rank, std::move(registry)); }
     else
     {
+        {
+            std::scoped_lock lock(mutex);
+            if (!coordinatorSvcRef) { coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
+        }
         // Send to coordinator
         std::ostringstream body;
         StateSerDes::Write(body, *registry, StateNode::Handle::Root);
