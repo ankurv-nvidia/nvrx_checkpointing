@@ -33,9 +33,7 @@ struct Session
         uint64_t writtenPayloadRangeEnd{0};
         uint64_t writtenPayloadSize{0};
 
-        // Acquired during snapshotting
-        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
+        std::shared_ptr<SvcRef::InProc> selfSvcRef;
     };
 
     struct RegistryState
@@ -48,9 +46,9 @@ struct Session
         bool                                                                  planningReady{false};
         std::string                                                           planningFailure;
 
-        // Acquired during initial planning
-        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
+        std::unordered_map<checkpoint::ipc::Rank, std::shared_ptr<SvcRef::InProc>> receiveSvcRefs;
+        std::shared_ptr<SvcRef::InProc>                                            selfSvcRef;
+        std::shared_ptr<SvcRef::InProc>                                            failureSvcRef;
     };
 
     struct Snapshot
@@ -71,6 +69,7 @@ struct Session
         std::vector<std::string>                  failures;    // complete && failure.empty() implies success
     };
 
+    uint16_t const                        serverIndex;
     Server* const                         server;
     checkpoint::ipc::SessionId const      sessionId{checkpoint::ipc::SessionId::Invalid};
     RankTopology const                    topo;
@@ -88,7 +87,11 @@ struct Session
 
     std::vector<std::future<void>> asyncTasks;
 
-    Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
+    Session(Server* serverIn           LFTBND,
+            checkpoint::ipc::SessionId sessionIdIn,
+            std::filesystem::path      workDirIn,
+            RankTopology               topoIn,
+            uint16_t                   serverIndexIn = 0);
     std::atomic<bool> stopRequested{false};
 
     void Activate();

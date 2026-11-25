@@ -54,6 +54,11 @@ torchrun <torchrun-options> --module nvrx_checkpointing.megatron.integration "${
 Each rank must invoke the integration module; calling `install()` in a
 separate setup process will not work because the patches are process-local.
 
+Each node's checkpoint daemon runs inside the first training process that
+starts it. The owning process waits for daemon work and remote references to
+finish before exiting. Set `NATIVE_CKPT_SERVER_DISABLE_INPROC=1` to launch a
+separate daemon process. Daemon logs go directly to `NATIVE_CKPT_SERVER_LOG`.
+
 ### Enabling OpenTelemetry
 
 Native checkpoint telemetry is disabled by default. The checkpoint daemon

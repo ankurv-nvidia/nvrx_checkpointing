@@ -10,6 +10,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/container/small_vector.hpp>
+#include <boost/process/v2/pid.hpp>
 
 #include <fmt/format.h>
 
@@ -19,6 +20,7 @@
 
 #include <opentelemetry/common/key_value_iterable_view.h>
 #include <opentelemetry/context/context.h>
+#include <opentelemetry/context/runtime_context.h>
 #include <opentelemetry/exporters/otlp/otlp_file_client.h>
 #include <opentelemetry/exporters/otlp/otlp_file_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_file_log_record_exporter_factory.h>
@@ -38,8 +40,10 @@
 #include <opentelemetry/sdk/trace/batch_span_processor_factory.h>
 #include <opentelemetry/sdk/trace/tracer_provider_factory.h>
 #include <opentelemetry/trace/provider.h>
+#include <opentelemetry/trace/trace_state.h>
 
 #include <expected>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -324,10 +328,12 @@ struct LogTelState
         boost::container::small_vector<ActiveSpan, 16> entries;
     };
 
+    boost::process::v2::pid_type const            creator = boost::process::v2::current_pid();
     std::mutex                      mutex;
     checkpoint::telemetry::Id       lastId{};
-    std::once_flag                  poolOnce;
     std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<spdlog::details::thread_pool> threadPool;
+    std::shared_ptr<std::FILE>                    output;
 
     std::atomic<bool>                          enabled{false};
     std::shared_ptr<trace_sdk::TracerProvider> traceProvider;
@@ -337,6 +343,7 @@ struct LogTelState
     SaveStartState                             saveStarts;
     ActiveSpanState                            activeSpans;
     checkpoint::telemetry::MemorySampler       sampler;
+    std::mutex                                 shutdownMutex;
 
     std::mutex                                                  collectorMutex;
     std::variant<std::monostate, FileCollector, RelayCollector> collector;
@@ -349,6 +356,7 @@ struct LogTelState
     boost::container::small_vector<PendingOtlpRequest, 8> pendingOtlp;
     size_t                                                pendingOtlpBytes{0};
 
+    std::once_flag cleanupOnce;
     std::once_flag shutdownOnce;
 
     template <typename TCollector, typename... Args> void InitCollector(Args&&... args)
@@ -391,13 +399,29 @@ struct LogTelState
         return {.status = HttpOk, .body = {}};
     }
 
+    static LogTelState*& Storage()
+    {
+        static auto* Instance = new LogTelState;    // NOLINT(cppcoreguidelines-owning-memory)
+        return Instance;
+    }
+
     static LogTelState& Get()
     {
-        SUPPRESS_WARNINGS_START
-        SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
-        static LogTelState Instance;
-        SUPPRESS_WARNINGS_END
-        return Instance;
+        auto*& state = Storage();
+        if (state == nullptr)
+        {
+            state = new LogTelState;    // NOLINT(cppcoreguidelines-owning-memory)
+        }
+        std::call_once(state->cleanupOnce, [] {
+            std::atexit(+[] {
+                auto*& current = Storage();
+                if (current == nullptr || current->creator != boost::process::v2::current_pid()) { return; }
+                checkpoint::logging::Shutdown();
+                checkpoint::telemetry::Shutdown();
+                delete std::exchange(current, nullptr);    // NOLINT(cppcoreguidelines-owning-memory)
+            });
+        });
+        return *state;
     }
 };
 }    // namespace
@@ -407,6 +431,10 @@ namespace
 class LoggingSink final : public spdlog::sinks::sink
 {
     public:
+    explicit LoggingSink(std::shared_ptr<std::FILE> output, std::shared_ptr<std::promise<void>> flushed = {}) :
+        _output(std::move(output)), _flushed(std::move(flushed))
+    {}
+
     void log(spdlog::details::log_msg const& msg) override
     {
         std::string_view payload{msg.payload.data(), msg.payload.size()};
@@ -448,7 +476,7 @@ class LoggingSink final : public spdlog::sinks::sink
             std::string      line;
             line.reserve(prefix.size() + payload.size() + 1);
             line.append(prefix).append(payload).push_back('\n');
-            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), stderr));
+            static_cast<void>(std::fwrite(line.data(), sizeof(char), line.size(), _output.get()));
         }
 
         LogTelState& state = LogTelState::Get();
@@ -471,33 +499,47 @@ class LoggingSink final : public spdlog::sinks::sink
     void flush() override
     {
         std::scoped_lock lock(_mutex);
-        static_cast<void>(std::fflush(stderr));
+        static_cast<void>(std::fflush(_output.get()));
+        if (_flushed) { _flushed->set_value(); }
     }
 
     void set_pattern(std::string const& /*pattern*/) override {}
     void set_formatter(std::unique_ptr<spdlog::formatter> /*formatter*/) override {}
 
     private:
-    std::mutex _mutex;
+    std::mutex                 _mutex;
+    std::shared_ptr<std::FILE> _output;
+    std::shared_ptr<std::promise<void>> _flushed;
 };
 
 }    // namespace
 
 namespace checkpoint::logging
 {
-void Init()
+void Init(bool inproc)
 {
     LogTelState&     state = LogTelState::Get();
     std::scoped_lock lock(state.mutex);
     if (state.logger) { return; }
 
+    if (inproc)
+    {
+        auto const path   = checkpoint::config::GetConfigValue<checkpoint::config::LogFile>();
+        auto*      output = std::fopen(path.string().c_str(), "a");
+        if (output == nullptr) { throw std::runtime_error(fmt::format("Cannot open daemon log: {}", path)); }
+        state.output = std::shared_ptr<std::FILE>(output, std::fclose);
+    }
+    else
+    {
+        state.output = std::shared_ptr<std::FILE>(stderr, [](std::FILE*) {});
+    }
+
     static constexpr size_t QueueSize   = 8192;
     static constexpr size_t WorkerCount = 1;
-    std::call_once(state.poolOnce, [] { spdlog::init_thread_pool(QueueSize, WorkerCount); });
+    state.threadPool                    = std::make_shared<spdlog::details::thread_pool>(QueueSize, WorkerCount);
 
-    // The redirected descriptor is shared with async-signal-safe crash logging.
     auto logger = std::make_shared<spdlog::async_logger>(
-        "native_ckpt", std::make_shared<LoggingSink>(), spdlog::thread_pool(), spdlog::async_overflow_policy::overrun_oldest);
+        "native_ckpt", std::make_shared<LoggingSink>(state.output), state.threadPool, spdlog::async_overflow_policy::overrun_oldest);
 
     std::string const         levelStr = checkpoint::config::GetConfigValue<checkpoint::config::LogLevel>();
     spdlog::level::level_enum level    = spdlog::level::from_str(levelStr);
@@ -508,23 +550,39 @@ void Init()
     state.logger = std::move(logger);
 }
 
-void Flush()
+std::FILE* Output()
 {
     LogTelState&     state = LogTelState::Get();
     std::scoped_lock lock(state.mutex);
-    if (state.logger) { state.logger->flush(); }
+    return state.output ? state.output.get() : stderr;
+}
+
+bool Flush()
+{
+    LogTelState&     state = LogTelState::Get();
+    std::scoped_lock lock(state.mutex);
+    if (!state.logger) { return true; }
+    auto completed = std::make_shared<std::promise<void>>();
+    auto finished  = completed->get_future();
+    auto barrier   = std::make_shared<spdlog::async_logger>("native_ckpt_flush",
+                                                            std::make_shared<LoggingSink>(state.output, completed),
+                                                            state.threadPool,
+                                                            spdlog::async_overflow_policy::discard_new);
+    barrier->flush();
+    return finished.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
 }
 
 void Shutdown()
 {
     LogTelState& state = LogTelState::Get();
+    std::shared_ptr<spdlog::details::thread_pool> threadPool;
     {
         std::scoped_lock lock(state.mutex);
         if (!state.logger) { return; }
         state.logger->flush();
         state.logger.reset();
+        threadPool = std::move(state.threadPool);
     }
-    spdlog::shutdown();
 }
 
 void LogImpl(Level level, std::string_view message)
@@ -612,38 +670,49 @@ namespace
 class FileAppender : public otlp::OtlpFileAppender
 {
     public:
-    explicit FileAppender(std::string const& filePath) : _file(filePath, std::ios::out | std::ios::app)
+    explicit FileAppender(std::string const& filePath) : _file(filePath, std::ios::out | std::ios::app), _output(LogTelState::Get().output)
     {
         if (!_file.is_open()) { throw std::runtime_error("Failed to open file: " + filePath); }
         _file.exceptions(std::ios::badbit | std::ios::failbit);
     }
 
     void Export(std::string_view data, std::size_t /*record_count*/) override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (!_file.is_open()) { return; }
         _file.write(data.data(), static_cast<std::streamsize>(data.size()));
         if (data.empty() || data[data.size() - 1] != '\n') { _file.put('\n'); }
         _file.flush();
+    } catch (std::exception const& ex)
+    {
+        auto* output = _output ? _output.get() : stderr;
+        std::fputs("[native_ckpt:svr][WARN] Telemetry export failed: ", output);
+        std::fputs(ex.what(), output);
+        std::fputs("\n", output);
+        std::fflush(output);
     }
 
     bool ForceFlush(std::chrono::microseconds /*timeout*/) noexcept override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open()) { _file.flush(); }
         return true;
-    }
+    } catch (std::exception const&) { return false; }
 
     bool Shutdown(std::chrono::microseconds /*timeout*/) noexcept override
+    try
     {
         std::scoped_lock lock(_mutex);
         if (_file.is_open()) { _file.close(); }
         return true;
-    }
+    } catch (std::exception const&) { return false; }
 
     private:
-    std::mutex    _mutex;
-    std::ofstream _file;
+    std::mutex                 _mutex;
+    std::ofstream              _file;
+    std::shared_ptr<std::FILE> _output;
 };
 
 }    // namespace
@@ -687,6 +756,10 @@ void Init()
 
     checkpoint::config::OtelConfig const cfg;
     if (!cfg.enabled) { return; }
+
+    // Telemetry context singletons outlive daemon workers during process teardown.
+    static_cast<void>(opentelemetry::context::RuntimeContext::GetConstRuntimeContextStorage());
+    static_cast<void>(trace_api::TraceState::GetDefault());
 
     std::string const            service = cfg.service.empty() ? "nvrx-checkpoint-server" : cfg.service;
     otel_res::ResourceAttributes attrs{
@@ -735,7 +808,12 @@ void Init()
         state.logs.logger = state.logs.provider->GetLogger("nvrx.checkpoint", "nvrx.checkpoint");
     }
 
-    std::call_once(state.shutdownOnce, [] { std::atexit(+[] { Shutdown(); }); });
+    std::call_once(state.shutdownOnce, [] {
+        std::atexit(+[] {
+            auto* current = LogTelState::Storage();
+            if (current != nullptr && current->creator == boost::process::v2::current_pid()) { Shutdown(); }
+        });
+    });
 
     state.enabled.store(true, std::memory_order_release);
     state.sampler.Start();
@@ -744,9 +822,22 @@ void Init()
 bool IsEnabled() noexcept
 { return LogTelState::Get().enabled.load(std::memory_order_acquire); }
 
+bool Flush()
+{
+    LogTelState&          state = LogTelState::Get();
+    std::scoped_lock      lock(state.mutex, state.metrics.mutex, state.logs.mutex);
+    static constexpr auto Timeout = std::chrono::seconds{5};
+    bool                  flushed = true;
+    if (state.traceProvider) { flushed = state.traceProvider->ForceFlush(Timeout) && flushed; }
+    if (state.metrics.provider) { flushed = state.metrics.provider->ForceFlush(Timeout) && flushed; }
+    if (state.logs.provider) { flushed = state.logs.provider->ForceFlush(Timeout) && flushed; }
+    return flushed;
+}
+
 void Shutdown()
 {
-    LogTelState& state = LogTelState::Get();
+    LogTelState&     state = LogTelState::Get();
+    std::scoped_lock shutdownLock(state.shutdownMutex);
     state.sampler.Shutdown();
     {
         std::scoped_lock lock(state.mutex);
@@ -850,7 +941,7 @@ void Emitter<event::ProcessMemory>::Emit(event::ProcessMemory const& fields)
 
 void Emitter<span::CkptSave::Begin>::Emit(span::CkptSave::Begin const& fields)
 {
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::Output(),
                "[native_ckpt:svr][{}][PERF] Rank={} Begin span={} started_at_ns={} snapshot={}\n",
                static_cast<uint32_t>(fields.id.sessionId),
                static_cast<uint32_t>(fields.id.rank),
@@ -873,7 +964,7 @@ void Emitter<span::CkptSave::End>::Emit(span::CkptSave::End const& fields)
     auto const writeSeconds = static_cast<double>(fields.d2hDuration.count()) / 1e6;    // NOLINT
     auto const bwMbps
         = writeSeconds == 0.0 ? 0.0 : static_cast<double>(fields.totalTensorBytes) / (1024.0 * 1024.0) / writeSeconds;    // NOLINT
-    fmt::print(stderr,
+    fmt::print(checkpoint::logging::Output(),
                "[native_ckpt:svr][{}][PERF] Rank={} Finished bw_mbps={:.2f} "
                "| Time(us):  wr_tnsr_us={} snapshot_us={} total_us={} "
                "| Count: num_tensors={} total_d2h={} "

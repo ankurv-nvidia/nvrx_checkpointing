@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_otel_report():
-    spec = importlib.util.spec_from_file_location("otel_report", _REPO / "ci" / "scripts" / "otel_report.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _find_ckptbench() -> str | None:
@@ -50,7 +43,7 @@ def test_daemon_routing_collects_single_file(tmp_path):
         "NATIVE_CKPT_OTEL_FILE": str(out),
     }
     result = subprocess.run(
-        [ckptbench, "--stateregistry", registry, "--nodes", "2"],
+        [ckptbench, "--stateregistry", registry],
         env=env,
         timeout=300,
         check=False,
@@ -63,8 +56,13 @@ def test_daemon_routing_collects_single_file(tmp_path):
 
     assert out.exists(), "ckptbench ran successfully but produced no collected OTLP file"
 
-    otel_report = _load_otel_report()
-    samples = otel_report.collect_samples([str(out)])
-    ranks = {int(s["rank"]) for s in samples}
-    assert samples, "no ckpt.save spans in the collected file"
+    ranks = set()
+    for line in out.read_text().splitlines():
+        for resource in json.loads(line).get("resourceSpans", []):
+            for scope in resource.get("scopeSpans", []):
+                for span in scope.get("spans", []):
+                    if span.get("name") == "ckpt.save":
+                        attributes = {item["key"]: item["value"] for item in span.get("attributes", [])}
+                        ranks.add(int(attributes["nvrx.rank"]["intValue"]))
+    assert ranks, "no ckpt.save spans in the collected file"
     assert len(ranks) >= 2, f"expected >=2 ranks in the single collected file, got {ranks}"

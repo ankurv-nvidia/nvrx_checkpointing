@@ -9,6 +9,10 @@
 #include <filesystem>
 #include <memory>
 
+void SvcPing();
+void SvcStop();
+void SvcSpinDown();
+
 void FinalizeStateRegistry(StateTree& localRegistry);
 
 std::shared_ptr<StateTree> GetSnapshotRegistry(StateTree const& localRegistry);

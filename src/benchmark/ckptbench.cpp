@@ -10,6 +10,7 @@
 #include <fmt/std.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -59,6 +60,7 @@ try
     auto               parsed = bpo::command_line_parser(argc, argv).options(desc).allow_unregistered().run();
     bpo::store(parsed, vm);
     bpo::notify(vm);
+    if (Ctx.outofproc) { ::setenv("NATIVE_CKPT_SERVER_DISABLE_INPROC", "1", 1); }    // NOLINT(concurrency-mt-unsafe)
 
     auto                     unrecognized = bpo::collect_unrecognized(parsed.options, bpo::include_positional);
     std::vector<std::string> benchArgStrings;

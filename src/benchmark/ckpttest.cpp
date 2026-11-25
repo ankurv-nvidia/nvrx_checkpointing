@@ -84,6 +84,7 @@ static std::filesystem::path GRegistryPath;    // NOLINT(cppcoreguidelines-avoid
 SUPPRESS_WARNINGS_END
 
 static constexpr char const* ShmTestServerArg = "--shmem-test-server";
+static constexpr char const* TelemetryExitTestArg = "--telemetry-exit-test";
 
 static std::filesystem::path const& TestRegistryPath()
 { return GRegistryPath; }
@@ -105,7 +106,6 @@ class TestServerProcess
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
         if (TryConnectToCheckpointService(LocalSvrPeer, 0))
         {
-            // TODO_NOMERGESvcStop();
             static constexpr size_t MaxStopAttempts = 50;
             using namespace std::chrono_literals;
             for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
@@ -143,17 +143,26 @@ class TestServerProcess
         using namespace std::chrono_literals;
         for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
         {
-            if (TryConnectToCheckpointService(LocalSvrPeer, 0)) { return; }
+            if (TryConnectToCheckpointService(LocalSvrPeer, 0))
+            {
+                _reference = SvcRef::CliAcquireLocalProc(0);
+                return;
+            }
             std::this_thread::sleep_for(100ms);
         }
         Stop();
         throw std::runtime_error("checkpoint test server did not become ready");
     }
 
-    bool Stop() { return WaitForExit(); }
+    bool Stop()
+    {
+        SvcRef::CloseLocalProcClients();
+        return WaitForExit();
+    }
 
     bool WaitForExit()
     {
+        ReleaseReference();
         static constexpr size_t MaxAttempts = 50;
         using namespace std::chrono_literals;
         int status = 0;
@@ -179,8 +188,11 @@ class TestServerProcess
         return waitResult >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
     }
 
+    void ReleaseReference() { _reference.reset(); }
+
     private:
-    pid_t _pid = -1;
+    std::shared_ptr<SvcRef::LocalProcCli> _reference;
+    pid_t                                 _pid = -1;
 };
 }    // namespace
 
@@ -1284,7 +1296,6 @@ TEST_CASE("finalize uses the completed HTTP status and error body", "[server][fi
     namespace http = boost::beast::http;
     if (TryConnectToCheckpointService(LocalSvrPeer, 0))
     {
-        // TODO_NOMERGE SvcStop();
         for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(LocalSvrPeer, 0); ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -1412,11 +1423,7 @@ TEST_CASE("a shard write failure reaches the finalize caller", "[server][finaliz
     CHECK(failure.contains("__0_0.distcp"));
     CHECK_FALSE(std::filesystem::exists(badDir / ".metadata"));
     CHECK(std::filesystem::exists(goodDir / ".metadata"));
-    // TODO_NOMERGE auto       spinDown   = std::async(std::launch::async, &SvcSpinDown);
-    // TODO_NOMERGE auto const stopStatus = spinDown.wait_for(std::chrono::seconds{10});
-    // TODO_NOMERGE if (stopStatus != std::future_status::ready) { CHECK(server.Stop()); }
-    // TODO_NOMERGE REQUIRE(stopStatus == std::future_status::ready);
-    // TODO_NOMERGE CHECK_NOTHROW(spinDown.get());
+    tree.svcref.reset();
     CHECK(server.WaitForExit());
     std::filesystem::remove_all(logDir);
 }
@@ -1560,6 +1567,7 @@ TEST_CASE("selected snapshot registries capture inline scalars during saves", "[
         {
             static_cast<Primitives64Bit&>(captured) = Primitives64Bit(int64_t{iteration});
             SaveCheckpoint(*selected, checkpoint::ipc::SnapshotId{iteration}, logDir / std::to_string(iteration));
+            WaitForCkptFinalize(TestSessionId, iteration);
             struct Expected
             {
                 checkpoint::ipc::SnapshotId snapshot;
@@ -2115,6 +2123,100 @@ static std::future<void> ServePeerRequests(boost::asio::io_context& ioc, boost::
     });
 }
 
+TEST_CASE("server drains preserve readers and finish committed snapshots past abandoned reservations", "[server][svcref][shmem][tier1]")
+{
+    using namespace std::chrono_literals;
+    using Tcp         = boost::asio::ip::tcp;
+    auto const logDir = CkptDir("svcref_queue_drain");
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    TestServerProcess server;
+    auto const*       configuredQueues = ::getenv("NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES");    // NOLINT(concurrency-mt-unsafe)
+    std::string const previousQueues   = configuredQueues != nullptr ? configuredQueues : "";
+    ::setenv("NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES", "2", 1);    // NOLINT(concurrency-mt-unsafe)
+    StartTestServer(server, logDir / "server.log", true);
+    if (configuredQueues != nullptr)
+    {
+        ::setenv("NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES", previousQueues.c_str(), 1);    // NOLINT(concurrency-mt-unsafe)
+    }
+    else
+    {
+        ::unsetenv("NATIVE_CKPT_SHM_RING_BUFFER_NUM_QUEUES");    // NOLINT(concurrency-mt-unsafe)
+    }
+    auto const topology = SingleRankTopo(0, 2);
+    auto       second   = topology;
+    second.rank         = Rank{1};
+    ActivateAndUploadRegistries(topology, {SerializedSliceRegistry(topology), SerializedSliceRegistry(second)});
+    REQUIRE(RequestTestQueue(Rank{0}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
+    boost::asio::io_context ioc;
+    Tcp::acceptor           acceptor{ioc, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto const              coordinator = fmt::format("127.0.0.1:{}", acceptor.local_endpoint().port());
+    unsigned                acquired{};
+    auto                    released = ServePeerRequests(ioc, acceptor, [&](auto const& request) {
+        if (request.target() == "/api/peer/acquireref") { ++acquired; }
+        return std::pair{std::string{}, request.target().starts_with("/api/peer/releaseref/")};
+    });
+    auto                    session  = SvcRef::CliAcquireLocalProc(0, 0, coordinator, "127.0.0.1:4100");
+    auto                    keeper   = SvcRef::CliAcquireLocalProc(0, 1);
+    server.ReleaseReference();
+    session.reset();
+    REQUIRE(released.wait_for(3s) == std::future_status::ready);
+    CHECK_NOTHROW(released.get());
+    CHECK(acquired == 1);
+    CHECK(TryConnectToCheckpointService(LocalSvrPeer, 0));
+    session = SvcRef::CliAcquireLocalProc(0, 0);
+    REQUIRE(RequestTestQueue(Rank{1}, uint64_t{16}, int32_t{-1}) == boost::beast::http::status::ok);
+    auto const                 checkpointDir = logDir / "iteration40";
+    std::array<float, 4> const values{1.0f, 2.0f, 3.0f, 4.0f};
+    auto const                 writer = ::fork();
+    REQUIRE(writer >= 0);
+    if (writer == 0)
+    {
+        try
+        {
+            using namespace checkpoint::ipc;
+            std::array<MsgQueue, 2> queues{MsgQueue::Open(Message::RequestChannelName(0, 0)),
+                                           MsgQueue::Open(Message::RequestChannelName(0, 1))};
+            for (uint32_t rank = 0; rank < queues.size(); ++rank)
+            {
+                auto& queue = queues[rank];
+                ActivateTestSnapshot(queue, checkpointDir, Rank{rank});
+                queue.Push({Message::SnapshotData{.sessionId   = SessionId::Default,
+                                                  .snapshotId  = SnapshotId{40},
+                                                  .globalRank  = Rank{rank},
+                                                  .messageSize = sizeof(values),
+                                                  .offset      = 0}},
+                           reinterpret_cast<char const*>(values.data()),
+                           sizeof(values));
+                queue.Push(
+                    {Message::FinalizeSnapshot{.sessionId = SessionId::Default, .globalRank = Rank{rank}, .snapshotId = SnapshotId{40}}},
+                    nullptr,
+                    0);
+            }
+            static_cast<void>(queues.back().AllocSlot({Message::Ping{}}));
+            ::_exit(EXIT_SUCCESS);
+        } catch (...) { ::_exit(EXIT_FAILURE); }
+    }
+    int status{};
+    REQUIRE(::waitpid(writer, &status, 0) == writer);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == EXIT_SUCCESS);
+    session.reset();
+    keeper.reset();
+    CHECK(server.WaitForExit());
+    CHECK(std::filesystem::is_regular_file(checkpointDir / ".metadata"));
+    Tensor::Dim shape;
+    shape.push_back(values.size());
+    for (uint32_t rank = 0; rank < 2; ++rank)
+    {
+        auto const saved = ReadWholeFile(checkpointDir / fmt::format("__{}_0.distcp", rank));
+        REQUIRE(saved.size() == checkpoint::distcp::ComputeShardArchiveSize(Tensor::DType::Float32, shape, sizeof(values)));
+        std::string_view const expected(reinterpret_cast<char const*>(values.data()), sizeof(values));
+        CHECK(std::search(saved.begin(), saved.end(), expected.begin(), expected.end()) != saved.end());
+    }
+    std::filesystem::remove_all(logDir);
+}
+
 TEST_CASE("incomplete tensor data reaches the finalize caller", "[server][finalize][tier2]")
 {
     using namespace std::chrono_literals;
@@ -2436,7 +2538,16 @@ TEST_CASE("the coordinator notifies peers after metadata is durable", "[server][
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/2/40", WriteCompletionBody("")) == http::status::ok);
     CHECK(PostToTestServer("/api/peer/writeckptcomplete/0/3/40", WriteCompletionBody("")) == http::status::ok);
     CHECK(received.wait_for(10s) == std::future_status::ready);
+    queue.Push({checkpoint::ipc::Message::FinalizeSnapshot{
+                   .sessionId  = checkpoint::ipc::SessionId::Default,
+                   .globalRank = Rank{0},
+                   .snapshotId = checkpoint::ipc::SnapshotId{40},
+               }},
+               nullptr,
+               0);
     CHECK(waiting.wait_for(3s) == std::future_status::timeout);
+    auto const duplicate = ReadWholeFile(logDir / "server.log");
+    CHECK(std::string_view{duplicate.data(), duplicate.size()}.contains("Snapshot rank is already finalized"));
     releaseAcknowledgment.set_value();
     REQUIRE(notified.wait_for(10s) == std::future_status::ready);
     CHECK_NOTHROW(notified.get());
@@ -2793,6 +2904,8 @@ TEST_CASE("registry completion publishes plans before snapshot data arrives", "[
             if (!peerFirst)
             {
                 CHECK(plan.wait_for(200ms) == std::future_status::timeout);
+                server.ReleaseReference();
+                CHECK(plan.wait_for(1200ms) == std::future_status::timeout);
                 CHECK(postPeer() == boost::beast::http::status::ok);
             }
             auto const status = plan.wait_for(10s);
@@ -3010,6 +3123,7 @@ TEST_CASE("registries are not dumped without a server log directory", "[server][
 
 TEST_CASE("checkpoint telemetry preserves the performance record schema", "[telemetry][tier1]")
 {
+    checkpoint::logging::Init();
     auto const outDir     = CkptDir("telemetry_schema");
     auto const stderrPath = outDir / "stderr.log";
     std::filesystem::remove_all(outDir);
@@ -3483,6 +3597,34 @@ TEST_CASE("Process memory samples export through OpenTelemetry", "[telemetry][me
     REQUIRE(json.contains("\"key\":\"nvrx.rank\",\"value\":{\"intValue\":\"1\"}"));
     REQUIRE(json.contains("\"key\":\"nvrx.snapshot_id\",\"value\":{\"intValue\":\"2\"}"));
     REQUIRE_FALSE(json.contains("nvrx.process.role"));
+    std::filesystem::remove_all(outDir);
+}
+
+TEST_CASE("OpenTelemetry logging survives native process wind-down", "[telemetry][tier1]")
+{
+    auto const outDir  = CkptDir("otel_native_exit");
+    auto const outPath = outDir / "telemetry.jsonl";
+    std::filesystem::remove_all(outDir);
+    std::filesystem::create_directories(outDir);
+
+    auto                 executable = std::filesystem::read_symlink("/proc/self/exe").string();
+    auto                 argument   = std::string{TelemetryExitTestArg};
+    auto                 output     = outPath.string();
+    std::array<char*, 4> args{executable.data(), argument.data(), output.data(), nullptr};
+    auto const           child = ::fork();
+    if (child == 0)
+    {
+        ::execv(executable.c_str(), args.data());
+        ::_exit(EXIT_FAILURE);
+    }
+    REQUIRE(child >= 0);
+    int status = 0;
+    REQUIRE(::waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == EXIT_SUCCESS);
+
+    auto const bytes = ReadFile(std::filesystem::path{outPath.string() + ".logs"});
+    REQUIRE(std::string(bytes.begin(), bytes.end()).contains("Logging during native process wind-down"));
     std::filesystem::remove_all(outDir);
 }
 
@@ -4269,6 +4411,24 @@ int main(int argc, char* argv[])
     {
         RunServer(0);
         return EXIT_SUCCESS;
+    }
+    if (argc == 3 && std::string_view{argv[1]} == TelemetryExitTestArg)
+    {
+        ::unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT");                         // NOLINT(concurrency-mt-unsafe)
+        ::setenv("NATIVE_CKPT_OTEL_FILE", argv[2], 1);                     // NOLINT(concurrency-mt-unsafe)
+        ::setenv("NATIVE_CKPT_OTEL_LOGS", "1", 1);                         // NOLINT(concurrency-mt-unsafe)
+        ::setenv("NATIVE_CKPT_OTEL_METRICS", "0", 1);                      // NOLINT(concurrency-mt-unsafe)
+        ::setenv("NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS", "0", 1);    // NOLINT(concurrency-mt-unsafe)
+        ::setenv("NATIVE_CKPT_LOG_LEVEL", "info", 1);                      // NOLINT(concurrency-mt-unsafe)
+        checkpoint::logging::Init();
+        checkpoint::telemetry::Init();
+        std::atexit(+[] {
+            checkpoint::logging::LogImpl(checkpoint::logging::Level::Info, "Logging during native process wind-down");
+            checkpoint::logging::Shutdown();
+            checkpoint::telemetry::Shutdown();
+        });
+        checkpoint::logging::LogImpl(checkpoint::logging::Level::Info, "Initialize the telemetry context");
+        return checkpoint::logging::Flush() ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     Catch::Session session;

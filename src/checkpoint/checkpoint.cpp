@@ -21,6 +21,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/process.hpp>
 #include <boost/process/execute.hpp>
+#include <boost/process/v2/pid.hpp>
 #include <hwloc.h>
 
 #include <chrono>
@@ -30,10 +31,12 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 using namespace std::chrono_literals;
@@ -46,7 +49,7 @@ static uint16_t ServerIndex(StateTree const& registry)
     return static_cast<uint16_t>(serverIndex);
 }
 
-static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target, std::string const& body)
+static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target, std::string const& body, bool allowClosing = false)
 {
     auto const                port        = cipc::Message::Port + serverIndex;
     static constexpr int      MaxAttempts = 5;
@@ -78,7 +81,8 @@ static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target,
         do { boost::beast::http::read(stream, buffer, parser, ec); } while (ec == boost::asio::error::interrupted);
         if (ec) { throw boost::system::system_error(ec); }
         auto response = parser.release();
-        if (response.result() != boost::beast::http::status::ok)
+        if (response.result() != boost::beast::http::status::ok
+            && !(allowClosing && response.result() == boost::beast::http::status::service_unavailable))
         {
             throw std::runtime_error(
                 fmt::format("{} failed on port {}: HTTP {}: {}", target, port, response.result_int(), response.body()));
@@ -97,6 +101,38 @@ static uint8_t ResolveClientQueueCount(RankTopology const& topo)
         configuredQueueCount = cipc::ExplicitSizeDefaultQueueCount;
     }
     return cipc::ResolveQueueCount(topo.ranksPerPeer, configuredQueueCount);
+}
+
+void SvcPing()
+{ SvcRef::EnsureService(0); }
+
+static void RequestServiceShutdown(std::string const& target)
+{
+    if (!TryConnectToCheckpointService(LocalSvrPeer, 0)) { return; }
+    static constexpr int MaxAttempts = 2;
+    for (int attempt = 0; attempt < MaxAttempts; ++attempt) try
+        {
+            LocalServiceRequest(0, target, {}, true);
+            return;
+        } catch (boost::system::system_error const&)
+        {
+            if (!TryConnectToCheckpointService(LocalSvrPeer, 0)) { return; }
+            if (attempt + 1 == MaxAttempts) { throw; }
+        }
+}
+
+void SvcStop()
+{ RequestServiceShutdown("/api/stop"); }
+
+void SvcSpinDown()
+{
+    RequestServiceShutdown("/api/spindown");
+    auto const deadline = std::chrono::steady_clock::now() + 30s;
+    while (TryConnectToCheckpointService(LocalSvrPeer, 0))
+    {
+        if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("Checkpoint service shutdown timed out"); }
+        std::this_thread::sleep_for(20ms);
+    }
 }
 
 void WaitForCkptFinalize(uint32_t sessionId, int64_t iteration)
@@ -144,16 +180,38 @@ struct CheckpointWriter
     // Note: a queue can be shared by multiple ranks
     struct QueueState
     {
-        std::unique_ptr<cipc::MsgQueue> queue;
-        std::shared_future<void>        ready;
-        std::shared_ptr<StateTree>      snapshotRegistry;
-        std::mutex                      snapshotMutex;
+        std::unique_ptr<cipc::MsgQueue>    queue;
+        std::shared_future<void>           ready;
+        std::shared_ptr<StateTree>         snapshotRegistry;
+        std::mutex                         snapshotMutex;
+        uint64_t                           generation{};
+        uint16_t                           serverIndex{};
+        boost::process::v2::pid_type const creatorPid = boost::process::v2::current_pid();
+        bool                               registered{false};
+
+        ~QueueState()
+        {
+            if (creatorPid != boost::process::v2::current_pid())
+            {
+                static_cast<void>(queue.release());
+                return;
+            }
+#ifdef PHOENIX_HAVE_CUDA
+            if (registered) try
+                {
+                    DeviceContext::CudaUnregisterHostBuffer(queue->GetShmDataRegion().data());
+                } catch (std::exception const& error)
+                {
+                    fmt::print(stderr, "[native_ckpt:cli][ERROR] Queue unregistration failed: {}\n", error.what());
+                }
+#endif
+        }
     };
 
     struct QueueRegistry
     {
-        std::mutex                                            mu;
-        std::unordered_map<Rank, std::shared_ptr<QueueState>> states;
+        std::mutex                                                              mu;
+        std::map<std::pair<cipc::SessionId, Rank>, std::shared_ptr<QueueState>> states;
     };
 
     static QueueRegistry& Registry()
@@ -165,17 +223,25 @@ struct CheckpointWriter
         return Registry;
     }
 
-    static void SendStateRegistry(StateTree const& registry)
+    static void SendStateRegistry(StateTree const& registry, uint64_t generation)
     {
         auto const& topo = registry.Topo();
         if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
-        auto&            reg = Registry();
+        auto const       serverIndex = ServerIndex(registry);
+        auto&            reg         = Registry();
         std::unique_lock lock(reg.mu);
-        if (reg.states.contains(topo.rank)) { return; }
+        std::erase_if(reg.states, [&](auto const& entry) {
+            return entry.first.second == topo.rank && entry.second->serverIndex == serverIndex && entry.second->generation != generation;
+        });
+        auto const key   = std::pair{registry.SessionId(), topo.rank};
+        auto const found = reg.states.find(key);
+        if (found != reg.states.end() && found->second->generation == generation) { return; }
         auto               state = std::make_shared<QueueState>();
         std::promise<void> readyPromise;
-        state->ready = readyPromise.get_future().share();
-        reg.states.emplace(topo.rank, state);
+        state->generation  = generation;
+        state->serverIndex = serverIndex;
+        state->ready       = readyPromise.get_future().share();
+        reg.states[key]    = state;
         lock.unlock();
         int numa = -1;
 #ifdef PHOENIX_HAVE_CUDA
@@ -214,6 +280,7 @@ struct CheckpointWriter
 #ifdef PHOENIX_HAVE_CUDA
             auto region = state->queue->GetShmDataRegion();
             DeviceContext::CudaRegisterHostBuffer(region.data(), region.size());
+            state->registered = true;
 #endif
             state->snapshotRegistry = std::move(snapshotRegistry);
         } catch (...)
@@ -230,7 +297,7 @@ struct CheckpointWriter
         {
             auto&            reg = Registry();
             std::scoped_lock lock(reg.mu);
-            state = reg.states.at(root.Topo().rank);
+            state = reg.states.at({root.SessionId(), root.Topo().rank});
         }
         state->ready.get();    // rethrows if queue initialization failed
         return state;
@@ -578,8 +645,14 @@ void WaitForCheckpointSave(StateTree const& snapshotRegistry)
 void FinalizeStateRegistry(StateTree& localRegistry)
 {
     if (!localRegistry.IsFinalized()) { localRegistry.FinalizeRegistry(); }
-    localRegistry.svcref = SvcRef::CliAcquireLocalProc(ServerIndex(localRegistry));
-    CheckpointWriter::SendStateRegistry(localRegistry);
+    auto const& topo = localRegistry.Topo();
+    if (topo.ranksPerPeer == 0 || topo.peersPerNode == 0) { throw std::invalid_argument("peer topology must be nonzero"); }
+    auto const node      = static_cast<uint32_t>(topo.rank) / topo.ranksPerPeer;
+    localRegistry.svcref = SvcRef::CliAcquireLocalProc(ServerIndex(localRegistry),
+                                                       static_cast<uint32_t>(localRegistry.SessionId()),
+                                                       node == 0 ? std::string{} : topo.peers.at(0),
+                                                       topo.peers.at(node));
+    CheckpointWriter::SendStateRegistry(localRegistry, localRegistry.svcref->generation);
 }
 
 // For now, we don't have any deferred tensors to save, so this is a no-op. In the future, we can add logic here to save any remaining

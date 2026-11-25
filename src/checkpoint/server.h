@@ -6,9 +6,11 @@
 #include <filesystem>
 #include <string_view>
 
-// Starts the checkpoint server, prints "READY\n" to stdout when the port is bound,
-// then blocks until a shutdown is triggered (either by message or inactivity timeout).
+// The standalone daemon announces readiness and waits for its references to drain.
 void RunServer(uint16_t index);
+
+void StartOwnedInprocServer(uint16_t index = 0);
+void WaitForOwnedInprocServer();
 
 void RunInprocServer(uint16_t nodes);
 void SpinDownAllInprocServers();

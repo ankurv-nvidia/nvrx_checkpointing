@@ -70,9 +70,12 @@ def _spawn_daemon(server: Path, log_file: Path) -> tuple[subprocess.Popen[str], 
 def check_daemon_election(server: Path, results_dir: Path) -> None:
     """The second candidate loses the election and the first keeps serving."""
     winner, ready = _spawn_daemon(server, results_dir / "election_winner.%p.log")
+    reference = None
     try:
         if not ready.wait(timeout=SERVER_READY_TIMEOUT_S):
             raise SystemExit(f"the checkpoint server did not print '{READY_MARKER}' within {SERVER_READY_TIMEOUT_S}s")
+        with urllib.request.urlopen(f"{BASE_URL}/api/acquirelocalref/{os.getpid()}", timeout=5.0) as response:
+            reference = int(response.read())
         logger.info("daemon up (pid %d); starting a second candidate", winner.pid)
         loser, _ = _spawn_daemon(server, results_dir / "election_loser.%p.log")
         try:
@@ -90,6 +93,9 @@ def check_daemon_election(server: Path, results_dir: Path) -> None:
             raise SystemExit(f"the daemon stopped serving after the election: /api/ping -> {status}")
         logger.info("election passed: the loser exited 0 and the winner still serves")
     finally:
+        if reference is not None:
+            with contextlib.suppress(OSError):
+                _http(f"/api/releaselocalref/{os.getpid()}/{reference}")
         with contextlib.suppress(OSError):
             _http("/api/stop")
         try:
