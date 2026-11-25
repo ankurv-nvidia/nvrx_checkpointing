@@ -103,14 +103,14 @@ class TestServerProcess
     void Start(std::filesystem::path const& stderrLog = {})
     {
         // The wheel smoke job runs pytest first, which can leave the shared test daemon running.
-        if (TryConnectToCheckpointService(0))
+        if (TryConnectToCheckpointService(LocalSvrPeer, 0))
         {
             // TODO_NOMERGESvcStop();
             static constexpr size_t MaxStopAttempts = 50;
             using namespace std::chrono_literals;
             for (size_t attempt = 0; attempt < MaxStopAttempts; ++attempt)
             {
-                if (!TryConnectToCheckpointService(0)) { break; }
+                if (!TryConnectToCheckpointService(LocalSvrPeer, 0)) { break; }
                 if (attempt + 1 == MaxStopAttempts) { throw std::runtime_error("existing checkpoint test server did not stop"); }
                 std::this_thread::sleep_for(100ms);
             }
@@ -143,7 +143,7 @@ class TestServerProcess
         using namespace std::chrono_literals;
         for (size_t attempt = 0; attempt < MaxAttempts; ++attempt)
         {
-            if (TryConnectToCheckpointService(0)) { return; }
+            if (TryConnectToCheckpointService(LocalSvrPeer, 0)) { return; }
             std::this_thread::sleep_for(100ms);
         }
         Stop();
@@ -1282,14 +1282,14 @@ FinalizeResultForResponse(boost::beast::http::status status, std::string const& 
 TEST_CASE("finalize uses the completed HTTP status and error body", "[server][finalize][tier1]")
 {
     namespace http = boost::beast::http;
-    if (TryConnectToCheckpointService(0))
+    if (TryConnectToCheckpointService(LocalSvrPeer, 0))
     {
         // TODO_NOMERGE SvcStop();
-        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(0); ++attempt)
+        for (size_t attempt = 0; attempt < 50 && TryConnectToCheckpointService(LocalSvrPeer, 0); ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
         }
-        REQUIRE_FALSE(TryConnectToCheckpointService(0));
+        REQUIRE_FALSE(TryConnectToCheckpointService(LocalSvrPeer, 0));
     }
     CHECK(FinalizeResultForResponse(http::status::ok).empty());
     CHECK(FinalizeResultForResponse(http::status::ok, "checkpoint is durable").empty());

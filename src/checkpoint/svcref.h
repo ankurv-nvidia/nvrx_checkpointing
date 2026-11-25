@@ -1,4 +1,6 @@
 #pragma once
+#include "CommonMacros.h"
+
 #include <list>
 #include <memory>
 #include <mutex>
@@ -9,14 +11,25 @@ struct SvcRef
 {
     public:
     struct InProc
-    {};
+    {
+        InProc();
+        ~InProc();
+        CLASS_DEFAULT_COPY_AND_MOVE(InProc);
+    };
+
     struct LocalProcCli
     {
+        LocalProcCli();
+        ~LocalProcCli();
+        CLASS_DEFAULT_COPY_AND_MOVE(LocalProcCli);
         uint64_t pid{};
         uint64_t token{};
     };
     struct RemoteProcCli
     {
+        RemoteProcCli();
+        ~RemoteProcCli();
+        CLASS_DEFAULT_COPY_AND_MOVE(RemoteProcCli);
         uint64_t    token{};
         std::string peer;
     };
@@ -24,12 +37,18 @@ struct SvcRef
     private:
     struct LocalProcSrv
     {
+        LocalProcSrv();
+        ~LocalProcSrv();
+        CLASS_DEFAULT_COPY_AND_MOVE(LocalProcSrv);
         uint64_t pid{};
         uint64_t token{};
     };
 
     struct RemoteProcSrv
     {
+        RemoteProcSrv();
+        ~RemoteProcSrv();
+        CLASS_DEFAULT_COPY_AND_MOVE(RemoteProcSrv);
         uint64_t    token{};
         std::string peer;
     };
@@ -59,10 +78,9 @@ struct SvcRef
 
     // A daemon can acquire both cli and srv references
     // Both must be empty to safely exit or release resources.
-    std::mutex                              _mutex;
-    std::list<std::weak_ptr<InProc>>        _inProc;
-    std::list<std::weak_ptr<LocalProcCli>>  _localProcCli;
-    std::list<std::weak_ptr<RemoteProcCli>> _remoteProcCli;
-    std::list<std::weak_ptr<LocalProcSrv>>  _localProcSrv;
-    std::list<std::weak_ptr<RemoteProcSrv>> _remoteProcSrv;
+    std::mutex                                _mutex;
+    std::list<std::weak_ptr<LocalProcCli>>    _localProcCli;
+    std::list<std::weak_ptr<RemoteProcCli>>   _remoteProcCli;
+    std::list<std::shared_ptr<LocalProcSrv>>  _localProcSrv;
+    std::list<std::shared_ptr<RemoteProcSrv>> _remoteProcSrv;
 };

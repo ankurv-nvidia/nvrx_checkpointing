@@ -1,5 +1,6 @@
 #pragma once
 #include "messages.h"
+#include "net_utils.h"
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -8,10 +9,11 @@
 #include <string>
 #include <thread>
 
+static constexpr std::string_view LocalSvrPeer = "localhost";
 // A short readiness probe shared by the training client and losing daemon
 // candidates. EINTR retries protect one socket operation; the two outer attempts
 // cover the narrow interval between instance election and the winner binding.
-inline bool TryConnectToCheckpointService(uint16_t index)
+inline bool TryConnectToCheckpointService(std::string_view const& peer, uint16_t index)
 {
     using namespace std::chrono_literals;
     namespace cipc = checkpoint::ipc;
@@ -32,15 +34,14 @@ inline bool TryConnectToCheckpointService(uint16_t index)
             boost::beast::tcp_stream       stream(ioc);
             boost::asio::ip::tcp::resolver resolver(ioc);
 
-            auto results = resolver.resolve("localhost", std::to_string(port), ec);
+            auto results = resolver.resolve(peer, std::to_string(port), ec);
             if (ec) { continue; }
 
             [[maybe_unused]] auto endpoint = stream.connect(results, ec);
             if (ec) { continue; }
 
-            static constexpr int                                         HttpVersion11 = 11;
             boost::beast::http::request<boost::beast::http::buffer_body> req{boost::beast::http::verb::get, "/api/ping", HttpVersion11};
-            req.set(boost::beast::http::field::host, fmt::format("{}:{}", "localhost", port));
+            req.set(boost::beast::http::field::host, fmt::format("{}:{}", peer, port));
             req.body().data = nullptr;
             req.body().size = 0;
             req.body().more = false;

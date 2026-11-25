@@ -34,21 +34,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 
 using namespace std::chrono_literals;
 namespace cipc = checkpoint::ipc;
-
-template <typename TStream> static void TryCleanShutdown(TStream& stream)
-{
-    boost::system::error_code ec;
-    ec = stream.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-    if (ec && ec != boost::system::errc::not_connected)
-    {    //
-        fmt::print(stderr, "[native_ckpt:cli][ERROR] Shutdown Error: {}\n", ec.what());
-    }
-}
 
 static uint16_t ServerIndex(StateTree const& registry)
 {
@@ -73,7 +62,6 @@ static auto LocalServiceRequest(uint32_t serverIndex, std::string const& target,
         [[maybe_unused]] auto endpoint = stream.connect(results, ec);
         if (ec) { continue; }
 
-        static constexpr int                                         HttpVersion11 = 11;
         boost::beast::http::request<boost::beast::http::string_body> req{boost::beast::http::verb::post, target, HttpVersion11};
         req.set(boost::beast::http::field::host, fmt::format("localhost:{}", port));
         req.set(boost::beast::http::field::content_type, "application/octet-stream");

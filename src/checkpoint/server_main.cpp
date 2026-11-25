@@ -271,7 +271,7 @@ try
     {
         // Losing candidates wait for the elected daemon's listener before releasing their launchers.
         fmt::print(stderr, "[native_ckpt:svr][INFO] {}\n", e.what());
-        if (!TryConnectToCheckpointService(index))
+        if (!TryConnectToCheckpointService(LocalSvrPeer, index))
         {
             fmt::print(stderr, "[native_ckpt:svr][INFO] Elected checkpoint server is unavailable; retrying election\n");
             fmt::print(stdout, "RETRY\n");

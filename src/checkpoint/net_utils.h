@@ -31,10 +31,10 @@ inline auto ResolveEndpoint(boost::asio::io_context& ioc, std::string_view const
 {
     // Cached results avoid intermittent host-not-found errors on repeated resolution.
     SUPPRESS_WARNINGS_START
-    SUPPRESS_CLANG_WARNING("-Wexit-time-destructors")
     SUPPRESS_CLANG_WARNING("-Wunique-object-duplication")
-    static std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type> EndpointCache;
-    static std::mutex                                                                         Mutex;
+    using Cache                = std::unordered_map<boost::urls::url, boost::asio::ip::tcp::resolver::results_type>;
+    static auto& EndpointCache = *new Cache;         // NOLINT(cppcoreguidelines-owning-memory)
+    static auto& Mutex         = *new std::mutex;    // NOLINT(cppcoreguidelines-owning-memory)
     SUPPRESS_WARNINGS_END
 
     boost::urls::url endpoint;
