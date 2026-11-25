@@ -19,7 +19,7 @@ struct SvcRef
 
     struct LocalProcCli
     {
-        LocalProcCli();
+        explicit LocalProcCli(uint16_t serverIndex);
         ~LocalProcCli();
         CLASS_DEFAULT_COPY_AND_MOVE(LocalProcCli);
         uint64_t pid{};
@@ -27,7 +27,7 @@ struct SvcRef
     };
     struct RemoteProcCli
     {
-        RemoteProcCli();
+        RemoteProcCli(std::string peer);
         ~RemoteProcCli();
         CLASS_DEFAULT_COPY_AND_MOVE(RemoteProcCli);
         uint64_t    token{};
@@ -79,8 +79,6 @@ struct SvcRef
     // A daemon can acquire both cli and srv references
     // Both must be empty to safely exit or release resources.
     std::mutex                                _mutex;
-    std::list<std::weak_ptr<LocalProcCli>>    _localProcCli;
-    std::list<std::weak_ptr<RemoteProcCli>>   _remoteProcCli;
     std::list<std::shared_ptr<LocalProcSrv>>  _localProcSrv;
     std::list<std::shared_ptr<RemoteProcSrv>> _remoteProcSrv;
 };

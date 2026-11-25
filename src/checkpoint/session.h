@@ -32,6 +32,10 @@ struct Session
         uint64_t writtenPayloadRangeBegin{0};
         uint64_t writtenPayloadRangeEnd{0};
         uint64_t writtenPayloadSize{0};
+
+        // Acquired during snapshotting
+        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
+        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
     };
 
     struct RegistryState
@@ -43,6 +47,10 @@ struct Session
         bool                                                                  planningStarted{false};
         bool                                                                  planningReady{false};
         std::string                                                           planningFailure;
+
+        // Acquired during initial planning
+        std::shared_ptr<SvcRef::InProc>        selfSvcRef;
+        std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
     };
 
     struct Snapshot
@@ -79,9 +87,6 @@ struct Session
     std::map<checkpoint::ipc::SnapshotId, std::unique_ptr<Snapshot>> snapshots;
 
     std::vector<std::future<void>> asyncTasks;
-    // Acquired during snapshotting and initial planning
-    std::shared_ptr<SvcRef::InProc>        selfSvcRef;
-    std::shared_ptr<SvcRef::RemoteProcCli> coordinatorSvcRef;
 
     Session(Server* serverIn LFTBND, checkpoint::ipc::SessionId sessionIdIn, std::filesystem::path workDirIn, RankTopology topoIn);
     std::atomic<bool> stopRequested{false};

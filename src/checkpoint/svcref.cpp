@@ -78,8 +78,9 @@ SvcRef::RemoteProcSrv::RemoteProcSrv()
 SvcRef::RemoteProcSrv::~RemoteProcSrv()
 { RemoteProcCounterSrv--; }
 
-SvcRef::LocalProcCli::LocalProcCli()
+SvcRef::LocalProcCli::LocalProcCli(uint16_t serverIndex)
 {
+    if (LocalProcCounterCli == 0) { SvcPing(serverIndex); }
     LocalProcCounterCli++;
     // TODO_NOMERGE: Send a increment-ref-count msg to LocalSrvPeer and store the returned tag
 }
@@ -90,8 +91,9 @@ SvcRef::LocalProcCli::~LocalProcCli()
     // TODO_NOMERGE: Send a decrement-ref-count msg to LocalSrvPeer along with the stored tag
 }
 
-SvcRef::RemoteProcCli::RemoteProcCli()
+SvcRef::RemoteProcCli::RemoteProcCli(std::string peerIn) : peer(std::move(peerIn))
 {
+    if (RemoteProcCounterCli == 0) { WaitForRemotePeerPing(peer); }    // Assuming 0 as the server index for simplicity
     RemoteProcCounterCli++;
     // TODO_NOMERGE: Send a increment-ref-count msg to RemoteSrvPeer and store the returned tag
 }
@@ -103,23 +105,27 @@ SvcRef::RemoteProcCli::~RemoteProcCli()
 }
 
 std::shared_ptr<SvcRef::InProc> SvcRef::AcquireInProc_()
-{ return std::make_shared<SvcRef::InProc>(); }
+{
+    std::scoped_lock lock(_mutex);
+    return std::make_shared<SvcRef::InProc>();
+}
 
 std::shared_ptr<SvcRef::LocalProcCli> SvcRef::CliAcquireLocalProc_(uint16_t serverIndex)
 {
-    if (LocalProcCounterCli == 0) { SvcPing(serverIndex); }
-    return std::make_shared<SvcRef::LocalProcCli>();
+    std::scoped_lock lock(_mutex);
+    return std::make_shared<SvcRef::LocalProcCli>(serverIndex);
 }
 
 std::shared_ptr<SvcRef::RemoteProcCli> SvcRef::CliAcquireRemoteProc_(std::string peer)
 {
-    if (RemoteProcCounterCli == 0) { WaitForRemotePeerPing(peer); }    // Assuming 0 as the server index for simplicity
-    return std::make_shared<SvcRef::RemoteProcCli>();
+    std::scoped_lock lock(_mutex);
+    return std::make_shared<SvcRef::RemoteProcCli>(std::move(peer));
 }
 
 uint64_t SvcRef::SvrAcquireLocalProcRef_(uint64_t pid)
 {
-    auto ref = std::make_shared<SvcRef::LocalProcSrv>();
+    std::scoped_lock lock(_mutex);
+    auto             ref = std::make_shared<SvcRef::LocalProcSrv>();
     _localProcSrv.push_back(ref);
     ref->pid   = pid;
     ref->token = LocalProcCounterSrv.load();
@@ -128,7 +134,8 @@ uint64_t SvcRef::SvrAcquireLocalProcRef_(uint64_t pid)
 
 void SvcRef::SvrReleaseLocalProcRef_(uint64_t pid, uint64_t token)
 {
-    auto ref = std::ranges::find_if(_localProcSrv, [&](auto const& r) { return r->token == token; });
+    std::scoped_lock lock(_mutex);
+    auto             ref = std::ranges::find_if(_localProcSrv, [&](auto const& r) { return r->token == token; });
     if (ref == _localProcSrv.end()) throw std::runtime_error("LocalProcSrv reference not found");
     if ((*ref)->pid != pid) throw std::runtime_error("LocalProcSrv pid mismatch");
     _localProcSrv.erase(ref);
@@ -136,16 +143,18 @@ void SvcRef::SvrReleaseLocalProcRef_(uint64_t pid, uint64_t token)
 
 uint64_t SvcRef::SvrAcquireRemoteProcRef_(std::string peer)
 {
-    auto ref   = std::make_shared<SvcRef::RemoteProcSrv>();
-    ref->peer  = std::move(peer);
-    ref->token = RemoteProcCounterSrv.load();
+    std::scoped_lock lock(_mutex);
+    auto             ref = std::make_shared<SvcRef::RemoteProcSrv>();
+    ref->peer            = std::move(peer);
+    ref->token           = RemoteProcCounterSrv.load();
     _remoteProcSrv.push_back(ref);
     return ref->token;
 }
 
 void SvcRef::SvrReleaseRemoteProcRef_(std::string_view const& peer, uint64_t token)
 {
-    auto ref = std::ranges::find_if(_remoteProcSrv, [&](auto const& r) { return r->token == token; });
+    std::scoped_lock lock(_mutex);
+    auto             ref = std::ranges::find_if(_remoteProcSrv, [&](auto const& r) { return r->token == token; });
     if (ref == _remoteProcSrv.end()) throw std::runtime_error("RemoteProcSrv reference not found");
     if ((*ref)->peer != peer) throw std::runtime_error("RemoteProcSrv peer mismatch");
     _remoteProcSrv.erase(ref);
