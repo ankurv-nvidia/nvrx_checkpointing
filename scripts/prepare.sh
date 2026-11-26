@@ -12,10 +12,10 @@ else
 fi
 
 # The CI build scripts, the JET image and the Slurm runner read these versions from here.
-PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
+PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.11-py3
 # The image's PyTorch series, which bases without PyTorch install so that Megatron-LM's pins hold.
-PYTORCH_SERIES=2.14
-CUDA_VERSION=13.4
+PYTORCH_SERIES=2.15
+CUDA_VERSION=13.5
 CLANG_VERSION=23
 
 # Resolved on demand: only the container/megatron functions need the
@@ -325,6 +325,8 @@ function megatron {
     export MAX_JOBS=${MAX_JOBS:-4}
     export CC=gcc
     export CXX=g++
+    BASE_TRANSFORMER_ENGINE_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("transformer-engine"))' 2>/dev/null || true)
+    BASE_TVM_FFI_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("apache-tvm-ffi"))' 2>/dev/null || true)
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
     # line in-shell. A truncating reader (head) closes the pipe early and SIGPIPEs
     # nvidia-smi, which pipefail would turn into a fatal exit on multi-GPU nodes.
@@ -357,12 +359,30 @@ function megatron {
     # Installs keep a base image's NumPy, which packages such as its Numba cap.
     export UV_CONSTRAINT=$(mktemp)
     python -c 'import importlib.metadata as m; print("numpy==" + m.version("numpy"))' 2>/dev/null > "${UV_CONSTRAINT}" || true
-    # The pinned Transformer Engine build needs its locked cuDNN frontend during metadata resolution.
-    uv pip install "nvidia-cudnn-frontend[cutedsl]==1.28.0"
+    uv pip install "nvidia-cudnn-frontend[cutedsl]==1.32.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
     UV_OVERRIDES=$(mktemp)
-    python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["tool"]["uv"].get("override-dependencies", [])))' \
-        "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}"
+    python - "${MEGATRON_ROOT}/pyproject.toml" > "${UV_OVERRIDES}" <<'PY'
+import re
+import sys
+import tomllib
+
+replaced = {"transformer-engine", "nvidia-cudnn-frontend", "apache-tvm-ffi"}
+with open(sys.argv[1], "rb") as stream:
+    requirements = tomllib.load(stream)["tool"]["uv"].get("override-dependencies", [])
+for requirement in requirements:
+    name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement.strip()).group()
+    if re.sub(r"[-_.]+", "-", name).lower() not in replaced:
+        print(requirement)
+PY
+    printf '%s\n' \
+        "transformer-engine==${BASE_TRANSFORMER_ENGINE_VERSION:-2.21.0}" \
+        "nvidia-cudnn-frontend[cutedsl]==1.32.0" >> "${UV_OVERRIDES}"
+    if [[ -n "${BASE_TVM_FFI_VERSION}" ]]; then
+        printf 'apache-tvm-ffi==%s\n' "${BASE_TVM_FFI_VERSION}" >> "${UV_OVERRIDES}"
+    else
+        printf '%s\n' 'apache-tvm-ffi>=0.1.12,<0.2' >> "${UV_OVERRIDES}"
+    fi
     # A base image's quack-kernels stays in use; its FlashAttention-4 needs that release.
     python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
@@ -386,6 +406,10 @@ function megatron {
     # Megatron-LM builds without isolation, so a base without pybind11 first gets its declared build requirements.
     python -c 'import pybind11' 2>/dev/null || uv pip install -r <(python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["build-system"]["requires"]))' "${MEGATRON_ROOT}/pyproject.toml")
     uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    if [[ -n "${BASE_TRANSFORMER_ENGINE_VERSION}" ]]; then
+        python -c 'import importlib.metadata as m, sys; actual = m.version("transformer-engine"); assert actual == sys.argv[1], (actual, sys.argv[1]); import transformer_engine.pytorch' \
+            "${BASE_TRANSFORMER_ENGINE_VERSION}"
+    fi
     # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
     python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
@@ -397,9 +421,7 @@ function megatron {
     export RDMA_CORE_HOME=/opt/rdma-core/build
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-}"
 
-    # Megatron requires NVSHMEM >=3.6.5: older releases can crash while initializing
-    # split NVLink-domain PE layouts. Keep the image reproducible at the current cu13 release.
-    uv pip install nvidia-nvshmem-cu13==3.7.2
+    uv pip install nvidia-nvshmem-cu13==3.8.0
     NVSHMEM_LIB_DIR=$(python -c 'from pathlib import Path; import nvidia.nvshmem; print(Path(next(iter(nvidia.nvshmem.__path__))) / "lib")')
     pushd "${NVSHMEM_LIB_DIR}"
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so

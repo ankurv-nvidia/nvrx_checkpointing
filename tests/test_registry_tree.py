@@ -138,7 +138,7 @@ class _Tree:
     def removed(self) -> None:
         self.nodes.append([_REMOVED, _REMOVED, "", 0, None])
 
-    def write(self, path: Path, version: int = 1) -> None:
+    def write(self, path: Path, version: int = 1, *, tensor_strides: tuple[int, ...] | None = None) -> None:
         out = bytearray(struct.pack("<IIIII", self.session_id, self.rank, self.world, 2, 1))
         out += struct.pack("<I", len(_PEER)) + _PEER.encode()
         if version >= 2:
@@ -146,7 +146,7 @@ class _Tree:
         out += struct.pack("<I", len(self.nodes))
         for handle, parent, name, kind, payload in self.nodes:
             if version >= 3 and kind == _TENSOR:
-                raise ValueError("registry version 3 contains distributed tensors")
+                raise ValueError(f"registry version {version} contains distributed tensors")
             wire_kind = kind - 1 if version >= 3 and kind >= _DTENSOR else kind
             out += struct.pack("<BBHII", wire_kind, len(name), 0, handle, parent) + name.encode()
             if kind == _DICT:
@@ -163,8 +163,15 @@ class _Tree:
                 dtype, fulldim, shards = payload
                 out += struct.pack("<IB", len(shards), dtype) + _dim(fulldim)
                 for shard_index, (rank, ranges, storage_size, device, device_index) in enumerate(shards):
-                    out += struct.pack("<I4xQQ", rank, 0x100000 + (handle << 8) + shard_index, storage_size)
+                    shard_handle = 0x100000 + (handle << 8) + shard_index
+                    strided = kind == _DTENSOR and tensor_strides is not None
+                    if version >= 4:
+                        out += struct.pack("<IBBBxQQ", rank, dtype, 6 if strided else 5, strided, shard_handle, storage_size)
+                    else:
+                        out += struct.pack("<I4xQQ", rank, shard_handle, storage_size)
                     out += _ranges(ranges) + struct.pack("<4sI", device, device_index)
+                    if version >= 4:
+                        out += _dim(tensor_strides if strided else ())
         path.write_bytes(bytes(out))
 
 
@@ -414,7 +421,7 @@ def test_script_runs_without_torch_or_numpy(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
 
 
-@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("version", [2, 3, 4])
 def test_metadata_registries_retain_blob_sizes_and_replica_ranks(tmp_path: Path, version: int) -> None:
     tree = _Tree(0)
     shards = [(rank, [(offset, offset + 1)], size, b"cpu\0", 0) for offset, size in ((0, 3), (1, 5)) for rank in (0, 1)]
@@ -465,8 +472,27 @@ def test_metadata_counts_local_membership_without_replica_hints(
     assert {rank: value[0] for rank, value in leaves["payload"].ranks.items()} == dict.fromkeys(expected_ranks, 17)
 
 
+@pytest.mark.parametrize(("shape", "strides"), [((1,), ()), ((2, 3), (3, 1))])
+def test_strided_shards_preserve_following_registry_entries(tmp_path: Path, shape: tuple[int, ...], strides: tuple[int, ...]) -> None:
+    tree = _Tree(0)
+    ranges = [(0, size) for size in shape]
+    storage_size = math.prod(shape) * 4
+    tree.add("weight", _DTENSOR, (_F32, shape, [(0, ranges, storage_size, b"cpu\0", 0)]))
+    tree.add("iteration", _SCALAR, ((_INT64_BITS, 17), (0,)))
+    path = tmp_path / "registry.0.bin"
+    tree.write(path, version=4, tensor_strides=strides)
+
+    parsed = registry_tree.read_registry(path)
+    assert parsed.trailing == 0
+    entries = {parsed.names[handle]: value for handle, _kind, value in parsed.entries}
+    assert entries["weight"].shards[0].ranges == tuple(ranges)
+    assert entries["weight"].shards[0].storage_size == storage_size
+    assert entries["iteration"].value == (_INT64_BITS, 17)
+    assert entries["iteration"].replicas == (0,)
+
+
 def test_registry_reader_rejects_unknown_metadata_version(tmp_path: Path) -> None:
     path = tmp_path / "registry.global.bin"
-    _Tree(0).write(path, version=4)
-    with pytest.raises(ValueError, match="unsupported registry version 4"):
+    _Tree(0).write(path, version=5)
+    with pytest.raises(ValueError, match="unsupported registry version 5"):
         registry_tree.read_registry(path)

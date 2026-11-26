@@ -37,8 +37,9 @@ page = _page_module()
 
 _INVALID, _DICT, _SCALAR, _BLOB, _TENSOR, _DTENSOR, _FIXED_BLOB = range(7)
 _REGISTRY_MAGIC = 0x32525453
-_REGISTRY_VERSION = 3
+_REGISTRY_VERSION = 4
 _METADATA_VERSION = 2
+_STRIDED_SHARD_VERSION = 4
 _DTYPES = {
     1: "float16",
     2: "bfloat16",
@@ -190,10 +191,12 @@ def _tensor_value(reader: _Reader) -> _TensorValue:
     return _TensorValue(dtype, storage_size, full_dim)
 
 
-def _shard_value(reader: _Reader) -> _ShardValue:
+def _shard_value(reader: _Reader, version: int) -> _ShardValue:
     rank, _, storage_size = reader.unpack(_SHARD_PREFIX)
     ranges = _ranges(reader)
     reader.take(_DEVICE.size)
+    if version >= _STRIDED_SHARD_VERSION:
+        _dim(reader)
     return _ShardValue(rank, storage_size, ranges)
 
 
@@ -214,7 +217,7 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
     version = 1
     if count == _REGISTRY_MAGIC:
         (version,) = reader.unpack(_U32)
-        if version not in (_METADATA_VERSION, _REGISTRY_VERSION):
+        if not _METADATA_VERSION <= version <= _REGISTRY_VERSION:
             raise ValueError(f"{path}: unsupported registry version {version}")
         (count,) = reader.unpack(_U32)
     for _ in range(count):
@@ -235,7 +238,7 @@ def read_registry(path: Path, data: bytes | None = None) -> Registry:
         elif kind in {_DTENSOR, _FIXED_BLOB}:
             shard_count, dtype = reader.unpack(_DTENSOR_PREFIX)
             full_dim = _dim(reader)
-            shards = tuple(_shard_value(reader) for _ in range(shard_count))
+            shards = tuple(_shard_value(reader, version) for _ in range(shard_count))
             registry.entries.append((handle, kind, _DTensorValue(dtype, full_dim, shards)))
         else:
             raise ValueError(f"{path}: node at byte {start} has unknown type {kind}")

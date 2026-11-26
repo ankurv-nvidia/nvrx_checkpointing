@@ -9,7 +9,7 @@ struct StateSerDes
 {
     using Type                            = StateNode::Type;
     static constexpr uint32_t WireMagic   = 0x32525453U;
-    static constexpr uint32_t WireVersion = 3;
+    static constexpr uint32_t WireVersion = 4;
 
     struct DictHeader
     { uint32_t numChild{}; };
