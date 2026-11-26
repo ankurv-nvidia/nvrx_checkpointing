@@ -185,6 +185,7 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
         {
             std::unordered_map<std::string, uint64_t> blobSizes;
             auto const                                otherRanks = static_cast<size_t>(topo.worldSize) - 1;
+            auto const                                deadline   = std::chrono::steady_clock::now() + ServerWaitTimeout;
             while (true)
             {
                 {
@@ -202,6 +203,10 @@ void Session::AsyncWorkFinalizeSnapshot_(cipc::Message::FinalizeSnapshot const& 
                          otherRanks);
                 }
                 if (stopRequested) { throw std::runtime_error("Stop requested while waiting for ranks to write checkpoint"); }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    throw std::runtime_error("Timed out waiting for ranks to write checkpoint");
+                }
 
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -608,9 +613,9 @@ void Session::Handle(cipc::Message::ActivateSnapshot const& hdr, std::span<char 
         snapshotState->snapshotRegistry = registry;
         snapshotState->startedAt        = hdr.startedAt;
         snapshotState->snapshotData     = ByteStorage(payloadSize);
-        snapshot->snapshotStateForRank.emplace(hdr.globalRank, std::move(snapshotState));
-        snapshotState->selfSvcRef = SvcRef::AcquireInProc();
+        snapshotState->selfSvcRef       = SvcRef::AcquireInProc();
         if (!IsCoordinatorPeer()) { snapshotState->coordinatorSvcRef = SvcRef::CliAcquireRemoteProc(topo.peers[0]); }
+        snapshot->snapshotStateForRank.emplace(hdr.globalRank, std::move(snapshotState));
     }
     if (beginDurableSpan && IsCoordinatorPeer())
     {
@@ -680,25 +685,25 @@ static void FailPlanning(Session& session, std::string failure)
     std::scoped_lock lock(session.mutex);
     if (!session.sessionState.planningFailure.empty()) { return; }
     session.sessionState.planningFailure = std::move(failure);
-    session.sessionState.selfSvcRef.reset();
     if (session.stopRequested) { return; }
     ERR("[{}] Snapshot planning failed: {}", session, session.sessionState.planningFailure);
     auto const message = session.sessionState.planningFailure;
-    session.asyncTasks.emplace_back(std::async(std::launch::async, [&session, message] {
-        std::ostringstream result;
-        serdes::WriteBlobWithSize<uint32_t>(result, message);
-        auto const body      = result.str();
-        auto const firstPeer = session.IsCoordinatorPeer() ? size_t{1} : size_t{0};
-        auto const lastPeer  = session.IsCoordinatorPeer() ? session.topo.peers.size() : size_t{1};
-        for (size_t peer = firstPeer; peer < lastPeer; ++peer)
-        {
-            try
+    session.asyncTasks.emplace_back(
+        std::async(std::launch::async, [&session, message, selfSvcRef = std::move(session.sessionState.selfSvcRef)] mutable {
+            std::ostringstream result;
+            serdes::WriteBlobWithSize<uint32_t>(result, message);
+            auto const body      = result.str();
+            auto const firstPeer = session.IsCoordinatorPeer() ? size_t{1} : size_t{0};
+            auto const lastPeer  = session.IsCoordinatorPeer() ? session.topo.peers.size() : size_t{1};
+            for (size_t peer = firstPeer; peer < lastPeer; ++peer)
             {
-                SendToPeerWithRetries(
-                    session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
-            } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
-        }
-    }));
+                try
+                {
+                    SendToPeerWithRetries(
+                        session, session.topo.peers[peer], body, fmt::format("/api/peer/globalregistry/{}", session.sessionId), {});
+                } catch (std::exception const& error) { ERR("[{}] Failed to propagate planning error: {}", session, error.what()); }
+            }
+        }));
 }
 
 void Session::HandleGlobalRegistry(std::shared_ptr<StateTree> globalRegistry, std::string failure)
