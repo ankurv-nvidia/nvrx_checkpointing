@@ -375,9 +375,12 @@ for requirement in requirements:
     if re.sub(r"[-_.]+", "-", name).lower() not in replaced:
         print(requirement)
 PY
-    printf '%s\n' \
-        "transformer-engine==${BASE_TRANSFORMER_ENGINE_VERSION:-2.21.0}" \
-        "nvidia-cudnn-frontend[cutedsl]==1.32.0" >> "${UV_OVERRIDES}"
+    if [[ -n "${BASE_TRANSFORMER_ENGINE_VERSION}" ]]; then
+        printf '%s\n' "transformer-engine; sys_platform == 'never'" >> "${UV_OVERRIDES}"
+    else
+        printf '%s\n' 'transformer-engine==2.21.0' >> "${UV_OVERRIDES}"
+    fi
+    printf '%s\n' "nvidia-cudnn-frontend[cutedsl]==1.32.0" >> "${UV_OVERRIDES}"
     if [[ -n "${BASE_TVM_FFI_VERSION}" ]]; then
         printf 'apache-tvm-ffi==%s\n' "${BASE_TVM_FFI_VERSION}" >> "${UV_OVERRIDES}"
     else
