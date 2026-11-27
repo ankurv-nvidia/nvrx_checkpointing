@@ -326,7 +326,6 @@ function megatron {
     export CC=gcc
     export CXX=g++
     BASE_TRANSFORMER_ENGINE_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("transformer-engine"))' 2>/dev/null || true)
-    BASE_TVM_FFI_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("apache-tvm-ffi"))' 2>/dev/null || true)
     # nvidia-smi prints one line per GPU; capture the full output and slice the first
     # line in-shell. A truncating reader (head) closes the pipe early and SIGPIPEs
     # nvidia-smi, which pipefail would turn into a fatal exit on multi-GPU nodes.
@@ -359,6 +358,7 @@ function megatron {
     # Installs keep a base image's NumPy, which packages such as its Numba cap.
     export UV_CONSTRAINT=$(mktemp)
     python -c 'import importlib.metadata as m; print("numpy==" + m.version("numpy"))' 2>/dev/null > "${UV_CONSTRAINT}" || true
+    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' >> "${UV_CONSTRAINT}"
     uv pip install "nvidia-cudnn-frontend[cutedsl]==1.32.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
     UV_OVERRIDES=$(mktemp)
@@ -367,7 +367,7 @@ import re
 import sys
 import tomllib
 
-replaced = {"transformer-engine", "nvidia-cudnn-frontend", "apache-tvm-ffi"}
+replaced = {"transformer-engine", "nvidia-cudnn-frontend", "tilelang", "apache-tvm-ffi"}
 with open(sys.argv[1], "rb") as stream:
     requirements = tomllib.load(stream)["tool"]["uv"].get("override-dependencies", [])
 for requirement in requirements:
@@ -381,11 +381,7 @@ PY
         printf '%s\n' 'transformer-engine==2.21.0' >> "${UV_OVERRIDES}"
     fi
     printf '%s\n' "nvidia-cudnn-frontend[cutedsl]==1.32.0" >> "${UV_OVERRIDES}"
-    if [[ -n "${BASE_TVM_FFI_VERSION}" ]]; then
-        printf 'apache-tvm-ffi==%s\n' "${BASE_TVM_FFI_VERSION}" >> "${UV_OVERRIDES}"
-    else
-        printf '%s\n' 'apache-tvm-ffi>=0.1.12,<0.2' >> "${UV_OVERRIDES}"
-    fi
+    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' >> "${UV_OVERRIDES}"
     # A base image's quack-kernels stays in use; its FlashAttention-4 needs that release.
     python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
@@ -414,7 +410,7 @@ PY
             "${BASE_TRANSFORMER_ENGINE_VERSION}"
     fi
     # The CUTLASS DSL that Megatron-LM's packages bring must still serve FlashInfer.
-    python -c 'import cutlass.cutlass_dsl as dsl, flashinfer; dsl.CuteExperimentalDSL'
+    python -c 'import cutlass.cutlass_dsl as dsl, flashinfer, tilelang; dsl.CuteExperimentalDSL'
     # Error :  TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
     # uv pip install --system --no-cache --break-system-packages --no-build-isolation "flash-attn-4>=4.0.0b11" nvidia-cutlass-dsl[cu13]
 
