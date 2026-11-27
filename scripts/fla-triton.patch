@@ -1,0 +1,11 @@
+--- a/fla/ops/cp/chunk_delta_h.py
++++ b/fla/ops/cp/chunk_delta_h.py
+@@ -313,7 +313,7 @@
+         for num_stages in [2, 3, 4]
+         for BV in [32, 64]
+     ],
+-    key=['HV', 'K', 'V', 'BT'],
++    key=['HV', 'K', 'V'],
+     use_cuda_graph=USE_CUDA_GRAPH,
+     **autotune_cache_kwargs,
+ )

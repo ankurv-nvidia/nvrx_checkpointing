@@ -405,6 +405,12 @@ PY
     # Megatron-LM builds without isolation, so a base without pybind11 first gets its declared build requirements.
     python -c 'import pybind11' 2>/dev/null || uv pip install -r <(python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["build-system"]["requires"]))' "${MEGATRON_ROOT}/pyproject.toml")
     uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
+    FLA_PACKAGE_ROOT=$(python -c 'from importlib.metadata import distribution; d = distribution("fla-core"); assert d.version == "0.5.1", f"Unsupported fla-core version: {d.version}"; print(d.locate_file(""))')
+    if patch --batch --fuzz=0 --forward --dry-run -p1 -d "${FLA_PACKAGE_ROOT}" < "${SCRIPT_DIR}/fla-triton.patch"; then
+        patch --batch --fuzz=0 --forward -p1 -d "${FLA_PACKAGE_ROOT}" < "${SCRIPT_DIR}/fla-triton.patch"
+    else
+        patch --batch --force --fuzz=0 --reverse --dry-run -p1 -d "${FLA_PACKAGE_ROOT}" < "${SCRIPT_DIR}/fla-triton.patch"
+    fi
     if [[ -n "${BASE_TRANSFORMER_ENGINE_VERSION}" ]]; then
         python -c 'import importlib.metadata as m, sys; actual = m.version("transformer-engine"); assert actual == sys.argv[1], (actual, sys.argv[1]); import transformer_engine.pytorch' \
             "${BASE_TRANSFORMER_ENGINE_VERSION}"
@@ -441,7 +447,7 @@ PY
 
     unset CC
     unset CXX
-    python -c 'import megatron.core, transformer_engine.pytorch, causal_conv1d, mamba_ssm, flash_attn, deep_ep'
+    python -c 'import megatron.core, transformer_engine.pytorch, causal_conv1d, mamba_ssm, flash_attn, deep_ep, megatron.training'
     #pip install -e "${MEGATRON_ROOT}" --no-build-isolation --break-system-packages || true
     uv pip list
     #pip install  --no-build-isolation --break-system-packages
