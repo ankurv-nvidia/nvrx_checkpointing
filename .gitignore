@@ -14,3 +14,4 @@ __pycache__
 checkpoint_server
 *.so
 CLAUDE.local.md
+/ci/

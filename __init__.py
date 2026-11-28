@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -8,8 +9,8 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-SHLIB_PATH = SCRIPT_DIR / "checkpoint.abi3.so"
-SERVER_PATH = SCRIPT_DIR / "checkpoint_server"
+SHLIB_NAME = "checkpoint.abi3.so"
+SERVER_NAME = "checkpoint_server"
 CURRENT_HASH = None
 
 
@@ -76,25 +77,15 @@ def build_native_extensions() -> None:
         return
 
     native_build_dir = get_native_build_dir()
-    if SHLIB_PATH.is_file():
-        # resolve() maps a dev symlink to its build-tree target and a prebuilt
-        # regular file (e.g. extracted from a wheel artifact) to itself, so
-        # both forms of an externally provided extension skip the auto-build.
-        shlib_realpath = SHLIB_PATH.resolve()
-        if not shlib_realpath.is_relative_to(native_build_dir.resolve()):
-            return
-
     rank = try_get_rank()
     hash_file = native_build_dir / "source.hash"
     build_native_extensions.CURRENT_HASH = _compute_source_hash()
-    # A matching hash only counts with the artifacts present — the repo-root
-    # files can disappear independently of the build tree (e.g. a cleanup of
-    # extracted wheel binaries), and rebuilding is what restores them.
+    # A matching hash only counts with the artifacts present, because rebuilding is what restores them.
     if (
         hash_file.is_file()
         and hash_file.read_text().strip() == build_native_extensions.CURRENT_HASH
-        and SHLIB_PATH.is_file()
-        and SERVER_PATH.is_file()
+        and (native_build_dir / SHLIB_NAME).is_file()
+        and (native_build_dir / SERVER_NAME).is_file()
     ):
         return
 
@@ -133,16 +124,48 @@ def build_native_extensions() -> None:
     hash_file.write_text(build_native_extensions.CURRENT_HASH)
 
 
-if _is_git_repo():
-    build_native_extensions()
+def _built_from_these_sources(build_dir: Path) -> bool:
+    """Whether the CMake build in the directory configured these sources."""
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.is_file():
+        return False
+    for line in cache.read_text().splitlines():
+        if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
+            return Path(line.partition("=")[2]).resolve() == SCRIPT_DIR
+    return False
 
-if not SHLIB_PATH.is_file():
-    raise RuntimeError("[nvrx_checkpointing] extensions were not built successfully.")
-if not SERVER_PATH.is_file():
-    raise RuntimeError(
-        "[nvrx_checkpointing] checkpoint_server was not built successfully.",
-    )
 
-from . import ckpt_diag  # noqa: E402
+def _native_dir() -> Path:
+    """The directory that holds the native extension and the checkpoint server."""
+    beside_sources = SCRIPT_DIR / SHLIB_NAME
+    if beside_sources.is_file() and not beside_sources.is_symlink():
+        return SCRIPT_DIR
+    spec = importlib.util.find_spec(f"{__name__}.checkpoint")
+    if spec is not None and spec.origin is not None:
+        build_dir = Path(spec.origin).parent.resolve()
+        if build_dir != SCRIPT_DIR and _built_from_these_sources(build_dir):
+            return build_dir
+    if _is_git_repo():
+        build_native_extensions()
+        return get_native_build_dir()
+    return SCRIPT_DIR
 
-ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH)
+
+# pytest also imports this file as the root package of a source checkout, named after the checkout directory.
+if __name__ == "nvrx_checkpointing":
+    NATIVE_DIR = _native_dir()
+    if NATIVE_DIR != SCRIPT_DIR:
+        __path__.insert(0, NATIVE_DIR.as_posix())
+    SHLIB_PATH = NATIVE_DIR / SHLIB_NAME
+    SERVER_PATH = NATIVE_DIR / SERVER_NAME
+
+    if not SHLIB_PATH.is_file():
+        raise RuntimeError("[nvrx_checkpointing] extensions were not built successfully.")
+    if not SERVER_PATH.is_file():
+        raise RuntimeError(
+            "[nvrx_checkpointing] checkpoint_server was not built successfully.",
+        )
+
+    from . import ckpt_diag
+
+    ckpt_diag.enable_checkpoint_server_core_dumps(SERVER_PATH)

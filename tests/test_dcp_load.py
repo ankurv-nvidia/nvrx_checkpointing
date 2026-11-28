@@ -14,7 +14,7 @@ single process, so it falls back to local I/O.
 # ruff: noqa: S101
 from __future__ import annotations
 
-# sys.path + MEGATRON_NATIVE_BUILD_DIR opt-out are wired by `pytest_discover_tests`.
+# The CTest registration puts the build directory, which holds the shim, on the import path.
 import io
 import json
 import os

@@ -1,8 +1,5 @@
 # Using `nvrx_checkpointing` from an sbatch script
 
-For named Ultra v3 runs, background submission, per-run work directories, and
-custom image/source commits, see [Manual `slurm_job.py` runs](ci/slurm_job.md).
-
 ## Install a wheel from the project's pip index
 
 Successful `main` wheel builds publish x86_64 and aarch64 wheels to the
@@ -18,7 +15,8 @@ python3 -m pip install --upgrade --pre \
 The aarch64 wheel targets Grace (Neoverse V2) CPUs, as in GB200 and GB300
 systems.
 
-Published versions have the form `0.0.1.dev<RUN_NUMBER>+g<COMMIT_SHORT_SHA>`,
+Published versions have the form `0.0.1.dev<COMMIT_COUNT>+g<COMMIT_SHORT_SHA>`,
+where `COMMIT_COUNT` is the number of commits in the built commit's history,
 and the index keeps the newest 50 builds. To reproduce a particular build,
 replace `VERSION` below with its published version:
 
@@ -68,17 +66,29 @@ separate setup process will not work because the patches are process-local.
 
 ### Enabling OpenTelemetry
 
-Native checkpoint telemetry is disabled by default. To collect it through the
-node-local checkpoint daemon, set its output file for the training ranks and
-daemon. `daemon` is the default export mode:
+Native checkpoint telemetry is disabled by default. The checkpoint daemon
+exports it over OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, the variable the
+Megatron exporter also reads, so one setting sends both to an OpenTelemetry
+Collector:
 
 ```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+Without an external collector, point the endpoint at the node-local daemon and
+name the file the coordinator daemon writes for every node:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4100
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export NATIVE_CKPT_OTEL_FILE=/path/to/native_ckpt_otel.jsonl
 ```
 
-The file name accepts the same `%h` (host) and `%p` (process ID)
-substitutions as `NATIVE_CKPT_SERVER_LOG`. A relative path is resolved beneath
-the directory containing `NATIVE_CKPT_SERVER_LOG`.
+With no endpoint, `NATIVE_CKPT_OTEL_FILE` alone makes each daemon write its
+own telemetry to that file. The file name accepts the same `%h` (host) and `%p`
+(process ID) substitutions as `NATIVE_CKPT_SERVER_LOG`. A relative path is
+resolved beneath the directory containing `NATIVE_CKPT_SERVER_LOG`.
 
 Native span begin/end events automatically emit standalone `process.memory`
 events recording current and peak RSS plus anonymous, file, shared-memory,
@@ -89,7 +99,7 @@ Set `NATIVE_CKPT_MEMORY_SAMPLE_INTERVAL_SECONDS=1` to additionally emit a
 periodic `process.memory` event once per second. Periodic sampling is disabled
 by default.
 
-To include Megatron traces and metrics in the same daemon collector, also set:
+To include Megatron traces and metrics at the same endpoint, also set:
 
 ```bash
 export MEGATRON_OTEL_ENABLED=1
@@ -97,12 +107,10 @@ export MEGATRON_OTEL_TRACES_ENABLED=1
 export MEGATRON_OTEL_METRICS_ENABLED=1
 export MEGATRON_OTEL_EXPORT_STRATEGY=all_ranks
 export MEGATRON_OTEL_SPAN_GROUPS=default,load_checkpoint
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4100
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ```
 
-See [OpenTelemetry performance telemetry](docs/OpenTelemetry.md) for export
-modes, collector topology, attributes, and analysis commands.
+See [OpenTelemetry performance telemetry](docs/OpenTelemetry.md) for the
+collection topologies and attributes.
 
 ### Adapting an existing Megatron workload launcher
 

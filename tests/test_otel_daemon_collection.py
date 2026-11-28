@@ -29,7 +29,7 @@ def _find_registry() -> str | None:
     return None
 
 
-def test_daemon_mode_collects_single_file(tmp_path):
+def test_daemon_routing_collects_single_file(tmp_path):
     try:
         import pytest
     except ImportError:
@@ -45,7 +45,8 @@ def test_daemon_mode_collects_single_file(tmp_path):
     out = tmp_path / "collected.jsonl"
     env = {
         **os.environ,
-        "NATIVE_CKPT_OTEL_EXPORT": "daemon",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4100",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
         "NATIVE_CKPT_OTEL_FILE": str(out),
     }
     result = subprocess.run(

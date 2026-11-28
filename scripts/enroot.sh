@@ -35,15 +35,14 @@ source <(grep -E '^PYTORCH_IMAGE=' "${SCRIPT_DIR}/prepare.sh")
 DOCKER_IMAGE_BASE=${PYTORCH_IMAGE}
 PYTORCH_RELEASE=${PYTORCH_IMAGE##*:}
 PYTORCH_RELEASE=${PYTORCH_RELEASE%%-*}
-# First 10 hex chars of sha256(prepare.sh) — must match _prepare_sh_hash() in
-# ci/scripts/slurm_job.py so both paths agree on the filename.
+# First 10 hex chars of sha256(prepare.sh); the CI launcher names its image the same way.
 PREPARE_SH_HASH=$(sha256sum "${SCRIPT_DIR}/prepare.sh" | cut -c1-10)
 ENROOT_IMAGE_BASE=${ENROOT_IMAGE_BASE:-${MEGATRON_ROOT}/../pytorch${PYTORCH_RELEASE//./}.sqsh}
 ENROOT_IMAGE_OUT=${ENROOT_IMAGE_OUT:-${MEGATRON_ROOT}/../native.${PREPARE_SH_HASH}.sqsh}
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 GPUS_PER_NODE=${GPUS_PER_NODE:-$(detect_gpus_per_node)}
 
-# Common srun flags. Defaults match slurm_job.py; override via env vars in CI.
+# Common srun flags, matching the CI launcher's defaults; environment variables override them.
 # Direct runs bypass the SBATCH headers above, so srun takes the account explicitly.
 SLURM_ACCOUNT=${SLURM_ACCOUNT:?set SLURM_ACCOUNT to the Slurm account to charge}
 SLURM_TIME=${SLURM_TIME:-00:60:00}
