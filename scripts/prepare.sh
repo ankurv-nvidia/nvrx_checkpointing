@@ -358,7 +358,7 @@ function megatron {
     # Installs keep a base image's NumPy, which packages such as its Numba cap.
     export UV_CONSTRAINT=$(mktemp)
     python -c 'import importlib.metadata as m; print("numpy==" + m.version("numpy"))' 2>/dev/null > "${UV_CONSTRAINT}" || true
-    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' >> "${UV_CONSTRAINT}"
+    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' 'flash-linear-attention==0.5.2' 'fla-core==0.5.2' >> "${UV_CONSTRAINT}"
     uv pip install "nvidia-cudnn-frontend[cutedsl]==1.32.0"
     # uv pip does not read pyproject dependency overrides, so Megatron's list is passed explicitly.
     UV_OVERRIDES=$(mktemp)
@@ -367,7 +367,7 @@ import re
 import sys
 import tomllib
 
-replaced = {"transformer-engine", "nvidia-cudnn-frontend", "tilelang", "apache-tvm-ffi"}
+replaced = {"transformer-engine", "nvidia-cudnn-frontend", "tilelang", "apache-tvm-ffi", "flash-linear-attention", "fla-core"}
 with open(sys.argv[1], "rb") as stream:
     requirements = tomllib.load(stream)["tool"]["uv"].get("override-dependencies", [])
 for requirement in requirements:
@@ -381,7 +381,7 @@ PY
         printf '%s\n' 'transformer-engine==2.21.0' >> "${UV_OVERRIDES}"
     fi
     printf '%s\n' "nvidia-cudnn-frontend[cutedsl]==1.32.0" >> "${UV_OVERRIDES}"
-    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' >> "${UV_OVERRIDES}"
+    printf '%s\n' 'tilelang==0.1.15' 'apache-tvm-ffi==0.1.12' 'flash-linear-attention==0.5.2' 'fla-core==0.5.2' >> "${UV_OVERRIDES}"
     # A base image's quack-kernels stays in use; its FlashAttention-4 needs that release.
     python -c 'import importlib.metadata as m; m.version("quack-kernels")' 2>/dev/null && echo "quack-kernels; sys_platform == 'never'" >> "${UV_OVERRIDES}"
     cat "${UV_OVERRIDES}"
@@ -405,7 +405,7 @@ PY
     # Megatron-LM builds without isolation, so a base without pybind11 first gets its declared build requirements.
     python -c 'import pybind11' 2>/dev/null || uv pip install -r <(python -c 'import sys, tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb"))["build-system"]["requires"]))' "${MEGATRON_ROOT}/pyproject.toml")
     uv pip install --no-build-isolation --override "${UV_OVERRIDES}" -e "${MEGATRON_ROOT}[training,dev,otel,te,ssm]"
-    FLA_PACKAGE_ROOT=$(python -c 'from importlib.metadata import distribution; d = distribution("fla-core"); assert d.version == "0.5.1", f"Unsupported fla-core version: {d.version}"; print(d.locate_file(""))')
+    FLA_PACKAGE_ROOT=$(python -c 'from importlib.metadata import distribution; d = distribution("fla-core"); assert d.version == "0.5.2", f"Unsupported fla-core version: {d.version}"; print(d.locate_file(""))')
     if patch --batch --fuzz=0 --forward --dry-run -p1 -d "${FLA_PACKAGE_ROOT}" < "${SCRIPT_DIR}/fla-triton.patch"; then
         patch --batch --fuzz=0 --forward -p1 -d "${FLA_PACKAGE_ROOT}" < "${SCRIPT_DIR}/fla-triton.patch"
     else
