@@ -23,6 +23,7 @@ export TORCHINDUCTOR_WORKER_START=fork
 
 export QUANTIZATION_TYPE_DEBUG=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCH_DIST_USE_NCCL2="${TORCH_DIST_USE_NCCL2:-0}"
 
 
 NAME="12B_hybrid_moe_25T_phase1"
@@ -298,6 +299,6 @@ srun -l --mpi=none --ntasks=$SLURM_JOB_NUM_NODES \
      \
      --container-image=${IMAGE} \
      --container-mounts="/lustre:/lustre" \
-     --container-env=NCCL_IB_TIMEOUT,UCX_MEM_MMAP_HOOK_MODE,UCX_MEM_CUDA_HOOK_MODE,UCX_MEM_MALLOC_HOOKS,UCX_ERROR_SIGNALS \
+     --container-env=NCCL_IB_TIMEOUT,UCX_MEM_MMAP_HOOK_MODE,UCX_MEM_CUDA_HOOK_MODE,UCX_MEM_MALLOC_HOOKS,UCX_ERROR_SIGNALS,TORCH_DIST_USE_NCCL2 \
      --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
      sh -c "trap \"echo [\$(date '+%Y-%m-%d %H:%M:%S,%3N')] [ALWAYS] [RankMonServer.Restarter] [NestedRestarter] name=[InJob] state=aborted\" EXIT; eval \"${RUN_CMD}\""
